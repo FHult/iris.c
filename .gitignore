@@ -22,3 +22,7 @@ documents/
 *.a
 *.so
 *.dylib
+
+# Web UI
+web/output/
+web/venv/

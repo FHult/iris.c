@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FLUX.2 Image Generator</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>FLUX.2 Image Generator</h1>
+            <p class="subtitle">Generate images from text prompts</p>
+        </header>
+
+        <main>
+            <div class="panel controls">
+                <form id="generate-form">
+                    <div class="form-group">
+                        <label for="prompt">Prompt</label>
+                        <textarea
+                            id="prompt"
+                            name="prompt"
+                            rows="3"
+                            placeholder="A fluffy orange cat sitting on a windowsill, warm sunlight..."
+                            required
+                        ></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="aspect-preset">Presets</label>
+                        <select id="aspect-preset" name="aspect_preset">
+                            <option value="">-- Select a preset --</option>
+                            <optgroup label="Square">
+                                <option value="512x512">Square 512x512</option>
+                                <option value="1024x1024">Square 1024x1024</option>
+                            </optgroup>
+                            <optgroup label="Landscape">
+                                <option value="1024x576">Wide 16:9 (1024x576)</option>
+                                <option value="1024x768">Standard 4:3 (1024x768)</option>
+                                <option value="1280x720">HD 16:9 (1280x720)</option>
+                            </optgroup>
+                            <optgroup label="Portrait">
+                                <option value="576x1024">Tall 9:16 (576x1024)</option>
+                                <option value="768x1024">Portrait 3:4 (768x1024)</option>
+                                <option value="720x1280">HD Portrait (720x1280)</option>
+                            </optgroup>
+                            <optgroup label="Social Media">
+                                <option value="1080x1080">Instagram Square (1080x1080)</option>
+                                <option value="1080x1344">Instagram Portrait (1080x1344)</option>
+                                <option value="1200x672">Twitter/X Post (1200x672)</option>
+                                <option value="1200x624">Facebook Post (1200x624)</option>
+                                <option value="1280x720">YouTube Thumbnail (1280x720)</option>
+                            </optgroup>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="width">Width</label>
+                            <select id="width" name="width">
+                                <option value="256">256</option>
+                                <option value="512" selected>512</option>
+                                <option value="576">576</option>
+                                <option value="720">720</option>
+                                <option value="768">768</option>
+                                <option value="1024">1024</option>
+                                <option value="1080">1080</option>
+                                <option value="1200">1200</option>
+                                <option value="1280">1280</option>
+                                <option value="1344">1344</option>
+                                <option value="1536">1536</option>
+                                <option value="1792">1792</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="height">Height</label>
+                            <select id="height" name="height">
+                                <option value="256">256</option>
+                                <option value="512" selected>512</option>
+                                <option value="576">576</option>
+                                <option value="624">624</option>
+                                <option value="672">672</option>
+                                <option value="720">720</option>
+                                <option value="768">768</option>
+                                <option value="1024">1024</option>
+                                <option value="1080">1080</option>
+                                <option value="1280">1280</option>
+                                <option value="1344">1344</option>
+                                <option value="1536">1536</option>
+                                <option value="1792">1792</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="steps">Steps: <span id="steps-value">4</span></label>
+                            <input type="range" id="steps" name="steps" min="1" max="8" value="4">
+                        </div>
+                        <div class="form-group">
+                            <label for="seed">Seed (optional)</label>
+                            <input type="number" id="seed" name="seed" placeholder="Random">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="input-image">Reference Image (for img2img)</label>
+                        <div class="file-input-wrapper">
+                            <input type="file" id="input-image" name="input_image" accept="image/*">
+                            <div class="file-input-preview" id="input-preview">
+                                <span>Drop image here or click to select</span>
+                            </div>
+                        </div>
+                        <button type="button" id="clear-image" class="btn-secondary" style="display: none;">Clear Image</button>
+                    </div>
+
+                    <button type="submit" id="generate-btn" class="btn-primary">
+                        Generate
+                    </button>
+                </form>
+
+                <div id="progress-section" class="progress-section" style="display: none;">
+                    <div class="progress-header">
+                        <p class="progress-prompt" id="progress-prompt"></p>
+                        <button type="button" id="cancel-btn" class="btn-cancel" title="Cancel generation">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <p class="progress-text" id="progress-text">Starting...</p>
+                </div>
+
+                <div id="queue-section" class="queue-section" style="display: none;">
+                    <h3>Queue (<span id="queue-count">0</span>)</h3>
+                    <ul id="queue-list" class="queue-list"></ul>
+                </div>
+            </div>
+
+            <div class="panel output">
+                <div id="output-area" class="output-area">
+                    <div class="placeholder">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                            <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                            <polyline points="21 15 16 10 5 21"></polyline>
+                        </svg>
+                        <p>Your generated image will appear here</p>
+                    </div>
+                </div>
+                <div id="image-info" class="image-info" style="display: none;">
+                    <span id="seed-display"></span>
+                    <button type="button" id="remix-btn" class="btn-remix" title="Generate with same settings but new random seed">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 2v6h-6"></path>
+                            <path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path>
+                            <path d="M3 22v-6h6"></path>
+                            <path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path>
+                        </svg>
+                        Remix
+                    </button>
+                    <button type="button" id="use-as-input-btn" class="btn-remix" title="Use this image as img2img input">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                            <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                            <polyline points="21 15 16 10 5 21"></polyline>
+                        </svg>
+                        Use as Input
+                    </button>
+                </div>
+            </div>
+        </main>
+
+        <section id="history-section" class="history-section" style="display: none;">
+            <div class="history-header">
+                <h2>History</h2>
+                <button type="button" id="slideshow-btn" class="btn-slideshow" title="Start slideshow">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
+                    Slideshow
+                </button>
+            </div>
+            <div id="history-grid" class="history-grid"></div>
+        </section>
+
+        <footer>
+            <p>Powered by <a href="https://github.com/antirez/flux2.c" target="_blank">flux2.c</a> - Pure C implementation of FLUX.2-klein-4B</p>
+        </footer>
+    </div>
+
+    <!-- Lightbox Modal for Full-Size Images -->
+    <div id="lightbox-modal" class="lightbox-modal">
+        <button class="lightbox-close" id="lightbox-close">&times;</button>
+        <button class="lightbox-nav lightbox-prev" id="lightbox-prev">&lsaquo;</button>
+        <img id="lightbox-image" class="lightbox-image" src="" alt="Full size image">
+        <button class="lightbox-nav lightbox-next" id="lightbox-next">&rsaquo;</button>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

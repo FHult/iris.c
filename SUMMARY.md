@@ -1,0 +1,1 @@
+This project lists files in a directory and reads the content of README.md file.

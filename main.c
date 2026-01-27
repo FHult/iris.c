@@ -18,6 +18,7 @@
  *   -t, --strength N      Img2img strength (0.0-1.0)
  *   -q, --quiet           No output, just generate
  *   -v, --verbose         Extra detailed output
+ *   --server              Server mode: keep model loaded, read JSON from stdin
  *   -h, --help            Show help
  */
 
@@ -191,14 +192,277 @@ static double timer_end(void) {
 #define LOG_VERBOSE(...) do { if (output_level >= OUTPUT_VERBOSE) fprintf(stderr, __VA_ARGS__); } while(0)
 
 /* ========================================================================
- * Usage and Help
+ * Default Values
  * ======================================================================== */
 
-/* Default values */
 #define DEFAULT_WIDTH 256
 #define DEFAULT_HEIGHT 256
 #define DEFAULT_STEPS 4
 #define DEFAULT_STRENGTH 0.75f
+
+/* ========================================================================
+ * Simple JSON Helpers (for server mode)
+ * ======================================================================== */
+
+/* Extract string value from JSON (returns malloc'd string, caller must free) */
+static char *json_get_string(const char *json, const char *key) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+    if (*p != '"') return NULL;
+    p++;
+
+    const char *end = p;
+    while (*end && *end != '"') {
+        if (*end == '\\' && *(end+1)) end += 2;
+        else end++;
+    }
+
+    size_t len = end - p;
+    char *result = malloc(len + 1);
+    if (!result) return NULL;
+    memcpy(result, p, len);
+    result[len] = '\0';
+    return result;
+}
+
+/* Extract integer value from JSON */
+static int json_get_int(const char *json, const char *key, int default_val) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_val;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    /* Handle null */
+    if (strncmp(p, "null", 4) == 0) return default_val;
+
+    return atoi(p);
+}
+
+/* Extract int64 value from JSON */
+static int64_t json_get_int64(const char *json, const char *key, int64_t default_val) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_val;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    /* Handle null */
+    if (strncmp(p, "null", 4) == 0) return default_val;
+
+    return atoll(p);
+}
+
+/* ========================================================================
+ * Server Mode
+ * ======================================================================== */
+
+/* Track phase timing for server mode */
+static struct timeval server_phase_start_tv;
+static struct timeval server_step_start_tv;
+static struct timeval server_generation_start_tv;
+
+/* Server mode progress callback - output JSON status updates */
+static void server_step_callback(int step, int total) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    /* Calculate step time (time since last step or phase start) */
+    double step_time = (now.tv_sec - server_step_start_tv.tv_sec) +
+                       (now.tv_usec - server_step_start_tv.tv_usec) / 1000000.0;
+
+    /* Calculate elapsed time since generation started */
+    double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
+                     (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
+
+    printf("{\"event\":\"progress\",\"step\":%d,\"total\":%d,\"step_time\":%.2f,\"elapsed\":%.2f}\n",
+           step, total, step_time, elapsed);
+    fflush(stdout);
+
+    /* Update step start time for next step */
+    server_step_start_tv = now;
+}
+
+static void server_phase_callback(const char *phase, int done) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    if (!done) {
+        /* Phase starting */
+        server_phase_start_tv = now;
+        server_step_start_tv = now;
+
+        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
+                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
+
+        printf("{\"event\":\"phase\",\"phase\":\"%s\",\"elapsed\":%.2f}\n", phase, elapsed);
+        fflush(stdout);
+    } else {
+        /* Phase finished */
+        double phase_time = (now.tv_sec - server_phase_start_tv.tv_sec) +
+                            (now.tv_usec - server_phase_start_tv.tv_usec) / 1000000.0;
+        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
+                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
+
+        printf("{\"event\":\"phase_done\",\"phase\":\"%s\",\"phase_time\":%.2f,\"elapsed\":%.2f}\n",
+               phase, phase_time, elapsed);
+        fflush(stdout);
+    }
+}
+
+/* Run server mode - keeps model loaded and processes JSON requests from stdin */
+static int run_server_mode(flux_ctx *ctx) {
+    char line[65536];
+
+    /* Set up server-mode callbacks */
+    flux_step_callback = server_step_callback;
+    flux_phase_callback = server_phase_callback;
+    flux_substep_callback = NULL;
+
+    fprintf(stderr, "Server mode: ready for requests\n");
+    printf("{\"event\":\"ready\"}\n");
+    fflush(stdout);
+
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        /* Skip empty lines */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        /* Parse JSON request */
+        char *prompt = json_get_string(line, "prompt");
+        char *output_path = json_get_string(line, "output");
+        char *input_path = json_get_string(line, "input_image");
+        int width = json_get_int(line, "width", DEFAULT_WIDTH);
+        int height = json_get_int(line, "height", DEFAULT_HEIGHT);
+        int steps = json_get_int(line, "steps", DEFAULT_STEPS);
+        int64_t seed = json_get_int64(line, "seed", -1);
+
+        /* Validate request */
+        if (!prompt || !output_path) {
+            printf("{\"event\":\"error\",\"message\":\"Missing prompt or output\"}\n");
+            fflush(stdout);
+            free(prompt);
+            free(output_path);
+            free(input_path);
+            continue;
+        }
+
+        /* Validate parameters */
+        if (width < 64 || width > 1792 || width % 16 != 0) {
+            printf("{\"event\":\"error\",\"message\":\"Width must be 64-1792 and divisible by 16\"}\n");
+            fflush(stdout);
+            free(prompt);
+            free(output_path);
+            free(input_path);
+            continue;
+        }
+        if (height < 64 || height > 1792 || height % 16 != 0) {
+            printf("{\"event\":\"error\",\"message\":\"Height must be 64-1792 and divisible by 16\"}\n");
+            fflush(stdout);
+            free(prompt);
+            free(output_path);
+            free(input_path);
+            continue;
+        }
+
+        /* Set seed */
+        int64_t actual_seed = (seed >= 0) ? seed : (int64_t)time(NULL);
+        flux_set_seed(actual_seed);
+
+        /* Initialize generation timing */
+        gettimeofday(&server_generation_start_tv, NULL);
+        server_phase_start_tv = server_generation_start_tv;
+        server_step_start_tv = server_generation_start_tv;
+
+        /* Report seed */
+        printf("{\"event\":\"status\",\"seed\":%lld}\n", (long long)actual_seed);
+        fflush(stdout);
+
+        /* Set up params */
+        flux_params params = {
+            .width = width,
+            .height = height,
+            .num_steps = steps,
+            .seed = actual_seed,
+            .strength = DEFAULT_STRENGTH
+        };
+
+        /* Generate */
+        flux_image *output = NULL;
+        if (input_path && strlen(input_path) > 0) {
+            /* Img2img mode */
+            flux_image *input = flux_image_load(input_path);
+            if (!input) {
+                printf("{\"event\":\"error\",\"message\":\"Failed to load input image\"}\n");
+                fflush(stdout);
+                free(prompt);
+                free(output_path);
+                free(input_path);
+                continue;
+            }
+            output = flux_img2img(ctx, prompt, input, &params);
+            flux_image_free(input);
+        } else {
+            /* Text-to-image mode */
+            output = flux_generate(ctx, prompt, &params);
+        }
+
+        if (!output) {
+            printf("{\"event\":\"error\",\"message\":\"Generation failed: %s\"}\n", flux_get_error());
+            fflush(stdout);
+            free(prompt);
+            free(output_path);
+            free(input_path);
+            continue;
+        }
+
+        /* Save output */
+        if (flux_image_save_with_seed(output, output_path, actual_seed) != 0) {
+            printf("{\"event\":\"error\",\"message\":\"Failed to save image\"}\n");
+            fflush(stdout);
+            flux_image_free(output);
+            free(prompt);
+            free(output_path);
+            free(input_path);
+            continue;
+        }
+
+        flux_image_free(output);
+
+        /* Calculate total generation time */
+        struct timeval complete_tv;
+        gettimeofday(&complete_tv, NULL);
+        double total_time = (complete_tv.tv_sec - server_generation_start_tv.tv_sec) +
+                            (complete_tv.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
+
+        /* Report success */
+        printf("{\"event\":\"complete\",\"output\":\"%s\",\"seed\":%lld,\"total_time\":%.2f}\n",
+               output_path, (long long)actual_seed, total_time);
+        fflush(stdout);
+
+        free(prompt);
+        free(output_path);
+        free(input_path);
+    }
+
+    return 0;
+}
+
+/* ========================================================================
+ * Usage and Help
+ * ======================================================================== */
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
@@ -224,6 +488,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
+    fprintf(stderr, "      --server          Server mode: keep model loaded, read JSON from stdin\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
@@ -265,6 +530,7 @@ int main(int argc, char *argv[]) {
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
         {"debug-py",   no_argument,       0, 'D'},
+        {"server",     no_argument,       0, 'R'},
         {0, 0, 0, 0}
     };
 
@@ -289,6 +555,7 @@ int main(int argc, char *argv[]) {
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
+    int server_mode = 0;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
@@ -316,6 +583,7 @@ int main(int argc, char *argv[]) {
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
             case 'D': debug_py = 1; break;
+            case 'R': server_mode = 1; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -328,12 +596,12 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!prompt && !embeddings_path && !debug_py) {
+    if (!server_mode && !prompt && !embeddings_path && !debug_py) {
         fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
         print_usage(argv[0]);
         return 1;
     }
-    if (!output_path) {
+    if (!server_mode && !output_path) {
         fprintf(stderr, "Error: Output path (-o) is required\n\n");
         print_usage(argv[0]);
         return 1;
@@ -357,29 +625,31 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Set seed */
-    int64_t actual_seed;
-    if (params.seed >= 0) {
-        actual_seed = params.seed;
-    } else {
-        actual_seed = (int64_t)time(NULL);
-    }
-    flux_set_seed(actual_seed);
-    LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
+    /* Set seed (not for server mode - each request has its own seed) */
+    int64_t actual_seed = -1;
+    if (!server_mode) {
+        if (params.seed >= 0) {
+            actual_seed = params.seed;
+        } else {
+            actual_seed = (int64_t)time(NULL);
+        }
+        flux_set_seed(actual_seed);
+        LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
-    /* Verbose header */
-    LOG_VERBOSE("FLUX.2 klein 4B Image Generator\n");
-    LOG_VERBOSE("================================\n");
-    LOG_VERBOSE("Model: %s\n", model_dir);
-    if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
-    LOG_VERBOSE("Output: %s\n", output_path);
-    LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
-    LOG_VERBOSE("Steps: %d\n", params.num_steps);
-    if (input_path) {
-        LOG_VERBOSE("Input: %s\n", input_path);
-        LOG_VERBOSE("Strength: %.2f\n", params.strength);
+        /* Verbose header */
+        LOG_VERBOSE("FLUX.2 klein 4B Image Generator\n");
+        LOG_VERBOSE("================================\n");
+        LOG_VERBOSE("Model: %s\n", model_dir);
+        if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
+        LOG_VERBOSE("Output: %s\n", output_path);
+        LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
+        LOG_VERBOSE("Steps: %d\n", params.num_steps);
+        if (input_path) {
+            LOG_VERBOSE("Input: %s\n", input_path);
+            LOG_VERBOSE("Strength: %.2f\n", params.strength);
+        }
+        LOG_VERBOSE("\n");
     }
-    LOG_VERBOSE("\n");
 
     /* Load model (VAE only at startup, other components loaded on-demand) */
     LOG_NORMAL("Loading VAE...");
@@ -401,6 +671,16 @@ int main(int argc, char *argv[]) {
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_VERBOSE("  Model info: %s\n", flux_model_info(ctx));
+
+    /* Enter server mode if requested */
+    if (server_mode) {
+        int result = run_server_mode(ctx);
+        flux_free(ctx);
+#ifdef USE_METAL
+        flux_metal_cleanup();
+#endif
+        return result;
+    }
 
     /* Set up progress callbacks (for normal and verbose modes) */
     if (output_level >= OUTPUT_NORMAL) {
