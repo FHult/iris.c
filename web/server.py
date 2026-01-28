@@ -269,7 +269,7 @@ class FluxServer:
                 job.queue.put(("done", None))
                 self.current_job = None
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -292,7 +292,11 @@ class FluxServer:
             if seed is not None and seed != "":
                 request_data["seed"] = int(seed)
 
-            if input_image_path:
+            # Multi-reference mode (new) takes precedence
+            if reference_image_paths and len(reference_image_paths) > 0:
+                request_data["reference_images"] = [str(p) for p in reference_image_paths]
+            elif input_image_path:
+                # Backwards compatibility: single image mode
                 request_data["input_image"] = str(input_image_path)
 
             # Send request
@@ -312,11 +316,11 @@ class FluxServer:
             self.ready = False
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None):
     """Run generation using the persistent flux server."""
     global flux_server
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -329,6 +333,14 @@ def run_generation_server_mode(job, prompt, width, height, steps, seed, input_im
                 os.unlink(input_image_path)
             except:
                 pass
+        # Clean up reference images if they were temp files
+        if reference_image_paths:
+            for path in reference_image_paths:
+                if "temp_" in str(path):
+                    try:
+                        os.unlink(path)
+                    except:
+                        pass
 
 
 @app.route("/")
@@ -360,18 +372,40 @@ def generate():
     if steps < 1 or steps > 256:
         return jsonify({"error": "Steps must be 1-256"}), 400
 
-    # Handle input image for img2img
+    # Handle multiple reference images (new multiref mode)
+    reference_image_paths = []
+    reference_images_b64 = data.get("reference_images", [])
+    if reference_images_b64:
+        for i, img_b64 in enumerate(reference_images_b64[:4]):  # Max 4 reference images
+            if img_b64:
+                try:
+                    image_data = base64.b64decode(img_b64.split(",")[-1])
+                    ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
+                    with open(ref_path, "wb") as f:
+                        f.write(image_data)
+                    reference_image_paths.append(ref_path)
+                except Exception as e:
+                    # Clean up any already saved reference images
+                    for p in reference_image_paths:
+                        try:
+                            os.unlink(p)
+                        except:
+                            pass
+                    return jsonify({"error": f"Invalid reference image {i+1}: {e}"}), 400
+
+    # Handle single input image for img2img (backwards compatibility)
     input_image_path = None
-    input_image_b64 = data.get("input_image")
-    if input_image_b64:
-        try:
-            # Decode base64 image and save to temp file
-            image_data = base64.b64decode(input_image_b64.split(",")[-1])
-            input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
-            with open(input_image_path, "wb") as f:
-                f.write(image_data)
-        except Exception as e:
-            return jsonify({"error": f"Invalid input image: {e}"}), 400
+    if not reference_image_paths:  # Only use single input if no reference images
+        input_image_b64 = data.get("input_image")
+        if input_image_b64:
+            try:
+                # Decode base64 image and save to temp file
+                image_data = base64.b64decode(input_image_b64.split(",")[-1])
+                input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
+                with open(input_image_path, "wb") as f:
+                    f.write(image_data)
+            except Exception as e:
+                return jsonify({"error": f"Invalid input image: {e}"}), 400
 
     # Create job
     job_id = uuid.uuid4().hex[:12]
@@ -383,7 +417,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, prompt, width, height, steps, seed, input_image_path),
+        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths),
         daemon=True,
     )
     thread.start()

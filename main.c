@@ -262,6 +262,56 @@ static int64_t json_get_int64(const char *json, const char *key, int64_t default
     return atoll(p);
 }
 
+/* Extract array of strings from JSON (returns array of malloc'd strings, caller must free)
+ * Returns number of strings found, or 0 if key not found or not an array.
+ * The paths array must be pre-allocated with max_paths capacity. */
+static int json_get_string_array(const char *json, const char *key, char **paths, int max_paths) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+    if (*p != '[') return 0;
+    p++; /* skip '[' */
+
+    int count = 0;
+    while (*p && *p != ']' && count < max_paths) {
+        /* Skip whitespace and commas */
+        while (*p && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
+        if (*p == ']' || !*p) break;
+
+        if (*p != '"') {
+            /* Skip non-string values */
+            while (*p && *p != ',' && *p != ']') p++;
+            continue;
+        }
+        p++; /* skip opening quote */
+
+        const char *end = p;
+        while (*end && *end != '"') {
+            if (*end == '\\' && *(end+1)) end += 2;
+            else end++;
+        }
+
+        size_t len = end - p;
+        if (len > 0) {
+            char *str = malloc(len + 1);
+            if (str) {
+                memcpy(str, p, len);
+                str[len] = '\0';
+                paths[count++] = str;
+            }
+        }
+
+        p = end;
+        if (*p == '"') p++; /* skip closing quote */
+    }
+
+    return count;
+}
+
 /* ========================================================================
  * Server Mode
  * ======================================================================== */
@@ -344,6 +394,8 @@ static int run_server_mode(flux_ctx *ctx) {
         char *prompt = json_get_string(line, "prompt");
         char *output_path = json_get_string(line, "output");
         char *input_path = json_get_string(line, "input_image");
+        char *ref_paths[4] = {NULL, NULL, NULL, NULL};
+        int num_refs = json_get_string_array(line, "reference_images", ref_paths, 4);
         int width = json_get_int(line, "width", DEFAULT_WIDTH);
         int height = json_get_int(line, "height", DEFAULT_HEIGHT);
         int steps = json_get_int(line, "steps", DEFAULT_STEPS);
@@ -356,6 +408,7 @@ static int run_server_mode(flux_ctx *ctx) {
             free(prompt);
             free(output_path);
             free(input_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
 
@@ -366,6 +419,7 @@ static int run_server_mode(flux_ctx *ctx) {
             free(prompt);
             free(output_path);
             free(input_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
         if (height < 64 || height > 1792 || height % 16 != 0) {
@@ -374,6 +428,7 @@ static int run_server_mode(flux_ctx *ctx) {
             free(prompt);
             free(output_path);
             free(input_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
 
@@ -401,8 +456,41 @@ static int run_server_mode(flux_ctx *ctx) {
 
         /* Generate */
         flux_image *output = NULL;
-        if (input_path && strlen(input_path) > 0) {
-            /* Img2img mode */
+        if (num_refs > 0) {
+            /* Multi-reference mode */
+            flux_image *refs[4] = {NULL, NULL, NULL, NULL};
+            int loaded_refs = 0;
+            int load_error = 0;
+
+            for (int i = 0; i < num_refs && !load_error; i++) {
+                refs[i] = flux_image_load(ref_paths[i]);
+                if (!refs[i]) {
+                    printf("{\"event\":\"error\",\"message\":\"Failed to load reference image %d\"}\n", i + 1);
+                    fflush(stdout);
+                    load_error = 1;
+                } else {
+                    loaded_refs++;
+                }
+            }
+
+            if (!load_error) {
+                output = flux_multiref(ctx, prompt, (const flux_image **)refs, loaded_refs, &params);
+            }
+
+            /* Free loaded reference images */
+            for (int i = 0; i < loaded_refs; i++) {
+                flux_image_free(refs[i]);
+            }
+
+            if (load_error) {
+                free(prompt);
+                free(output_path);
+                free(input_path);
+                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+                continue;
+            }
+        } else if (input_path && strlen(input_path) > 0) {
+            /* Img2img mode (backwards compatibility) */
             flux_image *input = flux_image_load(input_path);
             if (!input) {
                 printf("{\"event\":\"error\",\"message\":\"Failed to load input image\"}\n");
@@ -410,6 +498,7 @@ static int run_server_mode(flux_ctx *ctx) {
                 free(prompt);
                 free(output_path);
                 free(input_path);
+                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
                 continue;
             }
             output = flux_img2img(ctx, prompt, input, &params);
@@ -425,6 +514,7 @@ static int run_server_mode(flux_ctx *ctx) {
             free(prompt);
             free(output_path);
             free(input_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
 
@@ -436,6 +526,7 @@ static int run_server_mode(flux_ctx *ctx) {
             free(prompt);
             free(output_path);
             free(input_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
 
@@ -455,6 +546,7 @@ static int run_server_mode(flux_ctx *ctx) {
         free(prompt);
         free(output_path);
         free(input_path);
+        for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
     }
 
     return 0;

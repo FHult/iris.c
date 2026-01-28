@@ -105,14 +105,38 @@
                     </div>
 
                     <div class="form-group">
-                        <label for="input-image">Reference Image (for img2img)</label>
-                        <div class="file-input-wrapper">
-                            <input type="file" id="input-image" name="input_image" accept="image/*">
-                            <div class="file-input-preview" id="input-preview">
-                                <span>Drop image here or click to select</span>
+                        <label>Reference Images (up to 4, for multi-reference generation)</label>
+                        <div class="reference-images-grid">
+                            <div class="reference-image-slot" data-slot="0">
+                                <input type="file" class="ref-image-input" data-slot="0" accept="image/*">
+                                <div class="file-input-preview ref-preview" data-slot="0">
+                                    <span>Image 1</span>
+                                </div>
+                                <button type="button" class="btn-clear-ref" data-slot="0" style="display: none;">×</button>
+                            </div>
+                            <div class="reference-image-slot" data-slot="1">
+                                <input type="file" class="ref-image-input" data-slot="1" accept="image/*">
+                                <div class="file-input-preview ref-preview" data-slot="1">
+                                    <span>Image 2</span>
+                                </div>
+                                <button type="button" class="btn-clear-ref" data-slot="1" style="display: none;">×</button>
+                            </div>
+                            <div class="reference-image-slot" data-slot="2">
+                                <input type="file" class="ref-image-input" data-slot="2" accept="image/*">
+                                <div class="file-input-preview ref-preview" data-slot="2">
+                                    <span>Image 3</span>
+                                </div>
+                                <button type="button" class="btn-clear-ref" data-slot="2" style="display: none;">×</button>
+                            </div>
+                            <div class="reference-image-slot" data-slot="3">
+                                <input type="file" class="ref-image-input" data-slot="3" accept="image/*">
+                                <div class="file-input-preview ref-preview" data-slot="3">
+                                    <span>Image 4</span>
+                                </div>
+                                <button type="button" class="btn-clear-ref" data-slot="3" style="display: none;">×</button>
                             </div>
                         </div>
-                        <button type="button" id="clear-image" class="btn-secondary" style="display: none;">Clear Image</button>
+                        <button type="button" id="clear-all-images" class="btn-secondary" style="display: none;">Clear All Images</button>
                     </div>
 
                     <button type="submit" id="generate-btn" class="btn-primary">
@@ -198,8 +222,50 @@
     <div id="lightbox-modal" class="lightbox-modal">
         <button class="lightbox-close" id="lightbox-close">&times;</button>
         <button class="lightbox-nav lightbox-prev" id="lightbox-prev">&lsaquo;</button>
-        <img id="lightbox-image" class="lightbox-image" src="" alt="Full size image">
+        <div class="lightbox-content" id="lightbox-content">
+            <img id="lightbox-image" class="lightbox-image" src="" alt="Full size image">
+            <div id="crop-overlay" class="crop-overlay" style="display: none;">
+                <div id="crop-selection" class="crop-selection">
+                    <div class="crop-handle crop-handle-nw" data-handle="nw"></div>
+                    <div class="crop-handle crop-handle-ne" data-handle="ne"></div>
+                    <div class="crop-handle crop-handle-sw" data-handle="sw"></div>
+                    <div class="crop-handle crop-handle-se" data-handle="se"></div>
+                </div>
+            </div>
+        </div>
         <button class="lightbox-nav lightbox-next" id="lightbox-next">&rsaquo;</button>
+        <div class="lightbox-toolbar" id="lightbox-toolbar">
+            <button type="button" id="lightbox-crop-btn" class="lightbox-tool-btn" title="Crop image">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6.13 1L6 16a2 2 0 0 0 2 2h15"></path>
+                    <path d="M1 6.13L16 6a2 2 0 0 1 2 2v15"></path>
+                </svg>
+                Crop
+            </button>
+            <button type="button" id="lightbox-use-btn" class="lightbox-tool-btn" title="Use as reference image">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                    <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+                Use as Input
+            </button>
+        </div>
+        <div class="crop-toolbar" id="crop-toolbar" style="display: none;">
+            <button type="button" id="crop-apply-btn" class="lightbox-tool-btn crop-apply">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="20 6 9 17 4 12"></polyline>
+                </svg>
+                Apply Crop
+            </button>
+            <button type="button" id="crop-cancel-btn" class="lightbox-tool-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+                Cancel
+            </button>
+        </div>
     </div>
 
     <script src="/static/app.js"></script>

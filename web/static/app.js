@@ -12,9 +12,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const seedDisplay = document.getElementById('seed-display');
     const stepsInput = document.getElementById('steps');
     const stepsValue = document.getElementById('steps-value');
-    const inputImage = document.getElementById('input-image');
-    const inputPreview = document.getElementById('input-preview');
-    const clearImageBtn = document.getElementById('clear-image');
     const remixBtn = document.getElementById('remix-btn');
     const historySection = document.getElementById('history-section');
     const historyGrid = document.getElementById('history-grid');
@@ -24,18 +21,30 @@ document.addEventListener('DOMContentLoaded', () => {
     const queueSection = document.getElementById('queue-section');
     const queueList = document.getElementById('queue-list');
     const queueCount = document.getElementById('queue-count');
+    const clearAllImagesBtn = document.getElementById('clear-all-images');
 
     const lightboxModal = document.getElementById('lightbox-modal');
     const lightboxImage = document.getElementById('lightbox-image');
     const lightboxClose = document.getElementById('lightbox-close');
+    const lightboxContent = document.getElementById('lightbox-content');
     const cancelBtn = document.getElementById('cancel-btn');
     const useAsInputBtn = document.getElementById('use-as-input-btn');
     const slideshowBtn = document.getElementById('slideshow-btn');
     const lightboxPrev = document.getElementById('lightbox-prev');
     const lightboxNext = document.getElementById('lightbox-next');
 
+    // Cropping elements
+    const cropOverlay = document.getElementById('crop-overlay');
+    const cropSelection = document.getElementById('crop-selection');
+    const lightboxToolbar = document.getElementById('lightbox-toolbar');
+    const cropToolbar = document.getElementById('crop-toolbar');
+    const lightboxCropBtn = document.getElementById('lightbox-crop-btn');
+    const lightboxUseBtn = document.getElementById('lightbox-use-btn');
+    const cropApplyBtn = document.getElementById('crop-apply-btn');
+    const cropCancelBtn = document.getElementById('crop-cancel-btn');
+
     let currentEventSource = null;
-    let inputImageData = null;
+    let referenceImageData = [null, null, null, null]; // Up to 4 reference images
     let currentGeneration = null; // Store current generation params for remix
     let generationQueue = [];
     let isGenerating = false;
@@ -46,6 +55,16 @@ document.addEventListener('DOMContentLoaded', () => {
     let cachedHistory = [];
     let historyPageSize = 20;
     let historyVisible = historyPageSize;
+
+    // Cropping state
+    let isCropping = false;
+    let cropStartX = 0, cropStartY = 0;
+    let cropRect = { x: 0, y: 0, width: 0, height: 0 };
+    let isDraggingCrop = false;
+    let isResizingCrop = false;
+    let resizeHandle = null;
+    let dragStartX = 0, dragStartY = 0;
+    let initialCropRect = null;
 
     // Load history on page load
     loadHistory();
@@ -72,6 +91,9 @@ document.addEventListener('DOMContentLoaded', () => {
         lightboxModal.classList.remove('active');
         document.body.style.overflow = '';
         stopSlideshow();
+        if (isCropping) {
+            exitCropMode();
+        }
     }
 
     function lightboxNavigate(direction) {
@@ -106,11 +128,19 @@ document.addEventListener('DOMContentLoaded', () => {
     document.addEventListener('keydown', (e) => {
         if (!lightboxModal.classList.contains('active')) return;
         if (e.key === 'Escape') {
-            closeLightbox();
-        } else if (e.key === 'ArrowLeft') {
+            if (isCropping) {
+                exitCropMode();
+            } else {
+                closeLightbox();
+            }
+        } else if (e.key === 'ArrowLeft' && !isCropping) {
             lightboxNavigate(-1);
-        } else if (e.key === 'ArrowRight') {
+        } else if (e.key === 'ArrowRight' && !isCropping) {
             lightboxNavigate(1);
+        } else if (e.key === 'c' && !isCropping) {
+            enterCropMode();
+        } else if (e.key === 'Enter' && isCropping) {
+            applyCrop();
         }
     });
 
@@ -144,6 +174,192 @@ document.addEventListener('DOMContentLoaded', () => {
             startSlideshow();
         }
     });
+
+    // ========== Cropping Functionality ==========
+
+    function enterCropMode() {
+        isCropping = true;
+        lightboxModal.classList.add('cropping');
+        cropOverlay.style.display = 'block';
+        lightboxToolbar.style.display = 'none';
+        cropToolbar.style.display = 'flex';
+        stopSlideshow();
+
+        // Initialize crop selection to center of image
+        const imgRect = lightboxImage.getBoundingClientRect();
+        const contentRect = lightboxContent.getBoundingClientRect();
+
+        // Image position relative to content container
+        const imgOffsetX = imgRect.left - contentRect.left;
+        const imgOffsetY = imgRect.top - contentRect.top;
+
+        // Default crop to 50% of image, centered
+        const cropW = imgRect.width * 0.5;
+        const cropH = imgRect.height * 0.5;
+        const cropX = imgOffsetX + (imgRect.width - cropW) / 2;
+        const cropY = imgOffsetY + (imgRect.height - cropH) / 2;
+
+        cropRect = { x: cropX, y: cropY, width: cropW, height: cropH };
+        updateCropSelection();
+    }
+
+    function exitCropMode() {
+        isCropping = false;
+        lightboxModal.classList.remove('cropping');
+        cropOverlay.style.display = 'none';
+        lightboxToolbar.style.display = 'flex';
+        cropToolbar.style.display = 'none';
+    }
+
+    function updateCropSelection() {
+        cropSelection.style.left = `${cropRect.x}px`;
+        cropSelection.style.top = `${cropRect.y}px`;
+        cropSelection.style.width = `${cropRect.width}px`;
+        cropSelection.style.height = `${cropRect.height}px`;
+    }
+
+    function applyCrop() {
+        // Get the image and crop coordinates
+        const imgRect = lightboxImage.getBoundingClientRect();
+        const contentRect = lightboxContent.getBoundingClientRect();
+
+        // Calculate image offset within content
+        const imgOffsetX = imgRect.left - contentRect.left;
+        const imgOffsetY = imgRect.top - contentRect.top;
+
+        // Calculate crop coordinates relative to image
+        const scaleX = lightboxImage.naturalWidth / imgRect.width;
+        const scaleY = lightboxImage.naturalHeight / imgRect.height;
+
+        const cropX = Math.max(0, (cropRect.x - imgOffsetX) * scaleX);
+        const cropY = Math.max(0, (cropRect.y - imgOffsetY) * scaleY);
+        const cropW = Math.min(lightboxImage.naturalWidth - cropX, cropRect.width * scaleX);
+        const cropH = Math.min(lightboxImage.naturalHeight - cropY, cropRect.height * scaleY);
+
+        // Create canvas and crop the image
+        const canvas = document.createElement('canvas');
+        canvas.width = cropW;
+        canvas.height = cropH;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(lightboxImage, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+        // Get cropped image data URL
+        const croppedDataUrl = canvas.toDataURL('image/png');
+
+        // Add to first empty reference slot
+        const slot = findFirstEmptySlot();
+        setReferenceImage(slot, croppedDataUrl);
+
+        exitCropMode();
+        closeLightbox();
+    }
+
+    // Crop button handler
+    lightboxCropBtn.addEventListener('click', enterCropMode);
+    cropCancelBtn.addEventListener('click', exitCropMode);
+    cropApplyBtn.addEventListener('click', applyCrop);
+
+    // Lightbox use as input button
+    lightboxUseBtn.addEventListener('click', () => {
+        const slot = findFirstEmptySlot();
+        loadImageIntoSlot(lightboxImage.src, slot);
+        closeLightbox();
+    });
+
+    // Crop selection dragging
+    cropSelection.addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('crop-handle')) {
+            isResizingCrop = true;
+            resizeHandle = e.target.dataset.handle;
+        } else {
+            isDraggingCrop = true;
+        }
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        initialCropRect = { ...cropRect };
+        e.stopPropagation();
+    });
+
+    // Crop overlay click to create new selection
+    cropOverlay.addEventListener('mousedown', (e) => {
+        if (e.target === cropOverlay) {
+            const contentRect = lightboxContent.getBoundingClientRect();
+            cropStartX = e.clientX - contentRect.left;
+            cropStartY = e.clientY - contentRect.top;
+            cropRect = { x: cropStartX, y: cropStartY, width: 0, height: 0 };
+            updateCropSelection();
+            isDraggingCrop = false;
+            isResizingCrop = true;
+            resizeHandle = 'se';
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            initialCropRect = { ...cropRect };
+        }
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isCropping) return;
+
+        const imgRect = lightboxImage.getBoundingClientRect();
+        const contentRect = lightboxContent.getBoundingClientRect();
+        const imgOffsetX = imgRect.left - contentRect.left;
+        const imgOffsetY = imgRect.top - contentRect.top;
+
+        const dx = e.clientX - dragStartX;
+        const dy = e.clientY - dragStartY;
+
+        if (isDraggingCrop && initialCropRect) {
+            // Move the selection
+            let newX = initialCropRect.x + dx;
+            let newY = initialCropRect.y + dy;
+
+            // Constrain to image bounds
+            newX = Math.max(imgOffsetX, Math.min(newX, imgOffsetX + imgRect.width - cropRect.width));
+            newY = Math.max(imgOffsetY, Math.min(newY, imgOffsetY + imgRect.height - cropRect.height));
+
+            cropRect.x = newX;
+            cropRect.y = newY;
+            updateCropSelection();
+        } else if (isResizingCrop && initialCropRect) {
+            // Resize the selection
+            let { x, y, width, height } = initialCropRect;
+
+            if (resizeHandle.includes('e')) {
+                width = Math.max(50, initialCropRect.width + dx);
+            }
+            if (resizeHandle.includes('w')) {
+                const newW = Math.max(50, initialCropRect.width - dx);
+                x = initialCropRect.x + initialCropRect.width - newW;
+                width = newW;
+            }
+            if (resizeHandle.includes('s')) {
+                height = Math.max(50, initialCropRect.height + dy);
+            }
+            if (resizeHandle.includes('n')) {
+                const newH = Math.max(50, initialCropRect.height - dy);
+                y = initialCropRect.y + initialCropRect.height - newH;
+                height = newH;
+            }
+
+            // Constrain to image bounds
+            x = Math.max(imgOffsetX, x);
+            y = Math.max(imgOffsetY, y);
+            width = Math.min(width, imgOffsetX + imgRect.width - x);
+            height = Math.min(height, imgOffsetY + imgRect.height - y);
+
+            cropRect = { x, y, width, height };
+            updateCropSelection();
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        isDraggingCrop = false;
+        isResizingCrop = false;
+        resizeHandle = null;
+        initialCropRect = null;
+    });
+
+    // ========== End Cropping Functionality ==========
 
     // Make output area images clickable
     outputArea.addEventListener('click', (e) => {
@@ -179,13 +395,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Queue functionality
     function getFormParams() {
+        // Collect non-null reference images
+        const refs = referenceImageData.filter(img => img !== null);
         return {
             prompt: document.getElementById('prompt').value.trim(),
             width: parseInt(widthSelect.value),
             height: parseInt(heightSelect.value),
             steps: parseInt(stepsInput.value),
             seed: document.getElementById('seed').value.trim() || null,
-            inputImage: inputImageData
+            referenceImages: refs.length > 0 ? refs : null
         };
     }
 
@@ -261,62 +479,155 @@ document.addEventListener('DOMContentLoaded', () => {
         stepsValue.textContent = stepsInput.value;
     });
 
-    // Handle image upload
-    inputImage.addEventListener('change', (e) => {
-        const file = e.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                inputImageData = event.target.result;
-                inputPreview.innerHTML = `<img src="${inputImageData}" alt="Input image">`;
-                clearImageBtn.style.display = 'block';
-            };
-            reader.readAsDataURL(file);
+    // Reference image slots handling
+    const refSlots = document.querySelectorAll('.reference-image-slot');
+    const refInputs = document.querySelectorAll('.ref-image-input');
+    const refPreviews = document.querySelectorAll('.ref-preview');
+    const refClearBtns = document.querySelectorAll('.btn-clear-ref');
+
+    // Update visibility of clear all button
+    function updateClearAllButton() {
+        const hasAnyImage = referenceImageData.some(img => img !== null);
+        clearAllImagesBtn.style.display = hasAnyImage ? 'block' : 'none';
+    }
+
+    // Set reference image for a specific slot
+    function setReferenceImage(slot, dataUrl, autoSetDimensions = true) {
+        referenceImageData[slot] = dataUrl;
+        const preview = refPreviews[slot];
+        const clearBtn = refClearBtns[slot];
+        const slotEl = refSlots[slot];
+
+        preview.innerHTML = `<img src="${dataUrl}" alt="Reference image ${slot + 1}">`;
+        clearBtn.style.display = 'block';
+        slotEl.classList.add('has-image');
+        updateClearAllButton();
+
+        // Auto-set dimensions based on first image (slot 0)
+        if (autoSetDimensions && slot === 0) {
+            autoSetDimensionsFromImage(dataUrl);
         }
-    });
+    }
 
-    // Drag and drop support for input area
-    const fileInputWrapper = document.querySelector('.file-input-wrapper');
-    fileInputWrapper.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        inputPreview.style.borderColor = 'var(--accent)';
-        inputPreview.style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
-    });
-    fileInputWrapper.addEventListener('dragleave', () => {
-        inputPreview.style.borderColor = '';
-        inputPreview.style.backgroundColor = '';
-    });
-    fileInputWrapper.addEventListener('drop', (e) => {
-        e.preventDefault();
-        inputPreview.style.borderColor = '';
-        inputPreview.style.backgroundColor = '';
+    // Clear reference image for a specific slot
+    function clearReferenceImage(slot) {
+        referenceImageData[slot] = null;
+        const preview = refPreviews[slot];
+        const clearBtn = refClearBtns[slot];
+        const slotEl = refSlots[slot];
+        const input = refInputs[slot];
 
-        // Check for image URL from drag
-        const imageUrl = e.dataTransfer.getData('text/plain');
-        if (imageUrl && imageUrl.startsWith('/image/')) {
-            loadImageAsInput(imageUrl);
-            return;
+        preview.innerHTML = `<span>Image ${slot + 1}</span>`;
+        clearBtn.style.display = 'none';
+        slotEl.classList.remove('has-image');
+        input.value = '';
+        updateClearAllButton();
+    }
+
+    // Find first empty slot
+    function findFirstEmptySlot() {
+        for (let i = 0; i < 4; i++) {
+            if (referenceImageData[i] === null) return i;
         }
+        return 0; // Default to first slot if all full
+    }
 
-        // Fall back to file drop
-        const file = e.dataTransfer.files[0];
-        if (file && file.type.startsWith('image/')) {
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                inputImageData = event.target.result;
-                inputPreview.innerHTML = `<img src="${inputImageData}" alt="Input image">`;
-                clearImageBtn.style.display = 'block';
-            };
-            reader.readAsDataURL(file);
-        }
+    // Auto-set dimensions from image and reset steps to default
+    function autoSetDimensionsFromImage(dataUrl) {
+        const img = new Image();
+        img.onload = function() {
+            const w = img.width;
+            const h = img.height;
+
+            // Find closest available dimension options
+            const widthOptions = Array.from(widthSelect.options).map(o => parseInt(o.value));
+            const heightOptions = Array.from(heightSelect.options).map(o => parseInt(o.value));
+
+            // Find closest width (divisible by 16)
+            let closestWidth = widthOptions.reduce((prev, curr) =>
+                Math.abs(curr - w) < Math.abs(prev - w) ? curr : prev
+            );
+
+            // Find closest height (divisible by 16)
+            let closestHeight = heightOptions.reduce((prev, curr) =>
+                Math.abs(curr - h) < Math.abs(prev - h) ? curr : prev
+            );
+
+            setDimensions(closestWidth, closestHeight);
+
+            // Reset steps to default (4)
+            stepsInput.value = 4;
+            stepsValue.textContent = '4';
+        };
+        img.src = dataUrl;
+    }
+
+    // Handle image upload for each slot
+    refInputs.forEach((input, slot) => {
+        input.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    setReferenceImage(slot, event.target.result);
+                };
+                reader.readAsDataURL(file);
+            }
+        });
     });
 
-    // Clear input image
-    clearImageBtn.addEventListener('click', () => {
-        inputImage.value = '';
-        inputImageData = null;
-        inputPreview.innerHTML = '<span>Drop image here or click to select</span>';
-        clearImageBtn.style.display = 'none';
+    // Drag and drop support for each slot
+    refSlots.forEach((slotEl, slot) => {
+        const preview = refPreviews[slot];
+
+        slotEl.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            preview.style.borderColor = 'var(--accent)';
+            preview.style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
+        });
+
+        slotEl.addEventListener('dragleave', () => {
+            preview.style.borderColor = '';
+            preview.style.backgroundColor = '';
+        });
+
+        slotEl.addEventListener('drop', (e) => {
+            e.preventDefault();
+            preview.style.borderColor = '';
+            preview.style.backgroundColor = '';
+
+            // Check for image URL from drag
+            const imageUrl = e.dataTransfer.getData('text/plain');
+            if (imageUrl && imageUrl.startsWith('/image/')) {
+                loadImageIntoSlot(imageUrl, slot);
+                return;
+            }
+
+            // Fall back to file drop
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    setReferenceImage(slot, event.target.result);
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+    });
+
+    // Clear button for each slot
+    refClearBtns.forEach((btn, slot) => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            clearReferenceImage(slot);
+        });
+    });
+
+    // Clear all images button
+    clearAllImagesBtn.addEventListener('click', () => {
+        for (let i = 0; i < 4; i++) {
+            clearReferenceImage(i);
+        }
     });
 
     // Remix button - regenerate with same settings but new seed
@@ -338,24 +649,32 @@ document.addEventListener('DOMContentLoaded', () => {
     useAsInputBtn.addEventListener('click', () => {
         const img = outputArea.querySelector('img');
         if (!img) return;
-        loadImageAsInput(img.src);
+        const slot = findFirstEmptySlot();
+        loadImageIntoSlot(img.src, slot);
+        // Reset steps to default when using as input
+        stepsInput.value = 4;
+        stepsValue.textContent = '4';
     });
 
-    // Fetch an image URL and set it as img2img input
-    async function loadImageAsInput(url) {
+    // Fetch an image URL and set it into a specific slot
+    async function loadImageIntoSlot(url, slot) {
         try {
             const response = await fetch(url);
             const blob = await response.blob();
             const reader = new FileReader();
             reader.onload = () => {
-                inputImageData = reader.result;
-                inputPreview.innerHTML = `<img src="${inputImageData}" alt="Input image">`;
-                clearImageBtn.style.display = 'block';
+                setReferenceImage(slot, reader.result);
             };
             reader.readAsDataURL(blob);
         } catch (err) {
-            console.error('Failed to load image as input:', err);
+            console.error('Failed to load image into slot:', err);
         }
+    }
+
+    // Backwards compatibility: load image as input (into first empty slot)
+    async function loadImageAsInput(url) {
+        const slot = findFirstEmptySlot();
+        await loadImageIntoSlot(url, slot);
     }
 
     // Helper to set dimensions and update preset selector
@@ -382,7 +701,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, inputImage } = params;
+            const { prompt, width, height, steps, seed, referenceImages } = params;
 
             // Store current generation params for remix
             currentGeneration = { prompt, width, height, steps };
@@ -402,7 +721,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     height,
                     steps,
                     seed: seed ? parseInt(seed) : null,
-                    input_image: inputImage,
+                    reference_images: referenceImages,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
