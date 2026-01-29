@@ -317,7 +317,6 @@ class FluxServer:
 
             # Send request
             request_line = json.dumps(request_data) + "\n"
-            print(f"Sending to flux: {request_line.strip()}")
             try:
                 self.process.stdin.write(request_line.encode('utf-8'))
                 self.process.stdin.flush()
@@ -400,13 +399,11 @@ def generate():
                     png_buffer = io.BytesIO()
                     jpeg_img.save(png_buffer, format='PNG')
                     image_data = png_buffer.getvalue()
-                    print(f"Converted JPEG to PNG ({len(image_data)} bytes)")
                 except ImportError:
-                    print("Warning: PIL not available, JPEG may not load correctly")
+                    pass  # JPEG may not load correctly without PIL
             input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
             with open(input_image_path, "wb") as f:
                 f.write(image_data)
-            print(f"Saved single input image ({len(image_data)} bytes) to {input_image_path}")
         except Exception as e:
             return jsonify({"error": f"Invalid input image: {e}"}), 400
     elif len(reference_images_b64) > 1:
@@ -424,14 +421,12 @@ def generate():
                         png_buffer = io.BytesIO()
                         jpeg_img.save(png_buffer, format='PNG')
                         image_data = png_buffer.getvalue()
-                        print(f"Converted reference {i+1} JPEG to PNG ({len(image_data)} bytes)")
                     except ImportError:
-                        print("Warning: PIL not available, JPEG may not load correctly")
+                        pass  # JPEG may not load correctly without PIL
                 ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
                 with open(ref_path, "wb") as f:
                     f.write(image_data)
                 reference_image_paths.append(ref_path)
-                print(f"Saved reference image {i+1} ({len(image_data)} bytes) to {ref_path}")
             except Exception as e:
                 # Clean up any already saved reference images
                 for p in reference_image_paths:
