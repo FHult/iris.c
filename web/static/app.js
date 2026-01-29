@@ -98,6 +98,28 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function lightboxNavigate(direction) {
         if (lightboxItems.length === 0) return;
+
+        // Sync lightbox items with current history to avoid showing deleted images
+        if (cachedHistory.length > 0 && lightboxItems !== cachedHistory) {
+            const currentItem = lightboxItems[lightboxIndex];
+            lightboxItems = cachedHistory;
+            // Try to find current item in updated history
+            if (currentItem) {
+                const newIndex = lightboxItems.findIndex(h => h.id === currentItem.id);
+                if (newIndex !== -1) {
+                    lightboxIndex = newIndex;
+                } else {
+                    // Current item was deleted, start from beginning
+                    lightboxIndex = 0;
+                }
+            }
+        }
+
+        if (lightboxItems.length === 0) {
+            closeLightbox();
+            return;
+        }
+
         lightboxIndex = (lightboxIndex + direction + lightboxItems.length) % lightboxItems.length;
         const item = lightboxItems[lightboxIndex];
         lightboxImage.src = `${item.image_url}?t=${item.created_at}`;
@@ -218,7 +240,7 @@ document.addEventListener('DOMContentLoaded', () => {
         cropSelection.style.height = `${cropRect.height}px`;
     }
 
-    function applyCrop() {
+    async function applyCrop() {
         // Get the image and crop coordinates
         const imgRect = lightboxImage.getBoundingClientRect();
         const contentRect = lightboxContent.getBoundingClientRect();
@@ -245,6 +267,34 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Get cropped image data URL
         const croppedDataUrl = canvas.toDataURL('image/png');
+
+        // Get original image metadata from lightbox item (if available)
+        let originalItem = null;
+        if (lightboxItems.length > 0 && lightboxIndex >= 0 && lightboxIndex < lightboxItems.length) {
+            originalItem = lightboxItems[lightboxIndex];
+        }
+
+        // Save cropped image to history
+        try {
+            const response = await fetch('/save-crop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image: croppedDataUrl,
+                    original_id: originalItem?.id || null,
+                    prompt: originalItem ? `Cropped: ${originalItem.prompt}` : 'Cropped image',
+                    seed: originalItem?.seed || null,
+                    width: Math.round(cropW),
+                    height: Math.round(cropH),
+                }),
+            });
+            if (response.ok) {
+                // Refresh history to show the new cropped image
+                await loadHistory();
+            }
+        } catch (err) {
+            console.error('Failed to save crop to history:', err);
+        }
 
         // Add to first empty reference slot
         const slot = findFirstEmptySlot();
@@ -408,10 +458,18 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function addToQueue(params) {
-        generationQueue.push({
+        // Deep copy the params to preserve reference images even if UI is cleared
+        const queueItem = {
             id: Date.now(),
-            ...params
-        });
+            prompt: params.prompt,
+            width: params.width,
+            height: params.height,
+            steps: params.steps,
+            seed: params.seed,
+            // Deep copy reference images array (data URLs are strings, already immutable)
+            referenceImages: params.referenceImages ? [...params.referenceImages] : null
+        };
+        generationQueue.push(queueItem);
         renderQueue();
         // Clear prompt for next entry
         document.getElementById('prompt').value = '';
@@ -509,18 +567,32 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // Clear reference image for a specific slot
+    // Clear reference image for a specific slot and compact remaining images
     function clearReferenceImage(slot) {
-        referenceImageData[slot] = null;
-        const preview = refPreviews[slot];
-        const clearBtn = refClearBtns[slot];
-        const slotEl = refSlots[slot];
-        const input = refInputs[slot];
+        // Shift all images after this slot up to fill the gap
+        for (let i = slot; i < 3; i++) {
+            referenceImageData[i] = referenceImageData[i + 1];
+        }
+        referenceImageData[3] = null; // Last slot is now empty
 
-        preview.innerHTML = `<span>Image ${slot + 1}</span>`;
-        clearBtn.style.display = 'none';
-        slotEl.classList.remove('has-image');
-        input.value = '';
+        // Re-render all slots
+        for (let i = 0; i < 4; i++) {
+            const preview = refPreviews[i];
+            const clearBtn = refClearBtns[i];
+            const slotEl = refSlots[i];
+            const input = refInputs[i];
+
+            if (referenceImageData[i]) {
+                preview.innerHTML = `<img src="${referenceImageData[i]}" alt="Reference image ${i + 1}">`;
+                clearBtn.style.display = 'block';
+                slotEl.classList.add('has-image');
+            } else {
+                preview.innerHTML = `<span>Image ${i + 1}</span>`;
+                clearBtn.style.display = 'none';
+                slotEl.classList.remove('has-image');
+            }
+            input.value = '';
+        }
         updateClearAllButton();
     }
 
@@ -625,9 +697,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Clear all images button
     clearAllImagesBtn.addEventListener('click', () => {
+        // Clear all slots directly without compacting
+        referenceImageData = [null, null, null, null];
         for (let i = 0; i < 4; i++) {
-            clearReferenceImage(i);
+            const preview = refPreviews[i];
+            const clearBtn = refClearBtns[i];
+            const slotEl = refSlots[i];
+            const input = refInputs[i];
+
+            preview.innerHTML = `<span>Image ${i + 1}</span>`;
+            clearBtn.style.display = 'none';
+            slotEl.classList.remove('has-image');
+            input.value = '';
         }
+        updateClearAllButton();
     });
 
     // Remix button - regenerate with same settings but new seed
@@ -900,6 +983,27 @@ document.addEventListener('DOMContentLoaded', () => {
             const history = await response.json();
 
             cachedHistory = history;
+
+            // Sync lightbox items with history if lightbox is open
+            if (lightboxModal.classList.contains('active') && lightboxItems.length > 0) {
+                // Check if current lightbox image still exists
+                const currentItem = lightboxItems[lightboxIndex];
+                if (currentItem) {
+                    const stillExists = history.some(h => h.id === currentItem.id);
+                    if (!stillExists) {
+                        // Current image was deleted, close lightbox
+                        closeLightbox();
+                    } else {
+                        // Update lightbox items to current history
+                        lightboxItems = history;
+                        // Find new index of current item
+                        const newIndex = history.findIndex(h => h.id === currentItem.id);
+                        if (newIndex !== -1) {
+                            lightboxIndex = newIndex;
+                        }
+                    }
+                }
+            }
 
             if (history.length === 0) {
                 historySection.style.display = 'none';

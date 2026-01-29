@@ -100,6 +100,8 @@ class Job:
         self.height = height
         self.steps = steps
         self.created_at = time.time()
+        # Temp files to clean up after job completes
+        self.temp_files = []
 
     def to_dict(self):
         return {
@@ -123,6 +125,16 @@ class Job:
             "created_at": self.created_at,
             "image_url": f"/image/{self.id}",
         }
+
+    def cleanup_temp_files(self):
+        """Clean up any temp files associated with this job."""
+        for path in self.temp_files:
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+        self.temp_files = []
 
 
 class FluxServer:
@@ -254,6 +266,8 @@ class FluxServer:
                     "total_time": total_time
                 }))
                 job.queue.put(("done", None))
+                # Clean up temp files now that generation is complete
+                job.cleanup_temp_files()
                 # Add to history
                 with history_lock:
                     history.insert(0, job)
@@ -267,6 +281,8 @@ class FluxServer:
                 job.error = event.get("message", "Unknown error")
                 job.queue.put(("error", {"message": job.error}))
                 job.queue.put(("done", None))
+                # Clean up temp files on error
+                job.cleanup_temp_files()
                 self.current_job = None
 
     def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None):
@@ -301,6 +317,7 @@ class FluxServer:
 
             # Send request
             request_line = json.dumps(request_data) + "\n"
+            print(f"Sending to flux: {request_line.strip()}")
             try:
                 self.process.stdin.write(request_line.encode('utf-8'))
                 self.process.stdin.flush()
@@ -321,26 +338,15 @@ def run_generation_server_mode(job, prompt, width, height, steps, seed, input_im
     global flux_server
     try:
         flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths)
+        # Request sent successfully - temp files will be cleaned up in _read_output
+        # when the job completes or errors
     except Exception as e:
         job.status = "error"
         job.error = str(e)
         job.queue.put(("error", {"message": str(e)}))
         job.queue.put(("done", None))
-    finally:
-        # Clean up input image if it was a temp file
-        if input_image_path and "temp_" in str(input_image_path):
-            try:
-                os.unlink(input_image_path)
-            except:
-                pass
-        # Clean up reference images if they were temp files
-        if reference_image_paths:
-            for path in reference_image_paths:
-                if "temp_" in str(path):
-                    try:
-                        os.unlink(path)
-                    except:
-                        pass
+        # Clean up temp files immediately on send failure
+        job.cleanup_temp_files()
 
 
 @app.route("/")
@@ -372,34 +378,74 @@ def generate():
     if steps < 1 or steps > 256:
         return jsonify({"error": "Steps must be 1-256"}), 400
 
-    # Handle multiple reference images (new multiref mode)
+    # Handle reference images
     reference_image_paths = []
-    reference_images_b64 = data.get("reference_images", [])
-    if reference_images_b64:
-        for i, img_b64 in enumerate(reference_images_b64[:4]):  # Max 4 reference images
-            if img_b64:
-                try:
-                    image_data = base64.b64decode(img_b64.split(",")[-1])
-                    ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
-                    with open(ref_path, "wb") as f:
-                        f.write(image_data)
-                    reference_image_paths.append(ref_path)
-                except Exception as e:
-                    # Clean up any already saved reference images
-                    for p in reference_image_paths:
-                        try:
-                            os.unlink(p)
-                        except:
-                            pass
-                    return jsonify({"error": f"Invalid reference image {i+1}: {e}"}), 400
-
-    # Handle single input image for img2img (backwards compatibility)
     input_image_path = None
-    if not reference_image_paths:  # Only use single input if no reference images
+    reference_images_b64 = data.get("reference_images", [])
+
+    # Filter out None/empty values
+    reference_images_b64 = [img for img in reference_images_b64 if img] if reference_images_b64 else []
+
+    if len(reference_images_b64) == 1:
+        # Single image: use img2img mode for better results
+        try:
+            image_data = base64.b64decode(reference_images_b64[0].split(",")[-1])
+            # Check if JPEG - needs conversion since C code only supports PNG
+            is_jpeg = image_data[:2] == b'\xff\xd8'
+            if is_jpeg:
+                try:
+                    from PIL import Image
+                    import io
+                    jpeg_img = Image.open(io.BytesIO(image_data))
+                    png_buffer = io.BytesIO()
+                    jpeg_img.save(png_buffer, format='PNG')
+                    image_data = png_buffer.getvalue()
+                    print(f"Converted JPEG to PNG ({len(image_data)} bytes)")
+                except ImportError:
+                    print("Warning: PIL not available, JPEG may not load correctly")
+            input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
+            with open(input_image_path, "wb") as f:
+                f.write(image_data)
+            print(f"Saved single input image ({len(image_data)} bytes) to {input_image_path}")
+        except Exception as e:
+            return jsonify({"error": f"Invalid input image: {e}"}), 400
+    elif len(reference_images_b64) > 1:
+        # Multiple images: use multiref mode
+        for i, img_b64 in enumerate(reference_images_b64[:4]):
+            try:
+                image_data = base64.b64decode(img_b64.split(",")[-1])
+                # Check if JPEG - needs conversion since C code only supports PNG
+                is_jpeg = image_data[:2] == b'\xff\xd8'
+                if is_jpeg:
+                    try:
+                        from PIL import Image
+                        import io
+                        jpeg_img = Image.open(io.BytesIO(image_data))
+                        png_buffer = io.BytesIO()
+                        jpeg_img.save(png_buffer, format='PNG')
+                        image_data = png_buffer.getvalue()
+                        print(f"Converted reference {i+1} JPEG to PNG ({len(image_data)} bytes)")
+                    except ImportError:
+                        print("Warning: PIL not available, JPEG may not load correctly")
+                ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
+                with open(ref_path, "wb") as f:
+                    f.write(image_data)
+                reference_image_paths.append(ref_path)
+                print(f"Saved reference image {i+1} ({len(image_data)} bytes) to {ref_path}")
+            except Exception as e:
+                # Clean up any already saved reference images
+                for p in reference_image_paths:
+                    try:
+                        os.unlink(p)
+                    except:
+                        pass
+                return jsonify({"error": f"Invalid reference image {i+1}: {e}"}), 400
+
+    # Also check for legacy input_image parameter (backwards compatibility)
+    if not input_image_path and not reference_image_paths:
         input_image_b64 = data.get("input_image")
         if input_image_b64:
             try:
-                # Decode base64 image and save to temp file
                 image_data = base64.b64decode(input_image_b64.split(",")[-1])
                 input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
                 with open(input_image_path, "wb") as f:
@@ -410,6 +456,12 @@ def generate():
     # Create job
     job_id = uuid.uuid4().hex[:12]
     job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
+
+    # Store temp file paths in job for cleanup after generation completes
+    if input_image_path:
+        job.temp_files.append(str(input_image_path))
+    if reference_image_paths:
+        job.temp_files.extend([str(p) for p in reference_image_paths])
 
     with jobs_lock:
         jobs[job_id] = job
@@ -520,6 +572,50 @@ def delete_history(job_id):
                 save_history()
                 return jsonify({"status": "deleted"})
     return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/save-crop", methods=["POST"])
+def save_crop():
+    """Save a cropped image to history."""
+    data = request.json or {}
+
+    image_b64 = data.get("image")
+    if not image_b64:
+        return jsonify({"error": "Image data required"}), 400
+
+    # Get metadata from original image
+    original_id = data.get("original_id")
+    prompt = data.get("prompt", "Cropped image")
+    seed = data.get("seed")
+    width = data.get("width")
+    height = data.get("height")
+
+    # Create new job entry for the cropped image
+    job_id = uuid.uuid4().hex[:12]
+    job = Job(job_id, prompt=prompt, width=width or 512, height=height or 512, steps=0)
+    job.seed = seed
+    job.status = "complete"
+    job.output_path = OUTPUT_DIR / f"{job_id}.png"
+
+    # Decode and save the cropped image
+    try:
+        image_data = base64.b64decode(image_b64.split(",")[-1])
+        with open(job.output_path, "wb") as f:
+            f.write(image_data)
+    except Exception as e:
+        return jsonify({"error": f"Failed to save image: {e}"}), 500
+
+    # Add to history
+    with history_lock:
+        history.insert(0, job)
+        if len(history) > MAX_HISTORY:
+            history.pop()
+        save_history()
+
+    return jsonify({
+        "job_id": job_id,
+        "image_url": f"/image/{job_id}",
+    })
 
 
 @app.route("/cancel/<job_id>", methods=["POST"])
