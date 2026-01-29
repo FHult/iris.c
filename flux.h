@@ -86,13 +86,12 @@ typedef struct {
     int height;             /* Output height (default: 256) */
     int num_steps;          /* Inference steps (default: 4 for klein) */
     int64_t seed;           /* Random seed (-1 for random) */
-    float strength;         /* For img2img: 0.0-1.0 (default: 0.75) */
 } flux_params;
 
 /* Default parameters */
 #define FLUX_DEFAULT_WIDTH  256
 #define FLUX_DEFAULT_HEIGHT 256
-#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 4, -1, 0.75f }
+#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 4, -1 }
 
 /* ========================================================================
  * Core API
@@ -136,7 +135,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 /*
  * Image-to-image generation.
  * Takes an input image and modifies it according to the prompt.
- * strength controls how much the image changes (0.0 = no change, 1.0 = full generation).
+ * Uses in-context conditioning: the reference image is passed as additional
+ * tokens that the model attends to during generation.
  */
 flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
                          const flux_image *input, const flux_params *params);

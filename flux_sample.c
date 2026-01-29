@@ -169,6 +169,19 @@ extern float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                                                  const float *txt_emb, int txt_seq,
                                                  float timestep);
 
+/* Forward declaration for multi-reference conditioning */
+typedef struct {
+    const float *latent;  /* Reference latent in NCHW format */
+    int h, w;             /* Latent dimensions */
+    int t_offset;         /* RoPE T coordinate (10, 20, 30, ...) */
+} flux_ref_t;
+
+extern float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
+                                                       const float *img_latent, int img_h, int img_w,
+                                                       const flux_ref_t *refs, int num_refs,
+                                                       const float *txt_emb, int txt_seq,
+                                                       float timestep);
+
 /* VAE decode for step image callback */
 extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w);
@@ -342,6 +355,73 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
 }
 
 /*
+ * Sample using Euler method with multiple reference images.
+ * Each reference gets a different T offset in RoPE (10, 20, 30, ...).
+ */
+float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
+                                         float *z, int batch, int channels, int h, int w,
+                                         const flux_ref_t *refs, int num_refs,
+                                         const float *text_emb, int text_seq,
+                                         const float *schedule, int num_steps,
+                                         void (*progress_callback)(int step, int total)) {
+    (void)text_encoder;
+    flux_transformer_t *tf = (flux_transformer_t *)transformer;
+    int latent_size = batch * channels * h * w;
+
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    flux_copy(z_curr, z, latent_size);
+
+    flux_reset_timing();
+    double total_denoising_start = get_time_ms();
+    double step_times[FLUX_MAX_STEPS];
+
+    for (int step = 0; step < num_steps; step++) {
+        float t_curr = schedule[step];
+        float t_next = schedule[step + 1];
+        float dt = t_next - t_curr;
+
+        double step_start = get_time_ms();
+
+        if (flux_step_callback)
+            flux_step_callback(step + 1, num_steps);
+
+        /* Predict velocity with multiple reference images */
+        float *v = flux_transformer_forward_with_multi_refs(tf,
+                                                            z_curr, h, w,
+                                                            refs, num_refs,
+                                                            text_emb, text_seq,
+                                                            t_curr);
+
+        /* Euler step */
+        flux_axpy(z_curr, dt, v, latent_size);
+        free(v);
+
+        step_times[step] = get_time_ms() - step_start;
+
+        if (progress_callback)
+            progress_callback(step + 1, num_steps);
+
+        if (flux_step_image_callback && flux_step_image_vae) {
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
+        }
+    }
+
+    double total_denoising = get_time_ms() - total_denoising_start;
+    fprintf(stderr, "\nDenoising timing breakdown (multi-ref, %d refs):\n", num_refs);
+    for (int step = 0; step < num_steps; step++) {
+        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    }
+    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+
+    return z_curr;
+}
+
+/*
  * Sample using Euler method with stochastic noise injection.
  * This can help with diversity and quality.
  */
@@ -478,42 +558,53 @@ float *flux_sample_heun(void *transformer,
 /*
  * Initialize latent noise for generation.
  * For rectified flow, we start from pure noise (t=1).
+ *
+ * Size-independent noise: We generate noise at max latent size (112x112)
+ * and subsample to target size. This ensures the same seed produces
+ * similar compositions at different resolutions.
  */
+#define NOISE_MAX_LATENT_DIM 112  /* 1792/16 = 112 */
+
 float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed) {
-    int size = batch * channels * h * w;
-    float *noise = (float *)malloc(size * sizeof(float));
+    int target_size = batch * channels * h * w;
+    float *noise = (float *)malloc(target_size * sizeof(float));
 
     if (seed >= 0) {
         flux_rng_seed((uint64_t)seed);
     }
 
-    flux_randn(noise, size);
+    /* If target is max size or larger, just generate directly */
+    if (h >= NOISE_MAX_LATENT_DIM && w >= NOISE_MAX_LATENT_DIM) {
+        flux_randn(noise, target_size);
+        return noise;
+    }
+
+    /* Generate noise at max latent size */
+    int max_h = NOISE_MAX_LATENT_DIM;
+    int max_w = NOISE_MAX_LATENT_DIM;
+    int max_size = batch * channels * max_h * max_w;
+    float *max_noise = (float *)malloc(max_size * sizeof(float));
+    flux_randn(max_noise, max_size);
+
+    /* Subsample to target size using nearest-neighbor */
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < channels; c++) {
+            for (int ty = 0; ty < h; ty++) {
+                for (int tx = 0; tx < w; tx++) {
+                    /* Map target position to source position */
+                    int sy = ty * max_h / h;
+                    int sx = tx * max_w / w;
+
+                    int src_idx = ((b * channels + c) * max_h + sy) * max_w + sx;
+                    int dst_idx = ((b * channels + c) * h + ty) * w + tx;
+                    noise[dst_idx] = max_noise[src_idx];
+                }
+            }
+        }
+    }
+
+    free(max_noise);
     return noise;
-}
-
-/*
- * Initialize latent for img2img.
- * Blend between encoded image and noise based on strength.
- */
-float *flux_init_img2img(const float *img_latent, float strength,
-                         int batch, int channels, int h, int w, int64_t seed) {
-    int size = batch * channels * h * w;
-    float *latent = (float *)malloc(size * sizeof(float));
-
-    if (seed >= 0) {
-        flux_rng_seed((uint64_t)seed);
-    }
-
-    /* z = (1 - strength) * img_latent + strength * noise */
-    float noise_scale = strength;
-    float img_scale = 1.0f - strength;
-
-    for (int i = 0; i < size; i++) {
-        float noise = flux_random_normal();
-        latent[i] = img_scale * img_latent[i] + noise_scale * noise;
-    }
-
-    return latent;
 }
 
 /* ========================================================================
