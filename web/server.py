@@ -30,7 +30,9 @@ PROJECT_DIR = SCRIPT_DIR.parent
 DEFAULT_MODEL_DIR = PROJECT_DIR / "flux-klein-model"
 DEFAULT_FLUX_BINARY = PROJECT_DIR / "flux"
 OUTPUT_DIR = SCRIPT_DIR / "output"
+THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"
 HISTORY_FILE = OUTPUT_DIR / "history.json"
+THUMB_SIZE = 200  # Max dimension for thumbnails
 
 app = Flask(__name__, static_folder="static")
 
@@ -124,6 +126,7 @@ class Job:
             "seed": self.seed,
             "created_at": self.created_at,
             "image_url": f"/image/{self.id}",
+            "thumb_url": f"/thumb/{self.id}",
         }
 
     def cleanup_temp_files(self):
@@ -529,6 +532,45 @@ def get_image(job_id):
     return send_file(job.output_path, mimetype="image/png")
 
 
+@app.route("/thumb/<job_id>")
+def get_thumb(job_id):
+    """Serve a thumbnail for a generated image."""
+    # Ensure thumb directory exists
+    THUMB_DIR.mkdir(exist_ok=True)
+
+    thumb_path = THUMB_DIR / f"{job_id}.jpg"
+
+    # If thumbnail exists, serve it
+    if thumb_path.exists():
+        return send_file(thumb_path, mimetype="image/jpeg")
+
+    # Otherwise, generate it from the original image
+    original_path = OUTPUT_DIR / f"{job_id}.png"
+    if not original_path.exists():
+        return jsonify({"error": "Image not found"}), 404
+
+    try:
+        from PIL import Image
+        img = Image.open(original_path)
+        img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
+        # Convert to RGB for JPEG (handles RGBA)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', img.size, (0, 0, 0))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        img.save(thumb_path, "JPEG", quality=80)
+        return send_file(thumb_path, mimetype="image/jpeg")
+    except ImportError:
+        # PIL not available, serve original
+        return send_file(original_path, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate thumbnail: {e}"}), 500
+
+
 @app.route("/status/<job_id>")
 def get_status(job_id):
     """Get current job status."""
@@ -562,6 +604,13 @@ def delete_history(job_id):
                 if job.output_path and job.output_path.exists():
                     try:
                         os.unlink(job.output_path)
+                    except OSError:
+                        pass
+                # Delete thumbnail too
+                thumb_path = THUMB_DIR / f"{job_id}.jpg"
+                if thumb_path.exists():
+                    try:
+                        os.unlink(thumb_path)
                     except OSError:
                         pass
                 save_history()

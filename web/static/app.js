@@ -43,8 +43,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const cropApplyBtn = document.getElementById('crop-apply-btn');
     const cropCancelBtn = document.getElementById('crop-cancel-btn');
     const cropDimensions = document.getElementById('crop-dimensions');
+    const cropPreset = document.getElementById('crop-preset');
     const copySeedBtn = document.getElementById('copy-seed-btn');
     const downloadBtn = document.getElementById('download-btn');
+    const promptHistoryBtn = document.getElementById('prompt-history-btn');
+    const promptHistoryDropdown = document.getElementById('prompt-history-dropdown');
 
     let currentEventSource = null;
     let referenceImageData = [null, null]; // Up to 2 reference images
@@ -214,6 +217,7 @@ document.addEventListener('DOMContentLoaded', () => {
         cropOverlay.style.display = 'block';
         lightboxToolbar.style.display = 'none';
         cropToolbar.style.display = 'flex';
+        cropPreset.value = ''; // Reset preset dropdown
         stopSlideshow();
 
         // Initialize crop selection to center of image
@@ -331,6 +335,37 @@ document.addEventListener('DOMContentLoaded', () => {
     lightboxCropBtn.addEventListener('click', enterCropMode);
     cropCancelBtn.addEventListener('click', exitCropMode);
     cropApplyBtn.addEventListener('click', applyCrop);
+
+    // Crop preset handler
+    cropPreset.addEventListener('change', () => {
+        const value = cropPreset.value;
+        if (!value) return;
+
+        const [targetW, targetH] = value.split('x').map(Number);
+        const imgRect = lightboxImage.getBoundingClientRect();
+        const contentRect = lightboxContent.getBoundingClientRect();
+        const imgOffsetX = imgRect.left - contentRect.left;
+        const imgOffsetY = imgRect.top - contentRect.top;
+
+        // Calculate scale from image natural size to display size
+        const scaleX = imgRect.width / lightboxImage.naturalWidth;
+        const scaleY = imgRect.height / lightboxImage.naturalHeight;
+
+        // Target size in display pixels
+        let cropW = targetW * scaleX;
+        let cropH = targetH * scaleY;
+
+        // Constrain to image bounds
+        cropW = Math.min(cropW, imgRect.width);
+        cropH = Math.min(cropH, imgRect.height);
+
+        // Center the crop
+        const cropX = imgOffsetX + (imgRect.width - cropW) / 2;
+        const cropY = imgOffsetY + (imgRect.height - cropH) / 2;
+
+        cropRect = { x: cropX, y: cropY, width: cropW, height: cropH };
+        updateCropSelection();
+    });
 
     // Lightbox use as input button
     lightboxUseBtn.addEventListener('click', () => {
@@ -1049,14 +1084,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const item = visible[i];
             const div = document.createElement('div');
             div.className = 'history-item';
-            const imgUrl = `${item.image_url}?t=${item.created_at}`;
+            // Use thumbnail for grid, full image for lightbox
+            const thumbUrl = item.thumb_url ? `${item.thumb_url}?t=${item.created_at}` : `${item.image_url}?t=${item.created_at}`;
+            const fullUrl = `${item.image_url}?t=${item.created_at}`;
             div.setAttribute('draggable', 'true');
             div.addEventListener('dragstart', (e) => {
                 e.dataTransfer.setData('text/plain', item.image_url);
                 e.dataTransfer.effectAllowed = 'copy';
             });
             div.innerHTML = `
-                <img src="${imgUrl}" alt="${item.prompt}" data-fullsize="${imgUrl}" draggable="false">
+                <img src="${thumbUrl}" alt="${item.prompt}" data-fullsize="${fullUrl}" draggable="false">
                 <button class="history-item-delete" title="Delete">&times;</button>
                 <div class="history-item-overlay">
                     <div class="history-item-prompt">${escapeHtml(item.prompt)}</div>
@@ -1253,4 +1290,80 @@ document.addEventListener('DOMContentLoaded', () => {
     widthSelect.addEventListener('change', saveSettings);
     heightSelect.addEventListener('change', saveSettings);
     stepsInput.addEventListener('change', saveSettings);
+
+    // ========== Prompt History ==========
+    const PROMPT_HISTORY_KEY = 'flux_prompt_history';
+    const MAX_PROMPT_HISTORY = 20;
+
+    function getPromptHistory() {
+        try {
+            const saved = localStorage.getItem(PROMPT_HISTORY_KEY);
+            return saved ? JSON.parse(saved) : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function savePromptToHistory(prompt) {
+        if (!prompt || prompt.trim().length === 0) return;
+        prompt = prompt.trim();
+
+        try {
+            let history = getPromptHistory();
+            // Remove if already exists (to move to top)
+            history = history.filter(p => p !== prompt);
+            // Add to beginning
+            history.unshift(prompt);
+            // Limit size
+            if (history.length > MAX_PROMPT_HISTORY) {
+                history = history.slice(0, MAX_PROMPT_HISTORY);
+            }
+            localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(history));
+        } catch (err) {
+            console.error('Failed to save prompt history:', err);
+        }
+    }
+
+    function renderPromptHistory() {
+        const history = getPromptHistory();
+        promptHistoryDropdown.innerHTML = '';
+
+        if (history.length === 0) {
+            promptHistoryDropdown.innerHTML = '<div class="prompt-history-empty">No recent prompts</div>';
+            return;
+        }
+
+        history.forEach(prompt => {
+            const item = document.createElement('div');
+            item.className = 'prompt-history-item';
+            item.textContent = prompt;
+            item.title = prompt;
+            item.addEventListener('click', () => {
+                document.getElementById('prompt').value = prompt;
+                promptHistoryDropdown.classList.remove('active');
+            });
+            promptHistoryDropdown.appendChild(item);
+        });
+    }
+
+    // Toggle prompt history dropdown
+    promptHistoryBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        renderPromptHistory();
+        promptHistoryDropdown.classList.toggle('active');
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!promptHistoryDropdown.contains(e.target) && e.target !== promptHistoryBtn) {
+            promptHistoryDropdown.classList.remove('active');
+        }
+    });
+
+    // Save prompt when generation starts (hook into form submit)
+    const originalFormSubmit = form.onsubmit;
+    form.addEventListener('submit', () => {
+        const prompt = document.getElementById('prompt').value;
+        savePromptToHistory(prompt);
+    });
 });
