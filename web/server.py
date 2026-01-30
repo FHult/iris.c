@@ -43,6 +43,10 @@ def convert_image_to_png(image_data: bytes) -> bytes:
     Supports JPEG, WebP, GIF, BMP, TIFF, and any other PIL-supported format.
     Handles animated images (uses first frame) and transparency.
     """
+    # Quick check: if already PNG, return as-is
+    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        return image_data
+
     try:
         from PIL import Image
         import io
@@ -50,9 +54,13 @@ def convert_image_to_png(image_data: bytes) -> bytes:
         # Try to open the image with PIL
         img = Image.open(io.BytesIO(image_data))
 
+        # Force load the image data (important for some formats)
+        img.load()
+
         # Handle animated images (GIF, WebP) - use first frame
         if hasattr(img, 'n_frames') and img.n_frames > 1:
             img.seek(0)
+            img.load()
 
         # Convert palette and other modes to RGBA or RGB
         if img.mode == 'P':
@@ -68,10 +76,7 @@ def convert_image_to_png(image_data: bytes) -> bytes:
         return png_buffer.getvalue()
 
     except ImportError:
-        # PIL not available - check if already PNG
-        if image_data[:8] == b'\x89PNG\r\n\x1a\n':
-            return image_data
-        raise ValueError("PIL/Pillow required for non-PNG image formats")
+        raise ValueError("PIL/Pillow required for non-PNG image formats. Install with: pip install Pillow")
     except Exception as e:
         raise ValueError(f"Failed to convert image: {e}")
 
