@@ -42,9 +42,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const lightboxUseBtn = document.getElementById('lightbox-use-btn');
     const cropApplyBtn = document.getElementById('crop-apply-btn');
     const cropCancelBtn = document.getElementById('crop-cancel-btn');
+    const cropDimensions = document.getElementById('crop-dimensions');
+    const copySeedBtn = document.getElementById('copy-seed-btn');
+    const downloadBtn = document.getElementById('download-btn');
 
     let currentEventSource = null;
-    let referenceImageData = [null, null, null, null]; // Up to 4 reference images
+    let referenceImageData = [null, null]; // Up to 2 reference images
     let currentGeneration = null; // Store current generation params for remix
     let generationQueue = [];
     let isGenerating = false;
@@ -68,6 +71,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load history on page load
     loadHistory();
+
+    // Load saved settings from localStorage
+    loadSavedSettings();
+
+    // Auto-focus prompt field
+    document.getElementById('prompt').focus();
 
     // Lightbox functionality
     function openLightbox(imageSrc, items, index) {
@@ -238,6 +247,20 @@ document.addEventListener('DOMContentLoaded', () => {
         cropSelection.style.top = `${cropRect.y}px`;
         cropSelection.style.width = `${cropRect.width}px`;
         cropSelection.style.height = `${cropRect.height}px`;
+
+        // Update crop dimensions display (in actual pixels)
+        const imgRect = lightboxImage.getBoundingClientRect();
+        const contentRect = lightboxContent.getBoundingClientRect();
+        const imgOffsetX = imgRect.left - contentRect.left;
+        const imgOffsetY = imgRect.top - contentRect.top;
+
+        const scaleX = lightboxImage.naturalWidth / imgRect.width;
+        const scaleY = lightboxImage.naturalHeight / imgRect.height;
+
+        const actualW = Math.round(Math.min(lightboxImage.naturalWidth, cropRect.width * scaleX));
+        const actualH = Math.round(Math.min(lightboxImage.naturalHeight, cropRect.height * scaleY));
+
+        cropDimensions.textContent = `${actualW} × ${actualH}`;
     }
 
     async function applyCrop() {
@@ -570,13 +593,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Clear reference image for a specific slot and compact remaining images
     function clearReferenceImage(slot) {
         // Shift all images after this slot up to fill the gap
-        for (let i = slot; i < 3; i++) {
+        for (let i = slot; i < 1; i++) {
             referenceImageData[i] = referenceImageData[i + 1];
         }
-        referenceImageData[3] = null; // Last slot is now empty
+        referenceImageData[1] = null; // Last slot is now empty
 
         // Re-render all slots
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 2; i++) {
             const preview = refPreviews[i];
             const clearBtn = refClearBtns[i];
             const slotEl = refSlots[i];
@@ -598,7 +621,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Find first empty slot
     function findFirstEmptySlot() {
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 2; i++) {
             if (referenceImageData[i] === null) return i;
         }
         return 0; // Default to first slot if all full
@@ -698,8 +721,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Clear all images button
     clearAllImagesBtn.addEventListener('click', () => {
         // Clear all slots directly without compacting
-        referenceImageData = [null, null, null, null];
-        for (let i = 0; i < 4; i++) {
+        referenceImageData = [null, null];
+        for (let i = 0; i < 2; i++) {
             const preview = refPreviews[i];
             const clearBtn = refClearBtns[i];
             const slotEl = refSlots[i];
@@ -1131,4 +1154,103 @@ document.addEventListener('DOMContentLoaded', () => {
         div.textContent = text;
         return div.innerHTML;
     }
+
+    // ========== Copy Seed Button ==========
+    copySeedBtn.addEventListener('click', async () => {
+        if (!currentGeneration || !currentGeneration.seed) return;
+
+        try {
+            await navigator.clipboard.writeText(String(currentGeneration.seed));
+            copySeedBtn.classList.add('copied');
+            setTimeout(() => copySeedBtn.classList.remove('copied'), 1500);
+        } catch (err) {
+            console.error('Failed to copy seed:', err);
+        }
+    });
+
+    // ========== Download Button ==========
+    downloadBtn.addEventListener('click', () => {
+        const img = outputArea.querySelector('img');
+        if (!img) return;
+
+        const link = document.createElement('a');
+        // Remove cache-busting query param for cleaner filename
+        const imageUrl = img.src.split('?')[0];
+        link.href = imageUrl;
+
+        // Generate filename from prompt
+        const prompt = currentGeneration?.prompt || 'image';
+        const seed = currentGeneration?.seed || 'unknown';
+        const safePrompt = prompt.substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
+        link.download = `flux_${safePrompt}_${seed}.png`;
+
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    });
+
+    // ========== Paste Image from Clipboard (Ctrl+V) ==========
+    document.addEventListener('paste', async (e) => {
+        // Don't intercept paste in text inputs
+        if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
+            return;
+        }
+
+        const items = e.clipboardData?.items;
+        if (!items) return;
+
+        for (const item of items) {
+            if (item.type.startsWith('image/')) {
+                e.preventDefault();
+                const blob = item.getAsFile();
+                if (!blob) continue;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const slot = findFirstEmptySlot();
+                    setReferenceImage(slot, event.target.result);
+                };
+                reader.readAsDataURL(blob);
+                break;
+            }
+        }
+    });
+
+    // ========== LocalStorage Settings Persistence ==========
+    const SETTINGS_KEY = 'flux_settings';
+
+    function loadSavedSettings() {
+        try {
+            const saved = localStorage.getItem(SETTINGS_KEY);
+            if (!saved) return;
+
+            const settings = JSON.parse(saved);
+            if (settings.width) widthSelect.value = settings.width;
+            if (settings.height) heightSelect.value = settings.height;
+            if (settings.steps) {
+                stepsInput.value = settings.steps;
+                stepsValue.textContent = settings.steps;
+            }
+        } catch (err) {
+            console.error('Failed to load settings:', err);
+        }
+    }
+
+    function saveSettings() {
+        try {
+            const settings = {
+                width: widthSelect.value,
+                height: heightSelect.value,
+                steps: stepsInput.value,
+            };
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        } catch (err) {
+            console.error('Failed to save settings:', err);
+        }
+    }
+
+    // Save settings when they change
+    widthSelect.addEventListener('change', saveSettings);
+    heightSelect.addEventListener('change', saveSettings);
+    stepsInput.addEventListener('change', saveSettings);
 });
