@@ -36,6 +36,46 @@ THUMB_SIZE = 200  # Max dimension for thumbnails
 
 app = Flask(__name__, static_folder="static")
 
+
+def convert_image_to_png(image_data: bytes) -> bytes:
+    """
+    Convert any image format to PNG for the C code.
+    Supports JPEG, WebP, GIF, BMP, TIFF, and any other PIL-supported format.
+    Handles animated images (uses first frame) and transparency.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        # Try to open the image with PIL
+        img = Image.open(io.BytesIO(image_data))
+
+        # Handle animated images (GIF, WebP) - use first frame
+        if hasattr(img, 'n_frames') and img.n_frames > 1:
+            img.seek(0)
+
+        # Convert palette and other modes to RGBA or RGB
+        if img.mode == 'P':
+            img = img.convert('RGBA')
+        elif img.mode == 'LA':
+            img = img.convert('RGBA')
+        elif img.mode not in ('RGB', 'RGBA'):
+            img = img.convert('RGB')
+
+        # Save as PNG
+        png_buffer = io.BytesIO()
+        img.save(png_buffer, format='PNG')
+        return png_buffer.getvalue()
+
+    except ImportError:
+        # PIL not available - check if already PNG
+        if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+            return image_data
+        raise ValueError("PIL/Pillow required for non-PNG image formats")
+    except Exception as e:
+        raise ValueError(f"Failed to convert image: {e}")
+
+
 # Store active jobs and their progress
 jobs = {}
 jobs_lock = threading.Lock()
@@ -392,18 +432,8 @@ def generate():
         # Single image: use img2img mode for better results
         try:
             image_data = base64.b64decode(reference_images_b64[0].split(",")[-1])
-            # Check if JPEG - needs conversion since C code only supports PNG
-            is_jpeg = image_data[:2] == b'\xff\xd8'
-            if is_jpeg:
-                try:
-                    from PIL import Image
-                    import io
-                    jpeg_img = Image.open(io.BytesIO(image_data))
-                    png_buffer = io.BytesIO()
-                    jpeg_img.save(png_buffer, format='PNG')
-                    image_data = png_buffer.getvalue()
-                except ImportError:
-                    pass  # JPEG may not load correctly without PIL
+            # Convert any format to PNG
+            image_data = convert_image_to_png(image_data)
             input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
             with open(input_image_path, "wb") as f:
                 f.write(image_data)
@@ -411,21 +441,11 @@ def generate():
             return jsonify({"error": f"Invalid input image: {e}"}), 400
     elif len(reference_images_b64) > 1:
         # Multiple images: use multiref mode
-        for i, img_b64 in enumerate(reference_images_b64[:4]):
+        for i, img_b64 in enumerate(reference_images_b64[:2]):
             try:
                 image_data = base64.b64decode(img_b64.split(",")[-1])
-                # Check if JPEG - needs conversion since C code only supports PNG
-                is_jpeg = image_data[:2] == b'\xff\xd8'
-                if is_jpeg:
-                    try:
-                        from PIL import Image
-                        import io
-                        jpeg_img = Image.open(io.BytesIO(image_data))
-                        png_buffer = io.BytesIO()
-                        jpeg_img.save(png_buffer, format='PNG')
-                        image_data = png_buffer.getvalue()
-                    except ImportError:
-                        pass  # JPEG may not load correctly without PIL
+                # Convert any format to PNG
+                image_data = convert_image_to_png(image_data)
                 ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
                 with open(ref_path, "wb") as f:
                     f.write(image_data)
@@ -445,6 +465,8 @@ def generate():
         if input_image_b64:
             try:
                 image_data = base64.b64decode(input_image_b64.split(",")[-1])
+                # Convert any format to PNG
+                image_data = convert_image_to_png(image_data)
                 input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
                 with open(input_image_path, "wb") as f:
                     f.write(image_data)
