@@ -718,10 +718,13 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         return flux_generate(ctx, prompt, params);
     }
 
-    /* Single reference - use optimized path */
-    if (num_refs == 1) {
-        return flux_img2img(ctx, prompt, refs[0], params);
-    }
+    /*
+     * WORKAROUND: Full multi-reference produces black images.
+     * Use only first reference via img2img until upstream fixes this.
+     */
+    return flux_img2img(ctx, prompt, refs[0], params);
+
+#if 0  /* TODO: Re-enable when upstream multiref is fixed */
 
     flux_params p;
     if (params) {
@@ -872,6 +875,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     free(latent);
     return result;
+#endif  /* Disabled multiref code */
 }
 
 /* ========================================================================
