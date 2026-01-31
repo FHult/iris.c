@@ -19,7 +19,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps converter convert-f16
+.PHONY: all clean debug lib install info test pngtest help generic blas mps
 
 # Default: show available targets
 all: help
@@ -154,51 +154,6 @@ pngtest:
 	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/flux_png_compare
 	@echo "PNG TEST PASSED"
-
-# Build the bf16->f16 converter tool (uses Metal GPU for fast conversion)
-converter: convert_bf16_to_f16.mps.o flux_metal.o flux_safetensors.mps.o flux_kernels.mps.o
-	$(CC) $(MPS_CFLAGS) -o convert_bf16_to_f16 $^ $(MPS_LDFLAGS)
-	@echo "Built convert_bf16_to_f16 (Metal GPU accelerated)"
-
-convert_bf16_to_f16.mps.o: convert_bf16_to_f16.c
-	$(CC) $(MPS_CFLAGS) -c -o $@ $<
-
-# Convert bf16 safetensors to f16 (one-time, for faster MPS loading)
-# Usage: make convert-f16 MODEL_DIR=./flux-klein-model
-convert-f16: converter
-ifndef MODEL_DIR
-	@echo "Usage: make convert-f16 MODEL_DIR=<path-to-model>"
-	@echo ""
-	@echo "Converts bf16 safetensors files to f16 for faster loading on Apple Silicon."
-	@echo "The original bf16 files are preserved. The flux binary will automatically"
-	@echo "use f16 files if present, falling back to bf16 if not."
-	@exit 1
-else
-	@echo "Converting transformer weights..."
-	@if [ -f "$(MODEL_DIR)/transformer/diffusion_pytorch_model.safetensors" ] && \
-	    [ ! -f "$(MODEL_DIR)/transformer/diffusion_pytorch_model.f16.safetensors" ]; then \
-		./convert_bf16_to_f16 "$(MODEL_DIR)/transformer/diffusion_pytorch_model.safetensors" \
-		                      "$(MODEL_DIR)/transformer/diffusion_pytorch_model.f16.safetensors"; \
-	else \
-		echo "  Skipping transformer (already converted or not found)"; \
-	fi
-	@echo "Converting text encoder weights..."
-	@if [ -f "$(MODEL_DIR)/text_encoder/model-00001-of-00002.safetensors" ] && \
-	    [ ! -f "$(MODEL_DIR)/text_encoder/model-00001-of-00002.f16.safetensors" ]; then \
-		./convert_bf16_to_f16 "$(MODEL_DIR)/text_encoder/model-00001-of-00002.safetensors" \
-		                      "$(MODEL_DIR)/text_encoder/model-00001-of-00002.f16.safetensors"; \
-	else \
-		echo "  Skipping text_encoder shard 1 (already converted or not found)"; \
-	fi
-	@if [ -f "$(MODEL_DIR)/text_encoder/model-00002-of-00002.safetensors" ] && \
-	    [ ! -f "$(MODEL_DIR)/text_encoder/model-00002-of-00002.f16.safetensors" ]; then \
-		./convert_bf16_to_f16 "$(MODEL_DIR)/text_encoder/model-00002-of-00002.safetensors" \
-		                      "$(MODEL_DIR)/text_encoder/model-00002-of-00002.f16.safetensors"; \
-	else \
-		echo "  Skipping text_encoder shard 2 (already converted or not found)"; \
-	fi
-	@echo "Done! F16 files created."
-endif
 
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin

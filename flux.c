@@ -139,37 +139,6 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
-/*
- * Try to open f16-converted safetensors first, fall back to original.
- * For a path like "foo/bar.safetensors", tries "foo/bar.f16.safetensors" first.
- * Returns the opened file and sets *used_f16 to indicate which was used.
- */
-static safetensors_file_t *safetensors_open_prefer_f16(const char *path, int *used_f16) {
-    char f16_path[1024];
-    safetensors_file_t *sf = NULL;
-
-    if (used_f16) *used_f16 = 0;
-
-    /* Build f16 path: replace .safetensors with .f16.safetensors */
-    const char *ext = strstr(path, ".safetensors");
-    if (ext) {
-        size_t prefix_len = (size_t)(ext - path);
-        if (prefix_len < sizeof(f16_path) - 20) {
-            memcpy(f16_path, path, prefix_len);
-            strcpy(f16_path + prefix_len, ".f16.safetensors");
-
-            sf = safetensors_open(f16_path);
-            if (sf) {
-                if (used_f16) *used_f16 = 1;
-                return sf;
-            }
-        }
-    }
-
-    /* Fall back to original path */
-    return safetensors_open(path);
-}
-
 flux_ctx *flux_load_dir(const char *model_dir) {
     char path[1024];
 
@@ -192,8 +161,7 @@ flux_ctx *flux_load_dir(const char *model_dir) {
      * to support systems with limited RAM (e.g., 16GB). */
     snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", model_dir);
     if (file_exists(path)) {
-        int used_f16 = 0;
-        safetensors_file_t *sf = safetensors_open_prefer_f16(path, &used_f16);
+        safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->vae = flux_vae_load_safetensors(sf);
             safetensors_close(sf);
@@ -259,15 +227,8 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
              ctx->model_dir);
 
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
-    int used_f16 = 0;
-    safetensors_file_t *sf = safetensors_open_prefer_f16(path, &used_f16);
+    safetensors_file_t *sf = safetensors_open(path);
     if (sf) {
-#ifdef USE_METAL
-        /* If using pre-converted F16 weights, skip bf16→f16 conversion in Metal */
-        if (used_f16) {
-            flux_metal_set_weights_f16_mode(1);
-        }
-#endif
         if (ctx->use_mmap) {
             /* Mmap mode: load only small weights, keep sf open for on-demand loading.
              * The transformer takes ownership of sf and will close it on free. */

@@ -207,17 +207,6 @@ static id<MTLComputePipelineState> g_transpose_from_heads_bf16_pipeline;
 static id<MTLComputePipelineState> g_attention_fused_bf16_pipeline;
 static int g_shaders_initialized;
 
-/* Flag indicating loaded weights are already F16 (no bf16→f16 conversion needed) */
-static int g_weights_are_f16 = 0;
-
-/* Set whether loaded weights are already F16 format (skips bf16→f16 conversion) */
-void flux_metal_set_weights_f16_mode(int is_f16) {
-    g_weights_are_f16 = is_f16;
-    if (is_f16) {
-        NSLog(@"Metal: F16 weight mode enabled - skipping bf16→f16 conversion");
-    }
-}
-
 /* ========================================================================
  * Weight Buffer Cache
  * Cache GPU buffers for weight matrices to avoid repeated allocations.
@@ -963,14 +952,8 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
     size_t size = num_elements * sizeof(uint16_t);
     id<MTLBuffer> buf = nil;
 
-    /* If weights are already F16, just create buffer directly (no conversion needed) */
-    if (g_weights_are_f16) {
-        buf = [g_device newBufferWithBytes:weights
-                                    length:size
-                                   options:MTLResourceStorageModeShared];
-    }
     /* Use GPU kernel for conversion if available (much faster) */
-    else if (g_shaders_initialized && g_bf16_to_f16_pipeline) {
+    if (g_shaders_initialized && g_bf16_to_f16_pipeline) {
         /* Upload bf16 data to GPU */
         id<MTLBuffer> input_buf = [g_device newBufferWithBytes:weights
                                                         length:size

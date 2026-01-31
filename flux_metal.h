@@ -599,12 +599,6 @@ int flux_bf16_pipeline_available(void);
  */
 void flux_metal_bf16_to_f16_bulk(const uint16_t *input, uint16_t *output, int n);
 
-/*
- * Set F16 weight mode - when enabled, weight loading skips bf16→f16 conversion
- * because weights are already in F16 format (from pre-converted safetensors).
- */
-void flux_metal_set_weights_f16_mode(int is_f16);
-
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 
