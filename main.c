@@ -260,6 +260,25 @@ static int64_t json_get_int64(const char *json, const char *key, int64_t default
     return atoll(p);
 }
 
+/* Extract boolean value from JSON */
+static int json_get_bool(const char *json, const char *key, int default_val) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_val;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    /* Handle null */
+    if (strncmp(p, "null", 4) == 0) return default_val;
+    /* Handle true/false */
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+    /* Handle numeric 0/1 */
+    return atoi(p) != 0;
+}
+
 /* Extract array of strings from JSON (returns array of malloc'd strings, caller must free)
  * Returns number of strings found, or 0 if key not found or not an array.
  * The paths array must be pre-allocated with max_paths capacity. */
@@ -319,6 +338,9 @@ static struct timeval server_phase_start_tv;
 static struct timeval server_step_start_tv;
 static struct timeval server_generation_start_tv;
 
+/* Current output path base for step images (set before each generation) */
+static char server_step_image_base[512] = {0};
+
 /* Server mode progress callback - output JSON status updates */
 static void server_step_callback(int step, int total) {
     struct timeval now;
@@ -367,6 +389,27 @@ static void server_phase_callback(const char *phase, int done) {
     }
 }
 
+/* Server mode step image callback - save intermediate image and emit JSON */
+static void server_step_image_callback(int step, int total, const flux_image *img) {
+    if (!server_step_image_base[0]) return;
+
+    /* Build step image path: /path/to/output_step_N.png */
+    char step_path[600];
+    snprintf(step_path, sizeof(step_path), "%s_step_%d.png", server_step_image_base, step);
+
+    /* Save the intermediate image */
+    if (flux_image_save(img, step_path) == 0) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
+                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
+
+        printf("{\"event\":\"step_image\",\"step\":%d,\"total\":%d,\"path\":\"%s\",\"elapsed\":%.2f}\n",
+               step, total, step_path, elapsed);
+        fflush(stdout);
+    }
+}
+
 /* Run server mode - keeps model loaded and processes JSON requests from stdin */
 static int run_server_mode(flux_ctx *ctx) {
     char line[65536];
@@ -398,6 +441,7 @@ static int run_server_mode(flux_ctx *ctx) {
         int height = json_get_int(line, "height", DEFAULT_HEIGHT);
         int steps = json_get_int(line, "steps", DEFAULT_STEPS);
         int64_t seed = json_get_int64(line, "seed", -1);
+        int show_steps = json_get_bool(line, "show_steps", 1);
 
         /* Validate request */
         if (!prompt || !output_path) {
@@ -438,6 +482,21 @@ static int run_server_mode(flux_ctx *ctx) {
         gettimeofday(&server_generation_start_tv, NULL);
         server_phase_start_tv = server_generation_start_tv;
         server_step_start_tv = server_generation_start_tv;
+
+        /* Set up step image base path (output_path without .png extension) */
+        strncpy(server_step_image_base, output_path, sizeof(server_step_image_base) - 1);
+        server_step_image_base[sizeof(server_step_image_base) - 1] = '\0';
+        size_t base_len = strlen(server_step_image_base);
+        if (base_len > 4 && strcmp(server_step_image_base + base_len - 4, ".png") == 0) {
+            server_step_image_base[base_len - 4] = '\0';
+        }
+
+        /* Enable/disable step image callback based on show_steps parameter */
+        if (show_steps) {
+            flux_set_step_image_callback(ctx, server_step_image_callback);
+        } else {
+            flux_set_step_image_callback(ctx, NULL);
+        }
 
         /* Report seed */
         printf("{\"event\":\"status\",\"seed\":%lld}\n", (long long)actual_seed);

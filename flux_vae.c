@@ -111,14 +111,75 @@ typedef struct flux_vae {
     float *post_quant_conv_weight;  /* [32, 32, 1, 1] - decoder */
     float *post_quant_conv_bias;    /* [32] */
 
-    /* Working memory (allocated for max image size) */
-    int max_h, max_w;
+    /* Working memory (dynamically allocated based on actual image size) */
+    int max_h, max_w;           /* Maximum supported dimensions */
+    int cur_alloc_h, cur_alloc_w;  /* Currently allocated dimensions (0 if not allocated) */
     float *work1, *work2, *work3;
     size_t work_size;
 } flux_vae_t;
 
 /* Forward declarations */
 void flux_vae_free(flux_vae_t *vae);
+
+/*
+ * Ensure VAE work buffers are allocated for the given image dimensions.
+ * Buffers are reused if already large enough, otherwise reallocated.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int vae_ensure_work_buffers(flux_vae_t *vae, int H, int W) {
+    /* Check if existing allocation is sufficient */
+    if (vae->work1 && vae->work2 && vae->work3 &&
+        vae->cur_alloc_h >= H && vae->cur_alloc_w >= W) {
+        return 0;  /* Already have enough */
+    }
+
+    /* Calculate required size:
+     * - Encoder peak: 512 channels at H/8 × W/8
+     * - Decoder peak: 128 channels at H × W (full resolution)
+     * - work3 needs 4x for attention/resblock operations
+     * Use 4 * 128 * H * W = 512 * H * W to cover all cases with margin
+     */
+    size_t max_spatial = (size_t)H * W;
+    size_t max_channels = 128;  /* base_channels at full resolution */
+    size_t new_size = 4 * max_channels * max_spatial * sizeof(float);
+
+    /* Free existing if too small */
+    if (vae->work_size < new_size) {
+        free(vae->work1);
+        free(vae->work2);
+        free(vae->work3);
+        vae->work1 = vae->work2 = vae->work3 = NULL;
+        vae->work_size = 0;
+        vae->cur_alloc_h = vae->cur_alloc_w = 0;
+    }
+
+    /* Allocate if needed */
+    if (!vae->work1) {
+        vae->work1 = malloc(new_size);
+        vae->work2 = malloc(new_size);
+        vae->work3 = malloc(new_size);
+
+        if (!vae->work1 || !vae->work2 || !vae->work3) {
+            free(vae->work1);
+            free(vae->work2);
+            free(vae->work3);
+            vae->work1 = vae->work2 = vae->work3 = NULL;
+            vae->work_size = 0;
+            vae->cur_alloc_h = vae->cur_alloc_w = 0;
+            return -1;
+        }
+
+        vae->work_size = new_size;
+        vae->cur_alloc_h = H;
+        vae->cur_alloc_w = W;
+
+        /* Log the allocation for debugging */
+        fprintf(stderr, "[VAE] Allocated work buffers for %dx%d (%.1f MB total)\n",
+                W, H, (3.0 * new_size) / (1024.0 * 1024.0));
+    }
+
+    return 0;
+}
 
 /* ========================================================================
  * Helper Functions
@@ -306,6 +367,12 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
      * -> batch_norm
      */
 
+    /* Ensure work buffers are allocated for this image size */
+    if (vae_ensure_work_buffers(vae, H, W) < 0) {
+        fprintf(stderr, "VAE encode: failed to allocate work buffers for %dx%d\n", W, H);
+        return NULL;
+    }
+
     int ch_mult[4] = {1, 2, 4, 4};
     float *x = vae->work1;
     float *work = vae->work2;
@@ -416,6 +483,16 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
      * -> conv_in -> mid_block -> up_blocks -> norm -> conv_out
      * -> [B, 3, H, W]
      */
+
+    /* Calculate output image dimensions (latent is H/16 x W/16) */
+    int out_H = latent_h * 16;
+    int out_W = latent_w * 16;
+
+    /* Ensure work buffers are allocated for this image size */
+    if (vae_ensure_work_buffers(vae, out_H, out_W) < 0) {
+        fprintf(stderr, "VAE decode: failed to allocate work buffers for %dx%d\n", out_W, out_H);
+        return NULL;
+    }
 
     int ch_mult[4] = {1, 2, 4, 4};
     float *x = vae->work1;
@@ -1059,27 +1136,16 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
         for (int i = 0; i < FLUX_LATENT_CHANNELS; i++) vae->bn_var[i] = 1.0f;
     }
 
-    /* Allocate working memory
-     * The decoder upsamples from H/8 to full H resolution.
-     * At full resolution (level 0), we have base_channels (128) channels.
-     * work1/work2: hold main tensors, max 128 * H * W
-     * work3: used for resblock/attention ops, needs ~4x main buffer
-     *
-     * Memory per buffer = 4 * 128 * H * W = 512 * H * W floats
-     * For 1024x1024: ~2GB per buffer, ~6GB total working memory
-     * For 1792x1792: ~6GB per buffer, ~18GB total working memory
+    /* Work buffers are now allocated on-demand in encode/decode functions
+     * based on actual image dimensions. This saves significant memory
+     * when generating smaller images (e.g., 256x256 uses ~100MB instead of 6GB).
      */
-    size_t max_spatial = (size_t)vae->max_h * vae->max_w;
-    size_t max_channels = vae->base_channels;  /* 128 at full resolution */
-    vae->work_size = 4 * max_channels * max_spatial * sizeof(float);
-    vae->work1 = malloc(vae->work_size);
-    vae->work2 = malloc(vae->work_size);
-    vae->work3 = malloc(vae->work_size);
-
-    if (!vae->work1 || !vae->work2 || !vae->work3) {
-        flux_vae_free(vae);
-        return NULL;
-    }
+    vae->work1 = NULL;
+    vae->work2 = NULL;
+    vae->work3 = NULL;
+    vae->work_size = 0;
+    vae->cur_alloc_h = 0;
+    vae->cur_alloc_w = 0;
 
     return vae;
 }

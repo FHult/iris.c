@@ -196,6 +196,7 @@ static id<MTLComputePipelineState> g_bmm_bf16_sv_pipeline;
 static id<MTLComputePipelineState> g_softmax_bf16_pipeline;
 static id<MTLComputePipelineState> g_f32_to_bf16_pipeline;
 static id<MTLComputePipelineState> g_bf16_to_f32_pipeline;
+static id<MTLComputePipelineState> g_bf16_to_f16_pipeline;
 static id<MTLComputePipelineState> g_linear_bf16_pipeline;
 static id<MTLComputePipelineState> g_split_qkv_mlp_bf16_pipeline;
 static id<MTLComputePipelineState> g_concat_attn_mlp_bf16_pipeline;
@@ -205,6 +206,17 @@ static id<MTLComputePipelineState> g_transpose_to_heads_bf16_pipeline;
 static id<MTLComputePipelineState> g_transpose_from_heads_bf16_pipeline;
 static id<MTLComputePipelineState> g_attention_fused_bf16_pipeline;
 static int g_shaders_initialized;
+
+/* Flag indicating loaded weights are already F16 (no bf16→f16 conversion needed) */
+static int g_weights_are_f16 = 0;
+
+/* Set whether loaded weights are already F16 format (skips bf16→f16 conversion) */
+void flux_metal_set_weights_f16_mode(int is_f16) {
+    g_weights_are_f16 = is_f16;
+    if (is_f16) {
+        NSLog(@"Metal: F16 weight mode enabled - skipping bf16→f16 conversion");
+    }
+}
 
 /* ========================================================================
  * Weight Buffer Cache
@@ -935,7 +947,7 @@ static void clear_f16_cache(void) {
     pthread_mutex_unlock(&g_f16_cache_mutex);
 }
 
-/* Get bf16 weights as f16 buffer for MPS */
+/* Get bf16 weights as f16 buffer for MPS (GPU-accelerated conversion) */
 static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size_t num_elements) {
     pthread_mutex_lock(&g_f16_cache_mutex);
 
@@ -948,34 +960,73 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
         }
     }
 
-    /* Convert bf16 to f16 */
-    uint16_t *f16_data = malloc(num_elements * sizeof(uint16_t));
-    if (!f16_data) {
-        pthread_mutex_unlock(&g_f16_cache_mutex);
-        return nil;
-    }
-    for (size_t i = 0; i < num_elements; i++) {
-        f16_data[i] = bf16_to_f16(weights[i]);
-    }
-
     size_t size = num_elements * sizeof(uint16_t);
+    id<MTLBuffer> buf = nil;
 
-    /* Cache is full - just create buffer without caching */
-    if (g_f16_cache_count >= F16_WEIGHT_CACHE_SIZE) {
-        id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
-                                                  length:size
-                                                 options:MTLResourceStorageModeShared];
+    /* If weights are already F16, just create buffer directly (no conversion needed) */
+    if (g_weights_are_f16) {
+        buf = [g_device newBufferWithBytes:weights
+                                    length:size
+                                   options:MTLResourceStorageModeShared];
+    }
+    /* Use GPU kernel for conversion if available (much faster) */
+    else if (g_shaders_initialized && g_bf16_to_f16_pipeline) {
+        /* Upload bf16 data to GPU */
+        id<MTLBuffer> input_buf = [g_device newBufferWithBytes:weights
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared];
+        /* Allocate output buffer */
+        id<MTLBuffer> output_buf = [g_device newBufferWithLength:size
+                                                         options:MTLResourceStorageModeShared];
+
+        if (input_buf && output_buf) {
+            /* Run GPU conversion kernel */
+            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+            int n = (int)num_elements;
+            [encoder setComputePipelineState:g_bf16_to_f16_pipeline];
+            [encoder setBuffer:input_buf offset:0 atIndex:0];
+            [encoder setBuffer:output_buf offset:0 atIndex:1];
+            [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+            NSUInteger threads = 256;
+            NSUInteger groups = (num_elements + threads - 1) / threads;
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [encoder endEncoding];
+
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+
+            buf = output_buf;
+            /* input_buf is released automatically by ARC */
+        }
+    }
+
+    /* Fallback to CPU conversion if GPU not available */
+    if (!buf) {
+        uint16_t *f16_data = malloc(size);
+        if (!f16_data) {
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return nil;
+        }
+        for (size_t i = 0; i < num_elements; i++) {
+            f16_data[i] = bf16_to_f16(weights[i]);
+        }
+        buf = [g_device newBufferWithBytes:f16_data
+                                    length:size
+                                   options:MTLResourceStorageModeShared];
         free(f16_data);
+    }
+
+    /* Cache is full - return without caching */
+    if (g_f16_cache_count >= F16_WEIGHT_CACHE_SIZE) {
         pthread_mutex_unlock(&g_f16_cache_mutex);
         return buf;
     }
 
-    /* Create and cache */
-    id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
-                                              length:size
-                                             options:MTLResourceStorageModeShared];
-    free(f16_data);
-
+    /* Cache the result */
     g_f16_cache[g_f16_cache_count].cpu_ptr = weights;
     g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
     g_f16_cache[g_f16_cache_count].size = size;
@@ -1971,6 +2022,47 @@ void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> outpu
     }
 }
 
+/* Bulk bf16 to f16 conversion (CPU memory to CPU memory via GPU) */
+void flux_metal_bf16_to_f16_bulk(const uint16_t *input, uint16_t *output, int n) {
+    if (!g_shaders_initialized || !g_bf16_to_f16_pipeline || n <= 0) return;
+
+    @autoreleasepool {
+        size_t size = (size_t)n * sizeof(uint16_t);
+
+        /* Create input buffer with data */
+        id<MTLBuffer> input_buf = [g_device newBufferWithBytes:input
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared];
+
+        /* Create output buffer */
+        id<MTLBuffer> output_buf = [g_device newBufferWithLength:size
+                                                         options:MTLResourceStorageModeShared];
+
+        if (!input_buf || !output_buf) return;
+
+        /* Run conversion kernel */
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_bf16_to_f16_pipeline];
+        [encoder setBuffer:input_buf offset:0 atIndex:0];
+        [encoder setBuffer:output_buf offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Copy result back to CPU */
+        memcpy(output, [output_buf contents], size);
+    }
+}
+
 /* RMSNorm on bf16 tensors */
 void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
                          int seq_len, int hidden, float eps) {
@@ -2950,63 +3042,93 @@ int flux_metal_init_shaders(void) {
     @autoreleasepool {
         NSError *error = nil;
 
-        /* Try to find the shader file in various locations */
-        NSString *shaderPath = nil;
-        NSArray *searchPaths = @[
-            @"flux_shaders.metal",
-            @"./flux_shaders.metal",
-            [[NSBundle mainBundle] pathForResource:@"flux_shaders" ofType:@"metal"],
+        /* First, try to load pre-compiled metallib for faster startup */
+        NSArray *metallibSearchPaths = @[
+            @"flux_shaders.metallib",
+            @"./flux_shaders.metallib",
         ];
 
-        for (NSString *path in searchPaths) {
+        /* Try executable directory for metallib */
+        NSString *execPath = [[NSBundle mainBundle] executablePath];
+        NSString *execDir = execPath ? [execPath stringByDeletingLastPathComponent] : nil;
+
+        for (NSString *path in metallibSearchPaths) {
             if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
-                shaderPath = path;
-                break;
+                NSURL *url = [NSURL fileURLWithPath:path];
+                g_shader_library = [g_device newLibraryWithURL:url error:&error];
+                if (g_shader_library) {
+                    fprintf(stderr, "Metal shaders: loaded pre-compiled %s\n", [path UTF8String]);
+                    break;
+                }
             }
         }
 
-        if (!shaderPath) {
-            /* Try executable directory */
-            NSString *execPath = [[NSBundle mainBundle] executablePath];
-            if (execPath) {
-                NSString *execDir = [execPath stringByDeletingLastPathComponent];
+        if (!g_shader_library && execDir) {
+            NSString *path = [execDir stringByAppendingPathComponent:@"flux_shaders.metallib"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                NSURL *url = [NSURL fileURLWithPath:path];
+                g_shader_library = [g_device newLibraryWithURL:url error:&error];
+                if (g_shader_library) {
+                    fprintf(stderr, "Metal shaders: loaded pre-compiled %s\n", [path UTF8String]);
+                }
+            }
+        }
+
+        /* Fall back to runtime compilation from source */
+        if (!g_shader_library) {
+            NSString *shaderPath = nil;
+            NSArray *searchPaths = @[
+                @"flux_shaders.metal",
+                @"./flux_shaders.metal",
+                [[NSBundle mainBundle] pathForResource:@"flux_shaders" ofType:@"metal"],
+            ];
+
+            for (NSString *path in searchPaths) {
+                if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                    shaderPath = path;
+                    break;
+                }
+            }
+
+            if (!shaderPath && execDir) {
                 NSString *path = [execDir stringByAppendingPathComponent:@"flux_shaders.metal"];
                 if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
                     shaderPath = path;
                 }
             }
-        }
 
-        if (!shaderPath) {
-            fprintf(stderr, "Metal shaders: flux_shaders.metal not found\n");
-            return 0;
-        }
+            if (!shaderPath) {
+                fprintf(stderr, "Metal shaders: flux_shaders.metal not found\n");
+                return 0;
+            }
 
-        /* Load shader source */
-        NSString *shaderSource = [NSString stringWithContentsOfFile:shaderPath
-                                                           encoding:NSUTF8StringEncoding
-                                                              error:&error];
-        if (!shaderSource) {
-            fprintf(stderr, "Metal shaders: failed to read %s: %s\n",
-                    [shaderPath UTF8String], [[error localizedDescription] UTF8String]);
-            return 0;
-        }
+            /* Load shader source */
+            NSString *shaderSource = [NSString stringWithContentsOfFile:shaderPath
+                                                               encoding:NSUTF8StringEncoding
+                                                                  error:&error];
+            if (!shaderSource) {
+                fprintf(stderr, "Metal shaders: failed to read %s: %s\n",
+                        [shaderPath UTF8String], [[error localizedDescription] UTF8String]);
+                return 0;
+            }
 
-        /* Compile shader library */
-        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+            /* Compile shader library */
+            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-        options.mathMode = MTLMathModeFast;
+            options.mathMode = MTLMathModeFast;
 #else
-        options.fastMathEnabled = YES;
+            options.fastMathEnabled = YES;
 #endif
 
-        g_shader_library = [g_device newLibraryWithSource:shaderSource
-                                                  options:options
-                                                    error:&error];
-        if (!g_shader_library) {
-            fprintf(stderr, "Metal shaders: compilation failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            return 0;
+            g_shader_library = [g_device newLibraryWithSource:shaderSource
+                                                      options:options
+                                                        error:&error];
+            if (!g_shader_library) {
+                fprintf(stderr, "Metal shaders: compilation failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                return 0;
+            }
+            fprintf(stderr, "Metal shaders: compiled from source\n");
         }
 
         /* Create compute pipeline states for each kernel */
@@ -3220,6 +3342,11 @@ int flux_metal_init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"bf16_to_f32_convert"];
         if (func) {
             g_bf16_to_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"bf16_to_f16_convert"];
+        if (func) {
+            g_bf16_to_f16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
         func = [g_shader_library newFunctionWithName:@"linear_bf16"];

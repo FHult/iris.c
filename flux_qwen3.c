@@ -37,6 +37,33 @@
  * Fixes issue #9: SIGKILL on 16GB Metal systems during text encoding. */
 #define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
 
+/*
+ * Try to open f16-converted safetensors first, fall back to original.
+ * For a path like "foo/bar.safetensors", tries "foo/bar.f16.safetensors" first.
+ */
+static safetensors_file_t *safetensors_open_prefer_f16(const char *path) {
+    char f16_path[1024];
+    safetensors_file_t *sf = NULL;
+
+    /* Build f16 path: replace .safetensors with .f16.safetensors */
+    const char *ext = strstr(path, ".safetensors");
+    if (ext) {
+        size_t prefix_len = (size_t)(ext - path);
+        if (prefix_len < sizeof(f16_path) - 20) {
+            memcpy(f16_path, path, prefix_len);
+            strcpy(f16_path + prefix_len, ".f16.safetensors");
+
+            sf = safetensors_open(f16_path);
+            if (sf) {
+                return sf;
+            }
+        }
+    }
+
+    /* Fall back to original path */
+    return safetensors_open(path);
+}
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -667,14 +694,14 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
         return NULL;
     }
 
-    /* Open safetensors files */
+    /* Open safetensors files (prefer f16 if available) */
     char path1[512], path2[512];
     snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
     snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
 
     safetensors_file_t *files[2];
-    files[0] = safetensors_open(path1);
-    files[1] = safetensors_open(path2);
+    files[0] = safetensors_open_prefer_f16(path1);
+    files[1] = safetensors_open_prefer_f16(path2);
 
     if (!files[0] || !files[1]) {
         fprintf(stderr, "qwen3_model_load: failed to open safetensors files\n");
@@ -771,13 +798,13 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         return NULL;
     }
 
-    /* Open safetensors files and keep them open */
+    /* Open safetensors files and keep them open (prefer f16 if available) */
     char path1[512], path2[512];
     snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
     snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
 
-    model->sf_files[0] = safetensors_open(path1);
-    model->sf_files[1] = safetensors_open(path2);
+    model->sf_files[0] = safetensors_open_prefer_f16(path1);
+    model->sf_files[1] = safetensors_open_prefer_f16(path2);
 
     if (!model->sf_files[0] || !model->sf_files[1]) {
         fprintf(stderr, "qwen3_model_load_mmap: failed to open safetensors files\n");

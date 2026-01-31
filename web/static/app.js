@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const seedDisplay = document.getElementById('seed-display');
     const stepsInput = document.getElementById('steps');
     const stepsValue = document.getElementById('steps-value');
+    const showStepsCheckbox = document.getElementById('show-steps');
     const remixBtn = document.getElementById('remix-btn');
     const historySection = document.getElementById('history-section');
     const historyGrid = document.getElementById('history-grid');
@@ -853,6 +854,19 @@ document.addEventListener('DOMContentLoaded', () => {
             progressPrompt.title = prompt;
             showProgress('Starting generation...', 0);
 
+            // Clear output area to show placeholder while generating
+            outputArea.innerHTML = `
+                <div class="placeholder">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                        <polyline points="21 15 16 10 5 21"></polyline>
+                    </svg>
+                    <p>Generating...</p>
+                </div>
+            `;
+            imageInfo.style.display = 'none';
+
             fetch('/generate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -863,6 +877,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     steps,
                     seed: seed ? parseInt(seed) : null,
                     reference_images: referenceImages,
+                    show_steps: showStepsCheckbox.checked,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -918,6 +933,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const stepTime = data.step_time ? ` (${data.step_time.toFixed(1)}s)` : '';
             const elapsed = data.elapsed ? ` - ${data.elapsed.toFixed(1)}s elapsed` : '';
             showProgress(`${data.phase} - Step ${data.progress}/${data.total_steps}${stepTime}${elapsed}`, percent);
+        });
+
+        currentEventSource.addEventListener('step_image', (e) => {
+            const data = JSON.parse(e.data);
+            const url = `${data.image_url}?t=${Date.now()}`;
+            outputArea.innerHTML = `
+                <div class="step-preview">
+                    <img src="${url}" alt="Step ${data.step} preview">
+                    <span class="step-badge">Step ${data.step}/${data.total}</span>
+                </div>
+            `;
         });
 
         currentEventSource.addEventListener('status', (e) => {
@@ -1268,6 +1294,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 stepsInput.value = settings.steps;
                 stepsValue.textContent = settings.steps;
             }
+            if (settings.showSteps !== undefined) {
+                showStepsCheckbox.checked = settings.showSteps;
+            }
         } catch (err) {
             console.error('Failed to load settings:', err);
         }
@@ -1279,6 +1308,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 width: widthSelect.value,
                 height: heightSelect.value,
                 steps: stepsInput.value,
+                showSteps: showStepsCheckbox.checked,
             };
             localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
         } catch (err) {
@@ -1290,6 +1320,7 @@ document.addEventListener('DOMContentLoaded', () => {
     widthSelect.addEventListener('change', saveSettings);
     heightSelect.addEventListener('change', saveSettings);
     stepsInput.addEventListener('change', saveSettings);
+    showStepsCheckbox.addEventListener('change', saveSettings);
 
     // ========== Prompt History ==========
     const PROMPT_HISTORY_KEY = 'flux_prompt_history';

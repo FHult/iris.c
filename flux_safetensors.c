@@ -380,12 +380,17 @@ int safetensor_is_bf16(const safetensor_t *t) {
     return t && t->dtype == DTYPE_BF16;
 }
 
+/* Check if tensor is 16-bit float (BF16 or F16) */
+int safetensor_is_f16_or_bf16(const safetensor_t *t) {
+    return t && (t->dtype == DTYPE_BF16 || t->dtype == DTYPE_F16);
+}
+
 uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t *t) {
     if (!sf || !t) return NULL;
 
-    /* Only works for BF16 tensors */
-    if (t->dtype != DTYPE_BF16) {
-        fprintf(stderr, "safetensors_get_bf16: tensor is not BF16 (dtype=%d)\n", t->dtype);
+    /* Works for BF16 or F16 tensors (both are 16-bit) */
+    if (t->dtype != DTYPE_BF16 && t->dtype != DTYPE_F16) {
+        fprintf(stderr, "safetensors_get_bf16: tensor is not BF16/F16 (dtype=%d)\n", t->dtype);
         return NULL;
     }
 
@@ -395,7 +400,7 @@ uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t 
     const void *data = safetensors_data(sf, t);
     if (!data) return NULL;
 
-    /* Allocate and copy bf16 data (already in correct format) */
+    /* Allocate and copy data (already in 16-bit format) */
     uint16_t *out = (uint16_t *)malloc(n * sizeof(uint16_t));
     if (!out) return NULL;
 
@@ -403,10 +408,11 @@ uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t 
     return out;
 }
 
-/* Get direct pointer to bf16 data in mmap'd region (no copy, caller must not free) */
+/* Get direct pointer to 16-bit data in mmap'd region (no copy, caller must not free) */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t) {
     if (!sf || !t) return NULL;
-    if (t->dtype != DTYPE_BF16) return NULL;
+    /* Accept both BF16 and F16 (both are 16-bit) */
+    if (t->dtype != DTYPE_BF16 && t->dtype != DTYPE_F16) return NULL;
     return (uint16_t *)safetensors_data(sf, t);
 }
 

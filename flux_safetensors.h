@@ -64,13 +64,19 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
  * Handles conversion from F16/BF16 */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get tensor data as raw bf16 array (allocates, caller must free)
- * Only works for BF16 tensors. Returns NULL for other dtypes. */
+/* Get tensor data as raw 16-bit array (allocates, caller must free)
+ * Works for BF16 or F16 tensors. Returns NULL for other dtypes. */
 uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get direct pointer to bf16 data in mmap'd region (no copy, caller must NOT free)
- * Only works for BF16 tensors. Returns NULL for other dtypes. */
+/* Get direct pointer to 16-bit data in mmap'd region (no copy, caller must NOT free)
+ * Works for BF16 or F16 tensors. Returns NULL for other dtypes. */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t);
+
+/* Check if tensor is BF16 dtype */
+int safetensor_is_bf16(const safetensor_t *t);
+
+/* Check if tensor is BF16 or F16 dtype (any 16-bit float) */
+int safetensor_is_f16_or_bf16(const safetensor_t *t);
 
 /* Check if tensor is stored in bf16 format */
 int safetensor_is_bf16(const safetensor_t *t);

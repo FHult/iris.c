@@ -283,12 +283,14 @@ static float *mmap_get_f32(safetensors_file_t *sf, const char *name) {
     return safetensors_get_f32(sf, t);
 }
 
-/* Helper to get tensor as bf16 direct pointer (used by mmap load functions)
+/* Helper to get tensor as 16-bit direct pointer (used by mmap load functions)
+ * Accepts both BF16 and pre-converted F16 data.
  * Returns pointer into mmap'd region - caller must NOT free */
 static uint16_t *mmap_get_bf16(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) return NULL;
-    if (!safetensor_is_bf16(t)) return NULL;
+    /* Accept both BF16 and F16 (pre-converted) */
+    if (!safetensor_is_f16_or_bf16(t)) return NULL;
     return safetensors_get_bf16_direct(sf, t);
 }
 
@@ -3915,14 +3917,15 @@ static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
     return safetensors_get_f32(sf, t);
 }
 
-/* Get tensor as bf16 (for GPU acceleration) */
+/* Get tensor as 16-bit (for GPU acceleration) - accepts BF16 or pre-converted F16 */
 static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) {
         return NULL;  /* Not an error - bf16 is optional */
     }
-    if (!safetensor_is_bf16(t)) {
-        return NULL;  /* Not bf16, will use f32 version */
+    /* Accept both BF16 and F16 (pre-converted) */
+    if (!safetensor_is_f16_or_bf16(t)) {
+        return NULL;  /* Not 16-bit, will use f32 version */
     }
     return safetensors_get_bf16(sf, t);
 }

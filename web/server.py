@@ -183,6 +183,15 @@ class Job:
             except Exception:
                 pass
         self.temp_files = []
+        # Clean up step images
+        step_images = getattr(self, 'step_images', {})
+        for path in step_images.values():
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+        self.step_images = {}
 
 
 class FluxServer:
@@ -304,24 +313,42 @@ class FluxServer:
                 data["elapsed"] = elapsed
                 job.queue.put(("progress", data))
 
+            elif event_type == "step_image":
+                step = event.get("step", 0)
+                total = event.get("total", job.total_steps)
+                path = event.get("path", "")
+                elapsed = event.get("elapsed", 0)
+                # Store step image path for serving
+                if not hasattr(job, 'step_images'):
+                    job.step_images = {}
+                job.step_images[step] = path
+                job.queue.put(("step_image", {
+                    "step": step,
+                    "total": total,
+                    "image_url": f"/step-image/{job.id}/{step}",
+                    "elapsed": elapsed
+                }))
+
             elif event_type == "complete":
                 job.status = "complete"
                 job.output_path = OUTPUT_DIR / f"{job.id}.png"
                 job.progress = job.total_steps
                 total_time = event.get("total_time", 0)
-                job.queue.put(("complete", {
-                    "image_url": f"/image/{job.id}",
-                    "total_time": total_time
-                }))
-                job.queue.put(("done", None))
                 # Clean up temp files now that generation is complete
                 job.cleanup_temp_files()
-                # Add to history
+                # Add to history BEFORE sending complete event to avoid race condition
+                # (frontend calls loadHistory immediately on receiving complete)
                 with history_lock:
                     history.insert(0, job)
                     if len(history) > MAX_HISTORY:
                         history.pop()
                     save_history()
+                # Now send the complete event
+                job.queue.put(("complete", {
+                    "image_url": f"/image/{job.id}",
+                    "total_time": total_time
+                }))
+                job.queue.put(("done", None))
                 self.current_job = None
 
             elif event_type == "error":
@@ -333,7 +360,7 @@ class FluxServer:
                 job.cleanup_temp_files()
                 self.current_job = None
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -351,6 +378,7 @@ class FluxServer:
                 "width": width,
                 "height": height,
                 "steps": steps,
+                "show_steps": show_steps,
             }
 
             if seed is not None and seed != "":
@@ -380,11 +408,11 @@ class FluxServer:
             self.ready = False
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
     """Run generation using the persistent flux server."""
     global flux_server
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
         # Request sent successfully - temp files will be cleaned up in _read_output
         # when the job completes or errors
     except Exception as e:
@@ -416,6 +444,7 @@ def generate():
     height = int(data.get("height", 512))
     steps = int(data.get("steps", 4))
     seed = data.get("seed")
+    show_steps = bool(data.get("show_steps", True))
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -494,7 +523,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths),
+        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps),
         daemon=True,
     )
     thread.start()
@@ -557,6 +586,25 @@ def get_image(job_id):
         return jsonify({"error": "Image not found"}), 404
 
     return send_file(job.output_path, mimetype="image/png")
+
+
+@app.route("/step-image/<job_id>/<int:step>")
+def get_step_image(job_id, step):
+    """Serve a step image (intermediate denoising result)."""
+    # Check active jobs
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    step_images = getattr(job, 'step_images', {})
+    path = step_images.get(step)
+
+    if not path or not Path(path).exists():
+        return jsonify({"error": "Step image not found"}), 404
+
+    return send_file(path, mimetype="image/png")
 
 
 @app.route("/thumb/<job_id>")
