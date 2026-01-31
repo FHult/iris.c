@@ -11,6 +11,7 @@
 
 #include "flux_qwen3.h"
 #include "flux_safetensors.h"
+#include "flux_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,12 +193,6 @@ static void qwen3_head_rms_norm(float *out, const float *x, const float *weight,
                 out_head[i] = x_head[i] * rms_inv * weight[i];
             }
         }
-    }
-}
-
-static void qwen3_silu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] / (1.0f + expf(-x[i]));
     }
 }
 
@@ -443,7 +438,7 @@ static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int se
 
     /* SwiGLU: silu(gate) * up */
     int n = seq_len * intermediate;
-    qwen3_silu(model->mlp_gate, n);
+    flux_silu(model->mlp_gate, n);
     for (int i = 0; i < n; i++) {
         model->mlp_gate[i] *= model->mlp_up[i];
     }
