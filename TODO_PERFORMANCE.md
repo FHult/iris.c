@@ -40,6 +40,13 @@ Most optimizations in this list were based on assumptions that don't hold for th
 - [x] GPU bf16→f16 JIT conversion (450 MB/s, used by MPS matmul)
 - [x] Transformer dynamic buffer allocation
 - [x] SiLU consolidation - removed duplicate qwen3_silu(), now uses flux_silu()
+- [x] **Qwen3 async layer prefetching** - Uses GCD to prefetch next layer's weights
+      while computing current layer. Overlaps mmap I/O with CPU computation.
+      ~30% speedup on text encoding (17s → 12s). Set FLUX_NO_PREFETCH=1 to disable.
+- [x] **Metal command batching** - Already implemented via flux_gpu_batch_begin/end.
+      Queues all block operations without waiting, waits only at end.
+- [x] **Transformer weight prefetch** - Already optimized by batching design.
+      Weight loading overlaps with GPU computation naturally.
 
 ---
 
