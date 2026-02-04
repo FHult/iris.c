@@ -7,6 +7,11 @@
  * - GQA with 32 query heads and 8 KV heads
  * - RoPE positional embeddings
  * - SwiGLU MLP
+ *
+ * Optimization: Layer weight prefetching
+ * - Uses GCD (Grand Central Dispatch) to prefetch next layer's weights
+ *   while computing current layer
+ * - Overlaps I/O (mmap page faults) with computation
  */
 
 #include "flux_qwen3.h"
@@ -16,6 +21,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
+
+/* GCD for async prefetching (macOS/iOS) */
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#define USE_PREFETCH 1
+#endif
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
@@ -110,6 +122,84 @@ struct qwen3_model {
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
 static void free_layer_weights(qwen3_layer_t *layer);
+
+/* ========================================================================
+ * Layer Weight Prefetching (Async I/O Optimization)
+ *
+ * While computing layer N, prefetch layer N+1's weights in background.
+ * This overlaps mmap page faults with computation.
+ * ======================================================================== */
+
+#ifdef USE_PREFETCH
+
+/* Runtime control: set FLUX_NO_PREFETCH=1 to disable for A/B testing */
+static int prefetch_enabled(void) {
+    static int checked = 0, enabled = 1;
+    if (!checked) {
+        enabled = (getenv("FLUX_NO_PREFETCH") == NULL);
+        checked = 1;
+    }
+    return enabled;
+}
+
+/* Prefetch state */
+typedef struct {
+    dispatch_queue_t queue;
+    dispatch_semaphore_t ready;
+    qwen3_layer_t *target_layer;
+    safetensors_file_t **files;
+    int num_files;
+    int layer_idx;
+    int result;
+    int active;
+} prefetch_state_t;
+
+static prefetch_state_t g_prefetch = {0};
+
+/* Initialize prefetch system */
+static void prefetch_init(void) {
+    if (!g_prefetch.queue) {
+        g_prefetch.queue = dispatch_queue_create("qwen3.prefetch", DISPATCH_QUEUE_SERIAL);
+        g_prefetch.ready = dispatch_semaphore_create(0);
+    }
+    g_prefetch.active = 0;
+}
+
+/* Start async prefetch for a layer */
+static void prefetch_start(qwen3_layer_t *layer, safetensors_file_t **files,
+                           int num_files, int layer_idx) {
+    g_prefetch.target_layer = layer;
+    g_prefetch.files = files;
+    g_prefetch.num_files = num_files;
+    g_prefetch.layer_idx = layer_idx;
+    g_prefetch.result = 0;
+    g_prefetch.active = 1;
+
+    dispatch_async(g_prefetch.queue, ^{
+        g_prefetch.result = load_layer_weights(g_prefetch.target_layer,
+                                                g_prefetch.files,
+                                                g_prefetch.num_files,
+                                                g_prefetch.layer_idx);
+        dispatch_semaphore_signal(g_prefetch.ready);
+    });
+}
+
+/* Wait for prefetch to complete, returns load result */
+static int prefetch_wait(void) {
+    if (!g_prefetch.active) return 0;
+    dispatch_semaphore_wait(g_prefetch.ready, DISPATCH_TIME_FOREVER);
+    g_prefetch.active = 0;
+    return g_prefetch.result;
+}
+
+#endif /* USE_PREFETCH */
+
+/* Timing helper */
+static double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /* ========================================================================
  * Basic Operations
@@ -509,36 +599,97 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
-    for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
-        /* In mmap mode, load layer weights on-demand */
-        if (model->use_mmap) {
-            safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
-            if (load_layer_weights(&model->layers[layer_idx], files, 2, layer_idx) != 0) {
-                fprintf(stderr, "Failed to load layer %d weights\n", layer_idx);
-                return NULL;
+#ifdef USE_PREFETCH
+    /* Prefetch-enabled path: overlap I/O with computation */
+    if (model->use_mmap && prefetch_enabled()) {
+        double t_start = get_time_ms();
+        prefetch_init();
+        safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
+
+        /* Load first layer directly (nothing to prefetch yet) */
+        if (load_layer_weights(&model->layers[0], files, 2, 0) != 0) {
+            fprintf(stderr, "Failed to load layer 0 weights\n");
+            return NULL;
+        }
+
+        for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
+            /* Start prefetching NEXT layer while we compute current */
+            if (layer_idx < model->num_layers - 1) {
+                prefetch_start(&model->layers[layer_idx + 1], files, 2, layer_idx + 1);
+            }
+
+            /* Compute current layer */
+            qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
+
+            /* Free current layer weights */
+            free_layer_weights(&model->layers[layer_idx]);
+
+            /* Wait for prefetch to complete before next iteration */
+            if (layer_idx < model->num_layers - 1) {
+                if (prefetch_wait() != 0) {
+                    fprintf(stderr, "Failed to prefetch layer %d weights\n", layer_idx + 1);
+                    return NULL;
+                }
+            }
+
+            /* Save output at extraction layers (9, 18, 27) */
+            if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
+                memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
+            } else if (layer_idx == QWEN3_OUTPUT_LAYER_2) {
+                memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
+            } else if (layer_idx == QWEN3_OUTPUT_LAYER_3) {
+                memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
+            }
+
+            /* Progress indicator */
+            if ((layer_idx + 1) % 6 == 0) {
+                fprintf(stderr, ".");
+                fflush(stderr);
             }
         }
 
-        qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
+        double t_end = get_time_ms();
+        fprintf(stderr, " [prefetch: %.1fs]", (t_end - t_start) / 1000.0);
+    } else
+#endif
+    /* Standard path (no mmap or no prefetch support) */
+    {
+        double t_start = get_time_ms();
+        for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
+            /* In mmap mode, load layer weights on-demand */
+            if (model->use_mmap) {
+                safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
+                if (load_layer_weights(&model->layers[layer_idx], files, 2, layer_idx) != 0) {
+                    fprintf(stderr, "Failed to load layer %d weights\n", layer_idx);
+                    return NULL;
+                }
+            }
 
-        /* In mmap mode, free layer weights after use */
+            qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
+
+            /* In mmap mode, free layer weights after use */
+            if (model->use_mmap) {
+                free_layer_weights(&model->layers[layer_idx]);
+            }
+
+            /* Save output at extraction layers (9, 18, 27) */
+            if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
+                memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
+            } else if (layer_idx == QWEN3_OUTPUT_LAYER_2) {
+                memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
+            } else if (layer_idx == QWEN3_OUTPUT_LAYER_3) {
+                memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
+            }
+
+            /* Progress indicator */
+            if ((layer_idx + 1) % 6 == 0) {
+                fprintf(stderr, ".");
+                fflush(stderr);
+            }
+        }
+        double t_end = get_time_ms();
         if (model->use_mmap) {
-            free_layer_weights(&model->layers[layer_idx]);
-        }
-
-        /* Save output at extraction layers (9, 18, 27) */
-        if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
-            memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
-        } else if (layer_idx == QWEN3_OUTPUT_LAYER_2) {
-            memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
-        } else if (layer_idx == QWEN3_OUTPUT_LAYER_3) {
-            memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
-        }
-
-        /* Progress indicator */
-        if ((layer_idx + 1) % 6 == 0) {
-            fprintf(stderr, ".");
-            fflush(stderr);
+            fprintf(stderr, " [sequential: %.1fs]", (t_end - t_start) / 1000.0);
         }
     }
 
