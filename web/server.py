@@ -37,6 +37,32 @@ THUMB_SIZE = 200  # Max dimension for thumbnails
 app = Flask(__name__, static_folder="static")
 
 
+def generate_thumbnail(job_id: str, source_path: Path) -> bool:
+    """Generate thumbnail for an image in background. Returns True on success."""
+    THUMB_DIR.mkdir(exist_ok=True)
+    thumb_path = THUMB_DIR / f"{job_id}.jpg"
+    if thumb_path.exists():
+        return True
+    try:
+        from PIL import Image
+        img = Image.open(source_path)
+        img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
+        # Convert to RGB for JPEG (handles RGBA)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', img.size, (0, 0, 0))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        img.save(thumb_path, "JPEG", quality=80)
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to generate thumbnail for {job_id}: {e}")
+        return False
+
+
 def convert_image_to_png(image_data: bytes) -> bytes:
     """
     Convert any image format to PNG for the C code.
@@ -87,8 +113,21 @@ jobs_lock = threading.Lock()
 
 # Store history of completed generations
 history = []
+history_by_id = {}  # O(1) lookup by job_id
 history_lock = threading.Lock()
 MAX_HISTORY = 10000  # Effectively unlimited; frontend handles pagination
+
+# Job queue for pending generations
+job_queue = []
+job_queue_lock = threading.Lock()
+
+# Batched history save
+history_dirty = False
+history_save_interval = 5.0  # seconds
+
+# Job cleanup settings
+JOB_CLEANUP_AGE = 3600  # Remove completed jobs after 1 hour
+JOB_CLEANUP_INTERVAL = 300  # Check every 5 minutes
 
 # Flux server process manager
 flux_server = None
@@ -97,16 +136,52 @@ flux_server_lock = threading.Lock()
 
 def save_history():
     """Save history to JSON file (must be called with history_lock held)."""
+    global history_dirty
     try:
         data = [job.to_history_dict() for job in history]
         with open(HISTORY_FILE, "w") as f:
             json.dump(data, f)
+        history_dirty = False
     except Exception as e:
         print(f"Warning: Failed to save history: {e}")
 
 
+def mark_history_dirty():
+    """Mark history as needing save (called with history_lock held)."""
+    global history_dirty
+    history_dirty = True
+
+
+def periodic_history_saver():
+    """Background thread that saves history periodically when dirty."""
+    global history_dirty
+    while True:
+        time.sleep(history_save_interval)
+        with history_lock:
+            if history_dirty:
+                save_history()
+
+
+def periodic_job_cleanup():
+    """Background thread that removes old completed jobs from memory."""
+    while True:
+        time.sleep(JOB_CLEANUP_INTERVAL)
+        now = time.time()
+        to_remove = []
+        with jobs_lock:
+            for job_id, job in jobs.items():
+                if job.status in ("complete", "error", "cancelled"):
+                    if now - job.created_at > JOB_CLEANUP_AGE:
+                        to_remove.append(job_id)
+            for job_id in to_remove:
+                del jobs[job_id]
+        if to_remove:
+            print(f"Cleaned up {len(to_remove)} old jobs from memory")
+
+
 def load_history_from_disk():
     """Load history from JSON file on startup."""
+    global history_by_id
     if not HISTORY_FILE.exists():
         return
     try:
@@ -125,6 +200,7 @@ def load_history_from_disk():
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
+            history_by_id[job_id] = job
         print(f"Loaded {len(history)} history items from disk")
     except Exception as e:
         print(f"Warning: Failed to load history: {e}")
@@ -336,13 +412,22 @@ class FluxServer:
                 total_time = event.get("total_time", 0)
                 # Clean up temp files now that generation is complete
                 job.cleanup_temp_files()
+                # Generate thumbnail in background thread
+                thumb_thread = threading.Thread(
+                    target=generate_thumbnail,
+                    args=(job.id, job.output_path),
+                    daemon=True
+                )
+                thumb_thread.start()
                 # Add to history BEFORE sending complete event to avoid race condition
                 # (frontend calls loadHistory immediately on receiving complete)
                 with history_lock:
                     history.insert(0, job)
+                    history_by_id[job.id] = job
                     if len(history) > MAX_HISTORY:
-                        history.pop()
-                    save_history()
+                        old_job = history.pop()
+                        history_by_id.pop(old_job.id, None)
+                    mark_history_dirty()  # Batched save instead of immediate
                 # Now send the complete event
                 job.queue.put(("complete", {
                     "image_url": f"/image/{job.id}",
@@ -350,6 +435,8 @@ class FluxServer:
                 }))
                 job.queue.put(("done", None))
                 self.current_job = None
+                # Process next queued job if any
+                process_job_queue()
 
             elif event_type == "error":
                 job.status = "error"
@@ -359,6 +446,8 @@ class FluxServer:
                 # Clean up temp files on error
                 job.cleanup_temp_files()
                 self.current_job = None
+                # Process next queued job if any
+                process_job_queue()
 
     def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
         """Send a generation request to the flux server."""
@@ -407,21 +496,99 @@ class FluxServer:
             self.process = None
             self.ready = False
 
+    def restart(self):
+        """Restart the flux server (used for cancellation)."""
+        print("Restarting flux server...")
+        self.stop()
+        self.start()
+        print("Flux server restarted")
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
-    """Run generation using the persistent flux server."""
+
+def process_job_queue():
+    """Process the next job in the queue if the server is free."""
     global flux_server
+    with job_queue_lock:
+        if not job_queue:
+            return
+        # Check if server is busy
+        if flux_server and flux_server.current_job:
+            return
+        # Get next job
+        queued = job_queue.pop(0)
+        # Update queue positions for remaining jobs
+        for i, q in enumerate(job_queue):
+            q['job'].queue.put(("queue_position", {"position": i + 1, "total": len(job_queue) + 1}))
+
+    # Start the job
+    job = queued['job']
+    job.status = "running"
+    job.queue.put(("status", job.to_dict()))
+
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
-        # Request sent successfully - temp files will be cleaned up in _read_output
-        # when the job completes or errors
+        flux_server.generate(
+            job,
+            queued['prompt'],
+            queued['width'],
+            queued['height'],
+            queued['steps'],
+            queued['seed'],
+            queued['input_image_path'],
+            queued['reference_image_paths'],
+            queued['show_steps']
+        )
     except Exception as e:
         job.status = "error"
         job.error = str(e)
         job.queue.put(("error", {"message": str(e)}))
         job.queue.put(("done", None))
-        # Clean up temp files immediately on send failure
         job.cleanup_temp_files()
+        # Try next job
+        process_job_queue()
+
+
+def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
+    """Queue a generation job. Starts immediately if server is free, otherwise queues."""
+    global flux_server
+
+    queued_job = {
+        'job': job,
+        'prompt': prompt,
+        'width': width,
+        'height': height,
+        'steps': steps,
+        'seed': seed,
+        'input_image_path': input_image_path,
+        'reference_image_paths': reference_image_paths,
+        'show_steps': show_steps,
+    }
+
+    with job_queue_lock:
+        # Check if server is busy
+        if flux_server and flux_server.current_job:
+            # Queue the job
+            job_queue.append(queued_job)
+            position = len(job_queue)
+            job.status = "queued"
+            job.queue.put(("queued", {"position": position, "total": position}))
+            return
+
+    # Server is free, start immediately
+    job.status = "running"
+    job.queue.put(("status", job.to_dict()))
+
+    try:
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
+    except Exception as e:
+        job.status = "error"
+        job.error = str(e)
+        job.queue.put(("error", {"message": str(e)}))
+        job.queue.put(("done", None))
+        job.cleanup_temp_files()
+
+
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
+    """Run generation using the persistent flux server (legacy, now uses queue)."""
+    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
 
 
 @app.route("/")
@@ -568,13 +735,10 @@ def get_image(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
 
-    # Fall back to history
+    # Fall back to history (O(1) lookup)
     if not job:
         with history_lock:
-            for h in history:
-                if h.id == job_id:
-                    job = h
-                    break
+            job = history_by_id.get(job_id)
 
     # Fall back to file on disk
     if not job:
@@ -672,24 +836,25 @@ def get_history():
 def delete_history(job_id):
     """Delete a history item."""
     with history_lock:
-        for i, job in enumerate(history):
-            if job.id == job_id:
-                history.pop(i)
-                # Delete the image file too
-                if job.output_path and job.output_path.exists():
-                    try:
-                        os.unlink(job.output_path)
-                    except OSError:
-                        pass
-                # Delete thumbnail too
-                thumb_path = THUMB_DIR / f"{job_id}.jpg"
-                if thumb_path.exists():
-                    try:
-                        os.unlink(thumb_path)
-                    except OSError:
-                        pass
-                save_history()
-                return jsonify({"status": "deleted"})
+        job = history_by_id.get(job_id)
+        if job:
+            history.remove(job)
+            del history_by_id[job_id]
+            # Delete the image file too
+            if job.output_path and job.output_path.exists():
+                try:
+                    os.unlink(job.output_path)
+                except OSError:
+                    pass
+            # Delete thumbnail too
+            thumb_path = THUMB_DIR / f"{job_id}.jpg"
+            if thumb_path.exists():
+                try:
+                    os.unlink(thumb_path)
+                except OSError:
+                    pass
+            mark_history_dirty()
+            return jsonify({"status": "deleted"})
     return jsonify({"error": "Not found"}), 404
 
 
@@ -727,9 +892,19 @@ def save_crop():
     # Add to history
     with history_lock:
         history.insert(0, job)
+        history_by_id[job_id] = job
         if len(history) > MAX_HISTORY:
-            history.pop()
-        save_history()
+            old_job = history.pop()
+            history_by_id.pop(old_job.id, None)
+        mark_history_dirty()
+
+    # Generate thumbnail in background
+    thumb_thread = threading.Thread(
+        target=generate_thumbnail,
+        args=(job_id, job.output_path),
+        daemon=True
+    )
+    thumb_thread.start()
 
     return jsonify({
         "job_id": job_id,
@@ -737,9 +912,34 @@ def save_crop():
     })
 
 
+@app.route("/server-status")
+def server_status():
+    """Get server status including ready state and current job."""
+    global flux_server
+    status = {
+        "ready": False,
+        "busy": False,
+        "current_job": None,
+        "queue_length": 0,
+    }
+
+    if flux_server:
+        status["ready"] = flux_server.ready
+        if flux_server.current_job:
+            status["busy"] = True
+            status["current_job"] = flux_server.current_job.id
+
+    with job_queue_lock:
+        status["queue_length"] = len(job_queue)
+
+    return jsonify(status)
+
+
 @app.route("/cancel/<job_id>", methods=["POST"])
 def cancel_job(job_id):
-    """Cancel a running job."""
+    """Cancel a running or queued job."""
+    global flux_server
+
     with jobs_lock:
         job = jobs.get(job_id)
 
@@ -749,7 +949,41 @@ def cancel_job(job_id):
     if job.status == "complete":
         return jsonify({"error": "Job already complete"}), 400
 
-    # Mark job as cancelled and send event
+    # Check if job is queued (not yet running)
+    with job_queue_lock:
+        for i, queued in enumerate(job_queue):
+            if queued['job'].id == job_id:
+                job_queue.pop(i)
+                job.status = "cancelled"
+                job.error = "Cancelled by user"
+                job.queue.put(("error", {"message": "Cancelled"}))
+                job.queue.put(("done", None))
+                job.cleanup_temp_files()
+                # Update queue positions for remaining jobs
+                for j, q in enumerate(job_queue):
+                    q['job'].queue.put(("queue_position", {"position": j + 1, "total": len(job_queue)}))
+                return jsonify({"status": "cancelled"})
+
+    # Job is currently running - need to restart flux server
+    if flux_server and flux_server.current_job and flux_server.current_job.id == job_id:
+        job.status = "cancelled"
+        job.error = "Cancelled by user"
+        job.queue.put(("error", {"message": "Cancelled"}))
+        job.queue.put(("done", None))
+        job.cleanup_temp_files()
+
+        # Restart the flux server to stop the current generation
+        # Do this in a background thread to not block the response
+        def restart_and_process_queue():
+            flux_server.restart()
+            process_job_queue()
+
+        restart_thread = threading.Thread(target=restart_and_process_queue, daemon=True)
+        restart_thread.start()
+
+        return jsonify({"status": "cancelled", "server_restarting": True})
+
+    # Job already finished or errored
     job.status = "cancelled"
     job.error = "Cancelled by user"
     job.queue.put(("error", {"message": "Cancelled"}))
@@ -786,6 +1020,13 @@ def main():
 
     # Load history from disk
     load_history_from_disk()
+
+    # Start background threads
+    history_saver_thread = threading.Thread(target=periodic_history_saver, daemon=True)
+    history_saver_thread.start()
+
+    job_cleanup_thread = threading.Thread(target=periodic_job_cleanup, daemon=True)
+    job_cleanup_thread.start()
 
     # Start flux server (persistent model)
     print("Starting flux server with persistent model...")
