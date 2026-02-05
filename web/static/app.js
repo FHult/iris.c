@@ -49,6 +49,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const downloadBtn = document.getElementById('download-btn');
     const promptHistoryBtn = document.getElementById('prompt-history-btn');
     const promptHistoryDropdown = document.getElementById('prompt-history-dropdown');
+    const stylePresetSelect = document.getElementById('style-preset');
+    const styleHint = document.getElementById('style-hint');
+    const stepsHint = document.getElementById('steps-hint');
+    const enhanceBtn = document.getElementById('enhance-btn');
+    const promptTextarea = document.getElementById('prompt');
 
     let currentEventSource = null;
     let referenceImageData = [null, null]; // Up to 2 reference images
@@ -63,6 +68,12 @@ document.addEventListener('DOMContentLoaded', () => {
     let historyPageSize = 20;
     let historyVisible = historyPageSize;
 
+    // Style presets and step guidance
+    let stylePresets = {};
+    let stepGuidance = {};
+    let isPromptEnhanced = false;
+    let originalPrompt = '';
+
     // Cropping state
     let isCropping = false;
     let cropStartX = 0, cropStartY = 0;
@@ -75,6 +86,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load history on page load
     loadHistory();
+
+    // Load style presets and step guidance
+    loadStylePresets();
 
     // Load saved settings from localStorage
     loadSavedSettings();
@@ -591,10 +605,68 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Update steps display
+    // Update steps display and hint
     stepsInput.addEventListener('input', () => {
-        stepsValue.textContent = stepsInput.value;
+        const steps = parseInt(stepsInput.value);
+        stepsValue.textContent = steps;
+        updateStepHint(steps);
     });
+
+    // Style preset change handler
+    if (stylePresetSelect) {
+        stylePresetSelect.addEventListener('change', () => {
+            const value = stylePresetSelect.value;
+            if (value && stylePresets[value]) {
+                const preset = stylePresets[value];
+                if (styleHint) {
+                    styleHint.textContent = preset.description;
+                }
+                // Update recommended steps
+                if (preset.recommended_steps) {
+                    stepsInput.value = preset.recommended_steps;
+                    stepsValue.textContent = preset.recommended_steps;
+                    updateStepHint(preset.recommended_steps);
+                }
+            } else {
+                if (styleHint) {
+                    styleHint.textContent = '';
+                }
+            }
+            // Reset enhanced state when style changes
+            isPromptEnhanced = false;
+            originalPrompt = '';
+            if (enhanceBtn) {
+                enhanceBtn.classList.remove('enhanced');
+                enhanceBtn.title = 'Enhance prompt with style modifiers';
+            }
+        });
+    }
+
+    // Enhance button handler
+    if (enhanceBtn) {
+        enhanceBtn.addEventListener('click', () => {
+            if (isPromptEnhanced) {
+                revertPrompt();
+            } else {
+                enhancePrompt();
+            }
+        });
+    }
+
+    // Reset enhanced state when prompt is manually edited
+    if (promptTextarea) {
+        promptTextarea.addEventListener('input', () => {
+            if (isPromptEnhanced) {
+                // User is editing, mark as no longer enhanced
+                isPromptEnhanced = false;
+                originalPrompt = '';
+                if (enhanceBtn) {
+                    enhanceBtn.classList.remove('enhanced');
+                    enhanceBtn.title = 'Enhance prompt with style modifiers';
+                }
+            }
+        });
+    }
 
     // Reference image slots handling
     const refSlots = document.querySelectorAll('.reference-image-slot');
@@ -1059,6 +1131,91 @@ document.addEventListener('DOMContentLoaded', () => {
         const url = `${imageUrl}?t=${Date.now()}`;
         outputArea.innerHTML = `<img src="${url}" alt="Generated image">`;
         imageInfo.style.display = 'flex';
+    }
+
+    // Load style presets from server
+    async function loadStylePresets() {
+        try {
+            const response = await fetch('/style-presets');
+            const data = await response.json();
+            stylePresets = data.presets || {};
+            stepGuidance = data.step_guidance || {};
+
+            // Populate style preset dropdown
+            if (stylePresetSelect) {
+                Object.entries(stylePresets).forEach(([key, preset]) => {
+                    const option = document.createElement('option');
+                    option.value = key;
+                    option.textContent = preset.name;
+                    stylePresetSelect.appendChild(option);
+                });
+            }
+
+            // Update initial step hint
+            updateStepHint(parseInt(stepsInput.value));
+        } catch (error) {
+            console.error('Failed to load style presets:', error);
+        }
+    }
+
+    // Update step hint based on current value
+    function updateStepHint(steps) {
+        if (stepsHint && stepGuidance[steps]) {
+            stepsHint.textContent = `(${stepGuidance[steps].label})`;
+        }
+    }
+
+    // Enhance prompt with selected style
+    async function enhancePrompt() {
+        const prompt = promptTextarea.value.trim();
+        if (!prompt) return;
+
+        const style = stylePresetSelect ? stylePresetSelect.value : '';
+
+        try {
+            const response = await fetch('/enhance-prompt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    prompt: prompt,
+                    style: style || null,
+                    auto_enhance: !style // Only auto-enhance if no style selected
+                })
+            });
+            const data = await response.json();
+
+            if (data.enhanced && data.enhanced !== prompt) {
+                originalPrompt = prompt;
+                promptTextarea.value = data.enhanced;
+                isPromptEnhanced = true;
+                if (enhanceBtn) {
+                    enhanceBtn.classList.add('enhanced');
+                    enhanceBtn.title = 'Prompt enhanced! Click to revert';
+                }
+
+                // Update steps if recommended
+                if (data.recommended_steps && data.recommended_steps !== parseInt(stepsInput.value)) {
+                    stepsInput.value = data.recommended_steps;
+                    stepsValue.textContent = data.recommended_steps;
+                    updateStepHint(data.recommended_steps);
+                }
+            }
+        } catch (error) {
+            console.error('Failed to enhance prompt:', error);
+        }
+    }
+
+    // Revert enhanced prompt to original
+    function revertPrompt() {
+        if (isPromptEnhanced && originalPrompt) {
+            promptTextarea.value = originalPrompt;
+            isPromptEnhanced = false;
+            originalPrompt = '';
+            if (enhanceBtn) {
+                enhanceBtn.classList.remove('enhanced');
+                enhanceBtn.title = 'Enhance prompt with style modifiers';
+            }
+        }
     }
 
     async function loadHistory() {

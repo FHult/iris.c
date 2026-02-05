@@ -152,19 +152,24 @@ textarea {
     min-height: 80px;
 }
 
-/* Prompt wrapper with history button */
+/* Prompt wrapper with action buttons */
 .prompt-wrapper {
     position: relative;
 }
 
 .prompt-wrapper textarea {
-    padding-right: 40px;
+    padding-right: 72px;
 }
 
-.prompt-history-btn {
+.prompt-buttons {
     position: absolute;
     top: 8px;
     right: 8px;
+    display: flex;
+    gap: 4px;
+}
+
+.prompt-action-btn {
     width: 28px;
     height: 28px;
     padding: 0;
@@ -179,9 +184,35 @@ textarea {
     transition: all 0.2s;
 }
 
-.prompt-history-btn:hover {
+.prompt-action-btn:hover {
     background: var(--border);
     color: var(--text-primary);
+}
+
+#enhance-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+#enhance-btn.enhanced {
+    color: var(--success);
+    border-color: var(--success);
+}
+
+/* Style preset hint */
+.style-hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+/* Steps hint */
+.steps-hint {
+    font-size: 0.75rem;
+    color: var(--accent);
+    font-weight: normal;
 }
 
 .prompt-history-dropdown {

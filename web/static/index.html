@@ -26,14 +26,29 @@
                                 placeholder="A fluffy orange cat sitting on a windowsill, warm sunlight..."
                                 required
                             ></textarea>
-                            <button type="button" id="prompt-history-btn" class="prompt-history-btn" title="Recent prompts">
-                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <circle cx="12" cy="12" r="10"></circle>
-                                    <polyline points="12 6 12 12 16 14"></polyline>
-                                </svg>
-                            </button>
+                            <div class="prompt-buttons">
+                                <button type="button" id="enhance-btn" class="prompt-action-btn" title="Enhance prompt with style modifiers">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                                    </svg>
+                                </button>
+                                <button type="button" id="prompt-history-btn" class="prompt-action-btn" title="Recent prompts">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <polyline points="12 6 12 12 16 14"></polyline>
+                                    </svg>
+                                </button>
+                            </div>
                         </div>
                         <div id="prompt-history-dropdown" class="prompt-history-dropdown"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="style-preset">Style Preset</label>
+                        <select id="style-preset" name="style_preset">
+                            <option value="">None (use prompt as-is)</option>
+                        </select>
+                        <span class="style-hint" id="style-hint"></span>
                     </div>
 
                     <div class="form-group">
@@ -104,7 +119,7 @@
 
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="steps">Steps: <span id="steps-value">4</span></label>
+                            <label for="steps">Steps: <span id="steps-value">4</span> <span id="steps-hint" class="steps-hint">(Standard)</span></label>
                             <input type="range" id="steps" name="steps" min="1" max="8" value="4">
                         </div>
                         <div class="form-group">

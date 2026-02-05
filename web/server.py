@@ -935,6 +935,152 @@ def server_status():
     return jsonify(status)
 
 
+# Style presets for prompt enhancement
+STYLE_PRESETS = {
+    "photo_realistic": {
+        "name": "Photo Realistic",
+        "description": "Photorealistic style with natural lighting",
+        "suffix": ", photorealistic, high resolution, natural lighting, sharp focus, detailed textures, professional photography",
+        "recommended_steps": 4,
+    },
+    "cinematic": {
+        "name": "Cinematic",
+        "description": "Movie-like dramatic lighting and composition",
+        "suffix": ", cinematic lighting, dramatic composition, film grain, anamorphic lens, movie still, atmospheric",
+        "recommended_steps": 4,
+    },
+    "digital_art": {
+        "name": "Digital Art",
+        "description": "Polished digital illustration style",
+        "suffix": ", digital art, highly detailed, vibrant colors, sharp lines, trending on artstation, professional illustration",
+        "recommended_steps": 4,
+    },
+    "anime": {
+        "name": "Anime",
+        "description": "Japanese anime/manga style",
+        "suffix": ", anime style, cel shaded, vibrant colors, clean lines, studio ghibli inspired, detailed",
+        "recommended_steps": 4,
+    },
+    "oil_painting": {
+        "name": "Oil Painting",
+        "description": "Classical oil painting aesthetic",
+        "suffix": ", oil painting, textured brush strokes, classical art, rich colors, museum quality, masterpiece",
+        "recommended_steps": 6,
+    },
+    "watercolor": {
+        "name": "Watercolor",
+        "description": "Soft watercolor painting style",
+        "suffix": ", watercolor painting, soft edges, flowing colors, paper texture, artistic, delicate details",
+        "recommended_steps": 4,
+    },
+    "concept_art": {
+        "name": "Concept Art",
+        "description": "Professional concept art for games/films",
+        "suffix": ", concept art, detailed environment, atmospheric perspective, professional, matte painting, epic scale",
+        "recommended_steps": 6,
+    },
+    "portrait": {
+        "name": "Portrait",
+        "description": "Professional portrait photography",
+        "suffix": ", portrait photography, studio lighting, shallow depth of field, professional headshot, detailed face, sharp focus",
+        "recommended_steps": 4,
+    },
+    "landscape": {
+        "name": "Landscape",
+        "description": "Epic landscape photography",
+        "suffix": ", landscape photography, golden hour, dramatic sky, wide angle, national geographic style, breathtaking scenery",
+        "recommended_steps": 4,
+    },
+    "fantasy": {
+        "name": "Fantasy",
+        "description": "Epic fantasy art style",
+        "suffix": ", fantasy art, magical atmosphere, ethereal lighting, detailed, epic composition, mythical, enchanted",
+        "recommended_steps": 6,
+    },
+    "scifi": {
+        "name": "Sci-Fi",
+        "description": "Futuristic science fiction style",
+        "suffix": ", science fiction, futuristic, cyberpunk, neon lights, high tech, detailed machinery, atmospheric",
+        "recommended_steps": 6,
+    },
+    "minimalist": {
+        "name": "Minimalist",
+        "description": "Clean, simple, minimal design",
+        "suffix": ", minimalist, clean design, simple composition, negative space, modern aesthetic, elegant",
+        "recommended_steps": 2,
+    },
+}
+
+# Step count guidance
+STEP_GUIDANCE = {
+    1: {"label": "Fastest", "description": "Very quick, loose interpretation", "quality": "draft"},
+    2: {"label": "Fast", "description": "Quick with decent coherence", "quality": "good"},
+    3: {"label": "Balanced", "description": "Good balance of speed and quality", "quality": "good"},
+    4: {"label": "Standard", "description": "Recommended default, good prompt adherence", "quality": "high"},
+    5: {"label": "Quality", "description": "Higher fidelity, slower", "quality": "high"},
+    6: {"label": "High Quality", "description": "Detailed output, recommended for complex prompts", "quality": "very_high"},
+    7: {"label": "Maximum", "description": "Best quality, slowest", "quality": "very_high"},
+    8: {"label": "Ultra", "description": "Maximum detail and coherence", "quality": "maximum"},
+}
+
+
+@app.route("/style-presets")
+def get_style_presets():
+    """Get available style presets for prompt enhancement."""
+    return jsonify({
+        "presets": {k: {
+            "name": v["name"],
+            "description": v["description"],
+            "recommended_steps": v["recommended_steps"],
+        } for k, v in STYLE_PRESETS.items()},
+        "step_guidance": STEP_GUIDANCE,
+    })
+
+
+@app.route("/enhance-prompt", methods=["POST"])
+def enhance_prompt():
+    """Enhance a prompt with style modifiers and detail expansion."""
+    data = request.json or {}
+    prompt = data.get("prompt", "").strip()
+    style = data.get("style")  # Optional style preset key
+    auto_enhance = data.get("auto_enhance", True)  # Add quality modifiers
+
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+
+    enhanced = prompt
+    recommended_steps = 4
+
+    # Apply style preset if specified
+    if style and style in STYLE_PRESETS:
+        preset = STYLE_PRESETS[style]
+        enhanced = prompt + preset["suffix"]
+        recommended_steps = preset["recommended_steps"]
+    elif auto_enhance:
+        # Auto-enhance: add generic quality modifiers if prompt is short/simple
+        word_count = len(prompt.split())
+        if word_count < 10:
+            # Short prompt - add quality modifiers
+            quality_suffixes = [
+                ", high quality",
+                ", detailed",
+                ", well-composed",
+            ]
+            # Only add if not already present
+            for suffix in quality_suffixes:
+                keyword = suffix.replace(", ", "").strip()
+                if keyword.lower() not in prompt.lower():
+                    enhanced += suffix
+                    break
+
+    return jsonify({
+        "original": prompt,
+        "enhanced": enhanced,
+        "style": style,
+        "recommended_steps": recommended_steps,
+    })
+
+
 @app.route("/cancel/<job_id>", methods=["POST"])
 def cancel_job(job_id):
     """Cancel a running or queued job."""
