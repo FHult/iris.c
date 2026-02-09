@@ -23,16 +23,31 @@
 
 #include "flux.h"
 #include "flux_kernels.h"
-#include "kitty.h"
+#include "flux_cli.h"
+#include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 #include <time.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
+#endif
+
+#ifdef USE_BLAS
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#else
+/* OpenBLAS introspection functions */
+extern int openblas_get_num_threads(void);
+extern int openblas_get_num_procs(void);
+extern char *openblas_get_corename(void);
+extern char *openblas_get_config(void);
+extern void openblas_set_num_threads(int num_threads);
+#endif
 #endif
 
 /* ========================================================================
@@ -53,6 +68,7 @@ static output_level_t output_level = OUTPUT_NORMAL;
 
 static int cli_current_step = 0;
 static int cli_legend_printed = 0;
+static term_graphics_proto cli_graphics_proto = TERM_PROTO_NONE;
 
 /* Called at the start of each sampling step */
 static void cli_step_callback(int step, int total) {
@@ -136,11 +152,11 @@ static void cli_phase_callback(const char *phase, int done) {
 }
 
 /* Set up CLI progress callbacks */
-/* Step image callback - display intermediate images using Kitty protocol */
+/* Step image callback - display intermediate images in terminal */
 static void cli_step_image_callback(int step, int total, const flux_image *img) {
     (void)total;
     fprintf(stderr, "\n[Step %d]\n", step);
-    kitty_display_image(img);
+    terminal_display_image(img, cli_graphics_proto);
 }
 
 static void cli_setup_progress(void) {
@@ -197,6 +213,7 @@ static double timer_end(void) {
 #define DEFAULT_WIDTH 256
 #define DEFAULT_HEIGHT 256
 #define DEFAULT_STEPS 4
+#define MAX_INPUT_IMAGES 16
 
 /* ========================================================================
  * Simple JSON Helpers (for server mode)
@@ -613,7 +630,7 @@ static int run_server_mode(flux_ctx *ctx) {
  * ======================================================================== */
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
+    fprintf(stderr, "FLUX.2 klein - Pure C Image Generation\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d, --dir PATH        Path to model directory\n");
@@ -622,24 +639,35 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Generation options:\n");
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
-    fprintf(stderr, "  -s, --steps N         Sampling steps (default: %d)\n", DEFAULT_STEPS);
-    fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n\n");
-    fprintf(stderr, "Image-to-image options:\n");
-    fprintf(stderr, "  -i, --input PATH      Input image for img2img\n\n");
+    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)\n");
+    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)\n");
+    fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
+    fprintf(stderr, "      --linear          Use linear timestep schedule (default: shifted sigmoid)\n");
+    fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
+    fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n\n");
+    fprintf(stderr, "Model options:\n");
+    fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
+    fprintf(stderr, "Reference images (img2img / multi-reference):\n");
+    fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
+    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (Kitty protocol)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (slow)\n\n");
+    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
+    fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
     fprintf(stderr, "      --server          Server mode: keep model loaded, read JSON from stdin\n");
+    fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
+    fprintf(stderr, "      --blas-threads N  Set number of BLAS threads (OpenBLAS only)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
-    fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png -t 0.7\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"combine them\" -i car.png -i beach.png -o result.png\n", prog);
 }
 
 /* ========================================================================
@@ -649,10 +677,6 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
-#elif defined(USE_BLAS)
-    fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
-#else
-    fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
 #endif
 
     /* Command line options */
@@ -663,9 +687,9 @@ int main(int argc, char *argv[]) {
         {"width",      required_argument, 0, 'W'},
         {"height",     required_argument, 0, 'H'},
         {"steps",      required_argument, 0, 's'},
+        {"guidance",   required_argument, 0, 'g'},
         {"seed",       required_argument, 0, 'S'},
         {"input",      required_argument, 0, 'i'},
-        {"strength",   required_argument, 0, 't'},
         {"embeddings", required_argument, 0, 'e'},
         {"noise",      required_argument, 0, 'n'},
         {"quiet",      no_argument,       0, 'q'},
@@ -676,8 +700,15 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
+        {"zoom",       required_argument, 0, 'z'},
+        {"base",       no_argument,       0, 'B'},
+        {"linear",     no_argument,       0, 'L'},
+        {"power",      no_argument,       0, 256},
+        {"power-alpha",required_argument, 0, 257},
         {"debug-py",   no_argument,       0, 'D'},
         {"server",     no_argument,       0, 'R'},
+        {"no-license-info", no_argument, 0, 258},
+        {"blas-threads",required_argument, 0, 259},
         {0, 0, 0, 0}
     };
 
@@ -685,23 +716,30 @@ int main(int argc, char *argv[]) {
     char *model_dir = NULL;
     char *prompt = NULL;
     char *output_path = NULL;
-    char *input_path = NULL;
+    char *input_paths[MAX_INPUT_IMAGES] = {NULL};
+    int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
 
     flux_params params = {
         .width = DEFAULT_WIDTH,
         .height = DEFAULT_HEIGHT,
-        .num_steps = DEFAULT_STEPS,
-        .seed = -1
+        .num_steps = 0,   /* 0 = auto from model type */
+        .seed = -1,
+        .guidance = 0.0f, /* 0 = auto from model type */
+        .power_alpha = 2.0f
     };
 
-    int width_set = 0, height_set = 0;
+    int width_set = 0, height_set = 0, steps_set = 0;
     int use_mmap = 1;  /* mmap is default (fastest on MPS) */
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
     int server_mode = 0;
+    int force_base = 0;
+    int no_license_info = 0;
+    int blas_threads = 0; (void)blas_threads;
+    term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
@@ -712,28 +750,79 @@ int main(int argc, char *argv[]) {
             case 'o': output_path = optarg; break;
             case 'W': params.width = atoi(optarg); width_set = 1; break;
             case 'H': params.height = atoi(optarg); height_set = 1; break;
-            case 's': params.num_steps = atoi(optarg); break;
+            case 's': params.num_steps = atoi(optarg); steps_set = 1; break;
+            case 'g': params.guidance = atof(optarg); break;
             case 'S': params.seed = atoll(optarg); break;
-            case 'i': input_path = optarg; break;
-            case 't': break; /* strength option removed */
+            case 'i':
+                if (num_inputs < MAX_INPUT_IMAGES) {
+                    input_paths[num_inputs++] = optarg;
+                } else {
+                    fprintf(stderr, "Warning: Maximum %d input images supported\n", MAX_INPUT_IMAGES);
+                }
+                break;
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
-            case 'v': output_level = OUTPUT_VERBOSE; break;
+            case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
-                fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
+                fprintf(stderr, "FLUX.2 klein v1.0.0\n");
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
+            case 'z': terminal_set_zoom(atoi(optarg)); break;
+            case 'B': force_base = 1; break;
+            case 'L': params.linear_schedule = 1; break;
+            case 256: params.power_schedule = 1; break;
+            case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
+            case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 'R': server_mode = 1; break;
+            case 259: blas_threads = atoi(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    /* BLAS: apply thread setting regardless of quiet mode */
+#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
+    if (blas_threads > 0) openblas_set_num_threads(blas_threads);
+#endif
+
+    /* Backend banner (suppressed by --quiet) */
+    if (output_level != OUTPUT_QUIET) {
+#ifdef USE_METAL
+        if (flux_metal_available()) {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            char cpu_brand[128] = "Apple Silicon";
+            size_t len = sizeof(cpu_brand);
+            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
+            fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
+        }
+#elif defined(USE_BLAS)
+#ifdef __APPLE__
+        {
+            char cpu_brand[128] = "Apple Silicon";
+            size_t len = sizeof(cpu_brand);
+            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            fprintf(stderr, "BLAS: Accelerate | %s | %ld cores\n", cpu_brand, ncpu);
+            if (blas_threads > 0)
+                fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
+        }
+#else
+        fprintf(stderr, "BLAS: OpenBLAS | %s | %d threads / %d procs\n",
+                openblas_get_corename(),
+                openblas_get_num_threads(),
+                openblas_get_num_procs());
+        fprintf(stderr, "      %s\n", openblas_get_config());
+#endif
+#else
+        fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
+#endif
     }
 
     /* Validate required arguments */
@@ -742,15 +831,21 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!server_mode && !prompt && !embeddings_path && !debug_py) {
-        fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-    if (!server_mode && !output_path) {
-        fprintf(stderr, "Error: Output path (-o) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
+
+    /* Interactive mode: -d provided but no -p, -e, -o, --debug-py, or --server */
+    int interactive_mode = (!prompt && !embeddings_path && !output_path && !debug_py && !server_mode);
+
+    if (!interactive_mode && !server_mode) {
+        if (!prompt && !embeddings_path && !debug_py) {
+            fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        if (!output_path) {
+            fprintf(stderr, "Error: Output path (-o) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
     /* Validate parameters */
@@ -762,7 +857,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Height must be between 64 and 4096\n");
         return 1;
     }
-    if (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS) {
+    if (steps_set && (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS)) {
         fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
         return 1;
     }
@@ -778,18 +873,21 @@ int main(int argc, char *argv[]) {
         flux_set_seed(actual_seed);
         LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
-        /* Verbose header */
-        LOG_VERBOSE("FLUX.2 klein 4B Image Generator\n");
-        LOG_VERBOSE("================================\n");
-        LOG_VERBOSE("Model: %s\n", model_dir);
-        if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
-        LOG_VERBOSE("Output: %s\n", output_path);
-        LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
-        LOG_VERBOSE("Steps: %d\n", params.num_steps);
-        if (input_path) {
-            LOG_VERBOSE("Input: %s\n", input_path);
+    }
+
+    /* Verbose header */
+    LOG_VERBOSE("FLUX.2 klein Image Generator\n");
+    LOG_VERBOSE("================================\n");
+    LOG_VERBOSE("Model: %s\n", model_dir);
+    if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
+    LOG_VERBOSE("Output: %s\n", output_path);
+    LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
+    LOG_VERBOSE("Steps: %d\n", params.num_steps);
+    if (num_inputs > 0) {
+        LOG_VERBOSE("Input images: %d\n", num_inputs);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  [%d] %s\n", i + 1, input_paths[i]);
         }
-        LOG_VERBOSE("\n");
     }
 
     /* Load model (VAE only at startup, other components loaded on-demand) */
@@ -809,9 +907,40 @@ int main(int argc, char *argv[]) {
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
 
+    /* Override model type if --base was specified */
+    if (force_base) {
+        flux_set_base_mode(ctx);
+    }
+
+    /* Resolve auto-parameters now that we know the model type */
+    if (!steps_set || params.num_steps <= 0) {
+        params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
+    }
+    if (params.guidance <= 0) {
+        params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
+    }
+
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
-    LOG_VERBOSE("  Model info: %s\n", flux_model_info(ctx));
+    LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
+
+    /* Non-commercial license warning for 9B model */
+    if (flux_is_non_commercial(ctx) && !no_license_info
+        && output_level != OUTPUT_QUIET) {
+        fprintf(stderr,
+            "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
+            "The output can only be used under the terms of the\n"
+            "FLUX non-commercial license:\n"
+            "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/LICENSE.md\n"
+            "(use --no-license-info to suppress this message)\n\n");
+    }
+
+    /* Interactive mode: start REPL */
+    if (interactive_mode) {
+        int rc = flux_cli_run(ctx, model_dir);
+        flux_free(ctx);
+        return rc;
+    }
 
     /* Enter server mode if requested */
     if (server_mode) {
@@ -830,7 +959,12 @@ int main(int argc, char *argv[]) {
 
     /* Set up step image callback if requested */
     if (show_steps) {
-        flux_set_step_image_callback(ctx, cli_step_image_callback);
+        if (graphics_proto == TERM_PROTO_NONE) {
+            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, WezTerm, or Konsole)\n");
+        } else {
+            cli_graphics_proto = graphics_proto;
+            flux_set_step_image_callback(ctx, cli_step_image_callback);
+        }
     }
 
     /* Generate image */
@@ -842,30 +976,39 @@ int main(int argc, char *argv[]) {
         /* ============== Debug mode: use Python inputs ============== */
         LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
         output = flux_img2img_debug_py(ctx, &params);
-    } else if (input_path) {
-        /* ============== Image-to-image mode ============== */
-        LOG_NORMAL("Loading input image...");
+    } else if (num_inputs > 0) {
+        /* ============== Image-to-image mode (single or multi-reference) ============== */
+        LOG_NORMAL("Loading %d input image%s...", num_inputs, num_inputs > 1 ? "s" : "");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
         timer_begin();
 
-        flux_image *input = flux_image_load(input_path);
-        if (!input) {
-            fprintf(stderr, "\nError: Failed to load input image: %s\n", input_path);
-            flux_free(ctx);
-            return 1;
+        flux_image *inputs[MAX_INPUT_IMAGES];
+        for (int i = 0; i < num_inputs; i++) {
+            inputs[i] = flux_image_load(input_paths[i]);
+            if (!inputs[i]) {
+                fprintf(stderr, "\nError: Failed to load input image: %s\n", input_paths[i]);
+                for (int j = 0; j < i; j++) flux_image_free(inputs[j]);
+                flux_free(ctx);
+                return 1;
+            }
         }
 
         LOG_NORMAL(" done (%.1fs)\n", timer_end());
-        LOG_VERBOSE("  Input: %dx%d, %d channels\n",
-                    input->width, input->height, input->channels);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  Input[%d]: %dx%d, %d channels\n",
+                        i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
+        }
 
-        /* Use input image dimensions if not explicitly set */
-        if (!width_set) params.width = input->width;
-        if (!height_set) params.height = input->height;
+        /* Use first input image dimensions if not explicitly set */
+        if (!width_set) params.width = inputs[0]->width;
+        if (!height_set) params.height = inputs[0]->height;
 
-        /* Generate */
-        output = flux_img2img(ctx, prompt, input, &params);
-        flux_image_free(input);
+        /* Generate with multi-reference */
+        output = flux_multiref(ctx, prompt, (const flux_image **)inputs, num_inputs, &params);
+
+        for (int i = 0; i < num_inputs; i++) {
+            flux_image_free(inputs[i]);
+        }
 
     } else if (embeddings_path) {
         /* ============== External embeddings mode ============== */
@@ -884,7 +1027,7 @@ int main(int argc, char *argv[]) {
         long file_size = ftell(emb_file);
         fseek(emb_file, 0, SEEK_SET);
 
-        int text_dim = FLUX_TEXT_DIM;
+        int text_dim = flux_text_dim(ctx);
         int text_seq = file_size / (text_dim * sizeof(float));
 
         float *text_emb = (float *)malloc(file_size);
@@ -989,7 +1132,7 @@ int main(int argc, char *argv[]) {
 
     /* Display image in terminal if requested */
     if (show_image) {
-        kitty_display_image(output);
+        terminal_display_png(output_path, graphics_proto);
     }
 
     /* Print total time (always, unless quiet) */

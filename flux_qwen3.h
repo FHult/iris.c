@@ -1,8 +1,8 @@
 /*
  * Qwen3 Text Encoder for FLUX.2-klein
  *
- * Implements Qwen3-4B (2560 hidden dim variant) text encoder that produces
- * embeddings for FLUX image generation.
+ * Implements the Qwen3 text encoder that produces embeddings for FLUX image
+ * generation. Supports multiple model sizes (architecture read from config.json).
  */
 
 #ifndef FLUX_QWEN3_H
@@ -15,15 +15,10 @@ extern "C" {
 #endif
 
 /* ========================================================================
- * Architecture Constants (from text_encoder/config.json)
+ * Architecture Constants
  * ======================================================================== */
 
-#define QWEN3_HIDDEN_SIZE      2560
-#define QWEN3_INTERMEDIATE_SIZE 9728
-#define QWEN3_NUM_HEADS        32
-#define QWEN3_NUM_KV_HEADS     8
-#define QWEN3_HEAD_DIM         128
-#define QWEN3_NUM_LAYERS       36
+/* Fixed constants (same across model sizes) */
 #define QWEN3_VOCAB_SIZE       151936
 #define QWEN3_MAX_SEQ_LEN      512
 #define QWEN3_RMS_NORM_EPS     1e-6f
@@ -35,9 +30,6 @@ extern "C" {
 #define QWEN3_OUTPUT_LAYER_1   8
 #define QWEN3_OUTPUT_LAYER_2   17
 #define QWEN3_OUTPUT_LAYER_3   26
-
-/* Final text embedding dimension: 3 × hidden_size = 7680 */
-#define QWEN3_TEXT_DIM         (3 * QWEN3_HIDDEN_SIZE)
 
 /* ========================================================================
  * Opaque Types

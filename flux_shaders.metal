@@ -1062,6 +1062,43 @@ kernel void qk_rms_norm_bf16(
     }
 }
 
+/* Per-head RMSNorm for bf16 - single tensor version for GQA support
+ * x: [seq, heads * head_dim] (bf16, modified in-place)
+ * weight: [head_dim] (bf16)
+ * Dispatched with (seq, heads) threadgroups
+ */
+kernel void head_rms_norm_bf16(
+    device ushort *x [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    constant int &heads [[buffer(2)]],
+    constant int &head_dim [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+
+    if (head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    uint offset = seq_idx * hidden + head_idx * head_dim;
+
+    // Compute RMS
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(x[offset + d]);
+        sum_sq += val * val;
+    }
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+
+    // Normalize and scale
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(x[offset + d]);
+        float w = bf16_to_f32(weight[d]);
+        x[offset + d] = f32_to_bf16(val * rms_inv * w);
+    }
+}
+
 /* LayerNorm + AdaLN for bf16
  * out = (1 + scale) * norm(x) + shift
  */
@@ -1159,6 +1196,21 @@ kernel void gated_add_bf16(
         float g = bf16_to_f32(gate[h]);
         float p = bf16_to_f32(proj[idx]);
         out[idx] = f32_to_bf16(o + g * p);
+    }
+}
+
+/* Simple element-wise add for bf16: out = a + b */
+kernel void add_bf16(
+    device const ushort *a [[buffer(0)]],
+    device const ushort *b [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        float va = bf16_to_f32(a[gid]);
+        float vb = bf16_to_f32(b[gid]);
+        out[gid] = f32_to_bf16(va + vb);
     }
 }
 
@@ -1788,4 +1840,344 @@ kernel void attention_fused_bf16(
         }
         out_row[d] = f32_to_bf16(acc);
     }
+}
+
+/* ========================================================================
+ * BF16 Causal Attention with GQA Support
+ *
+ * Fused kernel for causal (decoder) attention with bf16 I/O and f32 compute.
+ * Supports Grouped Query Attention where num_q_heads > num_kv_heads.
+ *
+ * Q: [seq, num_q_heads * head_dim] (bf16)
+ * K: [seq, num_kv_heads * head_dim] (bf16)
+ * V: [seq, num_kv_heads * head_dim] (bf16)
+ * out: [seq, num_q_heads * head_dim] (bf16)
+ * attn_mask: [seq] - 1 for valid tokens, 0 for padding (optional)
+ *
+ * Each threadgroup processes one (query_pos, head) pair.
+ * ======================================================================== */
+
+kernel void causal_attention_fused_bf16(
+    device const ushort *Q [[buffer(0)]],
+    device const ushort *K [[buffer(1)]],
+    device const ushort *V [[buffer(2)]],
+    device ushort *out [[buffer(3)]],
+    device const int *attn_mask [[buffer(4)]],
+    constant int &seq [[buffer(5)]],
+    constant int &num_q_heads [[buffer(6)]],
+    constant int &num_kv_heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &use_mask [[buffer(10)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_pos [[thread_position_in_threadgroup]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    // Shared memory for scores and reductions
+    threadgroup float shared_scores[512];
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+    threadgroup float shared_q[128];  // Cache Q for this query position
+
+    int query_idx = tg_pos.x;
+    int head_idx = tg_pos.y;
+    uint tid = tid_pos.x;
+    uint threads = tg_size.x;
+
+    if (query_idx >= seq || head_idx >= num_q_heads) return;
+
+    // GQA: map Q head to KV head
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head_idx = head_idx / heads_per_kv;
+
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Pointers to this head's Q, K, V (bf16)
+    device const ushort *q_row = Q + query_idx * q_dim + head_idx * head_dim;
+    device const ushort *K_head = K + kv_head_idx * head_dim;
+    device const ushort *V_head = V + kv_head_idx * head_dim;
+    device ushort *out_row = out + query_idx * q_dim + head_idx * head_dim;
+
+    // Load Q into shared memory (convert bf16 -> f32)
+    for (int d = tid; d < head_dim; d += threads) {
+        shared_q[d] = bf16_to_f32(q_row[d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 1: Compute Q @ K^T with causal mask ==========
+    float local_max = -INFINITY;
+
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        // Causal mask: only attend to positions <= query_idx
+        // Attention mask: only attend to valid tokens
+        bool masked = (key_idx > query_idx);
+        if (use_mask && attn_mask[key_idx] == 0) {
+            masked = true;
+        }
+
+        if (masked) {
+            shared_scores[key_idx] = -INFINITY;
+        } else {
+            // Dot product: Q[query_idx, head] · K[key_idx, kv_head]
+            float dot = 0.0f;
+            device const ushort *k_row = K_head + key_idx * kv_dim;
+            for (int d = 0; d < head_dim; d++) {
+                dot += shared_q[d] * bf16_to_f32(k_row[d]);
+            }
+            float score = dot * scale;
+            shared_scores[key_idx] = score;
+            local_max = max(local_max, score);
+        }
+    }
+
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 2: Find global max (parallel reduction) ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_max[0];
+
+    // ========== Phase 3: Compute exp(score - max) and sum ==========
+    float local_sum = 0.0f;
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        float score = shared_scores[key_idx];
+        if (score > -1e30f) {
+            float e = exp(score - max_val);
+            shared_scores[key_idx] = e;
+            local_sum += e;
+        } else {
+            shared_scores[key_idx] = 0.0f;
+        }
+    }
+
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 4: Find total sum (parallel reduction) ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_sum[0];
+
+    // ========== Phase 5: Normalize scores ==========
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        shared_scores[key_idx] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 6: Compute output = scores @ V ==========
+    for (int d = tid; d < head_dim; d += threads) {
+        float acc = 0.0f;
+        for (int key_idx = 0; key_idx < seq; key_idx++) {
+            float score = shared_scores[key_idx];
+            if (score > 0.0f) {
+                float v_val = bf16_to_f32(V_head[key_idx * kv_dim + d]);
+                acc += score * v_val;
+            }
+        }
+        out_row[d] = f32_to_bf16(acc);
+    }
+}
+
+/* ========================================================================
+ * BF16 RoPE for Text-Only (Qwen3 style)
+ *
+ * Applies rotary position embeddings to Q and K tensors.
+ * Unlike the unified RoPE, this is for decoder-only text encoding.
+ *
+ * Q: [seq, num_q_heads * head_dim] (bf16) - modified in-place
+ * K: [seq, num_kv_heads * head_dim] (bf16) - modified in-place
+ * cos: [seq, head_dim/2] (f32) - precomputed cos(pos * freq)
+ * sin: [seq, head_dim/2] (f32) - precomputed sin(pos * freq)
+ *
+ * RoPE formula: for each pair (x0, x1):
+ *   x0' = x0 * cos - x1 * sin
+ *   x1' = x0 * sin + x1 * cos
+ * ======================================================================== */
+
+kernel void rope_bf16(
+    device ushort *Q [[buffer(0)]],
+    device ushort *K [[buffer(1)]],
+    device const float *cos_cache [[buffer(2)]],
+    device const float *sin_cache [[buffer(3)]],
+    constant int &seq [[buffer(4)]],
+    constant int &num_q_heads [[buffer(5)]],
+    constant int &num_kv_heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]  // (pos, head)
+) {
+    int pos = gid.x;
+    int head = gid.y;
+
+    if (pos >= seq) return;
+
+    int half_dim = head_dim / 2;
+
+    // Apply RoPE to Q heads
+    if (head < num_q_heads) {
+        int q_dim = num_q_heads * head_dim;
+        device ushort *q_head = Q + pos * q_dim + head * head_dim;
+
+        for (int i = 0; i < half_dim; i++) {
+            float x0 = bf16_to_f32(q_head[i]);
+            float x1 = bf16_to_f32(q_head[i + half_dim]);
+            float c = cos_cache[pos * half_dim + i];
+            float s = sin_cache[pos * half_dim + i];
+
+            q_head[i] = f32_to_bf16(x0 * c - x1 * s);
+            q_head[i + half_dim] = f32_to_bf16(x0 * s + x1 * c);
+        }
+    }
+
+    // Apply RoPE to K heads (fewer heads due to GQA)
+    if (head < num_kv_heads) {
+        int kv_dim = num_kv_heads * head_dim;
+        device ushort *k_head = K + pos * kv_dim + head * head_dim;
+
+        for (int i = 0; i < half_dim; i++) {
+            float x0 = bf16_to_f32(k_head[i]);
+            float x1 = bf16_to_f32(k_head[i + half_dim]);
+            float c = cos_cache[pos * half_dim + i];
+            float s = sin_cache[pos * half_dim + i];
+
+            k_head[i] = f32_to_bf16(x0 * c - x1 * s);
+            k_head[i + half_dim] = f32_to_bf16(x0 * s + x1 * c);
+        }
+    }
+}
+
+/* ========================================================================
+ * F32 VAE Shaders — GPU-resident VAE decoder operations
+ * ======================================================================== */
+
+/* GroupNorm f32: one threadgroup per (batch, group) pair.
+ * Layout: [batch, channels, H, W] (NCHW)
+ * Each group has channels_per_group consecutive channels.
+ * Computes mean and variance over all spatial positions × channels in the group. */
+kernel void group_norm_f32(
+    device const float *x [[buffer(0)]],
+    device const float *gamma [[buffer(1)]],
+    device const float *beta [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &channels [[buffer(4)]],
+    constant int &spatial [[buffer(5)]],       /* H * W */
+    constant int &channels_per_group [[buffer(6)]],
+    constant float &eps [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    threadgroup float shared_sum2[256];
+
+    /* group_id encodes (batch, group) */
+    int num_groups = channels / channels_per_group;
+    int batch_idx = group_id / num_groups;
+    int group_idx = group_id % num_groups;
+
+    int c_start = group_idx * channels_per_group;
+    int group_size = channels_per_group * spatial;
+
+    /* Base offset for this batch element */
+    device const float *x_batch = x + batch_idx * channels * spatial;
+    device float *out_batch = out + batch_idx * channels * spatial;
+
+    /* Compute partial sums for mean and variance */
+    float local_sum = 0.0f;
+    float local_sum2 = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float val = x_batch[c * spatial + s];
+        local_sum += val;
+        local_sum2 += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    shared_sum2[tid] = local_sum2;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Parallel reduction */
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum2[tid] += shared_sum2[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = shared_sum[0] / float(group_size);
+    float var = shared_sum2[0] / float(group_size) - mean * mean;
+    float inv_std = rsqrt(var + eps);
+
+    /* Apply normalization with gamma/beta per channel */
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        int idx = c * spatial + s;
+        float val = (x_batch[idx] - mean) * inv_std;
+        out_batch[idx] = gamma[c] * val + beta[c];
+    }
+}
+
+/* Swish f32: out = x * sigmoid(x), in-place safe (out can alias x) */
+kernel void swish_f32(
+    device const float *x [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        float v = x[gid];
+        out[gid] = v / (1.0f + exp(-v));
+    }
+}
+
+/* Add f32: out = a + b, in-place safe (out can alias a or b) */
+kernel void add_f32(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant int &n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        out[gid] = a[gid] + b[gid];
+    }
+}
+
+/* Upsample nearest 2x f32: [B, C, H, W] -> [B, C, 2H, 2W]
+ * Each thread writes one output element. */
+kernel void upsample_nearest_2x_f32(
+    device const float *x [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &channels [[buffer(2)]],
+    constant int &in_h [[buffer(3)]],
+    constant int &in_w [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int out_h = in_h * 2;
+    int out_w = in_w * 2;
+    int out_spatial = out_h * out_w;
+    int total = channels * out_spatial;  /* batch=1 assumed */
+    if (gid >= uint(total)) return;
+
+    int c = gid / out_spatial;
+    int rem = gid % out_spatial;
+    int oy = rem / out_w;
+    int ox = rem % out_w;
+
+    int iy = oy / 2;
+    int ix = ox / 2;
+
+    out[c * out_spatial + oy * out_w + ox] = x[c * in_h * in_w + iy * in_w + ix];
 }

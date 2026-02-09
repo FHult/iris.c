@@ -1,8 +1,8 @@
 /*
- * FLUX.2 klein 4B - Pure C Inference Engine
+ * FLUX.2 klein - Pure C Inference Engine
  *
  * A dependency-free C implementation for image synthesis using the
- * FLUX.2 klein 4B rectified flow transformer model.
+ * FLUX.2 klein rectified flow transformer model.
  *
  * Usage:
  *   flux_ctx *ctx = flux_load_dir("path/to/model");
@@ -29,16 +29,8 @@ extern "C" {
  * Configuration Constants
  * ======================================================================== */
 
-/* Model architecture (klein 4B) */
-#define FLUX_HIDDEN_SIZE        3072
-#define FLUX_NUM_HEADS          24
-#define FLUX_HEAD_DIM           128
-#define FLUX_NUM_DOUBLE_LAYERS  5
-#define FLUX_NUM_SINGLE_LAYERS  20
-#define FLUX_MLP_RATIO          3.0f
-#define FLUX_TEXT_DIM           7680
+/* Model architecture constants (same across model sizes) */
 #define FLUX_LATENT_CHANNELS    128
-#define FLUX_ROPE_THETA         2000.0f
 
 /* VAE architecture */
 #define FLUX_VAE_Z_CHANNELS     32
@@ -84,14 +76,18 @@ struct flux_image {
 typedef struct {
     int width;              /* Output width (default: 256) */
     int height;             /* Output height (default: 256) */
-    int num_steps;          /* Inference steps (default: 4 for klein) */
+    int num_steps;          /* Inference steps (default: 4 distilled, 50 base) */
     int64_t seed;           /* Random seed (-1 for random) */
+    float guidance;         /* CFG guidance scale (0 = auto from model type) */
+    int linear_schedule;    /* Use linear timestep schedule instead of shifted sigmoid */
+    int power_schedule;     /* Use power curve timestep schedule */
+    float power_alpha;      /* Exponent for power schedule (default: 2.0) */
 } flux_params;
 
 /* Default parameters */
 #define FLUX_DEFAULT_WIDTH  256
 #define FLUX_DEFAULT_HEIGHT 256
-#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 4, -1 }
+#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f }
 
 /* ========================================================================
  * Core API
@@ -125,6 +121,18 @@ void flux_release_text_encoder(flux_ctx *ctx);
 void flux_set_mmap(flux_ctx *ctx, int enable);
 
 /*
+ * Check if model is distilled (4-step) or base (50-step with CFG).
+ * Returns 1 for distilled, 0 for base.
+ */
+int flux_is_distilled(flux_ctx *ctx);
+
+/*
+ * Force base model mode (overrides autodetection).
+ * Call after flux_load_dir() if model_index.json is missing.
+ */
+void flux_set_base_mode(flux_ctx *ctx);
+
+/*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().
  * Returns NULL on error.
@@ -156,7 +164,7 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params);
 
 /*
  * Text-to-image generation with pre-computed embeddings.
- * text_emb: float array of shape [text_seq, FLUX_TEXT_DIM]
+ * text_emb: float array of shape [text_seq, text_dim]
  * text_seq: number of text tokens (typically 512)
  */
 flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
@@ -226,6 +234,16 @@ void flux_set_seed(int64_t seed);
  * Get model info string.
  */
 const char *flux_model_info(flux_ctx *ctx);
+
+/*
+ * Get text embedding dimension (7680 for 4B, varies by model).
+ */
+int flux_text_dim(flux_ctx *ctx);
+
+/*
+ * Check if model has non-commercial license (e.g., 9B model).
+ */
+int flux_is_non_commercial(flux_ctx *ctx);
 
 /*
  * Get last error message.

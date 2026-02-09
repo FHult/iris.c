@@ -227,6 +227,17 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
                                         int seq_len, int in_dim, int out_dim);
 
 /*
+ * GPU linear with bf16 weights - writes to pre-allocated output tensor.
+ * Same as flux_gpu_linear_bf16 but allows reusing output buffers to avoid allocation overhead.
+ * out: [seq_len, out_dim] (f32, pre-allocated)
+ * Returns 1 on success, 0 on failure.
+ */
+int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
+                              flux_gpu_tensor_t x,
+                              const uint16_t *W_bf16,
+                              int seq_len, int in_dim, int out_dim);
+
+/*
  * GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline.
  * Uses native MPSDataTypeBFloat16.
  */
@@ -379,6 +390,20 @@ void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
                                 flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
                                 int seq, int heads, int head_dim, float eps);
 
+/* BF16 per-head RMSNorm (single tensor, for GQA with different Q/K head counts) */
+int flux_gpu_head_rms_norm_bf16(flux_gpu_tensor_t x, flux_gpu_tensor_t weight_bf16,
+                                 int seq, int heads, int head_dim, float eps);
+
+/* BF16 RMS Norm: out = rms_norm(x) * weight */
+void flux_gpu_rms_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                             flux_gpu_tensor_t weight, int seq, int hidden, float eps);
+
+/* BF16 element-wise add: out = a + b */
+void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
+
+/* BF16 buffer copy (GPU blit): dst = src */
+void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+
 /* BF16 SiLU multiply: gate = silu(gate) * up */
 void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
 
@@ -396,6 +421,29 @@ void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
                             const float *cos_freq, const float *sin_freq,
                             int seq, int heads, int head_dim, int axis_dim);
+
+/* BF16 Causal Attention with GQA support (for text encoder)
+ * Q: [seq, num_q_heads * head_dim] (bf16)
+ * K, V: [seq, num_kv_heads * head_dim] (bf16)
+ * out: [seq, num_q_heads * head_dim] (bf16)
+ * attention_mask: [seq] - 1 for valid, 0 for padding (can be NULL)
+ * Supports GQA where num_q_heads > num_kv_heads.
+ * Returns 1 on success, 0 on failure.
+ */
+int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
+                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                    const int *attention_mask,
+                                    int seq, int num_q_heads, int num_kv_heads,
+                                    int head_dim, float scale);
+
+/* BF16 RoPE for text encoder (Qwen3 style)
+ * Q: [seq, num_q_heads * head_dim] (bf16) - modified in-place
+ * K: [seq, num_kv_heads * head_dim] (bf16) - modified in-place
+ * cos_cache, sin_cache: [seq, head_dim/2] (f32) - precomputed
+ */
+void flux_gpu_rope_text_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                              const float *cos_cache, const float *sin_cache,
+                              int seq, int num_q_heads, int num_kv_heads, int head_dim);
 
 /* Concatenate two bf16 sequences along seq dimension */
 void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
@@ -417,6 +465,44 @@ void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
 void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
                                     flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
 
+/* ========================================================================
+ * F32 VAE Tensor Operations - GPU-resident VAE decoder operations
+ * ======================================================================== */
+
+/* GroupNorm on f32 GPU tensors: out = gamma * (x - mean) / sqrt(var + eps) + beta
+ * x: [batch, channels, H, W] (NCHW)
+ * gamma, beta: [channels] (CPU f32 pointers, cached on GPU)
+ * num_groups: number of groups (e.g. 32)
+ */
+void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                              const float *gamma, const float *beta,
+                              int batch, int channels, int spatial, int num_groups, float eps);
+
+/* Swish/SiLU on f32 GPU tensor: out = x * sigmoid(x), in-place safe */
+void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n);
+
+/* Element-wise add on f32 GPU tensors: out = a + b, in-place safe */
+void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
+
+/* Nearest neighbor 2x upsample on f32 GPU tensor: [1, C, H, W] -> [1, C, 2H, 2W] (batch=1) */
+flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
+                                                     int channels, int H, int W);
+
+/* Conv2d on f32 GPU tensors using MPSGraph.
+ * x: GPU tensor [batch, in_ch, H, W]
+ * weight: CPU f32 [out_ch, in_ch, kH, kW] (cached on GPU)
+ * bias: CPU f32 [out_ch] (cached on GPU)
+ * Returns new GPU tensor [batch, out_ch, outH, outW] or NULL on failure.
+ */
+flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
+                                       const float *weight, const float *bias,
+                                       int batch, int in_ch, int out_ch,
+                                       int H, int W, int kH, int kW,
+                                       int stride, int padding);
+
+/* GPU blit copy for f32 tensors */
+void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+
 /* Convert f32 GPU tensor to bf16 (returns new tensor) */
 flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor);
 
@@ -427,6 +513,13 @@ flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor);
 flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim);
+
+/* BF16 native linear layer writing into a pre-allocated bf16 output tensor.
+ * Returns 1 on success, 0 on failure. */
+int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
+                                     flux_gpu_tensor_t x,
+                                     const uint16_t *W_bf16,
+                                     int seq_len, int in_dim, int out_dim);
 
 /* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
 void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
@@ -575,6 +668,13 @@ int flux_metal_shaders_available(void);
  * This converts bf16 weights to f16 and caches the result.
  */
 void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
+
+/*
+ * Pre-warm the bf16 buffer cache for a weight tensor.
+ * Copies bf16 data to a Metal GPU buffer so the first matmul call doesn't
+ * pay the buffer creation cost.
+ */
+void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
 
 /* ========================================================================
  * Native BF16 Pipeline API

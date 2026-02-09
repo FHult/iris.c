@@ -20,7 +20,7 @@ Prerequisites:
     # Place a test image at /tmp/woman.png
 
 After running, use C with --debug-py to compare:
-    ./flux -d flux-klein-model --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
+    ./flux -d flux-klein-4b --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
 """
 
 import os
@@ -62,7 +62,7 @@ def inv_batch_norm(z, running_mean, running_var, eps=1e-4):
 
 def main():
     # Configuration
-    model_dir = os.path.join(project_root, "flux-klein-model")
+    model_dir = os.path.join(project_root, "flux-klein-4b")
     input_image = "/tmp/woman.png"
     width, height = 256, 256
     num_steps = 4

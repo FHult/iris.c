@@ -10,9 +10,26 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 
 /* Forward declarations */
 struct flux_image;
+
+/* Fast exponential approximation using range reduction + degree-5 polynomial.
+ * Relative error < 2e-6 across the full float range.
+ * Inlined so the compiler can auto-vectorize loops that use it. */
+static inline float fast_expf(float x) {
+    if (x < -87.3f) return 0.0f;
+    if (x > 88.7f) return 1e38f;
+    float n = floorf(x * 1.4426950408889634f + 0.5f);
+    float r = x - n * 0.6931471805599453f;
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f +
+              r * (0.04166667f + r * 0.00833333f))));
+    union { float f; int32_t i; } v;
+    v.f = p;
+    v.i += (int32_t)n << 23;
+    return v.f;
+}
 
 /* ========================================================================
  * Basic Operations
@@ -134,8 +151,12 @@ void flux_batch_norm(float *out, const float *x,
 /* SiLU / Swish activation: x * sigmoid(x) */
 void flux_silu(float *x, int n);
 
+/* Fused SiLU(gate) * up - single pass for SwiGLU */
+void flux_silu_mul(float *gate, const float *up, int n);
+
 /* Softmax over last dimension */
 void flux_softmax(float *x, int rows, int cols);
+void flux_softmax_cpu(float *x, int rows, int cols);
 
 /* ========================================================================
  * Attention Operations
@@ -275,5 +296,24 @@ extern flux_phase_callback_t flux_phase_callback;
 typedef void (*flux_step_image_callback_t)(int step, int total, const struct flux_image *img);
 extern flux_step_image_callback_t flux_step_image_callback;
 extern void *flux_step_image_vae;  /* Set to flux_vae_t* for step image decoding */
+
+/*
+ * Text encoder progress callback - called once per Qwen3 layer.
+ * layer: current layer (0-based)
+ * total: total number of layers (36)
+ */
+typedef void (*flux_text_progress_callback_t)(int layer, int total);
+extern flux_text_progress_callback_t flux_text_progress_callback;
+
+/*
+ * VAE progress callback - called once per resblock/attention block.
+ * block: current block (0-based)
+ * total: total number of blocks (11 for encoder, 15 for decoder)
+ */
+typedef void (*flux_vae_progress_callback_t)(int block, int total);
+extern flux_vae_progress_callback_t flux_vae_progress_callback;
+
+/* Global verbose flag - when 0, library code suppresses diagnostic output */
+extern int flux_verbose;
 
 #endif /* FLUX_KERNELS_H */

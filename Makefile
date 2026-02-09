@@ -10,8 +10,10 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c kitty.c
+SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c
 OBJS = $(SRCS:.c=.o)
+CLI_SRCS = flux_cli.c linenoise.c embcache.c
+CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
 TARGET = flux
 LIB = libflux.a
@@ -43,7 +45,7 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
-	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
+	@echo "Example: make mps && ./flux -d flux-klein-4b -p \"a cat\" -o cat.png"
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -81,7 +83,7 @@ mps: clean mps-build
 	@echo ""
 	@echo "Built with MPS backend (Metal GPU acceleration)"
 
-mps-build: $(SRCS:.c=.mps.o) flux_metal.o main.mps.o
+mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) flux_metal.o main.mps.o
 	$(CC) $(MPS_CFLAGS) -o $(TARGET) $^ $(MPS_LDFLAGS)
 
 # Pre-compile Metal shaders for faster startup (requires full Xcode, not just Command Line Tools)
@@ -105,7 +107,11 @@ flux_shaders.metallib: flux_shaders.metal
 %.mps.o: %.c flux.h flux_kernels.h
 	$(CC) $(MPS_CFLAGS) -c -o $@ $<
 
-flux_metal.o: flux_metal.m flux_metal.h
+# Embed Metal shader source as C array (runtime compilation, no Metal toolchain needed)
+flux_shaders_source.h: flux_shaders.metal
+	xxd -i $< > $@
+
+flux_metal.o: flux_metal.m flux_metal.h flux_shaders_source.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
 
 else
@@ -122,7 +128,7 @@ endif
 # =============================================================================
 # Build rules
 # =============================================================================
-$(TARGET): $(OBJS) main.o
+$(TARGET): $(OBJS) $(CLI_OBJS) main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 lib: $(LIB)
@@ -165,7 +171,8 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB) convert_bf16_to_f16
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB) convert_bf16_to_f16
+	rm -f flux_shaders_source.h
 
 clean-shaders:
 	rm -f flux_shaders.metallib flux_shaders.air
@@ -198,5 +205,8 @@ flux_image.o: flux_image.c flux.h
 flux_safetensors.o: flux_safetensors.c flux_safetensors.h
 flux_qwen3.o: flux_qwen3.c flux_qwen3.h flux_safetensors.h
 flux_qwen3_tokenizer.o: flux_qwen3_tokenizer.c flux_qwen3.h
-kitty.o: kitty.c kitty.h flux.h
-main.o: main.c flux.h flux_kernels.h kitty.h
+terminals.o: terminals.c terminals.h flux.h
+flux_cli.o: flux_cli.c flux_cli.h flux.h flux_qwen3.h embcache.h linenoise.h terminals.h
+linenoise.o: linenoise.c linenoise.h
+embcache.o: embcache.c embcache.h
+main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h

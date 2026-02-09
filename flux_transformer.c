@@ -29,6 +29,45 @@ extern double flux_timing_transformer_double;
 extern double flux_timing_transformer_single;
 extern double flux_timing_transformer_final;
 
+/* Fine-grained profiling for BLAS optimization */
+static double prof_single_adaln = 0;
+static double prof_single_fused_matmul = 0;
+static double prof_single_split = 0;
+static double prof_single_qknorm_rope = 0;
+static double prof_single_attention = 0;
+static double prof_single_swiglu = 0;
+static double prof_single_proj_matmul = 0;
+static double prof_single_gated_add = 0;
+
+static double prof_get_time(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+void flux_print_blas_profile(void) {
+    double total = prof_single_adaln + prof_single_fused_matmul + prof_single_split +
+                   prof_single_qknorm_rope + prof_single_attention + prof_single_swiglu +
+                   prof_single_proj_matmul + prof_single_gated_add;
+    if (total < 1.0) return;
+    fprintf(stderr, "\nSingle block breakdown (cumulative):\n");
+    fprintf(stderr, "  AdaLN+mod:     %7.1fms (%4.1f%%)\n", prof_single_adaln, 100*prof_single_adaln/total);
+    fprintf(stderr, "  Fused QKV+MLP: %7.1fms (%4.1f%%)\n", prof_single_fused_matmul, 100*prof_single_fused_matmul/total);
+    fprintf(stderr, "  Split:         %7.1fms (%4.1f%%)\n", prof_single_split, 100*prof_single_split/total);
+    fprintf(stderr, "  QKnorm+RoPE:   %7.1fms (%4.1f%%)\n", prof_single_qknorm_rope, 100*prof_single_qknorm_rope/total);
+    fprintf(stderr, "  Attention:     %7.1fms (%4.1f%%)\n", prof_single_attention, 100*prof_single_attention/total);
+    fprintf(stderr, "  SwiGLU:        %7.1fms (%4.1f%%)\n", prof_single_swiglu, 100*prof_single_swiglu/total);
+    fprintf(stderr, "  Proj matmul:   %7.1fms (%4.1f%%)\n", prof_single_proj_matmul, 100*prof_single_proj_matmul/total);
+    fprintf(stderr, "  Gated add:     %7.1fms (%4.1f%%)\n", prof_single_gated_add, 100*prof_single_gated_add/total);
+    fprintf(stderr, "  Total:         %7.1fms\n", total);
+}
+
+void flux_reset_blas_profile(void) {
+    prof_single_adaln = prof_single_fused_matmul = prof_single_split = 0;
+    prof_single_qknorm_rope = prof_single_attention = prof_single_swiglu = 0;
+    prof_single_proj_matmul = prof_single_gated_add = 0;
+}
+
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
     struct timeval tv;
@@ -43,6 +82,8 @@ static double tf_get_time_ms(void) {
 #else
 #include <cblas.h>
 #endif
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
 /* Use Metal for GPU acceleration when available */
@@ -257,16 +298,199 @@ typedef struct flux_transformer {
     float *double_img_attn_out;     /* [max_seq, hidden] */
     float *double_txt_attn_out;     /* [max_seq, hidden] */
 
+    /* Cached 2D RoPE embeddings (to avoid malloc/compute each step) */
+    float *cached_img_rope_cos;     /* [img_seq * axis_dim * 4] */
+    float *cached_img_rope_sin;
+    int cached_img_h;
+    int cached_img_w;
+    float *cached_ref_rope_cos;     /* [ref_seq * axis_dim * 4] for img2img */
+    float *cached_ref_rope_sin;
+    int cached_ref_h;
+    int cached_ref_w;
+    int cached_ref_t_offset;
+    float *cached_txt_rope_cos;     /* [txt_seq * head_dim] */
+    float *cached_txt_rope_sin;
+    int cached_txt_seq;
+    /* Combined RoPE cache for img2img (target + reference) */
+    float *cached_combined_rope_cos;  /* [(img_seq + ref_seq) * axis_dim * 4] */
+    float *cached_combined_rope_sin;
+    int cached_combined_img_h;
+    int cached_combined_img_w;
+    int cached_combined_ref_h;
+    int cached_combined_ref_w;
+    int cached_combined_t_offset;
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
-    safetensors_file_t *sf;
+    #define MAX_TF_SHARDS 4
+    safetensors_file_t *sf_files[MAX_TF_SHARDS];
+    int num_sf_files;
 } flux_transformer_t;
+
+/* ========================================================================
+ * Transformer Config Parsing
+ * ======================================================================== */
+
+/* Parse transformer/config.json to get architecture dimensions.
+ * Returns 0 on success, -1 on failure (caller should use defaults). */
+static int parse_transformer_config(const char *model_dir, flux_transformer_t *tf) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    /* Simple JSON integer/float extraction.
+     * Look for "key": value patterns. */
+    char *p;
+    int num_heads = 0, head_dim = 0, num_layers = 0, num_single = 0;
+    int joint_attention_dim = 0, in_channels = 0;
+    float mlp_ratio = 0, rope_theta = 0;
+
+    if ((p = strstr(buf, "\"num_attention_heads\""))) {
+        if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"attention_head_dim\""))) {
+        if ((p = strchr(p, ':'))) head_dim = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_layers\""))) {
+        if ((p = strchr(p, ':'))) num_layers = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_single_layers\""))) {
+        if ((p = strchr(p, ':'))) num_single = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"joint_attention_dim\""))) {
+        if ((p = strchr(p, ':'))) joint_attention_dim = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"in_channels\""))) {
+        if ((p = strchr(p, ':'))) in_channels = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"mlp_ratio\""))) {
+        if ((p = strchr(p, ':'))) mlp_ratio = atof(p + 1);
+    }
+    if ((p = strstr(buf, "\"rope_theta\""))) {
+        if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
+    }
+
+    /* Validate: we need at least heads and head_dim */
+    if (num_heads <= 0 || head_dim <= 0) return -1;
+
+    tf->num_heads = num_heads;
+    tf->head_dim = head_dim;
+    tf->hidden_size = num_heads * head_dim;
+    tf->mlp_hidden = (int)(tf->hidden_size * (mlp_ratio > 0 ? mlp_ratio : 3.0f));
+    tf->num_double_layers = num_layers > 0 ? num_layers : 5;
+    tf->num_single_layers = num_single > 0 ? num_single : 20;
+    tf->text_dim = joint_attention_dim > 0 ? joint_attention_dim : 7680;
+    tf->latent_channels = in_channels > 0 ? in_channels : 128;
+    tf->rope_theta = rope_theta > 0 ? rope_theta : 2000.0f;
+    tf->rope_dim = head_dim;
+    tf->axis_dim = head_dim / 4;  /* 4 RoPE axes */
+
+    return 0;
+}
+
+/* Open transformer safetensors shards.
+ * Reads diffusion_pytorch_model.safetensors.index.json for shard filenames,
+ * falls back to single diffusion_pytorch_model.safetensors.
+ * Returns number of files opened (0 on failure). */
+static int open_transformer_shards(const char *model_dir,
+                                   safetensors_file_t **files, int max_files) {
+    char path[1024];
+    int num_files = 0;
+
+    /* Try to read index JSON for sharded models */
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json",
+             model_dir);
+    FILE *fp = fopen(path, "r");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long len = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        char *json = malloc(len + 1);
+        if (json) {
+            fread(json, 1, len, fp);
+            json[len] = '\0';
+            fclose(fp);
+
+            /* Extract unique shard filenames from weight_map values */
+            char shard_names[MAX_TF_SHARDS][256];
+            int num_shards = 0;
+            const char *p = strstr(json, "\"weight_map\"");
+            if (p) {
+                p = strchr(p, '{');
+                if (p) p++;
+                while (p && num_shards < max_files) {
+                    /* Find next value (shard filename) */
+                    const char *colon = strchr(p, ':');
+                    if (!colon) break;
+                    const char *q1 = strchr(colon, '"');
+                    if (!q1) break;
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (!q2) break;
+                    int slen = (int)(q2 - q1);
+                    if (slen > 0 && slen < 256) {
+                        char fname[256];
+                        memcpy(fname, q1, slen);
+                        fname[slen] = '\0';
+                        /* Check if already seen */
+                        int dup = 0;
+                        for (int i = 0; i < num_shards; i++) {
+                            if (strcmp(shard_names[i], fname) == 0) { dup = 1; break; }
+                        }
+                        if (!dup) {
+                            strcpy(shard_names[num_shards], fname);
+                            num_shards++;
+                        }
+                    }
+                    p = q2 + 1;
+                    /* Skip to next key or end */
+                    const char *comma = strchr(p, ',');
+                    const char *brace = strchr(p, '}');
+                    if (brace && (!comma || brace < comma)) break;
+                    if (comma) p = comma + 1; else break;
+                }
+            }
+            free(json);
+
+            /* Open each shard - all must succeed */
+            for (int i = 0; i < num_shards; i++) {
+                snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, shard_names[i]);
+                files[num_files] = safetensors_open(path);
+                if (files[num_files]) {
+                    num_files++;
+                } else {
+                    fprintf(stderr, "Error: failed to open transformer shard %s\n", shard_names[i]);
+                    for (int j = 0; j < num_files; j++) safetensors_close(files[j]);
+                    return 0;
+                }
+            }
+            if (num_files > 0) return num_files;
+        } else {
+            fclose(fp);
+        }
+    }
+
+    /* Fallback: single file */
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
+             model_dir);
+    files[0] = safetensors_open(path);
+    if (files[0]) return 1;
+
+    return 0;
+}
 
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
-static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static int load_double_block_weights(double_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
 static void free_double_block_weights(double_block_t *b);
-static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static int load_single_block_weights(single_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
 static void free_single_block_weights(single_block_t *b);
 
 /* ========================================================================
@@ -274,63 +498,62 @@ static void free_single_block_weights(single_block_t *b);
  * ======================================================================== */
 
 /* Helper to get tensor as f32 (used by mmap load functions) */
-static float *mmap_get_f32(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        fprintf(stderr, "Error: required tensor %s not found\n", name);
-        return NULL;
+static float *mmap_get_f32(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) return safetensors_get_f32(files[f], t);
     }
-    return safetensors_get_f32(sf, t);
+    fprintf(stderr, "Error: required tensor %s not found\n", name);
+    return NULL;
 }
 
-/* Helper to get tensor as 16-bit direct pointer (used by mmap load functions)
- * Accepts both BF16 and pre-converted F16 data.
+/* Helper to get tensor as bf16 direct pointer (used by mmap load functions)
  * Returns pointer into mmap'd region - caller must NOT free */
-static uint16_t *mmap_get_bf16(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) return NULL;
-    /* Accept both BF16 and F16 (pre-converted) */
-    if (!safetensor_is_f16_or_bf16(t)) return NULL;
-    return safetensors_get_bf16_direct(sf, t);
+static uint16_t *mmap_get_bf16(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t && safetensor_is_bf16(t)) return safetensors_get_bf16_direct(files[f], t);
+    }
+    return NULL;
 }
 
 /* Load weights for a single double_block on-demand */
-static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
-                                     int idx, int h, int mlp, int use_bf16) {
+static int load_double_block_weights(double_block_t *b, safetensors_file_t **files,
+                                     int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
 
     /* Image attention - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->img_norm_q_weight = mmap_get_f32(sf, name);
+    b->img_norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->img_norm_k_weight = mmap_get_f32(sf, name);
+    b->img_norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Image Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", idx);
-    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", idx);
-    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_k_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", idx);
-    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_v_weight = mmap_get_f32(files, num_files, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", idx);
-    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_proj_weight = mmap_get_f32(files, num_files, name);
 
     /* Image FFN - linear_in contains gate and up fused - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *ff_in_bf16 = mmap_get_bf16(sf, name);
+        uint16_t *ff_in_bf16 = mmap_get_bf16(files, num_files, name);
         if (ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->img_mlp_gate_weight_bf16 = ff_in_bf16;
             b->img_mlp_up_weight_bf16 = ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *ff_in = mmap_get_f32(sf, name);
+        float *ff_in = mmap_get_f32(files, num_files, name);
         if (ff_in) {
             b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -341,41 +564,41 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", idx);
-    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(files, num_files, name);
 
     /* Text stream - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", idx);
-    b->txt_norm_q_weight = mmap_get_f32(sf, name);
+    b->txt_norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", idx);
-    b->txt_norm_k_weight = mmap_get_f32(sf, name);
+    b->txt_norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Text Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", idx);
-    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", idx);
-    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_k_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", idx);
-    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_v_weight = mmap_get_f32(files, num_files, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", idx);
-    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(files, num_files, name);
 
     /* Text FFN - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(sf, name);
+        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(files, num_files, name);
         if (txt_ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->txt_mlp_gate_weight_bf16 = txt_ff_in_bf16;
             b->txt_mlp_up_weight_bf16 = txt_ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *txt_ff_in = mmap_get_f32(sf, name);
+        float *txt_ff_in = mmap_get_f32(files, num_files, name);
         if (txt_ff_in) {
             b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -386,8 +609,8 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", idx);
-    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(files, num_files, name);
 
     return 0;
 }
@@ -395,6 +618,11 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
 /* Free weights for a single double_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_double_block_weights(double_block_t *b) {
+#ifdef USE_METAL
+    /* Invalidate GPU weight cache before freeing CPU pointers.
+     * malloc can reuse freed addresses, causing stale cache hits. */
+    flux_metal_clear_weight_cache_only();
+#endif
     free(b->img_norm_q_weight); b->img_norm_q_weight = NULL;
     free(b->img_norm_k_weight); b->img_norm_k_weight = NULL;
     free(b->img_q_weight); b->img_q_weight = NULL;
@@ -432,26 +660,26 @@ static void free_double_block_weights(double_block_t *b) {
 }
 
 /* Load weights for a single single_block on-demand */
-static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
-                                     int idx, int h, int mlp, int use_bf16) {
+static int load_single_block_weights(single_block_t *b, safetensors_file_t **files,
+                                     int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
     (void)h; (void)mlp;  /* Unused in single block */
 
     /* QK norm weights (always f32, small) */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->norm_q_weight = mmap_get_f32(sf, name);
+    b->norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->norm_k_weight = mmap_get_f32(sf, name);
+    b->norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Fused QKV+MLP input projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", idx);
-    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(files, num_files, name);
 
     /* Fused attn out + MLP down projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", idx);
-    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(files, num_files, name);
 
     return 0;
 }
@@ -459,6 +687,9 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
 /* Free weights for a single single_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_single_block_weights(single_block_t *b) {
+#ifdef USE_METAL
+    flux_metal_clear_weight_cache_only();
+#endif
     free(b->norm_q_weight); b->norm_q_weight = NULL;
     free(b->norm_k_weight); b->norm_k_weight = NULL;
     free(b->qkv_mlp_weight); b->qkv_mlp_weight = NULL;
@@ -467,6 +698,90 @@ static void free_single_block_weights(single_block_t *b) {
     b->qkv_mlp_weight_bf16 = NULL;
     b->proj_mlp_weight_bf16 = NULL;
 }
+
+/* Free cached mmap weights for all blocks.
+ * Called after denoising completes to release memory held across steps. */
+void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
+    if (!tf || !tf->use_mmap) return;
+    for (int i = 0; i < tf->num_double_layers; i++)
+        free_double_block_weights(&tf->double_blocks[i]);
+    for (int i = 0; i < tf->num_single_layers; i++)
+        free_single_block_weights(&tf->single_blocks[i]);
+}
+
+#ifdef USE_METAL
+/* Pre-warm bf16 weight buffer cache for all blocks (mmap mode).
+ * Loads each block's bf16 mmap pointers and copies weight data to Metal
+ * GPU buffers so the first denoising step doesn't pay the cache-miss cost. */
+static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
+    if (!tf->use_mmap || !tf->use_bf16) return;
+
+    int h = tf->hidden_size, mlp = tf->mlp_hidden;
+    int fused = h * 3 + mlp * 2;
+
+    /* Input/output projections (already loaded) */
+    if (tf->img_in_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->img_in_weight_bf16,
+                                       (size_t)tf->latent_channels * h);
+    if (tf->txt_in_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->txt_in_weight_bf16,
+                                       (size_t)tf->text_dim * h);
+    if (tf->final_proj_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->final_proj_weight_bf16,
+                                       (size_t)tf->latent_channels * h);
+
+    /* Double blocks */
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        double_block_t *b = &tf->double_blocks[i];
+
+        if (b->img_q_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_q_weight_bf16, (size_t)h*h);
+        if (b->img_k_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_k_weight_bf16, (size_t)h*h);
+        if (b->img_v_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_v_weight_bf16, (size_t)h*h);
+        if (b->img_proj_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_proj_weight_bf16, (size_t)h*h);
+        if (b->img_mlp_gate_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_gate_weight_bf16, (size_t)mlp*h);
+        if (b->img_mlp_up_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_up_weight_bf16, (size_t)mlp*h);
+        if (b->img_mlp_down_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_down_weight_bf16, (size_t)h*mlp);
+
+        if (b->txt_q_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_q_weight_bf16, (size_t)h*h);
+        if (b->txt_k_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_k_weight_bf16, (size_t)h*h);
+        if (b->txt_v_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_v_weight_bf16, (size_t)h*h);
+        if (b->txt_proj_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_proj_weight_bf16, (size_t)h*h);
+        if (b->txt_mlp_gate_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_gate_weight_bf16, (size_t)mlp*h);
+        if (b->txt_mlp_up_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_up_weight_bf16, (size_t)mlp*h);
+        if (b->txt_mlp_down_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_down_weight_bf16, (size_t)h*mlp);
+
+        free_double_block_weights(&tf->double_blocks[i]);
+    }
+
+    /* Single blocks */
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        single_block_t *b = &tf->single_blocks[i];
+
+        if (b->qkv_mlp_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->qkv_mlp_weight_bf16, (size_t)fused*h);
+        if (b->proj_mlp_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->proj_mlp_weight_bf16, (size_t)h*(h+mlp));
+
+        free_single_block_weights(&tf->single_blocks[i]);
+    }
+}
+#endif
 
 /* ========================================================================
  * RoPE (Rotary Position Embeddings)
@@ -685,6 +1000,156 @@ static void compute_rope_text(float *cos_out, float *sin_out,
 }
 
 /* ========================================================================
+ * Cached RoPE Helpers
+ * Cache RoPE embeddings between steps to avoid malloc/compute overhead.
+ * ======================================================================== */
+
+/* Get or compute cached image RoPE for target (T=0) */
+static void get_cached_img_rope(flux_transformer_t *tf, int patch_h, int patch_w,
+                                float **cos_out, float **sin_out) {
+    int seq = patch_h * patch_w;
+    int axis_dim = tf->axis_dim;
+    size_t size = (size_t)seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_img_h == patch_h && tf->cached_img_w == patch_w &&
+        tf->cached_img_rope_cos && tf->cached_img_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_img_rope_cos;
+        *sin_out = tf->cached_img_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_img_rope_cos) free(tf->cached_img_rope_cos);
+    if (tf->cached_img_rope_sin) free(tf->cached_img_rope_sin);
+    tf->cached_img_rope_cos = (float *)malloc(size);
+    tf->cached_img_rope_sin = (float *)malloc(size);
+    tf->cached_img_h = patch_h;
+    tf->cached_img_w = patch_w;
+
+    compute_rope_2d(tf->cached_img_rope_cos, tf->cached_img_rope_sin,
+                    patch_h, patch_w, axis_dim, tf->rope_theta);
+
+    *cos_out = tf->cached_img_rope_cos;
+    *sin_out = tf->cached_img_rope_sin;
+}
+
+/* Get or compute cached reference image RoPE (with T offset for img2img) */
+static void get_cached_ref_rope(flux_transformer_t *tf, int patch_h, int patch_w,
+                                int t_offset, float **cos_out, float **sin_out) {
+    int seq = patch_h * patch_w;
+    int axis_dim = tf->axis_dim;
+    size_t size = (size_t)seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_ref_h == patch_h && tf->cached_ref_w == patch_w &&
+        tf->cached_ref_t_offset == t_offset &&
+        tf->cached_ref_rope_cos && tf->cached_ref_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_ref_rope_cos;
+        *sin_out = tf->cached_ref_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_ref_rope_cos) free(tf->cached_ref_rope_cos);
+    if (tf->cached_ref_rope_sin) free(tf->cached_ref_rope_sin);
+    tf->cached_ref_rope_cos = (float *)malloc(size);
+    tf->cached_ref_rope_sin = (float *)malloc(size);
+    tf->cached_ref_h = patch_h;
+    tf->cached_ref_w = patch_w;
+    tf->cached_ref_t_offset = t_offset;
+
+    compute_rope_2d_with_t_offset(tf->cached_ref_rope_cos, tf->cached_ref_rope_sin,
+                                   patch_h, patch_w, axis_dim, tf->rope_theta, t_offset);
+
+    *cos_out = tf->cached_ref_rope_cos;
+    *sin_out = tf->cached_ref_rope_sin;
+}
+
+/* Get or compute cached text RoPE */
+static void get_cached_txt_rope(flux_transformer_t *tf, int txt_seq,
+                                float **cos_out, float **sin_out) {
+    int head_dim = tf->head_dim;
+    size_t size = (size_t)txt_seq * head_dim * sizeof(float);
+
+    if (tf->cached_txt_seq == txt_seq &&
+        tf->cached_txt_rope_cos && tf->cached_txt_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_txt_rope_cos;
+        *sin_out = tf->cached_txt_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_txt_rope_cos) free(tf->cached_txt_rope_cos);
+    if (tf->cached_txt_rope_sin) free(tf->cached_txt_rope_sin);
+    tf->cached_txt_rope_cos = (float *)malloc(size);
+    tf->cached_txt_rope_sin = (float *)malloc(size);
+    tf->cached_txt_seq = txt_seq;
+
+    compute_rope_text(tf->cached_txt_rope_cos, tf->cached_txt_rope_sin,
+                      txt_seq, tf->axis_dim, tf->rope_theta);
+
+    *cos_out = tf->cached_txt_rope_cos;
+    *sin_out = tf->cached_txt_rope_sin;
+}
+
+/* Get or compute cached combined RoPE for img2img (target + reference) */
+static void get_cached_combined_rope(flux_transformer_t *tf,
+                                     int img_h, int img_w,
+                                     int ref_h, int ref_w,
+                                     int t_offset,
+                                     float **cos_out, float **sin_out) {
+    int img_seq = img_h * img_w;
+    int ref_seq = ref_h * ref_w;
+    int combined_seq = img_seq + ref_seq;
+    int axis_dim = tf->axis_dim;
+    size_t combined_size = (size_t)combined_seq * axis_dim * 4 * sizeof(float);
+    size_t img_size = (size_t)img_seq * axis_dim * 4 * sizeof(float);
+    size_t ref_size = (size_t)ref_seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_combined_img_h == img_h &&
+        tf->cached_combined_img_w == img_w &&
+        tf->cached_combined_ref_h == ref_h &&
+        tf->cached_combined_ref_w == ref_w &&
+        tf->cached_combined_t_offset == t_offset &&
+        tf->cached_combined_rope_cos && tf->cached_combined_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_combined_rope_cos;
+        *sin_out = tf->cached_combined_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_combined_rope_cos) free(tf->cached_combined_rope_cos);
+    if (tf->cached_combined_rope_sin) free(tf->cached_combined_rope_sin);
+    tf->cached_combined_rope_cos = (float *)malloc(combined_size);
+    tf->cached_combined_rope_sin = (float *)malloc(combined_size);
+    tf->cached_combined_img_h = img_h;
+    tf->cached_combined_img_w = img_w;
+    tf->cached_combined_ref_h = ref_h;
+    tf->cached_combined_ref_w = ref_w;
+    tf->cached_combined_t_offset = t_offset;
+
+    /* Compute target image RoPE (T=0) */
+    float *img_rope_cos, *img_rope_sin;
+    get_cached_img_rope(tf, img_h, img_w, &img_rope_cos, &img_rope_sin);
+
+    /* Compute reference image RoPE (T=t_offset) */
+    float *ref_rope_cos, *ref_rope_sin;
+    get_cached_ref_rope(tf, ref_h, ref_w, t_offset, &ref_rope_cos, &ref_rope_sin);
+
+    /* Concatenate: [target, reference] */
+    memcpy(tf->cached_combined_rope_cos, img_rope_cos, img_size);
+    memcpy(tf->cached_combined_rope_cos + img_seq * axis_dim * 4, ref_rope_cos, ref_size);
+    memcpy(tf->cached_combined_rope_sin, img_rope_sin, img_size);
+    memcpy(tf->cached_combined_rope_sin + img_seq * axis_dim * 4, ref_rope_sin, ref_size);
+
+    *cos_out = tf->cached_combined_rope_cos;
+    *sin_out = tf->cached_combined_rope_sin;
+}
+
+/* ========================================================================
  * Timestep Embedding
  * ======================================================================== */
 
@@ -867,7 +1332,7 @@ static void apply_qk_norm(float *q, float *k,
 
 /* Multi-head self-attention */
 
-#if defined(USE_METAL) || defined(USE_BLAS)
+#ifdef USE_METAL
 /* Transpose from [seq, heads, head_dim] to [heads, seq, head_dim]
  * Needed for batched attention that processes each head separately */
 static void transpose_shd_to_hsd(float *out, const float *in,
@@ -892,7 +1357,7 @@ static void transpose_hsd_to_shd(float *out, const float *in,
         }
     }
 }
-#endif /* USE_METAL || USE_BLAS */
+#endif /* USE_METAL */
 
 /* Ensure attn_scores buffer is large enough for current sequence lengths.
  * Only needed for BLAS/Metal paths - flash attention doesn't use this buffer.
@@ -999,6 +1464,105 @@ static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
     return 0;
 }
 
+/* ========================================================================
+ * Thread-parallel attention for BLAS path.
+ * Per-head sgemm is too small for BLAS internal threading, so we
+ * parallelize across heads using pthreads instead.
+ * ======================================================================== */
+
+#ifdef USE_BLAS
+/* Work descriptor for self-attention (single blocks) */
+typedef struct {
+    const float *q, *k, *v;
+    float *out, *scores;
+    int seq, head_dim, hidden;
+    float scale;
+    int head_start, head_end;
+} mha_thread_work_t;
+
+static void *mha_thread_worker(void *arg) {
+    mha_thread_work_t *w = (mha_thread_work_t *)arg;
+    for (int h = w->head_start; h < w->head_end; h++) {
+        const float *qh = w->q + h * w->head_dim;
+        const float *kh = w->k + h * w->head_dim;
+        const float *vh = w->v + h * w->head_dim;
+        float *oh = w->out + h * w->head_dim;
+        float *sh = w->scores + (size_t)h * w->seq * w->seq;
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->seq, w->seq, w->head_dim,
+                    w->scale, qh, w->hidden, kh, w->hidden,
+                    0.0f, sh, w->seq);
+        flux_softmax_cpu(sh, w->seq, w->seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->seq, w->head_dim, w->seq,
+                    1.0f, sh, w->seq, vh, w->hidden,
+                    0.0f, oh, w->hidden);
+    }
+    return NULL;
+}
+
+/* Work descriptor for joint attention (double blocks) */
+typedef struct {
+    const float *img_q, *txt_q, *cat_k, *cat_v;
+    float *img_out, *txt_out, *scores;
+    int img_seq, txt_seq, total_seq, head_dim, hidden;
+    float scale;
+    int head_start, head_end;
+} joint_attn_thread_work_t;
+
+static void *joint_attn_thread_worker(void *arg) {
+    joint_attn_thread_work_t *w = (joint_attn_thread_work_t *)arg;
+    for (int h = w->head_start; h < w->head_end; h++) {
+        const float *img_qh = w->img_q + h * w->head_dim;
+        const float *txt_qh = w->txt_q + h * w->head_dim;
+        const float *kh = w->cat_k + h * w->head_dim;
+        const float *vh = w->cat_v + h * w->head_dim;
+        float *img_oh = w->img_out + h * w->head_dim;
+        float *txt_oh = w->txt_out + h * w->head_dim;
+        float *img_sh = w->scores + (size_t)h * w->total_seq * w->total_seq;
+        float *txt_sh = img_sh + (size_t)w->img_seq * w->total_seq;
+
+        /* Image attention */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->img_seq, w->total_seq, w->head_dim,
+                    w->scale, img_qh, w->hidden, kh, w->hidden,
+                    0.0f, img_sh, w->total_seq);
+        flux_softmax_cpu(img_sh, w->img_seq, w->total_seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->img_seq, w->head_dim, w->total_seq,
+                    1.0f, img_sh, w->total_seq, vh, w->hidden,
+                    0.0f, img_oh, w->hidden);
+
+        /* Text attention */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->txt_seq, w->total_seq, w->head_dim,
+                    w->scale, txt_qh, w->hidden, kh, w->hidden,
+                    0.0f, txt_sh, w->total_seq);
+        flux_softmax_cpu(txt_sh, w->txt_seq, w->total_seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->txt_seq, w->head_dim, w->total_seq,
+                    1.0f, txt_sh, w->total_seq, vh, w->hidden,
+                    0.0f, txt_oh, w->hidden);
+    }
+    return NULL;
+}
+
+/* Get number of threads for head-parallel attention.
+ * Uses CPU core count, capped to divide num_heads evenly. */
+static int get_attn_num_threads(int heads) {
+    static int cached = 0;
+    if (cached) return cached;
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 2) { cached = 1; return 1; }
+    if (ncpu > heads) ncpu = heads;
+    /* Round down to divide heads evenly */
+    while (heads % ncpu != 0) ncpu--;
+    cached = ncpu;
+    return cached;
+}
+#endif /* USE_BLAS */
+
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
  */
@@ -1039,45 +1603,56 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: transpose + batched matrix multiply per head */
+    /* BLAS path: thread-parallel per-head attention.
+     * Q, K, V are [seq, heads*head_dim] layout. We use lda=hidden to stride
+     * over heads, reading head_dim elements per row directly.
+     * Per-head sgemm is too small for BLAS internal threading, so we
+     * parallelize across heads with pthreads for better core utilization. */
     {
-        float *q_t = tf->attn_q_t;
-        float *k_t = tf->attn_k_t;
-        float *v_t = tf->attn_v_t;
-        float *out_t = tf->attn_out_t;
+        int hidden = tf->num_heads * head_dim;
         float *scores = tf->attn_scores;
+        int nthreads = get_attn_num_threads(tf->num_heads);
+        int heads_per_thread = tf->num_heads / nthreads;
 
-        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
-        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
-        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
-        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
+        if (nthreads <= 1) {
+            /* Serial fallback */
+            for (int h = 0; h < tf->num_heads; h++) {
+                const float *qh = q + h * head_dim;
+                const float *kh = k + h * head_dim;
+                const float *vh = v + h * head_dim;
+                float *oh = out + h * head_dim;
+                float *sh = scores + (size_t)h * seq * seq;
 
-        /* Process each head with BLAS */
-        for (int h = 0; h < tf->num_heads; h++) {
-            float *qh = q_t + h * seq * head_dim;
-            float *kh = k_t + h * seq * head_dim;
-            float *vh = v_t + h * seq * head_dim;
-            float *oh = out_t + h * seq * head_dim;
-            float *sh = scores + h * seq * seq;
-
-            /* scores = Q @ K^T using BLAS */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        seq, seq, head_dim,
-                        scale, qh, head_dim, kh, head_dim,
-                        0.0f, sh, seq);
-
-            /* Softmax */
-            flux_softmax(sh, seq, seq);
-
-            /* out = scores @ V using BLAS */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        seq, head_dim, seq,
-                        1.0f, sh, seq, vh, head_dim,
-                        0.0f, oh, head_dim);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            seq, seq, head_dim,
+                            scale, qh, hidden, kh, hidden,
+                            0.0f, sh, seq);
+                flux_softmax(sh, seq, seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq, head_dim, seq,
+                            1.0f, sh, seq, vh, hidden,
+                            0.0f, oh, hidden);
+            }
+        } else {
+            pthread_t threads[nthreads];
+            mha_thread_work_t work[nthreads];
+            int ok[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                work[t] = (mha_thread_work_t){
+                    .q = q, .k = k, .v = v,
+                    .out = out, .scores = scores,
+                    .seq = seq, .head_dim = head_dim, .hidden = hidden,
+                    .scale = scale,
+                    .head_start = t * heads_per_thread,
+                    .head_end = (t + 1) * heads_per_thread,
+                };
+                ok[t] = pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]) == 0;
+                if (!ok[t]) mha_thread_worker(&work[t]);
+            }
+            for (int t = 0; t < nthreads; t++) {
+                if (ok[t]) pthread_join(threads[t], NULL);
+            }
         }
-
-        /* Transpose output back to [seq, heads, head_dim] */
-        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -1152,59 +1727,70 @@ static void joint_attention(float *img_out, float *txt_out,
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: transpose + batched matrix multiply per head */
+    /* BLAS path: thread-parallel per-head joint attention.
+     * All tensors are [seq, heads*head_dim] layout, use lda=hidden for strides.
+     * Each head gets its own scores slice for thread safety. */
     {
-        float *img_q_t = tf->attn_q_t;
-        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
-        float *cat_k_t = tf->attn_k_t;
-        float *cat_v_t = tf->attn_v_t;
-        float *img_out_t = tf->attn_out_t;
-        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
         float *scores = tf->attn_scores;
+        int nthreads = get_attn_num_threads(heads);
+        int heads_per_thread = heads / nthreads;
 
-        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
-        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
-        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
-        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
-        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
+        if (nthreads <= 1) {
+            /* Serial fallback */
+            for (int h = 0; h < heads; h++) {
+                const float *img_qh = img_q + h * head_dim;
+                const float *txt_qh = txt_q + h * head_dim;
+                const float *kh = cat_k + h * head_dim;
+                const float *vh = cat_v + h * head_dim;
+                float *img_oh = img_out + h * head_dim;
+                float *txt_oh = txt_out + h * head_dim;
+                float *img_sh = scores + (size_t)h * total_seq * total_seq;
+                float *txt_sh = img_sh + (size_t)img_seq * total_seq;
 
-        /* Process each head with BLAS */
-        for (int h = 0; h < heads; h++) {
-            float *img_qh = img_q_t + h * img_seq * head_dim;
-            float *txt_qh = txt_q_t + h * txt_seq * head_dim;
-            float *kh = cat_k_t + h * total_seq * head_dim;
-            float *vh = cat_v_t + h * total_seq * head_dim;
-            float *img_oh = img_out_t + h * img_seq * head_dim;
-            float *txt_oh = txt_out_t + h * txt_seq * head_dim;
-            float *img_sh = scores;  /* Reuse scores buffer */
-            float *txt_sh = scores + img_seq * total_seq;
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            img_seq, total_seq, head_dim,
+                            scale, img_qh, hidden, kh, hidden,
+                            0.0f, img_sh, total_seq);
+                flux_softmax(img_sh, img_seq, total_seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            img_seq, head_dim, total_seq,
+                            1.0f, img_sh, total_seq, vh, hidden,
+                            0.0f, img_oh, hidden);
 
-            /* Image attention: img_Q @ cat_K^T */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        img_seq, total_seq, head_dim,
-                        scale, img_qh, head_dim, kh, head_dim,
-                        0.0f, img_sh, total_seq);
-            flux_softmax(img_sh, img_seq, total_seq);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        img_seq, head_dim, total_seq,
-                        1.0f, img_sh, total_seq, vh, head_dim,
-                        0.0f, img_oh, head_dim);
-
-            /* Text attention: txt_Q @ cat_K^T */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        txt_seq, total_seq, head_dim,
-                        scale, txt_qh, head_dim, kh, head_dim,
-                        0.0f, txt_sh, total_seq);
-            flux_softmax(txt_sh, txt_seq, total_seq);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        txt_seq, head_dim, total_seq,
-                        1.0f, txt_sh, total_seq, vh, head_dim,
-                        0.0f, txt_oh, head_dim);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            txt_seq, total_seq, head_dim,
+                            scale, txt_qh, hidden, kh, hidden,
+                            0.0f, txt_sh, total_seq);
+                flux_softmax(txt_sh, txt_seq, total_seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            txt_seq, head_dim, total_seq,
+                            1.0f, txt_sh, total_seq, vh, hidden,
+                            0.0f, txt_oh, hidden);
+            }
+        } else {
+            pthread_t threads[nthreads];
+            joint_attn_thread_work_t work[nthreads];
+            int ok[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                work[t] = (joint_attn_thread_work_t){
+                    .img_q = img_q, .txt_q = txt_q,
+                    .cat_k = cat_k, .cat_v = cat_v,
+                    .img_out = img_out, .txt_out = txt_out,
+                    .scores = scores,
+                    .img_seq = img_seq, .txt_seq = txt_seq,
+                    .total_seq = total_seq,
+                    .head_dim = head_dim, .hidden = hidden,
+                    .scale = scale,
+                    .head_start = t * heads_per_thread,
+                    .head_end = (t + 1) * heads_per_thread,
+                };
+                ok[t] = pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]) == 0;
+                if (!ok[t]) joint_attn_thread_worker(&work[t]);
+            }
+            for (int t = 0; t < nthreads; t++) {
+                if (ok[t]) pthread_join(threads[t], NULL);
+            }
         }
-
-        /* Transpose outputs back */
-        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
-        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -1508,9 +2094,8 @@ static void swiglu_ffn_bf16(float *out, const float *x,
     LINEAR_BF16_OR_F32(up, x, up_weight, up_weight_bf16, seq, hidden, mlp_hidden);
     flux_gpu_end_batch();
 
-    /* SiLU(gate) * up */
-    flux_silu(gate, seq * mlp_hidden);
-    flux_mul_inplace(gate, up, seq * mlp_hidden);
+    /* SiLU(gate) * up - fused for better performance */
+    flux_silu_mul(gate, up, seq * mlp_hidden);
 
     /* Down projection */
     LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
@@ -1919,12 +2504,81 @@ cleanup:
     return 1;  /* GPU path succeeded */
 }
 
+/* ========================================================================
+ * Scratch buffers for GPU-chained single block (f32 path)
+ * Pre-allocating these avoids 10 GPU tensor alloc/frees per block (200 per step)
+ * ======================================================================== */
+typedef struct {
+    int seq;
+    int hidden;
+    int mlp_hidden;
+    int fused_dim;
+    flux_gpu_tensor_t norm;
+    flux_gpu_tensor_t fused;
+    flux_gpu_tensor_t q;
+    flux_gpu_tensor_t k;
+    flux_gpu_tensor_t v;
+    flux_gpu_tensor_t gate_mlp;
+    flux_gpu_tensor_t up;
+    flux_gpu_tensor_t attn_out;
+    flux_gpu_tensor_t concat;
+    flux_gpu_tensor_t proj_out;
+} single_block_gpu_scratch_t;
+
+static void single_block_gpu_scratch_free(single_block_gpu_scratch_t *s) {
+    if (!s) return;
+    if (s->norm) flux_gpu_tensor_free(s->norm);
+    if (s->fused) flux_gpu_tensor_free(s->fused);
+    if (s->q) flux_gpu_tensor_free(s->q);
+    if (s->k) flux_gpu_tensor_free(s->k);
+    if (s->v) flux_gpu_tensor_free(s->v);
+    if (s->gate_mlp) flux_gpu_tensor_free(s->gate_mlp);
+    if (s->up) flux_gpu_tensor_free(s->up);
+    if (s->attn_out) flux_gpu_tensor_free(s->attn_out);
+    if (s->concat) flux_gpu_tensor_free(s->concat);
+    if (s->proj_out) flux_gpu_tensor_free(s->proj_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int single_block_gpu_scratch_init(single_block_gpu_scratch_t *s,
+                                         int seq, int hidden, int mlp_hidden) {
+    if (!s || seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+
+    s->seq = seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    s->fused_dim = hidden * 3 + mlp_hidden * 2;
+
+    /* Allocate all f32 scratch buffers */
+    s->norm = flux_gpu_tensor_alloc((size_t)seq * hidden);
+    s->fused = flux_gpu_tensor_alloc((size_t)seq * s->fused_dim);
+    s->q = flux_gpu_tensor_alloc((size_t)seq * hidden);
+    s->k = flux_gpu_tensor_alloc((size_t)seq * hidden);
+    s->v = flux_gpu_tensor_alloc((size_t)seq * hidden);
+    s->gate_mlp = flux_gpu_tensor_alloc((size_t)seq * mlp_hidden);
+    s->up = flux_gpu_tensor_alloc((size_t)seq * mlp_hidden);
+    s->attn_out = flux_gpu_tensor_alloc((size_t)seq * hidden);
+    s->concat = flux_gpu_tensor_alloc((size_t)seq * (hidden + mlp_hidden));
+    s->proj_out = flux_gpu_tensor_alloc((size_t)seq * hidden);
+
+    if (!s->norm || !s->fused || !s->q || !s->k || !s->v ||
+        !s->gate_mlp || !s->up || !s->attn_out || !s->concat || !s->proj_out) {
+        single_block_gpu_scratch_free(s);
+        return 0;
+    }
+
+    return 1;
+}
+
 /* GPU-chained single block: operates on a GPU tensor that persists across blocks.
  * Unlike single_block_forward_gpu(), this does NOT copy hidden to/from CPU.
  * The hidden_gpu tensor must be pre-allocated and will be modified in-place.
  * Caller must be in batch mode (flux_gpu_batch_begin called).
  * The shift/scale/gate modulation parameters must be pre-computed by the caller
  * (they are the same for all 20 single blocks within a step).
+ * Optional scratch parameter: if provided, reuses pre-allocated buffers to avoid
+ * per-block allocation overhead (10 allocations per block -> 0).
  * Returns 1 if GPU path was used, 0 to fall back to CPU path.
  */
 static int single_block_forward_gpu_chained(flux_gpu_tensor_t hidden_gpu,
@@ -1932,7 +2586,8 @@ static int single_block_forward_gpu_chained(flux_gpu_tensor_t hidden_gpu,
                                             const float *shift, const float *scale, const float *gate,
                                             const float *img_rope_cos, const float *img_rope_sin,
                                             const float *txt_rope_cos, const float *txt_rope_sin,
-                                            int seq, int img_offset, flux_transformer_t *tf) {
+                                            int seq, int img_offset, flux_transformer_t *tf,
+                                            single_block_gpu_scratch_t *scratch) {
     /* Check if GPU tensors are available */
     if (!flux_metal_available() || !flux_metal_shaders_available()) return 0;
     if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
@@ -1946,40 +2601,84 @@ static int single_block_forward_gpu_chained(flux_gpu_tensor_t hidden_gpu,
     float eps = 1e-6f;
     int axis_dim = 32;
 
-    /* === Allocate intermediate GPU tensors === */
-    flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t gate_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
-    flux_gpu_tensor_t up_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
-    flux_gpu_tensor_t attn_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
+    int own_tensors = (scratch == NULL);
 
-    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
-        !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu) {
-        /* Cleanup and fall back */
-        if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
-        if (q_gpu) flux_gpu_tensor_free(q_gpu);
-        if (k_gpu) flux_gpu_tensor_free(k_gpu);
-        if (v_gpu) flux_gpu_tensor_free(v_gpu);
-        if (gate_gpu) flux_gpu_tensor_free(gate_gpu);
-        if (up_gpu) flux_gpu_tensor_free(up_gpu);
-        if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
-        if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    /* Either reuse scratch buffers (fast path) or allocate per-call (fallback) */
+    flux_gpu_tensor_t norm_gpu = NULL;
+    flux_gpu_tensor_t fused_result = NULL;
+    flux_gpu_tensor_t q_gpu = NULL;
+    flux_gpu_tensor_t k_gpu = NULL;
+    flux_gpu_tensor_t v_gpu = NULL;
+    flux_gpu_tensor_t gate_gpu = NULL;
+    flux_gpu_tensor_t up_gpu = NULL;
+    flux_gpu_tensor_t attn_out_gpu = NULL;
+    flux_gpu_tensor_t concat_gpu = NULL;
+    flux_gpu_tensor_t proj_out_gpu = NULL;
+
+    if (scratch) {
+        /* Validate scratch dimensions match */
+        if (scratch->seq != seq || scratch->hidden != h_size ||
+            scratch->mlp_hidden != mlp_hidden || scratch->fused_dim != fused_dim) {
+            return 0;
+        }
+        norm_gpu = scratch->norm;
+        fused_result = scratch->fused;
+        q_gpu = scratch->q;
+        k_gpu = scratch->k;
+        v_gpu = scratch->v;
+        gate_gpu = scratch->gate_mlp;
+        up_gpu = scratch->up;
+        attn_out_gpu = scratch->attn_out;
+        concat_gpu = scratch->concat;
+        proj_out_gpu = scratch->proj_out;
+
+        if (!norm_gpu || !fused_result || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+            return 0;
+        }
+    } else {
+        /* Allocate intermediate GPU tensors */
+        norm_gpu = flux_gpu_tensor_alloc(seq * h_size);
+        q_gpu = flux_gpu_tensor_alloc(seq * h_size);
+        k_gpu = flux_gpu_tensor_alloc(seq * h_size);
+        v_gpu = flux_gpu_tensor_alloc(seq * h_size);
+        gate_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+        up_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+        attn_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
+        concat_gpu = flux_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
+
+        if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu) {
+            /* Cleanup and fall back */
+            if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+            if (q_gpu) flux_gpu_tensor_free(q_gpu);
+            if (k_gpu) flux_gpu_tensor_free(k_gpu);
+            if (v_gpu) flux_gpu_tensor_free(v_gpu);
+            if (gate_gpu) flux_gpu_tensor_free(gate_gpu);
+            if (up_gpu) flux_gpu_tensor_free(up_gpu);
+            if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+            if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+            return 0;
+        }
     }
 
     /* === Phase 3: AdaLN normalization on GPU === */
     flux_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
 
     /* === Phase 4: Fused QKV + MLP projection on GPU === */
-    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16(norm_gpu,
-                                                          block->qkv_mlp_weight_bf16,
-                                                          seq, h_size, fused_dim);
-    if (!fused_result) {
-        /* Fall back - work tensors are owned by caller */
-        return 0;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_into(fused_result, norm_gpu,
+                                       block->qkv_mlp_weight_bf16,
+                                       seq, h_size, fused_dim)) {
+            return 0;
+        }
+    } else {
+        fused_result = flux_gpu_linear_bf16(norm_gpu,
+                                            block->qkv_mlp_weight_bf16,
+                                            seq, h_size, fused_dim);
+        if (!fused_result) {
+            return 0;
+        }
     }
 
     /* === Phase 5: Split fused output on GPU === */
@@ -2020,22 +2719,30 @@ static int single_block_forward_gpu_chained(flux_gpu_tensor_t hidden_gpu,
     flux_gpu_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu, seq, h_size, mlp_hidden);
 
     /* === Phase 11: Final projection on GPU === */
-    flux_gpu_tensor_t proj_out_gpu = flux_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
-                                                          seq, h_size + mlp_hidden, h_size);
-    if (!proj_out_gpu) {
-        /* Fall back to CPU projection - need to sync to read data */
-        flux_gpu_sync();
-        float *concat_cpu = tf->single_concat;
-        flux_gpu_tensor_read(concat_gpu, concat_cpu);
-        float *proj_out_cpu = tf->work1;
-        flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
-                                seq, h_size + mlp_hidden, h_size);
-        /* Read hidden back, apply gated add on CPU, write back */
-        float *hidden_cpu = tf->work2;  /* Reuse work2 since mod_params is done */
-        flux_gpu_tensor_read(hidden_gpu, hidden_cpu);
-        gated_add(hidden_cpu, gate, proj_out_cpu, seq, h_size);
-        memcpy(flux_gpu_tensor_data(hidden_gpu), hidden_cpu, seq * h_size * sizeof(float));
-        goto cleanup;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_into(proj_out_gpu, concat_gpu,
+                                       block->proj_mlp_weight_bf16,
+                                       seq, h_size + mlp_hidden, h_size)) {
+            return 0;
+        }
+    } else {
+        proj_out_gpu = flux_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
+                                            seq, h_size + mlp_hidden, h_size);
+        if (!proj_out_gpu) {
+            /* Fall back to CPU projection - need to sync to read data */
+            flux_gpu_sync();
+            float *concat_cpu = tf->single_concat;
+            flux_gpu_tensor_read(concat_gpu, concat_cpu);
+            float *proj_out_cpu = tf->work1;
+            flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                                    seq, h_size + mlp_hidden, h_size);
+            /* Read hidden back, apply gated add on CPU, write back */
+            float *hidden_cpu = tf->work2;  /* Reuse work2 since mod_params is done */
+            flux_gpu_tensor_read(hidden_gpu, hidden_cpu);
+            gated_add(hidden_cpu, gate, proj_out_cpu, seq, h_size);
+            memcpy(flux_gpu_tensor_data(hidden_gpu), hidden_cpu, seq * h_size * sizeof(float));
+            goto cleanup;
+        }
     }
 
     /* === Phase 12: Gated add residual on GPU (modifies hidden_gpu in-place) === */
@@ -2044,19 +2751,21 @@ static int single_block_forward_gpu_chained(flux_gpu_tensor_t hidden_gpu,
     /* Note: We do NOT sync here - GPU work will be committed when
      * flux_gpu_tensor_read is called at the end of all single blocks */
 
+    if (!own_tensors) return 1;  /* Using scratch - don't free */
+
     flux_gpu_tensor_free(proj_out_gpu);
 
 cleanup:
-    /* Free all tensors allocated in this function */
-    flux_gpu_tensor_free(fused_result);
-    flux_gpu_tensor_free(norm_gpu);
-    flux_gpu_tensor_free(q_gpu);
-    flux_gpu_tensor_free(k_gpu);
-    flux_gpu_tensor_free(v_gpu);
-    flux_gpu_tensor_free(gate_gpu);
-    flux_gpu_tensor_free(up_gpu);
-    flux_gpu_tensor_free(attn_out_gpu);
-    flux_gpu_tensor_free(concat_gpu);
+    /* Free all tensors allocated in this function (only when not using scratch) */
+    if (fused_result) flux_gpu_tensor_free(fused_result);
+    if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+    if (q_gpu) flux_gpu_tensor_free(q_gpu);
+    if (k_gpu) flux_gpu_tensor_free(k_gpu);
+    if (v_gpu) flux_gpu_tensor_free(v_gpu);
+    if (gate_gpu) flux_gpu_tensor_free(gate_gpu);
+    if (up_gpu) flux_gpu_tensor_free(up_gpu);
+    if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+    if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
 
     return 1;  /* GPU path succeeded */
 }
@@ -2075,6 +2784,68 @@ cleanup:
  *
  * Returns 1 on success, 0 to fall back to f32 path.
  * ======================================================================== */
+typedef struct {
+    int seq;
+    int hidden;
+    int mlp_hidden;
+    int fused_dim;
+    flux_gpu_tensor_t norm;
+    flux_gpu_tensor_t fused;
+    flux_gpu_tensor_t q;
+    flux_gpu_tensor_t k;
+    flux_gpu_tensor_t v;
+    flux_gpu_tensor_t gate_mlp;
+    flux_gpu_tensor_t up;
+    flux_gpu_tensor_t attn_out;
+    flux_gpu_tensor_t concat;
+    flux_gpu_tensor_t proj_out;
+} single_block_bf16_scratch_t;
+
+static void single_block_bf16_scratch_free(single_block_bf16_scratch_t *s) {
+    if (!s) return;
+    if (s->norm) flux_gpu_tensor_free(s->norm);
+    if (s->fused) flux_gpu_tensor_free(s->fused);
+    if (s->q) flux_gpu_tensor_free(s->q);
+    if (s->k) flux_gpu_tensor_free(s->k);
+    if (s->v) flux_gpu_tensor_free(s->v);
+    if (s->gate_mlp) flux_gpu_tensor_free(s->gate_mlp);
+    if (s->up) flux_gpu_tensor_free(s->up);
+    if (s->attn_out) flux_gpu_tensor_free(s->attn_out);
+    if (s->concat) flux_gpu_tensor_free(s->concat);
+    if (s->proj_out) flux_gpu_tensor_free(s->proj_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int single_block_bf16_scratch_init(single_block_bf16_scratch_t *s,
+                                         int seq, int hidden, int mlp_hidden) {
+    if (!s || seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+
+    s->seq = seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    s->fused_dim = hidden * 3 + mlp_hidden * 2;
+
+    s->norm = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->fused = flux_gpu_tensor_alloc_f16((size_t)seq * s->fused_dim);
+    s->q = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->k = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->v = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->gate_mlp = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+    s->up = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+    s->attn_out = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->concat = flux_gpu_tensor_alloc_f16((size_t)seq * (hidden + mlp_hidden));
+    s->proj_out = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+
+    if (!s->norm || !s->fused || !s->q || !s->k || !s->v ||
+        !s->gate_mlp || !s->up || !s->attn_out || !s->concat || !s->proj_out) {
+        single_block_bf16_scratch_free(s);
+        return 0;
+    }
+
+    return 1;
+}
+
 static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
                                       const single_block_t *block,
                                       flux_gpu_tensor_t shift_bf16,
@@ -2084,7 +2855,8 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
                                       flux_gpu_tensor_t norm_k_weight_bf16,
                                       const float *img_rope_cos, const float *img_rope_sin,
                                       const float *txt_rope_cos, const float *txt_rope_sin,
-                                      int seq, int img_offset, flux_transformer_t *tf) {
+                                      int seq, int img_offset, flux_transformer_t *tf,
+                                      single_block_bf16_scratch_t *scratch) {
     /* Check if bf16 pipeline is available */
     if (!flux_bf16_pipeline_available()) return 0;
     if (!hidden_gpu || !flux_gpu_tensor_is_f16(hidden_gpu)) return 0;
@@ -2098,144 +2870,92 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
     float eps = 1e-6f;
     int axis_dim = 32;
 
-    /* === Allocate bf16 intermediate tensors === */
-    flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t gate_mlp_gpu = flux_gpu_tensor_alloc_f16(seq * mlp_hidden);
-    flux_gpu_tensor_t up_gpu = flux_gpu_tensor_alloc_f16(seq * mlp_hidden);
-    flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc_f16(seq * (h_size + mlp_hidden));
-    flux_gpu_tensor_t attn_out_gpu = NULL;  /* Will be assigned from attention output */
+    int own_tensors = (scratch == NULL);
 
-    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
-        !gate_mlp_gpu || !up_gpu || !concat_gpu) {
-        /* Cleanup and fall back */
-        if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
-        if (q_gpu) flux_gpu_tensor_free(q_gpu);
-        if (k_gpu) flux_gpu_tensor_free(k_gpu);
-        if (v_gpu) flux_gpu_tensor_free(v_gpu);
-        if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
-        if (up_gpu) flux_gpu_tensor_free(up_gpu);
-        if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    /* Either reuse a scratch set (fast path) or allocate per-call (fallback). */
+    flux_gpu_tensor_t norm_gpu = NULL;
+    flux_gpu_tensor_t fused_result = NULL;
+    flux_gpu_tensor_t q_gpu = NULL;
+    flux_gpu_tensor_t k_gpu = NULL;
+    flux_gpu_tensor_t v_gpu = NULL;
+    flux_gpu_tensor_t gate_mlp_gpu = NULL;
+    flux_gpu_tensor_t up_gpu = NULL;
+    flux_gpu_tensor_t attn_out_gpu = NULL;
+    flux_gpu_tensor_t concat_gpu = NULL;
+    flux_gpu_tensor_t proj_out_gpu = NULL;
+
+    if (scratch) {
+        if (scratch->seq != seq || scratch->hidden != h_size ||
+            scratch->mlp_hidden != mlp_hidden || scratch->fused_dim != fused_dim) {
+            return 0;
+        }
+        norm_gpu = scratch->norm;
+        fused_result = scratch->fused;
+        q_gpu = scratch->q;
+        k_gpu = scratch->k;
+        v_gpu = scratch->v;
+        gate_mlp_gpu = scratch->gate_mlp;
+        up_gpu = scratch->up;
+        attn_out_gpu = scratch->attn_out;
+        concat_gpu = scratch->concat;
+        proj_out_gpu = scratch->proj_out;
+
+        if (!norm_gpu || !fused_result || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_mlp_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+            return 0;
+        }
+    } else {
+        norm_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        q_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        k_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        v_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        gate_mlp_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+        up_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+        attn_out_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        concat_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * (h_size + mlp_hidden));
+
+        if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_mlp_gpu || !up_gpu || !attn_out_gpu || !concat_gpu) {
+            goto cleanup;
+        }
     }
 
     /* === Phase 1: AdaLN normalization (bf16) === */
     flux_gpu_adaln_norm_bf16(norm_gpu, hidden_gpu, shift_bf16, scale_bf16, seq, h_size, eps);
 
     /* === Phase 2: Fused QKV + MLP projection (bf16 native) === */
-    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16_native(norm_gpu,
-                                                                  block->qkv_mlp_weight_bf16,
-                                                                  seq, h_size, fused_dim);
-    if (!fused_result) {
-        /* Fall back to f32 path */
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(attn_out_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_native_into(fused_result, norm_gpu,
+                                              block->qkv_mlp_weight_bf16,
+                                              seq, h_size, fused_dim)) {
+            return 0;
+        }
+    } else {
+        fused_result = flux_gpu_linear_bf16_native(norm_gpu,
+                                                   block->qkv_mlp_weight_bf16,
+                                                   seq, h_size, fused_dim);
+        if (!fused_result) goto cleanup;
     }
 
     /* === Phase 3: Split fused output (bf16) === */
     flux_gpu_split_qkv_mlp_bf16(fused_result, q_gpu, k_gpu, v_gpu, gate_mlp_gpu, up_gpu,
-                                 seq, h_size, mlp_hidden);
+                                seq, h_size, mlp_hidden);
 
     /* === Phase 4: QK RMSNorm (bf16) === */
     flux_gpu_qk_rms_norm_bf16(q_gpu, k_gpu, norm_q_weight_bf16, norm_k_weight_bf16,
-                               seq, heads, head_dim, eps);
+                              seq, heads, head_dim, eps);
 
     /* === Phase 5: Apply unified RoPE (bf16 tensors, f32 frequencies) === */
     flux_gpu_rope_unified_bf16(q_gpu, k_gpu,
-                                txt_rope_cos, txt_rope_sin,
-                                img_rope_cos, img_rope_sin,
-                                seq, img_offset, heads, head_dim, axis_dim);
+                               txt_rope_cos, txt_rope_sin,
+                               img_rope_cos, img_rope_sin,
+                               seq, img_offset, heads, head_dim, axis_dim);
 
     /* === Phase 6: Self-attention (native bf16 fused SDPA) === */
-    /* Use fused bf16 attention kernel:
-     * bf16 I/O with f32 accumulation, no intermediate score storage. */
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-
-    /* Allocate bf16 output tensor */
-    attn_out_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    if (!attn_out_gpu) {
-        flux_gpu_tensor_free(fused_result);
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
-    }
-
-    /* Try native fused bf16 attention first */
     if (!flux_gpu_attention_fused_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                        seq, seq, heads, head_dim, attn_scale)) {
-        /* Fall back to f32 path for sequences > 1024 */
-        flux_gpu_tensor_t q_f32 = flux_gpu_tensor_bf16_to_f32(q_gpu);
-        flux_gpu_tensor_t k_f32 = flux_gpu_tensor_bf16_to_f32(k_gpu);
-        flux_gpu_tensor_t v_f32 = flux_gpu_tensor_bf16_to_f32(v_gpu);
-        flux_gpu_tensor_t attn_f32 = flux_gpu_tensor_alloc(seq * h_size);
-
-        if (!q_f32 || !k_f32 || !v_f32 || !attn_f32) {
-            if (q_f32) flux_gpu_tensor_free(q_f32);
-            if (k_f32) flux_gpu_tensor_free(k_f32);
-            if (v_f32) flux_gpu_tensor_free(v_f32);
-            if (attn_f32) flux_gpu_tensor_free(attn_f32);
-            flux_gpu_tensor_free(fused_result);
-            flux_gpu_tensor_free(norm_gpu);
-            flux_gpu_tensor_free(q_gpu);
-            flux_gpu_tensor_free(k_gpu);
-            flux_gpu_tensor_free(v_gpu);
-            flux_gpu_tensor_free(gate_mlp_gpu);
-            flux_gpu_tensor_free(up_gpu);
-            flux_gpu_tensor_free(attn_out_gpu);
-            flux_gpu_tensor_free(concat_gpu);
-            return 0;
-        }
-
-        flux_gpu_sync();
-        if (!flux_gpu_attention_fused(attn_f32, q_f32, k_f32, v_f32,
                                        seq, seq, heads, head_dim, attn_scale)) {
-            /* Fall back to CPU attention */
-            float *q_cpu = tf->single_q;
-            float *k_cpu = tf->single_k;
-            float *v_cpu = tf->single_v;
-            flux_gpu_tensor_read(q_f32, q_cpu);
-            flux_gpu_tensor_read(k_f32, k_cpu);
-            flux_gpu_tensor_read(v_f32, v_cpu);
-            float *attn_out_cpu = tf->single_attn_out;
-            mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
-            flux_gpu_tensor_write(attn_f32, attn_out_cpu);
-        }
-        flux_gpu_sync();
-
-        /* Convert f32 attention output to bf16 */
-        flux_gpu_tensor_t attn_bf16 = flux_gpu_tensor_f32_to_bf16(attn_f32);
-        flux_gpu_tensor_free(q_f32);
-        flux_gpu_tensor_free(k_f32);
-        flux_gpu_tensor_free(v_f32);
-        flux_gpu_tensor_free(attn_f32);
-        flux_gpu_tensor_free(attn_out_gpu);
-        attn_out_gpu = attn_bf16;
-
-        if (!attn_out_gpu) {
-            flux_gpu_tensor_free(fused_result);
-            flux_gpu_tensor_free(norm_gpu);
-            flux_gpu_tensor_free(q_gpu);
-            flux_gpu_tensor_free(k_gpu);
-            flux_gpu_tensor_free(v_gpu);
-            flux_gpu_tensor_free(gate_mlp_gpu);
-            flux_gpu_tensor_free(up_gpu);
-            flux_gpu_tensor_free(concat_gpu);
-            return 0;
-        }
+        goto cleanup;
     }
 
     /* === Phase 7: SwiGLU (bf16) === */
@@ -2245,43 +2965,72 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
     flux_gpu_concat_attn_mlp_bf16(attn_out_gpu, gate_mlp_gpu, concat_gpu, seq, h_size, mlp_hidden);
 
     /* === Phase 9: Final projection (bf16 native) === */
-    flux_gpu_tensor_t proj_out_gpu = flux_gpu_linear_bf16_native(concat_gpu,
-                                                                  block->proj_mlp_weight_bf16,
-                                                                  seq, h_size + mlp_hidden, h_size);
-    if (!proj_out_gpu) {
-        /* Fall back */
-        flux_gpu_tensor_free(fused_result);
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(attn_out_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_native_into(proj_out_gpu, concat_gpu,
+                                              block->proj_mlp_weight_bf16,
+                                              seq, h_size + mlp_hidden, h_size)) {
+            return 0;
+        }
+    } else {
+        proj_out_gpu = flux_gpu_linear_bf16_native(concat_gpu,
+                                                   block->proj_mlp_weight_bf16,
+                                                   seq, h_size + mlp_hidden, h_size);
+        if (!proj_out_gpu) goto cleanup;
     }
 
     /* === Phase 10: Gated add residual (bf16) === */
     flux_gpu_gated_add_bf16(hidden_gpu, gate_bf16, proj_out_gpu, seq, h_size);
 
-    /* Cleanup */
-    flux_gpu_tensor_free(proj_out_gpu);
-    flux_gpu_tensor_free(fused_result);
-    flux_gpu_tensor_free(norm_gpu);
-    flux_gpu_tensor_free(q_gpu);
-    flux_gpu_tensor_free(k_gpu);
-    flux_gpu_tensor_free(v_gpu);
-    flux_gpu_tensor_free(gate_mlp_gpu);
-    flux_gpu_tensor_free(up_gpu);
-    flux_gpu_tensor_free(attn_out_gpu);
-    flux_gpu_tensor_free(concat_gpu);
+    if (!own_tensors) return 1;
 
+    /* Owned tensors: release intermediates before returning. */
+    if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+    if (fused_result) flux_gpu_tensor_free(fused_result);
+    if (q_gpu) flux_gpu_tensor_free(q_gpu);
+    if (k_gpu) flux_gpu_tensor_free(k_gpu);
+    if (v_gpu) flux_gpu_tensor_free(v_gpu);
+    if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
+    if (up_gpu) flux_gpu_tensor_free(up_gpu);
+    if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+    if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+    if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
     return 1;
+
+cleanup:
+    if (!own_tensors) return 0;
+
+    if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+    if (fused_result) flux_gpu_tensor_free(fused_result);
+    if (q_gpu) flux_gpu_tensor_free(q_gpu);
+    if (k_gpu) flux_gpu_tensor_free(k_gpu);
+    if (v_gpu) flux_gpu_tensor_free(v_gpu);
+    if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
+    if (up_gpu) flux_gpu_tensor_free(up_gpu);
+    if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+    if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+    if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
+
+    return 0;
 }
 
+/* BF16 GPU-accelerated transformer forward pass.
+ *
+ * Parameters:
+ *   img_transposed - Image tokens in NLC format (may include reference tokens for img2img)
+ *   img_seq        - Total image sequence length (target + reference for img2img)
+ *   extract_seq    - Number of tokens to extract for output (target only for img2img)
+ *   txt_emb        - Text embeddings
+ *   txt_seq        - Text sequence length
+ *   t_emb          - Timestep embedding
+ *   img_rope_*     - RoPE embeddings for image (includes reference RoPE for img2img)
+ *   txt_rope_*     - RoPE embeddings for text
+ *
+ * For text-to-image: img_seq == extract_seq (all image tokens are output)
+ * For img2img: img_seq > extract_seq (only target tokens are output)
+ */
 static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                             const float *img_transposed, int img_seq,
+                                            int extract_seq,
                                             const float *txt_emb, int txt_seq,
                                             const float *t_emb,
                                             const float *img_rope_cos, const float *img_rope_sin,
@@ -2316,12 +3065,8 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     flux_gpu_tensor_t txt_shift2 = NULL, txt_scale2 = NULL, txt_gate2 = NULL;
     flux_gpu_tensor_t single_shift = NULL, single_scale = NULL, single_gate = NULL;
     flux_gpu_tensor_t final_shift = NULL, final_scale = NULL;
-    double double_start = 0.0;
-    double single_start = 0.0;
-    double final_start = 0.0;
-    double double_time = 0.0;
-    double single_time = 0.0;
-    double final_time = 0.0;
+    double step_start = 0.0;
+    double step_time = 0.0;
 
     if (!tf->img_in_weight_bf16 || !tf->txt_in_weight_bf16 ||
         !tf->final_proj_weight_bf16 || !tf->adaln_single_weight ||
@@ -2362,8 +3107,10 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         goto cleanup;
     }
 
-    /* Precompute modulation parameters */
-    double_start = tf_get_time_ms();
+    /* Precompute ALL modulation parameters on CPU before starting the GPU batch.
+     * All modulation only depends on t_emb_silu and fixed weight matrices,
+     * not on any GPU results, so we can compute everything upfront. */
+    step_start = tf_get_time_ms();
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
         tf->t_emb_silu[i] = x / (1.0f + expf(-x));
@@ -2372,7 +3119,33 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                        1, hidden, hidden * 6);
     flux_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
                        1, hidden, hidden * 6);
+    int mod_size = hidden * 3;
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    float *mod_params = tf->work2 + total_seq * fused_dim;
+    flux_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+    float *final_mod = tf->double_mod_img;  /* Reuse buffer (double_mod_img not needed after its tensors are created) */
 
+    /* Pre-allocate all GPU buffers needed for the step */
+    concat_hidden = flux_gpu_tensor_alloc_f16((size_t)total_seq * hidden);
+    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
+    final_norm = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
+    if (!concat_hidden || !img_hidden_final || !final_norm) {
+        BF16_DEBUG("[BF16] failed to allocate step buffers\n");
+        goto cleanup;
+    }
+
+    single_block_bf16_scratch_t single_scratch;
+    int single_scratch_ok = single_block_bf16_scratch_init(&single_scratch, total_seq, hidden, mlp_hidden);
+    if (!single_scratch_ok) {
+        BF16_DEBUG("[BF16] failed to allocate single-block scratch tensors\n");
+        goto cleanup;
+    }
+
+    /* === MONOLITHIC GPU BATCH: all blocks + concat + slice + final in ONE command buffer ===
+     * This eliminates 4 waitUntilCompleted sync points per step (was 5 batches, now 1). */
+    flux_gpu_batch_begin();
+
+    /* Convert modulation params to bf16 GPU tensors (inside batch) */
     img_shift1 = bf16_tensor_from_f32(tf->double_mod_img, hidden);
     img_scale1 = bf16_tensor_from_f32(tf->double_mod_img + hidden, hidden);
     img_gate1 = bf16_tensor_from_f32(tf->double_mod_img + hidden * 2, hidden);
@@ -2387,18 +3160,23 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     txt_scale2 = bf16_tensor_from_f32(tf->double_mod_txt + hidden * 4, hidden);
     txt_gate2 = bf16_tensor_from_f32(tf->double_mod_txt + hidden * 5, hidden);
 
+    single_shift = bf16_tensor_from_f32(mod_params, hidden);
+    single_scale = bf16_tensor_from_f32(mod_params + hidden, hidden);
+    single_gate = bf16_tensor_from_f32(mod_params + hidden * 2, hidden);
+
     if (!img_shift1 || !img_scale1 || !img_gate1 || !img_shift2 || !img_scale2 || !img_gate2 ||
-        !txt_shift1 || !txt_scale1 || !txt_gate1 || !txt_shift2 || !txt_scale2 || !txt_gate2) {
-        BF16_DEBUG("[BF16] failed to create double-block modulation tensors\n");
+        !txt_shift1 || !txt_scale1 || !txt_gate1 || !txt_shift2 || !txt_scale2 || !txt_gate2 ||
+        !single_shift || !single_scale || !single_gate) {
+        BF16_DEBUG("[BF16] failed to create modulation tensors\n");
+        flux_gpu_batch_end();
+        single_block_bf16_scratch_free(&single_scratch);
         goto cleanup;
     }
 
-    /* Double-stream blocks - batch ALL blocks together for minimal sync overhead.
-     * Weight buffers are cached in GPU memory, so safe to batch even with mmap. */
-    flux_gpu_batch_begin();
+    /* Double-stream blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         if (!double_block_forward_bf16(img_hidden, txt_hidden,
@@ -2412,49 +3190,22 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                        img_seq, txt_seq, tf)) {
             BF16_DEBUG("[BF16] double block %d failed\n", i);
             flux_gpu_batch_end();
+            single_block_bf16_scratch_free(&single_scratch);
             goto cleanup;
         }
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches.
-             * Each block has stable unique addresses in the mmap region.
-             * Cache entries persist and get reused on subsequent steps. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
     }
-    flux_gpu_batch_end();
-    double_time = tf_get_time_ms() - double_start;
-
     /* Concatenate text and image for single blocks */
-    concat_hidden = flux_gpu_tensor_alloc_f16((size_t)total_seq * hidden);
-    if (!concat_hidden) {
-        BF16_DEBUG("[BF16] failed to allocate concat_hidden\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
     flux_gpu_concat_seq_bf16(concat_hidden, txt_hidden, img_hidden, txt_seq, img_seq, hidden);
-    flux_gpu_batch_end();
 
-    /* Single-stream modulation */
-    single_start = tf_get_time_ms();
-    int mod_size = hidden * 3;
-    int fused_dim = hidden * 3 + mlp_hidden * 2;
-    float *mod_params = tf->work2 + total_seq * fused_dim;
-    flux_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
-    single_shift = bf16_tensor_from_f32(mod_params, hidden);
-    single_scale = bf16_tensor_from_f32(mod_params + hidden, hidden);
-    single_gate = bf16_tensor_from_f32(mod_params + hidden * 2, hidden);
-    if (!single_shift || !single_scale || !single_gate) {
-        BF16_DEBUG("[BF16] failed to create single-block modulation tensors\n");
-        goto cleanup;
-    }
-
-    /* Single-stream blocks - batch ALL blocks together for minimal sync overhead. */
-    flux_gpu_batch_begin();
+    /* Single-stream blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
 
@@ -2466,11 +3217,12 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                        norm_q, norm_k,
                                        img_rope_cos, img_rope_sin,
                                        txt_rope_cos, txt_rope_sin,
-                                       total_seq, txt_seq, tf)) {
+                                       total_seq, txt_seq, tf, &single_scratch)) {
             if (norm_q) flux_gpu_tensor_free(norm_q);
             if (norm_k) flux_gpu_tensor_free(norm_k);
             BF16_DEBUG("[BF16] single block %d failed\n", i);
             flux_gpu_batch_end();
+            single_block_bf16_scratch_free(&single_scratch);
             goto cleanup;
         }
         flux_gpu_tensor_free(norm_q);
@@ -2478,83 +3230,64 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
 
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
     }
-    flux_gpu_batch_end();
-    single_time = tf_get_time_ms() - single_start;
+    single_block_bf16_scratch_free(&single_scratch);
 
     /* Slice image portion for final layer */
-    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)img_seq * hidden);
-    if (!img_hidden_final) {
-        BF16_DEBUG("[BF16] failed to slice image hidden\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
-    flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, img_seq, hidden, txt_seq);
-    flux_gpu_batch_end();
+    flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, extract_seq, hidden, txt_seq);
 
-    /* Final layer (bf16) */
-    final_start = tf_get_time_ms();
-    float *final_mod = tf->double_mod_img;
+    /* Final layer: compute modulation (reuse double_mod_img buffer, already consumed) */
     flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
     final_scale = bf16_tensor_from_f32(final_mod, hidden);
     final_shift = bf16_tensor_from_f32(final_mod + hidden, hidden);
     if (!final_scale || !final_shift) {
         BF16_DEBUG("[BF16] failed to create final modulation tensors\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
 
-    final_norm = flux_gpu_tensor_alloc_f16((size_t)img_seq * hidden);
-    if (!final_norm) {
-        BF16_DEBUG("[BF16] failed to allocate final_norm\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
     flux_gpu_adaln_norm_bf16(final_norm, img_hidden_final, final_shift, final_scale,
-                             img_seq, hidden, 1e-6f);
+                             extract_seq, hidden, 1e-6f);
 
     output_bf16 = flux_gpu_linear_bf16_native(final_norm, tf->final_proj_weight_bf16,
-                                              img_seq, hidden, channels);
+                                              extract_seq, hidden, channels);
     if (!output_bf16) {
         BF16_DEBUG("[BF16] final projection failed\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
-    flux_gpu_batch_end();
 
     output_f32 = flux_gpu_tensor_bf16_to_f32(output_bf16);
     if (!output_f32) {
         BF16_DEBUG("[BF16] failed to convert output to f32\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
 
-    /* Ensure any queued GPU work is complete before reading back. */
-    flux_gpu_sync();
+    flux_gpu_batch_end();
 
-    output_nlc = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+    output_nlc = (float *)malloc((size_t)extract_seq * channels * sizeof(float));
     if (!output_nlc) {
         BF16_DEBUG("[BF16] failed to allocate output_nlc\n");
         goto cleanup;
     }
     flux_gpu_tensor_read(output_f32, output_nlc);
 
-    output = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+    output = (float *)malloc((size_t)extract_seq * channels * sizeof(float));
     if (!output) {
         BF16_DEBUG("[BF16] failed to allocate output\n");
         goto cleanup;
     }
-    for (int pos = 0; pos < img_seq; pos++) {
+    for (int pos = 0; pos < extract_seq; pos++) {
         for (int c = 0; c < channels; c++) {
-            output[c * img_seq + pos] = output_nlc[pos * channels + c];
+            output[c * extract_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    final_time = tf_get_time_ms() - final_start;
-    flux_timing_transformer_double += double_time;
-    flux_timing_transformer_single += single_time;
-    flux_timing_transformer_final += final_time;
-    flux_timing_transformer_total += double_time + single_time + final_time;
+    step_time = tf_get_time_ms() - step_start;
+    flux_timing_transformer_total += step_time;
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
 
@@ -2618,6 +3351,7 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      * FLUX applies SiLU to t_emb before the modulation projection
      */
     int mod_size = h_size * 3;
+    double _t0 = prof_get_time();
 
     /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
     float *t_emb_silu = tf->t_emb_silu;
@@ -2638,6 +3372,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     /* Norm */
     float *norm = tf->work1;
     apply_adaln(norm, hidden, shift, scale, seq, h_size, eps);
+    double _t1 = prof_get_time();
+    prof_single_adaln += _t1 - _t0;
 
     /* Fused QKV + FFN input projection
      * Output: [seq, fused_dim] where fused_dim = [Q, K, V, gate, up]
@@ -2646,6 +3382,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *fused_out = tf->work2;
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
+    double _t2 = prof_get_time();
+    prof_single_fused_matmul += _t2 - _t1;
 
     /* Split outputs: use pre-allocated buffers
      * Each position has [Q, K, V, gate, up] concatenated
@@ -2664,6 +3402,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
         memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
         memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
     }
+
+    double _t3 = prof_get_time();
+    prof_single_split += _t3 - _t2;
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -2686,13 +3427,20 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
+    double _t4 = prof_get_time();
+    prof_single_qknorm_rope += _t4 - _t3;
+
     /* Self-attention - use pre-allocated buffer */
     float *attn_out = tf->single_attn_out;
     mha_forward(attn_out, q, k, v, seq, heads, head_dim, tf);
+    double _t5 = prof_get_time();
+    prof_single_attention += _t5 - _t4;
 
-    /* SwiGLU: silu(gate) * up */
-    flux_silu(mlp_gate, seq * mlp_hidden);
-    flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
+    /* SwiGLU: silu(gate) * up - fused for better performance */
+    flux_silu_mul(mlp_gate, mlp_up, seq * mlp_hidden);
+
+    double _t6 = prof_get_time();
+    prof_single_swiglu += _t6 - _t5;
 
     /* Fused output projection: [attn_out, mlp_out] -> hidden
      * proj_mlp_weight: [hidden, hidden + mlp_hidden]
@@ -2710,8 +3458,13 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
+    double _t7 = prof_get_time();
+    prof_single_proj_matmul += _t7 - _t6;
+
     /* Apply gate and add residual - use vectorized helper */
     gated_add(hidden, gate, proj_out, seq, h_size);
+    double _t8 = prof_get_time();
+    prof_single_gated_add += _t8 - _t7;
 
     /* No free - using pre-allocated buffers */
 }
@@ -2726,8 +3479,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                 float timestep) {
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
-    int head_dim = tf->head_dim;
-    int axis_dim = 32;  /* FLUX uses axes_dims_rope: [32, 32, 32, 32] */
 
     /* Ensure work buffers are sized for actual sequence length */
     int total_seq = img_seq + txt_seq;
@@ -2750,20 +3501,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
-    /* Compute 2D RoPE frequencies for image tokens based on actual dimensions
-     * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
-     */
-    /* Allocate RoPE: 4 axes * 32 dims = 128 dims per position (matches head_dim) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+    /* Get cached 2D RoPE frequencies for image tokens */
+    float *img_rope_cos, *img_rope_sin;
+    get_cached_img_rope(tf, img_h, img_w, &img_rope_cos, &img_rope_sin);
 
-    /* Compute text RoPE frequencies - text tokens have position IDs (0, 0, 0, L)
-     * where L is the sequence index. RoPE is applied in axis 3 (dims 96-127)
-     */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE frequencies */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose input from NCHW [channels, h, w] to NLC [seq, channels] format
      * Input: img_latent[c * img_seq + pos] for channel c at position pos
@@ -2781,22 +3525,15 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
     if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
-        static int bf16_path_logged = 0;
-        if (!bf16_path_logged) {
-            bf16_path_logged = 1;
-            fprintf(stderr, "[BF16] Using fused bf16 pipeline for transformer\n");
-        }
         float *bf16_output = flux_transformer_forward_bf16(tf, img_transposed, img_seq,
+                                                           img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
                                                            img_rope_cos, img_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
             free(img_transposed);
             free(t_emb);
-            free(img_rope_cos);
-            free(img_rope_sin);
-            free(txt_rope_cos);
-            free(txt_rope_sin);
+            /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed, falling back\n");
@@ -2858,9 +3595,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                        1, hidden, double_mod_size);
 
     for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand */
-        if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+        /* In mmap mode, load block weights on-demand and free after use */
+        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(img_hidden, txt_hidden,
@@ -2869,11 +3607,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
-        /* In mmap mode, free block weights after use */
-        if (tf->use_mmap) {
-            free_double_block_weights(&tf->double_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches. */
-        }
+        if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
@@ -2974,7 +3708,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                                        norm_q_bf16, norm_k_bf16,
                                                        img_rope_cos, img_rope_sin,
                                                        txt_rope_cos, txt_rope_sin,
-                                                       total_seq, txt_seq, tf)) {
+                                                       total_seq, txt_seq, tf, NULL)) {
                             bf16_path_ok = 0;
                             flux_gpu_batch_end();
                             /* Convert back to f32 for fallback */
@@ -3040,13 +3774,19 @@ float *flux_transformer_forward(flux_transformer_t *tf,
              * command buffer. This eliminates the sync between blocks. */
             flux_gpu_batch_begin();
 
+            /* Allocate scratch buffers once for all 20 single blocks.
+             * This eliminates 200 GPU tensor alloc/frees per denoising step. */
+            single_block_gpu_scratch_t scratch;
+            int scratch_ok = single_block_gpu_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
+
             /* Process all single blocks with GPU tensor chaining */
             for (int i = 0; i < tf->num_single_layers && gpu_chained_ok; i++) {
                 if (!single_block_forward_gpu_chained(concat_hidden_gpu, &tf->single_blocks[i],
                                                       precomputed_shift, precomputed_scale, precomputed_gate,
                                                       img_rope_cos, img_rope_sin,
                                                       txt_rope_cos, txt_rope_sin,
-                                                      total_seq, txt_seq, tf)) {
+                                                      total_seq, txt_seq, tf,
+                                                      scratch_ok ? &scratch : NULL)) {
                     /* GPU chained path failed, need to fall back */
                     gpu_chained_ok = 0;
                     /* End batch mode before falling back */
@@ -3057,6 +3797,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                 if (flux_substep_callback)
                     flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
             }
+
+            /* Free scratch buffers */
+            if (scratch_ok) single_block_gpu_scratch_free(&scratch);
 
             if (gpu_chained_ok) {
                 /* End batch mode - commits all GPU work and waits for completion */
@@ -3074,9 +3817,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
-            /* In mmap mode, load block weights on-demand */
-            if (tf->use_mmap) {
-                load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            /* In mmap mode, load block weights on-demand and free after use */
+            if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                             && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
+                load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
 #ifdef USE_METAL
@@ -3095,11 +3839,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                      txt_rope_cos, txt_rope_sin,
                                      total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
             }
-            /* In mmap mode, free block weights after use */
-            if (tf->use_mmap) {
-                free_single_block_weights(&tf->single_blocks[i]);
-                /* With direct mmap pointers for bf16, no need to clear caches. */
-            }
+            if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -3168,10 +3908,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     double final_time = tf_get_time_ms() - final_start;
 
@@ -3236,8 +3973,6 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     int img_seq = img_h * img_w;
     int ref_seq = ref_h * ref_w;
     int combined_img_seq = img_seq + ref_seq;  /* Target + reference */
-    int head_dim = tf->head_dim;
-    int axis_dim = 32;
     int channels = tf->latent_channels;
 
     /* Ensure work buffers are sized for combined sequence */
@@ -3258,34 +3993,14 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
-    /* Compute RoPE for target image (T=0) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+    /* Get cached combined RoPE for img2img (target + reference) */
+    float *combined_rope_cos, *combined_rope_sin;
+    get_cached_combined_rope(tf, img_h, img_w, ref_h, ref_w, t_offset,
+                             &combined_rope_cos, &combined_rope_sin);
 
-    /* Compute RoPE for reference image (T=t_offset) */
-    float *ref_rope_cos = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
-    float *ref_rope_sin = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d_with_t_offset(ref_rope_cos, ref_rope_sin, ref_h, ref_w,
-                                   axis_dim, tf->rope_theta, t_offset);
-
-    /* Concatenate RoPE: [target, reference] */
-    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_cos, img_rope_cos, img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_cos + img_seq * axis_dim * 4, ref_rope_cos, ref_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_sin, img_rope_sin, img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_sin + img_seq * axis_dim * 4, ref_rope_sin, ref_seq * axis_dim * 4 * sizeof(float));
-
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(ref_rope_cos);
-    free(ref_rope_sin);
-
-    /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate image latents: [target, reference] */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
@@ -3302,6 +4017,27 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
             combined_transposed[(img_seq + pos) * channels + c] = ref_latent[c * ref_seq + pos];
         }
     }
+
+#ifdef USE_METAL
+    /* Try BF16 GPU-accelerated path for img2img.
+     * Pass combined_img_seq as img_seq (full sequence including reference),
+     * but only extract img_seq (target) tokens at the end. */
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+        float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
+                                                           img_seq, /* extract_seq = target only */
+                                                           txt_emb, txt_seq, t_emb,
+                                                           combined_rope_cos, combined_rope_sin,
+                                                           txt_rope_cos, txt_rope_sin);
+        if (bf16_output) {
+            free(combined_transposed);
+            free(t_emb);
+            /* RoPE buffers are cached in transformer struct - don't free */
+            return bf16_output;
+        } else {
+            BF16_DEBUG("[BF16] bf16 pipeline failed for refs, falling back\n");
+        }
+    }
+#endif
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
@@ -3328,7 +4064,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Double blocks - process combined image with text */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -3354,7 +4090,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
@@ -3405,10 +4141,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(combined_rope_cos);
-    free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -3455,7 +4188,6 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
-    int head_dim = tf->head_dim;
     int axis_dim = 32;
     int channels = tf->latent_channels;
 
@@ -3503,10 +4235,9 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
         rope_offset += ref_seq * axis_dim * 4;
     }
 
-    /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate all image latents */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
@@ -3530,6 +4261,27 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
         }
         trans_offset += ref_seq;
     }
+
+#ifdef USE_METAL
+    /* Try BF16 GPU-accelerated path for multi-ref img2img. */
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+        float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
+                                                           img_seq, /* extract_seq = target only */
+                                                           txt_emb, txt_seq, t_emb,
+                                                           combined_rope_cos, combined_rope_sin,
+                                                           txt_rope_cos, txt_rope_sin);
+        if (bf16_output) {
+            free(combined_transposed);
+            free(t_emb);
+            free(combined_rope_cos);
+            free(combined_rope_sin);
+            /* txt_rope is cached - don't free */
+            return bf16_output;
+        } else {
+            BF16_DEBUG("[BF16] bf16 pipeline failed for multi-refs, falling back\n");
+        }
+    }
+#endif
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
@@ -3556,7 +4308,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -3581,7 +4333,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
@@ -3633,8 +4385,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     free(t_emb);
     free(combined_rope_cos);
     free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* Text RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -3682,6 +4433,7 @@ flux_transformer_t *flux_transformer_load(FILE *f) {
     float rope_theta;
     if (fread(&rope_theta, sizeof(float), 1, f) != 1) goto error;
     tf->rope_theta = rope_theta;
+    tf->axis_dim = 32;  /* RoPE axis dimension (head_dim = 128 = 4 * axis_dim) */
 
     /* Read input projections */
     tf->img_in_weight = read_floats(f, tf->hidden_size * tf->latent_channels);
@@ -3792,6 +4544,13 @@ error:
 void flux_transformer_free(flux_transformer_t *tf) {
     if (!tf) return;
 
+    /* In mmap mode, bf16 pointers point into the mmap'd file region and must
+     * NOT be freed. Clean up any cached block weights first, then only NULL
+     * the bf16 pointers (don't free them). */
+    if (tf->use_mmap) {
+        flux_transformer_free_mmap_cache(tf);
+    }
+
     free(tf->img_in_weight);
     free(tf->txt_in_weight);
     free(tf->img_in_weight_bf16);
@@ -3807,33 +4566,35 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->img_q_weight);
             free(b->img_k_weight);
             free(b->img_v_weight);
-            free(b->img_q_weight_bf16);
-            free(b->img_k_weight_bf16);
-            free(b->img_v_weight_bf16);
             free(b->img_proj_weight);
-            free(b->img_proj_weight_bf16);
             free(b->img_mlp_gate_weight);
             free(b->img_mlp_up_weight);
             free(b->img_mlp_down_weight);
-            free(b->img_mlp_gate_weight_bf16);
-            free(b->img_mlp_up_weight_bf16);
-            free(b->img_mlp_down_weight_bf16);
             free(b->txt_norm_q_weight);
             free(b->txt_norm_k_weight);
             free(b->txt_q_weight);
             free(b->txt_k_weight);
             free(b->txt_v_weight);
-            free(b->txt_q_weight_bf16);
-            free(b->txt_k_weight_bf16);
-            free(b->txt_v_weight_bf16);
             free(b->txt_proj_weight);
-            free(b->txt_proj_weight_bf16);
             free(b->txt_mlp_gate_weight);
             free(b->txt_mlp_up_weight);
             free(b->txt_mlp_down_weight);
-            free(b->txt_mlp_gate_weight_bf16);
-            free(b->txt_mlp_up_weight_bf16);
-            free(b->txt_mlp_down_weight_bf16);
+            if (!tf->use_mmap) {
+                free(b->img_q_weight_bf16);
+                free(b->img_k_weight_bf16);
+                free(b->img_v_weight_bf16);
+                free(b->img_proj_weight_bf16);
+                free(b->img_mlp_gate_weight_bf16);
+                free(b->img_mlp_up_weight_bf16);
+                free(b->img_mlp_down_weight_bf16);
+                free(b->txt_q_weight_bf16);
+                free(b->txt_k_weight_bf16);
+                free(b->txt_v_weight_bf16);
+                free(b->txt_proj_weight_bf16);
+                free(b->txt_mlp_gate_weight_bf16);
+                free(b->txt_mlp_up_weight_bf16);
+                free(b->txt_mlp_down_weight_bf16);
+            }
         }
         free(tf->double_blocks);
     }
@@ -3844,9 +4605,11 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->norm_q_weight);
             free(b->norm_k_weight);
             free(b->qkv_mlp_weight);
-            free(b->qkv_mlp_weight_bf16);
             free(b->proj_mlp_weight);
-            free(b->proj_mlp_weight_bf16);
+            if (!tf->use_mmap) {
+                free(b->qkv_mlp_weight_bf16);
+                free(b->proj_mlp_weight_bf16);
+            }
         }
         free(tf->single_blocks);
     }
@@ -3895,10 +4658,22 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
 
-    /* Close safetensors file if in mmap mode */
-    if (tf->use_mmap && tf->sf) {
-        safetensors_close(tf->sf);
-        tf->sf = NULL;
+    /* Free cached RoPE buffers */
+    free(tf->cached_img_rope_cos);
+    free(tf->cached_img_rope_sin);
+    free(tf->cached_ref_rope_cos);
+    free(tf->cached_ref_rope_sin);
+    free(tf->cached_txt_rope_cos);
+    free(tf->cached_txt_rope_sin);
+    free(tf->cached_combined_rope_cos);
+    free(tf->cached_combined_rope_sin);
+
+    /* Close safetensors files if in mmap mode */
+    if (tf->use_mmap) {
+        for (int i = 0; i < tf->num_sf_files; i++) {
+            if (tf->sf_files[i]) safetensors_close(tf->sf_files[i]);
+        }
+        tf->num_sf_files = 0;
     }
 
     free(tf);
@@ -3908,26 +4683,25 @@ void flux_transformer_free(flux_transformer_t *tf) {
  * Safetensors Loading
  * ======================================================================== */
 
-static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        fprintf(stderr, "Error: required tensor %s not found\n", name);
-        return NULL;
+static float *get_sf_tensor_tf(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) return safetensors_get_f32(files[f], t);
     }
-    return safetensors_get_f32(sf, t);
+    fprintf(stderr, "Error: required tensor %s not found\n", name);
+    return NULL;
 }
 
-/* Get tensor as 16-bit (for GPU acceleration) - accepts BF16 or pre-converted F16 */
-static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        return NULL;  /* Not an error - bf16 is optional */
+/* Get tensor as bf16 (for GPU acceleration) */
+static uint16_t *get_sf_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) {
+            if (!safetensor_is_bf16(t)) return NULL;
+            return safetensors_get_bf16(files[f], t);
+        }
     }
-    /* Accept both BF16 and F16 (pre-converted) */
-    if (!safetensor_is_f16_or_bf16(t)) {
-        return NULL;  /* Not 16-bit, will use f32 version */
-    }
-    return safetensors_get_bf16(sf, t);
+    return NULL;  /* Not found - bf16 is optional */
 }
 
 #ifdef USE_METAL
@@ -4002,35 +4776,43 @@ static void warmup_bf16_weights(flux_transformer_t *tf) {
 }
 #endif /* USE_METAL */
 
-flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
+flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
     char name[256];
 
-    /* Set config based on FLUX.2-klein-4B */
-    tf->hidden_size = 3072;
-    tf->num_heads = 24;
-    tf->head_dim = 128;
-    tf->mlp_hidden = 9216;
-    tf->num_double_layers = 5;
-    tf->num_single_layers = 20;
-    tf->text_dim = 7680;
-    tf->latent_channels = 128;
-    /* Max sequence length must accommodate image + text tokens combined.
-     * At 1024x1024: img_seq = (1024/8)^2 = 16384, txt_seq = 512, total = 16896
-     * At 1792x1792: img_seq = (1792/8)^2 = 50176, txt_seq = 512, total = 50688
-     * We set 52000 to support up to 1792x1792 with margin.
-     */
+    /* Parse config from transformer/config.json, fall back to 4B defaults */
+    if (parse_transformer_config(model_dir, tf) != 0) {
+        tf->hidden_size = 3072;
+        tf->num_heads = 24;
+        tf->head_dim = 128;
+        tf->mlp_hidden = 9216;
+        tf->num_double_layers = 5;
+        tf->num_single_layers = 20;
+        tf->text_dim = 7680;
+        tf->latent_channels = 128;
+        tf->rope_theta = 2000.0f;
+        tf->rope_dim = 128;
+        tf->axis_dim = 32;
+    }
     tf->max_seq_len = 52000;
-    tf->rope_dim = 128;
-    tf->rope_theta = 2000.0f;
+
+    /* Open safetensors shards */
+    safetensors_file_t *files[MAX_TF_SHARDS];
+    int num_files = open_transformer_shards(model_dir, files, MAX_TF_SHARDS);
+    if (num_files == 0) {
+        fprintf(stderr, "flux_transformer_load: failed to open safetensors files\n");
+        free(tf);
+        return NULL;
+    }
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
-        printf("Using bf16 weights for GPU acceleration\n");
+        if (flux_verbose)
+            fprintf(stderr, "Using bf16 weights for GPU acceleration\n");
     }
 #else
     tf->use_bf16 = 0;
@@ -4041,29 +4823,26 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
 
     /* Input projections */
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
     } else {
-        tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
-        tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+        tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
     }
 
-    /* Time embedding
-     * FLUX.2-klein uses 256-dim sinusoidal embedding (128 frequencies)
-     * linear_1: [3072, 256], linear_2: [3072, 3072]
-     */
+    /* Time embedding */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - these are always needed in f32 for CPU modulation computation */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(sf,
+    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
         "single_stream_modulation.linear.weight");
 
     /* Double blocks */
@@ -4073,29 +4852,29 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
 
         /* Image attention - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", i);
-        b->img_norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->img_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", i);
-        b->img_norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->img_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Image Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", i);
-        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", i);
-        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_k_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", i);
-        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_v_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", i);
-        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_proj_weight = get_sf_tensor_tf(files, num_files, name);
 
-        /* Image FFN - linear_in contains gate and up fused (18432 = 2*9216) */
+        /* Image FFN - linear_in contains gate and up fused */
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
             if (ff_in_bf16) {
                 b->img_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->img_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4104,7 +4883,7 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
                 free(ff_in_bf16);
             }
         } else {
-            float *ff_in = get_sf_tensor_tf(sf, name);
+            float *ff_in = get_sf_tensor_tf(files, num_files, name);
             if (ff_in) {
                 b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4115,33 +4894,33 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", i);
-        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Text stream - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", i);
-        b->txt_norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->txt_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", i);
-        b->txt_norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->txt_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Text Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", i);
-        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", i);
-        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_k_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", i);
-        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_v_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", i);
-        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_proj_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
             if (txt_ff_in_bf16) {
                 b->txt_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->txt_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4150,7 +4929,7 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
                 free(txt_ff_in_bf16);
             }
         } else {
-            float *txt_ff_in = get_sf_tensor_tf(sf, name);
+            float *txt_ff_in = get_sf_tensor_tf(files, num_files, name);
             if (txt_ff_in) {
                 b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4161,8 +4940,8 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", i);
-        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
     }
 
     /* Single blocks */
@@ -4172,27 +4951,30 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
 
         /* QK norm weights (always f32, small) */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", i);
-        b->norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", i);
-        b->norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Major linear weights - load bf16 or f32 based on mode */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", i);
-        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->qkv_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->qkv_mlp_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", i);
-        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->proj_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->proj_mlp_weight = get_sf_tensor_tf(files, num_files, name);
     }
 
     /* Final layer */
-    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
     } else {
-        tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+        tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     }
+
+    /* Close safetensors files (non-mmap: data already copied) */
+    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
     /* Precompute RoPE frequencies */
     tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
@@ -4247,66 +5029,78 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     return tf;
 }
 
-/* Load transformer in mmap mode - only load small weights, keep sf open for block loading */
-flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf) {
+/* Load transformer in mmap mode - only load small weights, keep files open for block loading */
+flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
-    /* Set config based on FLUX.2-klein-4B */
-    tf->hidden_size = 3072;
-    tf->num_heads = 24;
-    tf->head_dim = 128;
-    tf->mlp_hidden = 9216;
-    tf->num_double_layers = 5;
-    tf->num_single_layers = 20;
-    tf->text_dim = 7680;
-    tf->latent_channels = 128;
+    /* Parse config from transformer/config.json, fall back to 4B defaults */
+    if (parse_transformer_config(model_dir, tf) != 0) {
+        tf->hidden_size = 3072;
+        tf->num_heads = 24;
+        tf->head_dim = 128;
+        tf->mlp_hidden = 9216;
+        tf->num_double_layers = 5;
+        tf->num_single_layers = 20;
+        tf->text_dim = 7680;
+        tf->latent_channels = 128;
+        tf->rope_theta = 2000.0f;
+        tf->rope_dim = 128;
+        tf->axis_dim = 32;
+    }
     tf->max_seq_len = 52000;  /* Support up to 1792x1792 */
-    tf->rope_dim = 128;
-    tf->rope_theta = 2000.0f;
 
-    /* Enable mmap mode - keep sf open, don't load block weights yet */
+    /* Open safetensors shards and keep them open for on-demand loading */
     tf->use_mmap = 1;
-    tf->sf = sf;
+    tf->num_sf_files = open_transformer_shards(model_dir, tf->sf_files, MAX_TF_SHARDS);
+    if (tf->num_sf_files == 0) {
+        fprintf(stderr, "flux_transformer_load_mmap: failed to open safetensors files\n");
+        free(tf);
+        return NULL;
+    }
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
-        printf("Using bf16 weights for GPU acceleration (mmap mode)\n");
+        if (flux_verbose)
+            fprintf(stderr, "Using bf16 weights for GPU acceleration (mmap mode)\n");
     }
 #else
     tf->use_bf16 = 0;
 #endif
 
+    safetensors_file_t **files = tf->sf_files;
+    int num_files = tf->num_sf_files;
+
     /* Input projections - always load (small) */
-    tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
-    tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+    tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
+    tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
     }
 
     /* Time embedding - always load (small) */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - always load */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(sf,
+    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
         "single_stream_modulation.linear.weight");
     if (tf->use_bf16) {
-        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "double_stream_modulation_img.linear.weight");
-        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "double_stream_modulation_txt.linear.weight");
-        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "single_stream_modulation.linear.weight");
     }
 
@@ -4315,10 +5109,10 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     tf->single_blocks = calloc(tf->num_single_layers, sizeof(single_block_t));
 
     /* Final layer - always load (small) */
-    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
-    tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
+    tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
     }
 
     /* Precompute RoPE frequencies */
@@ -4364,6 +5158,13 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
         flux_transformer_free(tf);
         return NULL;
     }
+
+#ifdef USE_METAL
+    /* Pre-warm bf16 weight buffer cache: copy all block weights from mmap
+     * to Metal GPU buffers. This shifts ~1s of first-step overhead to model
+     * loading, making all denoising steps consistently fast. */
+    warmup_mmap_bf16_buffers(tf);
+#endif
 
     return tf;
 }

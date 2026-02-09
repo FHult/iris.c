@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Download FLUX.2-klein-4B model files from HuggingFace.
+Download FLUX.2-klein model files from HuggingFace.
 
 Usage:
-    python download_model.py [--output-dir DIR]
+    python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
 
 Requirements:
     pip install huggingface_hub
@@ -15,15 +15,54 @@ import argparse
 import sys
 from pathlib import Path
 
+MODELS = {
+    "4b": ("black-forest-labs/FLUX.2-klein-4B", "./flux-klein-4b"),
+    "4b-base": ("black-forest-labs/FLUX.2-klein-base-4B", "./flux-klein-4b-base"),
+    "9b": ("black-forest-labs/FLUX.2-klein-9B", "./flux-klein-9b"),
+    "9b-base": ("black-forest-labs/FLUX.2-klein-base-9B", "./flux-klein-9b-base"),
+}
+
+USAGE_TEXT = """\
+FLUX.2-klein Model Downloader
+
+Usage: python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
+
+Available models:
+
+  4b        Distilled 4B (4 steps, fast, ~16 GB disk)
+  4b-base   Base 4B (50 steps, CFG, higher quality, ~16 GB disk)
+  9b        Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)
+  9b-base   Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)
+
+By default this implementation uses mmap() so inference is often
+possible with less RAM than the model size.
+
+If this is your first time, we suggest downloading the "4b" model:
+  python download_model.py 4b"""
+
 
 def main():
+    if len(sys.argv) < 2 or sys.argv[1].startswith('-'):
+        print(USAGE_TEXT)
+        return 1
+
     parser = argparse.ArgumentParser(
-        description='Download FLUX.2-klein-4B model files from HuggingFace'
+        description='Download FLUX.2-klein model files from HuggingFace'
+    )
+    parser.add_argument(
+        'model',
+        choices=list(MODELS.keys()),
+        help='Model to download (4b, 4b-base, 9b, 9b-base)'
     )
     parser.add_argument(
         '--output-dir', '-o',
-        default='./flux-klein-model',
-        help='Output directory (default: ./flux-klein-model)'
+        default=None,
+        help='Output directory (default: auto based on model type)'
+    )
+    parser.add_argument(
+        '--token', '-t',
+        default=None,
+        help='HuggingFace authentication token (for gated models like 9B)'
     )
     args = parser.parse_args()
 
@@ -34,18 +73,27 @@ def main():
         print("Install with: pip install huggingface_hub")
         return 1
 
-    output_dir = Path(args.output_dir)
+    # Determine token: CLI arg > env var
+    token = args.token
+    if not token:
+        import os
+        token = os.environ.get('HF_TOKEN')
 
-    print("FLUX.2-klein-4B Model Downloader")
+    repo_id, default_dir = MODELS[args.model]
+    output_dir = Path(args.output_dir if args.output_dir else default_dir)
+
+    print(f"FLUX.2 Model Downloader")
     print("================================")
     print()
-    print(f"Repository: black-forest-labs/FLUX.2-klein-4B")
+    print(f"Repository: {repo_id}")
     print(f"Output dir: {output_dir}")
+    if token:
+        print(f"Auth: using token")
     print()
 
-    # Files to download - VAE, transformer, and Qwen3 text encoder
-    # Note: text_encoder_2 and tokenizer_2 are not used by the C implementation
+    # Files to download - VAE, transformer, Qwen3 text encoder, and model_index.json
     patterns = [
+        "model_index.json",
         "vae/*.safetensors",
         "vae/*.json",
         "transformer/*.safetensors",
@@ -54,16 +102,17 @@ def main():
         "tokenizer/*",
     ]
 
-    print("Downloading files (~16GB total)...")
+    print("Downloading files...")
     print("(This may take a while depending on your connection)")
     print()
 
     try:
         model_dir = snapshot_download(
-            "black-forest-labs/FLUX.2-klein-4B",
+            repo_id,
             local_dir=str(output_dir),
             allow_patterns=patterns,
             ignore_patterns=["*.bin", "*.pt", "*.pth"],  # Skip pytorch format
+            token=token,
         )
         print()
         print("Download complete!")
@@ -97,10 +146,19 @@ def main():
         print()
 
     except Exception as e:
+        error_msg = str(e)
         print(f"Error downloading: {e}")
         print()
-        print("If you need to authenticate, run:")
-        print("  huggingface-cli login")
+        if '401' in error_msg or '403' in error_msg or 'auth' in error_msg.lower():
+            print("Authentication required. For gated models (like 9B):")
+            print("  1. Accept the license at https://huggingface.co/black-forest-labs/" +
+                  repo_id.split('/')[-1])
+            print("  2. Get your token from https://huggingface.co/settings/tokens")
+            print(f"  3. Run: python download_model.py {args.model} --token YOUR_TOKEN")
+            print("  Or set the HF_TOKEN env var")
+        else:
+            print("If you need to authenticate, run:")
+            print("  huggingface-cli login")
         return 1
 
     return 0
