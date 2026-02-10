@@ -27,7 +27,12 @@ from flask import Flask, Response, jsonify, request, send_file, send_from_direct
 # Configuration
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
-DEFAULT_MODEL_DIR = PROJECT_DIR / "flux-klein-model"
+_MODEL_SEARCH_ORDER = ["flux-klein-4b", "flux-klein-model", "flux-klein-9b",
+                       "flux-klein-4b-base", "flux-klein-9b-base"]
+DEFAULT_MODEL_DIR = next(
+    (PROJECT_DIR / d for d in _MODEL_SEARCH_ORDER if (PROJECT_DIR / d).is_dir()),
+    PROJECT_DIR / "flux-klein-4b"  # fallback for error message
+)
 DEFAULT_FLUX_BINARY = PROJECT_DIR / "flux"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"

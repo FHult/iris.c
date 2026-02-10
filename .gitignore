@@ -27,6 +27,14 @@ documents/
 *.so
 *.dylib
 
+# Python
+__pycache__/
+*.pyc
+
+# Generated build files
+flux_shaders_source.h
+
 # Web UI
 web/output/
 web/venv/
+web/.venv/
