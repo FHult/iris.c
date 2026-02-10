@@ -54,6 +54,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const stepsHint = document.getElementById('steps-hint');
     const enhanceBtn = document.getElementById('enhance-btn');
     const promptTextarea = document.getElementById('prompt');
+    const variationsValue = document.getElementById('variations-value');
+    const variationsInc = document.getElementById('variations-inc');
+    const variationsDec = document.getElementById('variations-dec');
 
     let currentEventSource = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
@@ -73,6 +76,31 @@ document.addEventListener('DOMContentLoaded', () => {
     let stepGuidance = {};
     let isPromptEnhanced = false;
     let originalPrompt = '';
+
+    // Variations count
+    let variationsCount = 1;
+
+    function updateVariationsDisplay() {
+        variationsValue.textContent = variationsCount;
+        // Update generate button text hint
+        if (!isGenerating) {
+            generateBtn.textContent = variationsCount > 1 ? `Generate ${variationsCount}` : 'Generate';
+        }
+    }
+
+    variationsInc.addEventListener('click', () => {
+        if (variationsCount < 8) {
+            variationsCount++;
+            updateVariationsDisplay();
+        }
+    });
+
+    variationsDec.addEventListener('click', () => {
+        if (variationsCount > 1) {
+            variationsCount--;
+            updateVariationsDisplay();
+        }
+    });
 
     // Cropping state
     let isCropping = false;
@@ -1020,6 +1048,14 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        // Queue additional variations (each with a unique random seed)
+        const extraVariations = variationsCount - 1;
+        if (extraVariations > 0) {
+            for (let i = 0; i < extraVariations; i++) {
+                addToQueue({ ...params, seed: null }); // null seed = random
+            }
+        }
+
         if (isGenerating) {
             // Submit to server queue immediately
             addToQueue(params);
@@ -1264,7 +1300,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function setGenerating(generating) {
         isGenerating = generating;
-        generateBtn.textContent = generating ? 'Queue' : 'Generate';
+        if (generating) {
+            generateBtn.textContent = 'Queue';
+        } else {
+            generateBtn.textContent = variationsCount > 1 ? `Generate ${variationsCount}` : 'Generate';
+        }
         form.classList.toggle('generating', generating);
         progressSection.style.display = generating ? 'block' : 'none';
     }

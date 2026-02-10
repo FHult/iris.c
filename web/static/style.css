@@ -124,6 +124,48 @@ main {
     gap: 1rem;
 }
 
+.form-row:has(.variations-control) {
+    grid-template-columns: 1fr 1fr auto;
+}
+
+.variations-control {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.25rem 0.5rem;
+    height: 42px;
+}
+
+.variations-btn {
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+}
+
+.variations-btn:hover {
+    background: var(--bg-primary);
+}
+
+#variations-value {
+    font-size: 1rem;
+    font-weight: 500;
+    min-width: 1.2em;
+    text-align: center;
+}
+
 textarea,
 input[type="text"],
 input[type="number"],
