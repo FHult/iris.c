@@ -208,6 +208,7 @@ static id<MTLComputePipelineState> g_bmm_bf16_sv_pipeline;
 static id<MTLComputePipelineState> g_softmax_bf16_pipeline;
 static id<MTLComputePipelineState> g_f32_to_bf16_pipeline;
 static id<MTLComputePipelineState> g_bf16_to_f32_pipeline;
+static id<MTLComputePipelineState> g_bf16_to_f16_pipeline;
 static id<MTLComputePipelineState> g_linear_bf16_pipeline;
 static id<MTLComputePipelineState> g_split_qkv_mlp_bf16_pipeline;
 static id<MTLComputePipelineState> g_concat_attn_mlp_bf16_pipeline;
@@ -963,33 +964,56 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
         }
     }
 
-    /* Convert bf16 to f16 */
-    uint16_t *f16_data = malloc(num_elements * sizeof(uint16_t));
-    if (!f16_data) {
-        pthread_mutex_unlock(&g_f16_cache_mutex);
-        return nil;
-    }
-    for (size_t i = 0; i < num_elements; i++) {
-        f16_data[i] = bf16_to_f16(weights[i]);
-    }
-
     size_t size = num_elements * sizeof(uint16_t);
+    id<MTLBuffer> buf = nil;
 
-    /* Cache is full - just create buffer without caching */
-    if (g_f16_cache_count >= F16_WEIGHT_CACHE_SIZE) {
-        id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
-                                                  length:size
-                                                 options:MTLResourceStorageModeShared];
+    /* Use GPU kernel for bf16->f16 conversion if available (much faster) */
+    if (g_shaders_initialized && g_bf16_to_f16_pipeline) {
+        id<MTLBuffer> input_buf = [g_device newBufferWithBytes:weights
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buf = [g_device newBufferWithLength:size
+                                                         options:MTLResourceStorageModeShared];
+        if (input_buf && output_buf) {
+            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            int n = (int)num_elements;
+            [encoder setComputePipelineState:g_bf16_to_f16_pipeline];
+            [encoder setBuffer:input_buf offset:0 atIndex:0];
+            [encoder setBuffer:output_buf offset:0 atIndex:1];
+            [encoder setBytes:&n length:sizeof(int) atIndex:2];
+            NSUInteger threads = 256;
+            NSUInteger groups = (num_elements + threads - 1) / threads;
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [encoder endEncoding];
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            buf = output_buf;
+        }
+    }
+
+    /* Fallback: CPU conversion */
+    if (!buf) {
+        uint16_t *f16_data = malloc(size);
+        if (!f16_data) {
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return nil;
+        }
+        for (size_t i = 0; i < num_elements; i++) {
+            f16_data[i] = bf16_to_f16(weights[i]);
+        }
+        buf = [g_device newBufferWithBytes:f16_data
+                                    length:size
+                                   options:MTLResourceStorageModeShared];
         free(f16_data);
+    }
+
+    /* Cache is full - return without caching */
+    if (g_f16_cache_count >= F16_WEIGHT_CACHE_SIZE) {
         pthread_mutex_unlock(&g_f16_cache_mutex);
         return buf;
     }
-
-    /* Create and cache */
-    id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
-                                              length:size
-                                             options:MTLResourceStorageModeShared];
-    free(f16_data);
 
     g_f16_cache[g_f16_cache_count].cpu_ptr = weights;
     g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
@@ -3320,6 +3344,11 @@ int flux_metal_init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"bf16_to_f32_convert"];
         if (func) {
             g_bf16_to_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"bf16_to_f16_convert"];
+        if (func) {
+            g_bf16_to_f16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
         func = [g_shader_library newFunctionWithName:@"linear_bf16"];
