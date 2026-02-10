@@ -529,13 +529,14 @@ document.addEventListener('DOMContentLoaded', () => {
             height: parseInt(heightSelect.value),
             steps: parseInt(stepsInput.value),
             seed: document.getElementById('seed').value.trim() || null,
-            referenceImages: refs.length > 0 ? refs : null
+            referenceImages: refs.length > 0 ? refs : null,
+            style: stylePresetSelect ? stylePresetSelect.value || null : null,
         };
     }
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -548,6 +549,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     seed: seed ? parseInt(seed) : null,
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
+                    style: style || null,
                 }),
             });
             const data = await response.json();
@@ -953,7 +955,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style } = params;
 
             // Store current generation params for remix
             currentGeneration = { prompt, width, height, steps };
@@ -988,6 +990,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     seed: seed ? parseInt(seed) : null,
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
+                    style: style || null,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))

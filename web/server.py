@@ -635,6 +635,11 @@ def generate():
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
 
+    # Apply style preset suffix if specified
+    style = data.get("style")
+    if style and style in STYLE_PRESETS:
+        prompt = prompt + STYLE_PRESETS[style]["suffix"]
+
     width = int(data.get("width", 512))
     height = int(data.get("height", 512))
     steps = int(data.get("steps", 4))
