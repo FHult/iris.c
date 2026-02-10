@@ -944,6 +944,7 @@ int main(int argc, char *argv[]) {
 
     /* Enter server mode if requested */
     if (server_mode) {
+        flux_set_keep_models_loaded(ctx, 1);
         int result = run_server_mode(ctx);
         flux_free(ctx);
 #ifdef USE_METAL

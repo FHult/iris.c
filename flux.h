@@ -121,6 +121,13 @@ void flux_release_text_encoder(flux_ctx *ctx);
 void flux_set_mmap(flux_ctx *ctx, int enable);
 
 /*
+ * Keep all models loaded between generations (server mode).
+ * Prevents text encoder release and GPU cache clearing between requests.
+ * Uses more memory (~16GB extra) but eliminates reload overhead.
+ */
+void flux_set_keep_models_loaded(flux_ctx *ctx, int enable);
+
+/*
  * Check if model is distilled (4-step) or base (50-step with CFG).
  * Returns 1 for distilled, 0 for base.
  */

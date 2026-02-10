@@ -152,6 +152,7 @@ struct flux_ctx {
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
+    int keep_models_loaded;  /* Server mode: keep encoder+transformer resident */
 };
 
 /* Global error message */
@@ -311,6 +312,10 @@ void flux_set_mmap(flux_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
 }
 
+void flux_set_keep_models_loaded(flux_ctx *ctx, int enable) {
+    if (ctx) ctx->keep_models_loaded = enable;
+}
+
 int flux_is_distilled(flux_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
 }
@@ -327,6 +332,9 @@ void flux_set_base_mode(flux_ctx *ctx) {
 
 void flux_release_text_encoder(flux_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
+
+    /* In server mode, keep encoder loaded to avoid reload + GPU cache rebuild */
+    if (ctx->keep_models_loaded) return;
 
     qwen3_encoder_free(ctx->qwen3_encoder);
     ctx->qwen3_encoder = NULL;
