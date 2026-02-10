@@ -216,7 +216,9 @@ class Job:
         self.error = None
         self.output_path = None
         self.seed = None
-        self.queue = queue.Queue()
+        # Subscriber-based event broadcasting (supports multiple SSE connections)
+        self._subscribers = []
+        self._subscribers_lock = threading.Lock()
         # Store generation parameters for history/remix
         self.prompt = prompt
         self.width = width
@@ -225,6 +227,27 @@ class Job:
         self.created_at = time.time()
         # Temp files to clean up after job completes
         self.temp_files = []
+
+    def subscribe(self):
+        """Create a new subscriber queue for an SSE connection."""
+        q = queue.Queue()
+        with self._subscribers_lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        """Remove a subscriber queue."""
+        with self._subscribers_lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def put_event(self, event):
+        """Broadcast an event to all subscribers. Event is a (type, data) tuple."""
+        with self._subscribers_lock:
+            for q in self._subscribers:
+                q.put(event)
 
     def to_dict(self):
         return {
@@ -351,7 +374,7 @@ class FluxServer:
                 seed = event.get("seed")
                 if seed:
                     job.seed = seed
-                    job.queue.put(("status", job.to_dict()))
+                    job.put_event(("status", job.to_dict()))
 
             elif event_type == "phase":
                 phase = event.get("phase", "")
@@ -362,7 +385,7 @@ class FluxServer:
                 job.phase = phase
                 data = job.to_dict()
                 data["elapsed"] = elapsed
-                job.queue.put(("status", data))
+                job.put_event(("status", data))
 
             elif event_type == "phase_done":
                 phase = event.get("phase", "")
@@ -374,7 +397,7 @@ class FluxServer:
                 data["phase_done"] = phase
                 data["phase_time"] = phase_time
                 data["elapsed"] = elapsed
-                job.queue.put(("status", data))
+                job.put_event(("status", data))
 
             elif event_type == "progress":
                 step = event.get("step", 0)
@@ -387,7 +410,7 @@ class FluxServer:
                 data = job.to_dict()
                 data["step_time"] = step_time
                 data["elapsed"] = elapsed
-                job.queue.put(("progress", data))
+                job.put_event(("progress", data))
 
             elif event_type == "step_image":
                 step = event.get("step", 0)
@@ -398,7 +421,7 @@ class FluxServer:
                 if not hasattr(job, 'step_images'):
                     job.step_images = {}
                 job.step_images[step] = path
-                job.queue.put(("step_image", {
+                job.put_event(("step_image", {
                     "step": step,
                     "total": total,
                     "image_url": f"/step-image/{job.id}/{step}",
@@ -429,11 +452,11 @@ class FluxServer:
                         history_by_id.pop(old_job.id, None)
                     mark_history_dirty()  # Batched save instead of immediate
                 # Now send the complete event
-                job.queue.put(("complete", {
+                job.put_event(("complete", {
                     "image_url": f"/image/{job.id}",
                     "total_time": total_time
                 }))
-                job.queue.put(("done", None))
+                job.put_event(("done", None))
                 self.current_job = None
                 # Process next queued job if any
                 process_job_queue()
@@ -441,8 +464,8 @@ class FluxServer:
             elif event_type == "error":
                 job.status = "error"
                 job.error = event.get("message", "Unknown error")
-                job.queue.put(("error", {"message": job.error}))
-                job.queue.put(("done", None))
+                job.put_event(("error", {"message": job.error}))
+                job.put_event(("done", None))
                 # Clean up temp files on error
                 job.cleanup_temp_files()
                 self.current_job = None
@@ -457,7 +480,7 @@ class FluxServer:
 
             self.current_job = job
             job.status = "running"
-            job.queue.put(("status", job.to_dict()))
+            job.put_event(("status", job.to_dict()))
 
             # Build request
             output_path = OUTPUT_DIR / f"{job.id}.png"
@@ -517,12 +540,12 @@ def process_job_queue():
         queued = job_queue.pop(0)
         # Update queue positions for remaining jobs
         for i, q in enumerate(job_queue):
-            q['job'].queue.put(("queue_position", {"position": i + 1, "total": len(job_queue) + 1}))
+            q['job'].put_event(("queue_position", {"position": i + 1, "total": len(job_queue) + 1}))
 
     # Start the job
     job = queued['job']
     job.status = "running"
-    job.queue.put(("status", job.to_dict()))
+    job.put_event(("status", job.to_dict()))
 
     try:
         flux_server.generate(
@@ -539,8 +562,8 @@ def process_job_queue():
     except Exception as e:
         job.status = "error"
         job.error = str(e)
-        job.queue.put(("error", {"message": str(e)}))
-        job.queue.put(("done", None))
+        job.put_event(("error", {"message": str(e)}))
+        job.put_event(("done", None))
         job.cleanup_temp_files()
         # Try next job
         process_job_queue()
@@ -569,20 +592,20 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
             job_queue.append(queued_job)
             position = len(job_queue)
             job.status = "queued"
-            job.queue.put(("queued", {"position": position, "total": position}))
+            job.put_event(("queued", {"position": position, "total": position}))
             return
 
     # Server is free, start immediately
     job.status = "running"
-    job.queue.put(("status", job.to_dict()))
+    job.put_event(("status", job.to_dict()))
 
     try:
         flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
-        job.queue.put(("error", {"message": str(e)}))
-        job.queue.put(("done", None))
+        job.put_event(("error", {"message": str(e)}))
+        job.put_event(("done", None))
         job.cleanup_temp_files()
 
 
@@ -642,7 +665,7 @@ def generate():
             return jsonify({"error": f"Invalid input image: {e}"}), 400
     elif len(reference_images_b64) > 1:
         # Multiple images: use multiref mode
-        for i, img_b64 in enumerate(reference_images_b64[:2]):
+        for i, img_b64 in enumerate(reference_images_b64[:4]):
             try:
                 image_data = base64.b64decode(img_b64.split(",")[-1])
                 # Convert any format to PNG
@@ -700,23 +723,32 @@ def generate():
 
 @app.route("/progress/<job_id>")
 def progress(job_id):
-    """SSE endpoint for job progress updates."""
+    """SSE endpoint for job progress updates.
+
+    Uses per-connection subscriber queues so multiple SSE connections
+    (e.g. after page reload) each get their own independent event stream.
+    """
     with jobs_lock:
         job = jobs.get(job_id)
 
     if not job:
         return jsonify({"error": "Job not found"}), 404
 
+    subscriber_queue = job.subscribe()
+
     def generate_events():
-        while True:
-            try:
-                event_type, data = job.queue.get(timeout=30)
-                if event_type == "done":
-                    break
-                yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-            except queue.Empty:
-                # Send keepalive
-                yield ": keepalive\n\n"
+        try:
+            while True:
+                try:
+                    event_type, data = subscriber_queue.get(timeout=30)
+                    if event_type == "done":
+                        break
+                    yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    # Send keepalive
+                    yield ": keepalive\n\n"
+        finally:
+            job.unsubscribe(subscriber_queue)
 
     return Response(
         generate_events(),
@@ -935,6 +967,39 @@ def server_status():
     return jsonify(status)
 
 
+@app.route("/active-jobs")
+def active_jobs():
+    """Get all active (running + queued) jobs for recovery after page reload."""
+    result = {
+        "running": None,
+        "queued": [],
+    }
+
+    # Get currently running job
+    if flux_server and flux_server.current_job:
+        job = flux_server.current_job
+        d = job.to_dict()
+        d["prompt"] = job.prompt
+        d["width"] = job.width
+        d["height"] = job.height
+        d["steps"] = job.steps
+        result["running"] = d
+
+    # Get queued jobs
+    with job_queue_lock:
+        for i, queued in enumerate(job_queue):
+            job = queued["job"]
+            d = job.to_dict()
+            d["prompt"] = job.prompt
+            d["width"] = job.width
+            d["height"] = job.height
+            d["steps"] = job.steps
+            d["queue_position"] = i + 1
+            result["queued"].append(d)
+
+    return jsonify(result)
+
+
 # Style presets for prompt enhancement
 STYLE_PRESETS = {
     "photo_realistic": {
@@ -1102,20 +1167,20 @@ def cancel_job(job_id):
                 job_queue.pop(i)
                 job.status = "cancelled"
                 job.error = "Cancelled by user"
-                job.queue.put(("error", {"message": "Cancelled"}))
-                job.queue.put(("done", None))
+                job.put_event(("error", {"message": "Cancelled"}))
+                job.put_event(("done", None))
                 job.cleanup_temp_files()
                 # Update queue positions for remaining jobs
                 for j, q in enumerate(job_queue):
-                    q['job'].queue.put(("queue_position", {"position": j + 1, "total": len(job_queue)}))
+                    q['job'].put_event(("queue_position", {"position": j + 1, "total": len(job_queue)}))
                 return jsonify({"status": "cancelled"})
 
     # Job is currently running - need to restart flux server
     if flux_server and flux_server.current_job and flux_server.current_job.id == job_id:
         job.status = "cancelled"
         job.error = "Cancelled by user"
-        job.queue.put(("error", {"message": "Cancelled"}))
-        job.queue.put(("done", None))
+        job.put_event(("error", {"message": "Cancelled"}))
+        job.put_event(("done", None))
         job.cleanup_temp_files()
 
         # Restart the flux server to stop the current generation
@@ -1132,8 +1197,8 @@ def cancel_job(job_id):
     # Job already finished or errored
     job.status = "cancelled"
     job.error = "Cancelled by user"
-    job.queue.put(("error", {"message": "Cancelled"}))
-    job.queue.put(("done", None))
+    job.put_event(("error", {"message": "Cancelled"}))
+    job.put_event(("done", None))
 
     return jsonify({"status": "cancelled"})
 

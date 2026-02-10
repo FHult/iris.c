@@ -56,7 +56,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const promptTextarea = document.getElementById('prompt');
 
     let currentEventSource = null;
-    let referenceImageData = [null, null]; // Up to 2 reference images
+    let referenceImageData = [null, null, null, null]; // Up to 4 reference images
     let currentGeneration = null; // Store current generation params for remix
     let generationQueue = [];
     let isGenerating = false;
@@ -92,6 +92,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load saved settings from localStorage
     loadSavedSettings();
+
+    // Recover any active jobs (running/queued) after page reload
+    recoverActiveJobs();
 
     // Auto-focus prompt field
     document.getElementById('prompt').focus();
@@ -510,9 +513,9 @@ document.addEventListener('DOMContentLoaded', () => {
         setGenerating(false);
         showProgress('Cancelled', 0);
 
-        // Process next in queue if any
+        // Chain to next server-queued job if any
         if (generationQueue.length > 0) {
-            processNextInQueue();
+            recoverNextServerJob();
         }
     });
 
@@ -530,20 +533,42 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    function addToQueue(params) {
-        // Deep copy the params to preserve reference images even if UI is cleared
-        const queueItem = {
-            id: Date.now(),
-            prompt: params.prompt,
-            width: params.width,
-            height: params.height,
-            steps: params.steps,
-            seed: params.seed,
-            // Deep copy reference images array (data URLs are strings, already immutable)
-            referenceImages: params.referenceImages ? [...params.referenceImages] : null
-        };
-        generationQueue.push(queueItem);
-        renderQueue();
+    async function addToQueue(params) {
+        // Submit to server immediately — it will queue the job if busy
+        const { prompt, width, height, steps, seed, referenceImages } = params;
+        try {
+            const response = await fetch('/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    prompt,
+                    width,
+                    height,
+                    steps,
+                    seed: seed ? parseInt(seed) : null,
+                    reference_images: referenceImages,
+                    show_steps: showStepsCheckbox.checked,
+                }),
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                showError(data.error || 'Failed to queue job');
+                return;
+            }
+            // Track in local queue display with server's job_id
+            generationQueue.push({
+                id: data.job_id,
+                prompt,
+                width,
+                height,
+                steps,
+                seed,
+                serverJob: true,
+            });
+            renderQueue();
+        } catch (err) {
+            showError(`Failed to queue: ${err.message}`);
+        }
         // Clear prompt for next entry
         document.getElementById('prompt').value = '';
     }
@@ -569,10 +594,23 @@ document.addEventListener('DOMContentLoaded', () => {
             queueList.appendChild(li);
         });
 
-        // Add remove handlers
+        // Add remove/cancel handlers
         queueList.querySelectorAll('.queue-item-remove').forEach(btn => {
-            btn.addEventListener('click', () => {
-                removeFromQueue(parseInt(btn.dataset.id));
+            btn.addEventListener('click', async () => {
+                const id = btn.dataset.id;
+                const item = generationQueue.find(item => String(item.id) === id);
+                if (item && item.serverJob) {
+                    // Server-managed job: cancel via API
+                    try {
+                        await fetch(`/cancel/${id}`, { method: 'POST' });
+                    } catch (err) {
+                        console.error('Failed to cancel queued job:', err);
+                    }
+                    generationQueue = generationQueue.filter(item => String(item.id) !== id);
+                    renderQueue();
+                } else {
+                    removeFromQueue(parseInt(id));
+                }
             });
         });
     }
@@ -701,13 +739,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Clear reference image for a specific slot and compact remaining images
     function clearReferenceImage(slot) {
         // Shift all images after this slot up to fill the gap
-        for (let i = slot; i < 1; i++) {
+        for (let i = slot; i < 3; i++) {
             referenceImageData[i] = referenceImageData[i + 1];
         }
-        referenceImageData[1] = null; // Last slot is now empty
+        referenceImageData[3] = null; // Last slot is now empty
 
         // Re-render all slots
-        for (let i = 0; i < 2; i++) {
+        for (let i = 0; i < 4; i++) {
             const preview = refPreviews[i];
             const clearBtn = refClearBtns[i];
             const slotEl = refSlots[i];
@@ -729,7 +767,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Find first empty slot
     function findFirstEmptySlot() {
-        for (let i = 0; i < 2; i++) {
+        for (let i = 0; i < 4; i++) {
             if (referenceImageData[i] === null) return i;
         }
         return 0; // Default to first slot if all full
@@ -829,8 +867,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Clear all images button
     clearAllImagesBtn.addEventListener('click', () => {
         // Clear all slots directly without compacting
-        referenceImageData = [null, null];
-        for (let i = 0; i < 2; i++) {
+        referenceImageData = [null, null, null, null];
+        for (let i = 0; i < 4; i++) {
             const preview = refPreviews[i];
             const clearBtn = refClearBtns[i];
             const slotEl = refSlots[i];
@@ -980,7 +1018,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (isGenerating) {
-            // Add to queue if already generating
+            // Submit to server queue immediately
             addToQueue(params);
         } else {
             // Generate immediately
@@ -989,9 +1027,9 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch (error) {
                 // Error already shown
             }
-            // Process queue if any items were added while generating
+            // Chain to next server-queued job if any were added while generating
             if (generationQueue.length > 0) {
-                processNextInQueue();
+                recoverNextServerJob();
             }
         }
     });
@@ -1033,6 +1071,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 const elapsed = data.elapsed ? ` - ${data.elapsed.toFixed(1)}s elapsed` : '';
                 showProgress(`${data.phase}...${elapsed}`, null);
             }
+        });
+
+        currentEventSource.addEventListener('queued', (e) => {
+            const data = JSON.parse(e.data);
+            showProgress(`Queued (position ${data.position})`, 0);
+        });
+
+        currentEventSource.addEventListener('queue_position', (e) => {
+            const data = JSON.parse(e.data);
+            showProgress(`Queued (position ${data.position}/${data.total})`, 0);
         });
 
         currentEventSource.addEventListener('complete', (e) => {
@@ -1094,6 +1142,121 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
         };
+    }
+
+    async function recoverActiveJobs() {
+        try {
+            const response = await fetch('/active-jobs');
+            if (!response.ok) return;
+            const data = await response.json();
+
+            // Recover queued jobs into the queue display
+            if (data.queued && data.queued.length > 0) {
+                data.queued.forEach(job => {
+                    generationQueue.push({
+                        id: job.id,
+                        prompt: job.prompt,
+                        width: job.width,
+                        height: job.height,
+                        steps: job.steps,
+                        seed: job.seed,
+                        serverJob: true,
+                    });
+                });
+                renderQueue();
+            }
+
+            // Recover running job
+            if (data.running) {
+                const job = data.running;
+                currentJobId = job.id;
+
+                setGenerating(true);
+                progressPrompt.textContent = job.prompt;
+                progressPrompt.title = job.prompt;
+
+                if (job.progress > 0 && job.total_steps > 0) {
+                    const percent = (job.progress / job.total_steps) * 100;
+                    showProgress(
+                        `${job.phase} - Step ${job.progress}/${job.total_steps}`,
+                        percent
+                    );
+                } else {
+                    showProgress(`${job.phase || 'Reconnecting'}...`, 0);
+                }
+
+                currentGeneration = {
+                    prompt: job.prompt,
+                    width: job.width,
+                    height: job.height,
+                    steps: job.steps,
+                };
+
+                connectToProgress(job.id, job.steps,
+                    () => {
+                        // When running job completes, check for next queued job
+                        recoverNextServerJob();
+                    },
+                    () => {
+                        recoverNextServerJob();
+                    }
+                );
+            }
+        } catch (err) {
+            console.error('Failed to recover active jobs:', err);
+        }
+    }
+
+    async function recoverNextServerJob() {
+        // Remove the first server-managed queue item (server has already started it)
+        const idx = generationQueue.findIndex(item => item.serverJob);
+        if (idx !== -1) {
+            const item = generationQueue.splice(idx, 1)[0];
+            renderQueue();
+
+            // Give the server a moment to start the job, then check its status
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            try {
+                const response = await fetch(`/status/${item.id}`);
+                if (!response.ok) return;
+                const job = await response.json();
+
+                if (job.status === 'complete') {
+                    loadHistory();
+                    recoverNextServerJob();
+                    return;
+                }
+                if (job.status === 'error' || job.status === 'cancelled') {
+                    recoverNextServerJob();
+                    return;
+                }
+
+                // Job is running — track it
+                currentJobId = item.id;
+                setGenerating(true);
+                progressPrompt.textContent = item.prompt;
+                progressPrompt.title = item.prompt;
+                showProgress(`${job.phase || 'Starting'}...`, 0);
+
+                currentGeneration = {
+                    prompt: item.prompt,
+                    width: item.width,
+                    height: item.height,
+                    steps: item.steps,
+                };
+
+                connectToProgress(item.id, item.steps,
+                    () => recoverNextServerJob(),
+                    () => recoverNextServerJob()
+                );
+            } catch (err) {
+                console.error('Failed to track next queued job:', err);
+            }
+        } else if (generationQueue.length > 0) {
+            // Only client-queued items remain, process them normally
+            processNextInQueue();
+        }
     }
 
     function setGenerating(generating) {
