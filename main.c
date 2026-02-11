@@ -296,6 +296,22 @@ static int json_get_bool(const char *json, const char *key, int default_val) {
     return atoi(p) != 0;
 }
 
+/* Extract float value from JSON */
+static float json_get_float(const char *json, const char *key, float default_val) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_val;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    /* Handle null */
+    if (strncmp(p, "null", 4) == 0) return default_val;
+
+    return (float)atof(p);
+}
+
 /* Extract array of strings from JSON (returns array of malloc'd strings, caller must free)
  * Returns number of strings found, or 0 if key not found or not an array.
  * The paths array must be pre-allocated with max_paths capacity. */
@@ -437,7 +453,9 @@ static int run_server_mode(flux_ctx *ctx) {
     flux_substep_callback = NULL;
 
     fprintf(stderr, "Server mode: ready for requests\n");
-    printf("{\"event\":\"ready\"}\n");
+    printf("{\"event\":\"ready\",\"model\":\"%s\",\"is_distilled\":%s}\n",
+           flux_model_info(ctx),
+           flux_is_distilled(ctx) ? "true" : "false");
     fflush(stdout);
 
     while (fgets(line, sizeof(line), stdin) != NULL) {
@@ -459,6 +477,8 @@ static int run_server_mode(flux_ctx *ctx) {
         int steps = json_get_int(line, "steps", DEFAULT_STEPS);
         int64_t seed = json_get_int64(line, "seed", -1);
         int show_steps = json_get_bool(line, "show_steps", 1);
+        float guidance = json_get_float(line, "guidance", 0.0f);
+        char *schedule = json_get_string(line, "schedule");
 
         /* Validate request */
         if (!prompt || !output_path) {
@@ -524,8 +544,20 @@ static int run_server_mode(flux_ctx *ctx) {
             .width = width,
             .height = height,
             .num_steps = steps,
-            .seed = actual_seed
+            .seed = actual_seed,
+            .guidance = guidance,
         };
+
+        /* Apply schedule if specified */
+        if (schedule) {
+            if (strcmp(schedule, "linear") == 0) {
+                params.linear_schedule = 1;
+            } else if (strcmp(schedule, "power") == 0) {
+                params.power_schedule = 1;
+                params.power_alpha = json_get_float(line, "power_alpha", 2.0f);
+            }
+            free(schedule);
+        }
 
         /* Generate */
         flux_image *output = NULL;

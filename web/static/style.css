@@ -166,6 +166,75 @@ main {
     text-align: center;
 }
 
+.btn-link {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0.25rem 0;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.btn-link:hover {
+    color: var(--accent);
+}
+
+.advanced-row {
+    animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.history-tools {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.history-search {
+    width: 200px !important;
+    padding: 0.4rem 0.75rem !important;
+    font-size: 0.85rem;
+    border-radius: 6px;
+}
+
+.lightbox-metadata {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(transparent, rgba(0,0,0,0.85));
+    color: white;
+    padding: 2rem 1rem 0.75rem;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.lightbox-content:hover .lightbox-metadata {
+    opacity: 1;
+}
+
+.lightbox-metadata .meta-prompt {
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+    max-height: 3em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.lightbox-metadata .meta-details {
+    color: rgba(255,255,255,0.7);
+    font-size: 0.8rem;
+}
+
 textarea,
 input[type="text"],
 input[type="number"],

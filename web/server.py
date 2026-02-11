@@ -308,6 +308,8 @@ class FluxServer:
         self.ready = False
         self.lock = threading.Lock()
         self.current_job = None
+        self.model_info = None      # e.g. "FLUX.2-klein-4B v1.0 (distilled, 4 steps, guidance 1.0)"
+        self.is_distilled = True
 
     def start(self):
         """Start the flux server process."""
@@ -340,7 +342,9 @@ class FluxServer:
                 event = json.loads(line)
                 if event.get("event") == "ready":
                     self.ready = True
-                    print("Flux server ready")
+                    self.model_info = event.get("model")
+                    self.is_distilled = event.get("is_distilled", True)
+                    print(f"Flux server ready: {self.model_info}")
                     break
             except json.JSONDecodeError:
                 print(f"Flux server: {line}")
@@ -477,7 +481,7 @@ class FluxServer:
                 # Process next queued job if any
                 process_job_queue()
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -500,6 +504,12 @@ class FluxServer:
 
             if seed is not None and seed != "":
                 request_data["seed"] = int(seed)
+
+            if guidance is not None and guidance > 0:
+                request_data["guidance"] = float(guidance)
+
+            if schedule and schedule != "sigmoid":
+                request_data["schedule"] = schedule
 
             # Multi-reference mode (new) takes precedence
             if reference_image_paths and len(reference_image_paths) > 0:
@@ -562,7 +572,9 @@ def process_job_queue():
             queued['seed'],
             queued['input_image_path'],
             queued['reference_image_paths'],
-            queued['show_steps']
+            queued['show_steps'],
+            queued.get('guidance'),
+            queued.get('schedule'),
         )
     except Exception as e:
         job.status = "error"
@@ -574,7 +586,7 @@ def process_job_queue():
         process_job_queue()
 
 
-def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
+def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
     """Queue a generation job. Starts immediately if server is free, otherwise queues."""
     global flux_server
 
@@ -588,6 +600,8 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         'input_image_path': input_image_path,
         'reference_image_paths': reference_image_paths,
         'show_steps': show_steps,
+        'guidance': guidance,
+        'schedule': schedule,
     }
 
     with job_queue_lock:
@@ -605,7 +619,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -614,9 +628,9 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         job.cleanup_temp_files()
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
     """Run generation using the persistent flux server (legacy, now uses queue)."""
-    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps)
+    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule)
 
 
 @app.route("/")
@@ -645,6 +659,8 @@ def generate():
     steps = int(data.get("steps", 4))
     seed = data.get("seed")
     show_steps = bool(data.get("show_steps", True))
+    guidance = data.get("guidance")  # None = auto (1.0 distilled, 4.0 base)
+    schedule = data.get("schedule")  # "sigmoid" (default), "linear", "power"
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -723,7 +739,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps),
+        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule),
         daemon=True,
     )
     thread.start()
@@ -791,7 +807,9 @@ def get_image(job_id):
     if not job or not job.output_path or not job.output_path.exists():
         return jsonify({"error": "Image not found"}), 404
 
-    return send_file(job.output_path, mimetype="image/png")
+    response = send_file(job.output_path, mimetype="image/png")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
 
 
 @app.route("/step-image/<job_id>/<int:step>")
@@ -823,7 +841,9 @@ def get_thumb(job_id):
 
     # If thumbnail exists, serve it
     if thumb_path.exists():
-        return send_file(thumb_path, mimetype="image/jpeg")
+        response = send_file(thumb_path, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
     # Otherwise, generate it from the original image
     original_path = OUTPUT_DIR / f"{job_id}.png"
@@ -844,7 +864,9 @@ def get_thumb(job_id):
         elif img.mode != 'RGB':
             img = img.convert('RGB')
         img.save(thumb_path, "JPEG", quality=80)
-        return send_file(thumb_path, mimetype="image/jpeg")
+        response = send_file(thumb_path, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
     except ImportError:
         # PIL not available, serve original
         return send_file(original_path, mimetype="image/png")
@@ -975,6 +997,18 @@ def server_status():
         status["queue_length"] = len(job_queue)
 
     return jsonify(status)
+
+
+@app.route("/model-info")
+def model_info():
+    """Get loaded model information."""
+    global flux_server
+    if not flux_server or not flux_server.ready:
+        return jsonify({"error": "Server not ready"}), 503
+    return jsonify({
+        "model": flux_server.model_info,
+        "is_distilled": flux_server.is_distilled,
+    })
 
 
 @app.route("/active-jobs")

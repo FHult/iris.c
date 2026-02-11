@@ -10,7 +10,7 @@
     <div class="container">
         <header>
             <h1>FLUX.2 Image Generator</h1>
-            <p class="subtitle">Generate images from text prompts</p>
+            <p class="subtitle" id="model-info">Generate images from text prompts</p>
         </header>
 
         <main>
@@ -119,8 +119,8 @@
 
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="steps">Steps: <span id="steps-value">4</span> <span id="steps-hint" class="steps-hint">(Standard)</span></label>
-                            <input type="range" id="steps" name="steps" min="1" max="8" value="4">
+                            <label for="steps">Steps: <span id="steps-value">4</span> <span id="steps-hint" class="steps-hint"></span></label>
+                            <input type="range" id="steps" name="steps" min="1" max="50" value="4">
                         </div>
                         <div class="form-group">
                             <label for="seed">Seed (optional)</label>
@@ -135,6 +135,22 @@
                             </div>
                         </div>
                     </div>
+
+                    <div class="form-row advanced-row" id="advanced-controls" style="display: none;">
+                        <div class="form-group">
+                            <label for="guidance">Guidance: <span id="guidance-value">auto</span></label>
+                            <input type="range" id="guidance" name="guidance" min="0" max="20" step="0.5" value="0">
+                        </div>
+                        <div class="form-group">
+                            <label for="schedule">Schedule</label>
+                            <select id="schedule" name="schedule">
+                                <option value="sigmoid">Shifted Sigmoid (default)</option>
+                                <option value="linear">Linear</option>
+                                <option value="power">Power Curve</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button type="button" id="toggle-advanced" class="btn-link">Advanced options</button>
 
                     <div class="form-group checkbox-group">
                         <label class="checkbox-label">
@@ -256,12 +272,15 @@
         <section id="history-section" class="history-section" style="display: none;">
             <div class="history-header">
                 <h2>History</h2>
-                <button type="button" id="slideshow-btn" class="btn-slideshow" title="Start slideshow">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                    </svg>
-                    Slideshow
-                </button>
+                <div class="history-tools">
+                    <input type="text" id="history-search" class="history-search" placeholder="Search prompts...">
+                    <button type="button" id="slideshow-btn" class="btn-slideshow" title="Start slideshow">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        </svg>
+                        Slideshow
+                    </button>
+                </div>
             </div>
             <div id="history-grid" class="history-grid"></div>
         </section>
@@ -277,6 +296,7 @@
         <button class="lightbox-nav lightbox-prev" id="lightbox-prev">&lsaquo;</button>
         <div class="lightbox-content" id="lightbox-content">
             <img id="lightbox-image" class="lightbox-image" src="" alt="Full size image">
+            <div id="lightbox-metadata" class="lightbox-metadata"></div>
             <div id="crop-overlay" class="crop-overlay" style="display: none;">
                 <div id="crop-selection" class="crop-selection">
                     <div class="crop-handle crop-handle-nw" data-handle="nw"></div>

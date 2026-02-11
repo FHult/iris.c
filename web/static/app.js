@@ -57,6 +57,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const variationsValue = document.getElementById('variations-value');
     const variationsInc = document.getElementById('variations-inc');
     const variationsDec = document.getElementById('variations-dec');
+    const guidanceInput = document.getElementById('guidance');
+    const guidanceValue = document.getElementById('guidance-value');
+    const scheduleSelect = document.getElementById('schedule');
+    const advancedControls = document.getElementById('advanced-controls');
+    const toggleAdvancedBtn = document.getElementById('toggle-advanced');
+    const modelInfoEl = document.getElementById('model-info');
+    const historySearch = document.getElementById('history-search');
+    const lightboxMetadata = document.getElementById('lightbox-metadata');
 
     let currentEventSource = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
@@ -102,6 +110,40 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Advanced controls toggle
+    toggleAdvancedBtn.addEventListener('click', () => {
+        const visible = advancedControls.style.display !== 'none';
+        advancedControls.style.display = visible ? 'none' : 'grid';
+        toggleAdvancedBtn.textContent = visible ? 'Advanced options' : 'Hide advanced';
+    });
+
+    // Guidance slider
+    guidanceInput.addEventListener('input', () => {
+        const val = parseFloat(guidanceInput.value);
+        guidanceValue.textContent = val === 0 ? 'auto' : val.toFixed(1);
+    });
+
+    // Load model info into header
+    fetch('/model-info').then(r => r.json()).then(data => {
+        if (data.model) modelInfoEl.textContent = data.model;
+    }).catch(() => {});
+
+    // Ctrl+Enter to generate
+    document.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            form.dispatchEvent(new Event('submit'));
+        }
+    });
+
+    // History search
+    let historySearchQuery = '';
+    historySearch.addEventListener('input', () => {
+        historySearchQuery = historySearch.value.trim().toLowerCase();
+        historyVisible = historyPageSize;
+        renderHistory();
+    });
+
     // Cropping state
     let isCropping = false;
     let cropStartX = 0, cropStartY = 0;
@@ -137,12 +179,22 @@ document.addEventListener('DOMContentLoaded', () => {
             lightboxIndex = index;
             lightboxPrev.style.display = items.length > 1 ? '' : 'none';
             lightboxNext.style.display = items.length > 1 ? '' : 'none';
+            updateLightboxMetadata(items[index]);
         } else {
             lightboxItems = [];
             lightboxIndex = -1;
             lightboxPrev.style.display = 'none';
             lightboxNext.style.display = 'none';
+            lightboxMetadata.innerHTML = '';
         }
+    }
+
+    function updateLightboxMetadata(item) {
+        if (!item || !lightboxMetadata) return;
+        lightboxMetadata.innerHTML = `
+            <div class="meta-prompt">${escapeHtml(item.prompt)}</div>
+            <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}</div>
+        `;
     }
 
     function closeLightbox() {
@@ -181,6 +233,7 @@ document.addEventListener('DOMContentLoaded', () => {
         lightboxIndex = (lightboxIndex + direction + lightboxItems.length) % lightboxItems.length;
         const item = lightboxItems[lightboxIndex];
         lightboxImage.src = `${item.image_url}?t=${item.created_at}`;
+        updateLightboxMetadata(item);
         // Also select in form
         selectHistoryItem(item);
     }
@@ -551,6 +604,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function getFormParams() {
         // Collect non-null reference images
         const refs = referenceImageData.filter(img => img !== null);
+        const guidance = parseFloat(guidanceInput.value);
         return {
             prompt: document.getElementById('prompt').value.trim(),
             width: parseInt(widthSelect.value),
@@ -559,12 +613,14 @@ document.addEventListener('DOMContentLoaded', () => {
             seed: document.getElementById('seed').value.trim() || null,
             referenceImages: refs.length > 0 ? refs : null,
             style: stylePresetSelect ? stylePresetSelect.value || null : null,
+            guidance: guidance > 0 ? guidance : null,
+            schedule: scheduleSelect.value || null,
         };
     }
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -578,6 +634,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
                     style: style || null,
+                    guidance: guidance || null,
+                    schedule: schedule || null,
                 }),
             });
             const data = await response.json();
@@ -983,7 +1041,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule } = params;
 
             // Store current generation params for remix
             currentGeneration = { prompt, width, height, steps };
@@ -1019,6 +1077,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
                     style: style || null,
+                    guidance: guidance || null,
+                    schedule: schedule || null,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -1079,9 +1139,10 @@ document.addEventListener('DOMContentLoaded', () => {
         currentEventSource.addEventListener('progress', (e) => {
             const data = JSON.parse(e.data);
             const percent = (data.progress / data.total_steps) * 100;
-            const stepTime = data.step_time ? ` (${data.step_time.toFixed(1)}s)` : '';
-            const elapsed = data.elapsed ? ` - ${data.elapsed.toFixed(1)}s elapsed` : '';
-            showProgress(`${data.phase} - Step ${data.progress}/${data.total_steps}${stepTime}${elapsed}`, percent);
+            const stepTime = data.step_time ? ` (${data.step_time.toFixed(1)}s/step)` : '';
+            const remaining = data.total_steps - data.progress;
+            const eta = (data.step_time && remaining > 0) ? ` ~${(data.step_time * remaining).toFixed(0)}s left` : '';
+            showProgress(`${data.phase} - Step ${data.progress}/${data.total_steps}${stepTime}${eta}`, percent);
         });
 
         currentEventSource.addEventListener('step_image', (e) => {
@@ -1465,7 +1526,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderHistory() {
-        const history = cachedHistory;
+        const history = historySearchQuery
+            ? cachedHistory.filter(h => h.prompt.toLowerCase().includes(historySearchQuery))
+            : cachedHistory;
         historyGrid.innerHTML = '';
 
         const visible = history.slice(0, historyVisible);
