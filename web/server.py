@@ -74,10 +74,9 @@ def convert_image_to_png(image_data: bytes) -> bytes:
     Supports JPEG, WebP, GIF, BMP, TIFF, and any other PIL-supported format.
     Handles animated images (uses first frame) and transparency.
     """
-    # Quick check: if already PNG, return as-is
-    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
-        return image_data
-
+    # Always convert through PIL to normalize bit depth, color type, etc.
+    # User-uploaded PNGs may be 16-bit, palette-indexed, interlaced, or have
+    # other features the C PNG loader doesn't support.
     try:
         from PIL import Image
         import io
