@@ -202,6 +202,8 @@ def load_history_from_disk():
                       steps=item.get("steps", 4))
             job.seed = item.get("seed")
             job.created_at = item.get("created_at", 0)
+            job.generation_time = item.get("generation_time")
+            job.batch_id = item.get("batch_id")
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -232,6 +234,8 @@ class Job:
         self.created_at = time.time()
         # Temp files to clean up after job completes
         self.temp_files = []
+        self.generation_time = None
+        self.batch_id = None
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -274,6 +278,8 @@ class Job:
             "steps": self.steps,
             "seed": self.seed,
             "created_at": self.created_at,
+            "generation_time": self.generation_time,
+            "batch_id": self.batch_id,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -310,6 +316,7 @@ class FluxServer:
         self.current_job = None
         self.model_info = None      # e.g. "FLUX.2-klein-4B v1.0 (distilled, 4 steps, guidance 1.0)"
         self.is_distilled = True
+        self._intentional_stop = False
 
     def start(self):
         """Start the flux server process."""
@@ -442,6 +449,7 @@ class FluxServer:
                 job.output_path = OUTPUT_DIR / f"{job.id}.png"
                 job.progress = job.total_steps
                 total_time = event.get("total_time", 0)
+                job.generation_time = total_time
                 # Clean up temp files now that generation is complete
                 job.cleanup_temp_files()
                 # Generate thumbnail in background thread
@@ -480,6 +488,29 @@ class FluxServer:
                 self.current_job = None
                 # Process next queued job if any
                 process_job_queue()
+
+        # Process ended — check if unexpected crash
+        if not self._intentional_stop:
+            exit_code = self.process.returncode if self.process else None
+            print(f"Flux server process died unexpectedly (exit code: {exit_code})")
+            job = self.current_job
+            if job:
+                job.status = "error"
+                job.error = "Server process crashed"
+                job.put_event(("error", {"message": "Server process crashed, restarting..."}))
+                job.put_event(("done", None))
+                job.cleanup_temp_files()
+                self.current_job = None
+            # Auto-restart
+            print("Auto-restarting flux server...")
+            try:
+                self._intentional_stop = False
+                self.ready = False
+                self.start()
+                print("Flux server restarted successfully")
+                process_job_queue()
+            except Exception as e:
+                print(f"Failed to restart flux server: {e}")
 
     def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
         """Send a generation request to the flux server."""
@@ -528,6 +559,7 @@ class FluxServer:
 
     def stop(self):
         """Stop the flux server process."""
+        self._intentional_stop = True
         if self.process:
             self.process.terminate()
             self.process.wait()
@@ -538,6 +570,7 @@ class FluxServer:
         """Restart the flux server (used for cancellation)."""
         print("Restarting flux server...")
         self.stop()
+        self._intentional_stop = False
         self.start()
         print("Flux server restarted")
 
@@ -661,6 +694,7 @@ def generate():
     show_steps = bool(data.get("show_steps", True))
     guidance = data.get("guidance")  # None = auto (1.0 distilled, 4.0 base)
     schedule = data.get("schedule")  # "sigmoid" (default), "linear", "power"
+    batch_id = data.get("batch_id")  # Groups variation batches
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -726,6 +760,7 @@ def generate():
     # Create job
     job_id = uuid.uuid4().hex[:12]
     job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
+    job.batch_id = batch_id
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:

@@ -18,16 +18,20 @@
 
 ## Tier 3 — Medium Impact
 
-- [ ] **11. Store generation time in history** — Track performance, know what to expect.
-- [ ] **12. Persist style preset & variations count** in localStorage — Settings lost on reload.
-- [ ] **13. Auto-restart on process crash** — Hung server requires manual restart.
-- [ ] **14. Variation grid/mosaic view** — See all variations at once instead of one-by-one in history.
-- [ ] **15. Side-by-side comparison** — Compare two images (before/after, different seeds).
+- [x] **11. Store generation time in history** — Track performance, know what to expect.
+- [x] **12. Persist style preset & variations count** in localStorage — Settings lost on reload.
+- [x] **13. Auto-restart on process crash** — Hung server requires manual restart.
+- [x] **14. Variation grid/mosaic view** — See all variations at once instead of one-by-one in history.
+- [x] **15. Side-by-side comparison** — Compare two images (before/after, different seeds).
 
 ## Tier 4 — Nice to Have
 
-- [ ] **16. Lightbox delete + download buttons** — Common actions require leaving lightbox currently.
+- [x] **16. Lightbox delete + download buttons** — Common actions require leaving lightbox currently.
 - [ ] **17. Prompt templates** — Reusable prompt structures with variable placeholders.
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
-- [ ] **19. Reference image reorder** — Drag to reorder slots (order matters for multi-ref T_offset).
+- [x] **19. Reference image reorder** — Drag to reorder slots (order matters for multi-ref T_offset).
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.
+
+## Tier 5 — Extended Features
+
+- [x] **26. Dark/light theme toggle** — Toggle between dark and light themes with localStorage persistence.

@@ -65,6 +65,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const modelInfoEl = document.getElementById('model-info');
     const historySearch = document.getElementById('history-search');
     const lightboxMetadata = document.getElementById('lightbox-metadata');
+    const lightboxDownloadBtn = document.getElementById('lightbox-download-btn');
+    const lightboxDeleteBtn = document.getElementById('lightbox-delete-btn');
+    const lightboxVariationsBtn = document.getElementById('lightbox-variations-btn');
+    const compareModal = document.getElementById('compare-modal');
+    const compareGrid = document.getElementById('compare-grid');
+    const compareClose = document.getElementById('compare-close');
+    const compareBar = document.getElementById('compare-bar');
+    const compareBarText = document.getElementById('compare-bar-text');
+    const compareBarBtn = document.getElementById('compare-bar-btn');
+    const compareBarClear = document.getElementById('compare-bar-clear');
 
     let currentEventSource = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
@@ -88,6 +98,36 @@ document.addEventListener('DOMContentLoaded', () => {
     // Variations count
     let variationsCount = 1;
 
+    // Compare selection state
+    let selectedForCompare = [];
+
+    // Theme toggle
+    const themeToggle = document.getElementById('theme-toggle');
+    const themeIconSun = document.getElementById('theme-icon-sun');
+    const themeIconMoon = document.getElementById('theme-icon-moon');
+
+    function applyTheme(theme) {
+        if (theme === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+            themeIconSun.style.display = '';
+            themeIconMoon.style.display = 'none';
+        } else {
+            document.documentElement.removeAttribute('data-theme');
+            themeIconSun.style.display = 'none';
+            themeIconMoon.style.display = '';
+        }
+    }
+
+    // Load saved theme
+    applyTheme(localStorage.getItem('theme') || 'dark');
+
+    themeToggle.addEventListener('click', () => {
+        const isLight = document.documentElement.hasAttribute('data-theme');
+        const newTheme = isLight ? 'dark' : 'light';
+        localStorage.setItem('theme', newTheme);
+        applyTheme(newTheme);
+    });
+
     function updateVariationsDisplay() {
         variationsValue.textContent = variationsCount;
         // Update generate button text hint
@@ -100,6 +140,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (variationsCount < 8) {
             variationsCount++;
             updateVariationsDisplay();
+            saveSettings();
         }
     });
 
@@ -107,6 +148,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (variationsCount > 1) {
             variationsCount--;
             updateVariationsDisplay();
+            saveSettings();
         }
     });
 
@@ -191,10 +233,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateLightboxMetadata(item) {
         if (!item || !lightboxMetadata) return;
+        const timeStr = item.generation_time ? ` &middot; ${item.generation_time.toFixed(1)}s` : '';
         lightboxMetadata.innerHTML = `
             <div class="meta-prompt">${escapeHtml(item.prompt)}</div>
-            <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}</div>
+            <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}${timeStr}</div>
         `;
+        // Show/hide variations button
+        if (item.batch_id) {
+            const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
+            if (batchItems.length > 1) {
+                lightboxVariationsBtn.style.display = '';
+                lightboxVariationsBtn.textContent = `Variations (${batchItems.length})`;
+            } else {
+                lightboxVariationsBtn.style.display = 'none';
+            }
+        } else {
+            lightboxVariationsBtn.style.display = 'none';
+        }
     }
 
     function closeLightbox() {
@@ -620,7 +675,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -636,6 +691,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     style: style || null,
                     guidance: guidance || null,
                     schedule: schedule || null,
+                    batch_id: batchId || null,
                 }),
             });
             const data = await response.json();
@@ -816,6 +872,7 @@ document.addEventListener('DOMContentLoaded', () => {
         preview.innerHTML = `<img src="${dataUrl}" alt="Reference image ${slot + 1}">`;
         clearBtn.style.display = 'block';
         slotEl.classList.add('has-image');
+        slotEl.setAttribute('draggable', 'true');
         updateClearAllButton();
 
         // Auto-set dimensions based on first image (slot 0)
@@ -831,26 +888,7 @@ document.addEventListener('DOMContentLoaded', () => {
             referenceImageData[i] = referenceImageData[i + 1];
         }
         referenceImageData[3] = null; // Last slot is now empty
-
-        // Re-render all slots
-        for (let i = 0; i < 4; i++) {
-            const preview = refPreviews[i];
-            const clearBtn = refClearBtns[i];
-            const slotEl = refSlots[i];
-            const input = refInputs[i];
-
-            if (referenceImageData[i]) {
-                preview.innerHTML = `<img src="${referenceImageData[i]}" alt="Reference image ${i + 1}">`;
-                clearBtn.style.display = 'block';
-                slotEl.classList.add('has-image');
-            } else {
-                preview.innerHTML = `<span>Image ${i + 1}</span>`;
-                clearBtn.style.display = 'none';
-                slotEl.classList.remove('has-image');
-            }
-            input.value = '';
-        }
-        updateClearAllButton();
+        renderAllSlots();
     }
 
     // Find first empty slot
@@ -905,25 +943,80 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // Drag and drop support for each slot
+    // Drag and drop support for each slot (file drops + internal reorder)
+    let dragSourceSlot = null;
+
+    function renderAllSlots() {
+        for (let i = 0; i < 4; i++) {
+            const preview = refPreviews[i];
+            const clearBtn = refClearBtns[i];
+            const slotEl = refSlots[i];
+            const input = refInputs[i];
+
+            if (referenceImageData[i]) {
+                preview.innerHTML = `<img src="${referenceImageData[i]}" alt="Reference image ${i + 1}">`;
+                clearBtn.style.display = 'block';
+                slotEl.classList.add('has-image');
+                slotEl.setAttribute('draggable', 'true');
+            } else {
+                preview.innerHTML = `<span>Image ${i + 1}</span>`;
+                clearBtn.style.display = 'none';
+                slotEl.classList.remove('has-image');
+                slotEl.removeAttribute('draggable');
+            }
+            input.value = '';
+        }
+        updateClearAllButton();
+    }
+
     refSlots.forEach((slotEl, slot) => {
-        const preview = refPreviews[slot];
+        slotEl.addEventListener('dragstart', (e) => {
+            if (!referenceImageData[slot]) { e.preventDefault(); return; }
+            dragSourceSlot = slot;
+            slotEl.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/x-ref-slot', String(slot));
+        });
+
+        slotEl.addEventListener('dragend', () => {
+            slotEl.classList.remove('dragging');
+            dragSourceSlot = null;
+        });
 
         slotEl.addEventListener('dragover', (e) => {
             e.preventDefault();
-            preview.style.borderColor = 'var(--accent)';
-            preview.style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
+            if (dragSourceSlot !== null) {
+                slotEl.classList.add('drag-over');
+            } else {
+                refPreviews[slot].style.borderColor = 'var(--accent)';
+                refPreviews[slot].style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
+            }
         });
 
         slotEl.addEventListener('dragleave', () => {
-            preview.style.borderColor = '';
-            preview.style.backgroundColor = '';
+            slotEl.classList.remove('drag-over');
+            refPreviews[slot].style.borderColor = '';
+            refPreviews[slot].style.backgroundColor = '';
         });
 
         slotEl.addEventListener('drop', (e) => {
             e.preventDefault();
-            preview.style.borderColor = '';
-            preview.style.backgroundColor = '';
+            slotEl.classList.remove('drag-over');
+            refPreviews[slot].style.borderColor = '';
+            refPreviews[slot].style.backgroundColor = '';
+
+            // Internal reorder: swap source and target slot data
+            const sourceSlotStr = e.dataTransfer.getData('text/x-ref-slot');
+            if (sourceSlotStr !== '') {
+                const src = parseInt(sourceSlotStr);
+                if (src !== slot) {
+                    const tmp = referenceImageData[src];
+                    referenceImageData[src] = referenceImageData[slot];
+                    referenceImageData[slot] = tmp;
+                    renderAllSlots();
+                }
+                return;
+            }
 
             // Check for image URL from drag
             const imageUrl = e.dataTransfer.getData('text/plain');
@@ -954,20 +1047,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Clear all images button
     clearAllImagesBtn.addEventListener('click', () => {
-        // Clear all slots directly without compacting
         referenceImageData = [null, null, null, null];
-        for (let i = 0; i < 4; i++) {
-            const preview = refPreviews[i];
-            const clearBtn = refClearBtns[i];
-            const slotEl = refSlots[i];
-            const input = refInputs[i];
-
-            preview.innerHTML = `<span>Image ${i + 1}</span>`;
-            clearBtn.style.display = 'none';
-            slotEl.classList.remove('has-image');
-            input.value = '';
-        }
-        updateClearAllButton();
+        renderAllSlots();
     });
 
     // Remix button - regenerate with same settings but new seed
@@ -1041,7 +1122,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
 
             // Store current generation params for remix
             currentGeneration = { prompt, width, height, steps };
@@ -1079,6 +1160,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     style: style || null,
                     guidance: guidance || null,
                     schedule: schedule || null,
+                    batch_id: batchId || null,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -1107,6 +1189,10 @@ document.addEventListener('DOMContentLoaded', () => {
             showError('Please enter a prompt');
             return;
         }
+
+        // Generate batch ID for variation groups
+        const batchId = variationsCount > 1 ? crypto.randomUUID().slice(0, 12) : null;
+        if (batchId) params.batchId = batchId;
 
         // Queue additional variations (each with a unique random seed)
         const extraVariations = variationsCount - 1;
@@ -1418,6 +1504,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
 
+            // Restore saved style preset if pending
+            if (stylePresetSelect && stylePresetSelect.dataset.pendingStyle) {
+                stylePresetSelect.value = stylePresetSelect.dataset.pendingStyle;
+                delete stylePresetSelect.dataset.pendingStyle;
+            }
+
             // Update initial step hint
             updateStepHint(parseInt(stepsInput.value));
         } catch (error) {
@@ -1531,11 +1623,32 @@ document.addEventListener('DOMContentLoaded', () => {
             : cachedHistory;
         historyGrid.innerHTML = '';
 
+        // Build batch groups lookup
+        const batchGroups = {};
+        history.forEach(item => {
+            if (item.batch_id) {
+                if (!batchGroups[item.batch_id]) batchGroups[item.batch_id] = [];
+                batchGroups[item.batch_id].push(item);
+            }
+        });
+        const seenBatches = new Set();
+
         const visible = history.slice(0, historyVisible);
         for (let i = 0; i < visible.length; i++) {
             const item = visible[i];
             const div = document.createElement('div');
             div.className = 'history-item';
+
+            // Batch variation indicator
+            if (item.batch_id && batchGroups[item.batch_id]?.length > 1) {
+                div.classList.add('batch-item');
+            }
+
+            // Compare selection indicator
+            if (selectedForCompare.some(s => s.id === item.id)) {
+                div.classList.add('selected-compare');
+            }
+
             // Use thumbnail for grid, full image for lightbox
             const thumbUrl = item.thumb_url ? `${item.thumb_url}?t=${item.created_at}` : `${item.image_url}?t=${item.created_at}`;
             const fullUrl = `${item.image_url}?t=${item.created_at}`;
@@ -1544,13 +1657,35 @@ document.addEventListener('DOMContentLoaded', () => {
                 e.dataTransfer.setData('text/plain', item.image_url);
                 e.dataTransfer.effectAllowed = 'copy';
             });
+
+            // Build inner HTML with optional batch badge
+            let badgeHtml = '';
+            if (item.batch_id && batchGroups[item.batch_id]?.length > 1 && !seenBatches.has(item.batch_id)) {
+                seenBatches.add(item.batch_id);
+                const count = batchGroups[item.batch_id].length;
+                badgeHtml = `<div class="batch-badge" data-batch-id="${item.batch_id}" title="View all ${count} variations">${count}</div>`;
+            }
+
             div.innerHTML = `
-                <img src="${thumbUrl}" alt="${item.prompt}" data-fullsize="${fullUrl}" draggable="false">
+                ${badgeHtml}
+                <img src="${thumbUrl}" alt="${escapeHtml(item.prompt)}" data-fullsize="${fullUrl}" draggable="false">
                 <button class="history-item-delete" title="Delete">&times;</button>
                 <div class="history-item-overlay">
                     <div class="history-item-prompt">${escapeHtml(item.prompt)}</div>
                 </div>
             `;
+
+            // Batch badge click → open compare modal with batch
+            const badge = div.querySelector('.batch-badge');
+            if (badge) {
+                badge.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const batchId = badge.dataset.batchId;
+                    const batchItems = cachedHistory.filter(h => h.batch_id === batchId);
+                    openCompareModal(batchItems);
+                });
+            }
+
             const deleteBtn = div.querySelector('.history-item-delete');
             deleteBtn.addEventListener('click', async (e) => {
                 e.stopPropagation();
@@ -1567,14 +1702,21 @@ document.addEventListener('DOMContentLoaded', () => {
             const itemIndex = i;
             div.addEventListener('click', (e) => {
                 if (e.target.closest('.history-item-delete')) return;
+                if (e.target.closest('.batch-badge')) return;
+                // Shift+click toggles compare selection
+                if (e.shiftKey) {
+                    toggleCompareSelection(item);
+                    return;
+                }
                 selectHistoryItem(item);
             });
             div.addEventListener('dblclick', (e) => {
                 if (e.target.closest('.history-item-delete')) return;
+                if (e.target.closest('.batch-badge')) return;
                 openLightbox(
                     `${item.image_url}?t=${item.created_at}`,
                     cachedHistory,
-                    itemIndex
+                    cachedHistory.indexOf(item)
                 );
             });
             historyGrid.appendChild(div);
@@ -1723,6 +1865,22 @@ document.addEventListener('DOMContentLoaded', () => {
             if (settings.showSteps !== undefined) {
                 showStepsCheckbox.checked = settings.showSteps;
             }
+            if (settings.style && stylePresetSelect) {
+                // Defer style restore until presets are loaded
+                stylePresetSelect.dataset.pendingStyle = settings.style;
+            }
+            if (settings.variations && settings.variations > 1) {
+                variationsCount = Math.min(8, Math.max(1, settings.variations));
+                updateVariationsDisplay();
+            }
+            if (settings.guidance !== undefined && guidanceInput) {
+                guidanceInput.value = settings.guidance;
+                const val = parseFloat(settings.guidance);
+                guidanceValue.textContent = val === 0 ? 'auto' : val.toFixed(1);
+            }
+            if (settings.schedule && scheduleSelect) {
+                scheduleSelect.value = settings.schedule;
+            }
         } catch (err) {
             console.error('Failed to load settings:', err);
         }
@@ -1735,6 +1893,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 height: heightSelect.value,
                 steps: stepsInput.value,
                 showSteps: showStepsCheckbox.checked,
+                style: stylePresetSelect ? stylePresetSelect.value : '',
+                variations: variationsCount,
+                guidance: guidanceInput ? guidanceInput.value : '0',
+                schedule: scheduleSelect ? scheduleSelect.value : '',
             };
             localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
         } catch (err) {
@@ -1747,6 +1909,9 @@ document.addEventListener('DOMContentLoaded', () => {
     heightSelect.addEventListener('change', saveSettings);
     stepsInput.addEventListener('change', saveSettings);
     showStepsCheckbox.addEventListener('change', saveSettings);
+    if (guidanceInput) guidanceInput.addEventListener('change', saveSettings);
+    if (scheduleSelect) scheduleSelect.addEventListener('change', saveSettings);
+    if (stylePresetSelect) stylePresetSelect.addEventListener('change', saveSettings);
 
     // ========== Prompt History ==========
     const PROMPT_HISTORY_KEY = 'flux_prompt_history';
@@ -1822,5 +1987,139 @@ document.addEventListener('DOMContentLoaded', () => {
     form.addEventListener('submit', () => {
         const prompt = document.getElementById('prompt').value;
         savePromptToHistory(prompt);
+    });
+
+    // ========== Lightbox Download Button (#16) ==========
+    lightboxDownloadBtn.addEventListener('click', () => {
+        if (lightboxItems.length === 0 || lightboxIndex < 0) return;
+        const item = lightboxItems[lightboxIndex];
+        const link = document.createElement('a');
+        link.href = item.image_url;
+        const safePrompt = item.prompt.substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
+        link.download = `flux_${safePrompt}_${item.seed || 'unknown'}.png`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    });
+
+    // ========== Lightbox Delete Button (#16) ==========
+    lightboxDeleteBtn.addEventListener('click', async () => {
+        if (lightboxItems.length === 0 || lightboxIndex < 0) return;
+        const item = lightboxItems[lightboxIndex];
+        try {
+            const resp = await fetch(`/history/${item.id}`, { method: 'DELETE' });
+            if (!resp.ok) return;
+            await loadHistory();
+            // Navigate to next or close
+            if (cachedHistory.length === 0) {
+                closeLightbox();
+            } else {
+                lightboxItems = cachedHistory;
+                lightboxIndex = Math.min(lightboxIndex, lightboxItems.length - 1);
+                const next = lightboxItems[lightboxIndex];
+                lightboxImage.src = `${next.image_url}?t=${next.created_at}`;
+                updateLightboxMetadata(next);
+            }
+        } catch (err) {
+            console.error('Failed to delete from lightbox:', err);
+        }
+    });
+
+    // ========== Lightbox Variations Button (#14) ==========
+    lightboxVariationsBtn.addEventListener('click', () => {
+        if (lightboxItems.length === 0 || lightboxIndex < 0) return;
+        const item = lightboxItems[lightboxIndex];
+        if (!item.batch_id) return;
+        const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
+        if (batchItems.length > 1) {
+            closeLightbox();
+            openCompareModal(batchItems);
+        }
+    });
+
+    // ========== Compare Modal (#14, #15) ==========
+    function openCompareModal(items) {
+        compareGrid.innerHTML = '';
+        const n = Math.min(items.length, 4);
+        compareGrid.className = 'compare-grid cols-' + n;
+
+        items.slice(0, 4).forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'compare-item';
+            const timeStr = item.generation_time ? `${item.generation_time.toFixed(1)}s` : '';
+            div.innerHTML = `
+                <img src="${item.image_url}?t=${item.created_at}" alt="${escapeHtml(item.prompt)}">
+                <div class="compare-item-info">
+                    Seed: ${item.seed || '?'}${timeStr ? ' &middot; ' + timeStr : ''}
+                </div>
+            `;
+            // Click image to open in lightbox
+            div.querySelector('img').addEventListener('click', () => {
+                closeCompareModal();
+                const idx = cachedHistory.findIndex(h => h.id === item.id);
+                openLightbox(
+                    `${item.image_url}?t=${item.created_at}`,
+                    cachedHistory,
+                    idx >= 0 ? idx : 0
+                );
+            });
+            compareGrid.appendChild(div);
+        });
+
+        compareModal.classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }
+
+    function closeCompareModal() {
+        compareModal.classList.remove('active');
+        document.body.style.overflow = '';
+    }
+
+    compareClose.addEventListener('click', closeCompareModal);
+    compareModal.addEventListener('click', (e) => {
+        if (e.target === compareModal) closeCompareModal();
+    });
+
+    // Escape key closes compare modal
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && compareModal.classList.contains('active')) {
+            closeCompareModal();
+        }
+    });
+
+    // ========== Compare Selection in History (#15) ==========
+    function toggleCompareSelection(item) {
+        const idx = selectedForCompare.findIndex(s => s.id === item.id);
+        if (idx >= 0) {
+            selectedForCompare.splice(idx, 1);
+        } else if (selectedForCompare.length < 4) {
+            selectedForCompare.push(item);
+        }
+        renderHistory();
+        updateCompareBar();
+    }
+
+    function updateCompareBar() {
+        if (selectedForCompare.length >= 2) {
+            compareBar.style.display = 'flex';
+            compareBarText.textContent = `${selectedForCompare.length} selected`;
+        } else {
+            compareBar.style.display = selectedForCompare.length > 0 ? 'flex' : 'none';
+            compareBarText.textContent = `${selectedForCompare.length} selected (pick ${2 - selectedForCompare.length} more)`;
+        }
+        compareBarBtn.disabled = selectedForCompare.length < 2;
+        compareBarBtn.style.opacity = selectedForCompare.length < 2 ? '0.5' : '1';
+    }
+
+    compareBarBtn.addEventListener('click', () => {
+        if (selectedForCompare.length >= 2) {
+            openCompareModal(selectedForCompare);
+        }
+    });
+
+    compareBarClear.addEventListener('click', () => {
+        selectedForCompare = [];
+        renderHistory();
+        updateCompareBar();
     });
 });
