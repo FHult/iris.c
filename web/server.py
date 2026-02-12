@@ -204,6 +204,7 @@ def load_history_from_disk():
             job.created_at = item.get("created_at", 0)
             job.generation_time = item.get("generation_time")
             job.batch_id = item.get("batch_id")
+            job.style = item.get("style")
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -236,6 +237,7 @@ class Job:
         self.temp_files = []
         self.generation_time = None
         self.batch_id = None
+        self.style = None
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -280,6 +282,7 @@ class Job:
             "created_at": self.created_at,
             "generation_time": self.generation_time,
             "batch_id": self.batch_id,
+            "style": self.style,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -317,6 +320,7 @@ class FluxServer:
         self.model_info = None      # e.g. "FLUX.2-klein-4B v1.0 (distilled, 4 steps, guidance 1.0)"
         self.is_distilled = True
         self._intentional_stop = False
+        self.generation_count = 0
 
     def start(self):
         """Start the flux server process."""
@@ -506,6 +510,7 @@ class FluxServer:
             try:
                 self._intentional_stop = False
                 self.ready = False
+                self.generation_count = 0
                 self.start()
                 print("Flux server restarted successfully")
                 process_job_queue()
@@ -520,6 +525,10 @@ class FluxServer:
 
             self.current_job = job
             job.status = "running"
+            self.generation_count += 1
+            is_cold = self.generation_count == 1
+            if is_cold:
+                job.phase = "Loading models (first run, may take a minute)"
             job.put_event(("status", job.to_dict()))
 
             # Build request
@@ -571,6 +580,7 @@ class FluxServer:
         print("Restarting flux server...")
         self.stop()
         self._intentional_stop = False
+        self.generation_count = 0
         self.start()
         print("Flux server restarted")
 
@@ -682,10 +692,11 @@ def generate():
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
 
-    # Apply style preset suffix if specified
+    # Apply style preset suffix for generation (keep base prompt for history)
     style = data.get("style")
+    generation_prompt = prompt
     if style and style in STYLE_PRESETS:
-        prompt = prompt + STYLE_PRESETS[style]["suffix"]
+        generation_prompt = prompt + STYLE_PRESETS[style]["suffix"]
 
     width = int(data.get("width", 512))
     height = int(data.get("height", 512))
@@ -757,10 +768,11 @@ def generate():
             except Exception as e:
                 return jsonify({"error": f"Invalid input image: {e}"}), 400
 
-    # Create job
+    # Create job (store base prompt; style applied separately for generation)
     job_id = uuid.uuid4().hex[:12]
     job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
     job.batch_id = batch_id
+    job.style = style if (style and style in STYLE_PRESETS) else None
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:
@@ -774,7 +786,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule),
+        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule),
         daemon=True,
     )
     thread.start()
@@ -1081,77 +1093,219 @@ def active_jobs():
 
 # Style presets for prompt enhancement
 STYLE_PRESETS = {
+    # Photography
     "photo_realistic": {
         "name": "Photo Realistic",
+        "category": "Photography",
         "description": "Photorealistic style with natural lighting",
         "suffix": ", photorealistic, high resolution, natural lighting, sharp focus, detailed textures, professional photography",
         "recommended_steps": 4,
     },
     "cinematic": {
         "name": "Cinematic",
+        "category": "Photography",
         "description": "Movie-like dramatic lighting and composition",
         "suffix": ", cinematic lighting, dramatic composition, film grain, anamorphic lens, movie still, atmospheric",
         "recommended_steps": 4,
     },
-    "digital_art": {
-        "name": "Digital Art",
-        "description": "Polished digital illustration style",
-        "suffix": ", digital art, highly detailed, vibrant colors, sharp lines, trending on artstation, professional illustration",
-        "recommended_steps": 4,
-    },
-    "anime": {
-        "name": "Anime",
-        "description": "Japanese anime/manga style",
-        "suffix": ", anime style, cel shaded, vibrant colors, clean lines, studio ghibli inspired, detailed",
-        "recommended_steps": 4,
-    },
-    "oil_painting": {
-        "name": "Oil Painting",
-        "description": "Classical oil painting aesthetic",
-        "suffix": ", oil painting, textured brush strokes, classical art, rich colors, museum quality, masterpiece",
-        "recommended_steps": 6,
-    },
-    "watercolor": {
-        "name": "Watercolor",
-        "description": "Soft watercolor painting style",
-        "suffix": ", watercolor painting, soft edges, flowing colors, paper texture, artistic, delicate details",
-        "recommended_steps": 4,
-    },
-    "concept_art": {
-        "name": "Concept Art",
-        "description": "Professional concept art for games/films",
-        "suffix": ", concept art, detailed environment, atmospheric perspective, professional, matte painting, epic scale",
-        "recommended_steps": 6,
-    },
     "portrait": {
         "name": "Portrait",
+        "category": "Photography",
         "description": "Professional portrait photography",
         "suffix": ", portrait photography, studio lighting, shallow depth of field, professional headshot, detailed face, sharp focus",
         "recommended_steps": 4,
     },
     "landscape": {
         "name": "Landscape",
+        "category": "Photography",
         "description": "Epic landscape photography",
         "suffix": ", landscape photography, golden hour, dramatic sky, wide angle, national geographic style, breathtaking scenery",
         "recommended_steps": 4,
     },
+    "street_photo": {
+        "name": "Street Photography",
+        "category": "Photography",
+        "description": "Candid urban documentary feel",
+        "suffix": ", street photography, candid, urban, documentary style, natural light, film grain, authentic moment",
+        "recommended_steps": 4,
+    },
+    "macro": {
+        "name": "Macro",
+        "category": "Photography",
+        "description": "Extreme close-up with crisp detail",
+        "suffix": ", macro photography, extreme close-up, shallow depth of field, crisp detail, studio lighting, fine textures",
+        "recommended_steps": 4,
+    },
+    "long_exposure": {
+        "name": "Long Exposure",
+        "category": "Photography",
+        "description": "Motion blur, light trails, dreamy",
+        "suffix": ", long exposure photography, motion blur, light trails, smooth water, dreamy atmosphere, silky textures",
+        "recommended_steps": 4,
+    },
+    "film_noir": {
+        "name": "Film Noir",
+        "category": "Photography",
+        "description": "High contrast B&W, dramatic shadows",
+        "suffix": ", film noir, black and white, high contrast, dramatic shadows, moody lighting, 1940s aesthetic, venetian blinds",
+        "recommended_steps": 4,
+    },
+    "vintage": {
+        "name": "Vintage",
+        "category": "Photography",
+        "description": "Faded colors, 70s film stock feel",
+        "suffix": ", vintage photography, faded colors, light leaks, 70s film stock, warm tones, vignette, retro",
+        "recommended_steps": 4,
+    },
+    # Art Styles
+    "digital_art": {
+        "name": "Digital Art",
+        "category": "Art",
+        "description": "Polished digital illustration style",
+        "suffix": ", digital art, highly detailed, vibrant colors, sharp lines, trending on artstation, professional illustration",
+        "recommended_steps": 4,
+    },
+    "concept_art": {
+        "name": "Concept Art",
+        "category": "Art",
+        "description": "Professional concept art for games/films",
+        "suffix": ", concept art, detailed environment, atmospheric perspective, professional, matte painting, epic scale",
+        "recommended_steps": 6,
+    },
+    "anime": {
+        "name": "Anime",
+        "category": "Art",
+        "description": "Japanese anime/manga style",
+        "suffix": ", anime style, cel shaded, vibrant colors, clean lines, studio ghibli inspired, detailed",
+        "recommended_steps": 4,
+    },
+    "oil_painting": {
+        "name": "Oil Painting",
+        "category": "Art",
+        "description": "Classical oil painting aesthetic",
+        "suffix": ", oil painting, textured brush strokes, classical art, rich colors, museum quality, masterpiece",
+        "recommended_steps": 6,
+    },
+    "watercolor": {
+        "name": "Watercolor",
+        "category": "Art",
+        "description": "Soft watercolor painting style",
+        "suffix": ", watercolor painting, soft edges, flowing colors, paper texture, artistic, delicate details",
+        "recommended_steps": 4,
+    },
+    "impressionist": {
+        "name": "Impressionist",
+        "category": "Art",
+        "description": "Loose brushwork, light and color focus",
+        "suffix": ", impressionist painting, loose brushwork, visible brush strokes, light and color, Monet inspired, plein air",
+        "recommended_steps": 6,
+    },
+    "art_nouveau": {
+        "name": "Art Nouveau",
+        "category": "Art",
+        "description": "Ornate organic curves, Mucha-inspired",
+        "suffix": ", art nouveau, ornate, organic curves, Alphonse Mucha inspired, decorative borders, flowing lines, elegant",
+        "recommended_steps": 6,
+    },
+    "ukiyo_e": {
+        "name": "Ukiyo-e",
+        "category": "Art",
+        "description": "Japanese woodblock print style",
+        "suffix": ", ukiyo-e, Japanese woodblock print, flat colors, bold outlines, traditional Japanese art, Hokusai inspired",
+        "recommended_steps": 4,
+    },
+    "surrealist": {
+        "name": "Surrealist",
+        "category": "Art",
+        "description": "Dreamlike, impossible geometry",
+        "suffix": ", surrealist art, dreamlike, impossible geometry, Dali inspired, melting forms, subconscious imagery, bizarre",
+        "recommended_steps": 6,
+    },
+    "pop_art": {
+        "name": "Pop Art",
+        "category": "Art",
+        "description": "Bold colors, halftone dots, graphic",
+        "suffix": ", pop art, bold colors, halftone dots, Warhol inspired, graphic design, screen print, high contrast",
+        "recommended_steps": 4,
+    },
+    "pixel_art": {
+        "name": "Pixel Art",
+        "category": "Art",
+        "description": "Retro 8/16-bit game aesthetic",
+        "suffix": ", pixel art, retro 8-bit, 16-bit, clean pixels, limited color palette, game aesthetic, nostalgic",
+        "recommended_steps": 4,
+    },
+    # Design & Technical
+    "minimalist": {
+        "name": "Minimalist",
+        "category": "Design",
+        "description": "Clean, simple, minimal design",
+        "suffix": ", minimalist, clean design, simple composition, negative space, modern aesthetic, elegant",
+        "recommended_steps": 2,
+    },
+    "isometric": {
+        "name": "Isometric",
+        "category": "Design",
+        "description": "3D isometric view, clean geometry",
+        "suffix": ", isometric view, 3D isometric, clean geometry, technical illustration, precise angles, detailed miniature",
+        "recommended_steps": 4,
+    },
+    "flat_design": {
+        "name": "Flat Design",
+        "category": "Design",
+        "description": "Clean vectors, modern UI illustration",
+        "suffix": ", flat design, clean vector art, solid colors, modern UI illustration, geometric shapes, simple",
+        "recommended_steps": 2,
+    },
+    "blueprint": {
+        "name": "Blueprint",
+        "category": "Design",
+        "description": "Technical drawing, schematic style",
+        "suffix": ", blueprint, technical drawing, white lines on blue background, schematic, engineering diagram, precise",
+        "recommended_steps": 2,
+    },
+    # Mood & Genre
     "fantasy": {
         "name": "Fantasy",
+        "category": "Mood",
         "description": "Epic fantasy art style",
         "suffix": ", fantasy art, magical atmosphere, ethereal lighting, detailed, epic composition, mythical, enchanted",
         "recommended_steps": 6,
     },
     "scifi": {
         "name": "Sci-Fi",
+        "category": "Mood",
         "description": "Futuristic science fiction style",
         "suffix": ", science fiction, futuristic, cyberpunk, neon lights, high tech, detailed machinery, atmospheric",
         "recommended_steps": 6,
     },
-    "minimalist": {
-        "name": "Minimalist",
-        "description": "Clean, simple, minimal design",
-        "suffix": ", minimalist, clean design, simple composition, negative space, modern aesthetic, elegant",
-        "recommended_steps": 2,
+    "neon_glow": {
+        "name": "Neon Glow",
+        "category": "Mood",
+        "description": "Dark background with vivid neon colors",
+        "suffix": ", neon glow, dark background, vivid neon colors, cyberpunk lighting, glow effects, luminous, electric",
+        "recommended_steps": 4,
+    },
+    "dark_gothic": {
+        "name": "Dark Gothic",
+        "category": "Mood",
+        "description": "Moody, dark palette, fog and shadows",
+        "suffix": ", dark gothic, moody atmosphere, dark palette, cathedral architecture, fog, dramatic shadows, ominous",
+        "recommended_steps": 6,
+    },
+    "cozy": {
+        "name": "Cozy",
+        "category": "Mood",
+        "description": "Warm lighting, soft textures, inviting",
+        "suffix": ", cozy atmosphere, warm lighting, soft textures, hygge, inviting, intimate setting, comfortable",
+        "recommended_steps": 4,
+    },
+    "ethereal": {
+        "name": "Ethereal",
+        "category": "Mood",
+        "description": "Soft glow, pastel colors, dreamy",
+        "suffix": ", ethereal, soft glow, pastel colors, dreamy atmosphere, angelic, luminous, otherworldly beauty",
+        "recommended_steps": 4,
     },
 }
 
@@ -1174,6 +1328,7 @@ def get_style_presets():
     return jsonify({
         "presets": {k: {
             "name": v["name"],
+            "category": v.get("category", ""),
             "description": v["description"],
             "recommended_steps": v["recommended_steps"],
         } for k, v in STYLE_PRESETS.items()},

@@ -417,6 +417,20 @@ select {
     cursor: pointer;
 }
 
+select optgroup {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-style: normal;
+}
+
+select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-weight: normal;
+    padding: 4px 8px;
+}
+
 input[type="range"] {
     width: 100%;
     height: 6px;

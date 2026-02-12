@@ -234,9 +234,11 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateLightboxMetadata(item) {
         if (!item || !lightboxMetadata) return;
         const timeStr = item.generation_time ? ` &middot; ${item.generation_time.toFixed(1)}s` : '';
+        const styleName = item.style && stylePresets[item.style] ? stylePresets[item.style].name : null;
+        const styleStr = styleName ? ` &middot; ${escapeHtml(styleName)}` : '';
         lightboxMetadata.innerHTML = `
             <div class="meta-prompt">${escapeHtml(item.prompt)}</div>
-            <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}${timeStr}</div>
+            <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}${styleStr}${timeStr}</div>
         `;
         // Show/hide variations button
         if (item.batch_id) {
@@ -1194,21 +1196,23 @@ document.addEventListener('DOMContentLoaded', () => {
         const batchId = variationsCount > 1 ? crypto.randomUUID().slice(0, 12) : null;
         if (batchId) params.batchId = batchId;
 
-        // Queue additional variations (each with a unique random seed)
         const extraVariations = variationsCount - 1;
-        if (extraVariations > 0) {
-            for (let i = 0; i < extraVariations; i++) {
-                addToQueue({ ...params, seed: null }); // null seed = random
-            }
-        }
 
         if (isGenerating) {
-            // Submit to server queue immediately
+            // Already generating — queue everything (main first, then extras)
             addToQueue(params);
+            for (let i = 0; i < extraVariations; i++) {
+                addToQueue({ ...params, seed: null });
+            }
         } else {
-            // Generate immediately
+            // Generate main job first, then queue extras after it's submitted
             try {
-                await generateImage(params);
+                const mainPromise = generateImage(params);
+                // Queue extras after main job's fetch has been sent
+                for (let i = 0; i < extraVariations; i++) {
+                    addToQueue({ ...params, seed: null });
+                }
+                await mainPromise;
             } catch (error) {
                 // Error already shown
             }
@@ -1256,6 +1260,8 @@ document.addEventListener('DOMContentLoaded', () => {
             } else if (data.phase) {
                 const elapsed = data.elapsed ? ` - ${data.elapsed.toFixed(1)}s elapsed` : '';
                 showProgress(`${data.phase}...${elapsed}`, null);
+            } else if (data.status === 'running') {
+                showProgress('Starting...', 0);
             }
         });
 
@@ -1494,13 +1500,24 @@ document.addEventListener('DOMContentLoaded', () => {
             stylePresets = data.presets || {};
             stepGuidance = data.step_guidance || {};
 
-            // Populate style preset dropdown
+            // Populate style preset dropdown with optgroups by category
             if (stylePresetSelect) {
+                const groups = {};
                 Object.entries(stylePresets).forEach(([key, preset]) => {
-                    const option = document.createElement('option');
-                    option.value = key;
-                    option.textContent = preset.name;
-                    stylePresetSelect.appendChild(option);
+                    const cat = preset.category || 'Other';
+                    if (!groups[cat]) groups[cat] = [];
+                    groups[cat].push({ key, preset });
+                });
+                Object.entries(groups).forEach(([category, items]) => {
+                    const optgroup = document.createElement('optgroup');
+                    optgroup.label = category;
+                    items.forEach(({ key, preset }) => {
+                        const option = document.createElement('option');
+                        option.value = key;
+                        option.textContent = preset.name;
+                        optgroup.appendChild(option);
+                    });
+                    stylePresetSelect.appendChild(optgroup);
                 });
             }
 
@@ -1763,12 +1780,17 @@ document.addEventListener('DOMContentLoaded', () => {
         displayImage(item.image_url);
         seedDisplay.textContent = `Seed: ${item.seed}`;
 
-        // Fill form with the item's parameters
+        // Fill form with the item's parameters (base prompt, no style suffix)
         document.getElementById('prompt').value = item.prompt;
         setDimensions(item.width, item.height);
         document.getElementById('steps').value = item.steps;
         stepsValue.textContent = item.steps;
         document.getElementById('seed').value = item.seed || '';
+
+        // Restore style preset if item was generated with one
+        if (stylePresetSelect) {
+            stylePresetSelect.value = item.style || '';
+        }
 
         // Store for remix
         currentGeneration = {
