@@ -24,6 +24,7 @@
 #include "flux.h"
 #include "flux_kernels.h"
 #include "flux_cli.h"
+#include "embcache.h"
 #include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -447,6 +448,9 @@ static void server_step_image_callback(int step, int total, const flux_image *im
 static int run_server_mode(flux_ctx *ctx) {
     char line[65536];
 
+    /* Initialize embedding cache for repeat-prompt acceleration */
+    emb_cache_init();
+
     /* Set up server-mode callbacks */
     flux_step_callback = server_step_callback;
     flux_phase_callback = server_phase_callback;
@@ -654,6 +658,7 @@ static int run_server_mode(flux_ctx *ctx) {
         for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
     }
 
+    emb_cache_free();
     return 0;
 }
 

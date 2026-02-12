@@ -10,9 +10,9 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c
+SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c embcache.c
 OBJS = $(SRCS:.c=.o)
-CLI_SRCS = flux_cli.c linenoise.c embcache.c
+CLI_SRCS = flux_cli.c linenoise.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
 TARGET = flux
@@ -195,7 +195,7 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h
+flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h embcache.h
 flux_kernels.o: flux_kernels.c flux_kernels.h
 flux_tokenizer.o: flux_tokenizer.c flux.h
 flux_vae.o: flux_vae.c flux.h flux_kernels.h
@@ -209,4 +209,4 @@ terminals.o: terminals.c terminals.h flux.h
 flux_cli.o: flux_cli.c flux_cli.h flux.h flux_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h
 embcache.o: embcache.c embcache.h
-main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h
+main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h embcache.h

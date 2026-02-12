@@ -9,6 +9,7 @@
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
 #include "flux_qwen3.h"
+#include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -380,6 +381,15 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         return NULL;
     }
 
+    /* Check embedding cache first */
+    float *cached = emb_cache_lookup(prompt);
+    if (cached) {
+        if (flux_phase_callback) flux_phase_callback("encoding text (cached)", 0);
+        if (flux_phase_callback) flux_phase_callback("encoding text (cached)", 1);
+        *out_seq_len = QWEN3_MAX_SEQ_LEN;
+        return cached;
+    }
+
     /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
@@ -400,6 +410,12 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (flux_phase_callback) flux_phase_callback("encoding text", 0);
     float *embeddings = qwen3_encode_text(ctx->qwen3_encoder, prompt);
     if (flux_phase_callback) flux_phase_callback("encoding text", 1);
+
+    /* Store in cache for future lookups */
+    if (embeddings) {
+        emb_cache_store(prompt, embeddings,
+                        QWEN3_MAX_SEQ_LEN * ctx->text_dim);
+    }
 
     *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
     return embeddings;
