@@ -27,7 +27,7 @@
 ## Tier 4 — Nice to Have
 
 - [x] **16. Lightbox delete + download buttons** — Common actions require leaving lightbox currently.
-- [ ] **17. Prompt templates** — Reusable prompt structures with variable placeholders.
+- [x] **17. Prompt templates** — Reusable prompt structures with variable placeholders. [Plan](plans/17-prompt-templates.md)
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
 - [x] **19. Reference image reorder** — Drag to reorder slots (order matters for multi-ref T_offset).
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.

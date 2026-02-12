@@ -98,6 +98,19 @@ document.addEventListener('DOMContentLoaded', () => {
     // Variations count
     let variationsCount = 1;
 
+    // Template management
+    const templateBtn = document.getElementById('template-btn');
+    const templateDropdown = document.getElementById('template-dropdown');
+    const templateDropdownContent = document.getElementById('template-dropdown-content');
+    const templateSaveBtn = document.getElementById('template-save-btn');
+    const templateVariablesDiv = document.getElementById('template-variables');
+    const templateVariablesInputs = document.getElementById('template-variables-inputs');
+    const templateClearBtn = document.getElementById('template-clear-btn');
+    let activeTemplate = null;
+    let templateVariableValues = {};
+    let userTemplates = [];
+    const TEMPLATE_STORAGE_KEY = 'flux_prompt_templates';
+
     // Compare selection state
     let selectedForCompare = [];
 
@@ -1985,6 +1998,7 @@ document.addEventListener('DOMContentLoaded', () => {
             item.addEventListener('click', () => {
                 document.getElementById('prompt').value = prompt;
                 promptHistoryDropdown.classList.remove('active');
+                clearTemplate();
             });
             promptHistoryDropdown.appendChild(item);
         });
@@ -1995,6 +2009,7 @@ document.addEventListener('DOMContentLoaded', () => {
         e.stopPropagation();
         renderPromptHistory();
         promptHistoryDropdown.classList.toggle('active');
+        templateDropdown.classList.remove('active');
     });
 
     // Close dropdown when clicking outside
@@ -2144,4 +2159,279 @@ document.addEventListener('DOMContentLoaded', () => {
         renderHistory();
         updateCompareBar();
     });
+
+    // ========== Prompt Templates (#17) ==========
+
+    const BUILTIN_TEMPLATES = [
+        {
+            id: 'portrait',
+            name: 'Portrait',
+            pattern: 'Portrait of a {subject}, {lighting} lighting, {background} background',
+            category: 'Characters',
+        },
+        {
+            id: 'character',
+            name: 'Character Design',
+            pattern: '{character_type} character, {clothing}, {pose}, {expression} expression',
+            category: 'Characters',
+        },
+        {
+            id: 'landscape',
+            name: 'Landscape',
+            pattern: 'A {location} landscape, {time_of_day}, {weather} weather, {mood} atmosphere',
+            category: 'Scenes',
+        },
+        {
+            id: 'interior',
+            name: 'Interior',
+            pattern: '{room_type} interior, {style} style, {lighting} lighting, {mood} atmosphere',
+            category: 'Scenes',
+        },
+        {
+            id: 'style-transfer',
+            name: 'Style Transfer',
+            pattern: 'A {subject} in the style of {artist}, {medium} art, {mood} mood',
+            category: 'Artistic',
+        },
+        {
+            id: 'abstract',
+            name: 'Abstract',
+            pattern: 'Abstract {subject}, {colors} colors, {composition} composition',
+            category: 'Artistic',
+        },
+        {
+            id: 'product',
+            name: 'Product Shot',
+            pattern: '{product} product photography, {angle} angle, {lighting} lighting, {background} background',
+            category: 'Commercial',
+        },
+        {
+            id: 'creature',
+            name: 'Fantasy Creature',
+            pattern: 'A {creature} with {features}, in a {environment} environment',
+            category: 'Fantasy',
+        },
+    ];
+
+    function extractVariables(pattern) {
+        const matches = pattern.matchAll(/\{(\w+)\}/g);
+        return [...new Set(Array.from(matches, m => m[1]))];
+    }
+
+    function loadUserTemplates() {
+        try {
+            const saved = localStorage.getItem(TEMPLATE_STORAGE_KEY);
+            userTemplates = saved ? JSON.parse(saved) : [];
+        } catch (err) {
+            console.error('Failed to load user templates:', err);
+            userTemplates = [];
+        }
+    }
+
+    function saveUserTemplates() {
+        try {
+            localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(userTemplates));
+        } catch (err) {
+            console.error('Failed to save user templates:', err);
+        }
+    }
+
+    function renderTemplateDropdown() {
+        templateDropdownContent.innerHTML = '';
+
+        // Group by category
+        const categories = {};
+        BUILTIN_TEMPLATES.forEach(t => {
+            if (!categories[t.category]) categories[t.category] = [];
+            categories[t.category].push({ ...t, type: 'builtin' });
+        });
+        if (userTemplates.length > 0) {
+            categories['Your Templates'] = userTemplates.map(t => ({ ...t, type: 'user' }));
+        }
+
+        for (const [category, templates] of Object.entries(categories)) {
+            const header = document.createElement('div');
+            header.className = 'template-section-header';
+            header.textContent = category;
+            templateDropdownContent.appendChild(header);
+
+            templates.forEach(template => {
+                const item = document.createElement('div');
+                item.className = 'template-item';
+
+                const name = document.createElement('span');
+                name.className = 'template-item-name';
+                name.textContent = template.name;
+                item.appendChild(name);
+
+                const pattern = document.createElement('span');
+                pattern.className = 'template-item-pattern';
+                pattern.textContent = template.pattern.length > 70
+                    ? template.pattern.substring(0, 70) + '...'
+                    : template.pattern;
+                item.appendChild(pattern);
+
+                if (template.type === 'user') {
+                    const del = document.createElement('button');
+                    del.className = 'template-item-delete';
+                    del.innerHTML = '&times;';
+                    del.title = 'Delete template';
+                    del.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        deleteUserTemplate(template.id);
+                    });
+                    item.appendChild(del);
+                }
+
+                item.addEventListener('click', () => {
+                    applyTemplate(template);
+                    templateDropdown.classList.remove('active');
+                });
+
+                templateDropdownContent.appendChild(item);
+            });
+        }
+    }
+
+    function applyTemplate(template) {
+        const vars = extractVariables(template.pattern);
+        activeTemplate = { ...template, variables: vars };
+        templateVariableValues = {};
+        promptTextarea.value = template.pattern;
+
+        // Clear enhanced state
+        isPromptEnhanced = false;
+        originalPrompt = '';
+        if (enhanceBtn) enhanceBtn.classList.remove('enhanced');
+
+        renderTemplateVariables();
+    }
+
+    function renderTemplateVariables() {
+        if (!activeTemplate || activeTemplate.variables.length === 0) {
+            templateVariablesDiv.style.display = 'none';
+            return;
+        }
+
+        templateVariablesDiv.style.display = 'block';
+        templateVariablesInputs.innerHTML = '';
+
+        activeTemplate.variables.forEach(varName => {
+            const div = document.createElement('div');
+            div.className = 'template-variable-input';
+
+            const label = document.createElement('label');
+            label.setAttribute('for', 'tvar-' + varName);
+            label.textContent = '{' + varName + '}';
+            div.appendChild(label);
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = 'tvar-' + varName;
+            input.placeholder = varName.replace(/_/g, ' ');
+            input.value = templateVariableValues[varName] || '';
+            input.addEventListener('input', (e) => {
+                templateVariableValues[varName] = e.target.value;
+                updatePromptFromTemplate();
+            });
+            div.appendChild(input);
+
+            templateVariablesInputs.appendChild(div);
+        });
+
+        // Focus first input
+        const first = templateVariablesInputs.querySelector('input');
+        if (first) first.focus();
+    }
+
+    function updatePromptFromTemplate() {
+        if (!activeTemplate) return;
+        let composed = activeTemplate.pattern;
+        activeTemplate.variables.forEach(varName => {
+            const value = templateVariableValues[varName];
+            if (value) {
+                composed = composed.replace(new RegExp('\\{' + varName + '\\}', 'g'), value);
+            }
+        });
+        promptTextarea.value = composed;
+    }
+
+    function clearTemplate() {
+        activeTemplate = null;
+        templateVariableValues = {};
+        templateVariablesDiv.style.display = 'none';
+    }
+
+    function saveCurrentAsTemplate() {
+        const prompt = promptTextarea.value.trim();
+        if (!prompt) return;
+
+        const vars = extractVariables(prompt);
+        if (vars.length === 0) {
+            alert('Template must contain at least one {variable} placeholder.\n\nExample: A {subject} in {style} style');
+            return;
+        }
+
+        const name = window.prompt('Template name:');
+        if (!name || !name.trim()) return;
+
+        userTemplates.unshift({
+            id: Date.now().toString(),
+            name: name.trim(),
+            pattern: prompt,
+        });
+        saveUserTemplates();
+        renderTemplateDropdown();
+    }
+
+    function deleteUserTemplate(id) {
+        userTemplates = userTemplates.filter(t => t.id !== id);
+        saveUserTemplates();
+        renderTemplateDropdown();
+        if (activeTemplate && activeTemplate.id === id) clearTemplate();
+    }
+
+    // Template event handlers
+    templateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        renderTemplateDropdown();
+        templateDropdown.classList.toggle('active');
+        promptHistoryDropdown.classList.remove('active');
+    });
+
+    templateSaveBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        saveCurrentAsTemplate();
+    });
+
+    templateClearBtn.addEventListener('click', clearTemplate);
+
+    // Close template dropdown on outside click
+    document.addEventListener('click', (e) => {
+        if (!templateDropdown.contains(e.target) && e.target !== templateBtn) {
+            templateDropdown.classList.remove('active');
+        }
+    });
+
+    // Clear template when user manually edits prompt in a way that changes its structure
+    promptTextarea.addEventListener('input', () => {
+        if (!activeTemplate) return;
+        // If the user's text no longer contains any of the original template variables
+        // and doesn't match the composed output, they're free-editing
+        const currentText = promptTextarea.value;
+        const composedText = (() => {
+            let c = activeTemplate.pattern;
+            activeTemplate.variables.forEach(v => {
+                const val = templateVariableValues[v];
+                if (val) c = c.replace(new RegExp('\\{' + v + '\\}', 'g'), val);
+            });
+            return c;
+        })();
+        if (currentText !== composedText) {
+            clearTemplate();
+        }
+    });
+
+    // Load user templates on startup
+    loadUserTemplates();
 });

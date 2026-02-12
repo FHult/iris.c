@@ -413,6 +413,197 @@ textarea {
     text-align: center;
 }
 
+/* Template dropdown */
+.template-dropdown {
+    display: none;
+    position: absolute;
+    z-index: 100;
+    width: 100%;
+    max-height: 400px;
+    overflow-y: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.template-dropdown.active {
+    display: block;
+}
+
+.template-dropdown-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    border-radius: 8px 8px 0 0;
+}
+
+.template-dropdown-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.template-save-btn {
+    padding: 0.3rem 0.55rem;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.template-save-btn:hover {
+    background: var(--accent-hover, #4f46e5);
+}
+
+.template-section-header {
+    padding: 0.5rem 0.75rem 0.25rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.template-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+    transition: background 0.15s;
+    position: relative;
+}
+
+.template-item:hover {
+    background: var(--bg-tertiary);
+}
+
+.template-item-name {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.template-item-pattern {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    font-style: italic;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.template-item-delete {
+    position: absolute;
+    top: 50%;
+    right: 0.5rem;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 4px;
+    color: var(--error);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.template-item:hover .template-item-delete {
+    opacity: 1;
+}
+
+.template-item-delete:hover {
+    background: rgba(239, 68, 68, 0.2);
+}
+
+/* Template variables panel */
+.template-variables {
+    margin-top: 0.5rem;
+    padding: 0.6rem;
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.06) 0%, rgba(129, 140, 248, 0.03) 100%);
+    border: 1px solid rgba(99, 102, 241, 0.15);
+    border-radius: 8px;
+}
+
+.template-variables-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+}
+
+.template-variables-header span {
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--accent);
+}
+
+.template-clear-btn {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.2rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.template-clear-btn:hover {
+    color: var(--error);
+}
+
+#template-variables-inputs {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.5rem;
+}
+
+.template-variable-input {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.template-variable-input label {
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: var(--accent);
+    font-family: 'Courier New', monospace;
+}
+
+.template-variable-input input {
+    padding: 0.4rem 0.5rem;
+    font-size: 0.8rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+}
+
+.template-variable-input input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
+}
+
 select {
     cursor: pointer;
 }
