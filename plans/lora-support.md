@@ -346,3 +346,50 @@ For a rank-16 LoRA on 5 double blocks (4B Klein):
 5. Test with LoRA for wrong model size → should warn and skip
 6. Test with LoRA that has more blocks than model → should use available blocks
 7. Benchmark: measure overhead of LoRA application vs base generation
+
+---
+
+## Phase 2: GPU-Accelerated LoRA (after Phase 1 is proven with real LoRAs)
+
+**Goal:** Re-enable the Metal bf16 fast path while LoRA is active, eliminating
+the current full CPU fallback. LoRA rank is small (4-128) so the extra GPU
+kernel overhead is negligible compared to the base matmul.
+
+### Approach
+
+Add a small Metal compute kernel that computes `out += scale * B @ (A @ x)`
+on-GPU, keeping all tensors in GPU memory throughout the forward pass.
+
+**Steps:**
+
+1. **Store LoRA weights on GPU** — after `lora_load()`, copy `lora_A` and `lora_B`
+   float arrays into Metal buffers (one pair per adapter). Store these in
+   `lora_adapter_t` alongside the existing CPU pointers.
+
+2. **New Metal kernel in `flux_shaders.metal`:**
+   ```metal
+   // Compute: out += scale * lora_B @ (lora_A @ x)
+   // lora_A: [rank, in_dim], lora_B: [out_dim, rank], x: [seq_len, in_dim]
+   // Uses two sequential matmuls with a small [rank, seq_len] intermediate
+   kernel void lora_apply(...)
+   ```
+   Since rank is tiny (≤128), the intermediate fits in threadgroup memory.
+
+3. **Hook into the bf16 GPU forward path** — after each existing GPU linear
+   projection call (in `double_block_forward_bf16` etc.), if the matching
+   `lora_adapter_t` has GPU buffers, dispatch the Metal kernel.
+
+4. **Remove the `&& !tf->lora` bypass** — once GPU LoRA works, the condition
+   becomes unnecessary and the bf16 path runs unconditionally again.
+
+5. **Keep CPU `lora_apply()` as fallback** — for `generic` and `blas` builds
+   without Metal, behavior is unchanged.
+
+### Prerequisites
+- Phase 1 LoRA proven to produce correct visual results with real community LoRAs
+- Benchmark shows the CPU fallback is meaningfully slower (worth the complexity)
+
+### Scope
+- Only needed for `mps` (Metal) build target
+- `blas` and `generic` builds continue using CPU LoRA (already fast enough there)
+- Web UI LoRA controls (file picker, scale slider, loaded LoRA name display)
