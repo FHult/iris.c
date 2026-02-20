@@ -16,6 +16,7 @@
 #include "flux.h"
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
+#include "flux_lora.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,6 +326,9 @@ typedef struct flux_transformer {
     #define MAX_TF_SHARDS 4
     safetensors_file_t *sf_files[MAX_TF_SHARDS];
     int num_sf_files;
+
+    /* Optional LoRA adapter (NULL if no LoRA loaded) */
+    lora_state_t *lora;
 } flux_transformer_t;
 
 /* ========================================================================
@@ -2118,12 +2122,15 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                                  const float *img_rope_cos, const float *img_rope_sin,
                                  const float *txt_rope_cos, const float *txt_rope_sin,
                                  int img_seq, int txt_seq,
+                                 int block_idx,
                                  flux_transformer_t *tf) {
     int hidden = tf->hidden_size;
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
     float eps = 1e-6f;
+    lora_state_t *lora = tf->lora;
+    float *lora_scratch = lora ? lora->scratch : NULL;
 
     /* Extract pre-computed modulation parameters */
     const float *img_shift1 = img_mod;
@@ -2172,6 +2179,14 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                        img_seq, hidden, hidden);
     flux_gpu_end_batch();
 
+    /* Apply LoRA corrections to image Q, K, V */
+    if (lora && lora->double_img_q[block_idx].lora_A)
+        lora_apply(&lora->double_img_q[block_idx], lora->scale, img_norm, img_q, img_seq, lora_scratch);
+    if (lora && lora->double_img_k[block_idx].lora_A)
+        lora_apply(&lora->double_img_k[block_idx], lora->scale, img_norm, img_k, img_seq, lora_scratch);
+    if (lora && lora->double_img_v[block_idx].lora_A)
+        lora_apply(&lora->double_img_v[block_idx], lora->scale, img_norm, img_v, img_seq, lora_scratch);
+
     /* Apply QK normalization (per-head RMSNorm) */
     apply_qk_norm(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
                   img_seq, heads, head_dim, eps);
@@ -2209,6 +2224,14 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     LINEAR_BF16_OR_F32(txt_v, txt_norm, block->txt_v_weight, block->txt_v_weight_bf16,
                        txt_seq, hidden, hidden);
     flux_gpu_end_batch();
+
+    /* Apply LoRA corrections to text Q, K, V */
+    if (lora && lora->double_txt_q[block_idx].lora_A)
+        lora_apply(&lora->double_txt_q[block_idx], lora->scale, txt_norm, txt_q, txt_seq, lora_scratch);
+    if (lora && lora->double_txt_k[block_idx].lora_A)
+        lora_apply(&lora->double_txt_k[block_idx], lora->scale, txt_norm, txt_k, txt_seq, lora_scratch);
+    if (lora && lora->double_txt_v[block_idx].lora_A)
+        lora_apply(&lora->double_txt_v[block_idx], lora->scale, txt_norm, txt_v, txt_seq, lora_scratch);
 
     /* Apply QK normalization */
     apply_qk_norm(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
@@ -2248,6 +2271,12 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     LINEAR_BF16_OR_F32(txt_proj, txt_attn_out, block->txt_proj_weight, block->txt_proj_weight_bf16,
                        txt_seq, hidden, hidden);
     flux_gpu_end_batch();
+
+    /* Apply LoRA corrections to image and text output projections */
+    if (lora && lora->double_img_proj[block_idx].lora_A)
+        lora_apply(&lora->double_img_proj[block_idx], lora->scale, img_attn_out, img_proj, img_seq, lora_scratch);
+    if (lora && lora->double_txt_proj[block_idx].lora_A)
+        lora_apply(&lora->double_txt_proj[block_idx], lora->scale, txt_attn_out, txt_proj, txt_seq, lora_scratch);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -3334,7 +3363,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
                                  const float *img_rope_cos, const float *img_rope_sin,
                                  const float *txt_rope_cos, const float *txt_rope_sin,
-                                 int seq, int img_offset, flux_transformer_t *tf) {
+                                 int seq, int img_offset, int block_idx,
+                                 flux_transformer_t *tf) {
     /* seq = total_seq (txt + img)
      * img_offset = txt_seq (where image starts in the [txt, img] concatenation)
      */
@@ -3345,6 +3375,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     int fused_dim = h_size * 3 + mlp_hidden * 2;  /* QKV + gate + up */
     int img_seq = seq - img_offset;  /* Number of image tokens */
     float eps = 1e-6f;
+    lora_state_t *lora = tf->lora;
+    float *lora_scratch = lora ? lora->scratch : NULL;
 
     /* Compute AdaLN parameters (3: shift, scale, gate)
      * adaln_weight is [hidden*3, hidden], t_emb is [hidden]
@@ -3382,6 +3414,11 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *fused_out = tf->work2;
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
+
+    /* Apply LoRA to fused QKV+MLP linear (Kohya linear1 style) */
+    if (lora && lora->single_linear1[block_idx].lora_A)
+        lora_apply(&lora->single_linear1[block_idx], lora->scale, norm, fused_out, seq, lora_scratch);
+
     double _t2 = prof_get_time();
     prof_single_fused_matmul += _t2 - _t1;
 
@@ -3458,6 +3495,10 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
+    /* Apply LoRA to output projection (Kohya linear2 style) */
+    if (lora && lora->single_linear2[block_idx].lora_A)
+        lora_apply(&lora->single_linear2[block_idx], lora->scale, concat, proj_out, seq, lora_scratch);
+
     double _t7 = prof_get_time();
     prof_single_proj_matmul += _t7 - _t6;
 
@@ -3524,7 +3565,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #ifdef USE_METAL
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
         float *bf16_output = flux_transformer_forward_bf16(tf, img_transposed, img_seq,
                                                            img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
@@ -3606,7 +3647,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              tf->double_mod_img, tf->double_mod_txt,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             img_seq, txt_seq, tf);
+                             img_seq, txt_seq, i, tf);
         if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -3837,7 +3878,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                      t_emb, tf->adaln_single_weight,
                                      img_rope_cos, img_rope_sin,
                                      txt_rope_cos, txt_rope_sin,
-                                     total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+                                     total_seq, txt_seq, i, tf);  /* txt_seq is the offset to image */
             }
             if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
             if (flux_substep_callback)
@@ -4022,7 +4063,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Try BF16 GPU-accelerated path for img2img.
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4072,7 +4113,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              tf->double_mod_img, tf->double_mod_txt,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             combined_img_seq, txt_seq, tf);
+                             combined_img_seq, txt_seq, i, tf);
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
@@ -4097,7 +4138,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              t_emb, tf->adaln_single_weight,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+                             total_seq, txt_seq, i, tf);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
@@ -4264,7 +4305,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
 #ifdef USE_METAL
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4316,7 +4357,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              tf->double_mod_img, tf->double_mod_txt,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             combined_img_seq, txt_seq, tf);
+                             combined_img_seq, txt_seq, i, tf);
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
         }
@@ -4340,7 +4381,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              t_emb, tf->adaln_single_weight,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+                             total_seq, txt_seq, i, tf);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
         }
@@ -4676,7 +4717,21 @@ void flux_transformer_free(flux_transformer_t *tf) {
         tf->num_sf_files = 0;
     }
 
+    /* Free LoRA state if loaded */
+    lora_free(tf->lora);
+
     free(tf);
+}
+
+/* Accessor functions for transformer dimensions (used by flux.c LoRA API) */
+int flux_transformer_hidden_size(flux_transformer_t *tf) { return tf->hidden_size; }
+int flux_transformer_num_double_layers(flux_transformer_t *tf) { return tf->num_double_layers; }
+int flux_transformer_num_single_layers(flux_transformer_t *tf) { return tf->num_single_layers; }
+
+/* Set LoRA state (replaces any existing LoRA) */
+void flux_transformer_set_lora(flux_transformer_t *tf, lora_state_t *lora) {
+    lora_free(tf->lora);
+    tf->lora = lora;
 }
 
 /* ========================================================================

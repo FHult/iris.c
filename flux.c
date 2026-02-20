@@ -9,6 +9,7 @@
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
 #include "flux_qwen3.h"
+#include "flux_lora.h"
 #include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,10 @@ extern flux_transformer_t *flux_transformer_load(FILE *f);
 extern flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir);
 extern flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir);
 extern void flux_transformer_free(flux_transformer_t *tf);
+extern int flux_transformer_hidden_size(flux_transformer_t *tf);
+extern int flux_transformer_num_double_layers(flux_transformer_t *tf);
+extern int flux_transformer_num_single_layers(flux_transformer_t *tf);
+extern void flux_transformer_set_lora(flux_transformer_t *tf, lora_state_t *lora);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
@@ -329,6 +334,32 @@ void flux_set_base_mode(flux_ctx *ctx) {
     const char *size_label = ctx->is_non_commercial ? "9B" : "4B";
     snprintf(ctx->model_name, sizeof(ctx->model_name),
              "FLUX.2-klein-base-%s", size_label);
+}
+
+int flux_load_lora(flux_ctx *ctx, const char *path, float scale) {
+    if (!ctx || !ctx->transformer) return -1;
+    if (!path || !*path) return -1;
+
+    /* Ensure transformer is loaded */
+    if (!ctx->transformer) {
+        fprintf(stderr, "LoRA: transformer not loaded\n");
+        return -1;
+    }
+
+    int hidden = flux_transformer_hidden_size(ctx->transformer);
+    int num_double = flux_transformer_num_double_layers(ctx->transformer);
+    int num_single = flux_transformer_num_single_layers(ctx->transformer);
+
+    lora_state_t *lora = lora_load(path, num_double, num_single, hidden, scale);
+    if (!lora) return -1;
+
+    flux_transformer_set_lora(ctx->transformer, lora);
+    return 0;
+}
+
+void flux_unload_lora(flux_ctx *ctx) {
+    if (!ctx || !ctx->transformer) return;
+    flux_transformer_set_lora(ctx->transformer, NULL);
 }
 
 void flux_release_text_encoder(flux_ctx *ctx) {

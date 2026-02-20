@@ -483,14 +483,15 @@ static int run_server_mode(flux_ctx *ctx) {
         int show_steps = json_get_bool(line, "show_steps", 1);
         float guidance = json_get_float(line, "guidance", 0.0f);
         char *schedule = json_get_string(line, "schedule");
+        char *req_lora_path = json_get_string(line, "lora");
+        float req_lora_scale = json_get_float(line, "lora_scale", 1.0f);
 
         /* Validate request */
         if (!prompt || !output_path) {
             printf("{\"event\":\"error\",\"message\":\"Missing prompt or output\"}\n");
             fflush(stdout);
-            free(prompt);
-            free(output_path);
-            free(input_path);
+            free(prompt); free(output_path); free(input_path);
+            free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -499,20 +500,28 @@ static int run_server_mode(flux_ctx *ctx) {
         if (width < 64 || width > 1792 || width % 16 != 0) {
             printf("{\"event\":\"error\",\"message\":\"Width must be 64-1792 and divisible by 16\"}\n");
             fflush(stdout);
-            free(prompt);
-            free(output_path);
-            free(input_path);
+            free(prompt); free(output_path); free(input_path);
+            free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
         if (height < 64 || height > 1792 || height % 16 != 0) {
             printf("{\"event\":\"error\",\"message\":\"Height must be 64-1792 and divisible by 16\"}\n");
             fflush(stdout);
-            free(prompt);
-            free(output_path);
-            free(input_path);
+            free(prompt); free(output_path); free(input_path);
+            free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
+        }
+
+        /* Apply LoRA if requested (per-request hot-swap) */
+        if (req_lora_path) {
+            if (flux_load_lora(ctx, req_lora_path, req_lora_scale) != 0) {
+                fprintf(stderr, "Warning: Failed to load LoRA from %s\n", req_lora_path);
+            }
+            free(req_lora_path);
+        } else {
+            flux_unload_lora(ctx);
         }
 
         /* Set seed */
@@ -693,6 +702,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
     fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
+    fprintf(stderr, "LoRA options:\n");
+    fprintf(stderr, "      --lora PATH       Load LoRA adapter (XLabs, Kohya, or Diffusers .safetensors)\n");
+    fprintf(stderr, "      --lora-scale N    LoRA strength (default: 1.0, range: 0.0-2.0)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -746,6 +758,8 @@ int main(int argc, char *argv[]) {
         {"server",     no_argument,       0, 'R'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
+        {"lora",         required_argument, 0, 260},
+        {"lora-scale",   required_argument, 0, 261},
         {0, 0, 0, 0}
     };
 
@@ -776,6 +790,8 @@ int main(int argc, char *argv[]) {
     int force_base = 0;
     int no_license_info = 0;
     int blas_threads = 0; (void)blas_threads;
+    char *lora_path = NULL;
+    float lora_scale = 1.0f;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -818,6 +834,8 @@ int main(int argc, char *argv[]) {
             case 'D': debug_py = 1; break;
             case 'R': server_mode = 1; break;
             case 259: blas_threads = atoi(optarg); break;
+            case 260: lora_path = optarg; break;
+            case 261: lora_scale = (float)atof(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -947,6 +965,17 @@ int main(int argc, char *argv[]) {
     /* Override model type if --base was specified */
     if (force_base) {
         flux_set_base_mode(ctx);
+    }
+
+    /* Load LoRA adapter if requested */
+    if (lora_path) {
+        LOG_NORMAL("Loading LoRA: %s (scale=%.2f)...", lora_path, lora_scale);
+        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+        if (flux_load_lora(ctx, lora_path, lora_scale) != 0) {
+            fprintf(stderr, "\nWarning: Failed to load LoRA from %s\n", lora_path);
+        } else {
+            LOG_NORMAL(" done\n");
+        }
     }
 
     /* Resolve auto-parameters now that we know the model type */

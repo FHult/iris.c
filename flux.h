@@ -134,6 +134,21 @@ void flux_set_keep_models_loaded(flux_ctx *ctx, int enable);
 int flux_is_distilled(flux_ctx *ctx);
 
 /*
+ * Load a LoRA adapter from a safetensors file.
+ * Supports XLabs, Kohya, and Diffusers formats (auto-detected).
+ * scale: LoRA strength (0.0=no effect, 1.0=full, 2.0=amplified).
+ * Replaces any previously loaded LoRA.
+ * Returns 0 on success, -1 on error.
+ * Note: disables GPU bf16 path while LoRA is active (falls back to CPU).
+ */
+int flux_load_lora(flux_ctx *ctx, const char *path, float scale);
+
+/*
+ * Unload the current LoRA adapter and resume normal (GPU-accelerated) inference.
+ */
+void flux_unload_lora(flux_ctx *ctx);
+
+/*
  * Force base model mode (overrides autodetection).
  * Call after flux_load_dir() if model_index.json is missing.
  */
