@@ -3565,7 +3565,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #ifdef USE_METAL
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
         float *bf16_output = flux_transformer_forward_bf16(tf, img_transposed, img_seq,
                                                            img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
@@ -4063,7 +4063,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Try BF16 GPU-accelerated path for img2img.
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4305,7 +4305,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
 #ifdef USE_METAL
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
-    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !tf->lora) {
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,

@@ -326,6 +326,8 @@ int flux_is_distilled(flux_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
 }
 
+static int flux_load_transformer_if_needed(flux_ctx *ctx);
+
 void flux_set_base_mode(flux_ctx *ctx) {
     if (!ctx) return;
     ctx->is_distilled = 0;
@@ -337,14 +339,11 @@ void flux_set_base_mode(flux_ctx *ctx) {
 }
 
 int flux_load_lora(flux_ctx *ctx, const char *path, float scale) {
-    if (!ctx || !ctx->transformer) return -1;
+    if (!ctx) return -1;
     if (!path || !*path) return -1;
 
-    /* Ensure transformer is loaded */
-    if (!ctx->transformer) {
-        fprintf(stderr, "LoRA: transformer not loaded\n");
-        return -1;
-    }
+    /* Load transformer on-demand (it's lazy-loaded, may not be present yet) */
+    if (!flux_load_transformer_if_needed(ctx)) return -1;
 
     int hidden = flux_transformer_hidden_size(ctx->transformer);
     int num_double = flux_transformer_num_double_layers(ctx->transformer);

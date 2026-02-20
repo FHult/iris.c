@@ -128,9 +128,11 @@ static void free_adapter(lora_adapter_t *a) {
  * Load one simple (non-fused) adapter from a safetensors file.
  * down_key: key for lora_A ([rank, in_dim])
  * up_key:   key for lora_B ([out_dim, rank])
+ * expected_in/out: expected dimensions (-1 to skip check)
  */
 static int load_adapter(lora_adapter_t *a, const safetensors_file_t *sf,
-                        const char *down_key, const char *up_key, int *max_rank) {
+                        const char *down_key, const char *up_key, int *max_rank,
+                        int expected_in, int expected_out) {
     const safetensor_t *down = safetensors_find(sf, down_key);
     const safetensor_t *up   = safetensors_find(sf, up_key);
     if (!down || !up) return 0;
@@ -139,6 +141,17 @@ static int load_adapter(lora_adapter_t *a, const safetensors_file_t *sf,
     int rank    = (int)down->shape[0];
     int in_dim  = (int)down->shape[1];
     int out_dim = (int)up->shape[0];
+
+    if (expected_in  >= 0 && in_dim  != expected_in) {
+        fprintf(stderr, "LoRA: skipping %s: in_dim=%d (expected %d)\n",
+                down_key, in_dim, expected_in);
+        return 0;
+    }
+    if (expected_out >= 0 && out_dim != expected_out) {
+        fprintf(stderr, "LoRA: skipping %s: out_dim=%d (expected %d)\n",
+                up_key, out_dim, expected_out);
+        return 0;
+    }
 
     a->rank    = rank;
     a->in_dim  = in_dim;
@@ -250,7 +263,7 @@ static void load_xlabs(lora_state_t *lora, const safetensors_file_t *sf, int hid
         /* Image stream: output projection (lora1) */
         snprintf(dk, sizeof(dk), "double_blocks.%d.processor.proj_lora1.down.weight", i);
         snprintf(uk, sizeof(uk), "double_blocks.%d.processor.proj_lora1.up.weight", i);
-        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
             loaded++;
 
         /* Text stream: fused QKV (lora2) */
@@ -263,7 +276,7 @@ static void load_xlabs(lora_state_t *lora, const safetensors_file_t *sf, int hid
         /* Text stream: output projection (lora2) */
         snprintf(dk, sizeof(dk), "double_blocks.%d.processor.proj_lora2.down.weight", i);
         snprintf(uk, sizeof(uk), "double_blocks.%d.processor.proj_lora2.up.weight", i);
-        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
             loaded++;
     }
 
@@ -290,7 +303,7 @@ static void load_kohya(lora_state_t *lora, const safetensors_file_t *sf, int hid
         /* Image stream: output projection */
         snprintf(dk, sizeof(dk), "lora_unet_double_blocks_%d_img_attn_proj.lora_down.weight", i);
         snprintf(uk, sizeof(uk), "lora_unet_double_blocks_%d_img_attn_proj.lora_up.weight", i);
-        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
             loaded++;
 
         /* Text stream: fused QKV */
@@ -303,20 +316,21 @@ static void load_kohya(lora_state_t *lora, const safetensors_file_t *sf, int hid
         /* Text stream: output projection */
         snprintf(dk, sizeof(dk), "lora_unet_double_blocks_%d_txt_attn_proj.lora_down.weight", i);
         snprintf(uk, sizeof(uk), "lora_unet_double_blocks_%d_txt_attn_proj.lora_up.weight", i);
-        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
             loaded++;
     }
 
-    /* Single blocks: Kohya uses fused linear1 (QKV+MLP) and linear2 (proj+mlp_down) */
+    /* Single blocks: Kohya uses fused linear1 (QKV+MLP) and linear2 (proj+mlp_down).
+     * Dimensions vary by model, so no fixed expected size (-1 = no check). */
     for (int i = 0; i < lora->num_single_blocks; i++) {
         snprintf(dk, sizeof(dk), "lora_unet_single_blocks_%d_linear1.lora_down.weight", i);
         snprintf(uk, sizeof(uk), "lora_unet_single_blocks_%d_linear1.lora_up.weight", i);
-        if (load_adapter(&lora->single_linear1[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->single_linear1[i], sf, dk, uk, &lora->max_rank, -1, -1))
             loaded++;
 
         snprintf(dk, sizeof(dk), "lora_unet_single_blocks_%d_linear2.lora_down.weight", i);
         snprintf(uk, sizeof(uk), "lora_unet_single_blocks_%d_linear2.lora_up.weight", i);
-        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank))
+        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1))
             loaded++;
     }
 
@@ -330,7 +344,6 @@ static void load_kohya(lora_state_t *lora, const safetensors_file_t *sf, int hid
 
 static void load_diffusers(lora_state_t *lora, const safetensors_file_t *sf, int hidden)
 {
-    (void)hidden;  /* Only used for double block shapes, validated via load_adapter */
     int loaded = 0;
     char dk[256], uk[256];
 
@@ -338,39 +351,39 @@ static void load_diffusers(lora_state_t *lora, const safetensors_file_t *sf, int
         /* Image stream: separate Q, K, V */
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.to_q.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.to_q.lora_B.weight", i);
-        if (load_adapter(&lora->double_img_q[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_img_q[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.to_k.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.to_k.lora_B.weight", i);
-        if (load_adapter(&lora->double_img_k[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_img_k[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.to_v.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.to_v.lora_B.weight", i);
-        if (load_adapter(&lora->double_img_v[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_img_v[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.to_out.0.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.to_out.0.lora_B.weight", i);
-        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         /* Text stream: add_q_proj, add_k_proj, add_v_proj, to_add_out */
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.add_q_proj.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.add_q_proj.lora_B.weight", i);
-        if (load_adapter(&lora->double_txt_q[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_txt_q[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.add_k_proj.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.add_k_proj.lora_B.weight", i);
-        if (load_adapter(&lora->double_txt_k[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_txt_k[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.add_v_proj.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.add_v_proj.lora_B.weight", i);
-        if (load_adapter(&lora->double_txt_v[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_txt_v[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
 
         snprintf(dk, sizeof(dk), "transformer.transformer_blocks.%d.attn.to_add_out.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.transformer_blocks.%d.attn.to_add_out.lora_B.weight", i);
-        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
     }
 
-    /* Single blocks: to_q, to_k, to_v (separate), proj_mlp → linear1, proj_out → linear2 */
+    /* Single blocks: proj_out → single_linear2 (dims vary, no fixed size check) */
     for (int i = 0; i < lora->num_single_blocks; i++) {
         /* For diffusers single blocks, Q/K/V are separate but use the same input (norm).
          * We load them as separate adapters and store in single_linear1_q/k/v.
@@ -380,7 +393,7 @@ static void load_diffusers(lora_state_t *lora, const safetensors_file_t *sf, int
         /* proj_out → single_linear2 */
         snprintf(dk, sizeof(dk), "transformer.single_transformer_blocks.%d.proj_out.lora_A.weight", i);
         snprintf(uk, sizeof(uk), "transformer.single_transformer_blocks.%d.proj_out.lora_B.weight", i);
-        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank)) loaded++;
+        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1)) loaded++;
     }
 
     if (lora->num_single_blocks > 0) {
