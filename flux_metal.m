@@ -2861,6 +2861,7 @@ int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
         {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            g_tensor_cmd = nil;  /* Must nil before get_tensor_cmd() for phase 3 */
 
             /* Read f16 scores, convert to f32, softmax, convert back to f16 */
             size_t f32_size = scores_elements * sizeof(float);

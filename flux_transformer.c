@@ -2373,6 +2373,11 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     if (!flux_metal_available() || !flux_metal_shaders_available()) return 0;
     if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
 
+    /* In mmap mode, the OS may reuse the same virtual address for different blocks'
+     * weights after munmap. The f16 weight cache is keyed by CPU pointer, so it
+     * would return a stale Metal buffer for the new block. Clear it to avoid this. */
+    if (tf->use_mmap) flux_metal_clear_f16_cache_only();
+
     int h_size = tf->hidden_size;
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
@@ -3863,11 +3868,12 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             }
 #ifdef USE_METAL
             /* Try GPU-optimized path first */
-            if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+            int sblk_gpu = single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
                                           txt_rope_cos, txt_rope_sin,
-                                          total_seq, txt_seq, tf))
+                                          total_seq, txt_seq, tf);
+            if (!sblk_gpu)
 #endif
             {
                 /* Fall back to CPU path */
