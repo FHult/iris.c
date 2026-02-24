@@ -60,6 +60,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const guidanceInput = document.getElementById('guidance');
     const guidanceValue = document.getElementById('guidance-value');
     const scheduleSelect = document.getElementById('schedule');
+    const loraSelect = document.getElementById('lora-select');
+    const loraBrowseBtn = document.getElementById('lora-browse-btn');
+    const loraScaleInput = document.getElementById('lora-scale');
+    const loraScaleValue = document.getElementById('lora-scale-value');
+    const loraScaleGroup = document.getElementById('lora-scale-group');
+    const loraPanel = document.getElementById('lora-panel');
+    const loraPanelClose = document.getElementById('lora-panel-close');
+    const loraPanelBody = document.getElementById('lora-panel-body');
+    const loraPanelBackdrop = document.getElementById('lora-panel-backdrop');
     const advancedControls = document.getElementById('advanced-controls');
     const toggleAdvancedBtn = document.getElementById('toggle-advanced');
     const modelInfoEl = document.getElementById('model-info');
@@ -78,6 +87,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let currentEventSource = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
+    let availableLoras = [];   // [{name, filename, size_mb}] from /available-loras
+    let curatedLoras = [];     // [{...curated entry, downloaded: bool}]
+    let activeDownloads = {};  // {dl_id: {percent, done, error, interval}}
     let currentGeneration = null; // Store current generation params for remix
     let generationQueue = [];
     let isGenerating = false;
@@ -214,6 +226,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load style presets and step guidance
     loadStylePresets();
+
+    // Load available LoRA adapters
+    loadAvailableLoras();
 
     // Load saved settings from localStorage
     loadSavedSettings();
@@ -685,12 +700,14 @@ document.addEventListener('DOMContentLoaded', () => {
             style: stylePresetSelect ? stylePresetSelect.value || null : null,
             guidance: guidance > 0 ? guidance : null,
             schedule: scheduleSelect.value || null,
+            lora: loraSelect ? loraSelect.value || null : null,
+            lora_scale: loraScaleInput ? parseFloat(loraScaleInput.value) : 1.0,
         };
     }
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -707,6 +724,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     guidance: guidance || null,
                     schedule: schedule || null,
                     batch_id: batchId || null,
+                    lora: lora || null,
+                    lora_scale: lora_scale || 1.0,
                 }),
             });
             const data = await response.json();
@@ -1137,7 +1156,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
 
             // Store current generation params for remix
             currentGeneration = { prompt, width, height, steps };
@@ -1176,6 +1195,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     guidance: guidance || null,
                     schedule: schedule || null,
                     batch_id: batchId || null,
+                    lora: lora || null,
+                    lora_scale: lora_scale || 1.0,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -1506,6 +1527,215 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Load style presets from server
+    // =========================================================================
+    // LoRA Support
+    // =========================================================================
+
+    async function loadAvailableLoras() {
+        try {
+            const resp = await fetch('/available-loras');
+            const data = await resp.json();
+            availableLoras = data.loras || [];
+            curatedLoras = data.curated || [];
+            rebuildLoraDropdown();
+        } catch (e) {
+            console.error('Failed to load LoRAs:', e);
+        }
+    }
+
+    function rebuildLoraDropdown() {
+        if (!loraSelect) return;
+        const prev = loraSelect.value;
+        loraSelect.innerHTML = '<option value="">None</option>';
+        availableLoras.forEach(lora => {
+            const opt = document.createElement('option');
+            opt.value = lora.filename;
+            opt.textContent = lora.name + (lora.size_mb ? ` (${lora.size_mb} MB)` : '');
+            loraSelect.appendChild(opt);
+        });
+        if (prev && availableLoras.some(l => l.filename === prev)) {
+            loraSelect.value = prev;
+        }
+    }
+
+    function openLoraPanel() {
+        renderLoraPanel();
+        loraPanel.style.display = 'flex';
+        loraPanelBackdrop.style.display = 'block';
+    }
+
+    function closeLoraPanel() {
+        loraPanel.style.display = 'none';
+        loraPanelBackdrop.style.display = 'none';
+    }
+
+    function renderLoraPanel() {
+        if (!loraPanelBody) return;
+        loraPanelBody.innerHTML = '';
+
+        // Curated section
+        if (curatedLoras.length > 0) {
+            const h = document.createElement('div');
+            h.className = 'lora-section-header';
+            h.textContent = 'Klein LoRA Collection';
+            loraPanelBody.appendChild(h);
+
+            curatedLoras.forEach(lora => {
+                const card = document.createElement('div');
+                card.className = 'lora-card';
+                card.dataset.id = lora.id;
+
+                const badges = lora.models.map(m =>
+                    `<span class="lora-badge lora-badge-${m}">${m.toUpperCase()}</span>`
+                ).join('');
+                const trigger = lora.trigger
+                    ? `<span class="lora-trigger" title="Add this word to your prompt">${lora.trigger}</span>`
+                    : '';
+                const dlState = activeDownloads[lora.id];
+                let actionHtml;
+                if (dlState && !dlState.done && !dlState.error) {
+                    actionHtml = `<div class="lora-progress-wrap"><div class="lora-progress-bar" style="width:${dlState.percent || 0}%"></div></div>`;
+                } else if (lora.downloaded) {
+                    actionHtml = `<button class="lora-use-btn" data-filename="${lora.filename}">Use</button>`;
+                } else {
+                    actionHtml = `<button class="lora-dl-btn" data-id="${lora.id}" data-repo="${lora.repo}" data-filename="${lora.filename}">Download</button>`;
+                }
+
+                card.innerHTML = `
+                    <div class="lora-card-main">
+                        <div class="lora-card-info">
+                            <span class="lora-card-name">${lora.name}</span>
+                            <span class="lora-card-desc">${lora.description}</span>
+                            <div class="lora-card-tags">${badges}${trigger}</div>
+                        </div>
+                        <div class="lora-card-action">${actionHtml}</div>
+                    </div>
+                `;
+                loraPanelBody.appendChild(card);
+            });
+        }
+
+        // Local LoRAs not in curated list
+        const localOnly = availableLoras.filter(l =>
+            !curatedLoras.some(c => c.filename === l.filename)
+        );
+        if (localOnly.length > 0) {
+            const h = document.createElement('div');
+            h.className = 'lora-section-header';
+            h.textContent = 'Local LoRAs';
+            loraPanelBody.appendChild(h);
+            localOnly.forEach(lora => {
+                const card = document.createElement('div');
+                card.className = 'lora-card';
+                card.innerHTML = `
+                    <div class="lora-card-main">
+                        <div class="lora-card-info">
+                            <span class="lora-card-name">${lora.name}</span>
+                            <span class="lora-card-desc">${lora.size_mb} MB</span>
+                        </div>
+                        <div class="lora-card-action">
+                            <button class="lora-use-btn" data-filename="${lora.filename}">Use</button>
+                        </div>
+                    </div>
+                `;
+                loraPanelBody.appendChild(card);
+            });
+        }
+
+        if (curatedLoras.length === 0 && localOnly.length === 0) {
+            loraPanelBody.innerHTML = '<p class="lora-empty">No LoRAs found. Click Download to get one.</p>';
+        }
+
+        // Wire up buttons
+        loraPanelBody.querySelectorAll('.lora-dl-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                startLoraDownload(btn.dataset.id, btn.dataset.repo, btn.dataset.filename);
+            });
+        });
+        loraPanelBody.querySelectorAll('.lora-use-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (loraSelect) {
+                    loraSelect.value = btn.dataset.filename;
+                    loraSelect.dispatchEvent(new Event('change'));
+                }
+                closeLoraPanel();
+            });
+        });
+    }
+
+    async function startLoraDownload(dlId, repo, filename) {
+        activeDownloads[dlId] = { percent: 0, done: false, error: null };
+        renderLoraPanel();
+
+        try {
+            const resp = await fetch('/download-lora', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: dlId, repo, filename }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || data.error) {
+                activeDownloads[dlId].error = data.error || 'Download failed';
+                renderLoraPanel();
+                return;
+            }
+            if (data.already_exists) {
+                delete activeDownloads[dlId];
+                await loadAvailableLoras();
+                renderLoraPanel();
+                return;
+            }
+        } catch (e) {
+            activeDownloads[dlId].error = String(e);
+            renderLoraPanel();
+            return;
+        }
+
+        // Poll progress
+        const interval = setInterval(async () => {
+            try {
+                const pr = await fetch(`/download-lora/progress/${dlId}`);
+                const state = await pr.json();
+                activeDownloads[dlId].percent = state.percent || 0;
+                activeDownloads[dlId].done = state.done || false;
+                activeDownloads[dlId].error = state.error || null;
+
+                // Update progress bar in place without full re-render
+                const card = loraPanelBody ? loraPanelBody.querySelector(`[data-id="${dlId}"]`) : null;
+                if (card) {
+                    const bar = card.querySelector('.lora-progress-bar');
+                    if (bar) bar.style.width = `${state.percent || 0}%`;
+                }
+
+                if (state.done || state.error) {
+                    clearInterval(interval);
+                    delete activeDownloads[dlId];
+                    await loadAvailableLoras();
+                    renderLoraPanel();
+                }
+            } catch (e) {
+                clearInterval(interval);
+            }
+        }, 500);
+    }
+
+    // LoRA event listeners
+    if (loraSelect) {
+        loraSelect.addEventListener('change', () => {
+            if (loraScaleGroup) {
+                loraScaleGroup.style.display = loraSelect.value ? 'block' : 'none';
+            }
+        });
+    }
+    if (loraScaleInput && loraScaleValue) {
+        loraScaleInput.addEventListener('input', () => {
+            loraScaleValue.textContent = parseFloat(loraScaleInput.value).toFixed(2);
+        });
+    }
+    if (loraBrowseBtn) loraBrowseBtn.addEventListener('click', openLoraPanel);
+    if (loraPanelClose) loraPanelClose.addEventListener('click', closeLoraPanel);
+    if (loraPanelBackdrop) loraPanelBackdrop.addEventListener('click', closeLoraPanel);
+
     async function loadStylePresets() {
         try {
             const response = await fetch('/style-presets');
@@ -1803,6 +2033,18 @@ document.addEventListener('DOMContentLoaded', () => {
         // Restore style preset if item was generated with one
         if (stylePresetSelect) {
             stylePresetSelect.value = item.style || '';
+        }
+
+        // Restore LoRA settings
+        if (loraSelect) {
+            loraSelect.value = item.lora || '';
+            if (loraScaleGroup) {
+                loraScaleGroup.style.display = loraSelect.value ? '' : 'none';
+            }
+        }
+        if (loraScaleInput && item.lora_scale != null) {
+            loraScaleInput.value = item.lora_scale;
+            if (loraScaleValue) loraScaleValue.textContent = Number(item.lora_scale).toFixed(2);
         }
 
         // Store for remix
