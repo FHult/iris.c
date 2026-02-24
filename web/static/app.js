@@ -14,6 +14,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const stepsValue = document.getElementById('steps-value');
     const showStepsCheckbox = document.getElementById('show-steps');
     const remixBtn = document.getElementById('remix-btn');
+    const varySubtleBtn = document.getElementById('vary-subtle-btn');
+    const varyStrengthInput = document.getElementById('vary-strength');
+    const varyStrengthValue = document.getElementById('vary-strength-value');
     const historySection = document.getElementById('history-section');
     const historyGrid = document.getElementById('history-grid');
     const aspectPreset = document.getElementById('aspect-preset');
@@ -60,6 +63,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const guidanceInput = document.getElementById('guidance');
     const guidanceValue = document.getElementById('guidance-value');
     const scheduleSelect = document.getElementById('schedule');
+    const loraSelect = document.getElementById('lora-select');
+    const loraBrowseBtn = document.getElementById('lora-browse-btn');
+    const loraScaleInput = document.getElementById('lora-scale');
+    const loraScaleValue = document.getElementById('lora-scale-value');
+    const loraScaleGroup = document.getElementById('lora-scale-group');
+    const loraPanel = document.getElementById('lora-panel');
+    const loraPanelClose = document.getElementById('lora-panel-close');
+    const loraPanelBody = document.getElementById('lora-panel-body');
+    const loraPanelBackdrop = document.getElementById('lora-panel-backdrop');
     const advancedControls = document.getElementById('advanced-controls');
     const toggleAdvancedBtn = document.getElementById('toggle-advanced');
     const modelInfoEl = document.getElementById('model-info');
@@ -78,6 +90,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let currentEventSource = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
+    let availableLoras = [];   // [{name, filename, size_mb}] from /available-loras
+    let curatedLoras = [];     // [{...curated entry, downloaded: bool}]
+    let activeDownloads = {};  // {dl_id: {percent, done, error, interval}}
     let currentGeneration = null; // Store current generation params for remix
     let generationQueue = [];
     let isGenerating = false;
@@ -214,6 +229,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load style presets and step guidance
     loadStylePresets();
+
+    // Load available LoRA adapters
+    loadAvailableLoras();
 
     // Load saved settings from localStorage
     loadSavedSettings();
@@ -685,12 +703,14 @@ document.addEventListener('DOMContentLoaded', () => {
             style: stylePresetSelect ? stylePresetSelect.value || null : null,
             guidance: guidance > 0 ? guidance : null,
             schedule: scheduleSelect.value || null,
+            lora: loraSelect ? loraSelect.value || null : null,
+            lora_scale: loraScaleInput ? parseFloat(loraScaleInput.value) : 1.0,
         };
     }
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -707,6 +727,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     guidance: guidance || null,
                     schedule: schedule || null,
                     batch_id: batchId || null,
+                    lora: lora || null,
+                    lora_scale: lora_scale || 1.0,
+                    img2img_strength: img2img_strength || 1.0,
                 }),
             });
             const data = await response.json();
@@ -1066,20 +1089,62 @@ document.addEventListener('DOMContentLoaded', () => {
         renderAllSlots();
     });
 
-    // Remix button - regenerate with same settings but new seed
+    // Vary Strong — new random seed, no reference (same as old Remix)
     remixBtn.addEventListener('click', () => {
         if (!currentGeneration) return;
 
-        // Fill form with current generation params
         document.getElementById('prompt').value = currentGeneration.prompt;
         setDimensions(currentGeneration.width, currentGeneration.height);
         document.getElementById('steps').value = currentGeneration.steps;
         stepsValue.textContent = currentGeneration.steps;
-        document.getElementById('seed').value = ''; // Clear seed for random
+        document.getElementById('seed').value = '';
 
-        // Trigger generation
         form.dispatchEvent(new Event('submit'));
     });
+
+    // Vary Subtle — re-run with current output as img2img reference, new seed
+    if (varySubtleBtn) {
+        varySubtleBtn.addEventListener('click', async () => {
+            if (!currentGeneration) return;
+            const img = outputArea.querySelector('img');
+            if (!img) return;
+
+            varySubtleBtn.disabled = true;
+            try {
+                // Fetch the current output image and convert to base64
+                const response = await fetch(img.src);
+                const blob = await response.blob();
+                const base64 = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+
+                const strength = varyStrengthInput ? parseFloat(varyStrengthInput.value) : 0.7;
+
+                // Queue with the original output as a reference (→ img2img path)
+                await addToQueue({
+                    prompt: currentGeneration.prompt,
+                    width: currentGeneration.width,
+                    height: currentGeneration.height,
+                    steps: currentGeneration.steps,
+                    seed: null,
+                    referenceImages: [base64],
+                    style: null,
+                    guidance: currentGeneration.guidance,
+                    schedule: currentGeneration.schedule,
+                    lora: currentGeneration.lora,
+                    lora_scale: currentGeneration.lora_scale,
+                    img2img_strength: strength,
+                });
+            } catch (e) {
+                showError('Vary Subtle failed: ' + e.message);
+            } finally {
+                varySubtleBtn.disabled = false;
+            }
+        });
+    }
 
     // Use current output image as img2img input
     useAsInputBtn.addEventListener('click', () => {
@@ -1137,10 +1202,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
 
-            // Store current generation params for remix
-            currentGeneration = { prompt, width, height, steps };
+            // Store current generation params for vary/remix
+            currentGeneration = { prompt, width, height, steps, guidance, schedule, lora, lora_scale };
 
             // Disable form and show progress
             setGenerating(true);
@@ -1176,6 +1241,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     guidance: guidance || null,
                     schedule: schedule || null,
                     batch_id: batchId || null,
+                    lora: lora || null,
+                    lora_scale: lora_scale || 1.0,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -1395,6 +1462,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     width: job.width,
                     height: job.height,
                     steps: job.steps,
+                    guidance: job.guidance || null,
+                    schedule: job.schedule || null,
+                    lora: job.lora || null,
+                    lora_scale: job.lora_scale || 1.0,
                 };
 
                 connectToProgress(job.id, job.steps,
@@ -1449,6 +1520,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     width: item.width,
                     height: item.height,
                     steps: item.steps,
+                    guidance: item.guidance || null,
+                    schedule: item.schedule || null,
+                    lora: item.lora || null,
+                    lora_scale: item.lora_scale || 1.0,
                 };
 
                 connectToProgress(item.id, item.steps,
@@ -1506,6 +1581,255 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Load style presets from server
+    // =========================================================================
+    // LoRA Support
+    // =========================================================================
+
+    async function loadAvailableLoras() {
+        try {
+            const resp = await fetch('/available-loras');
+            const data = await resp.json();
+            availableLoras = data.loras || [];
+            curatedLoras = data.curated || [];
+            rebuildLoraDropdown();
+        } catch (e) {
+            console.error('Failed to load LoRAs:', e);
+        }
+    }
+
+    function rebuildLoraDropdown() {
+        if (!loraSelect) return;
+        const prev = loraSelect.value;
+        loraSelect.innerHTML = '<option value="">None</option>';
+        availableLoras.forEach(lora => {
+            const opt = document.createElement('option');
+            opt.value = lora.filename;
+            opt.textContent = lora.name + (lora.size_mb ? ` (${lora.size_mb} MB)` : '');
+            loraSelect.appendChild(opt);
+        });
+        if (prev && availableLoras.some(l => l.filename === prev)) {
+            loraSelect.value = prev;
+        }
+    }
+
+    function openLoraPanel() {
+        renderLoraPanel();
+        loraPanel.style.display = 'flex';
+        loraPanelBackdrop.style.display = 'block';
+    }
+
+    function closeLoraPanel() {
+        loraPanel.style.display = 'none';
+        loraPanelBackdrop.style.display = 'none';
+    }
+
+    function renderLoraPanel() {
+        if (!loraPanelBody) return;
+        loraPanelBody.innerHTML = '';
+
+        // Curated section
+        if (curatedLoras.length > 0) {
+            const h = document.createElement('div');
+            h.className = 'lora-section-header';
+            h.textContent = 'Klein LoRA Collection';
+            loraPanelBody.appendChild(h);
+
+            curatedLoras.forEach(lora => {
+                const card = document.createElement('div');
+                card.className = 'lora-card';
+                card.dataset.id = lora.id;
+
+                const badges = lora.models.map(m =>
+                    `<span class="lora-badge lora-badge-${m}">${m.toUpperCase()}</span>`
+                ).join('');
+                const trigger = lora.trigger
+                    ? `<span class="lora-trigger" title="Add this word to your prompt">${lora.trigger}</span>`
+                    : '';
+                const dlState = activeDownloads[lora.id];
+                const sourceBadge = lora.source === 'civitai'
+                    ? '<span class="lora-source-badge lora-source-civitai">Civitai</span>'
+                    : '<span class="lora-source-badge lora-source-hf">HuggingFace</span>';
+                const strengthLabel = lora.strength
+                    ? `<span class="lora-trigger" title="Recommended strength">⚡ ${lora.strength}</span>`
+                    : '';
+                let actionHtml;
+                if (dlState && !dlState.done && !dlState.error) {
+                    actionHtml = `<div class="lora-progress-wrap"><div class="lora-progress-bar" style="width:${dlState.percent || 0}%"></div></div>`;
+                } else if (lora.downloaded) {
+                    actionHtml = `<button class="lora-use-btn" data-filename="${lora.filename}">Use</button>`;
+                } else if (lora.source === 'civitai') {
+                    actionHtml = `<button class="lora-dl-btn"
+                        data-id="${lora.id}"
+                        data-source="civitai"
+                        data-civitai-model-id="${lora.civitai_model_id}"
+                        data-civitai-version-filter="${lora.civitai_version_filter || ''}"
+                        data-filename="${lora.filename}">Download</button>`;
+                } else {
+                    actionHtml = `<button class="lora-dl-btn"
+                        data-id="${lora.id}"
+                        data-source="huggingface"
+                        data-repo="${lora.repo}"
+                        data-filename="${lora.filename}">Download</button>`;
+                }
+
+                card.innerHTML = `
+                    <div class="lora-card-main">
+                        <div class="lora-card-info">
+                            <div class="lora-card-name-row">
+                                <span class="lora-card-name">${lora.name}</span>
+                                ${sourceBadge}
+                            </div>
+                            <span class="lora-card-desc">${lora.description}</span>
+                            <div class="lora-card-tags">${badges}${trigger}${strengthLabel}</div>
+                        </div>
+                        <div class="lora-card-action">${actionHtml}</div>
+                    </div>
+                `;
+                loraPanelBody.appendChild(card);
+            });
+        }
+
+        // Local LoRAs not in curated list
+        const localOnly = availableLoras.filter(l =>
+            !curatedLoras.some(c => c.filename === l.filename)
+        );
+        if (localOnly.length > 0) {
+            const h = document.createElement('div');
+            h.className = 'lora-section-header';
+            h.textContent = 'Local LoRAs';
+            loraPanelBody.appendChild(h);
+            localOnly.forEach(lora => {
+                const card = document.createElement('div');
+                card.className = 'lora-card';
+                card.innerHTML = `
+                    <div class="lora-card-main">
+                        <div class="lora-card-info">
+                            <span class="lora-card-name">${lora.name}</span>
+                            <span class="lora-card-desc">${lora.size_mb} MB</span>
+                        </div>
+                        <div class="lora-card-action">
+                            <button class="lora-use-btn" data-filename="${lora.filename}">Use</button>
+                        </div>
+                    </div>
+                `;
+                loraPanelBody.appendChild(card);
+            });
+        }
+
+        if (curatedLoras.length === 0 && localOnly.length === 0) {
+            loraPanelBody.innerHTML = '<p class="lora-empty">No LoRAs found. Click Download to get one.</p>';
+        }
+
+        // Wire up buttons
+        loraPanelBody.querySelectorAll('.lora-dl-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                startLoraDownload(btn.dataset.id, {
+                    source: btn.dataset.source || 'huggingface',
+                    repo: btn.dataset.repo,
+                    filename: btn.dataset.filename,
+                    civitai_model_id: btn.dataset.civitaiModelId ? Number(btn.dataset.civitaiModelId) : undefined,
+                    civitai_version_filter: btn.dataset.civitaiVersionFilter || undefined,
+                });
+            });
+        });
+        loraPanelBody.querySelectorAll('.lora-use-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (loraSelect) {
+                    loraSelect.value = btn.dataset.filename;
+                    loraSelect.dispatchEvent(new Event('change'));
+                }
+                closeLoraPanel();
+            });
+        });
+    }
+
+    async function startLoraDownload(dlId, entry) {
+        activeDownloads[dlId] = { percent: 0, done: false, error: null };
+        renderLoraPanel();
+
+        try {
+            const resp = await fetch('/download-lora', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: dlId,
+                    source: entry.source || 'huggingface',
+                    repo: entry.repo,
+                    filename: entry.filename,
+                    civitai_model_id: entry.civitai_model_id,
+                    civitai_version_filter: entry.civitai_version_filter,
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || data.error) {
+                activeDownloads[dlId].error = data.error || 'Download failed';
+                renderLoraPanel();
+                return;
+            }
+            if (data.already_exists) {
+                delete activeDownloads[dlId];
+                await loadAvailableLoras();
+                renderLoraPanel();
+                return;
+            }
+        } catch (e) {
+            activeDownloads[dlId].error = String(e);
+            renderLoraPanel();
+            return;
+        }
+
+        // Poll progress
+        const interval = setInterval(async () => {
+            try {
+                const pr = await fetch(`/download-lora/progress/${dlId}`);
+                const state = await pr.json();
+                activeDownloads[dlId].percent = state.percent || 0;
+                activeDownloads[dlId].done = state.done || false;
+                activeDownloads[dlId].error = state.error || null;
+
+                // Update progress bar in place without full re-render
+                const card = loraPanelBody ? loraPanelBody.querySelector(`[data-id="${dlId}"]`) : null;
+                if (card) {
+                    const bar = card.querySelector('.lora-progress-bar');
+                    if (bar) bar.style.width = `${state.percent || 0}%`;
+                }
+
+                if (state.done || state.error) {
+                    clearInterval(interval);
+                    delete activeDownloads[dlId];
+                    await loadAvailableLoras();
+                    renderLoraPanel();
+                }
+            } catch (e) {
+                clearInterval(interval);
+            }
+        }, 500);
+    }
+
+    // Vary strength slider live display
+    if (varyStrengthInput && varyStrengthValue) {
+        varyStrengthInput.addEventListener('input', () => {
+            varyStrengthValue.textContent = parseFloat(varyStrengthInput.value).toFixed(2);
+        });
+    }
+
+    // LoRA event listeners
+    if (loraSelect) {
+        loraSelect.addEventListener('change', () => {
+            if (loraScaleGroup) {
+                loraScaleGroup.style.display = loraSelect.value ? 'block' : 'none';
+            }
+        });
+    }
+    if (loraScaleInput && loraScaleValue) {
+        loraScaleInput.addEventListener('input', () => {
+            loraScaleValue.textContent = parseFloat(loraScaleInput.value).toFixed(2);
+        });
+    }
+    if (loraBrowseBtn) loraBrowseBtn.addEventListener('click', openLoraPanel);
+    if (loraPanelClose) loraPanelClose.addEventListener('click', closeLoraPanel);
+    if (loraPanelBackdrop) loraPanelBackdrop.addEventListener('click', closeLoraPanel);
+
     async function loadStylePresets() {
         try {
             const response = await fetch('/style-presets');
@@ -1805,13 +2129,29 @@ document.addEventListener('DOMContentLoaded', () => {
             stylePresetSelect.value = item.style || '';
         }
 
-        // Store for remix
+        // Restore LoRA settings
+        if (loraSelect) {
+            loraSelect.value = item.lora || '';
+            if (loraScaleGroup) {
+                loraScaleGroup.style.display = loraSelect.value ? '' : 'none';
+            }
+        }
+        if (loraScaleInput && item.lora_scale != null) {
+            loraScaleInput.value = item.lora_scale;
+            if (loraScaleValue) loraScaleValue.textContent = Number(item.lora_scale).toFixed(2);
+        }
+
+        // Store for vary/remix
         currentGeneration = {
             prompt: item.prompt,
             width: item.width,
             height: item.height,
             steps: item.steps,
             seed: item.seed,
+            guidance: item.guidance || null,
+            schedule: item.schedule || null,
+            lora: item.lora || null,
+            lora_scale: item.lora_scale || 1.0,
         };
     }
 

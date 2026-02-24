@@ -19,6 +19,7 @@ import queue
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -137,6 +138,157 @@ JOB_CLEANUP_INTERVAL = 300  # Check every 5 minutes
 flux_server = None
 flux_server_lock = threading.Lock()
 
+# Global model dir (set in main(), used by LoRA endpoints)
+model_dir_path = None
+
+# LoRA download progress tracking
+_download_progress = {}  # {dl_id: {percent, done, error}}
+
+# Curated list of Klein-compatible LoRA adapters
+CURATED_LORAS = [
+    # ── HuggingFace ──────────────────────────────────────────────────────────
+    {
+        "id": "fal-outpaint",
+        "name": "Outpaint",
+        "source": "huggingface",
+        "description": "Extends images beyond their borders with natural scene continuation",
+        "repo": "fal/flux-2-klein-4B-outpaint-lora",
+        "filename": "flux-outpaint-lora.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "1.0",
+    },
+    {
+        "id": "fal-zoom",
+        "name": "Zoom",
+        "source": "huggingface",
+        "description": "Zooms into red-highlighted regions and generates an enlarged detailed view",
+        "repo": "fal/flux-2-klein-4B-zoom-lora",
+        "filename": "flux-red-zoom-lora.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "1.0",
+    },
+    {
+        "id": "fal-sprite",
+        "name": "Spritesheet",
+        "source": "huggingface",
+        "description": "Turns a single object into a 2×2 sprite sheet with 4 camera angles",
+        "repo": "fal/flux-2-klein-4b-spritesheet-lora",
+        "filename": "flux-spritesheet-lora.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "1.0",
+    },
+    {
+        "id": "dever-arcane",
+        "name": "Arcane Style",
+        "source": "huggingface",
+        "description": "Painterly Arcane animated-series aesthetic",
+        "repo": "DeverStyle/Flux.2-Klein-Loras",
+        "filename": "arcane_visual_style.safetensors",
+        "models": ["9b"],
+        "trigger": "arcane_visual_style",
+        "strength": "1.0",
+    },
+    {
+        "id": "valiant-ac",
+        "name": "AC Comic Style",
+        "source": "huggingface",
+        "description": "American comic + pop art + cyber neon illustration blend",
+        "repo": "valiantcat/FLUX.2-klein-AC-Style-LORA",
+        "filename": "FLUX.2-Klein-AC-Style.safetensors",
+        "models": ["4b", "9b"],
+        "trigger": None,
+        "strength": "1.0",
+    },
+    # ── Civitai ───────────────────────────────────────────────────────────────
+    {
+        "id": "civitai-hayley",
+        "name": "Hayley (Influencer)",
+        "source": "civitai",
+        "description": "Photoreal influencer character with excellent facial likeness, expressions and casual photography styles. Works on both distilled and base.",
+        "civitai_model_id": 2399494,
+        "civitai_version_filter": None,
+        "filename": "hayley-flux2-klein.safetensors",
+        "models": ["4b"],
+        "trigger": "hayleymodel",
+        "strength": "1.0",
+    },
+    {
+        "id": "civitai-selfies",
+        "name": "Ultra Real Amateur Selfies",
+        "source": "civitai",
+        "description": "Smartphone-style realistic selfies with natural poses and a wide variety of looks.",
+        "civitai_model_id": 2233658,
+        "civitai_version_filter": None,
+        "filename": "ultra-real-selfies-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "1.0–1.25",
+    },
+    {
+        "id": "civitai-mecha",
+        "name": "New Mecha Style",
+        "source": "civitai",
+        "description": "Anime-inspired semi-realistic mecha and detailed digital illustrations. Works great on both base and distilled.",
+        "civitai_model_id": 2227157,
+        "civitai_version_filter": None,
+        "filename": "new-mecha-style-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.8",
+    },
+    {
+        "id": "civitai-photostyle",
+        "name": "Photostyle by Sean Archer",
+        "source": "civitai",
+        "description": "High-end fashion and glamour photography aesthetic. Best on base model.",
+        "civitai_model_id": 1632416,
+        "civitai_version_filter": "klein",
+        "filename": "photostyle-sean-archer-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.7–1.0",
+    },
+    {
+        "id": "civitai-blahaj",
+        "name": "Blahaj Shark",
+        "source": "civitai",
+        "description": "Cute IKEA shark plush / mascot character consistency.",
+        "civitai_model_id": 646253,
+        "civitai_version_filter": "klein4b",
+        "filename": "blahaj-v9-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.7",
+    },
+    {
+        "id": "civitai-quilm",
+        "name": "QuilM Style",
+        "source": "civitai",
+        "description": "Distinctive illustrative art style. Works best on distilled.",
+        "civitai_model_id": 2324191,
+        "civitai_version_filter": None,
+        "filename": "quilm-style-f2-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": "quilm style",
+        "strength": "0.8–1.0",
+    },
+    {
+        "id": "civitai-anatomy",
+        "name": "Anatomy / Quality Fixer",
+        "source": "civitai",
+        "description": "Improves hands, anatomy and overall coherence. Use at low strength for subtle correction.",
+        "civitai_model_id": 2324991,
+        "civitai_version_filter": "4b",
+        "filename": "klein-anatomy-fixer-4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.6–1.0",
+    },
+]
+
 
 def save_history():
     """Save history to JSON file (must be called with history_lock held)."""
@@ -204,6 +356,8 @@ def load_history_from_disk():
             job.generation_time = item.get("generation_time")
             job.batch_id = item.get("batch_id")
             job.style = item.get("style")
+            job.lora = item.get("lora")
+            job.lora_scale = item.get("lora_scale", 1.0)
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -237,6 +391,8 @@ class Job:
         self.generation_time = None
         self.batch_id = None
         self.style = None
+        self.lora = None        # LoRA filename (relative, inside loras/ dir)
+        self.lora_scale = 1.0
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -282,6 +438,8 @@ class Job:
             "generation_time": self.generation_time,
             "batch_id": self.batch_id,
             "style": self.style,
+            "lora": self.lora,
+            "lora_scale": self.lora_scale,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -516,7 +674,7 @@ class FluxServer:
             except Exception as e:
                 print(f"Failed to restart flux server: {e}")
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -556,6 +714,14 @@ class FluxServer:
             elif input_image_path:
                 # Backwards compatibility: single image mode
                 request_data["input_image"] = str(input_image_path)
+
+            if lora_name and model_dir_path:
+                lora_full_path = model_dir_path / "loras" / lora_name
+                request_data["lora"] = str(lora_full_path)
+                request_data["lora_scale"] = float(lora_scale)
+
+            if img2img_strength and float(img2img_strength) < 1.0:
+                request_data["img2img_strength"] = float(img2img_strength)
 
             # Send request
             request_line = json.dumps(request_data) + "\n"
@@ -617,6 +783,9 @@ def process_job_queue():
             queued['show_steps'],
             queued.get('guidance'),
             queued.get('schedule'),
+            queued.get('lora_name'),
+            queued.get('lora_scale', 1.0),
+            queued.get('img2img_strength', 1.0),
         )
     except Exception as e:
         job.status = "error"
@@ -628,7 +797,7 @@ def process_job_queue():
         process_job_queue()
 
 
-def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
+def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
     """Queue a generation job. Starts immediately if server is free, otherwise queues."""
     global flux_server
 
@@ -644,6 +813,9 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         'show_steps': show_steps,
         'guidance': guidance,
         'schedule': schedule,
+        'lora_name': lora_name,
+        'lora_scale': lora_scale,
+        'img2img_strength': img2img_strength,
     }
 
     with job_queue_lock:
@@ -661,7 +833,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -670,9 +842,9 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         job.cleanup_temp_files()
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
     """Run generation using the persistent flux server (legacy, now uses queue)."""
-    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule)
+    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
 
 
 @app.route("/")
@@ -705,6 +877,9 @@ def generate():
     guidance = data.get("guidance")  # None = auto (1.0 distilled, 4.0 base)
     schedule = data.get("schedule")  # "sigmoid" (default), "linear", "power"
     batch_id = data.get("batch_id")  # Groups variation batches
+    lora_name = data.get("lora") or None       # LoRA filename (relative, inside loras/ dir)
+    lora_scale = float(data.get("lora_scale", 1.0))
+    img2img_strength = float(data.get("img2img_strength", 1.0))
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -772,6 +947,8 @@ def generate():
     job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
     job.batch_id = batch_id
     job.style = style if (style and style in STYLE_PRESETS) else None
+    job.lora = lora_name
+    job.lora_scale = lora_scale
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:
@@ -785,7 +962,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule),
+        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength),
         daemon=True,
     )
     thread.start()
@@ -1379,6 +1556,134 @@ def enhance_prompt():
     })
 
 
+@app.route("/available-loras")
+def available_loras():
+    """List LoRA adapters available in the model's loras/ directory, plus the curated registry."""
+    loras = []
+    if model_dir_path:
+        lora_dir = model_dir_path / "loras"
+        if lora_dir.exists():
+            for f in sorted(lora_dir.glob("*.safetensors")):
+                size_mb = round(f.stat().st_size / 1_048_576, 1)
+                loras.append({"name": f.stem, "filename": f.name, "size_mb": size_mb})
+
+    # Annotate curated list with downloaded state
+    downloaded_filenames = {item["filename"] for item in loras}
+    curated = [
+        {**entry, "downloaded": entry["filename"] in downloaded_filenames}
+        for entry in CURATED_LORAS
+    ]
+
+    return jsonify({"loras": loras, "curated": curated})
+
+
+def _do_download(dl_id, url, dest, extra_headers=None):
+    """Background thread: download a file from url to dest, tracking progress."""
+    try:
+        headers = {"User-Agent": "flux2.c/1.0"}
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        _download_progress[dl_id]["percent"] = int(downloaded * 100 / total)
+        _download_progress[dl_id]["done"] = True
+        _download_progress[dl_id]["percent"] = 100
+    except Exception as e:
+        _download_progress[dl_id]["error"] = str(e)
+        # Remove partial file on error
+        try:
+            if dest.exists():
+                dest.unlink()
+        except Exception:
+            pass
+
+
+@app.route("/download-lora", methods=["POST"])
+def download_lora():
+    """Start downloading a LoRA (HuggingFace or Civitai) to the model's loras/ directory."""
+    data = request.json or {}
+    dl_id = data.get("id", "").strip()
+    source = data.get("source", "huggingface")
+    filename = data.get("filename", "").strip()
+
+    if not dl_id or not filename:
+        return jsonify({"error": "id and filename are required"}), 400
+
+    # Basic path safety: filename must be a plain filename with no slashes
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return jsonify({"error": "Invalid filename"}), 400
+
+    if not model_dir_path:
+        return jsonify({"error": "Model directory not configured"}), 500
+
+    lora_dir = model_dir_path / "loras"
+    lora_dir.mkdir(exist_ok=True)
+    dest = lora_dir / filename
+
+    if dest.exists():
+        return jsonify({"ok": True, "already_exists": True})
+
+    extra_headers = {}
+    civitai_token = os.environ.get("CIVITAI_TOKEN")
+
+    if source == "civitai":
+        civitai_model_id = data.get("civitai_model_id")
+        version_filter = (data.get("civitai_version_filter") or "").strip().lower()
+        if not civitai_model_id:
+            return jsonify({"error": "civitai_model_id required for civitai source"}), 400
+        try:
+            api_url = f"https://civitai.com/api/v1/models/{civitai_model_id}"
+            api_headers = {"User-Agent": "flux2.c/1.0"}
+            if civitai_token:
+                api_headers["Authorization"] = f"Bearer {civitai_token}"
+            api_req = urllib.request.Request(api_url, headers=api_headers)
+            with urllib.request.urlopen(api_req, timeout=15) as resp:
+                model_data = json.loads(resp.read())
+            versions = model_data.get("modelVersions", [])
+            if not versions:
+                return jsonify({"error": "No versions found for this Civitai model"}), 400
+            if version_filter:
+                matching = [v for v in versions if version_filter in v.get("name", "").lower()]
+                version = matching[0] if matching else versions[0]
+            else:
+                version = versions[0]
+            url = f"https://civitai.com/api/download/models/{version['id']}"
+            if civitai_token:
+                extra_headers["Authorization"] = f"Bearer {civitai_token}"
+        except Exception as e:
+            return jsonify({"error": f"Failed to resolve Civitai model: {e}"}), 500
+    else:
+        repo = data.get("repo", "").strip()
+        if not repo:
+            return jsonify({"error": "repo is required for huggingface source"}), 400
+        url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+
+    _download_progress[dl_id] = {"percent": 0, "done": False, "error": None}
+    threading.Thread(
+        target=_do_download, args=(dl_id, url, dest), kwargs={"extra_headers": extra_headers}, daemon=True
+    ).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/download-lora/progress/<dl_id>")
+def download_lora_progress(dl_id):
+    """Poll download progress for a given download id."""
+    state = _download_progress.get(dl_id)
+    if state is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    return jsonify(state)
+
+
 @app.route("/cancel/<job_id>", methods=["POST"])
 def cancel_job(job_id):
     """Cancel a running or queued job."""
@@ -1437,7 +1742,7 @@ def cancel_job(job_id):
 
 
 def main():
-    global flux_server
+    global flux_server, model_dir_path
 
     parser = argparse.ArgumentParser(description="FLUX.2 Web UI Server")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
@@ -1458,6 +1763,8 @@ def main():
         print(f"Error: Model directory not found at {args.model_dir}")
         print("Download it first with: ./download_model.sh")
         return 1
+
+    model_dir_path = args.model_dir
 
     # Ensure output directory exists
     OUTPUT_DIR.mkdir(exist_ok=True)
