@@ -2810,6 +2810,13 @@ int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
         id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
         if (!bufScores) return 0;
 
+        /* Zero the scores buffer before use. Pool buffers may be reused from a
+         * previous operation that wrote f32 data; those bytes interpreted as f16
+         * can have NaN bit patterns. MPS MPSMatrixMultiplication with beta=0.0f
+         * still evaluates beta*C_old (i.e. 0*NaN=NaN), so the output would inherit
+         * NaN from the stale buffer. Zeroing ensures a clean starting point. */
+        memset([bufScores contents], 0, scores_size);
+
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
 
         /* === Phase 1: Q @ K^T for each head === */

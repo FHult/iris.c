@@ -3868,12 +3868,11 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             }
 #ifdef USE_METAL
             /* Try GPU-optimized path first */
-            int sblk_gpu = single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+            if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
                                           txt_rope_cos, txt_rope_sin,
-                                          total_seq, txt_seq, tf);
-            if (!sblk_gpu)
+                                          total_seq, txt_seq, tf))
 #endif
             {
                 /* Fall back to CPU path */
