@@ -696,7 +696,11 @@ static void free_token_list(token_node_t *head) {
     }
 }
 
-/* Apply BPE to a single word (already in byte-level encoding) */
+/* Core BPE (Byte-Pair Encoding) algorithm. Starts with character-level
+ * tokens, then iteratively merges the adjacent pair with the lowest rank
+ * (highest priority) until no more merges apply. The merge ranks come from
+ * the tokenizer's trained vocabulary. This produces the subword tokenization
+ * that Qwen3 expects as input. */
 static token_node_t *bpe_encode_word(qwen3_tokenizer_t *tok, const char *word) {
     int len = strlen(word);
     if (len == 0) return NULL;
@@ -938,12 +942,13 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
     return tokens;
 }
 
-/*
- * Apply chat template and tokenize.
- * Format: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
- */
+/* Apply the Qwen3 chat template and tokenize the result. Template:
+ * <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+ * For Flux, also appends <think>\n\n</think>\n\n to match the training
+ * template that triggers direct generation. For Z-Image the think tags
+ * are skipped (controlled by skip_think_tags). */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
-                         int *num_tokens, int max_len) {
+                         int *num_tokens, int max_len, int skip_think_tags) {
     if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
 
     int capacity = 256;
@@ -1015,41 +1020,43 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     }
     free(asst_tokens);
 
-    /* <think>\n\n</think>\n\n */
-    if (total < max_len) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+    /* <think>\n\n</think>\n\n — only for Flux, not Z-Image. */
+    if (!skip_think_tags) {
+        if (total < max_len) {
+            if (total >= capacity) {
+                capacity *= 2;
+                tokens = realloc(tokens, capacity * sizeof(int));
+            }
+            tokens[total++] = QWEN3_THINK_START_ID;
         }
-        tokens[total++] = QWEN3_THINK_START_ID;
-    }
-    int *think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
-    for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+        int *think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
+        for (int i = 0; i < n && total < max_len; i++) {
+            if (total >= capacity) {
+                capacity *= 2;
+                tokens = realloc(tokens, capacity * sizeof(int));
+            }
+            tokens[total++] = think_newlines[i];
         }
-        tokens[total++] = think_newlines[i];
-    }
-    free(think_newlines);
+        free(think_newlines);
 
-    if (total < max_len) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+        if (total < max_len) {
+            if (total >= capacity) {
+                capacity *= 2;
+                tokens = realloc(tokens, capacity * sizeof(int));
+            }
+            tokens[total++] = QWEN3_THINK_END_ID;
         }
-        tokens[total++] = QWEN3_THINK_END_ID;
-    }
 
-    think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
-    for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+        think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
+        for (int i = 0; i < n && total < max_len; i++) {
+            if (total >= capacity) {
+                capacity *= 2;
+                tokens = realloc(tokens, capacity * sizeof(int));
+            }
+            tokens[total++] = think_newlines[i];
         }
-        tokens[total++] = think_newlines[i];
+        free(think_newlines);
     }
-    free(think_newlines);
 
     *num_tokens = total;
     return tokens;

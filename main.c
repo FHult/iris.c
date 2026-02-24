@@ -685,8 +685,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Generation options:\n");
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
-    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)\n");
-    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)\n");
+    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)\n");
+    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
     fprintf(stderr, "      --linear          Use linear timestep schedule (default: shifted sigmoid)\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
@@ -980,10 +980,16 @@ int main(int argc, char *argv[]) {
 
     /* Resolve auto-parameters now that we know the model type */
     if (!steps_set || params.num_steps <= 0) {
-        params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
+        if (flux_is_zimage(ctx))
+            params.num_steps = 9;  /* Z-Image-Turbo: 9 scheduler steps (8 NFE) */
+        else
+            params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
     }
     if (params.guidance <= 0) {
-        params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
+        if (flux_is_zimage(ctx))
+            params.guidance = 0.0f;
+        else
+            params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
     }
 
     double load_time = timer_end();

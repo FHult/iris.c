@@ -521,7 +521,10 @@ static uint16_t *mmap_get_bf16(safetensors_file_t **files, int num_files, const 
     return NULL;
 }
 
-/* Load weights for a single double_block on-demand */
+/* Load one double block's weights from safetensors files. In mmap mode,
+ * returns direct pointers into the memory-mapped file (zero-copy). For the
+ * bf16 GPU path, also returns direct bf16 pointers from the safetensors data.
+ * The fused FFN weight layout packs gate and up projections into linear_in. */
 static int load_double_block_weights(double_block_t *b, safetensors_file_t **files,
                                      int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
@@ -663,7 +666,10 @@ static void free_double_block_weights(double_block_t *b) {
     b->txt_mlp_down_weight_bf16 = NULL;
 }
 
-/* Load weights for a single single_block on-demand */
+/* Load one single block's weights from safetensors files, same zero-copy mmap
+ * strategy as double blocks. The fused qkv_mlp projection packs [Q, K, V,
+ * gate, up] into one weight matrix, enabling a single large matmul instead
+ * of five separate ones during inference. */
 static int load_single_block_weights(single_block_t *b, safetensors_file_t **files,
                                      int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
@@ -805,14 +811,12 @@ static void compute_rope_freqs(float *freqs, int max_seq, int dim, float theta) 
     }
 }
 
-/* Compute 2D RoPE frequencies for image tokens (h, w positions)
- * FLUX uses axes_dims_rope: [32, 32, 32, 32] = 128 total
- * Position IDs format: (T, H, W, L) where:
- * - Axis 0 (dims 0-31): T position (always 0 for images)
- * - Axis 1 (dims 32-63): H position (y/height coordinate)
- * - Axis 2 (dims 64-95): W position (x/width coordinate)
- * - Axis 3 (dims 96-127): L position (always 0 for images)
- */
+/* Build 4-axis RoPE frequency tables for image tokens on a (patch_h x patch_w) grid.
+ * Axes are T (temporal), H (height), W (width), L (sequence), each with axes_dim/2
+ * frequency pairs. Image tokens use H and W for spatial position encoding so the
+ * transformer knows where each image patch is; T and L are set to identity (cos=1,
+ * sin=0). The 2D grid positions let joint attention distinguish spatial layout,
+ * which is critical for coherent image generation. */
 static void compute_rope_2d(float *cos_out, float *sin_out,
                             int patch_h, int patch_w, int axis_dim, float theta) {
     int half_axis = axis_dim / 2;  /* 16 dims per half-axis */
@@ -936,11 +940,12 @@ static void compute_rope_2d_with_t_offset(float *cos_out, float *sin_out,
     }
 }
 
-/* Apply 2D RoPE to image Q/K: x shape [seq, heads * head_dim]
- * Matches diffusers apply_rotary_emb with use_real=True, use_real_unbind_dim=-1
- * For each pair (i, i+1): out[i] = x[i]*cos - x[i+1]*sin, out[i+1] = x[i+1]*cos + x[i]*sin
- * cos/sin have 128 dims per position (4 axes * 32 dims)
- */
+/* Apply precomputed RoPE rotation to Q or K tensors in-place.
+ * Uses consecutive-pair rotation: for each pair (x0, x1), computes
+ * (x0*cos - x1*sin, x1*cos + x0*sin). This is equivalent to complex
+ * multiplication (x0+i*x1) * (cos+i*sin), encoding positional information
+ * directly into the attention logits so that attention scores are
+ * position-aware without explicit position tokens. */
 static void apply_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                           int seq, int heads, int head_dim, int axis_dim) {
     (void)axis_dim;  /* head_dim = 128 = 4 * axis_dim (axis_dim = 32) */
@@ -965,10 +970,11 @@ static void apply_rope_2d(float *x, const float *cos_freq, const float *sin_freq
     }
 }
 
-/* Compute text RoPE frequencies for axis 3 (L dimension)
- * Text tokens have position IDs (T=0, H=0, W=0, L=seq_idx) where L = 0..seq-1
- * So axes 0-2 are identity, and axis 3 has the sequence position
- */
+/* Build RoPE for text tokens. Only axis 3 (L = sequence position) is active;
+ * axes 0-2 (T, H, W) are identity. Text tokens encode sequential order but
+ * have no spatial structure, matching their 1D nature. In joint attention,
+ * image and text tokens share the same head_dim but use orthogonal RoPE axes,
+ * so their positional encodings don't interfere with each other. */
 static void compute_rope_text(float *cos_out, float *sin_out,
                               int txt_seq, int axis_dim, float theta) {
     int half_axis = axis_dim / 2;  /* 16 */
@@ -1157,11 +1163,11 @@ static void get_cached_combined_rope(flux_transformer_t *tf,
  * Timestep Embedding
  * ======================================================================== */
 
-/* Sinusoidal timestep embedding
- * Matches diffusers get_timestep_embedding with:
- *   flip_sin_to_cos=True, downscale_freq_shift=0
- * Output format: [cos(all freqs), sin(all freqs)]
- */
+/* Convert scalar timestep t to a 256-dim sinusoidal embedding using log-spaced
+ * frequencies (like positional encoding in the original Transformer paper).
+ * Output layout is [cos(all freqs), sin(all freqs)] (flip_sin_to_cos=True).
+ * The diffusion model conditions on this to know what noise level it's
+ * denoising at the current step. */
 static void get_timestep_embedding(float *out, float t, int dim, float max_period) {
     int half = dim / 2;
     float log_max = logf(max_period);
@@ -1175,9 +1181,10 @@ static void get_timestep_embedding(float *out, float t, int dim, float max_perio
     }
 }
 
-/* Forward through time embedding MLP
- * work: pre-allocated buffer of size hidden for intermediate result
- */
+/* Project the 256-dim sinusoidal embedding through an MLP:
+ * Linear(256->hidden) + SiLU + Linear(hidden->hidden). The output drives
+ * AdaLN modulation in every transformer block -- this is how the model knows
+ * which denoising step it's on and adjusts its behavior accordingly. */
 static void time_embed_forward(float *out, const float *t_sincos,
                                const time_embed_t *te, int hidden, float *work) {
     /* MLP: fc1 (256->hidden) -> SiLU -> fc2 (hidden->hidden) */
@@ -1197,10 +1204,12 @@ static void time_embed_forward(float *out, const float *t_sincos,
  * AdaLN-Zero Modulation
  * ======================================================================== */
 
-/* Apply AdaLN: out = (1 + scale) * LayerNorm(x) + shift
- * This is the standard DiT/FLUX formulation where scale is centered at 0
- * FLUX2 uses LayerNorm (not RMSNorm) with elementwise_affine=False before modulation
- */
+/* Adaptive Layer Normalization: out = (1 + scale) * LayerNorm(x) + shift.
+ * The shift and scale come from the timestep embedding, letting each denoising
+ * step modulate the normalization differently. This is the key mechanism for
+ * timestep conditioning in the transformer -- without it, every step would
+ * produce the same output. Scale is centered at 0 (so (1+scale) starts near 1).
+ * Uses LayerNorm (not RMSNorm) with elementwise_affine=False. */
 static void apply_adaln(float *out, const float *x,
                         const float *shift, const float *scale,
                         int seq, int hidden, float eps) {
@@ -2111,11 +2120,13 @@ static void swiglu_ffn_bf16(float *out, const float *x,
  * Double-Stream Block (MM-DiT)
  * ======================================================================== */
 
-/* Double block forward pass.
- * img_mod and txt_mod contain pre-computed modulation parameters
- * (shift1, scale1, gate1, shift2, scale2, gate2 for each stream).
- * These are computed once per step and reused for all 5 double blocks.
- */
+/* One MM-DiT (Multi-Modal DiT) double block. Processes image and text as
+ * separate streams with their own Q/K/V projections, but performs joint
+ * attention (K and V are concatenated from both streams so each modality
+ * attends to the other). Each stream gets its own AdaLN modulation with
+ * 6 parameters: shift1, scale1, gate1 (pre-attention), shift2, scale2,
+ * gate2 (pre-FFN). The gating mechanism controls information flow from
+ * the attention and FFN residual paths. */
 static void double_block_forward(float *img_hidden, float *txt_hidden,
                                  const double_block_t *block,
                                  const float *img_mod, const float *txt_mod,
@@ -3044,21 +3055,12 @@ cleanup:
     return 0;
 }
 
-/* BF16 GPU-accelerated transformer forward pass.
- *
- * Parameters:
- *   img_transposed - Image tokens in NLC format (may include reference tokens for img2img)
- *   img_seq        - Total image sequence length (target + reference for img2img)
- *   extract_seq    - Number of tokens to extract for output (target only for img2img)
- *   txt_emb        - Text embeddings
- *   txt_seq        - Text sequence length
- *   t_emb          - Timestep embedding
- *   img_rope_*     - RoPE embeddings for image (includes reference RoPE for img2img)
- *   txt_rope_*     - RoPE embeddings for text
- *
- * For text-to-image: img_seq == extract_seq (all image tokens are output)
- * For img2img: img_seq > extract_seq (only target tokens are output)
- */
+/* GPU-accelerated forward pass using bf16 precision on Metal.
+ * Key optimization: runs ALL blocks (double + single) inside a single Metal
+ * command buffer batch, eliminating GPU sync points between blocks. Pre-computes
+ * per-step modulation vectors (shift/scale/gate) for all blocks in one pass
+ * before entering the block loop. For img2img, img_seq includes reference
+ * tokens but only extract_seq target tokens are returned as output. */
 static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                             const float *img_transposed, int img_seq,
                                             int extract_seq,
@@ -3361,6 +3363,13 @@ cleanup:
 }
 #endif /* USE_METAL */
 
+/* Single-stream DiT block operating on concatenated [text, image] tokens.
+ * Unlike double blocks, text and image share the same self-attention and are
+ * processed as one sequence. Uses a fused projection that outputs [Q, K, V,
+ * gate, up] in one matmul for efficiency. Text and image portions get
+ * different RoPE (text: axis 3, image: axes 1,2). After attention, the SwiGLU
+ * MLP output is concatenated with the attention output before the output
+ * projection -- this parallel attention+MLP design saves a serial step. */
 static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
                                  const float *img_rope_cos, const float *img_rope_sin,
@@ -3516,6 +3525,11 @@ static void single_block_forward(float *hidden, const single_block_t *block,
  * Full Transformer Forward Pass
  * ======================================================================== */
 
+/* Top-level transformer entry point for one denoising step. Transposes input
+ * from NCHW to NLC layout, computes timestep embedding, then runs double
+ * blocks (joint img/txt attention) followed by single blocks (fused stream).
+ * Routes to the GPU bf16 path when Metal is available. RoPE tables are cached
+ * across calls since they only depend on image dimensions (not timestep). */
 float *flux_transformer_forward(flux_transformer_t *tf,
                                 const float *img_latent, int img_h, int img_w,
                                 const float *txt_emb, int txt_seq,

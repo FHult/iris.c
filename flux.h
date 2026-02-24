@@ -30,10 +30,10 @@ extern "C" {
  * ======================================================================== */
 
 /* Model architecture constants (same across model sizes) */
-#define FLUX_LATENT_CHANNELS    128
+#define FLUX_LATENT_CHANNELS    128  /* Flux: 32*2*2, Z-Image: 16*2*2=64 */
 
 /* VAE architecture */
-#define FLUX_VAE_Z_CHANNELS     32
+#define FLUX_VAE_Z_CHANNELS     32   /* Flux default; Z-Image uses 16 */
 #define FLUX_VAE_BASE_CH        128
 #define FLUX_VAE_CH_MULT_0      1
 #define FLUX_VAE_CH_MULT_1      2
@@ -135,7 +135,7 @@ int flux_is_distilled(flux_ctx *ctx);
 
 /*
  * Load a LoRA adapter from a safetensors file.
- * Supports XLabs, Kohya, and Diffusers formats (auto-detected).
+ * Supports XLabs, Kohya, Diffusers, and BFL formats (auto-detected).
  * scale: LoRA strength (0.0=no effect, 1.0=full, 2.0=amplified).
  * Replaces any previously loaded LoRA.
  * Returns 0 on success, -1 on error.
@@ -147,6 +147,12 @@ int flux_load_lora(flux_ctx *ctx, const char *path, float scale);
  * Unload the current LoRA adapter and resume normal (GPU-accelerated) inference.
  */
 void flux_unload_lora(flux_ctx *ctx);
+
+/*
+ * Check if model is Z-Image (S3-DiT architecture).
+ * Returns 1 for Z-Image, 0 for Flux.
+ */
+int flux_is_zimage(flux_ctx *ctx);
 
 /*
  * Force base model mode (overrides autodetection).

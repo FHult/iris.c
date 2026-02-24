@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -67,6 +68,53 @@ FULL_TESTS = [
                         "output is 1024x1024",
     },
 ]
+
+# Optional Z-Image smoke test.
+# This runs only if a Z-Image model directory is auto-detected (or provided).
+ZIMAGE_SMOKE_TEST = {
+    "name": "Z-Image smoke test (2 steps, 256x256)",
+    "prompt": "A simple geometric logo",
+    "seed": 7,
+    "steps": 2,
+    "width": 256,
+    "height": 256,
+}
+
+
+def is_zimage_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a Z-Image model directory."""
+    if not model_dir.is_dir():
+        return False
+
+    model_index = model_dir / "model_index.json"
+    if not model_index.exists():
+        return False
+
+    try:
+        text = model_index.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+    return ("ZImagePipeline" in text) or ("Z-Image" in text)
+
+
+def detect_zimage_model_dir(explicit_dir: Optional[str]) -> Optional[Path]:
+    """Find a Z-Image model directory."""
+    if explicit_dir:
+        p = Path(explicit_dir)
+        return p if is_zimage_model_dir(p) else None
+
+    # Common local names first.
+    for p in (Path("zimage-turbo"), Path("zimage"), Path("Z-Image-Turbo")):
+        if is_zimage_model_dir(p):
+            return p
+
+    # Fallback: scan direct subdirectories.
+    for p in sorted(Path(".").iterdir()):
+        if p.is_dir() and is_zimage_model_dir(p):
+            return p
+
+    return None
 
 
 def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
@@ -145,6 +193,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run FLUX inference tests")
     parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
     parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
+    parser.add_argument("--zimage-model-dir", default=None,
+                        help="Optional Z-Image model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -156,16 +206,29 @@ def main():
         tests_to_run = list(TESTS)
     full_tests_to_run = list(FULL_TESTS) if args.full else []
 
-    total = len(tests_to_run) + len(full_tests_to_run)
+    # Optional zImage coverage: run only in non-quick mode.
+    scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
+    zimage_dir = detect_zimage_model_dir(args.zimage_model_dir)
+    if not args.quick:
+        if zimage_dir:
+            print(f"Detected Z-Image model dir: {zimage_dir}")
+            scheduled_tests.append((ZIMAGE_SMOKE_TEST, str(zimage_dir)))
+        elif args.zimage_model_dir:
+            print(f"Warning: --zimage-model-dir '{args.zimage_model_dir}' is not a valid Z-Image model dir")
+            print("Skipping optional Z-Image smoke test.")
+        else:
+            print("No Z-Image model dir detected; skipping optional Z-Image smoke test.")
+
+    total = len(scheduled_tests) + len(full_tests_to_run)
     print(f"Running {total} test(s)...\n")
 
     passed = 0
     failed = 0
     visual_checks = []
 
-    for i, test in enumerate(tests_to_run, 1):
+    for i, (test, model_dir) in enumerate(scheduled_tests, 1):
         print(f"[{i}/{total}] {test['name']}...")
-        ok, msg = run_test(args.flux_binary, test, args.model_dir)
+        ok, msg = run_test(args.flux_binary, test, model_dir)
 
         if ok:
             print(f"    PASS: {msg}")
@@ -174,7 +237,7 @@ def main():
             print(f"    FAIL: {msg}")
             failed += 1
 
-    for j, test in enumerate(full_tests_to_run, len(tests_to_run) + 1):
+    for j, test in enumerate(full_tests_to_run, len(scheduled_tests) + 1):
         print(f"[{j}/{total}] {test['name']}...")
 
         # Step 1: Generate a reference image to use as img2img input.

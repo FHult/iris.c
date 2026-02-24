@@ -535,6 +535,26 @@ void flux_metal_reset(void) {
     }
 }
 
+void flux_metal_reset_transient(void) {
+    if (!g_initialized) return;
+
+    @autoreleasepool {
+        /* Drain in-flight work and close any open batch/chain scopes. */
+        flux_gpu_sync();
+        flux_gpu_batch_end();
+        flux_gpu_chain_end();
+
+        /* Drop transient execution state, but keep model/weight caches hot. */
+        clear_rope_cache();
+        clear_activation_pool();
+
+        pthread_mutex_lock(&g_cache_mutex);
+        g_batch_input_count = 0;
+        pthread_mutex_unlock(&g_cache_mutex);
+        g_pending_count = 0;
+    }
+}
+
 /* Debug: Clear only specific caches (for isolating issues) */
 void flux_metal_clear_weight_cache_only(void) {
     if (!g_initialized) return;
@@ -614,13 +634,14 @@ int flux_metal_in_batch(void) {
  * Optimized Matrix Multiplication
  * ======================================================================== */
 
-void flux_metal_sgemm(int transpose_a, int transpose_b,
-                      int M, int N, int K,
-                      float alpha,
-                      const float *A, int lda,
-                      const float *B, int ldb,
-                      float beta,
-                      float *C, int ldc) {
+static void flux_metal_sgemm_impl(int transpose_a, int transpose_b,
+                                  int M, int N, int K,
+                                  float alpha,
+                                  const float *A, int lda,
+                                  const float *B, int ldb,
+                                  float beta,
+                                  float *C, int ldc,
+                                  int cache_B) {
     if (!g_initialized) return;
 
     @autoreleasepool {
@@ -634,11 +655,30 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
         size_t sizeB = (size_t)rowsB * ldb * sizeof(float);
         size_t sizeC = (size_t)M * ldc * sizeof(float);
 
-        /* Get or create buffers
-         * - B (weights) uses cache (likely reused across calls)
-         * - A (input) and C (output) use pooled buffers to avoid allocation overhead
-         */
-        id<MTLBuffer> bufferB = get_cached_weight_buffer(B, sizeB);
+        /* Get or create buffers.
+         * A (input) and C (output) use pooled buffers.
+         * B uses the cache only when explicitly requested (static weights).
+         *
+         * Why this split exists:
+         * We observed intermittent zImage decode corruption (hue shift + border)
+         * in long-lived sessions. Root cause was pointer-based B caching in the
+         * generic SGEMM path: dynamic matrices (for example VAE attention K/V)
+         * can be reallocated at the same CPU address, so stale cached GPU data
+         * was reused. The generic path must not cache B by pointer. */
+        id<MTLBuffer> bufferB = nil;
+        if (cache_B) {
+            /* Static immutable weights: safe to cache by pointer. */
+            bufferB = get_cached_weight_buffer(B, sizeB);
+        } else if (g_in_batch) {
+            /* Dynamic B in batch mode: keep data alive via pool, not pointer cache. */
+            bufferB = pool_get_buffer(sizeB);
+            if (bufferB) memcpy([bufferB contents], B, sizeB);
+        } else {
+            /* Dynamic B outside batch: one-shot upload, no pointer-based cache. */
+            bufferB = [g_device newBufferWithBytes:B
+                                            length:sizeB
+                                           options:MTLResourceStorageModeShared];
+        }
 
         /* Use cached input buffer if in batch mode, otherwise allocate fresh */
         id<MTLBuffer> bufferA = nil;
@@ -743,6 +783,40 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
             pool_release_buffer(bufferC);
         }
     }
+}
+
+void flux_metal_sgemm(int transpose_a, int transpose_b,
+                      int M, int N, int K,
+                      float alpha,
+                      const float *A, int lda,
+                      const float *B, int ldb,
+                      float beta,
+                      float *C, int ldc) {
+    flux_metal_sgemm_impl(transpose_a, transpose_b,
+                          M, N, K,
+                          alpha,
+                          A, lda,
+                          B, ldb,
+                          beta,
+                          C, ldc,
+                          0);
+}
+
+void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
+                             int M, int N, int K,
+                             float alpha,
+                             const float *A, int lda,
+                             const float *B, int ldb,
+                             float beta,
+                             float *C, int ldc) {
+    flux_metal_sgemm_impl(transpose_a, transpose_b,
+                          M, N, K,
+                          alpha,
+                          A, lda,
+                          B, ldb,
+                          beta,
+                          C, ldc,
+                          1);
 }
 
 /* Convert f32 to f16 for MPS matmuls */
@@ -1436,6 +1510,17 @@ void flux_metal_sync(void) {
      * - flux_metal_end_batch() for batch operations (g_batch_cmd)
      * - flux_gpu_chain_end() for chain operations (g_chain_cmd)
      * These are called explicitly where needed (e.g., at end of transformer forward). */
+}
+
+void flux_metal_wait_idle(void) {
+    if (!g_initialized || !g_queue) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        if (!cmdBuffer) return;
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
 }
 
 size_t flux_metal_memory_used(void) {
@@ -2417,7 +2502,9 @@ void flux_gpu_batch_end(void) {
 
     @autoreleasepool {
         if (g_tensor_cmd) {
-            [g_tensor_cmd commit];
+            if (g_tensor_cmd.status < MTLCommandBufferStatusCommitted) {
+                [g_tensor_cmd commit];
+            }
             [g_tensor_cmd waitUntilCompleted];
             g_tensor_cmd = nil;
         }
@@ -2463,7 +2550,12 @@ static id<MTLCommandBuffer> get_tensor_cmd(void) {
     if (g_chain_mode && g_chain_cmd) {
         return g_chain_cmd;
     }
-    if (g_tensor_batch_mode && g_tensor_cmd) {
+    if (g_tensor_batch_mode) {
+        /* MPSGraph may commit our buffer internally. Detect and replace. */
+        if (g_tensor_cmd && g_tensor_cmd.status < MTLCommandBufferStatusCommitted) {
+            return g_tensor_cmd;
+        }
+        g_tensor_cmd = [g_queue commandBuffer];
         return g_tensor_cmd;
     }
     return [g_queue commandBuffer];
@@ -3887,6 +3979,49 @@ void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
     }
 }
 
+/* GPU tensor version of f32 RMSNorm: out = rms_norm(x) * weight
+ * Uses pool buffers (not weight cache) because callers may pass temporary
+ * fused weights that change per block/step. */
+void flux_gpu_rms_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                            const float *weight, int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_rms_norm_pipeline || !out || !x) return;
+
+    @autoreleasepool {
+        size_t weight_size = (size_t)hidden * sizeof(float);
+        id<MTLBuffer> bufWeight = pool_get_buffer(weight_size);
+        if (!bufWeight) return;
+        memcpy([bufWeight contents], weight, weight_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_rms_norm_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufWeight offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:3];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:4];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufWeight);
+    }
+}
+
 /* GPU tensor version of RoPE 2D */
 void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim) {
@@ -4026,6 +4161,71 @@ void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
         pool_release_buffer(bufImgCos);
         pool_release_buffer(bufImgSin);
     }
+}
+
+static void encode_rope_single_f32(id<MTLCommandBuffer> cmdBuffer,
+                                   flux_gpu_tensor_t x,
+                                   id<MTLBuffer> bufCos, id<MTLBuffer> bufSin,
+                                   int seq, int heads, int head_dim) {
+    if (!x) return;
+
+    int img_offset = 0;
+    int axis_dim = head_dim; /* unused by unified shader but required */
+
+    id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:g_rope_unified_pipeline];
+    [encoder setBuffer:x->buffer offset:0 atIndex:0];
+    [encoder setBuffer:bufCos offset:0 atIndex:1];  /* txt_cos (unused) */
+    [encoder setBuffer:bufSin offset:0 atIndex:2];  /* txt_sin (unused) */
+    [encoder setBuffer:bufCos offset:0 atIndex:3];  /* img_cos = our table */
+    [encoder setBuffer:bufSin offset:0 atIndex:4];  /* img_sin = our table */
+    [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+    [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+    [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+    [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+    [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+    [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+       threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+    [encoder endEncoding];
+
+    x->has_pending_work = 1;
+}
+
+/* Apply single-stream RoPE to one or two f32 tensors using the same frequency table. */
+void flux_gpu_rope_single_pair_f32(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                   const float *cos_freq, const float *sin_freq,
+                                   int seq, int heads, int head_dim) {
+    if (!g_shaders_initialized || !g_rope_unified_pipeline) return;
+    if (!q && !k) return;
+
+    @autoreleasepool {
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+        id<MTLBuffer> bufCos = get_rope_buffer(cos_freq, freq_size);
+        id<MTLBuffer> bufSin = get_rope_buffer(sin_freq, freq_size);
+        if (!bufCos || !bufSin) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        encode_rope_single_f32(cmdBuffer, q, bufCos, bufSin, seq, heads, head_dim);
+        if (k && k != q) {
+            encode_rope_single_f32(cmdBuffer, k, bufCos, bufSin, seq, heads, head_dim);
+        }
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            if (q) q->has_pending_work = 0;
+            if (k) k->has_pending_work = 0;
+        }
+    }
+}
+
+/* GPU tensor version of single-stream RoPE for f32 tensors.
+ * Uses the unified RoPE shader with consecutive-pair rotation.
+ * All tokens use the same cos/sin table (no text/image split). */
+void flux_gpu_rope_single_f32(flux_gpu_tensor_t x,
+                               const float *cos_freq, const float *sin_freq,
+                               int seq, int heads, int head_dim) {
+    flux_gpu_rope_single_pair_f32(x, NULL, cos_freq, sin_freq, seq, heads, head_dim);
 }
 
 /* GPU tensor version of SiLU multiply */
@@ -4198,7 +4398,12 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_shaders_initialized || !g_attention_fused_pipeline) return 0;
     if (!out || !Q || !K || !V) return 0;
-    if (seq_k > 1024) return 0;  /* Limit for shared memory */
+
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static shared_max/sum.
+     * 32KB threadgroup memory allows up to ~7680 seq_k. */
+    NSUInteger scores_size = (NSUInteger)seq_k * sizeof(float);
+    NSUInteger static_size = 256 * sizeof(float) * 2; /* shared_max + shared_sum */
+    if (scores_size + static_size > 32768) return 0;  /* Hard limit: 32KB threadgroup */
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
@@ -4214,6 +4419,7 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
         [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setThreadgroupMemoryLength:scores_size atIndex:0];
 
         NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
         [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
@@ -4674,7 +4880,12 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
         }
     }
 
-    if (seq_k <= 1024 && g_attention_fused_bf16_pipeline) {
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static arrays */
+    NSUInteger bf16_scores_size = (NSUInteger)seq_k * sizeof(float);
+    NSUInteger bf16_static_size = (256 + 256 + 128) * sizeof(float); /* max/sum/q */
+    int custom_kernel_fits = (bf16_scores_size + bf16_static_size <= 32768);
+
+    if (custom_kernel_fits && g_attention_fused_bf16_pipeline) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
             id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -4694,6 +4905,7 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
             [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
             [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+            [encoder setThreadgroupMemoryLength:bf16_scores_size atIndex:0];
 
             /* Dispatch: one threadgroup per (query_pos, head) pair */
             NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
@@ -4726,8 +4938,8 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
         }
     }
 
-    if (seq_k > 1024 && bf16_debug_enabled()) {
-        fprintf(stderr, "[BF16] attention_fused_bf16 seq_k=%d too large\n", seq_k);
+    if (!custom_kernel_fits && bf16_debug_enabled()) {
+        fprintf(stderr, "[BF16] attention_fused_bf16 seq_k=%d exceeds threadgroup memory\n", seq_k);
     }
     if (!g_attention_fused_bf16_pipeline && bf16_debug_enabled()) {
         fprintf(stderr, "[BF16] attention_fused_bf16 missing pipeline\n");
@@ -5378,6 +5590,70 @@ flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
     return f32_tensor;
 }
 
+/* Convert f32 GPU tensor to bf16, writing into pre-allocated bf16 tensor.
+ * No allocation, batch-mode safe. */
+int flux_gpu_convert_f32_to_bf16_into(flux_gpu_tensor_t bf16_out, flux_gpu_tensor_t f32_in) {
+    if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return 0;
+    if (!bf16_out || !f32_in || !bf16_out->is_f16 || f32_in->is_f16) return 0;
+
+    @autoreleasepool {
+        int n = (int)f32_in->num_elements;
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_f32_to_bf16_pipeline];
+        [encoder setBuffer:f32_in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bf16_out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        bf16_out->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            bf16_out->has_pending_work = 0;
+        }
+    }
+    return 1;
+}
+
+/* Convert bf16 GPU tensor to f32, writing into pre-allocated f32 tensor.
+ * No allocation, batch-mode safe. */
+int flux_gpu_convert_bf16_to_f32_into(flux_gpu_tensor_t f32_out, flux_gpu_tensor_t bf16_in) {
+    if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return 0;
+    if (!f32_out || !bf16_in || f32_out->is_f16 || !bf16_in->is_f16) return 0;
+
+    @autoreleasepool {
+        int n = (int)bf16_in->num_elements;
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_bf16_to_f32_pipeline];
+        [encoder setBuffer:bf16_in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:f32_out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        f32_out->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            f32_out->has_pending_work = 0;
+        }
+    }
+    return 1;
+}
+
 flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim) {
@@ -5628,8 +5904,8 @@ void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
         [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:8];
 
         int max_dim = hidden > mlp_hidden ? hidden : mlp_hidden;
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_dim, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, max_dim, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, max_dim), 1)];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
@@ -5670,8 +5946,8 @@ void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp
         [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:5];
 
         int max_dim = hidden > mlp_hidden ? hidden : mlp_hidden;
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_dim, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, max_dim, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, max_dim), 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;
@@ -5863,9 +6139,11 @@ int flux_metal_attention_fused(float *out,
         return 0;  /* Shader not available, fall back to CPU */
     }
 
-    /* Limit seq_k length to what the shader can handle (1024 for shared memory) */
-    if (seq_k > 1024) {
-        return 0;  /* Fall back to CPU for long sequences */
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static shared_max/sum */
+    NSUInteger raw_scores_size = (NSUInteger)seq_k * sizeof(float);
+    NSUInteger raw_static_size = 256 * sizeof(float) * 2; /* shared_max + shared_sum */
+    if (raw_scores_size + raw_static_size > 32768) {
+        return 0;  /* Exceeds 32KB threadgroup memory limit */
     }
 
     @autoreleasepool {
@@ -5907,6 +6185,7 @@ int flux_metal_attention_fused(float *out,
         [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setThreadgroupMemoryLength:raw_scores_size atIndex:0];
 
         /* Dispatch: one threadgroup per (query_pos, head) pair
          * Each threadgroup has threads for parallel reduction (softmax) */
@@ -6112,6 +6391,34 @@ void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
     }
 }
 
+/* GPU blit copy for f32 tensors with element offsets */
+void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
+                               flux_gpu_tensor_t src, size_t src_offset,
+                               size_t n) {
+    if (!g_initialized || !dst || !src || n == 0) return;
+    if (dst_offset + n > dst->num_elements) return;
+    if (src_offset + n > src->num_elements) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+
+        [blit copyFromBuffer:src->buffer sourceOffset:src_offset * sizeof(float)
+                    toBuffer:dst->buffer destinationOffset:dst_offset * sizeof(float)
+                        size:n * sizeof(float)];
+        [blit endEncoding];
+
+        dst->has_pending_work = 1;
+        src->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            dst->has_pending_work = 0;
+            src->has_pending_work = 0;
+        }
+    }
+}
+
 /* Conv2d on f32 GPU tensors using MPSGraph within the batch system */
 flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
                                        const float *weight, const float *bias,
@@ -6218,4 +6525,3 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
 
     return out;
 }
-

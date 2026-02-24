@@ -62,12 +62,15 @@ typedef struct {
 /* VAE context */
 typedef struct flux_vae {
     /* Configuration */
-    int z_channels;         /* 32 */
+    int z_channels;         /* 32 (Flux) or 16 (Z-Image) */
+    int latent_channels;    /* z_channels * 4: 128 (Flux) or 64 (Z-Image) */
     int base_channels;      /* 128 */
     int ch_mult[4];         /* {1, 2, 4, 4} */
     int num_res_blocks;     /* 2 */
     int num_groups;         /* 32 */
-    float eps;              /* 1e-6 */
+    float eps;              /* 1e-4 (Flux batch_norm_eps) or 1e-6 (Z-Image) */
+    float scaling_factor;   /* 0 = use batch norm (Flux), else Z-Image scaling */
+    float shift_factor;     /* 0 = use batch norm (Flux), else Z-Image shift */
 
     /* Encoder weights */
     float *enc_conv_in_weight, *enc_conv_in_bias;   /* [128, 3, 3, 3] */
@@ -86,7 +89,7 @@ typedef struct flux_vae {
     float *enc_conv_out_weight, *enc_conv_out_bias; /* [64, 512, 3, 3] */
 
     /* Decoder weights */
-    float *dec_conv_in_weight, *dec_conv_in_bias;   /* [512, 32, 3, 3] */
+    float *dec_conv_in_weight, *dec_conv_in_bias;   /* [512, z_channels, 3, 3] */
 
     /* Decoder mid block */
     vae_resblock_t dec_mid_block1;
@@ -101,15 +104,15 @@ typedef struct flux_vae {
     float *dec_norm_out_weight, *dec_norm_out_bias; /* [128] */
     float *dec_conv_out_weight, *dec_conv_out_bias; /* [3, 128, 3, 3] */
 
-    /* Normalization stats for latent space */
-    float *bn_mean;         /* [128] */
-    float *bn_var;          /* [128] */
+    /* Normalization stats for latent space (Flux only, NULL for Z-Image) */
+    float *bn_mean;         /* [latent_channels] */
+    float *bn_var;          /* [latent_channels] */
 
-    /* Post-quantization conv (1x1) applied before decoder */
-    float *quant_conv_weight;       /* [64, 64, 1, 1] - encoder */
-    float *quant_conv_bias;         /* [64] */
-    float *post_quant_conv_weight;  /* [32, 32, 1, 1] - decoder */
-    float *post_quant_conv_bias;    /* [32] */
+    /* Post-quantization conv (1x1) - Flux only, NULL for Z-Image */
+    float *quant_conv_weight;       /* [z_ch*2, z_ch*2, 1, 1] - encoder */
+    float *quant_conv_bias;         /* [z_ch*2] */
+    float *post_quant_conv_weight;  /* [z_ch, z_ch, 1, 1] - decoder */
+    float *post_quant_conv_bias;    /* [z_ch] */
 
     /* Working memory (dynamically allocated based on actual image size) */
     int max_h, max_w;           /* Maximum supported dimensions */
@@ -236,7 +239,10 @@ static void swish_inplace(float *x, int n) {
     flux_silu(x, n);
 }
 
-/* Apply residual block */
+/* ResNet residual block: norm -> swish -> conv -> norm -> swish -> conv,
+ * with a skip connection that uses 1x1 conv when channels change.
+ * This is the core building block of both the VAE encoder and decoder,
+ * stacked at each resolution level to learn hierarchical features. */
 static void resblock_forward(float *out, const float *x,
                              const vae_resblock_t *block,
                              float *work, int batch, int H, int W,
@@ -279,8 +285,12 @@ static void resblock_forward(float *out, const float *x,
     flux_add_inplace(out, conv1_out, batch * out_ch * spatial);
 }
 
-/* Apply self-attention block */
-/* Returns 0 on success, -1 on OOM */
+/* Single-head self-attention over spatial dimensions. Reshapes [C,H,W]
+ * to [C, H*W], computes full attention, then reshapes back. Used only in
+ * the bottleneck (mid_block) of both encoder and decoder, where the spatial
+ * resolution is small enough for O(n^2) attention to be tractable, giving
+ * the model global spatial reasoning at the coarsest level.
+ * Returns 0 on success, -1 on OOM. */
 static int attnblock_forward(float *out, const float *x,
                              const vae_attnblock_t *block,
                              float *work, int batch, int H, int W,
@@ -378,6 +388,12 @@ static int attnblock_forward(float *out, const float *x,
  * Encoder Forward Pass
  * ======================================================================== */
 
+/* Encode an RGB image to latent space for img2img conditioning.
+ * Runs the encoder CNN (down_blocks halve resolution 3 times for 8x compression),
+ * takes the mean of the latent distribution, then patchifies and normalizes.
+ * Flux uses batch normalization; Z-Image uses (latent - shift) * scale.
+ * Output: [batch, latent_ch, H/16, W/16] where latent_ch is 128 (Flux) or
+ * 64 (Z-Image) after patchification. */
 float *flux_vae_encode(flux_vae_t *vae, const float *img,
                        int batch, int H, int W,
                        int *out_h, int *out_w) {
@@ -471,10 +487,12 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     vae_conv2d(x, work, vae->enc_conv_out_weight, vae->enc_conv_out_bias,
                 batch, mid_ch, z_ch, cur_h, cur_w, 3, 3, 1, 1);
 
-    /* Quant conv: 64 -> 64 (1x1 conv) */
-    vae_conv2d(work, x, vae->quant_conv_weight, vae->quant_conv_bias,
-               batch, z_ch, z_ch, cur_h, cur_w, 1, 1, 1, 0);
-    flux_copy(x, work, batch * z_ch * cur_h * cur_w);
+    /* Quant conv: z_ch*2 -> z_ch*2 (1x1 conv) - Flux only */
+    if (vae->quant_conv_weight) {
+        vae_conv2d(work, x, vae->quant_conv_weight, vae->quant_conv_bias,
+                   batch, z_ch, z_ch, cur_h, cur_w, 1, 1, 1, 0);
+        flux_copy(x, work, batch * z_ch * cur_h * cur_w);
+    }
 
     /* Take mean only (first 32 channels) */
     /* x is [B, 64, H/8, W/8], we want [B, 32, H/8, W/8] */
@@ -489,17 +507,26 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
                vae->z_channels * z_spatial * sizeof(float));
     }
 
-    /* Patchify: [B, 32, H/8, W/8] -> [B, 128, H/16, W/16] */
+    /* Patchify: [B, z_ch, H/8, W/8] -> [B, latent_ch, H/16, W/16] */
     int patch_h = latent_h / 2;
     int patch_w = latent_w / 2;
-    float *latent = (float *)malloc(batch * FLUX_LATENT_CHANNELS * patch_h * patch_w * sizeof(float));
+    int lat_ch = vae->latent_channels;
+    float *latent = (float *)malloc(batch * lat_ch * patch_h * patch_w * sizeof(float));
     flux_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
     free(mean);
 
-    /* Batch normalize */
-    flux_batch_norm(work, latent, vae->bn_mean, vae->bn_var, NULL, NULL,
-                    batch, FLUX_LATENT_CHANNELS, patch_h, patch_w, vae->eps);
-    flux_copy(latent, work, batch * FLUX_LATENT_CHANNELS * patch_h * patch_w);
+    /* Normalize latent space */
+    if (vae->scaling_factor != 0.0f) {
+        /* Z-Image: latent = (latent - shift) * scaling */
+        int n = batch * lat_ch * patch_h * patch_w;
+        for (int i = 0; i < n; i++)
+            latent[i] = (latent[i] - vae->shift_factor) * vae->scaling_factor;
+    } else {
+        /* Flux: batch normalize */
+        flux_batch_norm(work, latent, vae->bn_mean, vae->bn_var, NULL, NULL,
+                        batch, lat_ch, patch_h, patch_w, vae->eps);
+        flux_copy(latent, work, batch * lat_ch * patch_h * patch_w);
+    }
 
     *out_h = patch_h;
     *out_w = patch_w;
@@ -580,19 +607,29 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     int out_W = latent_w * 16;
     if (vae_ensure_work_buffers(vae, out_H, out_W) < 0) return NULL;
 
-    /* Batch denormalize + unpatchify on CPU (small data, fast) */
+    /* Denormalize + unpatchify on CPU (small data, fast) */
     float *cpu_x = vae->work1;
     float *cpu_work = vae->work2;
+    int lat_ch = vae->latent_channels;
 
     int z_spatial = latent_h * latent_w;
-    flux_copy(cpu_x, latent, batch * FLUX_LATENT_CHANNELS * z_spatial);
-    for (int b = 0; b < batch; b++) {
-        for (int c = 0; c < FLUX_LATENT_CHANNELS; c++) {
-            float mean = vae->bn_mean[c];
-            float std = sqrtf(vae->bn_var[c] + vae->eps);
-            for (int i = 0; i < z_spatial; i++) {
-                int idx = b * FLUX_LATENT_CHANNELS * z_spatial + c * z_spatial + i;
-                cpu_x[idx] = cpu_x[idx] * std + mean;
+    flux_copy(cpu_x, latent, batch * lat_ch * z_spatial);
+
+    if (vae->scaling_factor != 0.0f) {
+        /* Z-Image: latent = latent / scaling + shift */
+        int n = batch * lat_ch * z_spatial;
+        for (int i = 0; i < n; i++)
+            cpu_x[i] = cpu_x[i] / vae->scaling_factor + vae->shift_factor;
+    } else {
+        /* Flux: batch denormalize: x = x * sqrt(var + eps) + mean */
+        for (int b = 0; b < batch; b++) {
+            for (int c = 0; c < lat_ch; c++) {
+                float mean = vae->bn_mean[c];
+                float std = sqrtf(vae->bn_var[c] + vae->eps);
+                for (int i = 0; i < z_spatial; i++) {
+                    int idx = b * lat_ch * z_spatial + c * z_spatial + i;
+                    cpu_x[idx] = cpu_x[idx] * std + mean;
+                }
             }
         }
     }
@@ -609,15 +646,18 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     if (!x) return NULL;
 
     flux_gpu_batch_begin();
+    flux_gpu_tensor_t t;
 
-    /* Post-quantization conv (1x1): 32 -> 32 */
-    flux_gpu_tensor_t t = flux_gpu_conv2d_f32(x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
-                                               batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-    flux_gpu_tensor_free(x);
-    if (!t) { flux_gpu_batch_end(); return NULL; }
-    x = t;
+    /* Post-quantization conv (1x1) - Flux only */
+    if (vae->post_quant_conv_weight) {
+        t = flux_gpu_conv2d_f32(x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
+                                batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
+        flux_gpu_tensor_free(x);
+        if (!t) { flux_gpu_batch_end(); return NULL; }
+        x = t;
+    }
 
-    /* Conv in: 32 -> 512 */
+    /* Conv in: z_channels -> 512 */
     int mid_ch = vae->base_channels * ch_mult[3];
     t = flux_gpu_conv2d_f32(x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
                              batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
@@ -744,7 +784,7 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
                 val = val * 255.0f;
                 if (val < 0) val = 0;
                 if (val > 255) val = 255;
-                img->data[(y * W + c) * 3 + ch] = (unsigned char)(val + 0.5f);
+                img->data[(y * W + c) * 3 + ch] = (uint8_t)(val + 0.5f);
             }
         }
     }
@@ -759,6 +799,11 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
  * Decoder Forward Pass
  * ======================================================================== */
 
+/* Decode latents back to an RGB image. Reverses the encode normalization
+ * (Flux: batch denorm, Z-Image: x/scale + shift), unpatchifies, then runs
+ * the decoder CNN (up_blocks double resolution 3 times). Converts the
+ * float output to uint8 RGB. Tries GPU-resident decode first for speed,
+ * falling back to CPU on failure. */
 flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
 #ifdef USE_METAL
@@ -772,10 +817,10 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 
     /*
      * Decoder path:
-     * [B, 128, H/16, W/16]
-     * -> batch_denorm
-     * -> unpatchify -> [B, 32, H/8, W/8]
-     * -> conv_in -> mid_block -> up_blocks -> norm -> conv_out
+     * [B, latent_ch, H/16, W/16]
+     * -> denormalize (batch denorm for Flux, scaling/shift for Z-Image)
+     * -> unpatchify -> [B, z_ch, H/8, W/8]
+     * -> [post_quant_conv] -> conv_in -> mid_block -> up_blocks -> norm -> conv_out
      * -> [B, 3, H, W]
      */
 
@@ -792,24 +837,32 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     int ch_mult[4] = {1, 2, 4, 4};
     float *x = vae->work1;
     float *work = vae->work2;
+    int lat_ch = vae->latent_channels;
 
-    /* Batch denormalize */
+    /* Denormalize latent space */
     int z_spatial = latent_h * latent_w;
-    flux_copy(x, latent, batch * FLUX_LATENT_CHANNELS * z_spatial);
+    flux_copy(x, latent, batch * lat_ch * z_spatial);
 
-    /* Denormalize: x = x * sqrt(var + eps) + mean */
-    for (int b = 0; b < batch; b++) {
-        for (int c = 0; c < FLUX_LATENT_CHANNELS; c++) {
-            float mean = vae->bn_mean[c];
-            float std = sqrtf(vae->bn_var[c] + vae->eps);
-            for (int i = 0; i < z_spatial; i++) {
-                int idx = b * FLUX_LATENT_CHANNELS * z_spatial + c * z_spatial + i;
-                x[idx] = x[idx] * std + mean;
+    if (vae->scaling_factor != 0.0f) {
+        /* Z-Image: latent = latent / scaling + shift */
+        int n = batch * lat_ch * z_spatial;
+        for (int i = 0; i < n; i++)
+            x[i] = x[i] / vae->scaling_factor + vae->shift_factor;
+    } else {
+        /* Flux: batch denormalize: x = x * sqrt(var + eps) + mean */
+        for (int b = 0; b < batch; b++) {
+            for (int c = 0; c < lat_ch; c++) {
+                float mean = vae->bn_mean[c];
+                float std = sqrtf(vae->bn_var[c] + vae->eps);
+                for (int i = 0; i < z_spatial; i++) {
+                    int idx = b * lat_ch * z_spatial + c * z_spatial + i;
+                    x[idx] = x[idx] * std + mean;
+                }
             }
         }
     }
 
-    /* Unpatchify: [B, 128, H/16, W/16] -> [B, 32, H/8, W/8] */
+    /* Unpatchify: [B, latent_ch, H/16, W/16] -> [B, z_ch, H/8, W/8] */
     int unpatch_h = latent_h * 2;
     int unpatch_w = latent_w * 2;
     flux_unpatchify(work, x, batch, vae->z_channels, latent_h, latent_w, 2);
@@ -817,10 +870,12 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 
     int cur_h = unpatch_h, cur_w = unpatch_w;
 
-    /* Post-quantization conv (1x1): 32 -> 32 */
-    vae_conv2d(work, x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
-                batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-    flux_copy(x, work, batch * vae->z_channels * cur_h * cur_w);
+    /* Post-quantization conv (1x1) - Flux only */
+    if (vae->post_quant_conv_weight) {
+        vae_conv2d(work, x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
+                    batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
+        flux_copy(x, work, batch * vae->z_channels * cur_h * cur_w);
+    }
 
     /* Conv in: 32 -> 512 */
     int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
@@ -910,7 +965,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                 val = val * 255.0f;
                 if (val < 0) val = 0;
                 if (val > 255) val = 255;
-                img->data[(y * W + c) * 3 + ch] = (uint8_t)val;
+                img->data[(y * W + c) * 3 + ch] = (uint8_t)(val + 0.5f);
             }
         }
     }
@@ -1017,11 +1072,14 @@ flux_vae_t *flux_vae_load(FILE *f) {
     if (fread(config, sizeof(uint32_t), 6, f) != 6) goto error;
 
     vae->z_channels = config[0];
+    vae->latent_channels = vae->z_channels * 4;  /* 2x2 patchify */
     vae->base_channels = config[1];
     vae->num_res_blocks = config[2];
     vae->num_groups = config[3];
     vae->max_h = config[4];
     vae->max_w = config[5];
+    vae->scaling_factor = 0.0f;
+    vae->shift_factor = 0.0f;
 
     vae->ch_mult[0] = FLUX_VAE_CH_MULT_0;
     vae->ch_mult[1] = FLUX_VAE_CH_MULT_1;
@@ -1093,8 +1151,8 @@ flux_vae_t *flux_vae_load(FILE *f) {
     vae->dec_conv_out_bias = read_floats(f, 3);
 
     /* Read batch norm stats */
-    vae->bn_mean = read_floats(f, FLUX_LATENT_CHANNELS);
-    vae->bn_var = read_floats(f, FLUX_LATENT_CHANNELS);
+    vae->bn_mean = read_floats(f, vae->latent_channels);
+    vae->bn_var = read_floats(f, vae->latent_channels);
 
     /* Allocate working memory */
     size_t max_spatial = (size_t)vae->max_h * vae->max_w;
@@ -1311,7 +1369,15 @@ static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
     return 0;
 }
 
-flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
+/* Load VAE weights from safetensors format. Extended version takes z_channels
+ * (16 for Z-Image, 32 for Flux) and scaling/shift factors to support both
+ * VAE variants. Builds the full encoder and decoder weight hierarchy:
+ * conv_in -> down_blocks (4 levels, channel multipliers [1,2,4,4]) ->
+ * mid_block -> up_blocks -> conv_out. Also loads batch norm stats if present. */
+flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
+                                          int z_channels,
+                                          float scaling_factor,
+                                          float shift_factor) {
     flux_vae_t *vae = calloc(1, sizeof(flux_vae_t));
     if (!vae) return NULL;
 
@@ -1319,13 +1385,16 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
     int ch_mult[4] = {1, 2, 4, 4};
 
     /* Set config */
-    vae->z_channels = 32;
+    vae->z_channels = z_channels;
+    vae->latent_channels = z_channels * 4;  /* 2x2 patchify */
     vae->base_channels = 128;
     vae->num_res_blocks = 2;
     vae->num_groups = 32;
     vae->max_h = FLUX_VAE_MAX_DIM;
     vae->max_w = FLUX_VAE_MAX_DIM;
-    vae->eps = 1e-4f;  /* batch_norm_eps from config */
+    vae->scaling_factor = scaling_factor;
+    vae->shift_factor = shift_factor;
+    vae->eps = (scaling_factor != 0.0f) ? 1e-6f : 1e-4f;
 
     vae->ch_mult[0] = ch_mult[0];
     vae->ch_mult[1] = ch_mult[1];
@@ -1374,8 +1443,12 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
     vae->enc_norm_out_bias = get_sf_tensor(sf, "encoder.conv_norm_out.bias");
     vae->enc_conv_out_weight = get_sf_tensor(sf, "encoder.conv_out.weight");
     vae->enc_conv_out_bias = get_sf_tensor(sf, "encoder.conv_out.bias");
-    vae->quant_conv_weight = get_sf_tensor(sf, "quant_conv.weight");
-    vae->quant_conv_bias = get_sf_tensor(sf, "quant_conv.bias");
+
+    /* Quant conv (Flux only - Z-Image doesn't have these) */
+    if (safetensors_find(sf, "quant_conv.weight")) {
+        vae->quant_conv_weight = get_sf_tensor(sf, "quant_conv.weight");
+        vae->quant_conv_bias = get_sf_tensor(sf, "quant_conv.bias");
+    }
 
     /* Decoder conv_in */
     vae->dec_conv_in_weight = get_sf_tensor(sf, "decoder.conv_in.weight");
@@ -1423,7 +1496,7 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
     vae->dec_conv_out_weight = get_sf_tensor(sf, "decoder.conv_out.weight");
     vae->dec_conv_out_bias = get_sf_tensor(sf, "decoder.conv_out.bias");
 
-    /* Batch norm stats */
+    /* Batch norm stats (Flux only) */
     const safetensor_t *bn_mean_t = safetensors_find(sf, "bn.running_mean");
     if (bn_mean_t) {
         vae->bn_mean = safetensors_get_f32(sf, bn_mean_t);
@@ -1431,15 +1504,18 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
         vae->bn_var = bn_var_t ? safetensors_get_f32(sf, bn_var_t) : NULL;
     }
 
-    /* Post-quantization conv (32 -> 32, 1x1) */
-    vae->post_quant_conv_weight = get_sf_tensor(sf, "post_quant_conv.weight");
-    vae->post_quant_conv_bias = get_sf_tensor(sf, "post_quant_conv.bias");
-    if (!vae->bn_mean) {
-        vae->bn_mean = calloc(FLUX_LATENT_CHANNELS, sizeof(float));
+    /* Post-quantization conv (Flux only - Z-Image doesn't have this) */
+    if (safetensors_find(sf, "post_quant_conv.weight")) {
+        vae->post_quant_conv_weight = get_sf_tensor(sf, "post_quant_conv.weight");
+        vae->post_quant_conv_bias = get_sf_tensor(sf, "post_quant_conv.bias");
     }
-    if (!vae->bn_var) {
-        vae->bn_var = malloc(FLUX_LATENT_CHANNELS * sizeof(float));
-        for (int i = 0; i < FLUX_LATENT_CHANNELS; i++) vae->bn_var[i] = 1.0f;
+
+    /* Fallback: if no batch norm found and no scaling factor, use identity */
+    if (!vae->bn_mean && vae->scaling_factor == 0.0f) {
+        int lc = vae->latent_channels;
+        vae->bn_mean = calloc(lc, sizeof(float));
+        vae->bn_var = malloc(lc * sizeof(float));
+        for (int i = 0; i < lc; i++) vae->bn_var[i] = 1.0f;
     }
 
     /* Work buffers are now allocated on-demand in encode/decode functions
@@ -1454,4 +1530,9 @@ flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
     vae->cur_alloc_w = 0;
 
     return vae;
+}
+
+/* Backward-compatible wrapper: loads with Flux defaults (z_channels=32, no scaling) */
+flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
+    return flux_vae_load_safetensors_ex(sf, 32, 0.0f, 0.0f);
 }

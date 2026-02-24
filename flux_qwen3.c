@@ -90,7 +90,8 @@ struct qwen3_model {
     int head_dim;
     int vocab_size;
     float rope_theta;
-    int text_dim;             /* 3 * hidden_size */
+    int text_dim;             /* 3 * hidden_size (Flux) or hidden_size (Z-Image) */
+    int extraction_mode;      /* 0 = Flux (layers 8,17,26 concat), 1 = Z-Image (layer -2) */
 
     /* Embedding layer */
     float *embed_tokens;      /* [vocab_size, hidden] */
@@ -158,13 +159,13 @@ static void qwen3_linear(float *y, const float *x, const float *W,
     /* Use GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (flux_metal_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
-        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
-                         seq_len, out_dim, in_dim,
-                         1.0f,
-                         x, in_dim,
-                         W, in_dim,
-                         0.0f,
-                         y, out_dim);
+        flux_metal_sgemm_cached(0, 1,  /* no transpose A, transpose B */
+                                seq_len, out_dim, in_dim,
+                                1.0f,
+                                x, in_dim,
+                                W, in_dim,
+                                0.0f,
+                                y, out_dim);
         return;
     }
 #endif
@@ -268,6 +269,11 @@ static void compute_rope_freqs(float *cos_out, float *sin_out,
     }
 }
 
+/* Apply RoPE rotation to Q and K for all attention heads. Uses split-half
+ * rotation (dims [0..63] paired with [64..127]) within GQA: each of the
+ * 32 Q heads is rotated independently, while only 8 K heads are rotated
+ * (shared across groups of 4 Q heads). Position encoding creates
+ * relative-position-dependent attention logit decay. */
 static void apply_rope(float *q, float *k, const float *cos_cache, const float *sin_cache,
                        int seq_len, int num_q_heads, int num_kv_heads, int head_dim) {
     int half_dim = head_dim / 2;
@@ -317,6 +323,11 @@ static void apply_rope(float *q, float *k, const float *cos_cache, const float *
  * Attention
  * ======================================================================== */
 
+/* Full attention forward pass for one Qwen3 layer. Implements GQA (Grouped
+ * Query Attention): 32 Q heads share 8 KV heads (4:1 ratio for 4B model).
+ * Pipeline: Q/K/V projections -> per-head RMSNorm on Q and K -> RoPE ->
+ * scaled dot-product attention with causal + padding mask -> output projection.
+ * Each Q head attends to its corresponding KV group (h / heads_per_kv). */
 static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
                                     int seq_len, const int *attention_mask) {
     int num_heads = model->num_heads;
@@ -453,6 +464,9 @@ output_proj:
  * MLP (SwiGLU)
  * ======================================================================== */
 
+/* SwiGLU MLP: gate = W_gate @ x, up = W_up @ x, out = W_down @ (silu(gate) * up).
+ * The gated activation lets the network learn which features to pass through:
+ * silu(gate) acts as a learned soft switch on the up-projected features. */
 static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int seq_len) {
     int hidden = model->hidden_size;
     int intermediate = model->intermediate_size;
@@ -475,6 +489,10 @@ static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int se
  * Transformer Layer
  * ======================================================================== */
 
+/* One Qwen3 transformer layer (pre-norm architecture):
+ * RMSNorm -> self-attention -> residual add -> RMSNorm -> SwiGLU MLP ->
+ * residual add. Pre-norm (normalizing before each sub-layer rather than
+ * after) improves training stability and is standard in modern LLMs. */
 static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
                                 int seq_len, const int *attention_mask) {
     int hidden = model->hidden_size;
@@ -891,10 +909,19 @@ static flux_gpu_tensor_t qwen3_mlp_gpu(qwen3_model_t *model, qwen3_layer_t *laye
 /* Fully GPU-resident forward pass.
  * hidden_state must already be set (from embedding lookup).
  * Fills model->layer_outputs[0..2] with layers 8, 17, 26 outputs.
- * Only processes layers 0..26 (layers 27-35 are unused by output).
+ * Flux mode: processes layers 0..26 and saves outputs at layers 8,17,26.
+ * Z-Image mode: processes layers 0..(num_layers-2) and saves output at last.
  * Returns 1 on success, 0 on failure. */
+/* Fully GPU-resident Qwen3 forward pass. Key optimization: keeps all hidden
+ * states on GPU (bf16) across all layers, only reading back the extracted
+ * layer outputs at the end. This reduces ~72 CPU-GPU round-trips (2 per
+ * layer x 36 layers) down to a single GPU sync. Layer weights are still
+ * loaded from mmap on demand and freed after each layer. */
 static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *attention_mask) {
     int hidden = model->hidden_size;
+    int zimage = model->extraction_mode;
+    int last_layer = zimage ? (model->num_layers - 2) : QWEN3_OUTPUT_LAYER_3;
+    int num_saved = zimage ? 1 : 3;
 
     /* Upload hidden state to GPU as bf16 */
     flux_gpu_batch_begin();
@@ -906,7 +933,7 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
     /* Allocate tensors for saved layer outputs */
     flux_gpu_tensor_t saved[3] = {NULL, NULL, NULL};
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < num_saved; i++) {
         saved[i] = flux_gpu_tensor_alloc_f16(seq_len * hidden);
         if (!saved[i]) {
             for (int j = 0; j <= i; j++) if (saved[j]) flux_gpu_tensor_free(saved[j]);
@@ -918,7 +945,7 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
     int ok = 1;
 
-    for (int layer_idx = 0; layer_idx <= QWEN3_OUTPUT_LAYER_3; layer_idx++) {
+    for (int layer_idx = 0; layer_idx <= last_layer; layer_idx++) {
         qwen3_layer_t *layer = &model->layers[layer_idx];
 
         /* Load weights on demand (mmap mode) */
@@ -979,12 +1006,17 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
         }
 
         /* Save output at extraction layers (GPU blit copy) */
-        if (layer_idx == QWEN3_OUTPUT_LAYER_1)
-            flux_gpu_copy_bf16(saved[0], hidden_gpu, seq_len * hidden);
-        else if (layer_idx == QWEN3_OUTPUT_LAYER_2)
-            flux_gpu_copy_bf16(saved[1], hidden_gpu, seq_len * hidden);
-        else if (layer_idx == QWEN3_OUTPUT_LAYER_3)
-            flux_gpu_copy_bf16(saved[2], hidden_gpu, seq_len * hidden);
+        if (zimage) {
+            if (layer_idx == last_layer)
+                flux_gpu_copy_bf16(saved[0], hidden_gpu, seq_len * hidden);
+        } else {
+            if (layer_idx == QWEN3_OUTPUT_LAYER_1)
+                flux_gpu_copy_bf16(saved[0], hidden_gpu, seq_len * hidden);
+            else if (layer_idx == QWEN3_OUTPUT_LAYER_2)
+                flux_gpu_copy_bf16(saved[1], hidden_gpu, seq_len * hidden);
+            else if (layer_idx == QWEN3_OUTPUT_LAYER_3)
+                flux_gpu_copy_bf16(saved[2], hidden_gpu, seq_len * hidden);
+        }
 
         if (flux_text_progress_callback)
             flux_text_progress_callback(layer_idx, model->num_layers);
@@ -992,14 +1024,14 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
     if (!ok) {
         flux_gpu_batch_end();
-        for (int i = 0; i < 3; i++) if (saved[i]) flux_gpu_tensor_free(saved[i]);
+        for (int i = 0; i < num_saved; i++) if (saved[i]) flux_gpu_tensor_free(saved[i]);
         flux_gpu_tensor_free(hidden_gpu);
         return 0;
     }
 
     /* Convert saved bf16 → f32 on GPU (still within batch) */
     flux_gpu_tensor_t saved_f32[3] = {NULL, NULL, NULL};
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < num_saved; i++)
         saved_f32[i] = flux_gpu_tensor_bf16_to_f32(saved[i]);
 
     /* Execute everything in one GPU sync */
@@ -1011,7 +1043,7 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
     /* Read f32 results to CPU */
     int read_ok = 1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < num_saved; i++) {
         if (saved_f32[i]) {
             flux_gpu_tensor_read(saved_f32[i], model->layer_outputs[i]);
             flux_gpu_tensor_free(saved_f32[i]);
@@ -1031,9 +1063,17 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
  * Forward Pass
  * ======================================================================== */
 
+/* Main Qwen3 forward pass. Runs embedding lookup then processes through
+ * transformer layers. Flux mode: saves hidden states at layers 8, 17, 26
+ * and concatenates them -> [seq, 3*hidden]. Z-Image mode: saves only
+ * hidden_states[-2] (layer 34) -> [seq, hidden]. Stops early at the last
+ * needed extraction layer to skip ~9 unnecessary layers of compute. Tries
+ * fully GPU-resident path first, falls back to mixed CPU/GPU or pure CPU. */
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
     int hidden = model->hidden_size;
+    int zimage = model->extraction_mode;
+    int last_layer = zimage ? (model->num_layers - 2) : QWEN3_OUTPUT_LAYER_3;
     float *output;
 
     /* Embedding lookup */
@@ -1066,7 +1106,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 #endif
 
-    for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
+    for (int layer_idx = 0; layer_idx <= last_layer; layer_idx++) {
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
 #ifdef USE_METAL
@@ -1104,13 +1144,17 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             free_layer_weights(&model->layers[layer_idx]);
         }
 
-        /* Save output at extraction layers (9, 18, 27) */
-        if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
-            memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
-        } else if (layer_idx == QWEN3_OUTPUT_LAYER_2) {
-            memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
-        } else if (layer_idx == QWEN3_OUTPUT_LAYER_3) {
-            memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
+        /* Save output at extraction layers */
+        if (zimage) {
+            if (layer_idx == last_layer)
+                memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
+        } else {
+            if (layer_idx == QWEN3_OUTPUT_LAYER_1)
+                memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
+            else if (layer_idx == QWEN3_OUTPUT_LAYER_2)
+                memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
+            else if (layer_idx == QWEN3_OUTPUT_LAYER_3)
+                memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
         }
 
         /* Progress callback */
@@ -1125,7 +1169,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 #endif
 
-    /* Concatenate outputs from layers 8, 17, 26 -> [seq_len, 7680] */
+    /* Build output embeddings */
 #ifdef USE_METAL
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
@@ -1133,16 +1177,22 @@ concatenate: (void)0; /* label needs a statement; can't precede a declaration in
     output = malloc(seq_len * text_dim * sizeof(float));
     if (!output) return NULL;
 
-    for (int s = 0; s < seq_len; s++) {
-        memcpy(output + s * text_dim,
-               model->layer_outputs[0] + s * hidden,
-               hidden * sizeof(float));
-        memcpy(output + s * text_dim + hidden,
-               model->layer_outputs[1] + s * hidden,
-               hidden * sizeof(float));
-        memcpy(output + s * text_dim + 2 * hidden,
-               model->layer_outputs[2] + s * hidden,
-               hidden * sizeof(float));
+    if (zimage) {
+        /* Z-Image: single layer output -> [seq_len, hidden] */
+        memcpy(output, model->layer_outputs[0], seq_len * hidden * sizeof(float));
+    } else {
+        /* Flux: concatenate layers 8, 17, 26 -> [seq_len, 3*hidden] */
+        for (int s = 0; s < seq_len; s++) {
+            memcpy(output + s * text_dim,
+                   model->layer_outputs[0] + s * hidden,
+                   hidden * sizeof(float));
+            memcpy(output + s * text_dim + hidden,
+                   model->layer_outputs[1] + s * hidden,
+                   hidden * sizeof(float));
+            memcpy(output + s * text_dim + 2 * hidden,
+                   model->layer_outputs[2] + s * hidden,
+                   hidden * sizeof(float));
+        }
     }
 
     return output;
@@ -1508,6 +1558,11 @@ static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
     }
 }
 
+/* Eager-mode model loading: reads all weights into RAM upfront. Parses
+ * config.json for architecture parameters (hidden size, head counts, etc.),
+ * loads all layer weights from safetensors shards, and precomputes RoPE
+ * frequency tables. Uses ~16GB RAM for 4B model. Prefer mmap mode for
+ * lower memory usage unless weights need repeated random access. */
 qwen3_model_t *qwen3_model_load(const char *model_dir) {
     qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
     if (!model) return NULL;
@@ -1578,6 +1633,11 @@ error:
 
 /* Load model in mmap mode - keeps safetensors files open and loads layer weights
  * on-demand during forward pass. Reduces peak memory from ~16GB to ~2GB. */
+/* Memory-mapped loading: keeps safetensors files open and loads layer weights
+ * on demand during forward pass. Only embeddings, final norm, and RoPE tables
+ * are resident. Dramatically reduces startup time and peak memory (~2GB vs
+ * ~16GB). For GPU: also loads bf16 weight pointers for zero-copy GPU upload
+ * directly from the mmap region. */
 qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
     if (!model) return NULL;
@@ -1740,6 +1800,22 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     return enc;
 }
 
+/* Switch between Flux extraction (mode=0: layers 8+17+26 concatenated,
+ * output dim = 3*hidden) and Z-Image extraction (mode=1: layer -2 only,
+ * output dim = hidden). Must be called before encoding to set the correct
+ * text_dim, which determines the embedding size the transformer expects. */
+void qwen3_set_extraction_mode(qwen3_encoder_t *enc, int mode) {
+    if (!enc || !enc->model) return;
+    enc->model->extraction_mode = mode;
+    if (mode == 1) {
+        /* Z-Image: single layer output = hidden_size */
+        enc->model->text_dim = enc->model->hidden_size;
+    } else {
+        /* Flux: 3 layers concatenated = 3 * hidden_size */
+        enc->model->text_dim = 3 * enc->model->hidden_size;
+    }
+}
+
 void qwen3_encoder_free(qwen3_encoder_t *enc) {
     if (!enc) return;
     qwen3_tokenizer_free(enc->tokenizer);
@@ -1747,12 +1823,21 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
     free(enc);
 }
 
-float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
+/* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
+ * (with <think> tags for Flux, without for Z-Image), pads to max sequence
+ * length, runs the forward pass, and returns extracted embeddings. Also
+ * returns the number of real (non-padding) tokens via out_num_tokens,
+ * which Z-Image needs for its unpadded attention over text tokens. */
+float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
+                              int *out_num_tokens) {
     if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
+
+    int skip_think_tags = (enc->model->extraction_mode == 1);
 
     /* Tokenize with chat template */
     int num_tokens;
-    int *tokens = qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens, QWEN3_MAX_SEQ_LEN);
+    int *tokens = qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens,
+                                      QWEN3_MAX_SEQ_LEN, skip_think_tags);
     if (!tokens) return NULL;
 
     /* Pad to max length */
@@ -1765,6 +1850,8 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
         return NULL;
     }
 
+    if (out_num_tokens) *out_num_tokens = num_tokens;
+
     /* Forward pass */
     float *embeddings = qwen3_forward(enc->model, padded_tokens, attention_mask, QWEN3_MAX_SEQ_LEN);
 
@@ -1772,4 +1859,8 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
     free(attention_mask);
 
     return embeddings;
+}
+
+float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
+    return qwen3_encode_text_ex(enc, prompt, NULL);
 }

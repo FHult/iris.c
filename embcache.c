@@ -27,6 +27,11 @@ static uint64_t hash_string(const char *str) {
  * 4-bit Quantization
  * ======================================================================== */
 
+/* Quantize f32 embeddings to 4-bit with block-wise min/max scaling.
+ * Each block of 32 values is mapped to [0, 15] using per-block scale and
+ * min offset. Gives ~8x compression for caching text embeddings across
+ * repeated prompts, with minimal quality loss since the diffusion model
+ * is robust to small embedding perturbations. */
 emb_quantized_t *emb_quantize_4bit(const float *data, int num_elements) {
     if (!data || num_elements <= 0) return NULL;
 
@@ -154,6 +159,10 @@ void emb_cache_init(void) {
     g_cache_initialized = 1;
 }
 
+/* Store quantized text embeddings keyed by prompt string. Used in
+ * interactive CLI mode to skip the expensive Qwen3 forward pass when
+ * the same prompt is reused. Replaces the existing entry since the
+ * cache holds a single prompt (the common case is iterating on one). */
 void emb_cache_store(const char *prompt, const float *embedding, int num_elements) {
     if (!prompt || !embedding || num_elements <= 0) return;
     if (!g_cache_initialized) emb_cache_init();
@@ -174,7 +183,7 @@ void emb_cache_store(const char *prompt, const float *embedding, int num_element
     }
 }
 
-float *emb_cache_lookup(const char *prompt) {
+float *emb_cache_lookup_ex(const char *prompt, int *num_elements) {
     if (!prompt || !g_cache_initialized) return NULL;
 
     uint64_t hash = hash_string(prompt);
@@ -188,8 +197,14 @@ float *emb_cache_lookup(const char *prompt) {
     /* Full string comparison */
     if (strcmp(prompt, g_cache[slot].prompt) != 0) return NULL;
 
+    if (num_elements) *num_elements = g_cache[slot].emb->num_elements;
+
     /* Cache hit - dequantize and return */
     return emb_dequantize_4bit(g_cache[slot].emb);
+}
+
+float *emb_cache_lookup(const char *prompt) {
+    return emb_cache_lookup_ex(prompt, NULL);
 }
 
 int emb_cache_has(const char *prompt) {

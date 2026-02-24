@@ -37,6 +37,10 @@ extern int *flux_tokenize(flux_tokenizer *tok, const char *text,
 
 extern flux_vae_t *flux_vae_load(FILE *f);
 extern flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf);
+extern flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
+                                                  int z_channels,
+                                                  float scaling_factor,
+                                                  float shift_factor);
 extern void flux_vae_free(flux_vae_t *vae);
 extern float *flux_vae_encode(flux_vae_t *vae, const float *img,
                               int batch, int H, int W, int *out_h, int *out_w);
@@ -113,7 +117,24 @@ extern float *flux_sample_euler_cfg_with_multi_refs(void *transformer, void *tex
 extern float *flux_linear_schedule(int num_steps);
 extern float *flux_power_schedule(int num_steps, float alpha);
 extern float *flux_official_schedule(int num_steps, int image_seq_len);
+extern float *flux_zimage_schedule(int num_steps, int image_seq_len);
 extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
+
+/* Z-Image transformer and sampling */
+typedef struct zi_transformer zi_transformer_t;
+extern zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
+                                                           int dim, int n_heads,
+                                                           int n_layers, int n_refiner,
+                                                           int cap_feat_dim, int in_channels,
+                                                           int patch_size, float rope_theta,
+                                                           const int *axes_dims);
+extern void zi_transformer_free(zi_transformer_t *tf);
+extern float *flux_sample_euler_zimage(void *transformer,
+                                        float *z, int batch, int channels, int h, int w,
+                                        int patch_size,
+                                        const float *cap_feats, int cap_seq,
+                                        const float *schedule, int num_steps,
+                                        void (*progress_callback)(int step, int total));
 
 /* Return schedule based on params: linear, power, or official shifted sigmoid. */
 static float *flux_selected_schedule(const flux_params *p, int image_seq_len) {
@@ -122,6 +143,16 @@ static float *flux_selected_schedule(const flux_params *p, int image_seq_len) {
     if (p->linear_schedule)
         return flux_linear_schedule(p->num_steps);
     return flux_official_schedule(p->num_steps, image_seq_len);
+}
+
+/* Return Z-Image schedule based on params.
+ * Default is Z-Image FlowMatch schedule; linear/power are explicit overrides. */
+static float *flux_selected_zimage_schedule(const flux_params *p, int image_seq_len) {
+    if (p->power_schedule)
+        return flux_power_schedule(p->num_steps, p->power_alpha);
+    if (p->linear_schedule)
+        return flux_linear_schedule(p->num_steps);
+    return flux_zimage_schedule(p->num_steps, image_seq_len);
 }
 
 /* ========================================================================
@@ -140,6 +171,7 @@ struct flux_ctx {
     qwen3_encoder_t *qwen3_encoder;
     flux_vae_t *vae;
     flux_transformer_t *transformer;
+    zi_transformer_t *zi_transformer;
 
     /* Configuration */
     int max_width;
@@ -150,6 +182,23 @@ struct flux_ctx {
     int text_dim;      /* Text embedding dimension (7680 for 4B, varies for 9B) */
     int is_non_commercial; /* 1 if model has non-commercial license (9B) */
     int num_heads;     /* Transformer attention heads (24 for 4B, 32 for 9B) */
+    int is_zimage;     /* 1 = Z-Image S3-DiT, 0 = Flux MMDiT */
+
+    /* Z-Image specific config (from transformer/config.json) */
+    int zi_dim;            /* Hidden dim (3840) */
+    int zi_n_layers;       /* Main transformer layers (30) */
+    int zi_n_refiner;      /* Noise/context refiner layers (2) */
+    int zi_cap_feat_dim;   /* Caption feature dim (2560) */
+    int zi_in_channels;    /* VAE latent channels (16) */
+    int zi_patch_size;     /* Spatial patch size (2) */
+    float zi_rope_theta;   /* RoPE theta (256.0) */
+    int zi_axes_dims[3];   /* RoPE axis dims [32, 48, 48] */
+    int zi_latent_channels;/* Patchified latent channels (64 = 16*2*2) */
+
+    /* VAE config (read from vae/config.json) */
+    int vae_z_channels;    /* Latent channels before patchify (32 Flux, 16 Z-Image) */
+    float vae_scaling;     /* Scaling factor (0.3611 for Z-Image, 0 = use batch norm) */
+    float vae_shift;       /* Shift factor (0.1159 for Z-Image, 0 = use batch norm) */
 
     /* Model info */
     char model_name[64];
@@ -187,6 +236,12 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+/* Main model loading entry point. Parses model_index.json to auto-detect
+ * the model type (Flux vs Z-Image, distilled vs base), then reads
+ * transformer/config.json and vae/config.json for architecture parameters
+ * (hidden dim, heads, layers, etc.). Only the VAE (~300MB) is loaded
+ * eagerly; the text encoder and transformer are deferred to generation
+ * time so they can be swapped in/out on memory-constrained systems. */
 flux_ctx *flux_load_dir(const char *model_dir) {
     char path[1024];
 
@@ -203,8 +258,10 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
     /* Autodetect model type from model_index.json.
-     * Distilled model has "is_distilled": true, base model does not. */
+     * Distilled model has "is_distilled": true, base model does not.
+     * Z-Image has "_class_name": "ZImagePipeline". */
     ctx->is_distilled = 1;  /* Default to distilled */
+    ctx->is_zimage = 0;
     snprintf(path, sizeof(path), "%s/model_index.json", model_dir);
     if (file_exists(path)) {
         FILE *f = fopen(path, "r");
@@ -213,6 +270,10 @@ flux_ctx *flux_load_dir(const char *model_dir) {
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
             buf[n] = '\0';
             fclose(f);
+            /* Check for Z-Image pipeline */
+            if (strstr(buf, "ZImagePipeline") || strstr(buf, "Z-Image")) {
+                ctx->is_zimage = 1;
+            }
             /* If "is_distilled" is present and true, it's distilled.
              * If absent, it's the base model. */
             if (!strstr(buf, "\"is_distilled\": true") &&
@@ -222,15 +283,14 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         }
     }
 
-    /* Read transformer/config.json to determine model size (4B vs 9B)
-     * and text embedding dimension. */
+    /* Read transformer/config.json to determine model size and architecture. */
     int num_heads = 24;  /* default 4B */
     ctx->text_dim = 7680;  /* default 4B: 3 * 2560 */
     snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
     if (file_exists(path)) {
         FILE *f = fopen(path, "r");
         if (f) {
-            char buf[4096];
+            char buf[8192];
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
             buf[n] = '\0';
             fclose(f);
@@ -243,26 +303,153 @@ flux_ctx *flux_load_dir(const char *model_dir) {
                 if ((p = strchr(p, ':'))) joint_dim = atoi(p + 1);
             }
             if (joint_dim > 0) ctx->text_dim = joint_dim;
+
+            /* Z-Image autodetection: look for Z-Image-specific fields */
+            if ((p = strstr(buf, "\"cap_feat_dim\""))) {
+                ctx->is_zimage = 1;
+            }
+
+            /* Parse Z-Image config if detected */
+            if (ctx->is_zimage) {
+                /* dim (hidden size) */
+                ctx->zi_dim = 3840;
+                if ((p = strstr(buf, "\"dim\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_dim = atoi(colon + 1);
+                }
+                num_heads = ctx->zi_dim / 128;  /* head_dim = 128 */
+
+                /* n_layers */
+                ctx->zi_n_layers = 30;
+                if ((p = strstr(buf, "\"n_layers\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_n_layers = atoi(colon + 1);
+                }
+
+                /* n_refiner_layers */
+                ctx->zi_n_refiner = 2;
+                if ((p = strstr(buf, "\"n_refiner_layers\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_n_refiner = atoi(colon + 1);
+                }
+
+                /* cap_feat_dim */
+                ctx->zi_cap_feat_dim = 2560;
+                if ((p = strstr(buf, "\"cap_feat_dim\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_cap_feat_dim = atoi(colon + 1);
+                }
+
+                /* in_channels */
+                ctx->zi_in_channels = 16;
+                if ((p = strstr(buf, "\"in_channels\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_in_channels = atoi(colon + 1);
+                }
+
+                /* patch_size */
+                ctx->zi_patch_size = 2;
+                if ((p = strstr(buf, "\"patch_size\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_patch_size = atoi(colon + 1);
+                }
+
+                /* rope_theta */
+                ctx->zi_rope_theta = 256.0f;
+                if ((p = strstr(buf, "\"rope_theta\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->zi_rope_theta = atof(colon + 1);
+                }
+
+                /* axes_dims - parse JSON array [32, 48, 48] */
+                ctx->zi_axes_dims[0] = 32;
+                ctx->zi_axes_dims[1] = 48;
+                ctx->zi_axes_dims[2] = 48;
+                if ((p = strstr(buf, "\"axes_dims\""))) {
+                    char *bracket = strchr(p, '[');
+                    if (bracket) {
+                        ctx->zi_axes_dims[0] = atoi(bracket + 1);
+                        char *comma1 = strchr(bracket, ',');
+                        if (comma1) {
+                            ctx->zi_axes_dims[1] = atoi(comma1 + 1);
+                            char *comma2 = strchr(comma1 + 1, ',');
+                            if (comma2) {
+                                ctx->zi_axes_dims[2] = atoi(comma2 + 1);
+                            }
+                        }
+                    }
+                }
+
+                /* Derived values */
+                ctx->zi_latent_channels = ctx->zi_in_channels *
+                                          ctx->zi_patch_size * ctx->zi_patch_size;
+                ctx->text_dim = ctx->zi_cap_feat_dim;  /* 2560 for Z-Image */
+            }
         }
     }
 
-    /* Determine model variant name based on architecture size.
-     * 4B: 24 heads (hidden=3072), 9B: more heads (hidden>3072). */
-    int hidden_size = num_heads * 128;  /* head_dim is always 128 */
-    const char *size_label = (hidden_size > 3072) ? "9B" : "4B";
-    ctx->is_non_commercial = (hidden_size > 3072) ? 1 : 0;
-    ctx->num_heads = num_heads;
+    /* Read vae/config.json for Z-Image scaling/shift factors */
+    ctx->vae_z_channels = FLUX_VAE_Z_CHANNELS;  /* default: 32 */
+    ctx->vae_scaling = 0.0f;
+    ctx->vae_shift = 0.0f;
+    snprintf(path, sizeof(path), "%s/vae/config.json", model_dir);
+    if (file_exists(path)) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char buf[4096];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = '\0';
+            fclose(f);
+            char *p;
+            if ((p = strstr(buf, "\"latent_channels\""))) {
+                char *colon = strchr(p, ':');
+                if (colon) {
+                    int lc = atoi(colon + 1);
+                    if (lc > 0) ctx->vae_z_channels = lc;
+                }
+            }
+            if ((p = strstr(buf, "\"scaling_factor\""))) {
+                char *colon = strchr(p, ':');
+                if (colon) ctx->vae_scaling = atof(colon + 1);
+            }
+            if ((p = strstr(buf, "\"shift_factor\""))) {
+                char *colon = strchr(p, ':');
+                if (colon) ctx->vae_shift = atof(colon + 1);
+            }
+        }
+    }
 
-    if (ctx->is_distilled) {
-        ctx->default_steps = 4;
-        ctx->default_guidance = 1.0f;
+    /* Determine model variant name based on architecture. */
+    if (ctx->is_zimage) {
+        int hidden_size = ctx->zi_dim;
+        const char *size_label = "6B";  /* Z-Image-Turbo is 6B */
+        if (hidden_size != 3840) {
+            size_label = (hidden_size > 3840) ? "large" : "small";
+        }
+        ctx->is_non_commercial = 0;  /* Z-Image is Apache 2.0 */
+        ctx->num_heads = num_heads;
+        ctx->default_steps = 9;       /* 8 NFE = 9 scheduler steps */
+        ctx->default_guidance = 0.0f; /* No CFG for Z-Image-Turbo */
+        ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
         snprintf(ctx->model_name, sizeof(ctx->model_name),
-                 "FLUX.2-klein-%s", size_label);
+                 "Z-Image-Turbo-%s", size_label);
     } else {
-        ctx->default_steps = 50;
-        ctx->default_guidance = 4.0f;
-        snprintf(ctx->model_name, sizeof(ctx->model_name),
-                 "FLUX.2-klein-base-%s", size_label);
+        int hidden_size = num_heads * 128;  /* head_dim is always 128 */
+        const char *size_label = (hidden_size > 3072) ? "9B" : "4B";
+        ctx->is_non_commercial = (hidden_size > 3072) ? 1 : 0;
+        ctx->num_heads = num_heads;
+
+        if (ctx->is_distilled) {
+            ctx->default_steps = 4;
+            ctx->default_guidance = 1.0f;
+            snprintf(ctx->model_name, sizeof(ctx->model_name),
+                     "FLUX.2-klein-%s", size_label);
+        } else {
+            ctx->default_steps = 50;
+            ctx->default_guidance = 4.0f;
+            snprintf(ctx->model_name, sizeof(ctx->model_name),
+                     "FLUX.2-klein-base-%s", size_label);
+        }
     }
 
     /* Load VAE only at startup (~300MB).
@@ -272,7 +459,8 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     if (file_exists(path)) {
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
-            ctx->vae = flux_vae_load_safetensors(sf);
+            ctx->vae = flux_vae_load_safetensors_ex(sf,
+                ctx->vae_z_channels, ctx->vae_scaling, ctx->vae_shift);
             safetensors_close(sf);
         }
     }
@@ -310,6 +498,7 @@ void flux_free(flux_ctx *ctx) {
     qwen3_encoder_free(ctx->qwen3_encoder);
     flux_vae_free(ctx->vae);
     flux_transformer_free(ctx->transformer);
+    zi_transformer_free(ctx->zi_transformer);
 
     free(ctx);
 }
@@ -324,6 +513,10 @@ void flux_set_keep_models_loaded(flux_ctx *ctx, int enable) {
 
 int flux_is_distilled(flux_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
+}
+
+int flux_is_zimage(flux_ctx *ctx) {
+    return ctx ? ctx->is_zimage : 0;
 }
 
 static int flux_load_transformer_if_needed(flux_ctx *ctx);
@@ -361,6 +554,11 @@ void flux_unload_lora(flux_ctx *ctx) {
     flux_transformer_set_lora(ctx->transformer, NULL);
 }
 
+/* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.
+ * The encoder and transformer can't coexist in memory on most machines,
+ * so this is called after text encoding and before denoising. On Metal,
+ * also resets all GPU state (weight caches, pools) to avoid stale data
+ * when the transformer loads into the same memory regions. */
 void flux_release_text_encoder(flux_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
@@ -377,7 +575,10 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 #endif
 }
 
-/* Load transformer on-demand if not already loaded */
+/* Lazy-load the Flux transformer from safetensors files. Deferred to
+ * generation time because the text encoder must be freed first -- both
+ * are too large to fit in memory simultaneously. Once loaded, the
+ * transformer persists across generations (no reload per image). */
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     if (ctx->transformer) return 1;  /* Already loaded */
 
@@ -396,15 +597,41 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     return 1;
 }
 
+/* Load Z-Image transformer on-demand if not already loaded */
+static int flux_load_zimage_transformer_if_needed(flux_ctx *ctx) {
+    if (ctx->zi_transformer) return 1;  /* Already loaded */
+
+    if (flux_phase_callback) flux_phase_callback("Loading Z-Image transformer", 0);
+    ctx->zi_transformer = zi_transformer_load_safetensors(
+        ctx->model_dir,
+        ctx->zi_dim, ctx->zi_dim / 128, ctx->zi_n_layers, ctx->zi_n_refiner,
+        ctx->zi_cap_feat_dim, ctx->zi_in_channels, ctx->zi_patch_size,
+        ctx->zi_rope_theta, ctx->zi_axes_dims);
+    if (flux_phase_callback) flux_phase_callback("Loading Z-Image transformer", 1);
+
+    if (!ctx->zi_transformer) {
+        set_error("Failed to load Z-Image transformer");
+        return 0;
+    }
+    return 1;
+}
+
 /* Get transformer for debugging */
 void *flux_get_transformer(flux_ctx *ctx) {
-    return ctx ? ctx->transformer : NULL;
+    if (!ctx) return NULL;
+    if (ctx->is_zimage) return ctx->zi_transformer;
+    return ctx->transformer;
 }
 
 /* ========================================================================
  * Text Encoding
  * ======================================================================== */
 
+/* Run the prompt through Qwen3 to produce text embeddings. For Flux models,
+ * hidden states from layers 8, 17, 26 are concatenated to form [512, text_dim].
+ * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
+ * count via out_seq_len. The returned embedding buffer is still max-seq padded;
+ * Z-Image consumes only the first out_seq_len tokens. */
 float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx || !prompt) {
         *out_seq_len = 0;
@@ -431,14 +658,26 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     }
 
     if (!ctx->qwen3_encoder) {
-        /* Return zero embeddings if encoder not available */
+        if (ctx->is_zimage) {
+            /* Z-Image requires a real (unpadded) token sequence length. */
+            *out_seq_len = 0;
+            set_error("Qwen3 text encoder unavailable for Z-Image");
+            return NULL;
+        }
+        /* Flux fallback: return zero padded embeddings. */
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
         return (float *)calloc(QWEN3_MAX_SEQ_LEN * ctx->text_dim, sizeof(float));
     }
 
+    /* Set extraction mode: Z-Image uses single layer, Flux uses 3-layer concat */
+    qwen3_set_extraction_mode(ctx->qwen3_encoder, ctx->is_zimage ? 1 : 0);
+
     /* Encode text using Qwen3 */
     if (flux_phase_callback) flux_phase_callback("encoding text", 0);
-    float *embeddings = qwen3_encode_text(ctx->qwen3_encoder, prompt);
+
+    int num_real_tokens = 0;
+    float *embeddings = qwen3_encode_text_ex(ctx->qwen3_encoder, prompt,
+                                               &num_real_tokens);
     if (flux_phase_callback) flux_phase_callback("encoding text", 1);
 
     /* Store in cache for future lookups */
@@ -447,19 +686,158 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
                         QWEN3_MAX_SEQ_LEN * ctx->text_dim);
     }
 
-    *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
+    if (ctx->is_zimage) {
+        /* Z-Image: use only real tokens from the padded embedding buffer. */
+        *out_seq_len = num_real_tokens;
+    } else {
+        /* Flux: return full padded sequence (512) */
+        *out_seq_len = QWEN3_MAX_SEQ_LEN;
+    }
     return embeddings;
+}
+
+/* ========================================================================
+ * Z-Image Generation
+ * ======================================================================== */
+
+/* Z-Image txt2img pipeline with pre-computed embeddings. Unlike Flux which
+ * works in post-patchification space [128, H/16, W/16], Z-Image initializes
+ * noise at pre-patchification dimensions [16, H/8, W/8] and the transformer
+ * operates there. After denoising (8 NFE from 9 scheduler steps, where the
+ * last step is a no-op because sigma_min=0), the output is patchified to
+ * [64, H/16, W/16] for VAE decode. */
+static flux_image *flux_generate_zimage_with_embeddings(flux_ctx *ctx,
+                                                          const float *text_emb,
+                                                          int text_seq,
+                                                          const flux_params *p_in) {
+    if (!ctx || !text_emb || text_seq <= 0) {
+        set_error("Invalid context or embeddings");
+        return NULL;
+    }
+
+    flux_params p;
+    if (p_in) {
+        p = *p_in;
+    } else {
+        p = (flux_params)FLUX_PARAMS_DEFAULT;
+    }
+
+    /* Validate dimensions */
+    if (p.width <= 0) p.width = 1024;   /* Z-Image default: 1024x1024 */
+    if (p.height <= 0) p.height = 1024;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+
+    /* Ensure dimensions are divisible by 16 */
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+        set_error("Image dimensions exceed maximum (1792x1792)");
+        return NULL;
+    }
+
+    /* Release text encoder to free memory before loading transformer */
+    flux_release_text_encoder(ctx);
+
+    /* Load Z-Image transformer on-demand (persistent across generations). */
+    if (!flux_load_zimage_transformer_if_needed(ctx)) {
+        return NULL;
+    }
+
+    /* Z-Image latent dimensions:
+     * The transformer works at pre-patchification: [in_ch, H/8, W/8]
+     * where in_ch=16, and patchification happens inside the transformer.
+     * VAE decode expects post-patchification: [latent_ch, H/16, W/16]
+     * where latent_ch = in_ch * ps * ps = 64. */
+    int ps = ctx->zi_patch_size;  /* 2 */
+    int pre_h = p.height / 8;    /* H/8: pre-patchification spatial */
+    int pre_w = p.width / 8;
+    int in_ch = ctx->zi_in_channels;  /* 16 */
+    int post_h = pre_h / ps;     /* H/16: post-patchification spatial */
+    int post_w = pre_w / ps;
+    int image_seq_len = post_h * post_w;
+
+    /* Initialize noise at pre-patchification dimensions: [in_ch, H/8, W/8] */
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = flux_init_noise(1, in_ch, pre_h, pre_w, seed);
+
+    /* Get Z-Image schedule (default FlowMatch; linear/power if explicitly requested). */
+    float *schedule = flux_selected_zimage_schedule(&p, image_seq_len);
+
+    /* Sample using Z-Image Euler method.
+     * The transformer takes [in_ch, pre_h, pre_w] and returns same shape. */
+    float *denoised = flux_sample_euler_zimage(
+        ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
+        ps,
+        text_emb, text_seq,
+        schedule, p.num_steps,
+        NULL
+    );
+
+    free(z);
+    free(schedule);
+
+    if (!denoised) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Patchify transformer output for VAE decode:
+     * [1, in_ch, H/8, W/8] -> [1, latent_ch, H/16, W/16]
+     * where latent_ch = in_ch * ps * ps = 64 */
+    int latent_ch = in_ch * ps * ps;
+    float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    flux_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
+    free(denoised);
+
+    /* Decode latent to image */
+    flux_image *img = NULL;
+    if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
+        img = flux_vae_decode(ctx->vae, latent, 1, post_h, post_w);
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+    }
+
+    free(latent);
+    return img;
+}
+
+static flux_image *flux_generate_zimage(flux_ctx *ctx, const char *prompt,
+                                          const flux_params *p_in) {
+    /* Encode text (Z-Image mode: extraction mode 1, single layer) */
+    int text_seq;
+    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+
+    flux_image *img = flux_generate_zimage_with_embeddings(ctx, text_emb, text_seq, p_in);
+    free(text_emb);
+    return img;
 }
 
 /* ========================================================================
  * Image Generation
  * ======================================================================== */
 
+/* Main text-to-image entry point. Routes to Z-Image or Flux pipeline based
+ * on model type. For Flux: encodes text via Qwen3, frees the encoder, loads
+ * the transformer, initializes Gaussian noise in latent space, then runs
+ * Euler ODE denoising (4 steps distilled / 50 steps base with CFG) followed
+ * by VAE decode. For base models, an empty-prompt encoding is also produced
+ * for Classifier-Free Guidance (two sequential transformer passes per step). */
 flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
                           const flux_params *params) {
     if (!ctx || !prompt) {
         set_error("Invalid context or prompt");
         return NULL;
+    }
+
+    /* Route to Z-Image pipeline if appropriate */
+    if (ctx->is_zimage) {
+        return flux_generate_zimage(ctx, prompt, params);
     }
 
     /* Use defaults if params is NULL */
@@ -576,12 +954,21 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
  * Generation with Pre-computed Embeddings
  * ======================================================================== */
 
+/* Generate from pre-computed text embeddings, skipping the Qwen3 encoding
+ * step. Useful for the embedding cache (repeat prompts without re-encoding).
+ * Only supports distilled models and Z-Image -- base model CFG requires two
+ * separate embeddings (conditioned + empty prompt) which this API doesn't
+ * provide, so it would produce incorrect results. */
 flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
                                            const float *text_emb, int text_seq,
                                            const flux_params *params) {
     if (!ctx || !text_emb) {
         set_error("Invalid context or embeddings");
         return NULL;
+    }
+
+    if (ctx->is_zimage) {
+        return flux_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
     }
 
     /* This API only supports the distilled (non-CFG) sampler since the
@@ -671,6 +1058,12 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
                                                      const flux_params *params) {
     if (!ctx || !text_emb || !noise) {
         set_error("Invalid context, embeddings, or noise");
+        return NULL;
+    }
+
+    if (ctx->is_zimage) {
+        set_error("Z-Image does not support external embedding/noise generation API. "
+                  "Use flux_generate() with a prompt.");
         return NULL;
     }
 
@@ -824,10 +1217,21 @@ static int fit_refs_for_attention(int num_heads,
  * Image-to-Image Generation
  * ======================================================================== */
 
+/* Image-to-image generation via in-context conditioning. The reference image
+ * is VAE-encoded into latent tokens with a RoPE T offset (T=10), while the
+ * target starts from pure noise (T=0). Both are concatenated and fed to the
+ * transformer, which attends to reference tokens via joint attention -- this
+ * is fundamentally different from traditional img2img that adds noise to the
+ * encoded image. References are dynamically resized if the resulting attention
+ * matrix would exceed the 4GB MPS memory limit. */
 flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
                          const flux_image *input, const flux_params *params) {
     if (!ctx || !prompt || !input) {
         set_error("Invalid parameters");
+        return NULL;
+    }
+    if (ctx->is_zimage) {
+        set_error("img2img is not supported for Z-Image");
         return NULL;
     }
 
@@ -1023,11 +1427,20 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
  * Multi-Reference Generation
  * ======================================================================== */
 
+/* Multi-reference image generation dispatcher. Zero refs routes to txt2img,
+ * one ref to the optimized single-reference img2img path. For multiple refs,
+ * each reference is VAE-encoded with a distinct RoPE T offset (10, 20, 30...)
+ * so the transformer can distinguish them spatially. All reference latents
+ * participate in joint attention alongside the noised target tokens. */
 flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                           const flux_image **refs, int num_refs,
                           const flux_params *params) {
     if (!ctx || !prompt) {
         set_error("Invalid parameters");
+        return NULL;
+    }
+    if (ctx->is_zimage) {
+        set_error("multi-reference img2img is not supported for Z-Image");
         return NULL;
     }
 
@@ -1254,12 +1667,15 @@ void flux_set_seed(int64_t seed) {
 
 const char *flux_model_info(flux_ctx *ctx) {
     static char info[256];
+    const char *type;
     if (!ctx) {
         return "No model loaded";
     }
+    if (ctx->is_zimage) type = "zimage";
+    else type = ctx->is_distilled ? "distilled" : "base";
     snprintf(info, sizeof(info), "%s v%s (%s, %d steps, guidance %.1f)",
              ctx->model_name, ctx->model_version,
-             ctx->is_distilled ? "distilled" : "base",
+             type,
              ctx->default_steps, ctx->default_guidance);
     return info;
 }
@@ -1276,6 +1692,9 @@ int flux_is_non_commercial(flux_ctx *ctx) {
  * Low-level API
  * ======================================================================== */
 
+/* Public API: VAE-encode an RGB image to latent space. Converts the image
+ * to a float tensor, runs the VAE encoder, and returns the latent buffer
+ * with dimensions in out_h/out_w (each 1/16 of the pixel dimensions). */
 float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
                          int *out_h, int *out_w) {
     if (!ctx || !img || !ctx->vae) {
@@ -1292,6 +1711,8 @@ float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
     return latent;
 }
 
+/* Public API: VAE-decode a latent tensor back to an RGB image.
+ * Latent dimensions are 1/16 of the output pixel dimensions. */
 flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
                                int latent_h, int latent_w) {
     if (!ctx || !latent || !ctx->vae) return NULL;

@@ -514,12 +514,12 @@ kernel void attention_fused(
     constant int &num_heads [[buffer(6)]],
     constant int &head_dim [[buffer(7)]],
     constant float &scale [[buffer(8)]],
+    threadgroup float *shared_scores [[threadgroup(0)]],  // [seq_k] dynamic
     uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
     uint3 tid_pos [[thread_position_in_threadgroup]],
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
-    // Shared memory for scores and reductions
-    threadgroup float shared_scores[1024];  // Up to 1024 seq_k (768 for 256x256)
+    // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
 
@@ -1745,12 +1745,12 @@ kernel void attention_fused_bf16(
     constant int &num_heads [[buffer(6)]],
     constant int &head_dim [[buffer(7)]],
     constant float &scale [[buffer(8)]],
+    threadgroup float *shared_scores [[threadgroup(0)]],  // [seq_k] dynamic
     uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
     uint3 tid_pos [[thread_position_in_threadgroup]],
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
-    // Shared memory for scores and reductions
-    threadgroup float shared_scores[1024];  // Up to 1024 seq_k (768 for 256x256)
+    // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
 

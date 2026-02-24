@@ -64,6 +64,10 @@ void emb_cache_store(const char *prompt, const float *embedding, int num_element
  * Caller must free the returned embedding. */
 float *emb_cache_lookup(const char *prompt);
 
+/* Lookup embedding with element count metadata.
+ * If found, sets *num_elements to total float elements in returned embedding. */
+float *emb_cache_lookup_ex(const char *prompt, int *num_elements);
+
 /* Check if prompt is in cache without dequantizing */
 int emb_cache_has(const char *prompt);
 

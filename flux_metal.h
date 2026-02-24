@@ -41,6 +41,12 @@ void flux_metal_cleanup(void);
 void flux_metal_reset(void);
 void flux_metal_rope_cache_begin(void);
 
+/*
+ * Reset transient GPU execution state while preserving weight/bf16 caches.
+ * Intended for generation boundaries in long-lived interactive sessions.
+ */
+void flux_metal_reset_transient(void);
+
 /* Debug: Clear only specific caches (for isolating issues) */
 void flux_metal_clear_weight_cache_only(void);
 void flux_metal_clear_bf16_cache_only(void);
@@ -48,8 +54,11 @@ void flux_metal_clear_f16_cache_only(void);
 void flux_metal_clear_activation_pool_only(void);
 
 /*
- * GPU-accelerated matrix multiplication using MPS.
+ * GPU-accelerated matrix multiplication using MPS (generic).
  * C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
+ *
+ * This generic entry point does NOT cache B, so it is safe for dynamic
+ * matrices (for example attention K/V matrices allocated per call).
  *
  * transpose_a: if non-zero, use A^T
  * transpose_b: if non-zero, use B^T
@@ -61,6 +70,18 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                       const float *B, int ldb,
                       float beta,
                       float *C, int ldc);
+
+/*
+ * Same as flux_metal_sgemm(), but caches B by pointer for static weights.
+ * Use this only when B is immutable across calls (e.g., model parameters).
+ */
+void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
+                             int M, int N, int K,
+                             float alpha,
+                             const float *A, int lda,
+                             const float *B, int ldb,
+                             float beta,
+                             float *C, int ldc);
 
 /*
  * GPU-accelerated matrix multiplication with bf16 weights.
@@ -104,6 +125,12 @@ void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
  * Synchronize GPU operations (wait for completion).
  */
 void flux_metal_sync(void);
+
+/*
+ * Wait until the Metal command queue is fully drained.
+ * This is a stronger fence useful for debugging ordering/race issues.
+ */
+void flux_metal_wait_idle(void);
 
 /*
  * Begin a batch of GPU operations.
@@ -322,14 +349,30 @@ void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
                          const float *shift, const float *scale,
                          int seq, int hidden, float eps);
 
+/* RMSNorm on f32 GPU tensors: out = rms_norm(x) * weight */
+void flux_gpu_rms_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                            const float *weight, int seq, int hidden, float eps);
+
 /* QK RMSNorm on GPU: applies RMSNorm to Q and K in-place */
 void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps);
 
-/* RoPE 2D on GPU: applies rotary position embeddings in-place */
+/* RoPE 2D on GPU: applies rotary position embeddings in-place (4-axis split-half, Flux style) */
 void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim);
+
+/* Single-stream RoPE for f32 tensors (consecutive-pair rotation, Z-Image style).
+ * cos_freq, sin_freq: [seq, head_dim] with values duplicated for pairs. */
+void flux_gpu_rope_single_f32(flux_gpu_tensor_t x,
+                               const float *cos_freq, const float *sin_freq,
+                               int seq, int heads, int head_dim);
+
+/* Apply single-stream RoPE to Q and K tensors in one command buffer.
+ * Uses the same [seq, head_dim] tables for both tensors. */
+void flux_gpu_rope_single_pair_f32(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                   const float *cos_freq, const float *sin_freq,
+                                   int seq, int heads, int head_dim);
 
 /* Unified RoPE for text+image: applies different frequencies to text/image portions */
 void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
@@ -503,11 +546,22 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
 /* GPU blit copy for f32 tensors */
 void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
 
+/* GPU blit copy for f32 tensors with element offsets */
+void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
+                               flux_gpu_tensor_t src, size_t src_offset,
+                               size_t n);
+
 /* Convert f32 GPU tensor to bf16 (returns new tensor) */
 flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor);
 
 /* Convert bf16 GPU tensor to f32 (returns new tensor) */
 flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor);
+
+/* Convert f32 → bf16 into pre-allocated tensor (no alloc, batch-safe) */
+int flux_gpu_convert_f32_to_bf16_into(flux_gpu_tensor_t bf16_out, flux_gpu_tensor_t f32_in);
+
+/* Convert bf16 → f32 into pre-allocated tensor (no alloc, batch-safe) */
+int flux_gpu_convert_bf16_to_f32_into(flux_gpu_tensor_t f32_out, flux_gpu_tensor_t bf16_in);
 
 /* BF16 native linear layer (all bf16) */
 flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,

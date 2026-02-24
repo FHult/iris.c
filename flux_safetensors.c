@@ -200,6 +200,10 @@ static int parse_header(safetensors_file_t *sf) {
     return 0;
 }
 
+/* Open a safetensors file by memory-mapping it. Parses the JSON header to
+ * build a tensor index (name -> offset/shape/dtype). Memory mapping lets the
+ * OS page in tensor data on demand, avoiding upfront reads of multi-GB model
+ * files -- only the weights actually used get loaded into RAM. */
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -358,6 +362,10 @@ static float f16_to_f32(uint16_t f16) {
     return result;
 }
 
+/* Return a tensor's data as a newly allocated f32 array. Handles dtype
+ * conversion: f32 is memcpy'd directly, bf16 and f16 are converted
+ * element-wise. The caller owns the returned buffer. This is the main
+ * entry point for loading individual weights during model initialization. */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
     int64_t n = safetensor_numel(t);
     float *out = malloc(n * sizeof(float));

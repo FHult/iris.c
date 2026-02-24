@@ -135,6 +135,11 @@ void flux_axpy(float *a, float scale, const float *b, int n) {
  * Matrix Operations
  * ======================================================================== */
 
+/* General matrix multiply C = A @ B. Routes to Metal GPU when the matrix
+ * is large enough that GPU compute outweighs the CPU-GPU transfer cost,
+ * otherwise falls back to BLAS sgemm or a naive triple loop. This is the
+ * backbone operation: every linear projection in the transformer, text
+ * encoder, and VAE bottleneck goes through here. */
 void flux_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
@@ -222,13 +227,13 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
          * B[N, K] = W[out_dim, in_dim] (transposed)
          * C[M, N] = y[seq_len, out_dim]
          */
-        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
-                         seq_len, out_dim, in_dim,
-                         1.0f,
-                         x, in_dim,
-                         W, in_dim,
-                         0.0f,
-                         y, out_dim);
+        flux_metal_sgemm_cached(0, 1,  /* no transpose A, transpose B */
+                                seq_len, out_dim, in_dim,
+                                1.0f,
+                                x, in_dim,
+                                W, in_dim,
+                                0.0f,
+                                y, out_dim);
 
         /* Add bias if present */
         if (b != NULL) {
@@ -341,6 +346,11 @@ void flux_gpu_end_batch(void) {
  * Convolution Operations
  * ======================================================================== */
 
+/* 2D convolution via im2col + GEMM: reshapes input so each column is a
+ * flattened receptive field, then multiplies by the kernel weight matrix.
+ * Tiles spatially to bound memory usage for large feature maps. This is the
+ * standard approach for BLAS/GPU-friendly convolution, used throughout the
+ * VAE encoder and decoder. */
 void flux_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int batch, int in_ch, int out_ch, int H, int W,
                  int kH, int kW, int stride, int padding) {
@@ -639,6 +649,10 @@ void flux_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
+/* Scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V.
+ * This is the naive implementation that materializes the full seq_q x seq_k
+ * attention matrix. Used only for small sequences; the transformer's main
+ * attention path uses flux_flash_attention() or the GPU kernel instead. */
 void flux_attention(float *out, const float *Q, const float *K, const float *V,
                     int batch, int heads, int seq_q, int seq_k, int head_dim,
                     float scale) {
@@ -976,6 +990,11 @@ void flux_flash_attention(float *out, const float *Q, const float *K, const floa
     free(tile_scores);
 }
 
+/* Apply precomputed RoPE (Rotary Position Embedding) in-place using the
+ * split-half convention: dim d pairs with dim d+half for rotation. This is
+ * the Flux convention (4-axis, split-half); Z-Image uses consecutive pairs
+ * via a separate kernel. RoPE lets the transformer learn relative position
+ * from the dot-product structure of Q and K. */
 void flux_apply_rope(float *x, const float *freqs,
                      int batch, int seq, int heads, int head_dim) {
     /* x: [batch, seq, heads, head_dim]
@@ -1043,6 +1062,11 @@ void flux_upsample_nearest(float *out, const float *in,
     }
 }
 
+/* Convert spatial latent to patch tokens for the diffusion transformer.
+ * Groups each ps x ps spatial block into a single token vector:
+ * [batch, channels, H, W] -> [batch, channels*ps*ps, H/ps, W/ps].
+ * The transformer operates on these patch tokens, not individual spatial
+ * positions, reducing sequence length by ps*ps (4x for ps=2). */
 void flux_patchify(float *out, const float *in,
                    int batch, int channels, int H, int W, int patch_size) {
     /* [B, C, H, W] -> [B, C*p*p, H/p, W/p] */

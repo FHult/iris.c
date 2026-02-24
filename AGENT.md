@@ -1,31 +1,44 @@
-This is a C implementation of the Flux.2 Klein model, an image synthesis model
-created by Black Forest Labs, supporting both 4B and 9B parameter variants.
+This is a C implementation of two image synthesis model families:
+- Flux.2 Klein (4B and 9B variants)
+- Z-Image-Turbo (6B)
 
-Four model variants are supported:
-- **4B Distilled** (flux-klein-4b): 4 steps, no CFG, fast.
-- **4B Base** (flux-klein-4b-base): 50 steps default, Classifier-Free Guidance (CFG), higher quality but ~25x slower.
-- **9B Distilled** (flux-klein-9b): 4 steps, larger model, higher quality. Non-commercial license.
-- **9B Base** (flux-klein-9b-base): 50 steps default, CFG, highest quality. Non-commercial license.
+The Flux models are created by Black Forest Labs.
+Z-Image-Turbo is published as `Tongyi-MAI/Z-Image-Turbo`.
 
-All share the same architecture (rectified flow transformer) with different dimensions. Architecture parameters are read at runtime from the model's config JSON files (`transformer/config.json` and `text_encoder/config.json`). The model type is autodetected from `model_index.json` and the transformer config. The `--base` CLI flag can force base mode.
+Model type and architecture are autodetected from model metadata/config files.
+Do not rely on hardcoded dimensions when a config value is available.
 
-- The model works both in txt2img mode than in img2img mode with text conditioning.
-- The text embedding is created via Qwen3 (4B for the 4B model, 8B for the 9B model).
-- The conditioning images, that can be more than one, are VAE-encoded and concatenated with the text embeddings.
+# Supported Model Variants
 
-For deeper technical details, see the "Implementation Details" section at the bottom.
+Flux variants:
+- **4B Distilled** (`flux-klein-4b`): 4 steps, no CFG, fast.
+- **4B Base** (`flux-klein-4b-base`): 50 steps default, CFG, higher quality but much slower.
+- **9B Distilled** (`flux-klein-9b`): 4 steps, larger model, higher quality. Non-commercial license.
+- **9B Base** (`flux-klein-9b-base`): 50 steps default, CFG. Non-commercial license.
+
+Z-Image variant:
+- **Z-Image-Turbo** (`zimage-turbo`): distilled S3-DiT model, default 8 NFE (9 scheduler values), guidance 0.0.
+
+# High-Level Capabilities
+
+- Flux supports both txt2img and img2img with text conditioning.
+- Z-Image currently supports txt2img path in this codebase.
+- Text embeddings are generated via Qwen3.
+- VAE is used for latent/image conversion in both families.
 
 # File Structure
 
 ```
-flux.c                  - Main library (generation, img2img)
-flux_transformer.c      - Diffusion transformer
-flux_sample.c           - Sampling/denoising loop (Euler ODE)
+flux.c                  - Main library (model load, generation routing)
+flux_transformer.c      - Flux diffusion transformer (MMDiT)
+flux_zimage_transformer.c - Z-Image transformer (S3-DiT)
+flux_sample.c           - Sampling/denoising loops (Euler ODE)
 flux_qwen3.c            - Qwen3 text encoder
 flux_qwen3_tokenizer.c  - BPE tokenizer
 flux_vae.c              - VAE encoder/decoder
 flux_kernels.c          - CPU kernels (softmax, RMSNorm, etc.)
-flux_metal.m            - Metal GPU acceleration
+flux_metal.m            - Metal GPU acceleration runtime
+flux_metal.h            - Metal/GPU API surface
 flux_shaders.metal      - Metal compute kernels
 flux_safetensors.c      - Weight loading
 flux_image.c            - Image I/O (PNG/PPM/JPEG)
@@ -38,114 +51,138 @@ terminals.c             - Terminal handling
 main.c                  - CLI entry point
 ```
 
-# Pipeline Overview
-
-```
-1. Text Encoding:    prompt → Qwen3 → [512, text_dim] embeddings (text_dim=7680 for 4B, 12288 for 9B)
-2. Latent Init:      random noise [H/16, W/16, 128]
-3. Denoising Loop (4 steps distilled, 50 steps base):
-   └─ per step: double blocks → single blocks → final layer → velocity
-4. VAE Decode:       latents → VAE decoder → RGB image
-
-img2img: Reference images are VAE-encoded and passed as extra tokens (not noise).
-The model attends to them via joint attention (in-context conditioning).
-
-Base model CFG: each denoising step runs the transformer twice (once with empty
-prompt, once with real prompt). Combined as: v = v_uncond + guidance * (v_cond - v_uncond).
-The empty prompt is literal "" through the Qwen3 chat template. The two passes
-are run sequentially (not batched).
-```
-
-# Key Architecture Constants
-
-These are now read at runtime from the model's config JSON files. Reference values:
-
-4B Transformer: hidden=3072, heads=24, head_dim=128, mlp=9216, double_blocks=5, single_blocks=20, text_dim=7680
-9B Transformer: hidden=4096, heads=32, head_dim=128, mlp=12288, double_blocks=8, single_blocks=24, text_dim=12288
-
-4B Qwen3: hidden=2560, q_heads=32, kv_heads=8 (GQA 4:1), layers=36, output_dim=7680 (3×2560)
-9B Qwen3: hidden=4096, q_heads=32, kv_heads=8 (GQA 4:1), layers=36, output_dim=12288 (3×4096)
-
-Shared: latent_ch=128, head_dim=128, VAE architecture identical across all models.
-
-# Critical Implementation Details
-
-These details have caused bugs and are easy to get wrong:
-
-- **Concatenation order** is `[TEXT, IMAGE]` not `[IMAGE, TEXT]` for Q, K, V
-- **AdaLN formula**: `out = (1 + scale) * norm(x) + shift` (apply shift after scale)
-- **Final layer** projection output splits as `(scale, shift)` NOT `(shift, scale)`
-- **RoPE rotation**: `out[0] = cos*x0 - sin*x1`, `out[1] = cos*x1 + sin*x0` (see RoPE section for axis details)
-
 # Build Targets
 
-This project implements three different targets:
+This project implements three targets:
+- MPS: Apple Silicon GPU path.
+- BLAS: optimized CPU inference via BLAS/OpenBLAS.
+- generic: pure C fallback, very slow.
 
-- MPS: for Apple Silicon.
-- BLAS: for optimized CPU inference via SIMD.
-- generic: for CPUs, pure C, very slow.
+# Development Rules
 
-# Development rules
+- No additional project dependencies. Acceptable external deps are BLAS/OpenBLAS and Metal/MPS from macOS.
+- Reject tiny speed gains that add complexity; prefer substantial wins.
+- Always test code modifications with `make test`.
+- Once changes are validated, commit them.
+- Never add or commit unrelated unstaged files.
+- Keep code simple and understandable; leave no dead code.
+- If you optimize one backend, verify others were not regressed.
+- Stick to standard C; avoid compiler-specific tricks/pragmas unless strictly required.
 
-- We don't add any dependency to this project. Even the PNG and JPG support is implemented internally. The only acceptable dependencies are the blas / openblas library and the Metal primitives that are part of MacOS.
-- Don't accept speed improvements that are just marginal, like 1%: they may be just random fluctations among runs. Refuse small speed improvements especially if they make the code more complicated, however more complex code for important speed improvements is ok.
-- Always test a code modification after implementing it, using `make test`
-- Once you reach a positive result, commit it.
-- Never add or commit unstaged files, unless you created them for a specific purpose.
-- Code must be simple and understandable.
-- No dead code must be left around.
-- When you work on a single target (for instance MPS) you need to make sure OpenBLAS / CPU still work in case you did modifications that potentially created issues.
-- Stick to standard C, no compiler-specific tricks, pragmas, ...
+# How To Run
 
-# How to run the project
+Flux examples:
 
-    ./flux2 -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux2 -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux2 -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux2 -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
 
-You have your weights ready in `flux-klein-4b` (4B distilled), `flux-klein-4b-base` (4B base), `flux-klein-9b` (9B distilled), and `flux-klein-9b-base` (9B base). If you can't find them, there is a download script, but before using it ask the user.
+Z-Image example:
 
-# Where to find the reference implementation in Python
+    ./flux -d zimage-turbo -p "a fish" -o /tmp/zimage.png
 
-If you need to compare your outputs with the reference implementation, or if you need to inspect the reference implementation for clues about the model, you fill find it here:
+If model weights are missing, use the download script only after user approval.
 
-- Python venv to run the Python inference pipeline is in ./flux_env/
-- Python implementation of flux2 (official) is in ./flux2
+# Python Reference Implementations
+
+For parity checks/debugging:
+
+Flux references:
+- Python venv in `./flux_env/`
+- Official Flux Python code in `./flux2/`
+
+Z-Image references:
+- `flux_env/lib/python3.12/site-packages/diffusers/models/transformers/transformer_z_image.py`
+- `flux_env/lib/python3.12/site-packages/diffusers/pipelines/z_image/pipeline_z_image.py`
+- `flux_env/lib/python3.12/site-packages/diffusers/schedulers/scheduling_flow_match_euler_discrete.py`
+- `flux_env/lib/python3.12/site-packages/diffusers/models/autoencoders/autoencoder_kl.py`
 
 Rules:
+- Never add/commit `flux_env/` or `flux2/`.
+- If missing, ask user before recreating/downloading.
 
-- Never add / commit such directories into the git repository.
-- If you can't find such directories, ask the user before creating a venv and downloading the Flux2 official inference code.
+# Debugging Notes
 
-# Debugging
+- Reusable debug scripts belong in `./debug`.
+- One-off throwaway debugging tools should be created in `/tmp` and discarded.
+- JPEG code has dedicated tests/tools in `./jpg_test`.
 
-Into ./debug you can find Python scripts useful for debugging. If you need more debugging scripts, please add them there, with a name that let humans and LLMs able to understand what they do easily. Put there only reusable testing components, otherwise just create them in /tmp and discard them later.
+# Flux Pipeline Overview
 
-The JPEG code can be tested with the tools in ./jpg_test
+```
+1. Text Encoding:    prompt -> Qwen3 -> [512, text_dim] embeddings
+2. Latent Init:      random noise [H/16, W/16, 128]
+3. Denoising Loop:   double blocks -> single blocks -> final layer -> velocity
+4. VAE Decode:       latents -> VAE decoder -> RGB image
 
-# RoPE (Rotary Position Embedding)
+img2img: VAE-encode reference images and pass as extra tokens (in-context conditioning).
 
-4-axis RoPE with 32 dims per axis (128 total = head_dim):
-- Axis 0 (dims 0-31): T position (temporal, used for img2img reference offset)
-- Axis 1 (dims 32-63): H position (height/y coordinate)
-- Axis 2 (dims 64-95): W position (width/x coordinate)
-- Axis 3 (dims 96-127): L position (sequence index)
+Base CFG: run transformer twice per step (empty prompt + conditioned prompt):
+v = v_uncond + guidance * (v_cond - v_uncond)
+```
 
-Token types:
-- Image tokens: use axes 1,2 (spatial position), axes 0,3 = identity (cos=1, sin=0)
-- Text tokens: use axis 3 only (sequence position), axes 0,1,2 = identity
-- Reference image tokens (img2img): same as image but axis 0 has T offset (10, 20, 30...)
+# Flux Key Architecture Constants
 
-# Timestep Embedding
+Read from runtime config; reference values:
 
-1. Input timestep scaled by 1000 (t=1.0 → 1000.0)
-2. Sinusoidal embedding: 128 frequencies → 256 dims
-3. MLP: linear(256→hidden) + SiLU + linear(hidden→hidden)
+Flux 4B transformer:
+- hidden=3072
+- heads=24
+- head_dim=128
+- mlp=9216
+- double_blocks=5
+- single_blocks=20
+- text_dim=7680
 
-# Text Encoder (Qwen3)
+Flux 9B transformer:
+- hidden=4096
+- heads=32
+- head_dim=128
+- mlp=12288
+- double_blocks=8
+- single_blocks=24
+- text_dim=12288
 
-Chat template format:
+Qwen3 (4B/9B encoders used for Flux):
+- 4B: hidden=2560, q_heads=32, kv_heads=8, layers=36, output_dim=7680
+- 9B: hidden=4096, q_heads=32, kv_heads=8, layers=36, output_dim=12288
+
+Shared:
+- latent_ch=128 (Flux latent after patchification)
+- head_dim=128
+
+# Flux Critical Implementation Details
+
+- Concatenation order for attention is `[TEXT, IMAGE]`, not `[IMAGE, TEXT]`.
+- AdaLN formula is `out = (1 + scale) * norm(x) + shift`.
+- Final layer modulation split is `(scale, shift)`, not `(shift, scale)`.
+- RoPE pair rotation is:
+  - `out0 = cos * x0 - sin * x1`
+  - `out1 = cos * x1 + sin * x0`
+
+# Flux RoPE (Rotary Position Embedding)
+
+4-axis RoPE with 32 dims per axis (128 total):
+- Axis 0 (dims 0..31): T position
+- Axis 1 (dims 32..63): H position
+- Axis 2 (dims 64..95): W position
+- Axis 3 (dims 96..127): L sequence index
+
+Token usage:
+- Image tokens: use H/W axes, T/L identity.
+- Text tokens: use L axis only.
+- Reference image tokens (img2img): same as image plus T offset (10, 20, 30...).
+
+# Flux Timestep Embedding
+
+1. Scale timestep by 1000.
+2. Sinusoidal embedding (128 freqs -> 256 dims).
+3. MLP: linear(256->hidden) + SiLU + linear(hidden->hidden).
+
+# Flux Text Encoder (Qwen3)
+
+Chat template:
 ```
 <|im_start|>user
 {prompt}<|im_end|>
@@ -156,73 +193,193 @@ Chat template format:
 
 ```
 
-Layer extraction: outputs from layers 8, 17, 26 (0-indexed) are concatenated → [seq, 3*hidden] (7680 for 4B, 12288 for 9B)
+Flux extraction: concatenate layers 8, 17, 26 (0-indexed):
+- 4B: [seq, 7680]
+- 9B: [seq, 12288]
 
-# VAE
+# Flux VAE
 
-Latent space: 32 channels, 16x spatial compression
+- Latent space: 32 channels, 16x spatial compression.
+- Patchify (encode): [B, 32, H/8, W/8] -> [B, 128, H/16, W/16]
+- Unpatchify (decode): [B, 128, H/16, W/16] -> [B, 32, H/8, W/8]
+- Channel multipliers: [1,2,4,4] -> [128,256,512,512]
 
-Patchification (encode): [B, 32, H/8, W/8] → [B, 128, H/16, W/16]
-Unpatchification (decode): [B, 128, H/16, W/16] → [B, 32, H/8, W/8]
+# Flux Double Block Flow
 
-Channel multipliers: [1, 2, 4, 4] → [128, 256, 512, 512]
-
-# Double Block Flow
-
-Input: img_hidden [img_seq, hidden], txt_hidden [txt_seq, hidden]
+Input: `img_hidden [img_seq, hidden]`, `txt_hidden [txt_seq, hidden]`
 
 1. AdaLN normalize both streams (shift1, scale1)
-2. Separate Q, K, V projections for each stream
-3. QK normalization (per-head RMSNorm)
-4. Apply RoPE (image: axes 1,2; text: axis 3)
-5. Joint attention: concatenate [txt_k, img_k] and [txt_v, img_v], each Q attends to full KV
-6. Output projection + gating (gate1)
+2. Stream-specific Q/K/V projections
+3. QK per-head RMSNorm
+4. RoPE (image axes 1/2, text axis 3)
+5. Joint attention over concatenated KV
+6. Output projection + gate1
 7. Residual add
 8. AdaLN normalize (shift2, scale2)
-9. FFN with SiLU-gated MLP
-10. Gating (gate2) + residual add
+9. SiLU-gated MLP
+10. gate2 + residual add
 
-Modulation params per stream: shift1, scale1, gate1, shift2, scale2, gate2 (6 × hidden)
+Per-stream modulation params: shift1, scale1, gate1, shift2, scale2, gate2.
 
-# Single Block Flow
+# Flux Single Block Flow
 
-Input: concatenated [txt_hidden, img_hidden] as single sequence
+Input: concatenated `[txt_hidden, img_hidden]`
 
-1. AdaLN normalize (shift, scale from t_emb)
-2. Fused QKV + MLP projection → [Q, K, V, gate, up] per position
+1. AdaLN normalize (shift/scale from t_emb)
+2. Fused QKV+MLP projection -> [Q,K,V,gate,up]
 3. QK normalization
-4. Apply RoPE: text portion uses axis 3, image portion uses axes 1,2
-5. Self-attention over full sequence
-6. SwiGLU: gate = silu(gate) * up
-7. Concatenate attention output and MLP output
+4. RoPE (text uses axis 3, image uses axes 1/2)
+5. Full self-attention
+6. SwiGLU: `silu(gate) * up`
+7. Concat attention output + MLP output
 8. Output projection
-9. Gating + residual add
+9. Gated residual add
 
-Modulation params: shift, scale, gate (3 × hidden)
+# Z-Image Pipeline Overview
+
+```
+1. Text Encoding:    prompt -> Qwen3 hidden_states[-2] -> [seq, 2560]
+2. Latent Init:      random noise [16, H/8, W/8] then patch-space processing
+3. Denoising Loop:   noise_refiner(2) -> context_refiner(2) -> main layers(30)
+4. Final Layer:      norm + modulation + projection to patch channels
+5. Unpatchify:       [num_patches, 64] -> [16, H/8, W/8]
+6. VAE Decode:       latents -> image
+```
+
+Z-Image uses sequence order `[IMAGE_TOKENS | CAPTION_TOKENS]` in its transformer path.
+
+# Z-Image Architecture (S3-DiT)
+
+Overview:
+- Model: Z-Image-Turbo (6B)
+- Architecture: S3-DiT single-stream style with refiners
+- Steps: default 8 NFE (scheduler array has 9 sigma values)
+- guidance: 0.0 (no CFG)
+
+Transformer config (reference):
+- dim=3840
+- n_heads=30
+- n_kv_heads=30
+- head_dim=128
+- n_layers=30
+- n_refiner_layers=2 (noise + context)
+- in_channels=16
+- patch_size=2
+- cap_feat_dim=2560
+- axes_dims=[32,48,48]
+- rope_theta=256.0
+- ffn_hidden=10240
+
+# Z-Image Text Encoder
+
+Uses the same Qwen3 4B base encoder family, but extraction differs from Flux:
+- extract only `hidden_states[-2]` (layer 34/36)
+- output shape [seq, 2560]
+
+Chat template is the same as Flux Qwen3 template.
+
+# Z-Image VAE Notes
+
+Z-Image VAE is Flux-like architecture with different latent settings:
+- latent_channels=16 (Flux uses 32)
+- scaling_factor=0.3611
+- shift_factor=0.1159
+- patchification for transformer input uses 2x2 over 16ch -> 64-dim patch vector
+
+Decode uses:
+- `latents = (latents / scaling_factor) + shift_factor`, then decode.
+
+# Z-Image Block Structure
+
+With modulation (noise_refiner + main layers):
+- modulation vector split into: scale_msa, gate_msa, scale_mlp, gate_mlp
+- gates go through tanh
+- normalization is scaled (no additive shift in block modulation path)
+- attention and FFN residuals are gated
+
+Without modulation (context_refiner):
+- no adaLN modulation
+- standard residual attention + FFN structure
+
+# Z-Image RoPE
+
+3-axis RoPE, head_dim=128 split as:
+- Axis T: 32 dims
+- Axis H: 48 dims
+- Axis W: 48 dims
+
+Theta is 256.0.
+Caption and image position-id construction must match CPU/GPU path exactly.
+
+# Z-Image Scheduler
+
+Default scheduler follows official diffusers FlowMatch Euler behavior (static shift).
+Important points:
+- terminal sigma is appended as 0
+- implementation should match official sigma construction semantics
+- explicit `--linear` or `--power` options override default schedule for parity/testing
+
+# Z-Image Critical Implementation Details
+
+- Transformer sequence order is `[IMAGE | CAPTION]` in Z-Image path.
+- Step previews must decode correctly patchified latent representation (`patch_size=2`),
+  otherwise shown step resolution/content can be misleading.
+- Caption padding and position-id alignment must match between CPU and MPS paths.
+- Keep immutable/static and dynamic matrix paths separate in MPS GEMM caching.
+
+# Z-Image Runtime Lessons (Keep)
+
+- Keep transformer loaded across generations in interactive workflows; avoid load/free per image.
+- Precompute per-step modulation once and reuse across modulated blocks.
+- Keep GPU fallback policy inside the zImage GPU forward path; avoid immediate full CPU fallback.
+- Run zImage final layer on GPU path where possible; read back only what is needed for decode.
+- Run image/caption embedding projections on GPU path in MPS mode.
+- Warm bf16 weight caches at load time to reduce first-step jitter in steady-state usage.
+- Keep embedding-cache path wired for repeated prompts in distilled interactive mode.
+- Maintain zImage-specific denoising timing counters for targeted profiling.
+
+# Z-Image Known Pitfalls (Historical Bugs)
+
+1. **MPS SGEMM B-cache misuse caused VAE decode corruption (hue/border artifacts).**
+   - Root cause: generic SGEMM cached matrix B by pointer, but VAE attention K/V are dynamic temporaries.
+   - Fix: split API paths:
+     - `flux_metal_sgemm`: generic path, no B-pointer cache
+     - `flux_metal_sgemm_cached`: explicit static-weight cached path
+   - Static weight call sites (for example linear layers) use cached variant only.
+
+2. **Scheduler parity bug with official Python implementation.**
+   - Z-Image sigma schedule must follow official diffusers FlowMatch behavior.
+   - Incorrect sigma handling can waste steps and make show-steps output confusing.
+
+3. **Step-preview mismatch bug.**
+   - Z-Image preview decode must account for patch-size transformation, otherwise preview steps do not match final decode behavior.
+
+4. **CPU/GPU position-id mismatch under padded caption sequences.**
+   - Using non-padded cap length in one path and padded length in another changes RoPE indexing and output quality.
+
+5. **RMSNorm temporary weight caching pitfalls.**
+   - Temporary fused norm weights must not be pointer-cached as immutable weights.
 
 # Test Commands
 
-Basic verification (2-step catches multi-step bugs):
+Basic verification:
 ```bash
 make test
 ```
 
-Manual verification:
+Manual Flux sanity:
 ```bash
-./flux2 -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
-  --seed 42 --steps 2 -o /tmp/test.png -W 64 -H 64
-
-python3 -c "
-import numpy as np; from PIL import Image
-ref = np.array(Image.open('test_vectors/reference_2step_64x64_seed42.png'))
-test = np.array(Image.open('/tmp/test.png'))
-diff = np.abs(ref.astype(float) - test.astype(float))
-print('PASS' if diff.max() < 2 else 'FAIL')
-"
+./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 --steps 2 -o /tmp/flux_test.png -W 64 -H 64
 ```
 
-# Known Pitfalls (Historical Bugs)
+Manual Z-Image sanity:
+```bash
+./flux -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
+```
 
-1. **Unified RoPE kernel indexing**: GPU must use consecutive pairs (d, d+1), not axis-based (i0, i0+half_axis)
-2. **GPU caching of timestep params**: shift/scale/gate change each step, don't use weight cache for them
-3. **CLI mode CFG routing**: In interactive CLI mode, the base model must go through `flux_generate()` (which handles CFG internally), not `flux_generate_with_embeddings()` which only supports single-embedding distilled path
+# Flux Known Pitfalls (Historical Bugs)
+
+1. **Unified RoPE kernel indexing**: GPU must use consecutive pairs `(d, d+1)`, not axis-half indexing.
+2. **GPU caching of timestep params**: step-dependent shift/scale/gate must not be cached as static weights.
+3. **CLI mode CFG routing**: base models in interactive mode must go through `flux_generate()` (CFG-aware), not distilled-only embedding path.

@@ -8,10 +8,11 @@ show_usage() {
     echo ""
     echo "Available models:"
     echo ""
-    echo "  4b        Distilled 4B (4 steps, fast, ~16 GB disk)"
-    echo "  4b-base   Base 4B (50 steps, CFG, higher quality, ~16 GB disk)"
-    echo "  9b        Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)"
-    echo "  9b-base   Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)"
+    echo "  4b            Distilled 4B (4 steps, fast, ~16 GB disk)"
+    echo "  4b-base       Base 4B (50 steps, CFG, higher quality, ~16 GB disk)"
+    echo "  9b            Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)"
+    echo "  9b-base       Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)"
+    echo "  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)"
     echo ""
     echo "By default this implementation uses mmap() so inference is often"
     echo "possible with less RAM than the model size."
@@ -48,6 +49,11 @@ case "$MODEL" in
         REPO="FLUX.2-klein-base-9B"
         OUT="./flux-klein-9b-base"
         ;;
+    zimage-turbo)
+        ORG="Tongyi-MAI"
+        REPO="Z-Image-Turbo"
+        OUT="./zimage-turbo"
+        ;;
     *)
         echo "Unknown model: $MODEL"
         echo ""
@@ -83,7 +89,8 @@ fi
 
 echo "Downloading $REPO..."
 
-BASE="https://huggingface.co/black-forest-labs/$REPO/resolve/main"
+ORG="${ORG:-black-forest-labs}"
+BASE="https://huggingface.co/$ORG/$REPO/resolve/main"
 
 # Helper function to download with optional auth
 dl() {
@@ -100,7 +107,7 @@ dl() {
         echo ""
         if [ -z "$TOKEN" ]; then
             echo "This may be a gated model that requires authentication."
-            echo "  1. Accept the license at https://huggingface.co/black-forest-labs/$REPO"
+            echo "  1. Accept the license at https://huggingface.co/$ORG/$REPO"
             echo "  2. Get your token from https://huggingface.co/settings/tokens"
             echo "  3. Run: $0 $MODEL --token YOUR_TOKEN"
             echo "  Or set the HF_TOKEN env var"
@@ -108,7 +115,7 @@ dl() {
             echo "Authentication failed (HTTP 403). Possible causes:"
             echo "  - Token may be invalid or expired"
             echo "  - You may need to accept the license first:"
-            echo "    https://huggingface.co/black-forest-labs/$REPO"
+            echo "    https://huggingface.co/$ORG/$REPO"
             echo "  - The repository name may not exist (check spelling)"
         fi
         exit 1

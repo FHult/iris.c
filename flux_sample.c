@@ -30,12 +30,24 @@ double flux_timing_transformer_total = 0.0;
 double flux_timing_transformer_double = 0.0;
 double flux_timing_transformer_single = 0.0;
 double flux_timing_transformer_final = 0.0;
+double flux_timing_zi_total = 0.0;
+double flux_timing_zi_embeddings = 0.0;
+double flux_timing_zi_noise_refiner = 0.0;
+double flux_timing_zi_context_refiner = 0.0;
+double flux_timing_zi_main_blocks = 0.0;
+double flux_timing_zi_final = 0.0;
 
 void flux_reset_timing(void) {
     flux_timing_transformer_total = 0.0;
     flux_timing_transformer_double = 0.0;
     flux_timing_transformer_single = 0.0;
     flux_timing_transformer_final = 0.0;
+    flux_timing_zi_total = 0.0;
+    flux_timing_zi_embeddings = 0.0;
+    flux_timing_zi_noise_refiner = 0.0;
+    flux_timing_zi_context_refiner = 0.0;
+    flux_timing_zi_main_blocks = 0.0;
+    flux_timing_zi_final = 0.0;
 }
 
 /* ========================================================================
@@ -119,6 +131,12 @@ float *flux_resolution_schedule(int num_steps, int height, int width) {
  * FLUX.2 official schedule with empirical mu calculation
  * Matches Python's get_schedule() function from official flux2 code
  */
+/* Compute the empirical shift parameter mu for the resolution-dependent
+ * noise schedule. The constants a1, b1, a2, b2 are fitted from the Flux
+ * training distribution and control how the SNR schedule adapts to different
+ * image resolutions. Higher resolution images need more denoising steps
+ * at high noise levels. Interpolates between two linear fits based on
+ * step count, with a cutoff at 4300 tokens. */
 static float compute_empirical_mu(int image_seq_len, int num_steps) {
     const float a1 = 8.73809524e-05f, b1 = 1.89833333f;
     const float a2 = 0.00016927f, b2 = 0.45666666f;
@@ -135,6 +153,10 @@ static float compute_empirical_mu(int image_seq_len, int num_steps) {
     return a * num_steps + b;
 }
 
+/* Apply exponential SNR (Signal-to-Noise Ratio) shift to a timestep.
+ * Maps t in [0,1] through t/(t + (1-t)*exp(-mu)), shifting the schedule
+ * toward more time spent at higher noise levels. The boundary guards
+ * (t<=0, t>=1) prevent division by zero. */
 static float generalized_time_snr_shift(float t, float mu, float sigma) {
     /* t / (1 - t) with exp(mu) shift */
     if (t <= 0.0f) return 0.0f;
@@ -150,6 +172,45 @@ float *flux_official_schedule(int num_steps, int image_seq_len) {
         float t = 1.0f - (float)i / (float)num_steps;  /* Linear from 1 to 0 */
         schedule[i] = generalized_time_snr_shift(t, mu, 1.0f);
     }
+
+    return schedule;
+}
+
+/*
+ * Z-Image schedule: FlowMatchEulerDiscreteScheduler with static shift.
+ *
+ * Matches diffusers FlowMatchEulerDiscreteScheduler.set_timesteps()
+ * for use_dynamic_shifting=False, invert_sigmas=False.
+ *
+ * Diffusers behavior (with num_train_timesteps=1000, shift=3.0):
+ * 1) Build training sigmas from [1.0 .. 1/1000], then shift once.
+ * 2) For inference, linspace from sigma_max to sigma_min (already shifted).
+ * 3) Shift again.
+ * 4) Append terminal sigma=0.
+ *
+ * Returns array of num_steps+1 sigma values.
+ * The sampling loop uses these as sigmas directly with Euler:
+ *   dt = sigma_next - sigma (negative for denoising)
+ *   The transformer timestep = (1 - sigma), range [0, 1]
+ */
+float *flux_zimage_schedule(int num_steps, int image_seq_len) {
+    (void)image_seq_len;  /* Not used for static shift */
+    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    const float shift = 3.0f;
+    const float sigma_max = 1.0f;
+    const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
+    const float sigma_min = shift * sigma_train_min /
+                            (1.0f + (shift - 1.0f) * sigma_train_min);
+
+    /* Diffusers set_timesteps(): linspace(sigma_max, sigma_min, num_steps),
+     * then apply static shift one more time. */
+    for (int i = 0; i < num_steps; i++) {
+        float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
+        float raw = sigma_max + (sigma_min - sigma_max) * u;
+        schedule[i] = shift * raw / (1.0f + (shift - 1.0f) * raw);
+    }
+    /* Diffusers appends terminal sigma=0 (invert_sigmas=False). */
+    schedule[num_steps] = 0.0f;
 
     return schedule;
 }
@@ -178,6 +239,13 @@ extern float *flux_transformer_forward(flux_transformer_t *tf,
                                        const float *txt_emb, int txt_seq,
                                        float timestep);
 
+/* Z-Image transformer */
+typedef struct zi_transformer zi_transformer_t;
+extern float *zi_transformer_forward(zi_transformer_t *tf,
+                                      const float *latent, int latent_h, int latent_w,
+                                      float timestep,
+                                      const float *cap_feats, int cap_seq_len);
+
 /* Forward declaration for in-context conditioning (img2img) */
 extern float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                                                  const float *img_latent, int img_h, int img_w,
@@ -204,14 +272,11 @@ extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w);
 extern void flux_image_free(flux_image *img);
 
-/*
- * Sample using Euler method.
- *
- * z: initial noise [batch, channels, h, w]
- * text_emb: text embeddings [seq_len, hidden]
- * schedule: timestep schedule [num_steps + 1]
- * num_steps: number of denoising steps
- */
+/* Euler ODE sampler for Flux distilled models (txt2img). Iterates
+ * z_{n+1} = z_n + dt * v(z_n, t) where v is the velocity predicted by
+ * the transformer. The schedule provides sigma values from 1 to 0;
+ * the timestep passed to the transformer equals sigma, which it scales
+ * internally by 1000 for the sinusoidal embedding. */
 float *flux_sample_euler(void *transformer, void *text_encoder,
                          float *z, int batch, int channels, int h, int w,
                          const float *text_emb, int text_seq,
@@ -296,17 +361,135 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
     return z_curr;
 }
 
-/*
- * Sample using Euler method with in-context conditioning for img2img.
- *
- * This implements FLUX.2's approach where reference images are passed
- * as additional tokens with a distinct T coordinate in RoPE, allowing
- * the model to attend to them during generation.
- *
- * z: initial noise [batch, channels, h, w] - target image starts as pure noise
- * ref_latent: reference image in latent space [channels, ref_h, ref_w]
- * t_offset: RoPE T coordinate for reference (10 for first ref, 20 for second, etc.)
- */
+/* Euler sampler for Z-Image models. Key differences from Flux: the
+ * transformer timestep is (1-sigma) instead of sigma*1000, the velocity
+ * is negated in the update step (z += dt * (-v)), and the latent operates
+ * at pre-patchification dimensions [channels, H/8, W/8]. The schedule
+ * provides sigma values from ~1 to 0 with a static shift of 3.0. */
+float *flux_sample_euler_zimage(void *transformer,
+                                 float *z, int batch, int channels, int h, int w,
+                                 int patch_size,
+                                 const float *cap_feats, int cap_seq,
+                                 const float *schedule, int num_steps,
+                                 void (*progress_callback)(int step, int total)) {
+    zi_transformer_t *tf = (zi_transformer_t *)transformer;
+    int latent_size = batch * channels * h * w;
+
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    flux_copy(z_curr, z, latent_size);
+
+    flux_reset_timing();
+    double total_denoising_start = get_time_ms();
+    double step_times[FLUX_MAX_STEPS];
+    float *step_latent = NULL;
+    int step_h = h;
+    int step_w = w;
+
+    if (flux_step_image_callback && flux_step_image_vae && num_steps > 1 &&
+        patch_size > 1) {
+        if (h % patch_size == 0 && w % patch_size == 0) {
+            int step_ch = channels * patch_size * patch_size;
+            step_h = h / patch_size;
+            step_w = w / patch_size;
+            int step_latent_size = batch * step_ch * step_h * step_w;
+            step_latent = (float *)malloc(step_latent_size * sizeof(float));
+        } else if (flux_verbose) {
+            fprintf(stderr, "Warning: disabling zImage step previews (invalid patch size)\n");
+        }
+    }
+
+    for (int step = 0; step < num_steps; step++) {
+        float sigma = schedule[step];
+        float sigma_next = schedule[step + 1];
+        float dt = sigma_next - sigma;  /* Negative for denoising */
+
+        /* The transformer timestep is (1 - sigma), matching the Python pipeline:
+         * pipeline: timestep = (1000 - t_scheduler) / 1000 = 1 - sigma
+         * transformer: t = timestep * t_scale (1000) -> sinusoidal_input */
+        float timestep = 1.0f - sigma;
+
+        double step_start = get_time_ms();
+
+        if (flux_step_callback)
+            flux_step_callback(step + 1, num_steps);
+
+        /* Run Z-Image transformer */
+        float *model_out = zi_transformer_forward(tf, z_curr, h, w,
+                                                    timestep,
+                                                    cap_feats, cap_seq);
+
+        /* Euler step: z_next = z + dt * (-model_output) */
+        for (int i = 0; i < latent_size; i++) {
+            z_curr[i] += dt * (-model_out[i]);
+        }
+
+        free(model_out);
+
+        step_times[step] = get_time_ms() - step_start;
+
+        if (progress_callback)
+            progress_callback(step + 1, num_steps);
+
+        /* Step image callback */
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
+            const float *decode_latent = z_curr;
+            int decode_h = h;
+            int decode_w = w;
+
+            if (patch_size > 1) {
+                if (!step_latent) continue;
+                flux_patchify(step_latent, z_curr, batch, channels, h, w, patch_size);
+                decode_latent = step_latent;
+                decode_h = step_h;
+                decode_w = step_w;
+            }
+
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              decode_latent, 1, decode_h, decode_w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
+        }
+    }
+
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (Z-Image):\n");
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+        if (flux_timing_zi_total > 0.0) {
+            fprintf(stderr, "  Transformer breakdown (Z-Image GPU):\n");
+            fprintf(stderr, "    Embeddings+RoPE: %.1f ms (%.1f%%)\n",
+                    flux_timing_zi_embeddings,
+                    100.0 * flux_timing_zi_embeddings / flux_timing_zi_total);
+            fprintf(stderr, "    Noise refiner:   %.1f ms (%.1f%%)\n",
+                    flux_timing_zi_noise_refiner,
+                    100.0 * flux_timing_zi_noise_refiner / flux_timing_zi_total);
+            fprintf(stderr, "    Context refiner: %.1f ms (%.1f%%)\n",
+                    flux_timing_zi_context_refiner,
+                    100.0 * flux_timing_zi_context_refiner / flux_timing_zi_total);
+            fprintf(stderr, "    Main blocks:     %.1f ms (%.1f%%)\n",
+                    flux_timing_zi_main_blocks,
+                    100.0 * flux_timing_zi_main_blocks / flux_timing_zi_total);
+            fprintf(stderr, "    Final layer:     %.1f ms (%.1f%%)\n",
+                    flux_timing_zi_final,
+                    100.0 * flux_timing_zi_final / flux_timing_zi_total);
+            fprintf(stderr, "    Total:           %.1f ms\n", flux_timing_zi_total);
+        }
+    }
+
+    free(step_latent);
+    return z_curr;
+}
+
+/* Euler sampler for single-reference img2img. The reference image is
+ * VAE-encoded and concatenated with the noised target as extra tokens.
+ * A RoPE T offset (default 10) distinguishes reference from target in
+ * the positional encoding. The transformer attends to both via joint
+ * attention, implementing in-context conditioning. */
 float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
                                    float *z, int batch, int channels, int h, int w,
                                    const float *ref_latent, int ref_h, int ref_w,
@@ -460,9 +643,11 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
  *   v = v_uncond + guidance_scale * (v_cond - v_uncond)
  * ======================================================================== */
 
-/*
- * Euler sampler with CFG for text-to-image.
- */
+/* Euler sampler with Classifier-Free Guidance for Flux base models.
+ * Each step runs the transformer twice: once with empty prompt (unconditional)
+ * and once with real prompt (conditional). Combined as
+ * v = v_uncond + guidance_scale * (v_cond - v_uncond), which steers
+ * generation toward the prompt at the cost of 2x compute per step. */
 float *flux_sample_euler_cfg(void *transformer, void *text_encoder,
                               float *z, int batch, int channels, int h, int w,
                               const float *text_emb_cond, int text_seq_cond,
@@ -838,14 +1023,11 @@ float *flux_sample_heun(void *transformer,
  * Latent Noise Initialization
  * ======================================================================== */
 
-/*
- * Initialize latent noise for generation.
- * For rectified flow, we start from pure noise (t=1).
- *
- * Size-independent noise: We generate noise at max latent size (112x112)
- * and subsample to target size. This ensures the same seed produces
- * similar compositions at different resolutions.
- */
+/* Generate initial noise for the denoising process. Uses a fixed 112x112
+ * noise patch tiled/cropped to the target size, ensuring seed-reproducible
+ * results regardless of output resolution. Without this, the same seed
+ * would produce different images at different sizes. For targets at or
+ * above 112x112 latent dims, noise is generated directly. */
 #define NOISE_MAX_LATENT_DIM 112  /* 1792/16 = 112 */
 
 float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed) {
@@ -894,9 +1076,10 @@ float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed) {
  * Full Generation Pipeline
  * ======================================================================== */
 
-/*
- * Complete text-to-image generation pipeline.
- */
+/* Complete text-to-image pipeline in latent space. Orchestrates:
+ * text encoding -> noise initialization -> schedule computation -> Euler
+ * sampling -> returns denoised latent (caller handles VAE decode).
+ * Routes to the appropriate sampler variant based on model type. */
 typedef struct flux_ctx flux_ctx;
 
 /* Forward declaration */
