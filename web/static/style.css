@@ -895,9 +895,10 @@ input[type="range"]::-webkit-slider-thumb:hover {
     color: var(--text-secondary);
     text-align: center;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: center;
-    gap: 1rem;
+    gap: 0.6rem;
 }
 
 .btn-remix {

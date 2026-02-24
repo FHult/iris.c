@@ -2175,24 +2175,27 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ========== Download Button ==========
-    downloadBtn.addEventListener('click', () => {
+    downloadBtn.addEventListener('click', async () => {
         const img = outputArea.querySelector('img');
         if (!img) return;
 
-        const link = document.createElement('a');
-        // Remove cache-busting query param for cleaner filename
-        const imageUrl = img.src.split('?')[0];
-        link.href = imageUrl;
-
-        // Generate filename from prompt
-        const prompt = currentGeneration?.prompt || 'image';
-        const seed = currentGeneration?.seed || 'unknown';
-        const safePrompt = prompt.substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
-        link.download = `flux_${safePrompt}_${seed}.png`;
-
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+        try {
+            const response = await fetch(img.src.split('?')[0]);
+            const blob = await response.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = blobUrl;
+            const prompt = currentGeneration?.prompt || 'image';
+            const seed = currentGeneration?.seed || 'unknown';
+            const safePrompt = prompt.substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
+            link.download = `flux_${safePrompt}_${seed}.png`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(blobUrl);
+        } catch (e) {
+            console.error('Download failed:', e);
+        }
     });
 
     // ========== Paste Image from Clipboard (Ctrl+V) ==========
@@ -2367,16 +2370,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ========== Lightbox Download Button (#16) ==========
-    lightboxDownloadBtn.addEventListener('click', () => {
+    lightboxDownloadBtn.addEventListener('click', async () => {
         if (lightboxItems.length === 0 || lightboxIndex < 0) return;
         const item = lightboxItems[lightboxIndex];
-        const link = document.createElement('a');
-        link.href = item.image_url;
-        const safePrompt = item.prompt.substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
-        link.download = `flux_${safePrompt}_${item.seed || 'unknown'}.png`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+        try {
+            const response = await fetch(item.image_url.split('?')[0]);
+            const blob = await response.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = blobUrl;
+            const safePrompt = (item.prompt || 'image').substring(0, 50).replace(/[^a-zA-Z0-9]/g, '_');
+            link.download = `flux_${safePrompt}_${item.seed || 'unknown'}.png`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(blobUrl);
+        } catch (e) {
+            console.error('Lightbox download failed:', e);
+        }
     });
 
     // ========== Lightbox Delete Button (#16) ==========
