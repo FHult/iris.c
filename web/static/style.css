@@ -923,6 +923,51 @@ input[type="range"]::-webkit-slider-thumb:hover {
     flex-shrink: 0;
 }
 
+/* Vary Subtle / Vary Strong buttons */
+.btn-vary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.85rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s, opacity 0.2s;
+    white-space: nowrap;
+}
+
+.btn-vary svg {
+    flex-shrink: 0;
+}
+
+.btn-vary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.btn-vary-subtle {
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+}
+
+.btn-vary-subtle:hover:not(:disabled) {
+    background-color: var(--bg-primary);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.btn-vary-strong {
+    background-color: var(--accent);
+    color: white;
+    border: 1px solid var(--accent);
+}
+
+.btn-vary-strong:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+}
+
 .btn-icon {
     display: inline-flex;
     align-items: center;

@@ -14,6 +14,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const stepsValue = document.getElementById('steps-value');
     const showStepsCheckbox = document.getElementById('show-steps');
     const remixBtn = document.getElementById('remix-btn');
+    const varySubtleBtn = document.getElementById('vary-subtle-btn');
     const historySection = document.getElementById('history-section');
     const historyGrid = document.getElementById('history-grid');
     const aspectPreset = document.getElementById('aspect-preset');
@@ -1085,20 +1086,59 @@ document.addEventListener('DOMContentLoaded', () => {
         renderAllSlots();
     });
 
-    // Remix button - regenerate with same settings but new seed
+    // Vary Strong — new random seed, no reference (same as old Remix)
     remixBtn.addEventListener('click', () => {
         if (!currentGeneration) return;
 
-        // Fill form with current generation params
         document.getElementById('prompt').value = currentGeneration.prompt;
         setDimensions(currentGeneration.width, currentGeneration.height);
         document.getElementById('steps').value = currentGeneration.steps;
         stepsValue.textContent = currentGeneration.steps;
-        document.getElementById('seed').value = ''; // Clear seed for random
+        document.getElementById('seed').value = '';
 
-        // Trigger generation
         form.dispatchEvent(new Event('submit'));
     });
+
+    // Vary Subtle — re-run with current output as img2img reference, new seed
+    if (varySubtleBtn) {
+        varySubtleBtn.addEventListener('click', async () => {
+            if (!currentGeneration) return;
+            const img = outputArea.querySelector('img');
+            if (!img) return;
+
+            varySubtleBtn.disabled = true;
+            try {
+                // Fetch the current output image and convert to base64
+                const response = await fetch(img.src);
+                const blob = await response.blob();
+                const base64 = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+
+                // Queue with the original output as a reference (→ img2img path)
+                await addToQueue({
+                    prompt: currentGeneration.prompt,
+                    width: currentGeneration.width,
+                    height: currentGeneration.height,
+                    steps: currentGeneration.steps,
+                    seed: null,
+                    referenceImages: [base64],
+                    style: null,
+                    guidance: currentGeneration.guidance,
+                    schedule: currentGeneration.schedule,
+                    lora: currentGeneration.lora,
+                    lora_scale: currentGeneration.lora_scale,
+                });
+            } catch (e) {
+                showError('Vary Subtle failed: ' + e.message);
+            } finally {
+                varySubtleBtn.disabled = false;
+            }
+        });
+    }
 
     // Use current output image as img2img input
     useAsInputBtn.addEventListener('click', () => {
@@ -1158,8 +1198,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
 
-            // Store current generation params for remix
-            currentGeneration = { prompt, width, height, steps };
+            // Store current generation params for vary/remix
+            currentGeneration = { prompt, width, height, steps, guidance, schedule, lora, lora_scale };
 
             // Disable form and show progress
             setGenerating(true);
@@ -1416,6 +1456,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     width: job.width,
                     height: job.height,
                     steps: job.steps,
+                    guidance: job.guidance || null,
+                    schedule: job.schedule || null,
+                    lora: job.lora || null,
+                    lora_scale: job.lora_scale || 1.0,
                 };
 
                 connectToProgress(job.id, job.steps,
@@ -1470,6 +1514,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     width: item.width,
                     height: item.height,
                     steps: item.steps,
+                    guidance: item.guidance || null,
+                    schedule: item.schedule || null,
+                    lora: item.lora || null,
+                    lora_scale: item.lora_scale || 1.0,
                 };
 
                 connectToProgress(item.id, item.steps,
@@ -2080,13 +2128,17 @@ document.addEventListener('DOMContentLoaded', () => {
             if (loraScaleValue) loraScaleValue.textContent = Number(item.lora_scale).toFixed(2);
         }
 
-        // Store for remix
+        // Store for vary/remix
         currentGeneration = {
             prompt: item.prompt,
             width: item.width,
             height: item.height,
             steps: item.steps,
             seed: item.seed,
+            guidance: item.guidance || null,
+            schedule: item.schedule || null,
+            lora: item.lora || null,
+            lora_scale: item.lora_scale || 1.0,
         };
     }
 
