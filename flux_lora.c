@@ -1,13 +1,16 @@
 /*
  * flux_lora.c - LoRA support for the FLUX transformer
  *
- * Supports three safetensors formats (auto-detected):
+ * Supports four safetensors formats (auto-detected):
  *   XLabs     - "double_blocks.N.processor.qkv_lora1.down.weight"
  *   Kohya     - "lora_unet_double_blocks_N_img_attn_qkv.lora_down.weight"
  *   Diffusers - "transformer.transformer_blocks.N.attn.to_q.lora_A.weight"
+ *   BFL       - "diffusion_model.double_blocks.N.img_attn.qkv.lora_A.weight"
+ *               (also "base_model.model.double_blocks.N..." — same structure)
  *
- * All three formats support double-stream blocks (img+txt Q/K/V + output proj).
- * Kohya additionally supports single-stream blocks (linear1 fused QKV+MLP, linear2 fused proj).
+ * All formats support double-stream blocks (img+txt Q/K/V + output proj).
+ * Kohya and BFL additionally support single-stream blocks (linear1, linear2).
+ * BFL is the native Black Forest Labs Klein LoRA format used by fal, valiantcat, etc.
  */
 
 #include "flux_lora.h"
@@ -92,6 +95,7 @@ typedef enum {
     FORMAT_XLABS,
     FORMAT_KOHYA,
     FORMAT_DIFFUSERS,
+    FORMAT_BFL,
 } lora_format_t;
 
 static lora_format_t detect_format(const safetensors_file_t *sf) {
@@ -103,6 +107,9 @@ static lora_format_t detect_format(const safetensors_file_t *sf) {
             strstr(name, "transformer.single_transformer_blocks") ||
             strstr(name, "transformer.x_embedder"))
             return FORMAT_DIFFUSERS;
+        if (strstr(name, "diffusion_model.double_blocks.") ||
+            strstr(name, "base_model.model.double_blocks."))
+            return FORMAT_BFL;
     }
     return FORMAT_UNKNOWN;
 }
@@ -406,6 +413,75 @@ static void load_diffusers(lora_state_t *lora, const safetensors_file_t *sf, int
 }
 
 /* ========================================================================
+ * BFL format loading
+ *
+ * Native Black Forest Labs Klein LoRA format. Two prefix variants:
+ *   "diffusion_model."    (ai-toolkit / valiantcat)
+ *   "base_model.model."  (fal / ComfyUI-converted)
+ *
+ * Double blocks: img_attn.qkv (fused), img_attn.proj, txt_attn.qkv (fused), txt_attn.proj
+ * Single blocks: linear1 (fused QKV+MLP), linear2 (fused proj)
+ * ======================================================================== */
+
+static void load_bfl(lora_state_t *lora, const safetensors_file_t *sf, int hidden) {
+    int loaded = 0;
+    char dk[256], uk[256];
+
+    /* Detect which prefix this file uses */
+    const char *prefix = "diffusion_model";
+    for (int i = 0; i < sf->num_tensors; i++) {
+        if (strstr(sf->tensors[i].name, "base_model.model.double_blocks.")) {
+            prefix = "base_model.model";
+            break;
+        }
+    }
+
+    for (int i = 0; i < lora->num_double_blocks; i++) {
+        /* Image stream: fused QKV */
+        snprintf(dk, sizeof(dk), "%s.double_blocks.%d.img_attn.qkv.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.double_blocks.%d.img_attn.qkv.lora_B.weight", prefix, i);
+        if (load_adapter_split_qkv(&lora->double_img_q[i], &lora->double_img_k[i],
+                                    &lora->double_img_v[i], sf, dk, uk, hidden, &lora->max_rank))
+            loaded++;
+
+        /* Image stream: output projection */
+        snprintf(dk, sizeof(dk), "%s.double_blocks.%d.img_attn.proj.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.double_blocks.%d.img_attn.proj.lora_B.weight", prefix, i);
+        if (load_adapter(&lora->double_img_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
+            loaded++;
+
+        /* Text stream: fused QKV */
+        snprintf(dk, sizeof(dk), "%s.double_blocks.%d.txt_attn.qkv.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.double_blocks.%d.txt_attn.qkv.lora_B.weight", prefix, i);
+        if (load_adapter_split_qkv(&lora->double_txt_q[i], &lora->double_txt_k[i],
+                                    &lora->double_txt_v[i], sf, dk, uk, hidden, &lora->max_rank))
+            loaded++;
+
+        /* Text stream: output projection */
+        snprintf(dk, sizeof(dk), "%s.double_blocks.%d.txt_attn.proj.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.double_blocks.%d.txt_attn.proj.lora_B.weight", prefix, i);
+        if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden))
+            loaded++;
+    }
+
+    /* Single blocks */
+    for (int i = 0; i < lora->num_single_blocks; i++) {
+        snprintf(dk, sizeof(dk), "%s.single_blocks.%d.linear1.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.single_blocks.%d.linear1.lora_B.weight", prefix, i);
+        if (load_adapter(&lora->single_linear1[i], sf, dk, uk, &lora->max_rank, -1, -1))
+            loaded++;
+
+        snprintf(dk, sizeof(dk), "%s.single_blocks.%d.linear2.lora_A.weight", prefix, i);
+        snprintf(uk, sizeof(uk), "%s.single_blocks.%d.linear2.lora_B.weight", prefix, i);
+        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1))
+            loaded++;
+    }
+
+    fprintf(stderr, "LoRA: loaded %d BFL adapters across %d double + %d single blocks\n",
+            loaded, lora->num_double_blocks, lora->num_single_blocks);
+}
+
+/* ========================================================================
  * Public API
  * ======================================================================== */
 
@@ -425,7 +501,7 @@ lora_state_t *lora_load(const char *path, int num_double_blocks,
         return NULL;
     }
 
-    const char *fmt_names[] = {"unknown", "XLabs", "Kohya", "Diffusers"};
+    const char *fmt_names[] = {"unknown", "XLabs", "Kohya", "Diffusers", "BFL"};
     fprintf(stderr, "LoRA: loading %s format from %s\n", fmt_names[fmt], path);
     fprintf(stderr, "LoRA: model has %d double blocks, %d single blocks, hidden=%d\n",
             num_double_blocks, num_single_blocks, hidden_size);
@@ -465,6 +541,7 @@ lora_state_t *lora_load(const char *path, int num_double_blocks,
         case FORMAT_XLABS:     load_xlabs(lora, sf, hidden_size);     break;
         case FORMAT_KOHYA:     load_kohya(lora, sf, hidden_size);     break;
         case FORMAT_DIFFUSERS: load_diffusers(lora, sf, hidden_size); break;
+        case FORMAT_BFL:       load_bfl(lora, sf, hidden_size);       break;
         default: break;
     }
 
