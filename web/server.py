@@ -146,50 +146,146 @@ _download_progress = {}  # {dl_id: {percent, done, error}}
 
 # Curated list of Klein-compatible LoRA adapters
 CURATED_LORAS = [
+    # ── HuggingFace ──────────────────────────────────────────────────────────
     {
         "id": "fal-outpaint",
         "name": "Outpaint",
+        "source": "huggingface",
         "description": "Extends images beyond their borders with natural scene continuation",
         "repo": "fal/flux-2-klein-4B-outpaint-lora",
         "filename": "flux-outpaint-lora.safetensors",
         "models": ["4b"],
         "trigger": None,
+        "strength": "1.0",
     },
     {
         "id": "fal-zoom",
         "name": "Zoom",
+        "source": "huggingface",
         "description": "Zooms into red-highlighted regions and generates an enlarged detailed view",
         "repo": "fal/flux-2-klein-4B-zoom-lora",
         "filename": "flux-red-zoom-lora.safetensors",
         "models": ["4b"],
         "trigger": None,
+        "strength": "1.0",
     },
     {
         "id": "fal-sprite",
         "name": "Spritesheet",
+        "source": "huggingface",
         "description": "Turns a single object into a 2×2 sprite sheet with 4 camera angles",
         "repo": "fal/flux-2-klein-4b-spritesheet-lora",
         "filename": "flux-spritesheet-lora.safetensors",
         "models": ["4b"],
         "trigger": None,
+        "strength": "1.0",
     },
     {
         "id": "dever-arcane",
         "name": "Arcane Style",
+        "source": "huggingface",
         "description": "Painterly Arcane animated-series aesthetic",
         "repo": "DeverStyle/Flux.2-Klein-Loras",
         "filename": "arcane_visual_style.safetensors",
         "models": ["9b"],
         "trigger": "arcane_visual_style",
+        "strength": "1.0",
     },
     {
         "id": "valiant-ac",
         "name": "AC Comic Style",
+        "source": "huggingface",
         "description": "American comic + pop art + cyber neon illustration blend",
         "repo": "valiantcat/FLUX.2-klein-AC-Style-LORA",
         "filename": "FLUX.2-Klein-AC-Style.safetensors",
         "models": ["4b", "9b"],
         "trigger": None,
+        "strength": "1.0",
+    },
+    # ── Civitai ───────────────────────────────────────────────────────────────
+    {
+        "id": "civitai-hayley",
+        "name": "Hayley (Influencer)",
+        "source": "civitai",
+        "description": "Photoreal influencer character with excellent facial likeness, expressions and casual photography styles. Works on both distilled and base.",
+        "civitai_model_id": 2399494,
+        "civitai_version_filter": None,
+        "filename": "hayley-flux2-klein.safetensors",
+        "models": ["4b"],
+        "trigger": "hayleymodel",
+        "strength": "1.0",
+    },
+    {
+        "id": "civitai-selfies",
+        "name": "Ultra Real Amateur Selfies",
+        "source": "civitai",
+        "description": "Smartphone-style realistic selfies with natural poses and a wide variety of looks.",
+        "civitai_model_id": 2233658,
+        "civitai_version_filter": None,
+        "filename": "ultra-real-selfies-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "1.0–1.25",
+    },
+    {
+        "id": "civitai-mecha",
+        "name": "New Mecha Style",
+        "source": "civitai",
+        "description": "Anime-inspired semi-realistic mecha and detailed digital illustrations. Works great on both base and distilled.",
+        "civitai_model_id": 2227157,
+        "civitai_version_filter": None,
+        "filename": "new-mecha-style-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.8",
+    },
+    {
+        "id": "civitai-photostyle",
+        "name": "Photostyle by Sean Archer",
+        "source": "civitai",
+        "description": "High-end fashion and glamour photography aesthetic. Best on base model.",
+        "civitai_model_id": 1632416,
+        "civitai_version_filter": "klein",
+        "filename": "photostyle-sean-archer-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.7–1.0",
+    },
+    {
+        "id": "civitai-blahaj",
+        "name": "Blahaj Shark",
+        "source": "civitai",
+        "description": "Cute IKEA shark plush / mascot character consistency.",
+        "civitai_model_id": 646253,
+        "civitai_version_filter": "klein4b",
+        "filename": "blahaj-v9-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.7",
+    },
+    {
+        "id": "civitai-quilm",
+        "name": "QuilM Style",
+        "source": "civitai",
+        "description": "Distinctive illustrative art style. Works best on distilled.",
+        "civitai_model_id": 2324191,
+        "civitai_version_filter": None,
+        "filename": "quilm-style-f2-klein4b.safetensors",
+        "models": ["4b"],
+        "trigger": "quilm style",
+        "strength": "0.8–1.0",
+    },
+    {
+        "id": "civitai-anatomy",
+        "name": "Anatomy / Quality Fixer",
+        "source": "civitai",
+        "description": "Improves hands, anatomy and overall coherence. Use at low strength for subtle correction.",
+        "civitai_model_id": 2324991,
+        "civitai_version_filter": "4b",
+        "filename": "klein-anatomy-fixer-4b.safetensors",
+        "models": ["4b"],
+        "trigger": None,
+        "strength": "0.6–1.0",
     },
 ]
 
@@ -1475,10 +1571,13 @@ def available_loras():
     return jsonify({"loras": loras, "curated": curated})
 
 
-def _do_download(dl_id, url, dest):
+def _do_download(dl_id, url, dest, extra_headers=None):
     """Background thread: download a file from url to dest, tracking progress."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "flux2.c/1.0"})
+        headers = {"User-Agent": "flux2.c/1.0"}
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req) as resp:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
@@ -1505,14 +1604,14 @@ def _do_download(dl_id, url, dest):
 
 @app.route("/download-lora", methods=["POST"])
 def download_lora():
-    """Start downloading a LoRA from HuggingFace to the model's loras/ directory."""
+    """Start downloading a LoRA (HuggingFace or Civitai) to the model's loras/ directory."""
     data = request.json or {}
-    repo = data.get("repo", "").strip()
-    filename = data.get("filename", "").strip()
     dl_id = data.get("id", "").strip()
+    source = data.get("source", "huggingface")
+    filename = data.get("filename", "").strip()
 
-    if not repo or not filename or not dl_id:
-        return jsonify({"error": "repo, filename, and id are required"}), 400
+    if not dl_id or not filename:
+        return jsonify({"error": "id and filename are required"}), 400
 
     # Basic path safety: filename must be a plain filename with no slashes
     if "/" in filename or "\\" in filename or ".." in filename:
@@ -1528,9 +1627,45 @@ def download_lora():
     if dest.exists():
         return jsonify({"ok": True, "already_exists": True})
 
-    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+    extra_headers = {}
+    civitai_token = os.environ.get("CIVITAI_TOKEN")
+
+    if source == "civitai":
+        civitai_model_id = data.get("civitai_model_id")
+        version_filter = (data.get("civitai_version_filter") or "").strip().lower()
+        if not civitai_model_id:
+            return jsonify({"error": "civitai_model_id required for civitai source"}), 400
+        try:
+            api_url = f"https://civitai.com/api/v1/models/{civitai_model_id}"
+            api_headers = {"User-Agent": "flux2.c/1.0"}
+            if civitai_token:
+                api_headers["Authorization"] = f"Bearer {civitai_token}"
+            api_req = urllib.request.Request(api_url, headers=api_headers)
+            with urllib.request.urlopen(api_req, timeout=15) as resp:
+                model_data = json.loads(resp.read())
+            versions = model_data.get("modelVersions", [])
+            if not versions:
+                return jsonify({"error": "No versions found for this Civitai model"}), 400
+            if version_filter:
+                matching = [v for v in versions if version_filter in v.get("name", "").lower()]
+                version = matching[0] if matching else versions[0]
+            else:
+                version = versions[0]
+            url = f"https://civitai.com/api/download/models/{version['id']}"
+            if civitai_token:
+                extra_headers["Authorization"] = f"Bearer {civitai_token}"
+        except Exception as e:
+            return jsonify({"error": f"Failed to resolve Civitai model: {e}"}), 500
+    else:
+        repo = data.get("repo", "").strip()
+        if not repo:
+            return jsonify({"error": "repo is required for huggingface source"}), 400
+        url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+
     _download_progress[dl_id] = {"percent": 0, "done": False, "error": None}
-    threading.Thread(target=_do_download, args=(dl_id, url, dest), daemon=True).start()
+    threading.Thread(
+        target=_do_download, args=(dl_id, url, dest), kwargs={"extra_headers": extra_headers}, daemon=True
+    ).start()
     return jsonify({"ok": True})
 
 

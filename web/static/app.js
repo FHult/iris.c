@@ -1592,21 +1592,41 @@ document.addEventListener('DOMContentLoaded', () => {
                     ? `<span class="lora-trigger" title="Add this word to your prompt">${lora.trigger}</span>`
                     : '';
                 const dlState = activeDownloads[lora.id];
+                const sourceBadge = lora.source === 'civitai'
+                    ? '<span class="lora-source-badge lora-source-civitai">Civitai</span>'
+                    : '<span class="lora-source-badge lora-source-hf">HuggingFace</span>';
+                const strengthLabel = lora.strength
+                    ? `<span class="lora-trigger" title="Recommended strength">⚡ ${lora.strength}</span>`
+                    : '';
                 let actionHtml;
                 if (dlState && !dlState.done && !dlState.error) {
                     actionHtml = `<div class="lora-progress-wrap"><div class="lora-progress-bar" style="width:${dlState.percent || 0}%"></div></div>`;
                 } else if (lora.downloaded) {
                     actionHtml = `<button class="lora-use-btn" data-filename="${lora.filename}">Use</button>`;
+                } else if (lora.source === 'civitai') {
+                    actionHtml = `<button class="lora-dl-btn"
+                        data-id="${lora.id}"
+                        data-source="civitai"
+                        data-civitai-model-id="${lora.civitai_model_id}"
+                        data-civitai-version-filter="${lora.civitai_version_filter || ''}"
+                        data-filename="${lora.filename}">Download</button>`;
                 } else {
-                    actionHtml = `<button class="lora-dl-btn" data-id="${lora.id}" data-repo="${lora.repo}" data-filename="${lora.filename}">Download</button>`;
+                    actionHtml = `<button class="lora-dl-btn"
+                        data-id="${lora.id}"
+                        data-source="huggingface"
+                        data-repo="${lora.repo}"
+                        data-filename="${lora.filename}">Download</button>`;
                 }
 
                 card.innerHTML = `
                     <div class="lora-card-main">
                         <div class="lora-card-info">
-                            <span class="lora-card-name">${lora.name}</span>
+                            <div class="lora-card-name-row">
+                                <span class="lora-card-name">${lora.name}</span>
+                                ${sourceBadge}
+                            </div>
                             <span class="lora-card-desc">${lora.description}</span>
-                            <div class="lora-card-tags">${badges}${trigger}</div>
+                            <div class="lora-card-tags">${badges}${trigger}${strengthLabel}</div>
                         </div>
                         <div class="lora-card-action">${actionHtml}</div>
                     </div>
@@ -1649,7 +1669,13 @@ document.addEventListener('DOMContentLoaded', () => {
         // Wire up buttons
         loraPanelBody.querySelectorAll('.lora-dl-btn').forEach(btn => {
             btn.addEventListener('click', () => {
-                startLoraDownload(btn.dataset.id, btn.dataset.repo, btn.dataset.filename);
+                startLoraDownload(btn.dataset.id, {
+                    source: btn.dataset.source || 'huggingface',
+                    repo: btn.dataset.repo,
+                    filename: btn.dataset.filename,
+                    civitai_model_id: btn.dataset.civitaiModelId ? Number(btn.dataset.civitaiModelId) : undefined,
+                    civitai_version_filter: btn.dataset.civitaiVersionFilter || undefined,
+                });
             });
         });
         loraPanelBody.querySelectorAll('.lora-use-btn').forEach(btn => {
@@ -1663,7 +1689,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function startLoraDownload(dlId, repo, filename) {
+    async function startLoraDownload(dlId, entry) {
         activeDownloads[dlId] = { percent: 0, done: false, error: null };
         renderLoraPanel();
 
@@ -1671,7 +1697,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const resp = await fetch('/download-lora', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: dlId, repo, filename }),
+                body: JSON.stringify({
+                    id: dlId,
+                    source: entry.source || 'huggingface',
+                    repo: entry.repo,
+                    filename: entry.filename,
+                    civitai_model_id: entry.civitai_model_id,
+                    civitai_version_filter: entry.civitai_version_filter,
+                }),
             });
             const data = await resp.json();
             if (!resp.ok || data.error) {

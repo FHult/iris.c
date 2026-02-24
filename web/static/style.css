@@ -1789,11 +1789,37 @@ footer a:hover {
     min-width: 0;
 }
 
+.lora-card-name-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.25rem;
+}
+
 .lora-card-name {
     font-weight: 600;
     font-size: 0.9rem;
-    margin-bottom: 0.25rem;
     color: var(--text-primary);
+}
+
+.lora-source-badge {
+    font-size: 0.65rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: 999px;
+    font-weight: 500;
+    flex-shrink: 0;
+}
+
+.lora-source-hf {
+    background: color-mix(in srgb, #f97316 12%, transparent);
+    color: #f97316;
+    border: 1px solid color-mix(in srgb, #f97316 30%, transparent);
+}
+
+.lora-source-civitai {
+    background: color-mix(in srgb, #3b82f6 12%, transparent);
+    color: #3b82f6;
+    border: 1px solid color-mix(in srgb, #3b82f6 30%, transparent);
 }
 
 .lora-card-desc {
