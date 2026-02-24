@@ -15,6 +15,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const showStepsCheckbox = document.getElementById('show-steps');
     const remixBtn = document.getElementById('remix-btn');
     const varySubtleBtn = document.getElementById('vary-subtle-btn');
+    const varyStrengthInput = document.getElementById('vary-strength');
+    const varyStrengthValue = document.getElementById('vary-strength-value');
     const historySection = document.getElementById('history-section');
     const historyGrid = document.getElementById('history-grid');
     const aspectPreset = document.getElementById('aspect-preset');
@@ -708,7 +710,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -727,6 +729,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     batch_id: batchId || null,
                     lora: lora || null,
                     lora_scale: lora_scale || 1.0,
+                    img2img_strength: img2img_strength || 1.0,
                 }),
             });
             const data = await response.json();
@@ -1118,6 +1121,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     reader.readAsDataURL(blob);
                 });
 
+                const strength = varyStrengthInput ? parseFloat(varyStrengthInput.value) : 0.7;
+
                 // Queue with the original output as a reference (→ img2img path)
                 await addToQueue({
                     prompt: currentGeneration.prompt,
@@ -1131,6 +1136,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     schedule: currentGeneration.schedule,
                     lora: currentGeneration.lora,
                     lora_scale: currentGeneration.lora_scale,
+                    img2img_strength: strength,
                 });
             } catch (e) {
                 showError('Vary Subtle failed: ' + e.message);
@@ -1798,6 +1804,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 clearInterval(interval);
             }
         }, 500);
+    }
+
+    // Vary strength slider live display
+    if (varyStrengthInput && varyStrengthValue) {
+        varyStrengthInput.addEventListener('input', () => {
+            varyStrengthValue.textContent = parseFloat(varyStrengthInput.value).toFixed(2);
+        });
     }
 
     // LoRA event listeners

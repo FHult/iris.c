@@ -968,6 +968,49 @@ input[type="range"]::-webkit-slider-thumb:hover {
     background-color: var(--accent-hover);
 }
 
+/* Vary Subtle + inline strength slider group */
+.vary-subtle-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding-right: 0.5rem;
+}
+
+.vary-subtle-group .btn-vary-subtle {
+    border: none;
+    background: none;
+    border-radius: 5px 0 0 5px;
+}
+
+.vary-subtle-group .btn-vary-subtle:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: transparent;
+    color: var(--accent);
+}
+
+.vary-strength-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.vary-strength-slider {
+    width: 64px;
+    height: 3px;
+    cursor: pointer;
+    accent-color: var(--accent);
+}
+
+.vary-strength-value {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    min-width: 2.4ch;
+    font-variant-numeric: tabular-nums;
+}
+
 .btn-icon {
     display: inline-flex;
     align-items: center;

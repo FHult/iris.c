@@ -482,6 +482,7 @@ static int run_server_mode(flux_ctx *ctx) {
         int64_t seed = json_get_int64(line, "seed", -1);
         int show_steps = json_get_bool(line, "show_steps", 1);
         float guidance = json_get_float(line, "guidance", 0.0f);
+        float img2img_strength = json_get_float(line, "img2img_strength", 1.0f);
         char *schedule = json_get_string(line, "schedule");
         char *req_lora_path = json_get_string(line, "lora");
         float req_lora_scale = json_get_float(line, "lora_scale", 1.0f);
@@ -559,6 +560,7 @@ static int run_server_mode(flux_ctx *ctx) {
             .num_steps = steps,
             .seed = actual_seed,
             .guidance = guidance,
+            .img2img_strength = img2img_strength,
         };
 
         /* Apply schedule if specified */

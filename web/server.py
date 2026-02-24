@@ -674,7 +674,7 @@ class FluxServer:
             except Exception as e:
                 print(f"Failed to restart flux server: {e}")
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -719,6 +719,9 @@ class FluxServer:
                 lora_full_path = model_dir_path / "loras" / lora_name
                 request_data["lora"] = str(lora_full_path)
                 request_data["lora_scale"] = float(lora_scale)
+
+            if img2img_strength and float(img2img_strength) < 1.0:
+                request_data["img2img_strength"] = float(img2img_strength)
 
             # Send request
             request_line = json.dumps(request_data) + "\n"
@@ -782,6 +785,7 @@ def process_job_queue():
             queued.get('schedule'),
             queued.get('lora_name'),
             queued.get('lora_scale', 1.0),
+            queued.get('img2img_strength', 1.0),
         )
     except Exception as e:
         job.status = "error"
@@ -793,7 +797,7 @@ def process_job_queue():
         process_job_queue()
 
 
-def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0):
+def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
     """Queue a generation job. Starts immediately if server is free, otherwise queues."""
     global flux_server
 
@@ -811,6 +815,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         'schedule': schedule,
         'lora_name': lora_name,
         'lora_scale': lora_scale,
+        'img2img_strength': img2img_strength,
     }
 
     with job_queue_lock:
@@ -828,7 +833,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -837,9 +842,9 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         job.cleanup_temp_files()
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
     """Run generation using the persistent flux server (legacy, now uses queue)."""
-    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale)
+    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
 
 
 @app.route("/")
@@ -874,6 +879,7 @@ def generate():
     batch_id = data.get("batch_id")  # Groups variation batches
     lora_name = data.get("lora") or None       # LoRA filename (relative, inside loras/ dir)
     lora_scale = float(data.get("lora_scale", 1.0))
+    img2img_strength = float(data.get("img2img_strength", 1.0))
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -956,7 +962,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale),
+        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength),
         daemon=True,
     )
     thread.start()

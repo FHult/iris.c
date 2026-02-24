@@ -1258,9 +1258,16 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
 
-    /* Check attention memory budget — shrink reference if needed. */
+    /* Normalise strength: 0 means "not set", treat as 1.0 (in-context conditioning). */
+    float strength = p.img2img_strength;
+    if (strength <= 0.0f || strength > 1.0f) strength = 1.0f;
+
+    /* For noise-injection (strength < 1.0), the reference must be encoded at
+     * exactly the target output size so the latents can be blended.
+     * For in-context conditioning (strength == 1.0), we may shrink the reference
+     * to stay within the GPU attention memory budget. */
     int ref_w = p.width, ref_h = p.height;
-    {
+    if (strength >= 1.0f) {
         int ref_dims[2] = { p.height, p.width };
         if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
                                     ref_dims, 1, FLUX_MAX_SEQ_LEN)) {
@@ -1348,60 +1355,86 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /*
-     * FLUX.2 img2img uses in-context conditioning:
-     * - Reference image is encoded to latent with T offset in RoPE (T=10)
-     * - Target image starts from pure noise (T=0)
-     * - Both are concatenated as tokens in the transformer
-     * - Model attends to reference via joint attention
-     * - Only target tokens are output
-     *
-     * This is fundamentally different from traditional img2img that adds
-     * noise directly to the encoded image.
-     */
     int num_steps = p.num_steps;
     int out_lat_h = p.height / 16;
     int out_lat_w = p.width / 16;
-    int image_seq_len = out_lat_h * out_lat_w;  /* For schedule calculation */
+    int image_seq_len = out_lat_h * out_lat_w;
 
-    /* Get schedule */
     float *schedule = flux_selected_schedule(&p, image_seq_len);
-
-    /* Initialize target latent with pure noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
 
-    /* Reference image latent is img_latent, with T offset = 10 */
-    int t_offset = 10;
-
-    /* Sample using in-context conditioning */
     float *latent;
-    if (ctx->is_distilled) {
-        latent = flux_sample_euler_with_refs(
-            ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
-            img_latent, latent_h, latent_w,
-            t_offset,
-            text_emb, text_seq,
-            schedule, num_steps,
-            NULL
-        );
+
+    if (strength < 1.0f) {
+        /*
+         * Noise-injection img2img (strength < 1.0):
+         * - Blend the reference latent with Gaussian noise at timestep t_start
+         *   where t_start corresponds to (1 - strength) along the schedule
+         * - Denoise only the remaining fraction of the schedule
+         * - Lower strength  → start closer to the reference → subtler variation
+         * - Higher strength → start further from the reference → freer variation
+         */
+        int start_step = (int)((1.0f - strength) * num_steps);
+        if (start_step < 0) start_step = 0;
+        if (start_step >= num_steps) start_step = num_steps - 1;
+        float t_start = schedule[start_step];
+
+        float *eps = flux_init_noise(1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+        int latent_size = FLUX_LATENT_CHANNELS * out_lat_h * out_lat_w;
+
+        /* z = t_start * noise + (1 - t_start) * ref_latent */
+        float *z_blend = (float *)malloc(latent_size * sizeof(float));
+        for (int i = 0; i < latent_size; i++)
+            z_blend[i] = t_start * eps[i] + (1.0f - t_start) * img_latent[i];
+
+        free(eps);
+        free(img_latent);
+
+        int remaining = num_steps - start_step;
+        if (ctx->is_distilled) {
+            latent = flux_sample_euler(ctx->transformer, ctx->qwen3_encoder,
+                                       z_blend, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+                                       text_emb, text_seq,
+                                       &schedule[start_step], remaining, NULL);
+        } else {
+            latent = flux_sample_euler_cfg(ctx->transformer, ctx->qwen3_encoder,
+                                           z_blend, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+                                           text_emb, text_seq,
+                                           text_emb_uncond, text_seq_uncond,
+                                           guidance,
+                                           &schedule[start_step], remaining, NULL);
+        }
+        free(z_blend);
     } else {
-        latent = flux_sample_euler_cfg_with_refs(
-            ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
-            img_latent, latent_h, latent_w,
-            t_offset,
-            text_emb, text_seq,
-            text_emb_uncond, text_seq_uncond,
-            guidance,
-            schedule, num_steps,
-            NULL
-        );
+        /*
+         * In-context conditioning img2img (strength == 1.0, default):
+         * - Reference is VAE-encoded and concatenated as extra tokens in the transformer
+         * - Target latent starts from pure noise and denoises over all steps
+         * - The model attends to the reference via joint attention (loose structural guidance)
+         */
+        float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+        int t_offset = 10;
+
+        if (ctx->is_distilled) {
+            latent = flux_sample_euler_with_refs(
+                ctx->transformer, ctx->qwen3_encoder,
+                z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+                img_latent, latent_h, latent_w,
+                t_offset, text_emb, text_seq,
+                schedule, num_steps, NULL);
+        } else {
+            latent = flux_sample_euler_cfg_with_refs(
+                ctx->transformer, ctx->qwen3_encoder,
+                z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+                img_latent, latent_h, latent_w,
+                t_offset, text_emb, text_seq,
+                text_emb_uncond, text_seq_uncond,
+                guidance, schedule, num_steps, NULL);
+        }
+        free(z);
+        free(img_latent);
     }
 
-    free(z);
-    free(img_latent);
     free(schedule);
     free(text_emb);
     free(text_emb_uncond);

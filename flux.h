@@ -82,12 +82,13 @@ typedef struct {
     int linear_schedule;    /* Use linear timestep schedule instead of shifted sigmoid */
     int power_schedule;     /* Use power curve timestep schedule */
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
+    float img2img_strength; /* img2img denoising strength 0.0-1.0 (default: 1.0 = in-context conditioning) */
 } flux_params;
 
 /* Default parameters */
 #define FLUX_DEFAULT_WIDTH  256
 #define FLUX_DEFAULT_HEIGHT 256
-#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f }
+#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f }
 
 /* ========================================================================
  * Core API
