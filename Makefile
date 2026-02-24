@@ -10,7 +10,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c embcache.c
+SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c embcache.c flux_lora.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = flux_cli.c linenoise.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
@@ -195,11 +195,12 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h embcache.h
+flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h embcache.h flux_lora.h
 flux_kernels.o: flux_kernels.c flux_kernels.h
 flux_tokenizer.o: flux_tokenizer.c flux.h
 flux_vae.o: flux_vae.c flux.h flux_kernels.h
-flux_transformer.o: flux_transformer.c flux.h flux_kernels.h
+flux_transformer.o: flux_transformer.c flux.h flux_kernels.h flux_lora.h
+flux_lora.o: flux_lora.c flux_lora.h flux_safetensors.h
 flux_sample.o: flux_sample.c flux.h flux_kernels.h
 flux_image.o: flux_image.c flux.h
 flux_safetensors.o: flux_safetensors.c flux_safetensors.h
