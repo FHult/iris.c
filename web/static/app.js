@@ -869,7 +869,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // Make output area images clickable
     outputArea.addEventListener('click', (e) => {
         if (e.target.tagName === 'IMG') {
-            openLightbox(e.target.src);
+            const src = e.target.src;
+            // Look up the image in history so lightbox toolbar (upscale, delete, etc.) works
+            const cleanSrc = src.replace(window.location.origin, '').split('?')[0];
+            const idx = cachedHistory.findIndex(h => h.image_url === cleanSrc);
+            if (idx >= 0) {
+                openLightbox(src, cachedHistory, idx);
+            } else {
+                openLightbox(src);
+            }
         }
     });
 
@@ -954,6 +962,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 progressPrompt.textContent = prompt;
                 progressPrompt.title = prompt;
                 showProgress('Starting...', 0);
+                // Update currentGeneration so upscale/vary see the correct dimensions
+                currentGeneration = { prompt, width, height, steps, guidance, schedule, lora, lora_scale };
                 connectToProgress(data.job_id, steps,
                     () => recoverNextServerJob(),
                     () => recoverNextServerJob()
