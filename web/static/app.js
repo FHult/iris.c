@@ -105,6 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let lightboxIndex = -1;
     let lightboxItems = [];
     let lightboxBatchMode = false;
+    let lightboxBatchConstrained = false; // navigating within batch siblings only
     let slideshowTimer = null;
     let cachedHistory = [];
     let historyPageSize = 20;
@@ -262,9 +263,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Lightbox functionality
     function openLightbox(imageSrc, items, index) {
-        // Reset any previous batch mode before opening
+        // Reset any previous batch/constrained state before opening
         lightboxModal.classList.remove('batch-mode');
         lightboxBatchMode = false;
+        lightboxBatchConstrained = false;
 
         lightboxImage.src = imageSrc;
         lightboxModal.classList.add('active');
@@ -273,26 +275,29 @@ document.addEventListener('DOMContentLoaded', () => {
             lightboxItems = items;
             lightboxIndex = index;
 
-            // Auto-enter batch mode when the target image is part of a multi-image batch
+            // When the image is part of a multi-image batch, constrain navigation to
+            // its siblings so prev/next arrows browse variants, not all history.
             const item = items[index];
             if (item && item.batch_id) {
                 const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
                 if (batchItems.length > 1) {
-                    enterBatchMode(batchItems);
-                    return;
+                    lightboxBatchConstrained = true;
+                    lightboxItems = batchItems;
+                    const bi = batchItems.findIndex(h => h.id === item.id);
+                    lightboxIndex = bi >= 0 ? bi : 0;
                 }
             }
 
             // Single-image view
-            const multi = items.length > 1;
+            const multi = lightboxItems.length > 1;
             lightboxPrev.style.display = multi ? '' : 'none';
             lightboxNext.style.display = multi ? '' : 'none';
             if (lightboxZoneLeft) lightboxZoneLeft.style.display = multi ? 'flex' : 'none';
             if (lightboxZoneRight) lightboxZoneRight.style.display = multi ? 'flex' : 'none';
-            updateLightboxMetadata(items[index]);
-            populateLightboxFilmstrip(items);
-            updateLightboxFilmstrip(index);
-            updateLightboxCounter(index, items.length);
+            updateLightboxMetadata(lightboxItems[lightboxIndex]);
+            populateLightboxFilmstrip(lightboxItems);
+            updateLightboxFilmstrip(lightboxIndex);
+            updateLightboxCounter(lightboxIndex, lightboxItems.length);
         } else {
             lightboxItems = [];
             lightboxIndex = -1;
@@ -383,6 +388,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function closeLightbox() {
         lightboxModal.classList.remove('active', 'batch-mode');
         lightboxBatchMode = false;
+        lightboxBatchConstrained = false;
         document.body.style.overflow = '';
         stopSlideshow();
         if (isCropping) {
@@ -431,6 +437,11 @@ document.addEventListener('DOMContentLoaded', () => {
             // Click image → exit batch mode, open this variation in single view
             div.querySelector('img').addEventListener('click', () => {
                 exitBatchMode();
+                // Constrain navigation to batch siblings only when all items share a batch_id
+                const allSameBatch = item.batch_id != null &&
+                    lightboxItems.length > 1 &&
+                    lightboxItems.every(h => h.batch_id === item.batch_id);
+                lightboxBatchConstrained = allSameBatch;
                 const idx = lightboxItems.findIndex(h => h.id === item.id);
                 lightboxIndex = idx >= 0 ? idx : 0;
                 lightboxImage.src = `${item.image_url}?t=${item.created_at}`;
@@ -484,8 +495,16 @@ document.addEventListener('DOMContentLoaded', () => {
     function lightboxNavigate(direction) {
         if (lightboxBatchMode || lightboxItems.length === 0) return;
 
-        // Sync lightbox items with current history to avoid showing deleted images
-        if (cachedHistory.length > 0 && lightboxItems !== cachedHistory) {
+        // Sync lightbox items to avoid showing deleted images
+        if (lightboxBatchConstrained) {
+            // Stay within batch siblings; re-filter from cachedHistory
+            const currentItem = lightboxItems[lightboxIndex];
+            if (currentItem) {
+                lightboxItems = cachedHistory.filter(h => h.batch_id === currentItem.batch_id);
+                const newIndex = lightboxItems.findIndex(h => h.id === currentItem.id);
+                lightboxIndex = newIndex >= 0 ? newIndex : 0;
+            }
+        } else if (cachedHistory.length > 0 && lightboxItems !== cachedHistory) {
             const currentItem = lightboxItems[lightboxIndex];
             lightboxItems = cachedHistory;
             // Try to find current item in updated history
@@ -2894,7 +2913,28 @@ document.addEventListener('DOMContentLoaded', () => {
         const item = lightboxItems[lightboxIndex];
         try {
             await deleteHistoryItem(item.id);
-            if (cachedHistory.length === 0) {
+            if (lightboxBatchConstrained) {
+                // Stay within remaining batch siblings
+                const remaining = cachedHistory.filter(h => h.batch_id === item.batch_id);
+                if (remaining.length === 0) {
+                    closeLightbox();
+                } else {
+                    if (remaining.length === 1) lightboxBatchConstrained = false;
+                    lightboxItems = remaining;
+                    lightboxIndex = Math.min(lightboxIndex, remaining.length - 1);
+                    const next = lightboxItems[lightboxIndex];
+                    lightboxImage.src = `${next.image_url}?t=${next.created_at}`;
+                    updateLightboxMetadata(next);
+                    const multi = lightboxItems.length > 1;
+                    lightboxPrev.style.display = multi ? '' : 'none';
+                    lightboxNext.style.display = multi ? '' : 'none';
+                    if (lightboxZoneLeft) lightboxZoneLeft.style.display = multi ? 'flex' : 'none';
+                    if (lightboxZoneRight) lightboxZoneRight.style.display = multi ? 'flex' : 'none';
+                    populateLightboxFilmstrip(lightboxItems);
+                    updateLightboxFilmstrip(lightboxIndex);
+                    updateLightboxCounter(lightboxIndex, lightboxItems.length);
+                }
+            } else if (cachedHistory.length === 0) {
                 closeLightbox();
             } else {
                 lightboxItems = cachedHistory;
