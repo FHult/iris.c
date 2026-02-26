@@ -5,6 +5,7 @@ Usage: python3 run_test.py [--flux-binary PATH] [--full]
 """
 
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,18 @@ TESTS = [
         "height": 256,
         "input": "test_vectors/img2img_input_256x256.png",
         "reference": "test_vectors/reference_img2img_256x256_seed456.png",
+        "mean_diff_threshold": 20,
+    },
+    {
+        "name": "256x256 img2img strength=0.35 test (4 steps)",
+        "prompt": "A colorful oil painting of a cat",
+        "seed": 456,
+        "steps": 4,
+        "width": 256,
+        "height": 256,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "img2img_strength": 0.35,
+        "reference": "test_vectors/reference_img2img_strength035_256x256_seed456.png",
         "mean_diff_threshold": 20,
     },
 ]
@@ -140,6 +153,10 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     if "input" in test:
         cmd.extend(["-i", test["input"]])
 
+    # Add img2img strength if specified
+    if "img2img_strength" in test:
+        cmd.extend(["--img2img-strength", str(test["img2img_strength"])])
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
@@ -189,6 +206,85 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         return False, f"mean_diff={mean_diff:.2f} > {threshold} (max={max_diff:.0f})"
 
 
+def run_server_mode_test(flux_binary: str, model_dir: str) -> tuple[bool, str]:
+    """
+    Smoke-test the --server JSON IPC mode.
+
+    Spawns the binary with --server, sends one generation request via stdin,
+    reads stdout events until 'complete' or 'error', then verifies the output.
+    """
+    output_path = "/tmp/flux_server_mode_test.png"
+    request = {
+        "prompt": "A simple blue circle",
+        "output": output_path,
+        "seed": 1,
+        "steps": 2,
+        "width": 64,
+        "height": 64,
+        "show_steps": False,
+    }
+
+    try:
+        proc = subprocess.Popen(
+            [flux_binary, "-d", model_dir, "--server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False, f"binary not found: {flux_binary}"
+
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+
+        events = []
+        last_event = None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                events.append(ev)
+                last_event = ev
+                if ev.get("event") in ("complete", "error"):
+                    break
+            except json.JSONDecodeError:
+                pass
+
+        proc.wait(timeout=60)
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return False, "timeout (60s)"
+    except Exception as e:
+        proc.kill()
+        return False, str(e)
+
+    if not events:
+        return False, "no events received from server"
+
+    if last_event is None or last_event.get("event") != "complete":
+        err = last_event.get("message", "unknown error") if last_event else "no complete event"
+        return False, f"server error: {err}"
+
+    if not Path(output_path).exists():
+        return False, f"output file not created: {output_path}"
+
+    try:
+        img = Image.open(output_path)
+        if img.width != 64 or img.height != 64:
+            return False, f"wrong output size: {img.width}x{img.height}"
+    except Exception as e:
+        return False, f"output is not a valid image: {e}"
+
+    return True, (f"server emitted {len(events)} events, "
+                  f"output={output_path} ({img.width}x{img.height})")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run FLUX inference tests")
     parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
@@ -219,7 +315,10 @@ def main():
         else:
             print("No Z-Image model dir detected; skipping optional Z-Image smoke test.")
 
-    total = len(scheduled_tests) + len(full_tests_to_run)
+    # Server-mode IPC test runs in non-quick mode.
+    run_server_test = not args.quick
+
+    total = len(scheduled_tests) + len(full_tests_to_run) + (1 if run_server_test else 0)
     print(f"Running {total} test(s)...\n")
 
     passed = 0
@@ -279,6 +378,17 @@ def main():
             if "visual_check" in test:
                 visual_checks.append((test["name"], output_path,
                                       test["visual_check"]))
+        else:
+            print(f"    FAIL: {msg}")
+            failed += 1
+
+    if run_server_test:
+        server_idx = len(scheduled_tests) + len(full_tests_to_run) + 1
+        print(f"[{server_idx}/{total}] Server-mode IPC smoke test...")
+        ok, msg = run_server_mode_test(args.flux_binary, args.model_dir)
+        if ok:
+            print(f"    PASS: {msg}")
+            passed += 1
         else:
             print(f"    FAIL: {msg}")
             failed += 1

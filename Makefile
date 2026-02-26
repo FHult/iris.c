@@ -21,7 +21,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test test-unit test-quick web-tests pngtest help generic blas mps
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -148,16 +148,37 @@ debug: clean $(TARGET)
 # =============================================================================
 # Test and utilities
 # =============================================================================
-test:
+test: test-unit web-tests
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
 test-quick:
 	@python3 run_test.py --flux-binary ./$(TARGET) --quick
 
+# Web server API tests (no model or binary required)
+web-tests:
+	@echo "=== Web server API tests ==="
+	@python3 -m pytest web/tests/ -v --tb=short
+	@echo ""
+
+# Unit tests that run without a model (LoRA math, JPEG decoder, PNG roundtrip)
+test-unit:
+	@echo "=== LoRA unit tests ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_lora debug/test_lora.c flux_lora.c flux_safetensors.c -lm
+	@/tmp/flux_test_lora
+	@rm -f /tmp/flux_test_lora
+	@echo "=== JPEG unit tests ==="
+	@$(MAKE) -C jpg_test test --no-print-directory
+	@echo "=== PNG tests ==="
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c jpeg.c -lm -o /tmp/flux_png_compare
+	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
+	@rm -f /tmp/flux_png_compare
+	@echo "PNG TEST PASSED"
+	@echo ""
+	@echo "All unit tests passed."
+
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c -lm -o /tmp/flux_png_compare
-	@/tmp/flux_png_compare images/woman_with_sunglasses.png images/woman_with_sunglasses_compressed2.png
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c jpeg.c -lm -o /tmp/flux_png_compare
 	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/flux_png_compare
 	@echo "PNG TEST PASSED"
