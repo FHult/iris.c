@@ -299,6 +299,15 @@
                             <line x1="12" y1="15" x2="12" y2="3"></line>
                         </svg>
                     </button>
+                    <button type="button" id="upscale-btn" class="btn-vary btn-upscale" title="Upscale 2× — regenerate at double resolution using current image as reference">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="15 3 21 3 21 9"></polyline>
+                            <polyline points="9 21 3 21 3 15"></polyline>
+                            <line x1="21" y1="3" x2="14" y2="10"></line>
+                            <line x1="3" y1="21" x2="10" y2="14"></line>
+                        </svg>
+                        2×
+                    </button>
                     <div class="vary-subtle-group">
                         <button type="button" id="vary-subtle-btn" class="btn-vary btn-vary-subtle" title="Vary (Subtle) — re-run with original as img2img reference">
                             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -338,6 +347,12 @@
                 <h2>History</h2>
                 <div class="history-tools">
                     <input type="text" id="history-search" class="history-search" placeholder="Search prompts...">
+                    <button type="button" id="favorites-filter-btn" class="btn-slideshow" title="Show favorites only">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                        </svg>
+                        Favorites
+                    </button>
                     <button type="button" id="slideshow-btn" class="btn-slideshow" title="Start slideshow">
                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
                             <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -357,6 +372,9 @@
     <!-- Lightbox Modal for Full-Size Images -->
     <div id="lightbox-modal" class="lightbox-modal">
         <button class="lightbox-close" id="lightbox-close">&times;</button>
+        <div class="lightbox-counter" id="lightbox-counter"></div>
+        <div class="lightbox-zone lightbox-zone-left" id="lightbox-zone-left"></div>
+        <div class="lightbox-zone lightbox-zone-right" id="lightbox-zone-right"></div>
         <button class="lightbox-nav lightbox-prev" id="lightbox-prev">&lsaquo;</button>
         <div class="lightbox-content" id="lightbox-content">
             <img id="lightbox-image" class="lightbox-image" src="" alt="Full size image">
@@ -371,7 +389,15 @@
             </div>
         </div>
         <button class="lightbox-nav lightbox-next" id="lightbox-next">&rsaquo;</button>
+        <div id="lightbox-batch" class="lightbox-batch"></div>
+        <div class="lightbox-filmstrip" id="lightbox-filmstrip"></div>
         <div class="lightbox-toolbar" id="lightbox-toolbar">
+            <button type="button" id="lightbox-star-btn" class="lightbox-tool-btn" title="Favorite">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                </svg>
+                Favorite
+            </button>
             <button type="button" id="lightbox-download-btn" class="lightbox-tool-btn" title="Download image">
                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -379,6 +405,15 @@
                     <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
                 Download
+            </button>
+            <button type="button" id="lightbox-upscale-btn" class="lightbox-tool-btn" title="Upscale 2× — regenerate at double resolution">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="15 3 21 3 21 9"></polyline>
+                    <polyline points="9 21 3 21 3 15"></polyline>
+                    <line x1="21" y1="3" x2="14" y2="10"></line>
+                    <line x1="3" y1="21" x2="10" y2="14"></line>
+                </svg>
+                Upscale 2×
             </button>
             <button type="button" id="lightbox-crop-btn" class="lightbox-tool-btn" title="Crop image">
                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -402,7 +437,7 @@
                     <rect x="3" y="14" width="7" height="7"></rect>
                     <rect x="14" y="14" width="7" height="7"></rect>
                 </svg>
-                Variations
+                <span id="lightbox-variations-label">Variations</span>
             </button>
             <button type="button" id="lightbox-delete-btn" class="lightbox-tool-btn lightbox-delete-btn" title="Delete image">
                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -445,12 +480,6 @@
                 Cancel
             </button>
         </div>
-    </div>
-
-    <!-- Compare Modal for Side-by-Side View -->
-    <div id="compare-modal" class="compare-modal">
-        <button class="compare-close" id="compare-close">&times;</button>
-        <div id="compare-grid" class="compare-grid"></div>
     </div>
 
     <!-- Floating Compare Bar (shown when images selected in history) -->

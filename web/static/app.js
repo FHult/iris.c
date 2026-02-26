@@ -80,15 +80,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const lightboxDownloadBtn = document.getElementById('lightbox-download-btn');
     const lightboxDeleteBtn = document.getElementById('lightbox-delete-btn');
     const lightboxVariationsBtn = document.getElementById('lightbox-variations-btn');
-    const compareModal = document.getElementById('compare-modal');
-    const compareGrid = document.getElementById('compare-grid');
-    const compareClose = document.getElementById('compare-close');
+    const lightboxStarBtn = document.getElementById('lightbox-star-btn');
+    const lightboxUpscaleBtn = document.getElementById('lightbox-upscale-btn');
+    const lightboxCounter = document.getElementById('lightbox-counter');
+    const lightboxFilmstrip = document.getElementById('lightbox-filmstrip');
+    const lightboxZoneLeft = document.getElementById('lightbox-zone-left');
+    const lightboxZoneRight = document.getElementById('lightbox-zone-right');
+    const upscaleBtn = document.getElementById('upscale-btn');
     const compareBar = document.getElementById('compare-bar');
     const compareBarText = document.getElementById('compare-bar-text');
     const compareBarBtn = document.getElementById('compare-bar-btn');
     const compareBarClear = document.getElementById('compare-bar-clear');
 
     let currentEventSource = null;
+    let dragSrcQueueId = null;
     let referenceImageData = [null, null, null, null]; // Up to 4 reference images
     let availableLoras = [];   // [{name, filename, size_mb}] from /available-loras
     let curatedLoras = [];     // [{...curated entry, downloaded: bool}]
@@ -99,6 +104,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentJobId = null;
     let lightboxIndex = -1;
     let lightboxItems = [];
+    let lightboxBatchMode = false;
     let slideshowTimer = null;
     let cachedHistory = [];
     let historyPageSize = 20;
@@ -185,6 +191,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const visible = advancedControls.style.display !== 'none';
         advancedControls.style.display = visible ? 'none' : 'grid';
         toggleAdvancedBtn.textContent = visible ? 'Advanced options' : 'Hide advanced';
+        saveSettings();
     });
 
     // Guidance slider
@@ -206,13 +213,24 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // History search
+    // History search and favorites filter
     let historySearchQuery = '';
+    let historyFavoritesOnly = false;
     historySearch.addEventListener('input', () => {
         historySearchQuery = historySearch.value.trim().toLowerCase();
         historyVisible = historyPageSize;
         renderHistory();
     });
+
+    const favoritesFilterBtn = document.getElementById('favorites-filter-btn');
+    if (favoritesFilterBtn) {
+        favoritesFilterBtn.addEventListener('click', () => {
+            historyFavoritesOnly = !historyFavoritesOnly;
+            favoritesFilterBtn.classList.toggle('active', historyFavoritesOnly);
+            historyVisible = historyPageSize;
+            renderHistory();
+        });
+    }
 
     // Cropping state
     let isCropping = false;
@@ -244,22 +262,96 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Lightbox functionality
     function openLightbox(imageSrc, items, index) {
+        // Reset any previous batch mode before opening
+        lightboxModal.classList.remove('batch-mode');
+        lightboxBatchMode = false;
+
         lightboxImage.src = imageSrc;
         lightboxModal.classList.add('active');
         document.body.style.overflow = 'hidden';
         if (items && index !== undefined) {
             lightboxItems = items;
             lightboxIndex = index;
-            lightboxPrev.style.display = items.length > 1 ? '' : 'none';
-            lightboxNext.style.display = items.length > 1 ? '' : 'none';
+
+            // Auto-enter batch mode when the target image is part of a multi-image batch
+            const item = items[index];
+            if (item && item.batch_id) {
+                const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
+                if (batchItems.length > 1) {
+                    enterBatchMode(batchItems);
+                    return;
+                }
+            }
+
+            // Single-image view
+            const multi = items.length > 1;
+            lightboxPrev.style.display = multi ? '' : 'none';
+            lightboxNext.style.display = multi ? '' : 'none';
+            if (lightboxZoneLeft) lightboxZoneLeft.style.display = multi ? 'flex' : 'none';
+            if (lightboxZoneRight) lightboxZoneRight.style.display = multi ? 'flex' : 'none';
             updateLightboxMetadata(items[index]);
+            populateLightboxFilmstrip(items);
+            updateLightboxFilmstrip(index);
+            updateLightboxCounter(index, items.length);
         } else {
             lightboxItems = [];
             lightboxIndex = -1;
             lightboxPrev.style.display = 'none';
             lightboxNext.style.display = 'none';
+            if (lightboxZoneLeft) lightboxZoneLeft.style.display = 'none';
+            if (lightboxZoneRight) lightboxZoneRight.style.display = 'none';
             lightboxMetadata.innerHTML = '';
+            if (lightboxFilmstrip) lightboxFilmstrip.style.display = 'none';
+            if (lightboxCounter) lightboxCounter.style.display = 'none';
         }
+    }
+
+    function updateLightboxCounter(index, total) {
+        if (!lightboxCounter) return;
+        if (total > 1) {
+            lightboxCounter.textContent = `${index + 1} / ${total}`;
+            lightboxCounter.style.display = 'block';
+        } else {
+            lightboxCounter.style.display = 'none';
+        }
+    }
+
+    function populateLightboxFilmstrip(items) {
+        if (!lightboxFilmstrip || !items || items.length <= 1) {
+            if (lightboxFilmstrip) lightboxFilmstrip.style.display = 'none';
+            return;
+        }
+        lightboxFilmstrip.style.display = 'flex';
+        lightboxFilmstrip.innerHTML = '';
+        items.forEach((item, i) => {
+            const img = document.createElement('img');
+            img.src = item.thumb_url
+                ? `${item.thumb_url}?t=${item.created_at}`
+                : `${item.image_url}?t=${item.created_at}`;
+            img.alt = item.prompt;
+            img.className = 'filmstrip-thumb';
+            img.onerror = function() { this.onerror = null; this.src = `${item.image_url}?t=${item.created_at}`; };
+            img.addEventListener('click', (e) => {
+                e.stopPropagation();
+                lightboxIndex = i;
+                const it = lightboxItems[i];
+                lightboxImage.src = `${it.image_url}?t=${it.created_at}`;
+                updateLightboxMetadata(it);
+                selectHistoryItem(it);
+                updateLightboxFilmstrip(i);
+                updateLightboxCounter(i, lightboxItems.length);
+            });
+            lightboxFilmstrip.appendChild(img);
+        });
+    }
+
+    function updateLightboxFilmstrip(index) {
+        if (!lightboxFilmstrip) return;
+        lightboxFilmstrip.querySelectorAll('.filmstrip-thumb').forEach((t, i) => {
+            t.classList.toggle('active', i === index);
+        });
+        const active = lightboxFilmstrip.querySelector('.filmstrip-thumb.active');
+        if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
     }
 
     function updateLightboxMetadata(item) {
@@ -272,21 +364,25 @@ document.addEventListener('DOMContentLoaded', () => {
             <div class="meta-details">${item.width}x${item.height} &middot; ${item.steps} steps &middot; seed ${item.seed || '?'}${styleStr}${timeStr}</div>
         `;
         // Show/hide variations button
+        const variationsLabel = document.getElementById('lightbox-variations-label');
         if (item.batch_id) {
             const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
             if (batchItems.length > 1) {
                 lightboxVariationsBtn.style.display = '';
-                lightboxVariationsBtn.textContent = `Variations (${batchItems.length})`;
+                if (variationsLabel) variationsLabel.textContent = `Variations (${batchItems.length})`;
             } else {
                 lightboxVariationsBtn.style.display = 'none';
             }
         } else {
             lightboxVariationsBtn.style.display = 'none';
         }
+        // Sync star button
+        syncLightboxStarBtn(item.favorited || false);
     }
 
     function closeLightbox() {
-        lightboxModal.classList.remove('active');
+        lightboxModal.classList.remove('active', 'batch-mode');
+        lightboxBatchMode = false;
         document.body.style.overflow = '';
         stopSlideshow();
         if (isCropping) {
@@ -294,8 +390,99 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // ---- Batch / variation comparison mode ----
+
+    async function deleteHistoryItem(id) {
+        const resp = await fetch(`/history/${id}`, { method: 'DELETE' });
+        if (!resp.ok) throw new Error('Delete failed');
+        await loadHistory();
+    }
+
+    function enterBatchMode(items) {
+        lightboxBatchMode = true;
+        lightboxItems = items;
+        lightboxModal.classList.add('batch-mode');
+        renderBatchItems(items);
+    }
+
+    function exitBatchMode() {
+        lightboxBatchMode = false;
+        lightboxModal.classList.remove('batch-mode');
+    }
+
+    function renderBatchItems(items) {
+        const container = document.getElementById('lightbox-batch');
+        container.innerHTML = '';
+        items.forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'batch-view-item';
+            div.innerHTML = `
+                <img src="${item.image_url}?t=${item.created_at}" alt="${escapeHtml(item.prompt)}"
+                     onerror="this.onerror=null;this.src=this.src.split('?')[0]">
+                <div class="batch-view-info">Seed: ${item.seed || '?'}${item.generation_time ? ' &middot; ' + item.generation_time.toFixed(1) + 's' : ''}</div>
+                <button class="batch-view-delete" title="Delete this variation">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            `;
+
+            // Click image → exit batch mode, open this variation in single view
+            div.querySelector('img').addEventListener('click', () => {
+                exitBatchMode();
+                const idx = lightboxItems.findIndex(h => h.id === item.id);
+                lightboxIndex = idx >= 0 ? idx : 0;
+                lightboxImage.src = `${item.image_url}?t=${item.created_at}`;
+                updateLightboxMetadata(item);
+                const multi = lightboxItems.length > 1;
+                lightboxPrev.style.display = multi ? '' : 'none';
+                lightboxNext.style.display = multi ? '' : 'none';
+                if (lightboxZoneLeft) lightboxZoneLeft.style.display = multi ? 'flex' : 'none';
+                if (lightboxZoneRight) lightboxZoneRight.style.display = multi ? 'flex' : 'none';
+                populateLightboxFilmstrip(lightboxItems);
+                updateLightboxFilmstrip(lightboxIndex);
+                updateLightboxCounter(lightboxIndex, lightboxItems.length);
+            });
+
+            // Delete button
+            div.querySelector('.batch-view-delete').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                try {
+                    await deleteHistoryItem(item.id);
+                    const remaining = cachedHistory.filter(h => h.batch_id === item.batch_id);
+                    if (remaining.length === 0) {
+                        closeLightbox();
+                    } else if (remaining.length === 1) {
+                        exitBatchMode();
+                        const only = remaining[0];
+                        lightboxItems = cachedHistory;
+                        const idx = cachedHistory.findIndex(h => h.id === only.id);
+                        lightboxIndex = idx >= 0 ? idx : 0;
+                        lightboxImage.src = `${only.image_url}?t=${only.created_at}`;
+                        updateLightboxMetadata(only);
+                        lightboxPrev.style.display = '';
+                        lightboxNext.style.display = '';
+                        if (lightboxZoneLeft) lightboxZoneLeft.style.display = 'flex';
+                        if (lightboxZoneRight) lightboxZoneRight.style.display = 'flex';
+                        populateLightboxFilmstrip(lightboxItems);
+                        updateLightboxFilmstrip(lightboxIndex);
+                        updateLightboxCounter(lightboxIndex, lightboxItems.length);
+                    } else {
+                        lightboxItems = remaining;
+                        renderBatchItems(remaining);
+                    }
+                } catch (err) {
+                    console.error('Failed to delete variation:', err);
+                }
+            });
+
+            container.appendChild(div);
+        });
+    }
+
     function lightboxNavigate(direction) {
-        if (lightboxItems.length === 0) return;
+        if (lightboxBatchMode || lightboxItems.length === 0) return;
 
         // Sync lightbox items with current history to avoid showing deleted images
         if (cachedHistory.length > 0 && lightboxItems !== cachedHistory) {
@@ -322,6 +509,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const item = lightboxItems[lightboxIndex];
         lightboxImage.src = `${item.image_url}?t=${item.created_at}`;
         updateLightboxMetadata(item);
+        updateLightboxFilmstrip(lightboxIndex);
+        updateLightboxCounter(lightboxIndex, lightboxItems.length);
         // Also select in form
         selectHistoryItem(item);
     }
@@ -338,26 +527,47 @@ document.addEventListener('DOMContentLoaded', () => {
     // Close lightbox on button click
     lightboxClose.addEventListener('click', closeLightbox);
 
-    // Close lightbox when clicking outside the image
+    // Close lightbox when clicking backdrop; navigate on left/right thirds
     lightboxModal.addEventListener('click', (e) => {
-        if (e.target === lightboxModal) {
+        if (e.target !== lightboxModal) return;
+        if (lightboxBatchMode) { closeLightbox(); return; }
+        if (lightboxItems.length > 1 && !isCropping) {
+            const x = e.clientX / window.innerWidth;
+            if (x < 0.33) lightboxNavigate(-1);
+            else if (x > 0.67) lightboxNavigate(1);
+            else closeLightbox();
+        } else {
             closeLightbox();
         }
     });
+
+    // Click zone buttons
+    if (lightboxZoneLeft) lightboxZoneLeft.addEventListener('click', (e) => { e.stopPropagation(); lightboxNavigate(-1); });
+    if (lightboxZoneRight) lightboxZoneRight.addEventListener('click', (e) => { e.stopPropagation(); lightboxNavigate(1); });
+
+    // Touch swipe to navigate
+    let touchStartX = 0;
+    lightboxModal.addEventListener('touchstart', (e) => { touchStartX = e.touches[0].clientX; }, { passive: true });
+    lightboxModal.addEventListener('touchend', (e) => {
+        const dx = e.changedTouches[0].clientX - touchStartX;
+        if (Math.abs(dx) > 50 && !isCropping) lightboxNavigate(dx < 0 ? 1 : -1);
+    }, { passive: true });
 
     // Keyboard navigation in lightbox
     document.addEventListener('keydown', (e) => {
         if (!lightboxModal.classList.contains('active')) return;
         if (e.key === 'Escape') {
-            if (isCropping) {
-                exitCropMode();
-            } else {
-                closeLightbox();
-            }
+            if (isCropping) exitCropMode(); else closeLightbox();
         } else if (e.key === 'ArrowLeft' && !isCropping) {
             lightboxNavigate(-1);
         } else if (e.key === 'ArrowRight' && !isCropping) {
             lightboxNavigate(1);
+        } else if (e.key === 'u' && !isCropping) {
+            const item = lightboxItems[lightboxIndex];
+            if (item) {
+                closeLightbox();
+                upscaleImage(`${item.image_url}?t=${item.created_at}`, item);
+            }
         } else if (e.key === 'c' && !isCropping) {
             enterCropMode();
         } else if (e.key === 'Enter' && isCropping) {
@@ -737,22 +947,33 @@ document.addEventListener('DOMContentLoaded', () => {
                 showError(data.error || 'Failed to queue job');
                 return;
             }
-            // Track in local queue display with server's job_id
-            generationQueue.push({
-                id: data.job_id,
-                prompt,
-                width,
-                height,
-                steps,
-                seed,
-                serverJob: true,
-            });
-            renderQueue();
+            if (!isGenerating) {
+                // Server started the job immediately — connect to its progress stream
+                currentJobId = data.job_id;
+                setGenerating(true);
+                progressPrompt.textContent = prompt;
+                progressPrompt.title = prompt;
+                showProgress('Starting...', 0);
+                connectToProgress(data.job_id, steps,
+                    () => recoverNextServerJob(),
+                    () => recoverNextServerJob()
+                );
+            } else {
+                // Server queued it — track in local queue display
+                generationQueue.push({
+                    id: data.job_id,
+                    prompt,
+                    width,
+                    height,
+                    steps,
+                    seed,
+                    serverJob: true,
+                });
+                renderQueue();
+            }
         } catch (err) {
             showError(`Failed to queue: ${err.message}`);
         }
-        // Clear prompt for next entry
-        document.getElementById('prompt').value = '';
     }
 
     function removeFromQueue(id) {
@@ -768,11 +989,60 @@ document.addEventListener('DOMContentLoaded', () => {
         generationQueue.forEach((item) => {
             const li = document.createElement('li');
             li.className = 'queue-item';
+            li.setAttribute('draggable', 'true');
+            li.dataset.id = String(item.id);
             li.innerHTML = `
+                <span class="queue-drag-handle" title="Drag to reorder">⠿</span>
                 <span class="queue-item-prompt" title="${escapeHtml(item.prompt)}">${escapeHtml(item.prompt)}</span>
                 <span class="queue-item-info">${item.width}x${item.height}, ${item.steps} steps</span>
                 <button class="queue-item-remove" data-id="${item.id}" title="Remove">&times;</button>
             `;
+
+            li.addEventListener('dragstart', (e) => {
+                dragSrcQueueId = String(item.id);
+                li.classList.add('queue-item-dragging');
+                e.dataTransfer.effectAllowed = 'move';
+            });
+            li.addEventListener('dragend', () => {
+                dragSrcQueueId = null;
+                li.classList.remove('queue-item-dragging');
+                queueList.querySelectorAll('.queue-item').forEach(el => el.classList.remove('queue-item-drag-over'));
+            });
+            li.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                if (dragSrcQueueId && dragSrcQueueId !== String(item.id)) {
+                    li.classList.add('queue-item-drag-over');
+                }
+            });
+            li.addEventListener('dragleave', () => {
+                li.classList.remove('queue-item-drag-over');
+            });
+            li.addEventListener('drop', async (e) => {
+                e.preventDefault();
+                li.classList.remove('queue-item-drag-over');
+                if (!dragSrcQueueId || dragSrcQueueId === String(item.id)) return;
+                const srcIdx = generationQueue.findIndex(q => String(q.id) === dragSrcQueueId);
+                const dstIdx = generationQueue.findIndex(q => String(q.id) === String(item.id));
+                if (srcIdx < 0 || dstIdx < 0) return;
+                const [moved] = generationQueue.splice(srcIdx, 1);
+                generationQueue.splice(dstIdx, 0, moved);
+                renderQueue();
+                // Tell server the new order
+                const serverIds = generationQueue.filter(q => q.serverJob).map(q => String(q.id));
+                if (serverIds.length > 0) {
+                    try {
+                        await fetch('/queue/reorder', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ order: serverIds }),
+                        });
+                    } catch (err) {
+                        console.error('Failed to reorder queue:', err);
+                    }
+                }
+                dragSrcQueueId = null;
+            });
+
             queueList.appendChild(li);
         });
 
@@ -782,7 +1052,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 const id = btn.dataset.id;
                 const item = generationQueue.find(item => String(item.id) === id);
                 if (item && item.serverJob) {
-                    // Server-managed job: cancel via API
                     try {
                         await fetch(`/cancel/${id}`, { method: 'POST' });
                     } catch (err) {
@@ -1043,14 +1312,16 @@ document.addEventListener('DOMContentLoaded', () => {
             refPreviews[slot].style.borderColor = '';
             refPreviews[slot].style.backgroundColor = '';
 
-            // Internal reorder: swap source and target slot data
+            // Internal reorder: insert dragged slot before drop target
             const sourceSlotStr = e.dataTransfer.getData('text/x-ref-slot');
             if (sourceSlotStr !== '') {
                 const src = parseInt(sourceSlotStr);
                 if (src !== slot) {
-                    const tmp = referenceImageData[src];
-                    referenceImageData[src] = referenceImageData[slot];
-                    referenceImageData[slot] = tmp;
+                    const dragged = referenceImageData[src];
+                    referenceImageData.splice(src, 1);
+                    const insertAt = src < slot ? slot - 1 : slot;
+                    referenceImageData.splice(insertAt, 0, dragged);
+                    while (referenceImageData.length < 4) referenceImageData.push(null);
                     renderAllSlots();
                 }
                 return;
@@ -1142,6 +1413,71 @@ document.addEventListener('DOMContentLoaded', () => {
                 showError('Vary Subtle failed: ' + e.message);
             } finally {
                 varySubtleBtn.disabled = false;
+            }
+        });
+    }
+
+    // Upscale 2× — submit img2img at double resolution with low strength
+    async function upscaleImage(imageUrl, generation) {
+        if (!generation) { showError('No generation to upscale'); return; }
+        const maxDim = 1792;
+        const w = Math.min(Math.floor(generation.width * 2 / 16) * 16, maxDim);
+        const h = Math.min(Math.floor(generation.height * 2 / 16) * 16, maxDim);
+        if (w === generation.width && h === generation.height) {
+            showError('Already at maximum upscale size');
+            return;
+        }
+        try {
+            const resp = await fetch(imageUrl.split('?')[0]);
+            const blob = await resp.blob();
+            const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+            await addToQueue({
+                prompt: generation.prompt,
+                width: w,
+                height: h,
+                steps: Math.max(generation.steps || 4, 4),
+                seed: null,
+                referenceImages: [base64],
+                style: null,
+                guidance: generation.guidance || null,
+                schedule: generation.schedule || null,
+                lora: generation.lora || null,
+                lora_scale: generation.lora_scale || 1.0,
+                img2img_strength: 0.35,
+            });
+        } catch (e) {
+            showError('Upscale failed: ' + e.message);
+        }
+    }
+
+    if (upscaleBtn) {
+        upscaleBtn.addEventListener('click', async () => {
+            const img = outputArea.querySelector('img');
+            if (!img || !currentGeneration) return;
+            upscaleBtn.disabled = true;
+            try {
+                await upscaleImage(img.src, currentGeneration);
+            } finally {
+                upscaleBtn.disabled = false;
+            }
+        });
+    }
+
+    if (lightboxUpscaleBtn) {
+        lightboxUpscaleBtn.addEventListener('click', async () => {
+            const item = lightboxItems[lightboxIndex];
+            if (!item) return;
+            lightboxUpscaleBtn.disabled = true;
+            try {
+                closeLightbox();
+                await upscaleImage(`${item.image_url}?t=${item.created_at}`, item);
+            } finally {
+                lightboxUpscaleBtn.disabled = false;
             }
         });
     }
@@ -1284,6 +1620,8 @@ document.addEventListener('DOMContentLoaded', () => {
             for (let i = 0; i < extraVariations; i++) {
                 addToQueue({ ...params, seed: null });
             }
+            // Clear prompt immediately so user can type the next one
+            document.getElementById('prompt').value = '';
         } else {
             // Generate main job first, then queue extras after it's submitted
             try {
@@ -1609,6 +1947,15 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         if (prev && availableLoras.some(l => l.filename === prev)) {
             loraSelect.value = prev;
+        }
+        // Apply saved setting deferred from loadSavedSettings
+        if (loraSelect.dataset.pendingLora !== undefined) {
+            const pending = loraSelect.dataset.pendingLora;
+            if (pending && availableLoras.some(l => l.filename === pending)) {
+                loraSelect.value = pending;
+                if (loraScaleGroup) loraScaleGroup.style.display = 'block';
+            }
+            delete loraSelect.dataset.pendingLora;
         }
     }
 
@@ -1972,9 +2319,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderHistory() {
-        const history = historySearchQuery
+        let history = historySearchQuery
             ? cachedHistory.filter(h => h.prompt.toLowerCase().includes(historySearchQuery))
             : cachedHistory;
+        if (historyFavoritesOnly) history = history.filter(h => h.favorited);
         historyGrid.innerHTML = '';
 
         // Build batch groups lookup
@@ -2022,21 +2370,39 @@ document.addEventListener('DOMContentLoaded', () => {
 
             div.innerHTML = `
                 ${badgeHtml}
-                <img src="${thumbUrl}" alt="${escapeHtml(item.prompt)}" data-fullsize="${fullUrl}" draggable="false">
+                <img src="${thumbUrl}" alt="${escapeHtml(item.prompt)}" data-fullsize="${fullUrl}" draggable="false" onerror="this.onerror=null;this.src=this.dataset.fullsize">
                 <button class="history-item-delete" title="Delete">&times;</button>
+                <button class="history-item-star${item.favorited ? ' favorited' : ''}" title="Favorite">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"
+                         fill="${item.favorited ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                    </svg>
+                </button>
                 <div class="history-item-overlay">
                     <div class="history-item-prompt">${escapeHtml(item.prompt)}</div>
+                    <div class="history-item-actions">
+                        <button class="history-quick-btn history-remix-btn" title="Remix — new seed, same settings">↺ Remix</button>
+                        <button class="history-quick-btn history-vary-btn" title="Vary Subtle">~ Vary</button>
+                    </div>
                 </div>
             `;
 
-            // Batch badge click → open compare modal with batch
+            // Batch badge click → open lightbox in batch mode
             const badge = div.querySelector('.batch-badge');
             if (badge) {
                 badge.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const batchId = badge.dataset.batchId;
                     const batchItems = cachedHistory.filter(h => h.batch_id === batchId);
-                    openCompareModal(batchItems);
+                    if (batchItems.length > 0) {
+                        const idx = cachedHistory.findIndex(h => h.id === batchItems[0].id);
+                        openLightbox(
+                            `${batchItems[0].image_url}?t=${batchItems[0].created_at}`,
+                            cachedHistory,
+                            idx >= 0 ? idx : 0
+                        );
+                    }
                 });
             }
 
@@ -2053,10 +2419,82 @@ document.addEventListener('DOMContentLoaded', () => {
                     console.error('Failed to delete:', err);
                 }
             });
+
+            div.querySelector('.history-item-star').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                try {
+                    const resp = await fetch(`/history/${item.id}/favorite`, { method: 'POST' });
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        item.favorited = data.favorited;
+                        const starBtn = div.querySelector('.history-item-star');
+                        starBtn.classList.toggle('favorited', data.favorited);
+                        starBtn.querySelector('svg').setAttribute('fill', data.favorited ? 'currentColor' : 'none');
+                        // If favorites-only filter is on and we just un-favorited, re-render
+                        if (historyFavoritesOnly && !data.favorited) renderHistory();
+                    }
+                } catch (err) {
+                    console.error('Failed to toggle favorite:', err);
+                }
+            });
+
+            div.querySelector('.history-remix-btn').addEventListener('click', (e) => {
+                e.stopPropagation();
+                addToQueue({
+                    prompt: item.prompt,
+                    width: item.width,
+                    height: item.height,
+                    steps: item.steps,
+                    seed: null,
+                    referenceImages: null,
+                    style: item.style || null,
+                    guidance: null,
+                    schedule: null,
+                    lora: item.lora || null,
+                    lora_scale: item.lora_scale || 1.0,
+                });
+            });
+
+            div.querySelector('.history-vary-btn').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const btn = e.currentTarget;
+                btn.disabled = true;
+                try {
+                    const resp = await fetch(item.image_url);
+                    const blob = await resp.blob();
+                    const base64 = await new Promise((res, rej) => {
+                        const reader = new FileReader();
+                        reader.onload = () => res(reader.result);
+                        reader.onerror = rej;
+                        reader.readAsDataURL(blob);
+                    });
+                    await addToQueue({
+                        prompt: item.prompt,
+                        width: item.width,
+                        height: item.height,
+                        steps: item.steps,
+                        seed: null,
+                        referenceImages: [base64],
+                        style: item.style || null,
+                        guidance: null,
+                        schedule: null,
+                        lora: item.lora || null,
+                        lora_scale: item.lora_scale || 1.0,
+                        img2img_strength: 0.7,
+                    });
+                } catch (err) {
+                    console.error('Vary from history failed:', err);
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+
             const itemIndex = i;
             div.addEventListener('click', (e) => {
                 if (e.target.closest('.history-item-delete')) return;
+                if (e.target.closest('.history-item-star')) return;
                 if (e.target.closest('.batch-badge')) return;
+                if (e.target.closest('.history-item-actions')) return;
                 // Shift+click toggles compare selection
                 if (e.shiftKey) {
                     toggleCompareSelection(item);
@@ -2259,6 +2697,23 @@ document.addEventListener('DOMContentLoaded', () => {
             if (settings.schedule && scheduleSelect) {
                 scheduleSelect.value = settings.schedule;
             }
+            if (settings.lora !== undefined && loraSelect) {
+                // Defer: LoRA options loaded async; store as pending
+                loraSelect.dataset.pendingLora = settings.lora;
+            }
+            if (settings.lora_scale !== undefined && loraScaleInput) {
+                loraScaleInput.value = settings.lora_scale;
+                if (loraScaleValue) loraScaleValue.textContent = parseFloat(settings.lora_scale).toFixed(2);
+                if (loraScaleGroup && settings.lora) loraScaleGroup.style.display = 'block';
+            }
+            if (settings.varyStrength !== undefined && varyStrengthInput) {
+                varyStrengthInput.value = settings.varyStrength;
+                if (varyStrengthValue) varyStrengthValue.textContent = parseFloat(settings.varyStrength).toFixed(2);
+            }
+            if (settings.advancedOpen && advancedControls) {
+                advancedControls.style.display = 'grid';
+                if (toggleAdvancedBtn) toggleAdvancedBtn.textContent = 'Hide advanced';
+            }
         } catch (err) {
             console.error('Failed to load settings:', err);
         }
@@ -2275,6 +2730,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 variations: variationsCount,
                 guidance: guidanceInput ? guidanceInput.value : '0',
                 schedule: scheduleSelect ? scheduleSelect.value : '',
+                lora: loraSelect ? loraSelect.value : '',
+                lora_scale: loraScaleInput ? loraScaleInput.value : '1.0',
+                varyStrength: varyStrengthInput ? varyStrengthInput.value : '0.7',
+                advancedOpen: advancedControls ? advancedControls.style.display !== 'none' : false,
             };
             localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
         } catch (err) {
@@ -2290,6 +2749,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (guidanceInput) guidanceInput.addEventListener('change', saveSettings);
     if (scheduleSelect) scheduleSelect.addEventListener('change', saveSettings);
     if (stylePresetSelect) stylePresetSelect.addEventListener('change', saveSettings);
+    if (loraSelect) loraSelect.addEventListener('change', saveSettings);
+    if (loraScaleInput) loraScaleInput.addEventListener('change', saveSettings);
+    if (varyStrengthInput) varyStrengthInput.addEventListener('change', saveSettings);
 
     // ========== Prompt History ==========
     const PROMPT_HISTORY_KEY = 'flux_prompt_history';
@@ -2390,15 +2852,38 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ========== Lightbox Star Button (Favorite) ==========
+    if (lightboxStarBtn) {
+        lightboxStarBtn.addEventListener('click', async () => {
+            const item = lightboxItems[lightboxIndex];
+            if (!item) return;
+            try {
+                const resp = await fetch(`/history/${item.id}/favorite`, { method: 'POST' });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    item.favorited = data.favorited;
+                    const h = cachedHistory.find(h => h.id === item.id);
+                    if (h) h.favorited = data.favorited;
+                    syncLightboxStarBtn(data.favorited);
+                }
+            } catch (err) {
+                console.error('Failed to toggle favorite:', err);
+            }
+        });
+    }
+
+    function syncLightboxStarBtn(favorited) {
+        if (!lightboxStarBtn) return;
+        lightboxStarBtn.querySelector('svg').setAttribute('fill', favorited ? 'currentColor' : 'none');
+        lightboxStarBtn.classList.toggle('active', favorited);
+    }
+
     // ========== Lightbox Delete Button (#16) ==========
     lightboxDeleteBtn.addEventListener('click', async () => {
         if (lightboxItems.length === 0 || lightboxIndex < 0) return;
         const item = lightboxItems[lightboxIndex];
         try {
-            const resp = await fetch(`/history/${item.id}`, { method: 'DELETE' });
-            if (!resp.ok) return;
-            await loadHistory();
-            // Navigate to next or close
+            await deleteHistoryItem(item.id);
             if (cachedHistory.length === 0) {
                 closeLightbox();
             } else {
@@ -2407,6 +2892,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const next = lightboxItems[lightboxIndex];
                 lightboxImage.src = `${next.image_url}?t=${next.created_at}`;
                 updateLightboxMetadata(next);
+                updateLightboxFilmstrip(lightboxIndex);
+                updateLightboxCounter(lightboxIndex, lightboxItems.length);
             }
         } catch (err) {
             console.error('Failed to delete from lightbox:', err);
@@ -2414,64 +2901,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ========== Lightbox Variations Button (#14) ==========
+    // Enters batch mode to compare all variations side by side
     lightboxVariationsBtn.addEventListener('click', () => {
         if (lightboxItems.length === 0 || lightboxIndex < 0) return;
         const item = lightboxItems[lightboxIndex];
         if (!item.batch_id) return;
         const batchItems = cachedHistory.filter(h => h.batch_id === item.batch_id);
         if (batchItems.length > 1) {
-            closeLightbox();
-            openCompareModal(batchItems);
-        }
-    });
-
-    // ========== Compare Modal (#14, #15) ==========
-    function openCompareModal(items) {
-        compareGrid.innerHTML = '';
-        const n = Math.min(items.length, 4);
-        compareGrid.className = 'compare-grid cols-' + n;
-
-        items.slice(0, 4).forEach(item => {
-            const div = document.createElement('div');
-            div.className = 'compare-item';
-            const timeStr = item.generation_time ? `${item.generation_time.toFixed(1)}s` : '';
-            div.innerHTML = `
-                <img src="${item.image_url}?t=${item.created_at}" alt="${escapeHtml(item.prompt)}">
-                <div class="compare-item-info">
-                    Seed: ${item.seed || '?'}${timeStr ? ' &middot; ' + timeStr : ''}
-                </div>
-            `;
-            // Click image to open in lightbox
-            div.querySelector('img').addEventListener('click', () => {
-                closeCompareModal();
-                const idx = cachedHistory.findIndex(h => h.id === item.id);
-                openLightbox(
-                    `${item.image_url}?t=${item.created_at}`,
-                    cachedHistory,
-                    idx >= 0 ? idx : 0
-                );
-            });
-            compareGrid.appendChild(div);
-        });
-
-        compareModal.classList.add('active');
-        document.body.style.overflow = 'hidden';
-    }
-
-    function closeCompareModal() {
-        compareModal.classList.remove('active');
-        document.body.style.overflow = '';
-    }
-
-    compareClose.addEventListener('click', closeCompareModal);
-    compareModal.addEventListener('click', (e) => {
-        if (e.target === compareModal) closeCompareModal();
-    });
-
-    // Escape key closes compare modal
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && compareModal.classList.contains('active')) {
-            closeCompareModal();
+            enterBatchMode(batchItems);
         }
     });
 
@@ -2501,7 +2938,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     compareBarBtn.addEventListener('click', () => {
         if (selectedForCompare.length >= 2) {
-            openCompareModal(selectedForCompare);
+            // Open lightbox in batch mode for manual selection comparisons
+            lightboxModal.classList.remove('batch-mode');
+            lightboxBatchMode = false;
+            lightboxModal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+            enterBatchMode(selectedForCompare);
         }
     });
 

@@ -43,17 +43,26 @@ THUMB_SIZE = 200  # Max dimension for thumbnails
 app = Flask(__name__, static_folder="static")
 
 
+def _is_valid_thumb(path: Path) -> bool:
+    """Return True if path exists and is a non-empty file."""
+    return path.exists() and path.stat().st_size > 0
+
+
 def generate_thumbnail(job_id: str, source_path: Path) -> bool:
-    """Generate thumbnail for an image in background. Returns True on success."""
+    """Generate thumbnail for an image. Returns True on success.
+
+    Writes atomically (temp file + rename) to avoid corrupt thumbnails from
+    concurrent calls or mid-write interruptions.
+    """
     THUMB_DIR.mkdir(exist_ok=True)
     thumb_path = THUMB_DIR / f"{job_id}.jpg"
-    if thumb_path.exists():
+    if _is_valid_thumb(thumb_path):
         return True
     try:
         from PIL import Image
         img = Image.open(source_path)
         img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
-        # Convert to RGB for JPEG (handles RGBA)
+        # Convert to RGB for JPEG (handles RGBA/palette modes)
         if img.mode in ('RGBA', 'LA', 'P'):
             background = Image.new('RGB', img.size, (0, 0, 0))
             if img.mode == 'P':
@@ -62,7 +71,11 @@ def generate_thumbnail(job_id: str, source_path: Path) -> bool:
             img = background
         elif img.mode != 'RGB':
             img = img.convert('RGB')
-        img.save(thumb_path, "JPEG", quality=80)
+        # Write to a temp file then rename atomically — prevents corrupt
+        # thumbnails if two threads race or the process is interrupted.
+        tmp_path = thumb_path.with_suffix('.tmp')
+        img.save(tmp_path, "JPEG", quality=80)
+        tmp_path.replace(thumb_path)
         return True
     except Exception as e:
         print(f"Warning: Failed to generate thumbnail for {job_id}: {e}")
@@ -358,6 +371,7 @@ def load_history_from_disk():
             job.style = item.get("style")
             job.lora = item.get("lora")
             job.lora_scale = item.get("lora_scale", 1.0)
+            job.favorited = item.get("favorited", False)
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -393,6 +407,7 @@ class Job:
         self.style = None
         self.lora = None        # LoRA filename (relative, inside loras/ dir)
         self.lora_scale = 1.0
+        self.favorited = False
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -440,6 +455,7 @@ class Job:
             "style": self.style,
             "lora": self.lora,
             "lora_scale": self.lora_scale,
+            "favorited": self.favorited,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -1057,44 +1073,27 @@ def get_step_image(job_id, step):
 @app.route("/thumb/<job_id>")
 def get_thumb(job_id):
     """Serve a thumbnail for a generated image."""
-    # Ensure thumb directory exists
     THUMB_DIR.mkdir(exist_ok=True)
-
     thumb_path = THUMB_DIR / f"{job_id}.jpg"
 
-    # If thumbnail exists, serve it
-    if thumb_path.exists():
+    # Serve existing valid thumbnail directly (immutable cache — content never changes)
+    if _is_valid_thumb(thumb_path):
         response = send_file(thumb_path, mimetype="image/jpeg")
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response
 
-    # Otherwise, generate it from the original image
+    # No valid thumbnail — generate on demand from the original
     original_path = OUTPUT_DIR / f"{job_id}.png"
     if not original_path.exists():
         return jsonify({"error": "Image not found"}), 404
 
-    try:
-        from PIL import Image
-        img = Image.open(original_path)
-        img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
-        # Convert to RGB for JPEG (handles RGBA)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            background = Image.new('RGB', img.size, (0, 0, 0))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-        img.save(thumb_path, "JPEG", quality=80)
+    if generate_thumbnail(job_id, original_path):
         response = send_file(thumb_path, mimetype="image/jpeg")
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response
-    except ImportError:
-        # PIL not available, serve original
-        return send_file(original_path, mimetype="image/png")
-    except Exception as e:
-        return jsonify({"error": f"Failed to generate thumbnail: {e}"}), 500
+
+    # PIL unavailable or generation failed — fall back to serving the original
+    return send_file(original_path, mimetype="image/png")
 
 
 @app.route("/status/<job_id>")
@@ -1117,6 +1116,40 @@ def get_history():
     """Get list of recent generations."""
     with history_lock:
         return jsonify([job.to_history_dict() for job in history])
+
+
+@app.route("/history/<job_id>/favorite", methods=["POST"])
+def toggle_favorite(job_id):
+    """Toggle the favorited state of a history item."""
+    with history_lock:
+        job = history_by_id.get(job_id)
+        if not job:
+            return jsonify({"error": "Not found"}), 404
+        job.favorited = not job.favorited
+        mark_history_dirty()
+        return jsonify({"favorited": job.favorited})
+
+
+@app.route("/queue/reorder", methods=["POST"])
+def reorder_queue():
+    """Reorder pending jobs in the queue."""
+    data = request.json or {}
+    new_order = data.get("order", [])
+    with job_queue_lock:
+        by_id = {q["job"].id: q for q in job_queue}
+        reordered = []
+        seen = set()
+        for job_id in new_order:
+            if job_id in by_id:
+                reordered.append(by_id[job_id])
+                seen.add(job_id)
+        for q in job_queue:
+            if q["job"].id not in seen:
+                reordered.append(q)
+        job_queue[:] = reordered
+        for i, q in enumerate(job_queue):
+            q["job"].put_event(("queue_position", {"position": i + 1, "total": len(job_queue)}))
+    return jsonify({"status": "ok"})
 
 
 @app.route("/history/<job_id>", methods=["DELETE"])
