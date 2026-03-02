@@ -40,9 +40,10 @@ static int bf16_linear_use_graph(int seq_len, int in_dim, int out_dim) {
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
+static id g_residency_set = nil; /* id<MTLResidencySet>, macOS 15+ */
 
 /* Cache for MPSGraph-based SDPA graphs (bf16) */
-#define MAX_SDPA_GRAPH_CACHE 8
+#define MAX_SDPA_GRAPH_CACHE 32
 typedef struct {
     int seq_q;
     int seq_k;
@@ -64,7 +65,7 @@ static int g_sdpa_graph_count = 0;
 static pthread_mutex_t g_sdpa_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph-based bf16 linear graphs */
-#define MAX_LINEAR_GRAPH_CACHE 32
+#define MAX_LINEAR_GRAPH_CACHE 64
 typedef struct {
     int seq;
     int in_dim;
@@ -272,6 +273,17 @@ static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size)
     g_weight_cache[g_weight_cache_count].size = size;
     g_weight_cache_count++;
 
+    /* Register with residency set so GPU MMU pre-faults the pages (macOS 15+) */
+    if (@available(macOS 15.0, *)) {
+        if (!g_residency_set) {
+            MTLResidencySetDescriptor *desc = [MTLResidencySetDescriptor new];
+            desc.initialCapacity = WEIGHT_CACHE_SIZE;
+            g_residency_set = [g_device newResidencySetWithDescriptor:desc];
+        }
+        [(id<MTLResidencySet>)g_residency_set addAllocation:buf];
+        [(id<MTLResidencySet>)g_residency_set commit];
+    }
+
     pthread_mutex_unlock(&g_cache_mutex);
     return buf;
 }
@@ -283,6 +295,7 @@ static void clear_weight_cache(void) {
         g_weight_cache[i].cpu_ptr = NULL;
     }
     g_weight_cache_count = 0;
+    g_residency_set = nil;
     pthread_mutex_unlock(&g_cache_mutex);
 }
 
@@ -594,6 +607,9 @@ void flux_metal_begin_batch(void) {
 
     @autoreleasepool {
         g_batch_cmd = [g_queue commandBuffer];
+        if (@available(macOS 15.0, *)) {
+            if (g_residency_set) [g_batch_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
+        }
         g_in_batch = 1;
         g_pending_count = 0;
     }
@@ -2483,6 +2499,9 @@ void flux_gpu_sync(void) {
          * ops after sync would create orphan buffers that never execute. */
         if (g_tensor_batch_mode) {
             g_tensor_cmd = [g_queue commandBuffer];
+            if (@available(macOS 15.0, *)) {
+                if (g_residency_set) [g_tensor_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
+            }
         }
     }
 }
@@ -2493,6 +2512,9 @@ void flux_gpu_batch_begin(void) {
     @autoreleasepool {
         pool_flush_deferred();
         g_tensor_cmd = [g_queue commandBuffer];
+        if (@available(macOS 15.0, *)) {
+            if (g_residency_set) [g_tensor_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
+        }
         g_tensor_batch_mode = 1;
     }
 }
@@ -2522,6 +2544,9 @@ void flux_gpu_chain_begin(void) {
 
     @autoreleasepool {
         g_chain_cmd = [g_queue commandBuffer];
+        if (@available(macOS 15.0, *)) {
+            if (g_residency_set) [g_chain_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
+        }
         g_chain_mode = 1;
     }
 }
