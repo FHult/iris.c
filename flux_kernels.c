@@ -227,21 +227,24 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
          * B[N, K] = W[out_dim, in_dim] (transposed)
          * C[M, N] = y[seq_len, out_dim]
          */
-        flux_metal_sgemm_cached(0, 1,  /* no transpose A, transpose B */
-                                seq_len, out_dim, in_dim,
-                                1.0f,
-                                x, in_dim,
-                                W, in_dim,
-                                0.0f,
-                                y, out_dim);
-
-        /* Add bias if present */
         if (b != NULL) {
-            for (int s = 0; s < seq_len; s++) {
-                for (int o = 0; o < out_dim; o++) {
-                    y[s * out_dim + o] += b[o];
-                }
-            }
+            /* Fuse bias into the GPU kernel before readback */
+            flux_metal_sgemm_cached_bias(0, 1,
+                                         seq_len, out_dim, in_dim,
+                                         1.0f,
+                                         x, in_dim,
+                                         W, in_dim,
+                                         0.0f,
+                                         y, out_dim,
+                                         b);
+        } else {
+            flux_metal_sgemm_cached(0, 1,
+                                    seq_len, out_dim, in_dim,
+                                    1.0f,
+                                    x, in_dim,
+                                    W, in_dim,
+                                    0.0f,
+                                    y, out_dim);
         }
         return;
     }

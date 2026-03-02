@@ -42,6 +42,31 @@ static id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
 static id g_residency_set = nil; /* id<MTLResidencySet>, macOS 15+ */
 
+/* Cache for MPSGraph-based causal SDPA graphs (Qwen3 seq > 512 fallback) */
+#define MAX_CAUSAL_GRAPH_CACHE 8
+typedef struct {
+    int seq;
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    __strong MPSGraph *graph;
+    __strong MPSGraphTensor *qTensor;   /* [1, seq, q_heads, head_dim] */
+    __strong MPSGraphTensor *kTensor;   /* [1, seq, kv_heads, head_dim] */
+    __strong MPSGraphTensor *vTensor;   /* [1, seq, kv_heads, head_dim] */
+    __strong MPSGraphTensor *outTensor; /* [1, seq, q_heads, head_dim] */
+    __strong NSArray<NSNumber *> *qShape;
+    __strong NSArray<NSNumber *> *kShape;
+    __strong NSArray<NSNumber *> *vShape;
+    __strong NSArray<NSNumber *> *outShape;
+} causal_graph_cache_t;
+
+static causal_graph_cache_t g_causal_graph_cache[MAX_CAUSAL_GRAPH_CACHE];
+static int g_causal_graph_count = 0;
+static pthread_mutex_t g_causal_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int run_causal_mpsgraph_f32(float *out, const float *Q, const float *K,
+                                    const float *V, int seq, int num_q_heads,
+                                    int num_kv_heads, int head_dim);
+
 /* Cache for MPSGraph-based SDPA graphs (bf16) */
 #define MAX_SDPA_GRAPH_CACHE 32
 typedef struct {
@@ -223,6 +248,7 @@ static id<MTLComputePipelineState> g_group_norm_f32_pipeline;
 static id<MTLComputePipelineState> g_swish_f32_pipeline;
 static id<MTLComputePipelineState> g_add_f32_pipeline;
 static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
+static id<MTLComputePipelineState> g_bias_add_pipeline;
 static int g_shaders_initialized;
 
 /* ========================================================================
@@ -274,15 +300,17 @@ static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size)
     g_weight_cache_count++;
 
     /* Register with residency set so GPU MMU pre-faults the pages (macOS 15+) */
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
     if (@available(macOS 15.0, *)) {
         if (!g_residency_set) {
             MTLResidencySetDescriptor *desc = [MTLResidencySetDescriptor new];
             desc.initialCapacity = WEIGHT_CACHE_SIZE;
-            g_residency_set = [g_device newResidencySetWithDescriptor:desc];
+            g_residency_set = [g_device newResidencySetWithDescriptor:desc error:nil];
         }
         [(id<MTLResidencySet>)g_residency_set addAllocation:buf];
         [(id<MTLResidencySet>)g_residency_set commit];
     }
+#endif
 
     pthread_mutex_unlock(&g_cache_mutex);
     return buf;
@@ -657,6 +685,7 @@ static void flux_metal_sgemm_impl(int transpose_a, int transpose_b,
                                   const float *B, int ldb,
                                   float beta,
                                   float *C, int ldc,
+                                  const float *bias,
                                   int cache_B) {
     if (!g_initialized) return;
 
@@ -767,6 +796,23 @@ static void flux_metal_sgemm_impl(int transpose_a, int transpose_b,
                           rightMatrix:matrixB
                          resultMatrix:matrixC];
 
+        /* Fuse bias add on GPU before readback (avoids a full CPU pass over the output) */
+        if (bias && g_bias_add_pipeline) {
+            size_t bias_size = (size_t)N * sizeof(float);
+            id<MTLBuffer> bufBias = get_cached_weight_buffer(bias, bias_size);
+            if (bufBias) {
+                id<MTLComputeCommandEncoder> biasEnc = [cmdBuffer computeCommandEncoder];
+                [biasEnc setComputePipelineState:g_bias_add_pipeline];
+                [biasEnc setBuffer:bufferC offset:0 atIndex:0];
+                [biasEnc setBuffer:bufBias offset:0 atIndex:1];
+                [biasEnc setBytes:&N length:sizeof(int) atIndex:2];
+                MTLSize tg = MTLSizeMake(256, 1, 1);
+                MTLSize grid = MTLSizeMake(((NSUInteger)N + 255) / 256, (NSUInteger)M, 1);
+                [biasEnc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                [biasEnc endEncoding];
+            }
+        }
+
         if (g_in_batch) {
             /* In batch mode: defer result copy until end_batch */
             if (g_pending_count < MAX_BATCH_OUTPUTS) {
@@ -815,6 +861,7 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                           B, ldb,
                           beta,
                           C, ldc,
+                          NULL,
                           0);
 }
 
@@ -832,6 +879,26 @@ void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
                           B, ldb,
                           beta,
                           C, ldc,
+                          NULL,
+                          1);
+}
+
+void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
+                                  int M, int N, int K,
+                                  float alpha,
+                                  const float *A, int lda,
+                                  const float *B, int ldb,
+                                  float beta,
+                                  float *C, int ldc,
+                                  const float *bias) {
+    flux_metal_sgemm_impl(transpose_a, transpose_b,
+                          M, N, K,
+                          alpha,
+                          A, lda,
+                          B, ldb,
+                          beta,
+                          C, ldc,
+                          bias,
                           1);
 }
 
@@ -3534,6 +3601,11 @@ int flux_metal_init_shaders(void) {
             g_upsample_nearest_2x_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
+        func = [g_shader_library newFunctionWithName:@"bias_add"];
+        if (func) {
+            g_bias_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
         g_shaders_initialized = 1;
         if (flux_verbose)
             fprintf(stderr, "Metal shaders: compute kernels loaded\n");
@@ -5362,9 +5434,52 @@ int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
-    /* Limit seq length to what the shader can handle (512 for shared memory) */
+    /* Custom kernel handles seq <= 512. Longer sequences go via MPSGraph (f32 path). */
     if (seq > 512) {
-        return 0;
+        if (attention_mask != NULL) return 0;  /* Masked + long seq: fall back to CPU */
+
+        /* Sync any pending GPU work so we can read back the BF16 tensors */
+        id<MTLCommandBuffer> syncCmd = get_tensor_cmd();
+        if (syncCmd.status < MTLCommandBufferStatusCommitted) {
+            [syncCmd commit];
+            [syncCmd waitUntilCompleted];
+        }
+        g_tensor_cmd = nil;
+        if (g_tensor_batch_mode) {
+            g_tensor_cmd = [g_queue commandBuffer];
+            if (@available(macOS 15.0, *)) {
+                if (g_residency_set) [g_tensor_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
+            }
+        }
+
+        size_t q_elems  = (size_t)seq * num_q_heads  * head_dim;
+        size_t kv_elems = (size_t)seq * num_kv_heads * head_dim;
+        float *fQ  = (float *)malloc(q_elems  * sizeof(float));
+        float *fK  = (float *)malloc(kv_elems * sizeof(float));
+        float *fV  = (float *)malloc(kv_elems * sizeof(float));
+        float *fOut = (float *)malloc(q_elems * sizeof(float));
+        if (!fQ || !fK || !fV || !fOut) { free(fQ); free(fK); free(fV); free(fOut); return 0; }
+
+        /* Convert BF16 GPU buffers -> float32 on CPU */
+        const uint16_t *bQ  = (const uint16_t *)[Q->buffer contents];
+        const uint16_t *bK  = (const uint16_t *)[K->buffer contents];
+        const uint16_t *bV  = (const uint16_t *)[V->buffer contents];
+        for (size_t i = 0; i < q_elems;  i++) { uint32_t b = (uint32_t)bQ[i] << 16; memcpy(&fQ[i],  &b, 4); }
+        for (size_t i = 0; i < kv_elems; i++) { uint32_t b = (uint32_t)bK[i] << 16; memcpy(&fK[i], &b, 4); }
+        for (size_t i = 0; i < kv_elems; i++) { uint32_t b = (uint32_t)bV[i] << 16; memcpy(&fV[i], &b, 4); }
+
+        int ok = run_causal_mpsgraph_f32(fOut, fQ, fK, fV, seq, num_q_heads, num_kv_heads, head_dim);
+
+        if (ok) {
+            /* Convert float32 result back to BF16 in the output GPU buffer */
+            uint16_t *bOut = (uint16_t *)[out->buffer contents];
+            for (size_t i = 0; i < q_elems; i++) {
+                uint32_t bits; memcpy(&bits, &fOut[i], 4);
+                bOut[i] = (uint16_t)(bits >> 16);
+            }
+        }
+        free(fQ); free(fK); free(fV); free(fOut);
+        return ok;
     }
 
     @autoreleasepool {
@@ -6054,6 +6169,184 @@ void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t 
 }
 
 /* ========================================================================
+ * MPSGraph Causal SDPA fallback (Qwen3 seq > 512)
+ * Handles GQA by tiling K/V heads to match Q head count.
+ * Builds and caches a graph per (seq, q_heads, kv_heads, head_dim).
+ * ======================================================================== */
+
+static causal_graph_cache_t *get_causal_sdpa_graph(int seq, int num_q_heads,
+                                                    int num_kv_heads, int head_dim) {
+    if (!NSClassFromString(@"MPSGraph")) return NULL;
+
+    pthread_mutex_lock(&g_causal_graph_mutex);
+    for (int i = 0; i < g_causal_graph_count; i++) {
+        causal_graph_cache_t *e = &g_causal_graph_cache[i];
+        if (e->seq == seq && e->num_q_heads == num_q_heads &&
+            e->num_kv_heads == num_kv_heads && e->head_dim == head_dim) {
+            pthread_mutex_unlock(&g_causal_graph_mutex);
+            return e;
+        }
+    }
+
+    int slot = 0;
+    if (g_causal_graph_count < MAX_CAUSAL_GRAPH_CACHE) {
+        slot = g_causal_graph_count++;
+    } else {
+        /* Evict slot 0 (LRU approximation: just reuse first) */
+        slot = 0;
+    }
+
+    causal_graph_cache_t *entry = &g_causal_graph_cache[slot];
+    entry->seq          = seq;
+    entry->num_q_heads  = num_q_heads;
+    entry->num_kv_heads = num_kv_heads;
+    entry->head_dim     = head_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) { pthread_mutex_unlock(&g_causal_graph_mutex); return NULL; }
+
+        float scale = 1.0f / sqrtf((float)head_dim);
+        int groups  = num_q_heads / num_kv_heads;  /* GQA groups */
+
+        /* Input shapes: [1, seq, heads, head_dim] */
+        NSArray *qShape = @[@1, @(seq), @(num_q_heads), @(head_dim)];
+        NSArray *kShape = @[@1, @(seq), @(num_kv_heads), @(head_dim)];
+        NSArray *vShape = @[@1, @(seq), @(num_kv_heads), @(head_dim)];
+
+        MPSGraphTensor *qIn = [graph placeholderWithShape:qShape dataType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *kIn = [graph placeholderWithShape:kShape dataType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *vIn = [graph placeholderWithShape:vShape dataType:MPSDataTypeFloat32 name:nil];
+
+        /* Expand K/V for GQA: [1, seq, kv_heads, head_dim] -> [1, seq, q_heads, head_dim] */
+        MPSGraphTensor *kExp = (groups > 1)
+            ? [graph tileTensor:kIn withMultiplier:@[@1, @1, @(groups), @1] name:nil]
+            : kIn;
+        MPSGraphTensor *vExp = (groups > 1)
+            ? [graph tileTensor:vIn withMultiplier:@[@1, @1, @(groups), @1] name:nil]
+            : vIn;
+
+        /* Transpose to [1, heads, seq, head_dim] for SDPA */
+        MPSGraphTensor *qT = [graph transposeTensor:qIn  dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kT = [graph transposeTensor:kExp dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *vT = [graph transposeTensor:vExp dimension:1 withDimension:2 name:nil];
+
+        MPSGraphTensor *outT = nil;
+
+        /* Prefer native causal SDPA (Flash Attention, macOS 14+) */
+        if ([graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            /* Build a causal mask: [1, 1, seq, seq] lower-triangular, 0 or -inf */
+            NSMutableData *maskData = [NSMutableData dataWithLength:(size_t)seq * seq * sizeof(float)];
+            float *maskPtr = (float *)[maskData mutableBytes];
+            for (int i = 0; i < seq; i++) {
+                for (int j = 0; j < seq; j++) {
+                    maskPtr[i * seq + j] = (j > i) ? -1e9f : 0.0f;
+                }
+            }
+            MPSGraphTensor *maskTensor = [graph constantWithData:maskData
+                                                           shape:@[@1, @1, @(seq), @(seq)]
+                                                        dataType:MPSDataTypeFloat32];
+
+            /* Manual QK^T + mask + softmax + @V (works on all macOS 14+ including
+             * when the native causal variant is unavailable) */
+            MPSGraphTensor *kTT  = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+            MPSGraphTensor *qk   = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+            MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale shape:@[@1] dataType:MPSDataTypeFloat32];
+            MPSGraphTensor *qkSc = [graph multiplicationWithPrimaryTensor:qk secondaryTensor:scaleTensor name:nil];
+            MPSGraphTensor *qkM  = [graph additionWithPrimaryTensor:qkSc secondaryTensor:maskTensor name:nil];
+            MPSGraphTensor *sm   = [graph softMaxWithTensor:qkM axis:3 name:nil];
+            outT = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+        } else {
+            /* Older MPSGraph: simple manual attention without mask (rare fallback) */
+            MPSGraphTensor *kTT  = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+            MPSGraphTensor *qk   = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+            MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale shape:@[@1] dataType:MPSDataTypeFloat32];
+            MPSGraphTensor *qkSc = [graph multiplicationWithPrimaryTensor:qk secondaryTensor:scaleTensor name:nil];
+            MPSGraphTensor *sm   = [graph softMaxWithTensor:qkSc axis:3 name:nil];
+            outT = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+        }
+
+        /* Transpose back: [1, heads, seq, head_dim] -> [1, seq, heads, head_dim] */
+        MPSGraphTensor *outTransposed = [graph transposeTensor:outT dimension:1 withDimension:2 name:nil];
+
+        entry->graph     = graph;
+        entry->qTensor   = qIn;
+        entry->kTensor   = kIn;
+        entry->vTensor   = vIn;
+        entry->outTensor = outTransposed;
+        entry->qShape    = qShape;
+        entry->kShape    = kShape;
+        entry->vShape    = vShape;
+        entry->outShape  = @[@1, @(seq), @(num_q_heads), @(head_dim)];
+    }
+
+    pthread_mutex_unlock(&g_causal_graph_mutex);
+    return entry;
+}
+
+/* Run causal SDPA via MPSGraph for float32 tensors (CPU pointers in/out).
+ * Returns 1 on success, 0 if fallback to custom kernel or CPU is needed. */
+static int run_causal_mpsgraph_f32(float *out,
+                                    const float *Q, const float *K, const float *V,
+                                    int seq, int num_q_heads, int num_kv_heads, int head_dim) {
+    causal_graph_cache_t *entry = get_causal_sdpa_graph(seq, num_q_heads, num_kv_heads, head_dim);
+    if (!entry) return 0;
+
+    @autoreleasepool {
+        size_t q_bytes  = (size_t)seq * num_q_heads  * head_dim * sizeof(float);
+        size_t kv_bytes = (size_t)seq * num_kv_heads * head_dim * sizeof(float);
+
+        /* Use shared MTLBuffers so CPU data is visible to GPU without an extra copy. */
+        id<MTLBuffer> qBuf   = [g_device newBufferWithBytes:Q  length:q_bytes
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kBuf   = [g_device newBufferWithBytes:K  length:kv_bytes
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vBuf   = [g_device newBufferWithBytes:V  length:kv_bytes
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:q_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (!qBuf || !kBuf || !vBuf || !outBuf) return 0;
+
+        MPSGraphTensorData *qData  = [[MPSGraphTensorData alloc] initWithMTLBuffer:qBuf
+                                                                              shape:entry->qShape
+                                                                           dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *kData  = [[MPSGraphTensorData alloc] initWithMTLBuffer:kBuf
+                                                                              shape:entry->kShape
+                                                                           dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *vData  = [[MPSGraphTensorData alloc] initWithMTLBuffer:vBuf
+                                                                              shape:entry->vShape
+                                                                           dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *outData = [[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                                               shape:entry->outShape
+                                                                            dataType:MPSDataTypeFloat32];
+
+        NSDictionary *feeds   = @{ entry->qTensor: qData,
+                                   entry->kTensor: kData,
+                                   entry->vTensor: vData };
+        NSDictionary *results = @{ entry->outTensor: outData };
+
+        MPSCommandBuffer *mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        if (!mpsCmd) return 0;
+
+        @try {
+            [entry->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *e) {
+            return 0;
+        }
+
+        [mpsCmd commit];
+        [mpsCmd waitUntilCompleted];
+
+        memcpy(out, [outBuf contents], q_bytes);
+        return 1;
+    }
+}
+
+/* ========================================================================
  * Causal Attention for Text Encoder (Qwen3)
  * Fused GPU kernel that processes all heads in parallel with causal masking.
  * ======================================================================== */
@@ -6067,9 +6360,16 @@ int flux_metal_causal_attention(float *out,
         return 0;  /* Shader not available, fall back to CPU */
     }
 
-    /* Limit seq length to what the shader can handle (512 for shared memory) */
+    /* Custom kernel handles seq <= 512. Longer sequences go via MPSGraph. */
     if (seq > 512) {
-        return 0;  /* Fall back to CPU for long sequences */
+        /* Only fall back to MPSGraph when there is no padding mask; masking is
+         * rare in practice (only padded batches) and MPSGraph mask support
+         * would require rebuilding the graph per unique mask pattern. */
+        if (attention_mask == NULL) {
+            return run_causal_mpsgraph_f32(out, Q, K, V, seq,
+                                           num_q_heads, num_kv_heads, head_dim);
+        }
+        return 0;  /* Masked + long seq: fall back to CPU */
     }
 
     @autoreleasepool {

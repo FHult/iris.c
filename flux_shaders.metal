@@ -32,7 +32,7 @@ kernel void rms_norm(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];  // For reduction
+    threadgroup float simd_sums[8];
 
     device const float *x_row = x + row * hidden;
     device float *out_row = out + row * hidden;
@@ -43,20 +43,21 @@ kernel void rms_norm(
         float val = x_row[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
-
+    local_sum = simd_sum(local_sum);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Parallel reduction for sum
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     // Compute RMS inverse
-    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+    float rms_inv = rsqrt(simd_sums[0] / float(hidden) + eps);
 
     // Apply normalization with weight
     for (int i = tid; i < hidden; i += threads) {
@@ -124,8 +125,8 @@ kernel void adaln_norm(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
-    threadgroup float shared_sum_sq[256];
+    threadgroup float simd_sums[8];
+    threadgroup float simd_sqs[8];
 
     device const float *x_row = x + row * hidden;
     device float *out_row = out + row * hidden;
@@ -138,23 +139,31 @@ kernel void adaln_norm(
         local_sum += val;
         local_sum_sq += val * val;
     }
-    shared_sum[tid] = local_sum;
-    shared_sum_sq[tid] = local_sum_sq;
-
+    local_sum = simd_sum(local_sum);
+    local_sum_sq = simd_sum(local_sum_sq);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) {
+        simd_sums[simd_id] = local_sum;
+        simd_sqs[simd_id] = local_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        float total_sq = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) {
+            total += simd_sums[s];
+            total_sq += simd_sqs[s];
+        }
+        simd_sums[0] = total;
+        simd_sqs[0] = total_sq;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Parallel reduction
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     // Compute mean and std_inv
-    float mean = shared_sum[0] / float(hidden);
-    float var = shared_sum_sq[0] / float(hidden) - mean * mean;
+    float mean = simd_sums[0] / float(hidden);
+    float var = simd_sqs[0] / float(hidden) - mean * mean;
     float std_inv = rsqrt(var + eps);
 
     // Apply LayerNorm + AdaLN modulation
@@ -190,6 +199,24 @@ kernel void silu_mul(
         float g = gate[gid];
         float silu_g = g / (1.0f + exp(-g));
         gate[gid] = silu_g * up[gid];
+    }
+}
+
+/* ========================================================================
+ * Bias Add: y[s, o] += b[o]   (broadcast bias across sequence)
+ * y: [seq, out_dim], b: [out_dim]
+ * ======================================================================== */
+
+kernel void bias_add(
+    device float *y [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    constant int &out_dim [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]  // (out_idx, seq_idx)
+) {
+    uint o = pos.x;
+    uint s = pos.y;
+    if (o < uint(out_dim)) {
+        y[s * out_dim + o] += b[o];
     }
 }
 
@@ -300,28 +327,30 @@ kernel void softmax(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     device float *row_ptr = x + row * cols;
+
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
 
     // Find max (for numerical stability)
     float local_max = -INFINITY;
     for (int i = tid; i < cols; i += threads) {
         local_max = max(local_max, row_ptr[i]);
     }
-    shared_max[tid] = local_max;
-
+    local_max = simd_max(local_max);
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Reduce to find global max
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // Compute exp and sum
     float local_sum = 0.0f;
@@ -330,18 +359,17 @@ kernel void softmax(
         row_ptr[i] = e;  // Store exp temporarily
         local_sum += e;
     }
-    shared_sum[tid] = local_sum;
-
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Reduce to find total sum
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float sum = shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = simd_sums[0];
 
     // Normalize
     float inv_sum = 1.0f / sum;
@@ -520,8 +548,8 @@ kernel void attention_fused(
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
     // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -540,6 +568,9 @@ kernel void attention_fused(
     device const float *K_head = K + head_idx * head_dim;
     device const float *V_head = V + head_idx * head_dim;
 
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+
     // ========== Phase 1: Compute Q @ K^T ==========
     float local_max = -INFINITY;
 
@@ -555,17 +586,18 @@ kernel void attention_fused(
         local_max = max(local_max, score);
     }
 
-    shared_max[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // ========== Phase 2: Find global max ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    local_max = simd_max(local_max);
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
@@ -575,17 +607,18 @@ kernel void attention_fused(
         local_sum += e;
     }
 
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // ========== Phase 4: Find total sum ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / simd_sums[0];
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
@@ -640,8 +673,8 @@ kernel void causal_attention_fused(
 ) {
     // Shared memory for scores and reductions
     threadgroup float shared_scores[512];  // For attention scores (up to 512 seq len)
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -662,6 +695,9 @@ kernel void causal_attention_fused(
     device const float *K_head = K + kv_head_idx * head_dim;
     device const float *V_head = V + kv_head_idx * head_dim;
     device float *out_row = out + query_idx * q_dim + head_idx * head_dim;
+
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
 
     // ========== Phase 1: Compute Q @ K^T with causal mask ==========
     // Each thread computes scores for a subset of key positions
@@ -690,18 +726,18 @@ kernel void causal_attention_fused(
         }
     }
 
-    // Store local max for reduction
-    shared_max[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // ========== Phase 2: Find global max (parallel reduction) ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    local_max = simd_max(local_max);
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
@@ -716,17 +752,18 @@ kernel void causal_attention_fused(
         }
     }
 
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // ========== Phase 4: Find total sum (parallel reduction) ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float sum = shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = simd_sums[0];
     float inv_sum = 1.0f / sum;
 
     // ========== Phase 5: Normalize scores ==========
@@ -905,25 +942,27 @@ kernel void softmax_half(
     if (row >= (uint)total_rows) return;
 
     device half *row_data = scores + row * N;
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     // Find max (for numerical stability)
     float local_max = -INFINITY;
     for (int i = tid; i < N; i += threads) {
         local_max = max(local_max, float(row_data[i]));
     }
-    shared_max[tid] = local_max;
+    local_max = simd_max(local_max);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Reduce to find global max
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // Compute exp(x - max) and sum
     float local_sum = 0.0f;
@@ -932,17 +971,17 @@ kernel void softmax_half(
         row_data[i] = half(exp_val);  // Store temporarily
         local_sum += exp_val;
     }
-    shared_sum[tid] = local_sum;
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Reduce sum
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float sum = shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = simd_sums[0];
     float inv_sum = 1.0f / sum;
 
     // Normalize
@@ -985,7 +1024,7 @@ kernel void rms_norm_bf16(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
+    threadgroup float simd_sums[8];
 
     device const ushort *x_row = x + row * hidden;
     device ushort *out_row = out + row * hidden;
@@ -996,19 +1035,20 @@ kernel void rms_norm_bf16(
         float val = bf16_to_f32(x_row[i]);
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
-
+    local_sum = simd_sum(local_sum);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Parallel reduction
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+    float rms_inv = rsqrt(simd_sums[0] / float(hidden) + eps);
 
     // Apply normalization with weight, output bf16
     for (int i = tid; i < hidden; i += threads) {
@@ -1113,8 +1153,8 @@ kernel void adaln_norm_bf16(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
-    threadgroup float shared_sum_sq[256];
+    threadgroup float simd_sums[8];
+    threadgroup float simd_sqs[8];
 
     device const ushort *x_row = x + row * hidden;
     device ushort *out_row = out + row * hidden;
@@ -1126,21 +1166,22 @@ kernel void adaln_norm_bf16(
         local_sum += val;
         local_sum_sq += val * val;
     }
-    shared_sum[tid] = local_sum;
-    shared_sum_sq[tid] = local_sum_sq;
-
+    local_sum = simd_sum(local_sum);
+    local_sum_sq = simd_sum(local_sum_sq);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) { simd_sums[simd_id] = local_sum; simd_sqs[simd_id] = local_sum_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ts = 0.0f, tsq = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) { ts += simd_sums[s]; tsq += simd_sqs[s]; }
+        simd_sums[0] = ts; simd_sqs[0] = tsq;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float mean = shared_sum[0] / float(hidden);
-    float var = shared_sum_sq[0] / float(hidden) - mean * mean;
+    float mean = simd_sums[0] / float(hidden);
+    float var = simd_sqs[0] / float(hidden) - mean * mean;
     float std_inv = rsqrt(var + eps);
 
     for (int i = tid; i < hidden; i += threads) {
@@ -1383,24 +1424,27 @@ kernel void softmax_bf16(
     if (row >= (uint)total_rows) return;
 
     device ushort *row_data = scores + row * N;
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     // Find max in f32
     float local_max = -INFINITY;
     for (int i = tid; i < N; i += threads) {
         local_max = max(local_max, bf16_to_f32(row_data[i]));
     }
-    shared_max[tid] = local_max;
+    local_max = simd_max(local_max);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // Compute exp and sum in f32
     float local_sum = 0.0f;
@@ -1409,16 +1453,17 @@ kernel void softmax_bf16(
         row_data[i] = f32_to_bf16(exp_val);
         local_sum += exp_val;
     }
-    shared_sum[tid] = local_sum;
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / simd_sums[0];
 
     // Normalize and store as bf16
     for (int i = tid; i < N; i += threads) {
@@ -1751,8 +1796,8 @@ kernel void attention_fused_bf16(
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
     // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -1793,17 +1838,21 @@ kernel void attention_fused_bf16(
         local_max = max(local_max, score);
     }
 
-    shared_max[tid] = local_max;
+    local_max = simd_max(local_max);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 2: Find global max ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
@@ -1813,17 +1862,19 @@ kernel void attention_fused_bf16(
         local_sum += e;
     }
 
-    shared_sum[tid] = local_sum;
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 4: Find total sum ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / simd_sums[0];
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
@@ -1875,8 +1926,8 @@ kernel void causal_attention_fused_bf16(
 ) {
     // Shared memory for scores and reductions
     threadgroup float shared_scores[512];
-    threadgroup float shared_max[256];
-    threadgroup float shared_sum[256];
+    threadgroup float simd_maxs[8];
+    threadgroup float simd_sums[8];
     threadgroup float shared_q[128];  // Cache Q for this query position
 
     int query_idx = tg_pos.x;
@@ -1931,17 +1982,21 @@ kernel void causal_attention_fused_bf16(
         }
     }
 
-    shared_max[tid] = local_max;
+    local_max = simd_max(local_max);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) simd_maxs[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 2: Find global max (parallel reduction) ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = -INFINITY;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) m = max(m, simd_maxs[s]);
+        simd_maxs[0] = m;
     }
-    float max_val = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = simd_maxs[0];
 
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
@@ -1956,17 +2011,19 @@ kernel void causal_attention_fused_bf16(
         }
     }
 
-    shared_sum[tid] = local_sum;
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 4: Find total sum (parallel reduction) ==========
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && tid + stride < threads) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / simd_sums[0];
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq; key_idx += threads) {
@@ -2076,8 +2133,8 @@ kernel void group_norm_f32(
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
-    threadgroup float shared_sum2[256];
+    threadgroup float simd_sums[8];
+    threadgroup float simd_sqs[8];
 
     /* group_id encodes (batch, group) */
     int num_groups = channels / channels_per_group;
@@ -2101,22 +2158,24 @@ kernel void group_norm_f32(
         local_sum += val;
         local_sum2 += val * val;
     }
-    shared_sum[tid] = local_sum;
-    shared_sum2[tid] = local_sum2;
-
+    local_sum = simd_sum(local_sum);
+    local_sum2 = simd_sum(local_sum2);
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    if (simd_lane == 0) { simd_sums[simd_id] = local_sum; simd_sqs[simd_id] = local_sum2; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     /* Parallel reduction */
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum2[tid] += shared_sum2[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ts = 0.0f, tsq = 0.0f;
+        uint num_simds = (threads + 31) >> 5;
+        for (uint s = 0; s < num_simds; s++) { ts += simd_sums[s]; tsq += simd_sqs[s]; }
+        simd_sums[0] = ts; simd_sqs[0] = tsq;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float mean = shared_sum[0] / float(group_size);
-    float var = shared_sum2[0] / float(group_size) - mean * mean;
+    float mean = simd_sums[0] / float(group_size);
+    float var = simd_sqs[0] / float(group_size) - mean * mean;
     float inv_std = rsqrt(var + eps);
 
     /* Apply normalization with gamma/beta per channel */

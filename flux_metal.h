@@ -83,6 +83,17 @@ void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
                              float beta,
                              float *C, int ldc);
 
+/* Like flux_metal_sgemm_cached but fuses bias addition on the GPU before
+ * the result is copied back, avoiding a separate CPU bias pass. */
+void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
+                                  int M, int N, int K,
+                                  float alpha,
+                                  const float *A, int lda,
+                                  const float *B, int ldb,
+                                  float beta,
+                                  float *C, int ldc,
+                                  const float *bias);
+
 /*
  * GPU-accelerated matrix multiplication with bf16 weights.
  * C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
