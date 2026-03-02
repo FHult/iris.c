@@ -72,7 +72,11 @@ def _seed_history(n=1):
                       width=512, height=512, steps=4)
         job.seed = 1000 + i
         job.status = "complete"
-        job.output_path = srv.OUTPUT_DIR / f"{job_id}.png"
+        output_path = srv.OUTPUT_DIR / f"{job_id}.png"
+        # Create a minimal placeholder so the history filter sees the file as present
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.touch()
+        job.output_path = output_path
         srv.history.insert(0, job)
         srv.history_by_id[job_id] = job
         jobs.append(job)

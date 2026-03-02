@@ -1671,6 +1671,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     function connectToProgress(jobId, totalSteps, onComplete, onError) {
+        if (currentEventSource) {
+            currentEventSource.close();
+            currentEventSource = null;
+        }
         currentEventSource = new EventSource(`/progress/${jobId}`);
 
         currentEventSource.addEventListener('progress', (e) => {
@@ -1756,6 +1760,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         currentEventSource.onerror = () => {
             currentJobId = null;
+            setGenerating(false);
             // Connection error - try to get final status
             setTimeout(async () => {
                 try {
@@ -1773,7 +1778,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 } catch (err) {
                     if (onError) onError(err);
                 }
-                setGenerating(false);
             }, 500);
 
             if (currentEventSource) {

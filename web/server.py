@@ -138,6 +138,10 @@ MAX_HISTORY = 10000  # Effectively unlimited; frontend handles pagination
 # Job queue for pending generations
 job_queue = []
 job_queue_lock = threading.Lock()
+# True while a job has been popped from the queue but generate() hasn't set
+# current_job yet.  Prevents a second concurrent process_job_queue() call from
+# also popping a job in that brief window.
+job_queue_dispatching = False
 
 # Batched history save
 history_dirty = False
@@ -768,15 +772,21 @@ class FluxServer:
 
 def process_job_queue():
     """Process the next job in the queue if the server is free."""
-    global flux_server
+    global flux_server, job_queue_dispatching
     with job_queue_lock:
         if not job_queue:
             return
-        # Check if server is busy
+        # Check if server is busy or a dispatch is already in progress.
+        # job_queue_dispatching covers the window between popping the job and
+        # generate() setting current_job, preventing a second concurrent caller
+        # from also popping a job in that gap.
+        if job_queue_dispatching:
+            return
         if flux_server and flux_server.current_job:
             return
-        # Get next job
+        # Claim the next job atomically while still holding the lock
         queued = job_queue.pop(0)
+        job_queue_dispatching = True
         # Update queue positions for remaining jobs
         for i, q in enumerate(job_queue):
             q['job'].put_event(("queue_position", {"position": i + 1, "total": len(job_queue) + 1}))
@@ -811,6 +821,9 @@ def process_job_queue():
         job.cleanup_temp_files()
         # Try next job
         process_job_queue()
+    finally:
+        with job_queue_lock:
+            job_queue_dispatching = False
 
 
 def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
@@ -1115,7 +1128,10 @@ def get_status(job_id):
 def get_history():
     """Get list of recent generations."""
     with history_lock:
-        return jsonify([job.to_history_dict() for job in history])
+        return jsonify([
+            job.to_history_dict() for job in history
+            if job.output_path and job.output_path.exists()
+        ])
 
 
 @app.route("/history/<job_id>/favorite", methods=["POST"])
