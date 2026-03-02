@@ -1702,6 +1702,24 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     /* Allocate working memory */
     qwen3_alloc_work_buffers(model);
 
+#ifdef USE_METAL
+    /* Pre-compile all MPSGraph linear graphs by running a dummy GPU forward pass.
+     * Without this, the first real text encoding spends ~10s compiling 5 unique
+     * (seq, in_dim, out_dim) MPSGraph shapes. Running once at load time moves that
+     * cost here, where it is expected. Also populates the BF16 weight MTLBuffer
+     * cache for all 27 Flux-extraction layers, eliminating first-encoding latency. */
+    if (model->use_bf16 && flux_metal_available()) {
+        int *dummy_mask = calloc(QWEN3_MAX_SEQ_LEN, sizeof(int));
+        if (dummy_mask) {
+            for (int i = 0; i < QWEN3_MAX_SEQ_LEN; i++) dummy_mask[i] = 1;
+            /* hidden_state is already allocated by qwen3_alloc_work_buffers */
+            memset(model->hidden_state, 0, QWEN3_MAX_SEQ_LEN * model->hidden_size * sizeof(float));
+            qwen3_forward_gpu(model, QWEN3_MAX_SEQ_LEN, dummy_mask);
+            free(dummy_mask);
+        }
+    }
+#endif
+
     return model;
 
 error:

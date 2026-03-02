@@ -969,7 +969,10 @@ static inline uint16_t bf16_to_f16(uint16_t bf16) {
 }
 
 /* BF16 weight cache (stores bf16 weights directly for MPS bf16 matmul) */
-#define BF16_WEIGHT_CACHE_SIZE 512
+/* 1024 slots: Qwen3 4B mmap uses ~243, Flux 4B transformer uses ~215,
+ * Qwen3 9B mmap uses ~243, Flux 9B transformer uses ~300. 512 was too small
+ * when both Qwen3 (all 36 layers, no-mmap) and transformer are cached. */
+#define BF16_WEIGHT_CACHE_SIZE 1024
 
 typedef struct {
     const void *cpu_ptr;
