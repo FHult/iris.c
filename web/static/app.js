@@ -1866,6 +1866,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const job = await response.json();
 
                 if (job.status === 'complete') {
+                    showProgress('Complete!', 100);
+                    if (job.image_url) displayImage(job.image_url);
                     loadHistory();
                     recoverNextServerJob();
                     return;
@@ -1903,6 +1905,9 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (generationQueue.length > 0) {
             // Only client-queued items remain, process them normally
             processNextInQueue();
+        } else {
+            // No more jobs — reset generating state
+            setGenerating(false);
         }
     }
 
