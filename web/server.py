@@ -1668,7 +1668,7 @@ def available_models_endpoint():
     slots = []
     for slot in MODEL_SLOTS:
         slot_dir = PROJECT_DIR / slot["key"]
-        downloaded = (slot_dir / "model_index.json").exists()
+        downloaded = (slot_dir / "transformer").is_dir()
         is_current = (flux_server is not None and
                       Path(flux_server.model_dir).resolve() == slot_dir.resolve())
         slots.append({
@@ -1693,7 +1693,7 @@ def switch_model():
     if not slot:
         return jsonify({"error": "Unknown model key"}), 400
     new_dir = PROJECT_DIR / key
-    if not (new_dir / "model_index.json").exists():
+    if not (new_dir / "transformer").is_dir():
         return jsonify({"error": "Model not downloaded yet"}), 400
     if flux_server and Path(flux_server.model_dir).resolve() == new_dir.resolve():
         return jsonify({"error": "Already loaded"}), 400
