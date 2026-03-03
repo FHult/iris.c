@@ -1853,6 +1853,9 @@ def download_lora():
         if not repo:
             return jsonify({"error": "repo is required for huggingface source"}), 400
         url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            extra_headers["Authorization"] = f"Bearer {hf_token}"
 
     _download_progress[dl_id] = {"percent": 0, "done": False, "error": None}
     threading.Thread(

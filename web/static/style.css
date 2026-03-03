@@ -2364,6 +2364,23 @@ footer a:hover {
     width: 0%;
 }
 
+/* ===== LoRA Download Error ===== */
+
+.lora-dl-error-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.3rem;
+}
+
+.lora-dl-error {
+    font-size: 0.72rem;
+    color: var(--error, #e74c3c);
+    max-width: 180px;
+    text-align: right;
+    word-break: break-word;
+}
+
 /* ===== Empty state ===== */
 
 .lora-empty {

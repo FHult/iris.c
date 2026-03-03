@@ -2166,23 +2166,23 @@ document.addEventListener('DOMContentLoaded', () => {
                     ? `<span class="lora-trigger" title="Recommended strength">⚡ ${lora.strength}</span>`
                     : '';
                 let actionHtml;
+                const dlAttrs = lora.source === 'civitai'
+                    ? `data-id="${lora.id}" data-source="civitai" data-civitai-model-id="${lora.civitai_model_id}" data-civitai-version-filter="${lora.civitai_version_filter || ''}" data-filename="${lora.filename}"`
+                    : `data-id="${lora.id}" data-source="huggingface" data-repo="${lora.repo}" data-filename="${lora.filename}"`;
                 if (dlState && !dlState.done && !dlState.error) {
                     actionHtml = `<div class="lora-progress-wrap"><div class="lora-progress-bar" style="width:${dlState.percent || 0}%"></div></div>`;
+                } else if (dlState && dlState.error) {
+                    const errMsg = String(dlState.error).slice(0, 80);
+                    actionHtml = `<div class="lora-dl-error-wrap">
+                        <span class="lora-dl-error" title="${dlState.error}">${errMsg}</span>
+                        <button class="lora-dl-btn" ${dlAttrs}>Retry</button>
+                    </div>`;
                 } else if (lora.downloaded) {
                     actionHtml = `<button class="lora-use-btn" data-filename="${lora.filename}">Use</button>`;
                 } else if (lora.source === 'civitai') {
-                    actionHtml = `<button class="lora-dl-btn"
-                        data-id="${lora.id}"
-                        data-source="civitai"
-                        data-civitai-model-id="${lora.civitai_model_id}"
-                        data-civitai-version-filter="${lora.civitai_version_filter || ''}"
-                        data-filename="${lora.filename}">Download</button>`;
+                    actionHtml = `<button class="lora-dl-btn" ${dlAttrs}>Download</button>`;
                 } else {
-                    actionHtml = `<button class="lora-dl-btn"
-                        data-id="${lora.id}"
-                        data-source="huggingface"
-                        data-repo="${lora.repo}"
-                        data-filename="${lora.filename}">Download</button>`;
+                    actionHtml = `<button class="lora-dl-btn" ${dlAttrs}>Download</button>`;
                 }
 
                 card.innerHTML = `
@@ -2309,7 +2309,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 if (state.done || state.error) {
                     clearInterval(interval);
-                    delete activeDownloads[dlId];
+                    if (!state.error) {
+                        delete activeDownloads[dlId];
+                    }
                     await loadAvailableLoras();
                     renderLoraPanel();
                 }
