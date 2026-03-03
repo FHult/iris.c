@@ -201,9 +201,23 @@ document.addEventListener('DOMContentLoaded', () => {
         guidanceValue.textContent = val === 0 ? 'auto' : val.toFixed(1);
     });
 
+    // Tracks whether the currently loaded model is distilled (4 steps) or base (50 steps).
+    let _currentModelIsDistilled = true;
+
+    // Set steps and hint to the model's natural default.
+    // Called on initial load and after every model switch.
+    function applyModelDefaults(isDistilled) {
+        _currentModelIsDistilled = isDistilled;
+        const defaultSteps = isDistilled ? 4 : 50;
+        stepsInput.value = defaultSteps;
+        stepsValue.textContent = defaultSteps;
+        updateStepHint(defaultSteps);
+    }
+
     // Load model info into header
     fetch('/model-info').then(r => r.json()).then(data => {
         if (data.model) modelInfoEl.textContent = data.model;
+        if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled);
     }).catch(() => {});
 
     // ── Model switcher ────────────────────────────────────────────────────────
@@ -312,6 +326,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (data && data.model) {
                     clearInterval(interval);
                     modelInfoEl.textContent = data.model;
+                    if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled);
                     loadAvailableModels();
                 }
             }).catch(() => {});
@@ -1373,9 +1388,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             setDimensions(closestWidth, closestHeight);
 
-            // Reset steps to default (4)
-            stepsInput.value = 4;
-            stepsValue.textContent = '4';
+            // Reset steps to model default
+            applyModelDefaults(_currentModelIsDistilled);
         };
         img.src = dataUrl;
     }
@@ -1632,9 +1646,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!img) return;
         const slot = findFirstEmptySlot();
         loadImageIntoSlot(img.src, slot);
-        // Reset steps to default when using as input
-        stepsInput.value = 4;
-        stepsValue.textContent = '4';
+        // Reset steps to model default when using as input
+        applyModelDefaults(_currentModelIsDistilled);
     });
 
     // Fetch an image URL and set it into a specific slot
