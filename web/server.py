@@ -786,6 +786,7 @@ class FluxServer:
         """Restart the flux server (used for cancellation)."""
         print("Restarting flux server...")
         self.stop()
+        self.current_job = None  # intentional stop doesn't clear this in the event loop
         self._intentional_stop = False
         self.generation_count = 0
         self.start()
