@@ -1423,6 +1423,12 @@ static int ensure_attn_scores(flux_transformer_t *tf, int img_seq, int txt_seq) 
 #endif
 }
 
+/* Extra bytes appended to every BLAS output buffer.
+ * Apple Accelerate BLAS may read one element past the declared matrix end
+ * during SIMD vectorisation (with beta != 0).  On MALLOC_LARGE regions the
+ * next page is unmapped, causing SIGSEGV.  64 bytes absorbs any overread. */
+#define BLAS_PAD 64
+
 /* Ensure all work buffers are allocated for the given sequence length.
  * Buffers are only reallocated if the current allocation is too small.
  * Returns 0 on success, -1 on allocation failure.
@@ -1458,32 +1464,34 @@ static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
 
-    /* Allocate new buffers */
-    tf->img_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->txt_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    /* Allocate new buffers.  Each allocation gets BLAS_PAD extra bytes so that
+     * Apple Accelerate BLAS SIMD reads past the declared end of an output
+     * matrix (which happen when beta != 0) never fault on MALLOC_LARGE pages. */
+    tf->img_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->txt_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
     /* work2 needs to hold fused QKV+MLP output: seq * (hidden*3 + mlp*2) + mod_params (hidden*3)
      * fused_dim = hidden*3 + mlp*2 = 3072*3 + 9216*2 = 27648 */
     int fused_dim = hidden * 3 + mlp * 2;
     tf->work_size = (size_t)total_seq * fused_dim * sizeof(float) + (size_t)hidden * 3 * sizeof(float);
-    tf->work1 = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->work2 = (float *)malloc(tf->work_size);
-    tf->attn_q_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->attn_k_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->attn_v_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->attn_out_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->attn_cat_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->attn_cat_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->single_q = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->single_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->single_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->single_mlp_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
-    tf->single_mlp_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
-    tf->single_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->single_concat = (float *)malloc((size_t)total_seq * (hidden + mlp) * sizeof(float));
-    tf->ffn_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
-    tf->ffn_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
-    tf->double_img_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
-    tf->double_txt_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->work1 = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->work2 = (float *)malloc(tf->work_size + BLAS_PAD);
+    tf->attn_q_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->attn_k_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->attn_v_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->attn_out_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->attn_cat_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->attn_cat_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->single_q = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->single_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->single_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->single_mlp_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float) + BLAS_PAD);
+    tf->single_mlp_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float) + BLAS_PAD);
+    tf->single_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->single_concat = (float *)malloc((size_t)total_seq * (hidden + mlp) * sizeof(float) + BLAS_PAD);
+    tf->ffn_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float) + BLAS_PAD);
+    tf->ffn_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float) + BLAS_PAD);
+    tf->double_img_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
+    tf->double_txt_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float) + BLAS_PAD);
 
     /* Check all allocations succeeded */
     if (!tf->img_hidden || !tf->txt_hidden || !tf->work1 || !tf->work2 ||
