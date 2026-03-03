@@ -89,6 +89,11 @@ static sdpa_graph_cache_t g_sdpa_graph_cache[MAX_SDPA_GRAPH_CACHE];
 static int g_sdpa_graph_count = 0;
 static pthread_mutex_t g_sdpa_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Cache for MPSGraph-based SDPA graphs (float32) — reuses the same struct */
+static sdpa_graph_cache_t g_sdpa_f32_graph_cache[MAX_SDPA_GRAPH_CACHE];
+static int g_sdpa_f32_graph_count = 0;
+static pthread_mutex_t g_sdpa_f32_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Cache for MPSGraph-based bf16 linear graphs */
 #define MAX_LINEAR_GRAPH_CACHE 64
 typedef struct {
@@ -4549,6 +4554,12 @@ void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
     }
 }
 
+/* Forward declarations for f32 MPSGraph SDPA path (defined after the BF16 counterparts) */
+static int prefer_custom_attn(void);
+static int flux_gpu_attention_mpsgraph_f32(flux_gpu_tensor_t out,
+                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                            int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
 /* GPU tensor version of fused attention (no transpose needed) */
 int flux_gpu_attention_fused(flux_gpu_tensor_t out,
                              flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
@@ -4556,6 +4567,15 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
     if (!g_shaders_initialized || !g_attention_fused_pipeline) return 0;
     if (!out || !Q || !K || !V) return 0;
 
+    /* Try MPSGraph native SDPA first (Flash Attention, no seq_k limit).
+     * Falls through to custom kernel only if MPSGraph is unavailable. */
+    if (!prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
+        if (flux_gpu_attention_mpsgraph_f32(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
+            return 1;
+        }
+    }
+
+    /* Custom kernel: limited to ~7680 tokens by 32KB threadgroup memory. */
     /* Dynamic threadgroup memory: shared_scores[seq_k] + static shared_max/sum.
      * 32KB threadgroup memory allows up to ~7680 seq_k. */
     NSUInteger scores_size = (NSUInteger)seq_k * sizeof(float);
@@ -4813,6 +4833,102 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     return entry;
 }
 
+/* Float32 SDPA graph cache. Same layout as the BF16 cache but uses MPSDataTypeFloat32.
+ * Native SDPA runs in float32 internally regardless of input dtype, so no precision is
+ * lost by feeding f32 directly (unlike the BF16 path which casts output back to BF16). */
+static sdpa_graph_cache_t *get_sdpa_graph_cache_f32(int seq_q, int seq_k, int num_heads,
+                                                     int head_dim, float scale) {
+    if (!NSClassFromString(@"MPSGraph")) return NULL;
+
+    static int s_force_manual_sdpa = -1;
+    if (s_force_manual_sdpa < 0) {
+        s_force_manual_sdpa = getenv("FLUX_USE_MANUAL_SDPA") ? 1 : 0;
+    }
+
+    pthread_mutex_lock(&g_sdpa_f32_graph_mutex);
+    for (int i = 0; i < g_sdpa_f32_graph_count; i++) {
+        sdpa_graph_cache_t *entry = &g_sdpa_f32_graph_cache[i];
+        if (entry->seq_q == seq_q && entry->seq_k == seq_k &&
+            entry->num_heads == num_heads && entry->head_dim == head_dim) {
+            pthread_mutex_unlock(&g_sdpa_f32_graph_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_sdpa_f32_graph_count < MAX_SDPA_GRAPH_CACHE) {
+        slot = g_sdpa_f32_graph_count++;
+    }
+
+    sdpa_graph_cache_t *entry = &g_sdpa_f32_graph_cache[slot];
+    entry->seq_q = seq_q;
+    entry->seq_k = seq_k;
+    entry->num_heads = num_heads;
+    entry->head_dim = head_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_sdpa_f32_graph_mutex);
+            return NULL;
+        }
+
+        /* Native SDPA expects [batch, heads, seq, head_dim] layout.
+         * Our input is [seq, heads * head_dim], reshape to [1, seq, heads, head_dim]
+         * then transpose to [1, heads, seq, head_dim]. */
+        NSArray<NSNumber *> *qShape  = @[@1, @(seq_q), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *kShape  = @[@1, @(seq_k), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *vShape  = @[@1, @(seq_k), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *outShape = @[@1, @(seq_q), @(num_heads), @(head_dim)];
+
+        MPSGraphTensor *qIn = [graph placeholderWithShape:qShape dataType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *kIn = [graph placeholderWithShape:kShape dataType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *vIn = [graph placeholderWithShape:vShape dataType:MPSDataTypeFloat32 name:nil];
+
+        /* Transpose to [1, heads, seq, head_dim] for SDPA */
+        MPSGraphTensor *qT = [graph transposeTensor:qIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kT = [graph transposeTensor:kIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *vT = [graph transposeTensor:vIn dimension:1 withDimension:2 name:nil];
+
+        MPSGraphTensor *outTensor = nil;
+
+        if (!s_force_manual_sdpa &&
+            [graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            /* Native SDPA (Flash Attention) — output is f32, no cast needed */
+            MPSGraphTensor *out = [graph scaledDotProductAttentionWithQueryTensor:qT
+                                                                         keyTensor:kT
+                                                                       valueTensor:vT
+                                                                            scale:scale
+                                                                              name:nil];
+            outTensor = [graph transposeTensor:out dimension:1 withDimension:2 name:nil];
+        } else {
+            /* Manual fallback: Q @ K^T * scale -> softmax -> @ V */
+            MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+            MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+            MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
+                                                              shape:@[@1]
+                                                           dataType:MPSDataTypeFloat32];
+            MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qk secondaryTensor:scaleTensor name:nil];
+            MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
+            MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+            outTensor = [graph transposeTensor:out dimension:1 withDimension:2 name:nil];
+        }
+
+        entry->graph = graph;
+        entry->qTensor = qIn;
+        entry->kTensor = kIn;
+        entry->vTensor = vIn;
+        entry->outTensor = outTensor;
+        entry->qShape = qShape;
+        entry->kShape = kShape;
+        entry->vShape = vShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_sdpa_f32_graph_mutex);
+    return entry;
+}
+
 static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int out_dim) {
     if (!NSClassFromString(@"MPSGraph")) {
         return NULL;
@@ -4999,6 +5115,84 @@ static int flux_gpu_attention_mpsgraph_bf16(flux_gpu_tensor_t out,
             V->has_pending_work = 0;
         } else {
             /* MPSGraph may commit-and-continue; update the live buffer. */
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+
+        return 1;
+    }
+}
+
+/* Float32 MPSGraph SDPA — mirrors flux_gpu_attention_mpsgraph_bf16 but uses f32 throughout.
+ * Input: Q, K, V as f32 GPU tensors in [seq, heads*head_dim] layout.
+ * Output: f32 GPU tensor [seq, heads*head_dim]. */
+static int flux_gpu_attention_mpsgraph_f32(flux_gpu_tensor_t out,
+                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                            int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_initialized || !g_device) return 0;
+    if (!out || !Q || !K || !V) return 0;
+    if (out->is_f16 || Q->is_f16 || K->is_f16 || V->is_f16) return 0;
+
+    sdpa_graph_cache_t *cache = get_sdpa_graph_cache_f32(seq_q, seq_k, num_heads, head_dim, scale);
+    if (!cache || !cache->graph) return 0;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) return 0;
+        MPSCommandBuffer *mpsCmd = nil;
+        if (g_tensor_batch_mode) {
+            mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+        } else {
+            mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        }
+        if (!mpsCmd) return 0;
+
+        MPSGraphTensorData *qData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:Q->buffer
+                                                   shape:cache->qShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *kData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:K->buffer
+                                                   shape:cache->kShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *vData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:V->buffer
+                                                   shape:cache->vShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *outData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                   shape:cache->outShape
+                                                dataType:MPSDataTypeFloat32];
+
+        NSDictionary *feeds = @{
+            cache->qTensor : qData,
+            cache->kTensor : kData,
+            cache->vTensor : vData
+        };
+        NSDictionary *results = @{ cache->outTensor : outData };
+
+        @try {
+            [cache->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            return 0;
+        }
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        } else {
             g_tensor_cmd = [mpsCmd rootCommandBuffer];
         }
 
