@@ -160,12 +160,20 @@ web-tests:
 	@python3 -m pytest web/tests/ -v --tb=short
 	@echo ""
 
-# Unit tests that run without a model (LoRA math, JPEG decoder, PNG roundtrip)
+# Unit tests that run without a model (LoRA math, kernel ops, embcache, JPEG, PNG)
 test-unit:
 	@echo "=== LoRA unit tests ==="
 	@$(CC) -O2 -I. -o /tmp/flux_test_lora debug/test_lora.c flux_lora.c flux_safetensors.c -lm
 	@/tmp/flux_test_lora
 	@rm -f /tmp/flux_test_lora
+	@echo "=== Kernel unit tests ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_kernels debug/test_kernels.c flux_kernels.c -lm
+	@/tmp/flux_test_kernels
+	@rm -f /tmp/flux_test_kernels
+	@echo "=== Embcache unit tests ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_embcache debug/test_embcache.c embcache.c -lm
+	@/tmp/flux_test_embcache
+	@rm -f /tmp/flux_test_embcache
 	@echo "=== JPEG unit tests ==="
 	@$(MAKE) -C jpg_test test --no-print-directory
 	@echo "=== PNG tests ==="

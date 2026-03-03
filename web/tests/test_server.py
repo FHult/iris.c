@@ -503,3 +503,273 @@ class TestJobStatus:
         data = r.get_json()
         assert data["status"] == "complete"
         assert "image_url" in data
+
+
+# ---------------------------------------------------------------------------
+# /available-models  GET
+# ---------------------------------------------------------------------------
+
+class TestAvailableModels:
+    def test_returns_slots_and_current(self, client):
+        r = client.get("/available-models")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert "slots" in data
+        assert "current_model_dir" in data
+
+    def test_slots_have_required_fields(self, client):
+        r = client.get("/available-models")
+        data = r.get_json()
+        for slot in data["slots"]:
+            assert "key" in slot
+            assert "label" in slot
+            assert "description" in slot
+            assert "downloaded" in slot
+            assert "current" in slot
+            assert "downloadable" in slot
+
+    def test_no_server_current_is_null(self, client):
+        # client fixture sets flux_server = None
+        r = client.get("/available-models")
+        data = r.get_json()
+        assert data["current_model_dir"] is None
+        # No slot should be marked current when there's no server
+        assert not any(s["current"] for s in data["slots"])
+
+    def test_downloaded_reflects_filesystem(self, client, tmp_path):
+        import server as srv
+        # Point PROJECT_DIR at tmp_path so we can create a fake model dir
+        original_project_dir = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        try:
+            # Add a test slot
+            test_slot = {
+                "key": "test-model",
+                "label": "Test",
+                "description": "test",
+                "sh_arg": "test",
+                "expected_files": ["model_index.json"],
+            }
+            srv.MODEL_SLOTS.append(test_slot)
+
+            # Not downloaded yet
+            r = client.get("/available-models")
+            slots = {s["key"]: s for s in r.get_json()["slots"]}
+            assert slots["test-model"]["downloaded"] is False
+
+            # Create the transformer dir to simulate download
+            (tmp_path / "test-model" / "transformer").mkdir(parents=True)
+
+            r = client.get("/available-models")
+            slots = {s["key"]: s for s in r.get_json()["slots"]}
+            assert slots["test-model"]["downloaded"] is True
+        finally:
+            srv.MODEL_SLOTS.remove(test_slot)
+            srv.PROJECT_DIR = original_project_dir
+
+
+# ---------------------------------------------------------------------------
+# /switch-model  POST
+# ---------------------------------------------------------------------------
+
+class TestSwitchModel:
+    def test_unknown_key_returns_400(self, client):
+        r = client.post("/switch-model", json={"key": "no-such-model"})
+        assert r.status_code == 400
+        assert "error" in r.get_json()
+
+    def test_not_downloaded_returns_400(self, client, tmp_path):
+        import server as srv
+        original_project_dir = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        test_slot = {
+            "key": "not-downloaded-model",
+            "label": "ND",
+            "description": "not downloaded",
+            "sh_arg": "nd",
+            "expected_files": [],
+        }
+        srv.MODEL_SLOTS.append(test_slot)
+        try:
+            r = client.post("/switch-model", json={"key": "not-downloaded-model"})
+            assert r.status_code == 400
+            assert "not downloaded" in r.get_json()["error"].lower()
+        finally:
+            srv.MODEL_SLOTS.remove(test_slot)
+            srv.PROJECT_DIR = original_project_dir
+
+    def test_busy_server_returns_409(self, client, tmp_path):
+        """Cannot switch while a job is queued."""
+        import server as srv
+        original_project_dir = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        test_slot = {
+            "key": "busy-model",
+            "label": "Busy",
+            "description": "busy model",
+            "sh_arg": "busy",
+            "expected_files": [],
+        }
+        srv.MODEL_SLOTS.append(test_slot)
+        # Create transformer dir so it passes the "downloaded" check
+        (tmp_path / "busy-model" / "transformer").mkdir(parents=True)
+        # Push a fake job into the queue to make server appear busy
+        fake_job = srv.Job("busyjob1", prompt="x", width=512, height=512, steps=4)
+        with srv.job_queue_lock:
+            srv.job_queue.append({"job": fake_job, "params": {}})
+        try:
+            r = client.post("/switch-model", json={"key": "busy-model"})
+            assert r.status_code == 409
+            assert "error" in r.get_json()
+        finally:
+            with srv.job_queue_lock:
+                srv.job_queue.clear()
+            srv.MODEL_SLOTS.remove(test_slot)
+            srv.PROJECT_DIR = original_project_dir
+
+    def test_missing_key_returns_400(self, client):
+        r = client.post("/switch-model", json={})
+        assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /download-model  POST  and  /download-model/progress/<key>  GET
+# ---------------------------------------------------------------------------
+
+class TestDownloadModel:
+    def test_unknown_key_returns_400(self, client):
+        r = client.post("/download-model", json={"key": "bogus"})
+        assert r.status_code == 400
+
+    def test_non_downloadable_returns_400(self, client):
+        import server as srv
+        # Startup model slot has sh_arg=None (not downloadable)
+        non_dl = next((s for s in srv.MODEL_SLOTS if s.get("sh_arg") is None), None)
+        if non_dl is None:
+            pytest.skip("No non-downloadable slot in MODEL_SLOTS")
+        r = client.post("/download-model", json={"key": non_dl["key"]})
+        assert r.status_code == 400
+
+    def test_progress_not_started_returns_404(self, client):
+        r = client.get("/download-model/progress/never-started-key")
+        assert r.status_code == 404
+
+    def test_progress_has_required_fields(self, client):
+        import server as srv
+        # Inject a fake in-progress download state directly
+        srv._model_download_progress["test-progress-key"] = {
+            "done": False, "error": None
+        }
+        try:
+            r = client.get("/download-model/progress/test-progress-key")
+            assert r.status_code == 200
+            data = r.get_json()
+            assert "done" in data
+            assert "error" in data
+            assert "files_done" in data
+            assert "files_total" in data
+        finally:
+            srv._model_download_progress.pop("test-progress-key", None)
+
+    def test_idempotent_while_running(self, client):
+        import server as srv
+        # Simulate an already-running download
+        key = next((s["key"] for s in srv.MODEL_SLOTS if s.get("sh_arg")), None)
+        if key is None:
+            pytest.skip("No downloadable slot in MODEL_SLOTS")
+        srv._model_download_progress[key] = {"done": False, "error": None}
+        try:
+            r = client.post("/download-model", json={"key": key})
+            assert r.status_code == 200
+            data = r.get_json()
+            assert data.get("ok") is True
+            assert data.get("already_running") is True
+        finally:
+            srv._model_download_progress.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# /cancel/<job_id>  POST  — regression for stuck-server bug
+# ---------------------------------------------------------------------------
+
+class TestCancelJob:
+    def test_unknown_job_returns_404(self, client):
+        r = client.post("/cancel/nonexistent-job-id")
+        assert r.status_code == 404
+
+    def test_cancel_queued_job(self, client):
+        """Cancelling a queued (not yet running) job removes it from the queue."""
+        import server as srv
+        job = srv.Job("queued01", prompt="test", width=512, height=512, steps=4)
+        job.status = "queued"
+        with srv.jobs_lock:
+            srv.jobs["queued01"] = job
+        with srv.job_queue_lock:
+            srv.job_queue.append({"job": job, "params": {}})
+
+        r = client.post("/cancel/queued01")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["status"] == "cancelled"
+
+        # Job must be removed from the queue
+        with srv.job_queue_lock:
+            queued_ids = [q["job"].id for q in srv.job_queue]
+        assert "queued01" not in queued_ids
+
+        # Job status must be updated
+        assert job.status == "cancelled"
+
+    def test_cancel_already_complete_returns_400(self, client):
+        import server as srv
+        job = srv.Job("done01", prompt="test", width=512, height=512, steps=4)
+        job.status = "complete"
+        with srv.jobs_lock:
+            srv.jobs["done01"] = job
+
+        r = client.post("/cancel/done01")
+        assert r.status_code == 400
+
+    def test_cancel_running_job_clears_current_job(self, client):
+        """Regression: cancelling running job must clear current_job so server
+        is not permanently stuck as busy (fixed in restart())."""
+        import server as srv
+        import threading
+
+        # Set up a fake FluxServer-like object whose restart() we can observe
+        class FakeServer:
+            def __init__(self):
+                self.model_dir = "/fake/model"
+                self.current_job = None
+                self.restarted = threading.Event()
+
+            def restart(self):
+                # The real fix: clear current_job inside restart()
+                self.current_job = None
+                self.restarted.set()
+
+        fake_server = FakeServer()
+        job = srv.Job("running01", prompt="test", width=512, height=512, steps=4)
+        job.status = "running"
+        fake_server.current_job = job
+
+        with srv.jobs_lock:
+            srv.jobs["running01"] = job
+
+        original_server = srv.flux_server
+        srv.flux_server = fake_server
+        try:
+            r = client.post("/cancel/running01")
+            assert r.status_code == 200
+            data = r.get_json()
+            assert data["status"] == "cancelled"
+            assert data.get("server_restarting") is True
+
+            # Wait for the background restart thread to complete
+            assert fake_server.restarted.wait(timeout=3), "restart() was not called"
+
+            # The critical regression check: current_job must be None after restart
+            assert fake_server.current_job is None, \
+                "current_job was not cleared by restart() — stuck-server bug regression"
+        finally:
+            srv.flux_server = original_server
