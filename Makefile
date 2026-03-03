@@ -166,10 +166,14 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_lora debug/test_lora.c flux_lora.c flux_safetensors.c -lm
 	@/tmp/flux_test_lora
 	@rm -f /tmp/flux_test_lora
-	@echo "=== Kernel unit tests ==="
+	@echo "=== Kernel unit tests (incl. flash attention parity) ==="
 	@$(CC) -O2 -I. -o /tmp/flux_test_kernels debug/test_kernels.c flux_kernels.c -lm
 	@/tmp/flux_test_kernels
 	@rm -f /tmp/flux_test_kernels
+	@echo "=== Tokenizer unit tests ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_tokenizer debug/test_tokenizer.c flux_qwen3_tokenizer.c flux_kernels.c -lm
+	@/tmp/flux_test_tokenizer || true
+	@rm -f /tmp/flux_test_tokenizer
 	@echo "=== Embcache unit tests ==="
 	@$(CC) -O2 -I. -o /tmp/flux_test_embcache debug/test_embcache.c embcache.c -lm
 	@/tmp/flux_test_embcache

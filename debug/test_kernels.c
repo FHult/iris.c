@@ -413,6 +413,175 @@ static void test_rng_uniform_range(void) {
 }
 
 /* =========================================================================
+ * Flash Attention vs Naive Attention parity (TB-010)
+ *
+ * flux_attention  layout: Q/K/V [batch, heads, seq, head_dim]
+ * flux_flash_attention layout: Q/K/V [seq, heads*head_dim]
+ *
+ * For batch=1, heads=1 these layouts are identical, so we can feed the
+ * same buffer to both and compare outputs directly.
+ * For heads>1 we generate data in flash layout [seq, heads, head_dim]
+ * and transpose to [heads, seq, head_dim] for the naive call.
+ * ========================================================================= */
+
+/* Transpose [heads, seq, dim] <-> [seq, heads, dim] in-place using a tmp buf */
+static void transpose_hs(float *dst, const float *src, int heads, int seq, int dim) {
+    for (int h = 0; h < heads; h++)
+        for (int s = 0; s < seq; s++)
+            for (int d = 0; d < dim; d++)
+                dst[h * seq * dim + s * dim + d] = src[s * heads * dim + h * dim + d];
+}
+
+static float max_diff_f(const float *a, const float *b, int n) {
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+static float mean_diff_f(const float *a, const float *b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += fabsf(a[i] - b[i]);
+    return s / n;
+}
+
+static void test_flash_parity_single_head(void) {
+    /* batch=1, heads=1: layouts identical, feed same buffer to both */
+    int seq_q = 8, seq_k = 12, head_dim = 16;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int n_q = seq_q * head_dim, n_k = seq_k * head_dim;
+
+    float *Q = malloc(n_q * sizeof(float));
+    float *K = malloc(n_k * sizeof(float));
+    float *V = malloc(n_k * sizeof(float));
+    float *out_naive = malloc(n_q * sizeof(float));
+    float *out_flash = malloc(n_q * sizeof(float));
+
+    flux_rng_seed(12345);
+    flux_randn(Q, n_q);
+    flux_randn(K, n_k);
+    flux_randn(V, n_k);
+
+    /* Naive: batch=1, heads=1, layout same as flash for heads=1 */
+    flux_attention(out_naive, Q, K, V, 1, 1, seq_q, seq_k, head_dim, scale);
+    /* Flash: seq-major layout */
+    flux_flash_attention(out_flash, Q, K, V, seq_q, seq_k, 1, head_dim, scale);
+
+    float md = mean_diff_f(out_naive, out_flash, n_q);
+    float mx = max_diff_f(out_naive, out_flash, n_q);
+    char name[64];
+    snprintf(name, sizeof(name), "flash parity h=1 mean_diff<1e-3 (%.2e)", md);
+    check_true(name, md < 1e-3f);
+    snprintf(name, sizeof(name), "flash parity h=1 max_diff<5e-3 (%.2e)", mx);
+    check_true(name, mx < 5e-3f);
+
+    free(Q); free(K); free(V); free(out_naive); free(out_flash);
+}
+
+static void test_flash_parity_multi_head(void) {
+    /* heads=4, seq_q=16, seq_k=16, head_dim=8 */
+    int heads = 4, seq_q = 16, seq_k = 16, head_dim = 8;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int hidden = heads * head_dim;
+
+    /* Allocate in flash layout: [seq, heads*head_dim] */
+    float *Q_flash = malloc(seq_q * hidden * sizeof(float));
+    float *K_flash = malloc(seq_k * hidden * sizeof(float));
+    float *V_flash = malloc(seq_k * hidden * sizeof(float));
+    /* Naive layout: [heads, seq, head_dim] (batch=1) */
+    float *Q_naive = malloc(heads * seq_q * head_dim * sizeof(float));
+    float *K_naive = malloc(heads * seq_k * head_dim * sizeof(float));
+    float *V_naive = malloc(heads * seq_k * head_dim * sizeof(float));
+    float *out_naive = malloc(heads * seq_q * head_dim * sizeof(float));
+    float *out_flash = malloc(seq_q * hidden * sizeof(float));
+    /* Transposed flash output for comparison */
+    float *out_flash_t = malloc(heads * seq_q * head_dim * sizeof(float));
+
+    flux_rng_seed(99999);
+    flux_randn(Q_flash, seq_q * hidden);
+    flux_randn(K_flash, seq_k * hidden);
+    flux_randn(V_flash, seq_k * hidden);
+
+    /* Build naive-layout copies */
+    transpose_hs(Q_naive, Q_flash, heads, seq_q, head_dim);
+    transpose_hs(K_naive, K_flash, heads, seq_k, head_dim);
+    transpose_hs(V_naive, V_flash, heads, seq_k, head_dim);
+
+    flux_attention(out_naive, Q_naive, K_naive, V_naive,
+                   1, heads, seq_q, seq_k, head_dim, scale);
+    flux_flash_attention(out_flash, Q_flash, K_flash, V_flash,
+                         seq_q, seq_k, heads, head_dim, scale);
+
+    /* Transpose flash output back to [heads, seq, head_dim] for comparison */
+    transpose_hs(out_flash_t, out_flash, heads, seq_q, head_dim);
+
+    float md = mean_diff_f(out_naive, out_flash_t, heads * seq_q * head_dim);
+    float mx = max_diff_f(out_naive, out_flash_t, heads * seq_q * head_dim);
+    char name[64];
+    snprintf(name, sizeof(name), "flash parity h=4 mean_diff<1e-3 (%.2e)", md);
+    check_true(name, md < 1e-3f);
+    snprintf(name, sizeof(name), "flash parity h=4 max_diff<5e-3 (%.2e)", mx);
+    check_true(name, mx < 5e-3f);
+
+    free(Q_flash); free(K_flash); free(V_flash);
+    free(Q_naive); free(K_naive); free(V_naive);
+    free(out_naive); free(out_flash); free(out_flash_t);
+}
+
+static void test_flash_parity_large_seq(void) {
+    /* seq > 64 triggers the tiled path in flux_flash_attention */
+    int seq_q = 96, seq_k = 128, head_dim = 8;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    float *Q = malloc(seq_q * head_dim * sizeof(float));
+    float *K = malloc(seq_k * head_dim * sizeof(float));
+    float *V = malloc(seq_k * head_dim * sizeof(float));
+    float *out_naive = malloc(seq_q * head_dim * sizeof(float));
+    float *out_flash = malloc(seq_q * head_dim * sizeof(float));
+
+    flux_rng_seed(77777);
+    flux_randn(Q, seq_q * head_dim);
+    flux_randn(K, seq_k * head_dim);
+    flux_randn(V, seq_k * head_dim);
+
+    flux_attention(out_naive, Q, K, V, 1, 1, seq_q, seq_k, head_dim, scale);
+    flux_flash_attention(out_flash, Q, K, V, seq_q, seq_k, 1, head_dim, scale);
+
+    float md = mean_diff_f(out_naive, out_flash, seq_q * head_dim);
+    float mx = max_diff_f(out_naive, out_flash, seq_q * head_dim);
+    char name[64];
+    snprintf(name, sizeof(name), "flash parity tiled mean_diff<1e-3 (%.2e)", md);
+    check_true(name, md < 1e-3f);
+    snprintf(name, sizeof(name), "flash parity tiled max_diff<5e-3 (%.2e)", mx);
+    check_true(name, mx < 5e-3f);
+
+    free(Q); free(K); free(V); free(out_naive); free(out_flash);
+}
+
+static void test_flash_identity_v(void) {
+    /* If V is the identity matrix (head_dim == seq_k), output == softmax(QK^T/s) */
+    int seq_q = 4, seq_k = 4, head_dim = 4;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    float Q[] = {1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1};
+    float K[] = {1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1};
+    /* V = I: output[i] = softmax(QK^T[i]) */
+    float V[] = {1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1};
+    float out_naive[16], out_flash[16];
+
+    flux_attention(out_naive, Q, K, V, 1, 1, seq_q, seq_k, head_dim, scale);
+    flux_flash_attention(out_flash, Q, K, V, seq_q, seq_k, 1, head_dim, scale);
+
+    float md = mean_diff_f(out_naive, out_flash, 16);
+    check_true("flash identity-V mean_diff<1e-5", md < 1e-5f);
+    /* With K=Q=I and V=I, diagonal queries should dominate */
+    check_true("flash identity-V q0 peaks at d0", out_flash[0] > out_flash[1]);
+    check_true("flash identity-V q1 peaks at d1", out_flash[5] > out_flash[4]);
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 
@@ -459,6 +628,12 @@ int main(void) {
     test_rng_seed_reproducible();
     test_rng_different_seeds();
     test_rng_uniform_range();
+
+    printf("\n-- flash attention parity (TB-010) --\n");
+    test_flash_parity_single_head();
+    test_flash_parity_multi_head();
+    test_flash_parity_large_seq();
+    test_flash_identity_v();
 
     printf("\n");
     if (failures > 0) {
