@@ -399,6 +399,18 @@ static int parse_transformer_config(const char *model_dir, flux_transformer_t *t
     return 0;
 }
 
+/* Thread worker for parallel shard opening */
+typedef struct {
+    char path[1024];
+    safetensors_file_t *result;
+} open_shard_work_t;
+
+static void *open_shard_thread(void *arg) {
+    open_shard_work_t *w = (open_shard_work_t *)arg;
+    w->result = safetensors_open(w->path);
+    return NULL;
+}
+
 /* Open transformer safetensors shards.
  * Reads diffusion_pytorch_model.safetensors.index.json for shard filenames,
  * falls back to single diffusion_pytorch_model.safetensors.
@@ -463,17 +475,29 @@ static int open_transformer_shards(const char *model_dir,
             }
             free(json);
 
-            /* Open each shard - all must succeed */
+            /* Open all shards in parallel */
+            open_shard_work_t work[MAX_TF_SHARDS];
+            pthread_t threads[MAX_TF_SHARDS];
+            int launched[MAX_TF_SHARDS];
             for (int i = 0; i < num_shards; i++) {
-                snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, shard_names[i]);
-                files[num_files] = safetensors_open(path);
-                if (files[num_files]) {
-                    num_files++;
-                } else {
-                    fprintf(stderr, "Error: failed to open transformer shard %s\n", shard_names[i]);
-                    for (int j = 0; j < num_files; j++) safetensors_close(files[j]);
+                snprintf(work[i].path, sizeof(work[i].path), "%s/transformer/%s",
+                         model_dir, shard_names[i]);
+                work[i].result = NULL;
+                launched[i] = pthread_create(&threads[i], NULL,
+                                             open_shard_thread, &work[i]) == 0;
+                if (!launched[i])
+                    work[i].result = safetensors_open(work[i].path);
+            }
+            for (int i = 0; i < num_shards; i++) {
+                if (launched[i]) pthread_join(threads[i], NULL);
+                if (!work[i].result) {
+                    fprintf(stderr, "Error: failed to open transformer shard %s\n",
+                            shard_names[i]);
+                    for (int j = 0; j < i; j++)
+                        if (work[j].result) safetensors_close(work[j].result);
                     return 0;
                 }
+                files[num_files++] = work[i].result;
             }
             if (num_files > 0) return num_files;
         } else {
@@ -729,67 +753,67 @@ static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
     int h = tf->hidden_size, mlp = tf->mlp_hidden;
     int fused = h * 3 + mlp * 2;
 
-    /* Input/output projections (already loaded) */
-    if (tf->img_in_weight_bf16)
-        flux_metal_warmup_bf16_buffer(tf->img_in_weight_bf16,
-                                       (size_t)tf->latent_channels * h);
-    if (tf->txt_in_weight_bf16)
-        flux_metal_warmup_bf16_buffer(tf->txt_in_weight_bf16,
-                                       (size_t)tf->text_dim * h);
-    if (tf->final_proj_weight_bf16)
-        flux_metal_warmup_bf16_buffer(tf->final_proj_weight_bf16,
-                                       (size_t)tf->latent_channels * h);
+    /* Collect all bf16 weight pointers before any GPU work.
+     * In mmap mode, mmap_get_bf16() returns direct pointers into the mmap region
+     * (no allocation), so loading all blocks simultaneously is free in both
+     * CPU time and memory. We then create all Metal buffers in parallel using GCD,
+     * parallelising the NVMe page-fault I/O across all CPU cores. */
+    int max_w = 3 + tf->num_double_layers * 14 + tf->num_single_layers * 2;
+    const uint16_t **ptrs = malloc((size_t)max_w * sizeof(const uint16_t *));
+    size_t *szs = malloc((size_t)max_w * sizeof(size_t));
+    if (!ptrs || !szs) { free(ptrs); free(szs); return; }
+    int nw = 0;
 
-    /* Double blocks */
+#define COLLECT(ptr, sz) do { if (ptr) { ptrs[nw] = (ptr); szs[nw] = (sz); nw++; } } while(0)
+
+    /* Always-loaded weights (already in bf16 cache from load_mmap) */
+    COLLECT(tf->img_in_weight_bf16,     (size_t)tf->latent_channels * h);
+    COLLECT(tf->txt_in_weight_bf16,     (size_t)tf->text_dim * h);
+    COLLECT(tf->final_proj_weight_bf16, (size_t)tf->latent_channels * h);
+
+    /* Load all double blocks and collect pointers (just mmap pointer assignment) */
     for (int i = 0; i < tf->num_double_layers; i++) {
-        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        load_double_block_weights(&tf->double_blocks[i], tf->sf_files,
+                                  tf->num_sf_files, i, h, mlp, 1);
         double_block_t *b = &tf->double_blocks[i];
-
-        if (b->img_q_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_q_weight_bf16, (size_t)h*h);
-        if (b->img_k_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_k_weight_bf16, (size_t)h*h);
-        if (b->img_v_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_v_weight_bf16, (size_t)h*h);
-        if (b->img_proj_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_proj_weight_bf16, (size_t)h*h);
-        if (b->img_mlp_gate_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_mlp_gate_weight_bf16, (size_t)mlp*h);
-        if (b->img_mlp_up_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_mlp_up_weight_bf16, (size_t)mlp*h);
-        if (b->img_mlp_down_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->img_mlp_down_weight_bf16, (size_t)h*mlp);
-
-        if (b->txt_q_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_q_weight_bf16, (size_t)h*h);
-        if (b->txt_k_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_k_weight_bf16, (size_t)h*h);
-        if (b->txt_v_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_v_weight_bf16, (size_t)h*h);
-        if (b->txt_proj_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_proj_weight_bf16, (size_t)h*h);
-        if (b->txt_mlp_gate_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_mlp_gate_weight_bf16, (size_t)mlp*h);
-        if (b->txt_mlp_up_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_mlp_up_weight_bf16, (size_t)mlp*h);
-        if (b->txt_mlp_down_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->txt_mlp_down_weight_bf16, (size_t)h*mlp);
-
-        free_double_block_weights(&tf->double_blocks[i]);
+        COLLECT(b->img_q_weight_bf16,        (size_t)h * h);
+        COLLECT(b->img_k_weight_bf16,        (size_t)h * h);
+        COLLECT(b->img_v_weight_bf16,        (size_t)h * h);
+        COLLECT(b->img_proj_weight_bf16,     (size_t)h * h);
+        COLLECT(b->img_mlp_gate_weight_bf16, (size_t)mlp * h);
+        COLLECT(b->img_mlp_up_weight_bf16,   (size_t)mlp * h);
+        COLLECT(b->img_mlp_down_weight_bf16, (size_t)h * mlp);
+        COLLECT(b->txt_q_weight_bf16,        (size_t)h * h);
+        COLLECT(b->txt_k_weight_bf16,        (size_t)h * h);
+        COLLECT(b->txt_v_weight_bf16,        (size_t)h * h);
+        COLLECT(b->txt_proj_weight_bf16,     (size_t)h * h);
+        COLLECT(b->txt_mlp_gate_weight_bf16, (size_t)mlp * h);
+        COLLECT(b->txt_mlp_up_weight_bf16,   (size_t)mlp * h);
+        COLLECT(b->txt_mlp_down_weight_bf16, (size_t)h * mlp);
     }
 
-    /* Single blocks */
+    /* Load all single blocks and collect pointers */
     for (int i = 0; i < tf->num_single_layers; i++) {
-        load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        load_single_block_weights(&tf->single_blocks[i], tf->sf_files,
+                                  tf->num_sf_files, i, h, mlp, 1);
         single_block_t *b = &tf->single_blocks[i];
-
-        if (b->qkv_mlp_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->qkv_mlp_weight_bf16, (size_t)fused*h);
-        if (b->proj_mlp_weight_bf16)
-            flux_metal_warmup_bf16_buffer(b->proj_mlp_weight_bf16, (size_t)h*(h+mlp));
-
-        free_single_block_weights(&tf->single_blocks[i]);
+        COLLECT(b->qkv_mlp_weight_bf16,  (size_t)fused * h);
+        COLLECT(b->proj_mlp_weight_bf16, (size_t)h * (h + mlp));
     }
+
+#undef COLLECT
+
+    /* Create all Metal buffers in parallel, then batch-insert into BF16 cache */
+    flux_metal_warmup_bf16_buffers_parallel(ptrs, szs, nw);
+
+    /* Free block weight structs: NULLs bf16 mmap pointers, frees f32 norm weights */
+    for (int i = 0; i < tf->num_double_layers; i++)
+        free_double_block_weights(&tf->double_blocks[i]);
+    for (int i = 0; i < tf->num_single_layers; i++)
+        free_single_block_weights(&tf->single_blocks[i]);
+
+    free(ptrs);
+    free(szs);
 }
 #endif
 

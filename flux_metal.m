@@ -1199,6 +1199,58 @@ void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elem
     (void)get_cached_bf16_buffer(bf16_weights, num_elements);
 }
 
+/* Parallel BF16 MTLBuffer creation using GCD dispatch_apply.
+ * Creates all Metal buffers concurrently (parallelises NVMe page-fault I/O),
+ * then batch-inserts all results into the BF16 cache under a single mutex lock.
+ * Thread-safe: MTLDevice methods are thread-safe per Metal specification.
+ *
+ * ARC note: bufs[] stores void* with manual +1 retain (__bridge_retained) so
+ * buffers survive past the dispatch block. __bridge_transfer reclaims them. */
+void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
+                                              const size_t *counts, int n) {
+    if (!g_initialized || n <= 0) return;
+
+    /* void* array: ARC cannot manage C arrays of ObjC pointers; use manual retain */
+    void **bufs = calloc((size_t)n, sizeof(void *));
+    if (!bufs) return;
+
+    /* Concurrent buffer creation: each thread reads its mmap pages, triggering
+     * parallel NVMe reads instead of sequential page faults */
+    dispatch_apply((size_t)n,
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t idx) {
+        size_t sz = counts[idx] * sizeof(uint16_t);
+        id<MTLBuffer> buf = [g_device newBufferWithBytes:ptrs[idx]
+                                                  length:sz
+                                                 options:MTLResourceStorageModeShared];
+        if (buf)
+            bufs[idx] = (__bridge_retained void *)buf; /* manual +1 retain */
+    });
+
+    /* Single mutex acquisition for all cache insertions */
+    pthread_mutex_lock(&g_bf16_cache_mutex);
+    for (int i = 0; i < n; i++) {
+        if (!bufs[i]) continue;
+        /* Transfer ownership back to ARC; releases if not stored in cache */
+        id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)bufs[i];
+        bufs[i] = NULL;
+        if (g_bf16_cache_count >= BF16_WEIGHT_CACHE_SIZE) continue;
+        int dup = 0;
+        for (int j = 0; j < g_bf16_cache_count; j++) {
+            if (g_bf16_cache[j].cpu_ptr == ptrs[i]) { dup = 1; break; }
+        }
+        if (!dup) {
+            g_bf16_cache[g_bf16_cache_count].cpu_ptr    = ptrs[i];
+            g_bf16_cache[g_bf16_cache_count].gpu_buffer  = buf;
+            g_bf16_cache[g_bf16_cache_count].size        = counts[i] * sizeof(uint16_t);
+            g_bf16_cache_count++;
+        }
+    }
+    pthread_mutex_unlock(&g_bf16_cache_mutex);
+
+    free(bufs);
+}
+
 /*
  * BF16 matrix multiplication: C = alpha * A @ B + beta * C
  * A is f32, B is bf16 (weights, converted to f16 for MPS), C is f32

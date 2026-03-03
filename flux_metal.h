@@ -741,6 +741,15 @@ void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
  */
 void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
 
+/*
+ * Parallel BF16 MTLBuffer creation for bulk warmup.
+ * Creates Metal buffers for all ptrs[0..n-1] concurrently using GCD,
+ * then inserts all into the BF16 cache under a single mutex lock.
+ * Use instead of calling flux_metal_warmup_bf16_buffer() in a loop.
+ */
+void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
+                                              const size_t *counts, int n);
+
 /* ========================================================================
  * Native BF16 Pipeline API
  *

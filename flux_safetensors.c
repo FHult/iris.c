@@ -233,6 +233,10 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
+    /* Hint to kernel: pages will be accessed sequentially → enables aggressive read-ahead,
+     * avoiding per-page NVMe seek latency when copying weight data into Metal buffers. */
+    posix_madvise(data, file_size, POSIX_MADV_SEQUENTIAL);
+
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
     memcpy(&header_size, data, 8);
