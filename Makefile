@@ -76,9 +76,9 @@ blas: clean $(TARGET)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
+MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK -flto=thin
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
-MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation
+MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation -Wl,-dead_strip
 
 mps: clean mps-build
 	@echo ""
@@ -94,7 +94,7 @@ shaders: flux_shaders.metallib
 flux_shaders.metallib: flux_shaders.metal
 	@if xcrun --find metal >/dev/null 2>&1; then \
 		echo "Compiling Metal shaders..."; \
-		xcrun -sdk macosx metal -c flux_shaders.metal -o flux_shaders.air && \
+		xcrun -sdk macosx metal -O2 -ffast-math -c flux_shaders.metal -o flux_shaders.air && \
 		xcrun -sdk macosx metallib flux_shaders.air -o flux_shaders.metallib && \
 		rm -f flux_shaders.air && \
 		echo "Created flux_shaders.metallib"; \
