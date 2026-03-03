@@ -10,7 +10,15 @@
     <div class="container">
         <header>
             <h1>FLUX.2 Image Generator</h1>
-            <p class="subtitle" id="model-info">Generate images from text prompts</p>
+            <div class="model-switcher-row">
+                <span class="subtitle" id="model-info">Generate images from text prompts</span>
+                <button type="button" class="model-switch-btn" id="model-switch-btn"
+                        title="Switch or download models" style="display:none">Switch Model</button>
+            </div>
+            <div class="model-panel" id="model-panel" style="display:none">
+                <div id="model-panel-content"></div>
+                <button type="button" class="model-panel-close" id="model-panel-close">Close</button>
+            </div>
             <button type="button" class="theme-toggle" id="theme-toggle" title="Toggle light/dark theme">
                 <svg id="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none;">
                     <circle cx="12" cy="12" r="5"></circle>

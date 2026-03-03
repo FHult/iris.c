@@ -93,6 +93,110 @@ header .subtitle {
     font-size: 1rem;
 }
 
+.model-switcher-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: center;
+}
+
+.model-switch-btn {
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.model-switch-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+}
+
+.model-panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 8px auto 0;
+    max-width: 480px;
+    text-align: left;
+}
+
+.model-panel-slot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.model-panel-slot:last-of-type {
+    border-bottom: none;
+}
+
+.model-panel-slot .slot-info strong {
+    font-size: 0.9rem;
+}
+
+.model-panel-slot .slot-info small {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.model-panel-slot .slot-action button {
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    cursor: pointer;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.model-panel-slot .slot-action button:hover {
+    background: var(--bg-primary);
+}
+
+.model-panel-slot .badge-current {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    background: var(--accent, #4a9eff);
+    color: #fff;
+    border-radius: 4px;
+}
+
+.model-panel-slot .slot-error {
+    font-size: 0.75rem;
+    color: var(--error, #e55);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-panel-close {
+    display: block;
+    margin: 10px auto 0;
+    font-size: 0.75rem;
+    padding: 3px 12px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.model-panel-close:hover {
+    color: var(--text-primary);
+}
+
 main {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

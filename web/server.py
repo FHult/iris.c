@@ -36,6 +36,28 @@ DEFAULT_MODEL_DIR = next(
 )
 DEFAULT_FLUX_BINARY = PROJECT_DIR / "flux"
 OUTPUT_DIR = SCRIPT_DIR / "output"
+
+# Known model slots. The startup model dir is prepended dynamically in main().
+# sh_arg: argument to pass to download_model.sh; None means not downloadable via UI.
+MODEL_SLOTS = [
+    {
+        "key": "flux-klein-4b-base",
+        "label": "4B Base",
+        "description": "50 steps, CFG, higher quality",
+        "sh_arg": "4b-base",
+        "expected_files": [
+            "model_index.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors.index.json",
+            "tokenizer/tokenizer.json",
+        ],
+    }
+]
+_model_download_progress = {}  # key -> {done, error}
 THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"
 HISTORY_FILE = OUTPUT_DIR / "history.json"
 THUMB_SIZE = 200  # Max dimension for thumbnails
@@ -768,6 +790,20 @@ class FluxServer:
         self.generation_count = 0
         self.start()
         print("Flux server restarted")
+
+    def switch(self, new_model_dir):
+        """Switch to a different model directory.
+        stop() terminates the flux process and waits for it to exit, which causes the OS
+        to reclaim all Metal buffers and mmap regions — the old model is fully unloaded
+        before start() loads the new one. The two models are never in memory simultaneously.
+        """
+        print(f"Switching model to {new_model_dir}...")
+        self.stop()  # old process exits → OS reclaims all GPU memory / mmap regions
+        self.model_dir = new_model_dir
+        self._intentional_stop = False
+        self.generation_count = 0
+        self.start()
+        print("Model switch complete")
 
 
 def process_job_queue():
@@ -1626,6 +1662,106 @@ def available_loras():
     return jsonify({"loras": loras, "curated": curated})
 
 
+@app.route("/available-models")
+def available_models_endpoint():
+    """List known model slots with download and current status."""
+    slots = []
+    for slot in MODEL_SLOTS:
+        slot_dir = PROJECT_DIR / slot["key"]
+        downloaded = (slot_dir / "model_index.json").exists()
+        is_current = (flux_server is not None and
+                      Path(flux_server.model_dir).resolve() == slot_dir.resolve())
+        slots.append({
+            "key": slot["key"],
+            "label": slot["label"],
+            "description": slot["description"],
+            "downloaded": downloaded,
+            "current": is_current,
+            "downloadable": slot.get("sh_arg") is not None,
+        })
+    current_name = Path(flux_server.model_dir).name if flux_server else None
+    return jsonify({"current_model_dir": current_name, "slots": slots})
+
+
+@app.route("/switch-model", methods=["POST"])
+def switch_model():
+    """Switch the loaded model to a different directory (restarts the flux process)."""
+    global flux_server, model_dir_path
+    data = request.json or {}
+    key = data.get("key", "").strip()
+    slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
+    if not slot:
+        return jsonify({"error": "Unknown model key"}), 400
+    new_dir = PROJECT_DIR / key
+    if not (new_dir / "model_index.json").exists():
+        return jsonify({"error": "Model not downloaded yet"}), 400
+    if flux_server and Path(flux_server.model_dir).resolve() == new_dir.resolve():
+        return jsonify({"error": "Already loaded"}), 400
+    with job_queue_lock:
+        busy = bool(flux_server and flux_server.current_job) or bool(job_queue)
+    if busy:
+        return jsonify({"error": "Cannot switch while jobs are running or queued"}), 409
+
+    def do_switch():
+        global model_dir_path
+        flux_server.switch(new_dir)
+        model_dir_path = new_dir
+
+    threading.Thread(target=do_switch, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/download-model", methods=["POST"])
+def download_model_endpoint():
+    """Start downloading a model via download_model.sh."""
+    data = request.json or {}
+    key = data.get("key", "").strip()
+    slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
+    if not slot or not slot.get("sh_arg"):
+        return jsonify({"error": "Unknown or non-downloadable model key"}), 400
+    # Idempotent: if already running, return ok
+    state = _model_download_progress.get(key, {})
+    if state and not state.get("done") and not state.get("error"):
+        return jsonify({"ok": True, "already_running": True})
+
+    _model_download_progress[key] = {"done": False, "error": None}
+
+    def do_download():
+        script = PROJECT_DIR / "download_model.sh"
+        cmd = ["bash", str(script), slot["sh_arg"]]
+        token = os.environ.get("HF_TOKEN", "")
+        if token:
+            cmd += ["--token", token]
+        try:
+            proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), capture_output=True, text=True)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "Download failed")[-500:]
+                _model_download_progress[key]["error"] = err
+            else:
+                _model_download_progress[key]["done"] = True
+        except Exception as e:
+            _model_download_progress[key]["error"] = str(e)
+
+    threading.Thread(target=do_download, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/download-model/progress/<key>")
+def download_model_progress_endpoint(key):
+    """Poll download progress for a model download."""
+    state = _model_download_progress.get(key)
+    if state is None:
+        return jsonify({"error": "Not started"}), 404
+    slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
+    files_done = 0
+    files_total = 0
+    if slot:
+        out_dir = PROJECT_DIR / key
+        files_total = len(slot.get("expected_files", []))
+        files_done = sum(1 for f in slot.get("expected_files", []) if (out_dir / f).exists())
+    return jsonify({**state, "files_done": files_done, "files_total": files_total})
+
+
 def _do_download(dl_id, url, dest, extra_headers=None):
     """Background thread: download a file from url to dest, tracking progress."""
     try:
@@ -1814,6 +1950,18 @@ def main():
         return 1
 
     model_dir_path = args.model_dir
+
+    # Ensure the startup model dir is listed as a switchable slot so users can
+    # switch back to it after switching to another model.
+    startup_key = args.model_dir.resolve().name
+    if not any(s["key"] == startup_key for s in MODEL_SLOTS):
+        MODEL_SLOTS.insert(0, {
+            "key": startup_key,
+            "label": startup_key,
+            "description": "Startup model",
+            "sh_arg": None,
+            "expected_files": ["model_index.json"],
+        })
 
     # Ensure output directory exists
     OUTPUT_DIR.mkdir(exist_ok=True)

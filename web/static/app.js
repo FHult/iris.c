@@ -206,6 +206,121 @@ document.addEventListener('DOMContentLoaded', () => {
         if (data.model) modelInfoEl.textContent = data.model;
     }).catch(() => {});
 
+    // ── Model switcher ────────────────────────────────────────────────────────
+    const modelSwitchBtn = document.getElementById('model-switch-btn');
+    const modelPanel = document.getElementById('model-panel');
+    const modelPanelContent = document.getElementById('model-panel-content');
+    const modelPanelClose = document.getElementById('model-panel-close');
+    let _availableSlots = [];
+    let _dlProgress = {};
+
+    modelSwitchBtn.addEventListener('click', () => {
+        modelPanel.style.display = modelPanel.style.display === 'none' ? '' : 'none';
+    });
+    modelPanelClose.addEventListener('click', () => {
+        modelPanel.style.display = 'none';
+    });
+
+    function loadAvailableModels() {
+        fetch('/available-models').then(r => r.json()).then(data => {
+            _availableSlots = data.slots || [];
+            const hasSwitchable = _availableSlots.some(s => !s.current);
+            modelSwitchBtn.style.display = hasSwitchable ? '' : 'none';
+            renderModelPanel();
+        }).catch(() => {});
+    }
+
+    function renderModelPanel() {
+        modelPanelContent.innerHTML = _availableSlots.map(slot => {
+            let actionHtml = '';
+            if (slot.current) {
+                actionHtml = '<span class="badge-current">Current</span>';
+            } else if (slot.downloaded) {
+                actionHtml = `<button onclick="window._switchModel('${slot.key}')">Switch to this model</button>`;
+            } else if (!slot.downloadable) {
+                actionHtml = '<span style="color:var(--text-secondary);font-size:0.75rem">Not available</span>';
+            } else {
+                const prog = _dlProgress[slot.key];
+                if (prog && !prog.done && !prog.error) {
+                    const pct = prog.files_total
+                        ? Math.round(prog.files_done / prog.files_total * 100) : 0;
+                    actionHtml = `<span>${prog.files_done}/${prog.files_total} files (${pct}%)</span>`;
+                } else if (prog && prog.error) {
+                    const err = (prog.error || '').slice(0, 60);
+                    actionHtml = `<span class="slot-error" title="${prog.error}">${err}</span>
+                        <button onclick="window._downloadModel('${slot.key}')">Retry</button>`;
+                } else {
+                    actionHtml = `<button onclick="window._downloadModel('${slot.key}')">Download (~16 GB)</button>`;
+                }
+            }
+            return `<div class="model-panel-slot">
+                <div class="slot-info">
+                    <strong>${slot.label}</strong>
+                    <small>${slot.description}</small>
+                </div>
+                <div class="slot-action">${actionHtml}</div>
+            </div>`;
+        }).join('');
+    }
+
+    window._switchModel = function(key) {
+        if (!confirm('Switch model? The current model will be unloaded and the new one loaded. This takes 15–30 seconds.')) return;
+        modelInfoEl.textContent = 'Loading model...';
+        modelPanel.style.display = 'none';
+        fetch('/switch-model', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({key}),
+        }).then(r => r.json()).then(data => {
+            if (data.error) { alert(data.error); loadAvailableModels(); return; }
+            pollModelReady();
+        }).catch(() => { alert('Switch request failed'); });
+    };
+
+    window._downloadModel = function(key) {
+        _dlProgress[key] = {done: false, error: null, files_done: 0, files_total: 8};
+        renderModelPanel();
+        fetch('/download-model', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({key}),
+        }).then(() => pollDownloadProgress(key)).catch(() => {
+            _dlProgress[key].error = 'Request failed';
+            renderModelPanel();
+        });
+    };
+
+    function pollDownloadProgress(key) {
+        const interval = setInterval(() => {
+            fetch(`/download-model/progress/${key}`).then(r => r.json()).then(state => {
+                _dlProgress[key] = state;
+                renderModelPanel();
+                if (state.done || state.error) {
+                    clearInterval(interval);
+                    if (state.done) loadAvailableModels();
+                }
+            }).catch(() => {});
+        }, 2000);
+    }
+
+    function pollModelReady() {
+        const interval = setInterval(() => {
+            fetch('/model-info').then(r => {
+                if (r.status === 503) return null;
+                return r.json();
+            }).then(data => {
+                if (data && data.model) {
+                    clearInterval(interval);
+                    modelInfoEl.textContent = data.model;
+                    loadAvailableModels();
+                }
+            }).catch(() => {});
+        }, 1000);
+    }
+
+    loadAvailableModels();
+    // ── End model switcher ────────────────────────────────────────────────────
+
     // Ctrl+Enter to generate
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
