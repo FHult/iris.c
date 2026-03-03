@@ -1770,6 +1770,34 @@ kernel void transpose_from_heads_bf16(
 }
 
 /* ========================================================================
+ * VAE Attention Transpose
+ * Transposes channel and spatial dims of a batched f32 tensor.
+ * to_nhwc=1: [B, C, S] -> [B, S, C]  (before attention, NCHW-flat to NHWC-flat)
+ * to_nhwc=0: [B, S, C] -> [B, C, S]  (after attention, NHWC-flat to NCHW-flat)
+ * Dispatch: MTLSizeMake(spatial, channels, batch)
+ * ======================================================================== */
+kernel void vae_attn_transpose(
+    device const float *src [[buffer(0)]],
+    device float       *dst [[buffer(1)]],
+    constant int       &channels [[buffer(2)]],
+    constant int       &spatial  [[buffer(3)]],
+    constant int       &to_nhwc  [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]])
+{
+    int s = (int)pos.x, c = (int)pos.y, b = (int)pos.z;
+    if (s >= spatial || c >= channels) return;
+    if (to_nhwc) {
+        /* [B, C, S] -> [B, S, C] */
+        dst[b * spatial * channels + s * channels + c] =
+            src[b * channels * spatial + c * spatial + s];
+    } else {
+        /* [B, S, C] -> [B, C, S] */
+        dst[b * channels * spatial + c * spatial + s] =
+            src[b * spatial * channels + s * channels + c];
+    }
+}
+
+/* ========================================================================
  * Fused Non-Causal Attention for BF16 Pipeline
  * Same algorithm as attention_fused but with bf16 I/O and f32 computation.
  *

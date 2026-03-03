@@ -248,6 +248,7 @@ static id<MTLComputePipelineState> g_group_norm_f32_pipeline;
 static id<MTLComputePipelineState> g_swish_f32_pipeline;
 static id<MTLComputePipelineState> g_add_f32_pipeline;
 static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
+static id<MTLComputePipelineState> g_vae_attn_transpose_pipeline;
 static id<MTLComputePipelineState> g_bias_add_pipeline;
 static int g_shaders_initialized;
 
@@ -3655,6 +3656,10 @@ int flux_metal_init_shaders(void) {
         if (func) {
             g_upsample_nearest_2x_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
+        func = [g_shader_library newFunctionWithName:@"vae_attn_transpose"];
+        if (func) {
+            g_vae_attn_transpose_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
 
         func = [g_shader_library newFunctionWithName:@"bias_add"];
         if (func) {
@@ -6705,6 +6710,46 @@ void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tenso
             b->has_pending_work = 0;
         }
     }
+}
+
+/* Transpose channel/spatial dims of a batched f32 GPU tensor.
+ * to_nhwc=1: [B,C,S]->[B,S,C];  to_nhwc=0: [B,S,C]->[B,C,S]
+ * Returns new tensor (caller must free) or NULL on failure. */
+flux_gpu_tensor_t flux_gpu_transpose_cs(flux_gpu_tensor_t src,
+                                         int batch, int channels, int spatial,
+                                         int to_nhwc) {
+    if (!g_shaders_initialized || !g_vae_attn_transpose_pipeline) return NULL;
+    if (!src || batch <= 0 || channels <= 0 || spatial <= 0) return NULL;
+
+    flux_gpu_tensor_t dst = flux_gpu_tensor_alloc((size_t)batch * channels * spatial);
+    if (!dst) return NULL;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_vae_attn_transpose_pipeline];
+        [encoder setBuffer:src->buffer offset:0 atIndex:0];
+        [encoder setBuffer:dst->buffer offset:0 atIndex:1];
+        [encoder setBytes:&channels length:sizeof(int) atIndex:2];
+        [encoder setBytes:&spatial  length:sizeof(int) atIndex:3];
+        [encoder setBytes:&to_nhwc  length:sizeof(int) atIndex:4];
+
+        NSUInteger tg_x = MIN((NSUInteger)spatial, 64);
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)spatial, (NSUInteger)channels, (NSUInteger)batch)
+             threadsPerThreadgroup:MTLSizeMake(tg_x, 1, 1)];
+        [encoder endEncoding];
+
+        dst->has_pending_work = 1;
+        src->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            dst->has_pending_work = 0;
+            src->has_pending_work = 0;
+        }
+    }
+    return dst;
 }
 
 /* Nearest neighbor 2x upsample on f32 GPU tensor */

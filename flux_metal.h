@@ -557,6 +557,13 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
 /* GPU blit copy for f32 tensors */
 void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
 
+/* Transpose channel/spatial dims of a batched f32 GPU tensor.
+ * to_nhwc=1: [B,C,S]->[B,S,C];  to_nhwc=0: [B,S,C]->[B,C,S]
+ * Returns new tensor (caller must free) or NULL on failure. */
+flux_gpu_tensor_t flux_gpu_transpose_cs(flux_gpu_tensor_t src,
+                                         int batch, int channels, int spatial,
+                                         int to_nhwc);
+
 /* GPU blit copy for f32 tensors with element offsets */
 void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
                                flux_gpu_tensor_t src, size_t src_offset,

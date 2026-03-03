@@ -593,8 +593,80 @@ static flux_gpu_tensor_t resblock_forward_gpu(flux_gpu_tensor_t x,
     return skip;
 }
 
+/* GPU replacement for attnblock_forward(). Stays in GPU batch mode throughout.
+ * x: [batch, channels, H, W] f32 GPU tensor (NCHW layout).
+ * Returns new GPU tensor on success, NULL on failure (caller uses CPU fallback).
+ * Only batch=1 is supported; returns NULL for batch>1. */
+static flux_gpu_tensor_t attnblock_forward_gpu(flux_gpu_tensor_t x,
+                                                const vae_attnblock_t *block,
+                                                int batch, int H, int W,
+                                                int num_groups, float eps) {
+    if (batch != 1) return NULL;
+    int ch = block->channels, sp = H * W;
+    float scale = 1.0f / sqrtf((float)ch);
+
+    /* GroupNorm */
+    flux_gpu_tensor_t norm = flux_gpu_tensor_alloc((size_t)ch * sp);
+    if (!norm) return NULL;
+    flux_gpu_group_norm_f32(norm, x, block->norm_weight, block->norm_bias,
+                             batch, ch, sp, num_groups, eps);
+
+    /* Q / K / V projections (1x1 conv, NCHW output) */
+    flux_gpu_tensor_t q = flux_gpu_conv2d_f32(norm, block->q_weight, block->q_bias,
+                                               batch, ch, ch, H, W, 1, 1, 1, 0);
+    flux_gpu_tensor_t k = flux_gpu_conv2d_f32(norm, block->k_weight, block->k_bias,
+                                               batch, ch, ch, H, W, 1, 1, 1, 0);
+    flux_gpu_tensor_t v = flux_gpu_conv2d_f32(norm, block->v_weight, block->v_bias,
+                                               batch, ch, ch, H, W, 1, 1, 1, 0);
+    flux_gpu_tensor_free(norm);
+    if (!q || !k || !v) {
+        flux_gpu_tensor_free(q); flux_gpu_tensor_free(k); flux_gpu_tensor_free(v);
+        return NULL;
+    }
+
+    /* Transpose Q/K/V: [B,C,S] -> [B,S,C] for attention kernel */
+    flux_gpu_tensor_t qt = flux_gpu_transpose_cs(q, batch, ch, sp, 1);
+    flux_gpu_tensor_t kt = flux_gpu_transpose_cs(k, batch, ch, sp, 1);
+    flux_gpu_tensor_t vt = flux_gpu_transpose_cs(v, batch, ch, sp, 1);
+    flux_gpu_tensor_free(q); flux_gpu_tensor_free(k); flux_gpu_tensor_free(v);
+    if (!qt || !kt || !vt) {
+        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+        return NULL;
+    }
+
+    /* Single-head attention: seq=sp, num_heads=1, head_dim=ch */
+    flux_gpu_tensor_t attn = flux_gpu_tensor_alloc((size_t)sp * ch);
+    if (!attn) {
+        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+        return NULL;
+    }
+    if (!flux_gpu_attention_fused(attn, qt, kt, vt, sp, sp, 1, ch, scale)) {
+        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+        flux_gpu_tensor_free(attn);
+        return NULL;
+    }
+    flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+
+    /* Transpose output back: [B,S,C] -> [B,C,S] = NCHW */
+    flux_gpu_tensor_t attn_nchw = flux_gpu_transpose_cs(attn, batch, ch, sp, 0);
+    flux_gpu_tensor_free(attn);
+    if (!attn_nchw) return NULL;
+
+    /* Output projection (1x1 conv) */
+    flux_gpu_tensor_t proj = flux_gpu_conv2d_f32(attn_nchw, block->out_weight, block->out_bias,
+                                                   batch, ch, ch, H, W, 1, 1, 1, 0);
+    flux_gpu_tensor_free(attn_nchw);
+    if (!proj) return NULL;
+
+    /* Residual: result = x + proj */
+    flux_gpu_tensor_t result = flux_gpu_tensor_alloc((size_t)ch * sp);
+    if (!result) { flux_gpu_tensor_free(proj); return NULL; }
+    flux_gpu_add_f32(result, x, proj, ch * sp);
+    flux_gpu_tensor_free(proj);
+    return result;
+}
+
 /* GPU-resident VAE decode.
- * Keeps all data on GPU, only syncs for mid-block attention (CPU) and final output.
  * Returns NULL on failure (caller falls back to CPU path). */
 static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w) {
@@ -675,32 +747,31 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     x = t;
     if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
 
-    /* Mid block attention: sync to CPU, run attention, upload back */
+    /* Mid block attention: GPU path (stays in batch); CPU fallback on failure */
     {
-        size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
-        float *cpu_attn_in = cpu_work;
-
-        flux_gpu_batch_end();  /* Sync: execute everything queued so far */
-
-        /* Download GPU tensor to CPU */
-        flux_gpu_tensor_read(x, cpu_attn_in);
-
-        /* Run attention on CPU (uses existing attnblock_forward) */
-        float *cpu_attn_out = cpu_x;
-        if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
-                               vae->work3, batch, cur_h, cur_w,
-                               vae->num_groups, vae->eps) < 0) {
+        flux_gpu_tensor_t ar =
+            attnblock_forward_gpu(x, &vae->dec_mid_attn, batch, cur_h, cur_w,
+                                  vae->num_groups, vae->eps);
+        if (ar) {
             flux_gpu_tensor_free(x);
-            return NULL;
+            x = ar;
+        } else {
+            /* CPU fallback: sync, compute, re-upload, restart batch */
+            size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
+            flux_gpu_batch_end();
+            flux_gpu_tensor_read(x, cpu_work);
+            if (attnblock_forward(cpu_x, cpu_work, &vae->dec_mid_attn,
+                                   vae->work3, batch, cur_h, cur_w,
+                                   vae->num_groups, vae->eps) < 0) {
+                flux_gpu_tensor_free(x);
+                return NULL;
+            }
+            flux_gpu_tensor_free(x);
+            x = flux_gpu_tensor_create(cpu_x, attn_size);
+            if (!x) return NULL;
+            flux_gpu_batch_begin();
         }
         if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
-
-        /* Upload result back to GPU */
-        flux_gpu_tensor_free(x);
-        x = flux_gpu_tensor_create(cpu_attn_out, attn_size);
-        if (!x) return NULL;
-
-        flux_gpu_batch_begin();  /* Start new batch for remaining work */
     }
 
     /* Mid block: resblock2 */
