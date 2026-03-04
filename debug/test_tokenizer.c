@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "flux_qwen3.h"
+#include "iris_qwen3.h"
 
 /* qwen3_tokenize is not in the public header but is a non-static symbol */
 int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,

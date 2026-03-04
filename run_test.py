@@ -287,7 +287,7 @@ def run_server_mode_test(flux_binary: str, model_dir: str) -> tuple[bool, str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Run FLUX inference tests")
-    parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
+    parser.add_argument("--flux-binary", default="./iris", help="Path to flux binary")
     parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
     parser.add_argument("--zimage-model-dir", default=None,
                         help="Optional Z-Image model dir (auto-detected if omitted)")

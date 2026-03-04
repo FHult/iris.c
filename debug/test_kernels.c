@@ -21,7 +21,7 @@
 #include <math.h>
 
 /* Pull in the kernel declarations without Metal or BLAS */
-#include "flux_kernels.h"
+#include "iris_kernels.h"
 
 static int failures = 0;
 static int passes = 0;

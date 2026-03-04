@@ -1,4 +1,4 @@
-# FLUX.2 klein 4B - Pure C Inference Engine
+# FLUX.2 klein 4B / iris.c - Pure C Inference Engine
 # Makefile
 
 CC = gcc
@@ -10,13 +10,13 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_zimage_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c embcache.c flux_lora.c
+SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c embcache.c iris_lora.c
 OBJS = $(SRCS:.c=.o)
-CLI_SRCS = flux_cli.c linenoise.c
+CLI_SRCS = iris_cli.c linenoise.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
-TARGET = flux
-LIB = libflux.a
+TARGET = iris
+LIB = libiris.a
 
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
@@ -28,7 +28,7 @@ DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 all: help
 
 help:
-	@echo "FLUX.2 klein 4B - Build Targets"
+	@echo "iris.c / FLUX.2 klein 4B - Build Targets"
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
@@ -46,7 +46,7 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
-	@echo "Example: make mps && ./flux -d flux-klein-4b -p \"a cat\" -o cat.png"
+	@echo "Example: make mps && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -84,20 +84,20 @@ mps: clean mps-build
 	@echo ""
 	@echo "Built with MPS backend (Metal GPU acceleration)"
 
-mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) flux_metal.o main.mps.o
+mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) iris_metal.o main.mps.o
 	$(CC) $(MPS_CFLAGS) -o $(TARGET) $^ $(MPS_LDFLAGS)
 
 # Pre-compile Metal shaders for faster startup (requires full Xcode, not just Command Line Tools)
-shaders: flux_shaders.metallib
+shaders: iris_shaders.metallib
 	@echo "Metal shaders pre-compiled"
 
-flux_shaders.metallib: flux_shaders.metal
+iris_shaders.metallib: iris_shaders.metal
 	@if xcrun --find metal >/dev/null 2>&1; then \
 		echo "Compiling Metal shaders..."; \
-		xcrun -sdk macosx metal -O2 -ffast-math -c flux_shaders.metal -o flux_shaders.air && \
-		xcrun -sdk macosx metallib flux_shaders.air -o flux_shaders.metallib && \
-		rm -f flux_shaders.air && \
-		echo "Created flux_shaders.metallib"; \
+		xcrun -sdk macosx metal -O2 -ffast-math -c iris_shaders.metal -o iris_shaders.air && \
+		xcrun -sdk macosx metallib iris_shaders.air -o iris_shaders.metallib && \
+		rm -f iris_shaders.air && \
+		echo "Created iris_shaders.metallib"; \
 	else \
 		echo "Error: Metal compiler requires full Xcode (not just Command Line Tools)"; \
 		echo "Install Xcode from the App Store, then run: sudo xcode-select -s /Applications/Xcode.app"; \
@@ -105,14 +105,14 @@ flux_shaders.metallib: flux_shaders.metal
 		exit 1; \
 	fi
 
-%.mps.o: %.c flux.h flux_kernels.h
+%.mps.o: %.c iris.h iris_kernels.h
 	$(CC) $(MPS_CFLAGS) -c -o $@ $<
 
 # Embed Metal shader source as C array (runtime compilation, no Metal toolchain needed)
-flux_shaders_source.h: flux_shaders.metal
+iris_shaders_source.h: iris_shaders.metal
 	xxd -i $< > $@
 
-flux_metal.o: flux_metal.m flux_metal.h flux_shaders_source.h
+iris_metal.o: iris_metal.m iris_metal.h iris_shaders_source.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
 
 else
@@ -137,7 +137,7 @@ lib: $(LIB)
 $(LIB): $(OBJS)
 	ar rcs $@ $^
 
-%.o: %.c flux.h flux_kernels.h
+%.o: %.c iris.h iris_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Debug build
@@ -163,15 +163,15 @@ web-tests:
 # Unit tests that run without a model (LoRA math, kernel ops, embcache, JPEG, PNG)
 test-unit:
 	@echo "=== LoRA unit tests ==="
-	@$(CC) -O2 -I. -o /tmp/flux_test_lora debug/test_lora.c flux_lora.c flux_safetensors.c -lm
+	@$(CC) -O2 -I. -o /tmp/flux_test_lora debug/test_lora.c iris_lora.c iris_safetensors.c -lm
 	@/tmp/flux_test_lora
 	@rm -f /tmp/flux_test_lora
 	@echo "=== Kernel unit tests (incl. flash attention parity) ==="
-	@$(CC) -O2 -I. -o /tmp/flux_test_kernels debug/test_kernels.c flux_kernels.c -lm
+	@$(CC) -O2 -I. -o /tmp/flux_test_kernels debug/test_kernels.c iris_kernels.c -lm
 	@/tmp/flux_test_kernels
 	@rm -f /tmp/flux_test_kernels
 	@echo "=== Tokenizer unit tests ==="
-	@$(CC) -O2 -I. -o /tmp/flux_test_tokenizer debug/test_tokenizer.c flux_qwen3_tokenizer.c flux_kernels.c -lm
+	@$(CC) -O2 -I. -o /tmp/flux_test_tokenizer debug/test_tokenizer.c iris_qwen3_tokenizer.c iris_kernels.c -lm
 	@/tmp/flux_test_tokenizer || true
 	@rm -f /tmp/flux_test_tokenizer
 	@echo "=== Embcache unit tests ==="
@@ -181,7 +181,7 @@ test-unit:
 	@echo "=== JPEG unit tests ==="
 	@$(MAKE) -C jpg_test test --no-print-directory
 	@echo "=== PNG tests ==="
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c jpeg.c -lm -o /tmp/flux_png_compare
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c jpeg.c -lm -o /tmp/flux_png_compare
 	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/flux_png_compare
 	@echo "PNG TEST PASSED"
@@ -190,7 +190,7 @@ test-unit:
 
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c jpeg.c -lm -o /tmp/flux_png_compare
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c jpeg.c -lm -o /tmp/flux_png_compare
 	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/flux_png_compare
 	@echo "PNG TEST PASSED"
@@ -201,15 +201,15 @@ install: $(TARGET) $(LIB)
 	install -d /usr/local/include
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 $(LIB) /usr/local/lib/
-	install -m 644 flux.h /usr/local/include/
-	install -m 644 flux_kernels.h /usr/local/include/
+	install -m 644 iris.h /usr/local/include/
+	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB) convert_bf16_to_f16
-	rm -f flux_shaders_source.h
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB) convert_bf16_to_f16
+	rm -f iris_shaders_source.h
 
 clean-shaders:
-	rm -f flux_shaders.metallib flux_shaders.air
+	rm -f iris_shaders.metallib iris_shaders.air
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"
@@ -229,20 +229,20 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h embcache.h flux_lora.h
-flux_kernels.o: flux_kernels.c flux_kernels.h
-flux_tokenizer.o: flux_tokenizer.c flux.h
-flux_vae.o: flux_vae.c flux.h flux_kernels.h
-flux_transformer.o: flux_transformer.c flux.h flux_kernels.h flux_lora.h
-flux_lora.o: flux_lora.c flux_lora.h flux_safetensors.h
-flux_zimage_transformer.o: flux_zimage_transformer.c flux.h flux_kernels.h flux_safetensors.h
-flux_sample.o: flux_sample.c flux.h flux_kernels.h
-flux_image.o: flux_image.c flux.h
-flux_safetensors.o: flux_safetensors.c flux_safetensors.h
-flux_qwen3.o: flux_qwen3.c flux_qwen3.h flux_safetensors.h
-flux_qwen3_tokenizer.o: flux_qwen3_tokenizer.c flux_qwen3.h
-terminals.o: terminals.c terminals.h flux.h
-flux_cli.o: flux_cli.c flux_cli.h flux.h flux_qwen3.h embcache.h linenoise.h terminals.h
+iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h embcache.h iris_lora.h
+iris_kernels.o: iris_kernels.c iris_kernels.h
+iris_tokenizer.o: iris_tokenizer.c iris.h
+iris_vae.o: iris_vae.c iris.h iris_kernels.h
+iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h iris_lora.h
+iris_lora.o: iris_lora.c iris_lora.h iris_safetensors.h
+iris_transformer_zimage.o: iris_transformer_zimage.c iris.h iris_kernels.h iris_safetensors.h
+iris_sample.o: iris_sample.c iris.h iris_kernels.h
+iris_image.o: iris_image.c iris.h
+iris_safetensors.o: iris_safetensors.c iris_safetensors.h
+iris_qwen3.o: iris_qwen3.c iris_qwen3.h iris_safetensors.h
+iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h
+terminals.o: terminals.c terminals.h iris.h
+iris_cli.o: iris_cli.c iris_cli.h iris.h iris_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h
 embcache.o: embcache.c embcache.h
-main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h embcache.h
+main.o: main.c iris.h iris_kernels.h iris_cli.h terminals.h embcache.h

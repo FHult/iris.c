@@ -13,9 +13,9 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
-#include "flux_metal.h"
-#include "flux_kernels.h"
-#include "flux_shaders_source.h"
+#include "iris_metal.h"
+#include "iris_kernels.h"
+#include "iris_shaders_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3332,8 +3332,8 @@ int flux_metal_init_shaders(void) {
 
         /* Load shader source from embedded data */
         NSString *shaderSource = [[NSString alloc]
-            initWithBytes:flux_shaders_metal
-            length:flux_shaders_metal_len
+            initWithBytes:iris_shaders_metal
+            length:iris_shaders_metal_len
             encoding:NSUTF8StringEncoding];
         if (!shaderSource) {
             fprintf(stderr, "Metal shaders: failed to decode embedded source\n");

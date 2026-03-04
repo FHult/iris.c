@@ -29,26 +29,28 @@ Z-Image variant:
 # File Structure
 
 ```
-flux.c                  - Main library (model load, generation routing)
-flux_transformer.c      - Flux diffusion transformer (MMDiT)
-flux_zimage_transformer.c - Z-Image transformer (S3-DiT)
-flux_sample.c           - Sampling/denoising loops (Euler ODE)
-flux_qwen3.c            - Qwen3 text encoder
-flux_qwen3_tokenizer.c  - BPE tokenizer
-flux_vae.c              - VAE encoder/decoder
-flux_kernels.c          - CPU kernels (softmax, RMSNorm, etc.)
-flux_metal.m            - Metal GPU acceleration runtime
-flux_metal.h            - Metal/GPU API surface
-flux_shaders.metal      - Metal compute kernels
-flux_safetensors.c      - Weight loading
-flux_image.c            - Image I/O (PNG/PPM/JPEG)
-png.c                   - PNG encoder/decoder
-jpeg.c                  - JPEG decoder
-flux_cli.c              - Interactive CLI mode (REPL)
-embcache.c              - Embedding cache (4-bit quantized)
-linenoise.c             - Line editing library
-terminals.c             - Terminal handling
-main.c                  - CLI entry point
+iris.c                    - Main library (model load, generation routing)
+iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
+iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
+iris_sample.c             - Sampling/denoising loops (Euler ODE)
+iris_qwen3.c              - Qwen3 text encoder
+iris_qwen3_tokenizer.c    - BPE tokenizer
+iris_tokenizer.c          - BPE tokenizer (low-level)
+iris_vae.c                - VAE encoder/decoder
+iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
+iris_metal.m              - Metal GPU acceleration runtime
+iris_metal.h              - Metal/GPU API surface
+iris_shaders.metal        - Metal compute kernels
+iris_safetensors.c        - Weight loading
+iris_image.c              - Image I/O (PNG/PPM/JPEG)
+png.c                     - PNG encoder/decoder
+jpeg.c                    - JPEG decoder
+iris_cli.c                - Interactive CLI mode (REPL)
+iris_lora.c               - LoRA weight loading and application
+embcache.c                - Embedding cache (4-bit quantized)
+linenoise.c               - Line editing library
+terminals.c               - Terminal handling
+main.c                    - CLI entry point
 ```
 
 # Build Targets
@@ -73,14 +75,14 @@ This project implements three targets:
 
 Flux examples:
 
-    ./flux -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
 
 Z-Image example:
 
-    ./flux -d zimage-turbo -p "a fish" -o /tmp/zimage.png
+    ./iris -d zimage-turbo -p "a fish" -o /tmp/zimage.png
 
 If model weights are missing, use the download script only after user approval.
 
@@ -369,13 +371,13 @@ make test
 
 Manual Flux sanity:
 ```bash
-./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
+./iris -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
   --seed 42 --steps 2 -o /tmp/flux_test.png -W 64 -H 64
 ```
 
 Manual Z-Image sanity:
 ```bash
-./flux -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
+./iris -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
 ```
 
 # Flux Known Pitfalls (Historical Bugs)

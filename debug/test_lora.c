@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "../flux_lora.h"
+#include "../iris_lora.h"
 
 static int failures = 0;
 

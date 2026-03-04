@@ -7,7 +7,7 @@
 #ifndef TERMINALS_H
 #define TERMINALS_H
 
-#include "flux.h"
+#include "iris.h"
 
 /* ======================================================================
  * Terminal Protocol Types

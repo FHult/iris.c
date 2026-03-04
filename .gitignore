@@ -3,6 +3,7 @@
 
 # Compiled binaries
 flux
+iris
 
 # Model weights (large files)
 flux-klein-*/
@@ -32,7 +33,7 @@ __pycache__/
 *.pyc
 
 # Generated build files
-flux_shaders_source.h
+iris_shaders_source.h
 
 # Web UI
 web/output/

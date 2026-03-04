@@ -5,7 +5,7 @@ FLUX.2 Web UI - Simple Flask server for image generation.
 Uses flux binary in server mode for persistent model (faster subsequent generations).
 
 Usage:
-    python web/server.py [--port PORT] [--model-dir PATH] [--flux-binary PATH]
+    python web/server.py [--port PORT] [--model-dir PATH] [--iris-binary PATH]
 
 Requirements:
     pip install flask
@@ -34,7 +34,7 @@ DEFAULT_MODEL_DIR = next(
     (PROJECT_DIR / d for d in _MODEL_SEARCH_ORDER if (PROJECT_DIR / d).is_dir()),
     PROJECT_DIR / "flux-klein-4b"  # fallback for error message
 )
-DEFAULT_FLUX_BINARY = PROJECT_DIR / "flux"
+DEFAULT_IRIS_BINARY = PROJECT_DIR / "iris"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 
 # Known model slots. The startup model dir is prepended dynamically in main().
@@ -2100,13 +2100,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
                         help="Path to model directory")
-    parser.add_argument("--flux-binary", type=Path, default=DEFAULT_FLUX_BINARY,
+    parser.add_argument("--iris-binary", type=Path, default=DEFAULT_IRIS_BINARY,
                         help="Path to flux binary")
     args = parser.parse_args()
 
     # Validate paths
-    if not args.flux_binary.exists():
-        print(f"Error: flux binary not found at {args.flux_binary}")
+    if not args.iris_binary.exists():
+        print(f"Error: iris binary not found at {args.iris_binary}")
         print("Build it first with: make mps (or make blas)")
         return 1
 
@@ -2144,13 +2144,13 @@ def main():
 
     # Start flux server (persistent model)
     print("Starting flux server with persistent model...")
-    flux_server = FluxServer(args.flux_binary, args.model_dir)
+    flux_server = FluxServer(args.iris_binary, args.model_dir)
     flux_server.start()
 
     print(f"\nFLUX.2 Web UI")
     print(f"  URL: http://{args.host}:{args.port}")
     print(f"  Model: {args.model_dir}")
-    print(f"  Binary: {args.flux_binary}")
+    print(f"  Binary: {args.iris_binary}")
     print(f"  Mode: Server (persistent model)")
     print(f"  Press Ctrl+C to stop\n")
 

@@ -21,9 +21,9 @@
  *   -h, --help            Show help
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_cli.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_cli.h"
 #include "embcache.h"
 #include "terminals.h"
 #include <stdio.h>
@@ -35,7 +35,7 @@
 #include <unistd.h>
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 #ifdef USE_BLAS
