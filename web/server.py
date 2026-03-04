@@ -70,6 +70,19 @@ MODEL_SLOTS = [
             "tokenizer/tokenizer.json",
         ],
     },
+    {
+        "key": "zimage-turbo",
+        "label": "Z-Image Turbo",
+        "description": "8 steps, 6B, Apache 2.0",
+        "sh_arg": "zimage-turbo",
+        "expected_files": [
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/config.json",
+            "tokenizer/tokenizer.json",
+        ],
+    },
 ]
 _model_download_progress = {}  # key -> {done, error}
 THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"
@@ -566,6 +579,7 @@ class IrisServer:
         self.current_job = None
         self.model_info = None      # e.g. "FLUX.2-klein-4B v1.0 (distilled, 4 steps, guidance 1.0)"
         self.is_distilled = True
+        self.is_zimage = False
         self._intentional_stop = False
         self.generation_count = 0
 
@@ -577,7 +591,7 @@ class IrisServer:
             "--server",
         ]
 
-        print(f"Starting flux server: {' '.join(cmd)}")
+        print(f"Starting iris server: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(
             cmd,
@@ -602,7 +616,8 @@ class IrisServer:
                     self.ready = True
                     self.model_info = event.get("model")
                     self.is_distilled = event.get("is_distilled", True)
-                    print(f"Flux server ready: {self.model_info}")
+                    self.is_zimage = event.get("is_zimage", False)
+                    print(f"Iris server ready: {self.model_info}")
                     break
             except json.JSONDecodeError:
                 print(f"Flux server: {line}")
@@ -1493,6 +1508,7 @@ def model_info():
     return jsonify({
         "model": iris_server.model_info,
         "is_distilled": iris_server.is_distilled,
+        "is_zimage": iris_server.is_zimage,
     })
 
 
@@ -2157,7 +2173,7 @@ def main():
     job_cleanup_thread.start()
 
     # Start flux server (persistent model)
-    print("Starting flux server with persistent model...")
+    print("Starting iris server with persistent model...")
     iris_server = IrisServer(args.iris_binary, args.model_dir)
     iris_server.start()
 
