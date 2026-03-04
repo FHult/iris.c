@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FLUX test runner - verifies inference correctness against reference images.
-Usage: python3 run_test.py [--flux-binary PATH] [--full]
+Iris test runner - verifies inference correctness against reference images.
+Usage: python3 run_test.py [--iris-binary PATH] [--full]
 """
 
 import argparse
@@ -285,16 +285,36 @@ def run_server_mode_test(iris_binary: str, model_dir: str) -> tuple[bool, str]:
                   f"output={output_path} ({img.width}x{img.height})")
 
 
+FLUX_MODEL_SEARCH_ORDER = [
+    "flux-klein-4b", "flux-klein-model", "flux-klein-9b",
+    "flux-klein-4b-base", "flux-klein-9b-base",
+]
+
+
+def detect_flux_model_dir() -> Optional[str]:
+    for name in FLUX_MODEL_SEARCH_ORDER:
+        if Path(name).is_dir():
+            return name
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run FLUX inference tests")
-    parser.add_argument("--flux-binary", default="./iris", help="Path to flux binary")
-    parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
+    parser = argparse.ArgumentParser(description="Run iris inference tests")
+    parser.add_argument("--iris-binary", default="./iris", help="Path to iris binary")
+    parser.add_argument("--model-dir", default=None, help="Path to model (auto-detected if omitted)")
     parser.add_argument("--zimage-model-dir", default=None,
                         help="Optional Z-Image model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
     args = parser.parse_args()
+
+    if args.model_dir is None:
+        args.model_dir = detect_flux_model_dir()
+        if args.model_dir is None:
+            print("Error: no Flux model dir found. Pass --model-dir or download a model.")
+            sys.exit(1)
+        print(f"Detected Flux model dir: {args.model_dir}")
 
     if args.quick:
         tests_to_run = TESTS[:1]

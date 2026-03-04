@@ -39,4 +39,4 @@ if [ -z "$MODEL_DIR" ]; then
 fi
 
 echo ""
-python web/server.py --model-dir "$MODEL_DIR" "$@"
+python3 web/server.py --model-dir "$MODEL_DIR" "$@"

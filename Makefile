@@ -149,15 +149,15 @@ debug: clean $(TARGET)
 # Test and utilities
 # =============================================================================
 test: test-unit web-tests
-	@python3 run_test.py --flux-binary ./$(TARGET)
+	@web/venv/bin/python3 run_test.py --iris-binary ./$(TARGET)
 
 test-quick:
-	@python3 run_test.py --flux-binary ./$(TARGET) --quick
+	@web/venv/bin/python3 run_test.py --iris-binary ./$(TARGET) --quick
 
 # Web server API tests (no model or binary required)
 web-tests:
 	@echo "=== Web server API tests ==="
-	@python3 -m pytest web/tests/ -v --tb=short
+	@web/venv/bin/python3 -m pytest web/tests/ -v --tb=short
 	@echo ""
 
 # Unit tests that run without a model (LoRA math, kernel ops, embcache, JPEG, PNG)
