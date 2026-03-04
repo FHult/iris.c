@@ -94,7 +94,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let currentEventSource = null;
     let dragSrcQueueId = null;
-    let referenceImageData = [null, null, null, null]; // Up to 4 reference images
+    // Each slot: null | {dataUrl, strength, mode}
+    let referenceImageData = [null, null, null, null];
     let availableLoras = [];   // [{name, filename, size_mb}] from /available-loras
     let curatedLoras = [];     // [{...curated entry, downloaded: bool}]
     let activeDownloads = {};  // {dl_id: {percent, done, error, interval}}
@@ -1057,8 +1058,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Queue functionality
     function getFormParams() {
-        // Collect non-null reference images
-        const refs = referenceImageData.filter(img => img !== null);
+        // Collect non-null reference slots as {data, strength, mode} objects
+        const refs = referenceImageData
+            .filter(s => s !== null)
+            .map(s => ({ data: s.dataUrl, strength: s.strength, mode: s.mode }));
         const guidance = parseFloat(guidanceInput.value);
         return {
             prompt: document.getElementById('prompt').value.trim(),
@@ -1335,13 +1338,48 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Update visibility of clear all button
     function updateClearAllButton() {
-        const hasAnyImage = referenceImageData.some(img => img !== null);
+        const hasAnyImage = referenceImageData.some(s => s !== null);
         clearAllImagesBtn.style.display = hasAnyImage ? 'block' : 'none';
+    }
+
+    // Read strength/mode from the slot controls DOM (fallback to defaults)
+    function _slotControls(slot) {
+        const slotEl = refSlots[slot];
+        const strengthEl = slotEl ? slotEl.querySelector('.ref-strength-slider') : null;
+        const modeEl = slotEl ? slotEl.querySelector('.ref-mode-select') : null;
+        return {
+            strength: strengthEl ? parseFloat(strengthEl.value) : 0.85,
+            mode: modeEl ? modeEl.value : 'composition',
+        };
+    }
+
+    // Show or hide the per-slot controls overlay
+    function _updateSlotControls(slot) {
+        const slotEl = refSlots[slot];
+        if (!slotEl) return;
+        const controls = slotEl.querySelector('.ref-slot-controls');
+        if (!controls) return;
+        const hasImage = referenceImageData[slot] !== null;
+        controls.style.display = hasImage ? 'flex' : 'none';
+        if (hasImage) {
+            const s = referenceImageData[slot];
+            const strengthEl = controls.querySelector('.ref-strength-slider');
+            const modeEl = controls.querySelector('.ref-mode-select');
+            const labelEl = controls.querySelector('.ref-strength-label');
+            if (strengthEl) strengthEl.value = s.strength;
+            if (modeEl) modeEl.value = s.mode;
+            if (labelEl) labelEl.textContent = s.strength.toFixed(2);
+        }
     }
 
     // Set reference image for a specific slot
     function setReferenceImage(slot, dataUrl, autoSetDimensions = true) {
-        referenceImageData[slot] = dataUrl;
+        const prev = referenceImageData[slot];
+        referenceImageData[slot] = {
+            dataUrl,
+            strength: prev ? prev.strength : 0.85,
+            mode: prev ? prev.mode : 'composition',
+        };
         const preview = refPreviews[slot];
         const clearBtn = refClearBtns[slot];
         const slotEl = refSlots[slot];
@@ -1350,6 +1388,7 @@ document.addEventListener('DOMContentLoaded', () => {
         clearBtn.style.display = 'block';
         slotEl.classList.add('has-image');
         slotEl.setAttribute('draggable', 'true');
+        _updateSlotControls(slot);
         updateClearAllButton();
 
         // Auto-set dimensions based on first image (slot 0)
@@ -1430,7 +1469,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const input = refInputs[i];
 
             if (referenceImageData[i]) {
-                preview.innerHTML = `<img src="${referenceImageData[i]}" alt="Reference image ${i + 1}">`;
+                preview.innerHTML = `<img src="${referenceImageData[i].dataUrl}" alt="Reference image ${i + 1}">`;
                 clearBtn.style.display = 'block';
                 slotEl.classList.add('has-image');
                 slotEl.setAttribute('draggable', 'true');
@@ -1440,12 +1479,35 @@ document.addEventListener('DOMContentLoaded', () => {
                 slotEl.classList.remove('has-image');
                 slotEl.removeAttribute('draggable');
             }
+            _updateSlotControls(i);
             input.value = '';
         }
         updateClearAllButton();
     }
 
     refSlots.forEach((slotEl, slot) => {
+        // Wire per-slot controls
+        const strengthEl = slotEl.querySelector('.ref-strength-slider');
+        const modeEl = slotEl.querySelector('.ref-mode-select');
+        const labelEl = slotEl.querySelector('.ref-strength-label');
+        if (strengthEl) {
+            strengthEl.addEventListener('input', (e) => {
+                e.stopPropagation();
+                if (referenceImageData[slot]) {
+                    referenceImageData[slot].strength = parseFloat(e.target.value);
+                    if (labelEl) labelEl.textContent = referenceImageData[slot].strength.toFixed(2);
+                }
+            });
+        }
+        if (modeEl) {
+            modeEl.addEventListener('change', (e) => {
+                e.stopPropagation();
+                if (referenceImageData[slot]) {
+                    referenceImageData[slot].mode = e.target.value;
+                }
+            });
+        }
+
         slotEl.addEventListener('dragstart', (e) => {
             if (!referenceImageData[slot]) { e.preventDefault(); return; }
             dragSourceSlot = slot;
