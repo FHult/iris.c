@@ -1075,6 +1075,17 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
+    async function fetchImageAsBase64(url) {
+        const resp = await fetch(url.split('?')[0]);
+        const blob = await resp.blob();
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
         const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength } = params;
@@ -1540,16 +1551,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             varySubtleBtn.disabled = true;
             try {
-                // Fetch the current output image and convert to base64
-                const response = await fetch(img.src);
-                const blob = await response.blob();
-                const base64 = await new Promise((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onload = () => resolve(reader.result);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(blob);
-                });
-
+                const base64 = await fetchImageAsBase64(img.src);
                 const strength = varyStrengthInput ? parseFloat(varyStrengthInput.value) : 0.7;
 
                 // Queue with the original output as a reference (→ img2img path)
@@ -1586,14 +1588,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         try {
-            const resp = await fetch(imageUrl.split('?')[0]);
-            const blob = await resp.blob();
-            const base64 = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = reject;
-                reader.readAsDataURL(blob);
-            });
+            const base64 = await fetchImageAsBase64(imageUrl);
             await addToQueue({
                 prompt: generation.prompt,
                 width: w,
@@ -1636,6 +1631,37 @@ document.addEventListener('DOMContentLoaded', () => {
                 await upscaleImage(`${item.image_url}?t=${item.created_at}`, item);
             } finally {
                 lightboxUpscaleBtn.disabled = false;
+            }
+        });
+    }
+
+    const lightboxVaryBtn = document.getElementById('lightbox-vary-btn');
+    if (lightboxVaryBtn) {
+        lightboxVaryBtn.addEventListener('click', async () => {
+            const item = lightboxItems[lightboxIndex];
+            if (!item) return;
+            lightboxVaryBtn.disabled = true;
+            try {
+                const base64 = await fetchImageAsBase64(`${item.image_url}?t=${item.created_at}`);
+                closeLightbox();
+                await addToQueue({
+                    prompt: item.prompt,
+                    width: item.width,
+                    height: item.height,
+                    steps: item.steps,
+                    seed: null,
+                    referenceImages: [base64],
+                    style: item.style || null,
+                    guidance: item.guidance || null,
+                    schedule: item.schedule || null,
+                    lora: item.lora || null,
+                    lora_scale: item.lora_scale || 1.0,
+                    img2img_strength: varyStrengthInput ? parseFloat(varyStrengthInput.value) : 0.7,
+                });
+            } catch (err) {
+                console.error('Lightbox vary failed:', err);
+            } finally {
+                lightboxVaryBtn.disabled = false;
             }
         });
     }
@@ -2551,7 +2577,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     <div class="history-item-prompt">${escapeHtml(item.prompt)}</div>
                     <div class="history-item-actions">
                         <button class="history-quick-btn history-remix-btn" title="Remix — new seed, same settings">↺ Remix</button>
-                        <button class="history-quick-btn history-vary-btn" title="Vary Subtle">~ Vary</button>
+                        <div class="history-vary-group">
+                            <button class="history-quick-btn history-vary-btn" title="Vary — regenerate with this image as reference">~ Vary</button>
+                            <input type="range" class="history-vary-strength" min="0.1" max="0.95" step="0.05" value="0.7" title="Vary strength">
+                            <span class="history-vary-strength-label">0.70</span>
+                        </div>
                     </div>
                 </div>
             `;
@@ -2616,11 +2646,18 @@ document.addEventListener('DOMContentLoaded', () => {
                     seed: null,
                     referenceImages: null,
                     style: item.style || null,
-                    guidance: null,
-                    schedule: null,
+                    guidance: item.guidance || null,
+                    schedule: item.schedule || null,
                     lora: item.lora || null,
                     lora_scale: item.lora_scale || 1.0,
                 });
+            });
+
+            const varyStrengthSlider = div.querySelector('.history-vary-strength');
+            const varyStrengthLabel = div.querySelector('.history-vary-strength-label');
+            varyStrengthSlider.addEventListener('input', (e) => {
+                e.stopPropagation();
+                varyStrengthLabel.textContent = parseFloat(e.target.value).toFixed(2);
             });
 
             div.querySelector('.history-vary-btn').addEventListener('click', async (e) => {
@@ -2628,14 +2665,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const btn = e.currentTarget;
                 btn.disabled = true;
                 try {
-                    const resp = await fetch(item.image_url);
-                    const blob = await resp.blob();
-                    const base64 = await new Promise((res, rej) => {
-                        const reader = new FileReader();
-                        reader.onload = () => res(reader.result);
-                        reader.onerror = rej;
-                        reader.readAsDataURL(blob);
-                    });
+                    const base64 = await fetchImageAsBase64(item.image_url);
                     await addToQueue({
                         prompt: item.prompt,
                         width: item.width,
@@ -2644,11 +2674,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         seed: null,
                         referenceImages: [base64],
                         style: item.style || null,
-                        guidance: null,
-                        schedule: null,
+                        guidance: item.guidance || null,
+                        schedule: item.schedule || null,
                         lora: item.lora || null,
                         lora_scale: item.lora_scale || 1.0,
-                        img2img_strength: 0.7,
+                        img2img_strength: parseFloat(varyStrengthSlider.value),
                     });
                 } catch (err) {
                     console.error('Vary from history failed:', err);

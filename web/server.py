@@ -420,6 +420,9 @@ def load_history_from_disk():
             job.lora = item.get("lora")
             job.lora_scale = item.get("lora_scale", 1.0)
             job.favorited = item.get("favorited", False)
+            job.guidance = item.get("guidance")
+            job.schedule = item.get("schedule")
+            job.img2img_strength = item.get("img2img_strength", 1.0)
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -456,6 +459,9 @@ class Job:
         self.lora = None        # LoRA filename (relative, inside loras/ dir)
         self.lora_scale = 1.0
         self.favorited = False
+        self.guidance = None    # None = auto
+        self.schedule = None    # None = default (sigmoid)
+        self.img2img_strength = 1.0
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -504,6 +510,9 @@ class Job:
             "lora": self.lora,
             "lora_scale": self.lora_scale,
             "favorited": self.favorited,
+            "guidance": self.guidance,
+            "schedule": self.schedule,
+            "img2img_strength": self.img2img_strength,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -1037,6 +1046,9 @@ def generate():
     job.style = style if (style and style in STYLE_PRESETS) else None
     job.lora = lora_name
     job.lora_scale = lora_scale
+    job.guidance = guidance
+    job.schedule = schedule
+    job.img2img_strength = img2img_strength
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:
