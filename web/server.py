@@ -423,6 +423,7 @@ def load_history_from_disk():
             job.guidance = item.get("guidance")
             job.schedule = item.get("schedule")
             job.img2img_strength = item.get("img2img_strength", 1.0)
+            job.negative_prompt = item.get("negative_prompt", '')
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -462,6 +463,7 @@ class Job:
         self.guidance = None    # None = auto
         self.schedule = None    # None = default (sigmoid)
         self.img2img_strength = 1.0
+        self.negative_prompt = ''  # empty = no negative conditioning
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -513,6 +515,7 @@ class Job:
             "guidance": self.guidance,
             "schedule": self.schedule,
             "img2img_strength": self.img2img_strength,
+            "negative_prompt": self.negative_prompt,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -747,7 +750,7 @@ class FluxServer:
             except Exception as e:
                 print(f"Failed to restart flux server: {e}")
 
-    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
+    def generate(self, job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0, negative_prompt=''):
         """Send a generation request to the flux server."""
         with self.lock:
             if not self.ready or self.process.poll() is not None:
@@ -795,6 +798,9 @@ class FluxServer:
 
             if img2img_strength and float(img2img_strength) < 1.0:
                 request_data["img2img_strength"] = float(img2img_strength)
+
+            if negative_prompt:
+                request_data["negative_prompt"] = negative_prompt
 
             # Send request
             request_line = json.dumps(request_data) + "\n"
@@ -880,6 +886,7 @@ def process_job_queue():
             queued.get('lora_name'),
             queued.get('lora_scale', 1.0),
             queued.get('img2img_strength', 1.0),
+            queued.get('negative_prompt', ''),
         )
     except Exception as e:
         job.status = "error"
@@ -894,7 +901,7 @@ def process_job_queue():
             job_queue_dispatching = False
 
 
-def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
+def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0, negative_prompt=''):
     """Queue a generation job. Starts immediately if server is free, otherwise queues."""
     global flux_server
 
@@ -913,6 +920,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         'lora_name': lora_name,
         'lora_scale': lora_scale,
         'img2img_strength': img2img_strength,
+        'negative_prompt': negative_prompt,
     }
 
     with job_queue_lock:
@@ -930,7 +938,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
+        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -939,9 +947,9 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
         job.cleanup_temp_files()
 
 
-def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0):
+def run_generation_server_mode(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0, negative_prompt=''):
     """Run generation using the persistent flux server (legacy, now uses queue)."""
-    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength)
+    queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt)
 
 
 @app.route("/")
@@ -977,6 +985,7 @@ def generate():
     lora_name = data.get("lora") or None       # LoRA filename (relative, inside loras/ dir)
     lora_scale = float(data.get("lora_scale", 1.0))
     img2img_strength = float(data.get("img2img_strength", 1.0))
+    negative_prompt = (data.get("negative_prompt") or "").strip()
 
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
@@ -1067,6 +1076,7 @@ def generate():
     job.guidance = guidance
     job.schedule = schedule
     job.img2img_strength = img2img_strength
+    job.negative_prompt = negative_prompt
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:
@@ -1080,7 +1090,7 @@ def generate():
     # Start generation (server mode handles this via the persistent process)
     thread = threading.Thread(
         target=run_generation_server_mode,
-        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength),
+        args=(job, generation_prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt),
         daemon=True,
     )
     thread.start()

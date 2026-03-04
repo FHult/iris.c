@@ -875,10 +875,11 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        const char *neg = p.negative_prompt ? p.negative_prompt : "";
+        text_emb_uncond = flux_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
-            set_error("Failed to encode empty prompt for CFG");
+            set_error("Failed to encode negative prompt for CFG");
             return NULL;
         }
     }
@@ -1307,11 +1308,12 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        const char *neg = p.negative_prompt ? p.negative_prompt : "";
+        text_emb_uncond = flux_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             if (resized) flux_image_free(resized);
-            set_error("Failed to encode empty prompt for CFG");
+            set_error("Failed to encode negative prompt for CFG");
             return NULL;
         }
     }
@@ -1524,10 +1526,11 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        const char *neg = p.negative_prompt ? p.negative_prompt : "";
+        text_emb_uncond = flux_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
-            set_error("Failed to encode empty prompt for CFG");
+            set_error("Failed to encode negative prompt for CFG");
             return NULL;
         }
     }

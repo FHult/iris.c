@@ -213,6 +213,8 @@ document.addEventListener('DOMContentLoaded', () => {
         stepsInput.value = defaultSteps;
         stepsValue.textContent = defaultSteps;
         updateStepHint(defaultSteps);
+        const negGroup = document.getElementById('negative-prompt-group');
+        if (negGroup) negGroup.style.display = isDistilled ? 'none' : '';
     }
 
     // Load model info into header
@@ -1075,6 +1077,7 @@ document.addEventListener('DOMContentLoaded', () => {
             schedule: scheduleSelect.value || null,
             lora: loraSelect ? loraSelect.value || null : null,
             lora_scale: loraScaleInput ? parseFloat(loraScaleInput.value) : 1.0,
+            negative_prompt: document.getElementById('negative-prompt').value.trim() || null,
         };
     }
 
@@ -1091,7 +1094,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
-        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength } = params;
+        const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength, negative_prompt } = params;
         try {
             const response = await fetch('/generate', {
                 method: 'POST',
@@ -1111,6 +1114,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     lora: lora || null,
                     lora_scale: lora_scale || 1.0,
                     img2img_strength: img2img_strength || 1.0,
+                    negative_prompt: negative_prompt || null,
                 }),
             });
             const data = await response.json();
@@ -1719,6 +1723,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     lora: item.lora || null,
                     lora_scale: item.lora_scale || 1.0,
                     img2img_strength: varyStrengthInput ? parseFloat(varyStrengthInput.value) : 0.7,
+                    negative_prompt: item.negative_prompt || null,
                 });
             } catch (err) {
                 console.error('Lightbox vary failed:', err);
@@ -2865,6 +2870,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     schedule: item.schedule || null,
                     lora: item.lora || null,
                     lora_scale: item.lora_scale || 1.0,
+                    negative_prompt: item.negative_prompt || null,
                 });
             });
 
@@ -2894,6 +2900,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         lora: item.lora || null,
                         lora_scale: item.lora_scale || 1.0,
                         img2img_strength: parseFloat(varyStrengthSlider.value),
+                        negative_prompt: item.negative_prompt || null,
                     });
                 } catch (err) {
                     console.error('Vary from history failed:', err);

@@ -117,7 +117,8 @@ class TestHistoryGet:
         item = r.get_json()[0]
         required_fields = {"id", "prompt", "width", "height", "steps",
                            "seed", "image_url", "thumb_url", "favorited",
-                           "guidance", "schedule", "img2img_strength"}
+                           "guidance", "schedule", "img2img_strength",
+                           "negative_prompt"}
         assert required_fields.issubset(set(item.keys()))
 
     def test_history_item_guidance_schedule_defaults(self, client):
@@ -1012,3 +1013,120 @@ class TestOutpaintPrep:
         assert img.format == "PNG"
         assert img.width == 17   # 1 + 16
         assert img.height == 1
+
+
+# ---------------------------------------------------------------------------
+# Negative prompt — Feature 1
+# ---------------------------------------------------------------------------
+
+class TestNegativePrompt:
+    """negative_prompt field persisted in history and passed to generation."""
+
+    def test_history_item_negative_prompt_default(self, client):
+        """History items have an empty negative_prompt by default."""
+        _seed_history(1)
+        r = client.get("/history")
+        item = r.get_json()[0]
+        assert "negative_prompt" in item
+        assert item["negative_prompt"] == ""
+
+    def test_history_item_negative_prompt_persisted(self, client):
+        """negative_prompt is preserved in history when explicitly set."""
+        import server as srv
+        job_id = "negtest1"
+        job = srv.Job(job_id, prompt="castle", width=512, height=512, steps=50)
+        job.negative_prompt = "blurry, low quality"
+        job.seed = 42
+        job.status = "complete"
+        out = srv.OUTPUT_DIR / f"{job_id}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.touch()
+        job.output_path = out
+        srv.history.insert(0, job)
+        srv.history_by_id[job_id] = job
+
+        r = client.get("/history")
+        item = next(i for i in r.get_json() if i["id"] == job_id)
+        assert item["negative_prompt"] == "blurry, low quality"
+
+    def test_negative_prompt_round_trip_via_disk(self, client, tmp_path):
+        """negative_prompt survives save→load cycle through history.json."""
+        import json
+        import server as srv
+
+        srv.OUTPUT_DIR = tmp_path
+        srv.HISTORY_FILE = tmp_path / "history.json"
+
+        job_id = "negrt1"
+        job = srv.Job(job_id, prompt="dragon", width=512, height=512, steps=50)
+        job.negative_prompt = "cartoon, watermark"
+        job.seed = 77
+        job.status = "complete"
+        out = tmp_path / f"{job_id}.png"
+        out.touch()
+        job.output_path = out
+
+        srv.history.insert(0, job)
+        srv.history_by_id[job_id] = job
+
+        with srv.history_lock:
+            srv.save_history()
+
+        srv.history.clear()
+        srv.history_by_id.clear()
+        srv.load_history_from_disk()
+
+        loaded = srv.history_by_id.get(job_id)
+        assert loaded is not None
+        assert loaded.negative_prompt == "cartoon, watermark"
+
+    def test_generate_stores_negative_prompt_on_job(self, client):
+        """POST /generate with negative_prompt stores it on the job object."""
+        import server as srv
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+            "negative_prompt": "blurry, ugly",
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        with srv.jobs_lock:
+            job = srv.jobs.get(job_id)
+        assert job is not None
+        assert job.negative_prompt == "blurry, ugly"
+
+    def test_generate_empty_negative_prompt_stored_empty(self, client):
+        """POST /generate with empty negative_prompt stores empty string."""
+        import server as srv
+        r = client.post("/generate", json={
+            "prompt": "a forest",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+            "negative_prompt": "",
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        with srv.jobs_lock:
+            job = srv.jobs.get(job_id)
+        assert job is not None
+        assert job.negative_prompt == ""
+
+    def test_generate_whitespace_negative_prompt_stored_empty(self, client):
+        """Whitespace-only negative_prompt is normalised to empty string."""
+        import server as srv
+        r = client.post("/generate", json={
+            "prompt": "a mountain",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+            "negative_prompt": "   ",
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        with srv.jobs_lock:
+            job = srv.jobs.get(job_id)
+        assert job is not None
+        assert job.negative_prompt == ""
