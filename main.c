@@ -457,9 +457,10 @@ static int run_server_mode(iris_ctx *ctx) {
     iris_substep_callback = NULL;
 
     fprintf(stderr, "Server mode: ready for requests\n");
-    printf("{\"event\":\"ready\",\"model\":\"%s\",\"is_distilled\":%s}\n",
+    printf("{\"event\":\"ready\",\"model\":\"%s\",\"is_distilled\":%s,\"is_zimage\":%s}\n",
            iris_model_info(ctx),
-           iris_is_distilled(ctx) ? "true" : "false");
+           iris_is_distilled(ctx) ? "true" : "false",
+           iris_is_zimage(ctx) ? "true" : "false");
     fflush(stdout);
 
     while (fgets(line, sizeof(line), stdin) != NULL) {

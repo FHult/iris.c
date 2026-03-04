@@ -202,25 +202,49 @@ document.addEventListener('DOMContentLoaded', () => {
         guidanceValue.textContent = val === 0 ? 'auto' : val.toFixed(1);
     });
 
-    // Tracks whether the currently loaded model is distilled (4 steps) or base (50 steps).
+    // Tracks whether the currently loaded model is distilled or Z-Image.
     let _currentModelIsDistilled = true;
+    let _currentModelIsZimage = false;
 
     // Set steps and hint to the model's natural default.
     // Called on initial load and after every model switch.
-    function applyModelDefaults(isDistilled) {
+    function applyModelDefaults(isDistilled, isZimage) {
         _currentModelIsDistilled = isDistilled;
-        const defaultSteps = isDistilled ? 4 : 50;
+        _currentModelIsZimage = isZimage || false;
+
+        let defaultSteps, maxSteps;
+        if (isZimage) {
+            defaultSteps = 9; maxSteps = 20;
+        } else if (isDistilled) {
+            defaultSteps = 4; maxSteps = 8;
+        } else {
+            defaultSteps = 50; maxSteps = 256;
+        }
+        stepsInput.max = maxSteps;
         stepsInput.value = defaultSteps;
         stepsValue.textContent = defaultSteps;
         updateStepHint(defaultSteps);
-        const negGroup = document.getElementById('negative-prompt-group');
-        if (negGroup) negGroup.style.display = isDistilled ? 'none' : '';
+
+        // Z-Image: hide CFG controls, reference images, negative prompt
+        const hideForZimage = ['advanced-controls', 'reference-images-group', 'negative-prompt-group'];
+        hideForZimage.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = isZimage ? 'none' : '';
+        });
+        const toggleAdv = document.getElementById('toggle-advanced');
+        if (toggleAdv) toggleAdv.style.display = isZimage ? 'none' : '';
+
+        // Flux distilled: also hide negative prompt
+        if (!isZimage) {
+            const negGroup = document.getElementById('negative-prompt-group');
+            if (negGroup) negGroup.style.display = isDistilled ? 'none' : '';
+        }
     }
 
     // Load model info into header
     fetch('/model-info').then(r => r.json()).then(data => {
         if (data.model) modelInfoEl.textContent = data.model;
-        if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled);
+        if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled, data.is_zimage);
     }).catch(() => {});
 
     // ── Model switcher ────────────────────────────────────────────────────────
@@ -329,7 +353,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (data && data.model) {
                     clearInterval(interval);
                     modelInfoEl.textContent = data.model;
-                    if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled);
+                    if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled, data.is_zimage);
                     loadAvailableModels();
                 }
             }).catch(() => {});
@@ -1443,7 +1467,7 @@ document.addEventListener('DOMContentLoaded', () => {
             setDimensions(closestWidth, closestHeight);
 
             // Reset steps to model default
-            applyModelDefaults(_currentModelIsDistilled);
+            applyModelDefaults(_currentModelIsDistilled, _currentModelIsZimage);
         };
         img.src = dataUrl;
     }
@@ -1893,7 +1917,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const slot = findFirstEmptySlot();
         loadImageIntoSlot(img.src, slot);
         // Reset steps to model default when using as input
-        applyModelDefaults(_currentModelIsDistilled);
+        applyModelDefaults(_currentModelIsDistilled, _currentModelIsZimage);
     });
 
     // Fetch an image URL and set it into a specific slot
@@ -1941,7 +1965,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength, negative_prompt } = params;
 
             // Store current generation params for vary/remix
             currentGeneration = { prompt, width, height, steps, guidance, schedule, lora, lora_scale };
@@ -1982,6 +2006,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     batch_id: batchId || null,
                     lora: lora || null,
                     lora_scale: lora_scale || 1.0,
+                    img2img_strength: img2img_strength || 1.0,
+                    negative_prompt: negative_prompt || null,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))

@@ -518,6 +518,38 @@ class TestModelInfo:
 
 
 # ---------------------------------------------------------------------------
+# Z-Image capabilities
+# ---------------------------------------------------------------------------
+
+class TestZImageCapabilities:
+    def _make_mock_server(self, is_zimage):
+        return type("MockIrisServer", (), {
+            "ready": True,
+            "model_info": "Z-Image Turbo" if is_zimage else "Flux Klein 4B",
+            "is_distilled": True,
+            "is_zimage": is_zimage,
+        })()
+
+    def test_model_info_is_zimage_false_by_default(self, client):
+        import server as srv
+        srv.iris_server = self._make_mock_server(False)
+        r = client.get("/model-info")
+        assert r.status_code == 200
+        assert r.get_json()["is_zimage"] is False
+        srv.iris_server = None
+
+    def test_model_info_is_zimage_true_when_set(self, client):
+        import server as srv
+        srv.iris_server = self._make_mock_server(True)
+        r = client.get("/model-info")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["is_zimage"] is True
+        assert data["model"] == "Z-Image Turbo"
+        srv.iris_server = None
+
+
+# ---------------------------------------------------------------------------
 # /active-jobs  GET
 # ---------------------------------------------------------------------------
 
