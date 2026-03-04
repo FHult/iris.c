@@ -406,14 +406,17 @@ document.addEventListener('DOMContentLoaded', () => {
                     resultEl.className = 'slot-verify-result slot-verify-ok';
                     resultEl.innerHTML = '\u2713 All files verified — model is complete';
                 } else {
-                    const missing = data.missing.map(f =>
+                    const missing = (data.missing || []).map(f =>
                         `<li class="verify-file verify-missing"><span class="verify-tag">Missing</span>${f}</li>`).join('');
-                    const empty = data.empty.map(f =>
+                    const empty = (data.empty || []).map(f =>
                         `<li class="verify-file verify-empty"><span class="verify-tag">Empty</span>${f}</li>`).join('');
+                    const truncated = (data.truncated || []).map(t =>
+                        `<li class="verify-file verify-truncated"><span class="verify-tag">Truncated</span>${t.file}<span class="verify-reason">${t.reason}</span></li>`).join('');
+                    const total = (data.missing || []).length + (data.empty || []).length + (data.truncated || []).length;
                     resultEl.className = 'slot-verify-result slot-verify-error';
                     resultEl.innerHTML =
-                        `<strong>${data.missing.length + data.empty.length} file(s) have problems:</strong>
-                        <ul class="verify-file-list">${missing}${empty}</ul>`;
+                        `<strong>${total} file(s) have problems:</strong>
+                        <ul class="verify-file-list">${missing}${empty}${truncated}</ul>`;
                 }
             })
             .catch(() => { resultEl.style.display = 'none'; });

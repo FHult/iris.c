@@ -645,6 +645,17 @@ class TestSettings:
 # ---------------------------------------------------------------------------
 
 class TestVerifyModel:
+    @staticmethod
+    def _make_safetensors(path, payload=b"hello"):
+        """Write a minimal valid safetensors file."""
+        import struct, json as _json
+        hdr = {
+            "__metadata__": {},
+            "t": {"dtype": "F32", "shape": [len(payload)], "data_offsets": [0, len(payload)]},
+        }
+        hdr_bytes = _json.dumps(hdr).encode()
+        path.write_bytes(struct.pack("<Q", len(hdr_bytes)) + hdr_bytes + payload)
+
     def test_unknown_key_returns_400(self, client):
         r = client.get("/verify-model/nonexistent")
         assert r.status_code == 400
@@ -655,7 +666,10 @@ class TestVerifyModel:
         for rel in srv.MODEL_SLOTS[1]["expected_files"]:
             f = model_dir / rel
             f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_bytes(b"x")
+            if rel.endswith(".safetensors"):
+                self._make_safetensors(f)
+            else:
+                f.write_bytes(b"x")
         orig = srv.PROJECT_DIR
         srv.PROJECT_DIR = tmp_path
         r = client.get("/verify-model/flux-klein-4b-base")
@@ -682,7 +696,12 @@ class TestVerifyModel:
         for rel in srv.MODEL_SLOTS[1]["expected_files"]:
             f = model_dir / rel
             f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_bytes(b"" if rel == first else b"x")
+            if rel == first:
+                f.write_bytes(b"")
+            elif rel.endswith(".safetensors"):
+                self._make_safetensors(f)
+            else:
+                f.write_bytes(b"x")
         orig = srv.PROJECT_DIR
         srv.PROJECT_DIR = tmp_path
         r = client.get("/verify-model/flux-klein-4b-base")
@@ -690,6 +709,31 @@ class TestVerifyModel:
         data = r.get_json()
         assert data["ok"] is False
         assert len(data["empty"]) == 1
+
+    def test_truncated_safetensors_reported(self, client, tmp_path):
+        import server as srv, struct, json as _json
+        model_dir = tmp_path / "flux-klein-4b-base"
+        st_rel = next(r for r in srv.MODEL_SLOTS[1]["expected_files"] if r.endswith(".safetensors"))
+        for rel in srv.MODEL_SLOTS[1]["expected_files"]:
+            f = model_dir / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            if rel == st_rel:
+                # Header claims 100 bytes of data but we only write 10
+                hdr = {"__metadata__": {}, "t": {"dtype": "F32", "shape": [25], "data_offsets": [0, 100]}}
+                hdr_bytes = _json.dumps(hdr).encode()
+                f.write_bytes(struct.pack("<Q", len(hdr_bytes)) + hdr_bytes + b"\x00" * 10)
+            elif rel.endswith(".safetensors"):
+                self._make_safetensors(f)
+            else:
+                f.write_bytes(b"x")
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        r = client.get("/verify-model/flux-klein-4b-base")
+        srv.PROJECT_DIR = orig
+        data = r.get_json()
+        assert data["ok"] is False
+        assert len(data["truncated"]) == 1
+        assert data["truncated"][0]["file"] == st_rel
 
 
 # ---------------------------------------------------------------------------

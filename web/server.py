@@ -2032,14 +2032,50 @@ def delete_model_endpoint():
     return jsonify({"ok": True})
 
 
+def _check_safetensors_integrity(path):
+    """Return None if the safetensors file is complete, or an error string.
+
+    Reads the 8-byte header-length prefix and the JSON header to determine
+    the total expected size (8 + header_len + max data offset), then
+    compares against the actual file size on disk.
+    """
+    import struct, json as _json
+    try:
+        actual = path.stat().st_size
+        with open(path, 'rb') as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                return f"truncated header ({actual} bytes on disk)"
+            hdr_len = struct.unpack('<Q', raw)[0]
+            hdr_raw = f.read(hdr_len)
+            if len(hdr_raw) < hdr_len:
+                return f"truncated header ({actual} bytes on disk)"
+            hdr = _json.loads(hdr_raw)
+        max_end = 0
+        for k, v in hdr.items():
+            if k == '__metadata__':
+                continue
+            offsets = v.get('data_offsets')
+            if offsets and len(offsets) >= 2 and offsets[1] > max_end:
+                max_end = offsets[1]
+        expected = 8 + hdr_len + max_end
+        if actual < expected:
+            mb = (expected - actual) / (1024 * 1024)
+            return f"truncated: {actual:,} / {expected:,} bytes ({mb:.0f} MB missing)"
+        return None
+    except Exception as e:
+        return str(e)
+
+
 @app.route("/verify-model/<key>")
 def verify_model_endpoint(key):
-    """Check that all expected files for a model slot are present and non-empty."""
+    """Check that all expected files for a model slot are present and complete."""
     slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
     if not slot:
         return jsonify({"error": "Unknown model key"}), 400
     model_dir = PROJECT_DIR / key
     missing = []
+    truncated = []
     empty = []
     for rel_path in slot.get("expected_files", []):
         f = model_dir / rel_path
@@ -2047,8 +2083,12 @@ def verify_model_endpoint(key):
             missing.append(rel_path)
         elif f.stat().st_size == 0:
             empty.append(rel_path)
-    ok = not missing and not empty
-    return jsonify({"ok": ok, "missing": missing, "empty": empty})
+        elif rel_path.endswith('.safetensors'):
+            err = _check_safetensors_integrity(f)
+            if err:
+                truncated.append({"file": rel_path, "reason": err})
+    ok = not missing and not empty and not truncated
+    return jsonify({"ok": ok, "missing": missing, "empty": empty, "truncated": truncated})
 
 
 def _do_download(dl_id, url, dest, extra_headers=None):

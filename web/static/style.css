@@ -306,6 +306,18 @@ header .subtitle {
     color: #f59e0b;
 }
 
+.verify-truncated .verify-tag {
+    background: color-mix(in srgb, var(--error) 20%, transparent);
+    color: var(--error);
+}
+
+.verify-reason {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    margin-top: 1px;
+}
+
 .verify-spinner {
     display: inline-block;
     width: 12px;
