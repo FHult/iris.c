@@ -77,10 +77,11 @@ MODEL_SLOTS = [
         "sh_arg": "zimage-turbo",
         "expected_files": [
             "transformer/config.json",
-            "transformer/diffusion_pytorch_model.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
             "vae/diffusion_pytorch_model.safetensors",
             "text_encoder/config.json",
             "tokenizer/tokenizer.json",
+            "scheduler/scheduler_config.json",
         ],
     },
 ]

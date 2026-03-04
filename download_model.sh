@@ -122,7 +122,7 @@ dl() {
     fi
 }
 
-mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae}
+mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae,scheduler}
 
 # model_index.json (needed for autodetection)
 dl "$OUT/model_index.json" "$BASE/model_index.json"
@@ -152,13 +152,23 @@ for shard in $SHARDS; do
 done
 
 # tokenizer
-dl "$OUT/tokenizer/added_tokens.json" "$BASE/tokenizer/added_tokens.json"
-dl "$OUT/tokenizer/chat_template.jinja" "$BASE/tokenizer/chat_template.jinja"
-dl "$OUT/tokenizer/merges.txt" "$BASE/tokenizer/merges.txt"
-dl "$OUT/tokenizer/special_tokens_map.json" "$BASE/tokenizer/special_tokens_map.json"
-dl "$OUT/tokenizer/tokenizer.json" "$BASE/tokenizer/tokenizer.json"
-dl "$OUT/tokenizer/tokenizer_config.json" "$BASE/tokenizer/tokenizer_config.json"
-dl "$OUT/tokenizer/vocab.json" "$BASE/tokenizer/vocab.json"
+if [ "$MODEL" = "zimage-turbo" ]; then
+    # Z-Image tokenizer is a subset (no added_tokens, chat_template, or special_tokens_map)
+    dl "$OUT/tokenizer/merges.txt" "$BASE/tokenizer/merges.txt"
+    dl "$OUT/tokenizer/tokenizer.json" "$BASE/tokenizer/tokenizer.json"
+    dl "$OUT/tokenizer/tokenizer_config.json" "$BASE/tokenizer/tokenizer_config.json"
+    dl "$OUT/tokenizer/vocab.json" "$BASE/tokenizer/vocab.json"
+    # scheduler (Z-Image only)
+    dl "$OUT/scheduler/scheduler_config.json" "$BASE/scheduler/scheduler_config.json"
+else
+    dl "$OUT/tokenizer/added_tokens.json" "$BASE/tokenizer/added_tokens.json"
+    dl "$OUT/tokenizer/chat_template.jinja" "$BASE/tokenizer/chat_template.jinja"
+    dl "$OUT/tokenizer/merges.txt" "$BASE/tokenizer/merges.txt"
+    dl "$OUT/tokenizer/special_tokens_map.json" "$BASE/tokenizer/special_tokens_map.json"
+    dl "$OUT/tokenizer/tokenizer.json" "$BASE/tokenizer/tokenizer.json"
+    dl "$OUT/tokenizer/tokenizer_config.json" "$BASE/tokenizer/tokenizer_config.json"
+    dl "$OUT/tokenizer/vocab.json" "$BASE/tokenizer/vocab.json"
+fi
 
 # transformer
 dl "$OUT/transformer/config.json" "$BASE/transformer/config.json"
