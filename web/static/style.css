@@ -1685,6 +1685,54 @@ footer a:hover {
     box-shadow: 0 0 0 2px var(--accent);
 }
 
+/* Per-slot reference controls overlay */
+.ref-slot-controls {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.2rem 0.3rem;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(4px);
+    border-radius: 0 0 6px 6px;
+    z-index: 3;
+    pointer-events: auto;
+}
+
+.ref-mode-select {
+    font-size: 0.58rem;
+    padding: 0.1rem 0.2rem;
+    background: rgba(255,255,255,0.1);
+    color: white;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 3px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.ref-mode-select option {
+    background: #1e1e2e;
+    color: white;
+}
+
+.ref-strength-slider {
+    flex: 1;
+    min-width: 0;
+    height: 3px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.ref-strength-label {
+    font-size: 0.58rem;
+    color: rgba(255,255,255,0.7);
+    min-width: 2.4ch;
+    flex-shrink: 0;
+}
+
 /* Lightbox Toolbar and Cropping */
 .lightbox-content {
     position: relative;

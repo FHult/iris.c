@@ -986,38 +986,56 @@ def generate():
     if steps < 1 or steps > 256:
         return jsonify({"error": "Steps must be 1-256"}), 400
 
-    # Handle reference images
+    # Handle reference images — accept both bare base64 strings and
+    # per-slot objects: {"data": "<base64>", "strength": 0.85, "mode": "composition"|"style"}
     reference_image_paths = []
     input_image_path = None
-    reference_images_b64 = data.get("reference_images", [])
+    raw_refs = data.get("reference_images", []) or []
 
-    # Filter out None/empty values
-    reference_images_b64 = [img for img in reference_images_b64 if img] if reference_images_b64 else []
+    # Normalise to list of dicts; bare strings are backward-compat
+    def _normalise_ref(r):
+        if isinstance(r, dict):
+            return r
+        return {"data": r, "strength": 1.0, "mode": "composition"}
 
-    if len(reference_images_b64) == 1:
+    reference_slots = [_normalise_ref(r) for r in raw_refs if r]
+
+    # Derive effective img2img_strength: take the minimum slot strength so the
+    # most-constrained slot drives the global noise level (C backend uses one value).
+    # Style-mode slots get half-weight to reduce composition influence.
+    if reference_slots:
+        effective_strengths = []
+        for s in reference_slots:
+            w = float(s.get("strength", 1.0))
+            if s.get("mode") == "style":
+                w *= 0.5
+            effective_strengths.append(w)
+        # Use minimum — preserves the strongest constraint; override only when
+        # caller explicitly set img2img_strength at the request level.
+        if "img2img_strength" not in data:
+            img2img_strength = min(effective_strengths)
+
+    if len(reference_slots) == 1:
         # Single image: use img2img mode for better results
         try:
-            image_data = base64.b64decode(reference_images_b64[0].split(",")[-1])
-            # Convert any format to PNG
+            image_data = base64.b64decode(reference_slots[0]["data"].split(",")[-1])
             image_data = convert_image_to_png(image_data)
             input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
             with open(input_image_path, "wb") as f:
                 f.write(image_data)
         except Exception as e:
             return jsonify({"error": f"Invalid input image: {e}"}), 400
-    elif len(reference_images_b64) > 1:
+    elif len(reference_slots) > 1:
         # Multiple images: use multiref mode
-        for i, img_b64 in enumerate(reference_images_b64[:4]):
+        for i, slot in enumerate(reference_slots[:4]):
             try:
-                image_data = base64.b64decode(img_b64.split(",")[-1])
-                # Convert any format to PNG
+                image_data = base64.b64decode(slot["data"].split(",")[-1])
                 image_data = convert_image_to_png(image_data)
                 ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
                 with open(ref_path, "wb") as f:
                     f.write(image_data)
                 reference_image_paths.append(ref_path)
             except Exception as e:
-                # Clean up any already saved reference images
                 for p in reference_image_paths:
                     try:
                         os.unlink(p)
