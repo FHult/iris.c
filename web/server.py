@@ -78,6 +78,9 @@ MODEL_SLOTS = [
         "expected_files": [
             "transformer/config.json",
             "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
             "vae/diffusion_pytorch_model.safetensors",
             "text_encoder/config.json",
             "tokenizer/tokenizer.json",
