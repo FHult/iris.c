@@ -153,6 +153,7 @@ header .subtitle {
 
 .model-panel-slot {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
     gap: 12px;
@@ -236,6 +237,84 @@ header .subtitle {
 
 .model-panel-close:hover {
     color: var(--text-primary);
+}
+
+.slot-verify-result {
+    flex-basis: 100%;
+    margin-top: 0;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.slot-verify-checking {
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.slot-verify-ok {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 12%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+.slot-verify-error {
+    color: var(--error);
+    background: color-mix(in srgb, var(--error) 10%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
+}
+
+.verify-file-list {
+    list-style: none;
+    margin: 6px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.verify-file {
+    font-family: monospace;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.verify-tag {
+    font-family: sans-serif;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.verify-missing .verify-tag {
+    background: color-mix(in srgb, var(--error) 20%, transparent);
+    color: var(--error);
+}
+
+.verify-empty .verify-tag {
+    background: color-mix(in srgb, #f59e0b 20%, transparent);
+    color: #f59e0b;
+}
+
+.verify-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
 }
 
 .model-loading-panel {

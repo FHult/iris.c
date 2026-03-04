@@ -307,6 +307,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <small>${slot.description}</small>
                 </div>
                 <div class="slot-action">${actionHtml}</div>
+                <div class="slot-verify-result" id="verify-result-${slot.key}" style="display:none"></div>
             </div>`;
         }).join('');
     }
@@ -392,28 +393,30 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window._verifyModel = function(key) {
-        const card = document.querySelector(`[data-slot-key="${key}"] .slot-action`);
-        if (card) card.innerHTML = '<span style="color:var(--text-secondary);font-size:0.8rem">Verifying\u2026</span>';
+        const resultEl = document.getElementById(`verify-result-${key}`);
+        if (!resultEl) return;
+        resultEl.className = 'slot-verify-result slot-verify-checking';
+        resultEl.style.display = '';
+        resultEl.innerHTML = '<span class="verify-spinner"></span> Verifying files\u2026';
         fetch(`/verify-model/${key}`)
             .then(r => r.json())
             .then(data => {
-                if (data.error) { loadAvailableModels(); return; }
+                if (data.error) { resultEl.style.display = 'none'; return; }
                 if (data.ok) {
-                    if (card) card.innerHTML =
-                        '<span style="color:var(--success,#4c4);font-size:0.8rem">\u2713 All files OK</span>'
-                        + `<button onclick="window._switchModel('${key}')">Switch to this model</button>`
-                        + `<button onclick="window._verifyModel('${key}')">Verify</button>`
-                        + `<button class="btn-danger-sm" onclick="window._deleteModel('${key}')">Delete</button>`;
+                    resultEl.className = 'slot-verify-result slot-verify-ok';
+                    resultEl.innerHTML = '\u2713 All files verified — model is complete';
                 } else {
-                    const problems = [...data.missing.map(f => 'Missing: ' + f),
-                                      ...data.empty.map(f => 'Empty: ' + f)];
-                    if (card) card.innerHTML =
-                        `<span class="slot-error" title="${problems.join('\n')}">${problems.length} file(s) invalid</span>`
-                        + `<button onclick="window._downloadModel('${key}')">Re-download</button>`
-                        + `<button class="btn-danger-sm" onclick="window._deleteModel('${key}')">Delete</button>`;
+                    const missing = data.missing.map(f =>
+                        `<li class="verify-file verify-missing"><span class="verify-tag">Missing</span>${f}</li>`).join('');
+                    const empty = data.empty.map(f =>
+                        `<li class="verify-file verify-empty"><span class="verify-tag">Empty</span>${f}</li>`).join('');
+                    resultEl.className = 'slot-verify-result slot-verify-error';
+                    resultEl.innerHTML =
+                        `<strong>${data.missing.length + data.empty.length} file(s) have problems:</strong>
+                        <ul class="verify-file-list">${missing}${empty}</ul>`;
                 }
             })
-            .catch(() => { if (card) loadAvailableModels(); });
+            .catch(() => { resultEl.style.display = 'none'; });
     };
 
     window._downloadModel = function(key) {
