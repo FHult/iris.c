@@ -1981,6 +1981,25 @@ def delete_model_endpoint():
     return jsonify({"ok": True})
 
 
+@app.route("/verify-model/<key>")
+def verify_model_endpoint(key):
+    """Check that all expected files for a model slot are present and non-empty."""
+    slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
+    if not slot:
+        return jsonify({"error": "Unknown model key"}), 400
+    model_dir = PROJECT_DIR / key
+    missing = []
+    empty = []
+    for rel_path in slot.get("expected_files", []):
+        f = model_dir / rel_path
+        if not f.exists():
+            missing.append(rel_path)
+        elif f.stat().st_size == 0:
+            empty.append(rel_path)
+    ok = not missing and not empty
+    return jsonify({"ok": ok, "missing": missing, "empty": empty})
+
+
 def _do_download(dl_id, url, dest, extra_headers=None):
     """Background thread: download a file from url to dest, tracking progress."""
     try:

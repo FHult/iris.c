@@ -278,6 +278,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 actionHtml = '<span class="badge-current">Current</span>';
             } else if (slot.downloaded) {
                 actionHtml = `<button onclick="window._switchModel('${slot.key}')">Switch to this model</button>
+                    <button onclick="window._verifyModel('${slot.key}')">Verify</button>
                     <button class="btn-danger-sm" onclick="window._deleteModel('${slot.key}')">Delete</button>`;
             } else if (!slot.downloadable) {
                 actionHtml = '<span style="color:var(--text-secondary);font-size:0.75rem">Not available</span>';
@@ -299,7 +300,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     actionHtml = `<button onclick="window._downloadModel('${slot.key}')">Download (~16 GB)</button>`;
                 }
             }
-            return `<div class="model-panel-slot">
+            return `<div class="model-panel-slot" data-slot-key="${slot.key}">
                 <div class="slot-info">
                     <strong>${slot.label}</strong>
                     <small>${slot.description}</small>
@@ -335,6 +336,31 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.error) { alert(data.error); return; }
             loadAvailableModels();
         }).catch(() => alert('Delete request failed'));
+    };
+
+    window._verifyModel = function(key) {
+        const card = document.querySelector(`[data-slot-key="${key}"] .slot-action`);
+        if (card) card.innerHTML = '<span style="color:var(--text-secondary);font-size:0.8rem">Verifying\u2026</span>';
+        fetch(`/verify-model/${key}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) { loadAvailableModels(); return; }
+                if (data.ok) {
+                    if (card) card.innerHTML =
+                        '<span style="color:var(--success,#4c4);font-size:0.8rem">\u2713 All files OK</span>'
+                        + `<button onclick="window._switchModel('${key}')">Switch to this model</button>`
+                        + `<button onclick="window._verifyModel('${key}')">Verify</button>`
+                        + `<button class="btn-danger-sm" onclick="window._deleteModel('${key}')">Delete</button>`;
+                } else {
+                    const problems = [...data.missing.map(f => 'Missing: ' + f),
+                                      ...data.empty.map(f => 'Empty: ' + f)];
+                    if (card) card.innerHTML =
+                        `<span class="slot-error" title="${problems.join('\n')}">${problems.length} file(s) invalid</span>`
+                        + `<button onclick="window._downloadModel('${key}')">Re-download</button>`
+                        + `<button class="btn-danger-sm" onclick="window._deleteModel('${key}')">Delete</button>`;
+                }
+            })
+            .catch(() => { if (card) loadAvailableModels(); });
     };
 
     window._downloadModel = function(key) {

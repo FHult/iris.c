@@ -641,6 +641,58 @@ class TestSettings:
 
 
 # ---------------------------------------------------------------------------
+# /verify-model/<key>  GET
+# ---------------------------------------------------------------------------
+
+class TestVerifyModel:
+    def test_unknown_key_returns_400(self, client):
+        r = client.get("/verify-model/nonexistent")
+        assert r.status_code == 400
+
+    def test_all_files_present_returns_ok(self, client, tmp_path):
+        import server as srv
+        model_dir = tmp_path / "flux-klein-4b-base"
+        for rel in srv.MODEL_SLOTS[1]["expected_files"]:
+            f = model_dir / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x")
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        r = client.get("/verify-model/flux-klein-4b-base")
+        srv.PROJECT_DIR = orig
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+
+    def test_missing_file_reported(self, client, tmp_path):
+        import server as srv
+        model_dir = tmp_path / "flux-klein-4b-base"
+        model_dir.mkdir()
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        r = client.get("/verify-model/flux-klein-4b-base")
+        srv.PROJECT_DIR = orig
+        data = r.get_json()
+        assert data["ok"] is False
+        assert len(data["missing"]) > 0
+
+    def test_empty_file_reported(self, client, tmp_path):
+        import server as srv
+        model_dir = tmp_path / "flux-klein-4b-base"
+        first = srv.MODEL_SLOTS[1]["expected_files"][0]
+        for rel in srv.MODEL_SLOTS[1]["expected_files"]:
+            f = model_dir / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"" if rel == first else b"x")
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        r = client.get("/verify-model/flux-klein-4b-base")
+        srv.PROJECT_DIR = orig
+        data = r.get_json()
+        assert data["ok"] is False
+        assert len(data["empty"]) == 1
+
+
+# ---------------------------------------------------------------------------
 # /active-jobs  GET
 # ---------------------------------------------------------------------------
 
