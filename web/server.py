@@ -1865,6 +1865,7 @@ def available_models_endpoint():
     for slot in MODEL_SLOTS:
         slot_dir = PROJECT_DIR / slot["key"]
         downloaded = (slot_dir / "transformer").is_dir()
+        partial = slot_dir.is_dir() and not downloaded
         is_current = (iris_server is not None and
                       Path(iris_server.model_dir).resolve() == slot_dir.resolve())
         slots.append({
@@ -1872,6 +1873,7 @@ def available_models_endpoint():
             "label": slot["label"],
             "description": slot["description"],
             "downloaded": downloaded,
+            "partial": partial,
             "current": is_current,
             "downloadable": slot.get("sh_arg") is not None,
         })

@@ -291,6 +291,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     const err = (prog.error || '').slice(0, 60);
                     actionHtml = `<span class="slot-error" title="${prog.error}">${err}</span>
                         <button onclick="window._downloadModel('${slot.key}')">Retry</button>`;
+                } else if (slot.partial) {
+                    actionHtml = `<span style="color:var(--text-secondary);font-size:0.75rem">Partial download</span>
+                        <button onclick="window._downloadModel('${slot.key}')">Resume</button>
+                        <button class="btn-danger-sm" onclick="window._deleteModel('${slot.key}')">Delete</button>`;
                 } else {
                     actionHtml = `<button onclick="window._downloadModel('${slot.key}')">Download (~16 GB)</button>`;
                 }
