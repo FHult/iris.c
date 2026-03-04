@@ -2470,3 +2470,150 @@ footer a:hover {
     text-align: center;
     padding: 1.5rem 0;
 }
+
+/* ===== Outpaint Panel ===== */
+
+.outpaint-panel {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1rem 1.25rem 1.25rem;
+    background: var(--panel-bg, #1a1a2e);
+    z-index: 10;
+    border-radius: 8px;
+    overflow-y: auto;
+}
+
+.outpaint-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+
+.outpaint-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.3rem;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0.1rem 0.3rem;
+}
+
+.outpaint-close:hover { color: var(--text-primary); }
+
+.outpaint-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 0.5rem;
+    align-items: center;
+    justify-items: center;
+}
+
+.outpaint-dir-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.outpaint-dir-label {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.outpaint-amount {
+    padding: 0.25rem 0.4rem;
+    font-size: 0.78rem;
+    background: var(--input-bg, #2a2a3e);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    width: 80px;
+}
+
+.outpaint-center {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.outpaint-thumb {
+    width: 80px;
+    height: 60px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #111;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.outpaint-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.outpaint-new-size {
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+.outpaint-prompt-row {
+    display: flex;
+}
+
+.outpaint-prompt-input {
+    flex: 1;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.82rem;
+    background: var(--input-bg, #2a2a3e);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+}
+
+.outpaint-lora-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    background: rgba(255, 193, 7, 0.08);
+    border: 1px solid rgba(255, 193, 7, 0.25);
+    border-radius: 5px;
+    padding: 0.5rem 0.75rem;
+}
+
+.outpaint-lora-download-btn {
+    margin-left: auto;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.75rem;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.outpaint-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+}
+
+.outpaint-submit {
+    min-width: 90px;
+}
