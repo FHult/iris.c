@@ -570,6 +570,33 @@ class Job:
         self.step_images = {}
 
 
+_loading_status = {
+    "phase": "idle",       # idle | loading | ready | error
+    "model_key": None,
+    "messages": [],        # recent stderr lines, capped at 50
+    "started_at": None,
+}
+_loading_status_lock = threading.Lock()
+
+def _loading_reset(model_key):
+    import time
+    with _loading_status_lock:
+        _loading_status["phase"] = "loading"
+        _loading_status["model_key"] = model_key
+        _loading_status["messages"] = []
+        _loading_status["started_at"] = time.time()
+
+def _loading_append(line):
+    with _loading_status_lock:
+        _loading_status["messages"].append(line)
+        if len(_loading_status["messages"]) > 50:
+            _loading_status["messages"].pop(0)
+
+def _loading_set_phase(phase):
+    with _loading_status_lock:
+        _loading_status["phase"] = phase
+
+
 class IrisServer:
     """Manages a persistent flux process in server mode."""
 
@@ -594,6 +621,8 @@ class IrisServer:
             "--server",
         ]
 
+        model_key = Path(self.model_dir).name
+        _loading_reset(model_key)
         print(f"Starting iris server: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(
@@ -620,10 +649,15 @@ class IrisServer:
                     self.model_info = event.get("model")
                     self.is_distilled = event.get("is_distilled", True)
                     self.is_zimage = event.get("is_zimage", False)
+                    _loading_append(f"Ready: {self.model_info}")
+                    _loading_set_phase("ready")
                     print(f"Iris server ready: {self.model_info}")
                     break
             except json.JSONDecodeError:
                 print(f"Flux server: {line}")
+        else:
+            # Process exited without emitting ready
+            _loading_set_phase("error")
 
         # Start output reader thread
         reader_thread = threading.Thread(target=self._read_output, daemon=True)
@@ -635,6 +669,7 @@ class IrisServer:
             line = line.decode('utf-8', errors='replace').strip()
             if line:
                 print(f"Flux: {line}")
+                _loading_append(line)
 
     def _read_output(self):
         """Read JSON events from stdout and route to current job."""
@@ -1513,6 +1548,19 @@ def model_info():
         "is_distilled": iris_server.is_distilled,
         "is_zimage": iris_server.is_zimage,
     })
+
+
+@app.route("/model-loading-status")
+def model_loading_status():
+    """Return current model loading phase and recent log lines."""
+    import time
+    with _loading_status_lock:
+        data = dict(_loading_status)
+        data["messages"] = list(data["messages"])
+    elapsed = round(time.time() - data["started_at"], 1) if data["started_at"] else 0
+    data["elapsed"] = elapsed
+    data.pop("started_at", None)
+    return jsonify(data)
 
 
 @app.route("/active-jobs")

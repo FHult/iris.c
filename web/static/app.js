@@ -275,7 +275,8 @@ document.addEventListener('DOMContentLoaded', () => {
         modelPanelContent.innerHTML = _availableSlots.map(slot => {
             let actionHtml = '';
             if (slot.current) {
-                actionHtml = '<span class="badge-current">Current</span>';
+                actionHtml = `<span class="badge-current">Current</span>
+                    <button onclick="window._verifyModel('${slot.key}')">Verify</button>`;
             } else if (slot.downloaded) {
                 actionHtml = `<button onclick="window._switchModel('${slot.key}')">Switch to this model</button>
                     <button onclick="window._verifyModel('${slot.key}')">Verify</button>
@@ -310,18 +311,70 @@ document.addEventListener('DOMContentLoaded', () => {
         }).join('');
     }
 
-    window._switchModel = function(key) {
-        if (!confirm('Switch model? The current model will be unloaded and the new one loaded. This takes 15–30 seconds.')) return;
-        modelInfoEl.textContent = 'Loading model...';
+    const modelLoadingPanel = document.getElementById('model-loading-panel');
+    const modelLoadingTitle = document.getElementById('model-loading-title');
+    const modelLoadingElapsed = document.getElementById('model-loading-elapsed');
+    const modelLoadingLog = document.getElementById('model-loading-log');
+    let _loadingPollInterval = null;
+
+    function showLoadingPanel(label) {
         modelPanel.style.display = 'none';
+        modelLoadingPanel.style.display = '';
+        modelLoadingPanel.classList.remove('is-ready');
+        modelLoadingTitle.textContent = `Loading ${label}…`;
+        modelLoadingElapsed.textContent = '';
+        modelLoadingLog.innerHTML = '';
+        modelInfoEl.textContent = `Loading ${label}…`;
+    }
+
+    function hideLoadingPanel() {
+        modelLoadingPanel.style.display = 'none';
+    }
+
+    function pollLoadingStatus() {
+        if (_loadingPollInterval) clearInterval(_loadingPollInterval);
+        _loadingPollInterval = setInterval(() => {
+            fetch('/model-loading-status').then(r => r.json()).then(data => {
+                // Update elapsed timer
+                if (data.elapsed !== undefined) {
+                    modelLoadingElapsed.textContent = `${data.elapsed}s`;
+                }
+                // Render log lines
+                modelLoadingLog.innerHTML = data.messages.map((m, i) => {
+                    const isLast = i === data.messages.length - 1;
+                    const cls = (data.phase === 'ready' && isLast) ? ' class="log-ready"' : '';
+                    return `<div${cls}>${m}</div>`;
+                }).join('');
+                modelLoadingLog.scrollTop = modelLoadingLog.scrollHeight;
+
+                if (data.phase === 'ready') {
+                    clearInterval(_loadingPollInterval);
+                    _loadingPollInterval = null;
+                    modelLoadingPanel.classList.add('is-ready');
+                    // Now poll /model-info until server confirms ready
+                    pollModelReady();
+                } else if (data.phase === 'error') {
+                    clearInterval(_loadingPollInterval);
+                    _loadingPollInterval = null;
+                    modelLoadingTitle.textContent = 'Model failed to load';
+                }
+            }).catch(() => {});
+        }, 500);
+    }
+
+    window._switchModel = function(key) {
+        const slot = _availableSlots.find(s => s.key === key);
+        const label = slot ? slot.label : key;
+        if (!confirm(`Switch to ${label}? The current model will be unloaded and the new one loaded.`)) return;
+        showLoadingPanel(label);
         fetch('/switch-model', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({key}),
         }).then(r => r.json()).then(data => {
-            if (data.error) { alert(data.error); loadAvailableModels(); return; }
-            pollModelReady();
-        }).catch(() => { alert('Switch request failed'); });
+            if (data.error) { alert(data.error); hideLoadingPanel(); loadAvailableModels(); return; }
+            pollLoadingStatus();
+        }).catch(() => { alert('Switch request failed'); hideLoadingPanel(); });
     };
 
     window._deleteModel = function(key) {
@@ -400,9 +453,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     modelInfoEl.textContent = data.model;
                     if (data.is_distilled !== undefined) applyModelDefaults(data.is_distilled, data.is_zimage);
                     loadAvailableModels();
+                    // Brief pause so user can see the "Ready" line, then close panel
+                    setTimeout(hideLoadingPanel, 1200);
                 }
             }).catch(() => {});
-        }, 1000);
+        }, 500);
     }
 
     loadAvailableModels();

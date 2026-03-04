@@ -20,6 +20,14 @@
                 <div id="model-panel-content"></div>
                 <button type="button" class="model-panel-close" id="model-panel-close">Close</button>
             </div>
+            <div class="model-loading-panel" id="model-loading-panel" style="display:none">
+                <div class="model-loading-header">
+                    <span class="model-loading-spinner"></span>
+                    <span id="model-loading-title">Loading model…</span>
+                    <span id="model-loading-elapsed" class="model-loading-elapsed"></span>
+                </div>
+                <div class="model-loading-log" id="model-loading-log"></div>
+            </div>
             <div class="model-panel" id="settings-panel" style="display:none">
                 <div class="settings-panel-content">
                     <p style="font-size:0.8rem;color:var(--text-secondary);margin:0 0 10px">
