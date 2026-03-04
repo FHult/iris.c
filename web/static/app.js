@@ -277,7 +277,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (slot.current) {
                 actionHtml = '<span class="badge-current">Current</span>';
             } else if (slot.downloaded) {
-                actionHtml = `<button onclick="window._switchModel('${slot.key}')">Switch to this model</button>`;
+                actionHtml = `<button onclick="window._switchModel('${slot.key}')">Switch to this model</button>
+                    <button class="btn-danger-sm" onclick="window._deleteModel('${slot.key}')">Delete</button>`;
             } else if (!slot.downloadable) {
                 actionHtml = '<span style="color:var(--text-secondary);font-size:0.75rem">Not available</span>';
             } else {
@@ -316,6 +317,20 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.error) { alert(data.error); loadAvailableModels(); return; }
             pollModelReady();
         }).catch(() => { alert('Switch request failed'); });
+    };
+
+    window._deleteModel = function(key) {
+        const slot = _availableSlots.find(s => s.key === key);
+        const label = slot ? slot.label : key;
+        if (!confirm(`Delete ${label} from disk? This cannot be undone.`)) return;
+        fetch('/delete-model', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({key}),
+        }).then(r => r.json()).then(data => {
+            if (data.error) { alert(data.error); return; }
+            loadAvailableModels();
+        }).catch(() => alert('Delete request failed'));
     };
 
     window._downloadModel = function(key) {

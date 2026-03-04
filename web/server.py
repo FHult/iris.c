@@ -1955,6 +1955,27 @@ def download_model_progress_endpoint(key):
     return jsonify({**state, "files_done": files_done, "files_total": files_total})
 
 
+@app.route("/delete-model", methods=["POST"])
+def delete_model_endpoint():
+    """Delete a downloaded model directory from disk."""
+    import shutil
+    data = request.json or {}
+    key = data.get("key", "").strip()
+    slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
+    if not slot:
+        return jsonify({"error": "Unknown model key"}), 400
+    model_dir = PROJECT_DIR / key
+    if not model_dir.is_dir():
+        return jsonify({"error": "Model not downloaded"}), 400
+    if iris_server and Path(iris_server.model_dir).resolve() == model_dir.resolve():
+        return jsonify({"error": "Cannot delete the currently loaded model"}), 400
+    try:
+        shutil.rmtree(model_dir)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
 def _do_download(dl_id, url, dest, extra_headers=None):
     """Background thread: download a file from url to dest, tracking progress."""
     try:

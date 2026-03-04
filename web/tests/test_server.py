@@ -550,6 +550,50 @@ class TestZImageCapabilities:
 
 
 # ---------------------------------------------------------------------------
+# /delete-model  POST
+# ---------------------------------------------------------------------------
+
+class TestDeleteModel:
+    def test_unknown_key_returns_400(self, client):
+        r = client.post("/delete-model", json={"key": "nonexistent"})
+        assert r.status_code == 400
+
+    def test_not_downloaded_returns_400(self, client):
+        r = client.post("/delete-model", json={"key": "flux-klein-4b-base"})
+        assert r.status_code == 400
+
+    def test_deletes_directory(self, client, tmp_path):
+        import server as srv
+        model_dir = tmp_path / "flux-klein-4b-base"
+        (model_dir / "transformer").mkdir(parents=True)
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path
+        r = client.post("/delete-model", json={"key": "flux-klein-4b-base"})
+        srv.PROJECT_DIR = orig
+        assert r.status_code == 200
+        assert not model_dir.exists()
+
+    def test_cannot_delete_current_model(self, client, tmp_path):
+        import server as srv
+        model_dir = tmp_path / "flux-klein-4b-base"
+        (model_dir / "transformer").mkdir(parents=True)
+        mock = type("M", (), {
+            "model_dir": str(model_dir),
+            "ready": True,
+            "model_info": "",
+            "is_distilled": True,
+            "is_zimage": False,
+        })()
+        orig_srv, orig_dir = srv.iris_server, srv.PROJECT_DIR
+        srv.iris_server = mock
+        srv.PROJECT_DIR = tmp_path
+        r = client.post("/delete-model", json={"key": "flux-klein-4b-base"})
+        srv.iris_server = orig_srv
+        srv.PROJECT_DIR = orig_dir
+        assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # /active-jobs  GET
 # ---------------------------------------------------------------------------
 

@@ -181,6 +181,22 @@ header .subtitle {
     white-space: nowrap;
 }
 
+.btn-danger-sm {
+    background: none;
+    border: 1px solid var(--text-secondary);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-left: 6px;
+}
+
+.btn-danger-sm:hover {
+    border-color: var(--error, #e55);
+    color: var(--error, #e55);
+}
+
 .model-panel-close {
     display: block;
     margin: 10px auto 0;
