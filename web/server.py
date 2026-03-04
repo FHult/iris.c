@@ -41,6 +41,20 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 # sh_arg: argument to pass to download_model.sh; None means not downloadable via UI.
 MODEL_SLOTS = [
     {
+        "key": "flux-klein-model",
+        "label": "4B Distilled",
+        "description": "4 steps, fast generation",
+        "sh_arg": None,
+        "expected_files": [
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/config.json",
+            "tokenizer/tokenizer.json",
+        ],
+    },
+    {
         "key": "flux-klein-4b-base",
         "label": "4B Base",
         "description": "50 steps, CFG, higher quality",
@@ -55,7 +69,7 @@ MODEL_SLOTS = [
             "text_encoder/model.safetensors.index.json",
             "tokenizer/tokenizer.json",
         ],
-    }
+    },
 ]
 _model_download_progress = {}  # key -> {done, error}
 THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"
