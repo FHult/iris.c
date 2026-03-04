@@ -13,10 +13,10 @@
  * - Shared AdaLN-Zero modulation
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_safetensors.h"
-#include "flux_lora.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_safetensors.h"
+#include "iris_lora.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,7 +89,7 @@ static double tf_get_time_ms(void) {
 
 /* Use Metal for GPU acceleration when available */
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* Enable BF16 pipeline debug logging when FLUX_BF16_DEBUG is set. */

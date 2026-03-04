@@ -5,11 +5,11 @@
  * Ties together all components: tokenizer, text encoder, VAE, transformer, sampling.
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_safetensors.h"
-#include "flux_qwen3.h"
-#include "flux_lora.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_safetensors.h"
+#include "iris_qwen3.h"
+#include "iris_lora.h"
 #include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +18,7 @@
 #include <sys/stat.h>
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* ========================================================================

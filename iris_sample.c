@@ -5,8 +5,8 @@
  * Uses Euler method for ODE integration.
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
+#include "iris.h"
+#include "iris_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +15,7 @@
 #include <sys/time.h>
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* Timing utilities for performance analysis - use wall-clock time */

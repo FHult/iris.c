@@ -16,14 +16,14 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
 #include "embcache.h"
 #include "linenoise.h"
 #include "terminals.h"
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* ======================================================================

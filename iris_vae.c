@@ -11,11 +11,11 @@
  * - GroupNorm (32 groups) + Swish activation
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_safetensors.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_safetensors.h"
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>

@@ -10,7 +10,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
-#include "flux_kernels.h"
+#include "iris_kernels.h"
 
 /* ========================================================================
  * Configuration

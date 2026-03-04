@@ -13,8 +13,8 @@
  * BFL is the native Black Forest Labs Klein LoRA format used by fal, valiantcat, etc.
  */
 
-#include "flux_lora.h"
-#include "flux_safetensors.h"
+#include "iris_lora.h"
+#include "iris_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -5,7 +5,7 @@
  * Supports both WordPiece-style and SentencePiece-style tokenization.
  */
 
-#include "flux.h"
+#include "iris.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -13,9 +13,9 @@
  * - AdaLN modulation: scale + tanh(gate) only (no shift)
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_safetensors.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +31,7 @@
 #endif
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* ========================================================================

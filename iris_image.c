@@ -8,7 +8,7 @@
  * JPEG implementation supports baseline and progressive DCT with various subsampling.
  */
 
-#include "flux.h"
+#include "iris.h"
 #include "jpeg.h"
 #include <stdio.h>
 #include <stdlib.h>

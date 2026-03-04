@@ -9,9 +9,9 @@
  * - SwiGLU MLP
  */
 
-#include "flux_qwen3.h"
-#include "flux_safetensors.h"
-#include "flux_kernels.h"
+#include "iris_qwen3.h"
+#include "iris_safetensors.h"
+#include "iris_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +28,7 @@
 
 /* Use Metal for GPU acceleration */
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* Minimum matrix size for GPU acceleration.

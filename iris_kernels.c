@@ -5,7 +5,7 @@
  * Uses Metal/MPS on Apple Silicon, BLAS otherwise.
  */
 
-#include "flux_kernels.h"
+#include "iris_kernels.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,7 +13,7 @@
 
 /* Use Metal for GPU acceleration on Apple Silicon */
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* Use BLAS for matrix operations when enabled via Makefile */

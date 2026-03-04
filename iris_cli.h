@@ -5,7 +5,7 @@
 #ifndef FLUX_CLI_H
 #define FLUX_CLI_H
 
-#include "flux.h"
+#include "iris.h"
 
 /*
  * Run the interactive CLI. Called when flux is invoked without a prompt.
