@@ -483,6 +483,7 @@ static int run_server_mode(flux_ctx *ctx) {
         int show_steps = json_get_bool(line, "show_steps", 1);
         float guidance = json_get_float(line, "guidance", 0.0f);
         float img2img_strength = json_get_float(line, "img2img_strength", 1.0f);
+        char *negative_prompt = json_get_string(line, "negative_prompt");
         char *schedule = json_get_string(line, "schedule");
         char *req_lora_path = json_get_string(line, "lora");
         float req_lora_scale = json_get_float(line, "lora_scale", 1.0f);
@@ -492,7 +493,7 @@ static int run_server_mode(flux_ctx *ctx) {
             printf("{\"event\":\"error\",\"message\":\"Missing prompt or output\"}\n");
             fflush(stdout);
             free(prompt); free(output_path); free(input_path);
-            free(schedule); free(req_lora_path);
+            free(negative_prompt); free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -502,7 +503,7 @@ static int run_server_mode(flux_ctx *ctx) {
             printf("{\"event\":\"error\",\"message\":\"Width must be 64-1792 and divisible by 16\"}\n");
             fflush(stdout);
             free(prompt); free(output_path); free(input_path);
-            free(schedule); free(req_lora_path);
+            free(negative_prompt); free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -510,7 +511,7 @@ static int run_server_mode(flux_ctx *ctx) {
             printf("{\"event\":\"error\",\"message\":\"Height must be 64-1792 and divisible by 16\"}\n");
             fflush(stdout);
             free(prompt); free(output_path); free(input_path);
-            free(schedule); free(req_lora_path);
+            free(negative_prompt); free(schedule); free(req_lora_path);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -561,6 +562,7 @@ static int run_server_mode(flux_ctx *ctx) {
             .seed = actual_seed,
             .guidance = guidance,
             .img2img_strength = img2img_strength,
+            .negative_prompt = (negative_prompt && negative_prompt[0]) ? negative_prompt : NULL,
         };
 
         /* Apply schedule if specified */
@@ -603,9 +605,8 @@ static int run_server_mode(flux_ctx *ctx) {
             }
 
             if (load_error) {
-                free(prompt);
-                free(output_path);
-                free(input_path);
+                free(prompt); free(output_path); free(input_path);
+                free(negative_prompt);
                 for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
                 continue;
             }
@@ -615,9 +616,8 @@ static int run_server_mode(flux_ctx *ctx) {
             if (!input) {
                 printf("{\"event\":\"error\",\"message\":\"Failed to load input image\"}\n");
                 fflush(stdout);
-                free(prompt);
-                free(output_path);
-                free(input_path);
+                free(prompt); free(output_path); free(input_path);
+                free(negative_prompt);
                 for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
                 continue;
             }
@@ -631,9 +631,8 @@ static int run_server_mode(flux_ctx *ctx) {
         if (!output) {
             printf("{\"event\":\"error\",\"message\":\"Generation failed: %s\"}\n", flux_get_error());
             fflush(stdout);
-            free(prompt);
-            free(output_path);
-            free(input_path);
+            free(prompt); free(output_path); free(input_path);
+            free(negative_prompt);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -643,9 +642,8 @@ static int run_server_mode(flux_ctx *ctx) {
             printf("{\"event\":\"error\",\"message\":\"Failed to save image\"}\n");
             fflush(stdout);
             flux_image_free(output);
-            free(prompt);
-            free(output_path);
-            free(input_path);
+            free(prompt); free(output_path); free(input_path);
+            free(negative_prompt);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -663,9 +661,8 @@ static int run_server_mode(flux_ctx *ctx) {
                output_path, (long long)actual_seed, total_time);
         fflush(stdout);
 
-        free(prompt);
-        free(output_path);
-        free(input_path);
+        free(prompt); free(output_path); free(input_path);
+        free(negative_prompt);
         for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
     }
 
@@ -707,7 +704,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "LoRA options:\n");
     fprintf(stderr, "      --lora PATH       Load LoRA adapter (XLabs, Kohya, or Diffusers .safetensors)\n");
     fprintf(stderr, "      --lora-scale N    LoRA strength (default: 1.0, range: 0.0-2.0)\n");
-    fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n\n");
+    fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n");
+    fprintf(stderr, "  -N, --negative TEXT   Negative prompt for CFG (base models only; ignored for distilled)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -764,6 +762,7 @@ int main(int argc, char *argv[]) {
         {"lora",             required_argument, 0, 260},
         {"lora-scale",       required_argument, 0, 261},
         {"img2img-strength", required_argument, 0, 262},
+        {"negative",         required_argument, 0, 'N'},
         {0, 0, 0, 0}
     };
 
@@ -799,7 +798,7 @@ int main(int argc, char *argv[]) {
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:N:qvhVmMD",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -841,6 +840,7 @@ int main(int argc, char *argv[]) {
             case 260: lora_path = optarg; break;
             case 261: lora_scale = (float)atof(optarg); break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
+            case 'N': params.negative_prompt = optarg; break;
             default:
                 print_usage(argv[0]);
                 return 1;
