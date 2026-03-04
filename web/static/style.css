@@ -1377,6 +1377,39 @@ footer a:hover {
     cursor: default;
 }
 
+.history-vary-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.history-vary-strength {
+    width: 52px;
+    height: 3px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.history-item-overlay:hover .history-vary-strength,
+.history-vary-group:hover .history-vary-strength {
+    opacity: 1;
+}
+
+.history-vary-strength-label {
+    font-size: 0.6rem;
+    color: rgba(255,255,255,0.6);
+    min-width: 2.2ch;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.history-item-overlay:hover .history-vary-strength-label,
+.history-vary-group:hover .history-vary-strength-label {
+    opacity: 1;
+}
+
 .history-show-more {
     display: flex;
     gap: 0.75rem;
