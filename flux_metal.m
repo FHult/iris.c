@@ -67,6 +67,16 @@ static int run_causal_mpsgraph_f32(float *out, const float *Q, const float *K,
                                     const float *V, int seq, int num_q_heads,
                                     int num_kv_heads, int head_dim);
 
+/* BF16 causal SDPA graph cache — used by flux_gpu_causal_attention_bf16 for seq > 512.
+ * Keeps Q/K/V as BF16 GPU tensors throughout; no CPU round-trip. */
+static causal_graph_cache_t g_causal_graph_cache_bf16[MAX_CAUSAL_GRAPH_CACHE];
+static int g_causal_graph_count_bf16 = 0;
+static pthread_mutex_t g_causal_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int run_causal_mpsgraph_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t Q,
+                                     flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                     int seq, int num_q_heads, int num_kv_heads,
+                                     int head_dim);
+
 /* Cache for MPSGraph-based SDPA graphs (bf16) */
 #define MAX_SDPA_GRAPH_CACHE 32
 typedef struct {
@@ -5688,52 +5698,12 @@ int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
-    /* Custom kernel handles seq <= 512. Longer sequences go via MPSGraph (f32 path). */
+    /* Custom kernel handles seq <= 512.  Longer sequences use the BF16 MPSGraph
+     * path which keeps tensors on GPU throughout and stays in batch mode. */
     if (seq > 512) {
         if (attention_mask != NULL) return 0;  /* Masked + long seq: fall back to CPU */
-
-        /* Sync any pending GPU work so we can read back the BF16 tensors */
-        id<MTLCommandBuffer> syncCmd = get_tensor_cmd();
-        if (syncCmd.status < MTLCommandBufferStatusCommitted) {
-            [syncCmd commit];
-            [syncCmd waitUntilCompleted];
-        }
-        g_tensor_cmd = nil;
-        if (g_tensor_batch_mode) {
-            g_tensor_cmd = [g_queue commandBuffer];
-            if (@available(macOS 15.0, *)) {
-                if (g_residency_set) [g_tensor_cmd useResidencySet:(id<MTLResidencySet>)g_residency_set];
-            }
-        }
-
-        size_t q_elems  = (size_t)seq * num_q_heads  * head_dim;
-        size_t kv_elems = (size_t)seq * num_kv_heads * head_dim;
-        float *fQ  = (float *)malloc(q_elems  * sizeof(float));
-        float *fK  = (float *)malloc(kv_elems * sizeof(float));
-        float *fV  = (float *)malloc(kv_elems * sizeof(float));
-        float *fOut = (float *)malloc(q_elems * sizeof(float));
-        if (!fQ || !fK || !fV || !fOut) { free(fQ); free(fK); free(fV); free(fOut); return 0; }
-
-        /* Convert BF16 GPU buffers -> float32 on CPU */
-        const uint16_t *bQ  = (const uint16_t *)[Q->buffer contents];
-        const uint16_t *bK  = (const uint16_t *)[K->buffer contents];
-        const uint16_t *bV  = (const uint16_t *)[V->buffer contents];
-        for (size_t i = 0; i < q_elems;  i++) { uint32_t b = (uint32_t)bQ[i] << 16; memcpy(&fQ[i],  &b, 4); }
-        for (size_t i = 0; i < kv_elems; i++) { uint32_t b = (uint32_t)bK[i] << 16; memcpy(&fK[i], &b, 4); }
-        for (size_t i = 0; i < kv_elems; i++) { uint32_t b = (uint32_t)bV[i] << 16; memcpy(&fV[i], &b, 4); }
-
-        int ok = run_causal_mpsgraph_f32(fOut, fQ, fK, fV, seq, num_q_heads, num_kv_heads, head_dim);
-
-        if (ok) {
-            /* Convert float32 result back to BF16 in the output GPU buffer */
-            uint16_t *bOut = (uint16_t *)[out->buffer contents];
-            for (size_t i = 0; i < q_elems; i++) {
-                uint32_t bits; memcpy(&bits, &fOut[i], 4);
-                bOut[i] = (uint16_t)(bits >> 16);
-            }
-        }
-        free(fQ); free(fK); free(fV); free(fOut);
-        return ok;
+        return run_causal_mpsgraph_bf16(out, Q, K, V, seq,
+                                         num_q_heads, num_kv_heads, head_dim);
     }
 
     @autoreleasepool {
@@ -6596,6 +6566,159 @@ static int run_causal_mpsgraph_f32(float *out,
         [mpsCmd waitUntilCompleted];
 
         memcpy(out, [outBuf contents], q_bytes);
+        return 1;
+    }
+}
+
+/* BF16 causal SDPA graph — inputs/outputs are BF16; internal matmuls cast to f32
+ * for numerical stability, same strategy as the non-causal BF16 SDPA graph.
+ * Builds and caches a graph per (seq, q_heads, kv_heads, head_dim). */
+static causal_graph_cache_t *get_causal_sdpa_graph_bf16(int seq, int num_q_heads,
+                                                          int num_kv_heads, int head_dim) {
+    if (!NSClassFromString(@"MPSGraph")) return NULL;
+
+    pthread_mutex_lock(&g_causal_graph_bf16_mutex);
+    for (int i = 0; i < g_causal_graph_count_bf16; i++) {
+        causal_graph_cache_t *e = &g_causal_graph_cache_bf16[i];
+        if (e->seq == seq && e->num_q_heads == num_q_heads &&
+            e->num_kv_heads == num_kv_heads && e->head_dim == head_dim) {
+            pthread_mutex_unlock(&g_causal_graph_bf16_mutex);
+            return e;
+        }
+    }
+
+    int slot = 0;
+    if (g_causal_graph_count_bf16 < MAX_CAUSAL_GRAPH_CACHE) {
+        slot = g_causal_graph_count_bf16++;
+    } else {
+        slot = 0;  /* Evict first slot */
+    }
+
+    causal_graph_cache_t *entry = &g_causal_graph_cache_bf16[slot];
+    entry->seq          = seq;
+    entry->num_q_heads  = num_q_heads;
+    entry->num_kv_heads = num_kv_heads;
+    entry->head_dim     = head_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) { pthread_mutex_unlock(&g_causal_graph_bf16_mutex); return NULL; }
+
+        float scale = 1.0f / sqrtf((float)head_dim);
+        int groups  = num_q_heads / num_kv_heads;
+
+        NSArray *qShape = @[@1, @(seq), @(num_q_heads), @(head_dim)];
+        NSArray *kShape = @[@1, @(seq), @(num_kv_heads), @(head_dim)];
+        NSArray *vShape = @[@1, @(seq), @(num_kv_heads), @(head_dim)];
+
+        /* BF16 inputs */
+        MPSGraphTensor *qIn = [graph placeholderWithShape:qShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *kIn = [graph placeholderWithShape:kShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *vIn = [graph placeholderWithShape:vShape dataType:MPSDataTypeBFloat16 name:nil];
+
+        /* Expand K/V for GQA */
+        MPSGraphTensor *kExp = (groups > 1)
+            ? [graph tileTensor:kIn withMultiplier:@[@1, @1, @(groups), @1] name:nil]
+            : kIn;
+        MPSGraphTensor *vExp = (groups > 1)
+            ? [graph tileTensor:vIn withMultiplier:@[@1, @1, @(groups), @1] name:nil]
+            : vIn;
+
+        /* Transpose to [1, heads, seq, head_dim] */
+        MPSGraphTensor *qT = [graph transposeTensor:qIn  dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kT = [graph transposeTensor:kExp dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *vT = [graph transposeTensor:vExp dimension:1 withDimension:2 name:nil];
+
+        /* Cast to f32 for matmul and softmax precision */
+        MPSGraphTensor *qF32 = [graph castTensor:qT toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *kF32 = [graph castTensor:kT toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *vF32 = [graph castTensor:vT toType:MPSDataTypeFloat32 name:nil];
+
+        /* Causal mask: [1, 1, seq, seq] additive lower-triangular bias */
+        NSMutableData *maskData = [NSMutableData dataWithLength:(size_t)seq * seq * sizeof(float)];
+        float *maskPtr = (float *)[maskData mutableBytes];
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                maskPtr[i * seq + j] = (j > i) ? -1e9f : 0.0f;
+        MPSGraphTensor *maskTensor = [graph constantWithData:maskData
+                                                       shape:@[@1, @1, @(seq), @(seq)]
+                                                    dataType:MPSDataTypeFloat32];
+
+        /* Manual QK^T + causal mask + softmax + @V */
+        MPSGraphTensor *kTT  = [graph transposeTensor:kF32 dimension:2 withDimension:3 name:nil];
+        MPSGraphTensor *qk   = [graph matrixMultiplicationWithPrimaryTensor:qF32 secondaryTensor:kTT name:nil];
+        MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale shape:@[@1] dataType:MPSDataTypeFloat32];
+        MPSGraphTensor *qkSc = [graph multiplicationWithPrimaryTensor:qk secondaryTensor:scaleTensor name:nil];
+        MPSGraphTensor *qkM  = [graph additionWithPrimaryTensor:qkSc secondaryTensor:maskTensor name:nil];
+        MPSGraphTensor *sm   = [graph softMaxWithTensor:qkM axis:3 name:nil];
+        MPSGraphTensor *outF32 = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vF32 name:nil];
+
+        /* Transpose back and cast to BF16 */
+        MPSGraphTensor *outT  = [graph transposeTensor:outF32 dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *outBF16 = [graph castTensor:outT toType:MPSDataTypeBFloat16 name:nil];
+
+        entry->graph     = graph;
+        entry->qTensor   = qIn;
+        entry->kTensor   = kIn;
+        entry->vTensor   = vIn;
+        entry->outTensor = outBF16;
+        entry->qShape    = qShape;
+        entry->kShape    = kShape;
+        entry->vShape    = vShape;
+        entry->outShape  = @[@1, @(seq), @(num_q_heads), @(head_dim)];
+    }
+
+    pthread_mutex_unlock(&g_causal_graph_bf16_mutex);
+    return entry;
+}
+
+/* Run BF16 causal SDPA via MPSGraph.  Takes GPU tensors directly — no CPU
+ * conversion needed.  Respects batch mode: encodes into the live command buffer
+ * when batch mode is active, otherwise commits and waits synchronously. */
+static int run_causal_mpsgraph_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t Q,
+                                     flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                     int seq, int num_q_heads, int num_kv_heads,
+                                     int head_dim) {
+    causal_graph_cache_t *entry = get_causal_sdpa_graph_bf16(seq, num_q_heads,
+                                                              num_kv_heads, head_dim);
+    if (!entry) return 0;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) return 0;
+
+        MPSCommandBuffer *mpsCmd = g_tensor_batch_mode
+            ? [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer]
+            : [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        if (!mpsCmd) return 0;
+
+        MPSGraphTensorData *qData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:Q->buffer shape:entry->qShape dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *kData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:K->buffer shape:entry->kShape dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *vData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:V->buffer shape:entry->vShape dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *outData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:out->buffer shape:entry->outShape dataType:MPSDataTypeBFloat16];
+
+        @try {
+            [entry->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:@{entry->qTensor: qData,
+                                                  entry->kTensor: kData,
+                                                  entry->vTensor: vData}
+                               targetOperations:nil
+                              resultsDictionary:@{entry->outTensor: outData}
+                            executionDescriptor:nil];
+        } @catch (NSException *e) {
+            return 0;
+        }
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+        } else {
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
         return 1;
     }
 }
