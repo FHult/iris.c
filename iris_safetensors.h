@@ -1,5 +1,5 @@
 /*
- * flux_safetensors.h - Safetensors file format reader
+ * iris_safetensors.h - Safetensors file format reader
  *
  * Safetensors format:
  *   - 8 bytes: uint64 little-endian header size
@@ -7,8 +7,8 @@
  *   - Remaining: raw tensor data
  */
 
-#ifndef FLUX_SAFETENSORS_H
-#define FLUX_SAFETENSORS_H
+#ifndef IRIS_SAFETENSORS_H
+#define IRIS_SAFETENSORS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -90,4 +90,4 @@ void safetensor_print(const safetensor_t *t);
 /* Print all tensors in file */
 void safetensors_print_all(const safetensors_file_t *sf);
 
-#endif /* FLUX_SAFETENSORS_H */
+#endif /* IRIS_SAFETENSORS_H */

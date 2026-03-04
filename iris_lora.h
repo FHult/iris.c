@@ -1,5 +1,5 @@
 /*
- * flux_lora.h - LoRA (Low-Rank Adaptation) support for FLUX transformer
+ * iris_lora.h - LoRA (Low-Rank Adaptation) support for FLUX transformer
  *
  * Applies LoRA adapters at inference time without modifying model weights.
  * Formula: out += scale * (lora_B @ (lora_A @ x))
@@ -11,8 +11,8 @@
  *   Diffusers - "transformer.transformer_blocks.N.attn.to_q.lora_A.weight"
  */
 
-#ifndef FLUX_LORA_H
-#define FLUX_LORA_H
+#ifndef IRIS_LORA_H
+#define IRIS_LORA_H
 
 #include <stddef.h>
 
@@ -74,4 +74,4 @@ void lora_apply(const lora_adapter_t *adapter, float scale,
  */
 void lora_free(lora_state_t *lora);
 
-#endif /* FLUX_LORA_H */
+#endif /* IRIS_LORA_H */

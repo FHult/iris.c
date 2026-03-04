@@ -5,18 +5,18 @@
  * FLUX.2 klein rectified flow transformer model.
  *
  * Usage:
- *   flux_ctx *ctx = flux_load_dir("path/to/model");
+ *   iris_ctx *ctx = iris_load_dir("path/to/model");
  *   if (!ctx) { handle error }
  *
- *   flux_params params = FLUX_PARAMS_DEFAULT;
- *   flux_image *img = flux_generate(ctx, "a cat sitting on a rainbow", &params);
- *   flux_image_save(img, "output.png");
- *   flux_image_free(img);
- *   flux_free(ctx);
+ *   iris_params params = IRIS_PARAMS_DEFAULT;
+ *   iris_image *img = iris_generate(ctx, "a cat sitting on a rainbow", &params);
+ *   iris_image_save(img, "output.png");
+ *   iris_image_free(img);
+ *   iris_free(ctx);
  */
 
-#ifndef FLUX_H
-#define FLUX_H
+#ifndef IRIS_H
+#define IRIS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -30,39 +30,39 @@ extern "C" {
  * ======================================================================== */
 
 /* Model architecture constants (same across model sizes) */
-#define FLUX_LATENT_CHANNELS    128  /* Flux: 32*2*2, Z-Image: 16*2*2=64 */
+#define IRIS_LATENT_CHANNELS    128  /* Flux: 32*2*2, Z-Image: 16*2*2=64 */
 
 /* VAE architecture */
-#define FLUX_VAE_Z_CHANNELS     32   /* Flux default; Z-Image uses 16 */
-#define FLUX_VAE_BASE_CH        128
-#define FLUX_VAE_CH_MULT_0      1
-#define FLUX_VAE_CH_MULT_1      2
-#define FLUX_VAE_CH_MULT_2      4
-#define FLUX_VAE_CH_MULT_3      4
-#define FLUX_VAE_NUM_RES        2
-#define FLUX_VAE_GROUPS         32
-#define FLUX_VAE_MAX_DIM        1792  /* Max image dimension for VAE */
+#define IRIS_VAE_Z_CHANNELS     32   /* Flux default; Z-Image uses 16 */
+#define IRIS_VAE_BASE_CH        128
+#define IRIS_VAE_CH_MULT_0      1
+#define IRIS_VAE_CH_MULT_1      2
+#define IRIS_VAE_CH_MULT_2      4
+#define IRIS_VAE_CH_MULT_3      4
+#define IRIS_VAE_NUM_RES        2
+#define IRIS_VAE_GROUPS         32
+#define IRIS_VAE_MAX_DIM        1792  /* Max image dimension for VAE */
 
 /* Tokenizer */
-#define FLUX_MAX_SEQ_LEN        512
-#define FLUX_VOCAB_HASH_SIZE    150001
+#define IRIS_MAX_SEQ_LEN        512
+#define IRIS_VOCAB_HASH_SIZE    150001
 
 /* Sampling */
-#define FLUX_MAX_STEPS          256
+#define IRIS_MAX_STEPS          256
 
 /* ========================================================================
  * Opaque Types
  * ======================================================================== */
 
-typedef struct flux_ctx flux_ctx;
-typedef struct flux_image flux_image;
-typedef struct flux_tokenizer flux_tokenizer;
+typedef struct iris_ctx iris_ctx;
+typedef struct iris_image iris_image;
+typedef struct iris_tokenizer iris_tokenizer;
 
 /* ========================================================================
  * Image Structure
  * ======================================================================== */
 
-struct flux_image {
+struct iris_image {
     int width;
     int height;
     int channels;       /* 3 for RGB, 4 for RGBA */
@@ -84,12 +84,12 @@ typedef struct {
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
     float img2img_strength; /* img2img denoising strength 0.0-1.0 (default: 1.0 = in-context conditioning) */
     const char *negative_prompt; /* Negative prompt for CFG uncond pass (base models only; NULL = empty string) */
-} flux_params;
+} iris_params;
 
 /* Default parameters */
-#define FLUX_DEFAULT_WIDTH  256
-#define FLUX_DEFAULT_HEIGHT 256
-#define FLUX_PARAMS_DEFAULT { FLUX_DEFAULT_WIDTH, FLUX_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL }
+#define IRIS_DEFAULT_WIDTH  256
+#define IRIS_DEFAULT_HEIGHT 256
+#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL }
 
 /* ========================================================================
  * Core API
@@ -100,40 +100,40 @@ typedef struct {
  * Directory should contain: vae/, transformer/, tokenizer/ subdirectories.
  * Returns NULL on error.
  */
-flux_ctx *flux_load_dir(const char *model_dir);
+iris_ctx *iris_load_dir(const char *model_dir);
 
 /*
  * Free model and all associated resources.
  */
-void flux_free(flux_ctx *ctx);
+void iris_free(iris_ctx *ctx);
 
 /*
  * Release the text encoder to free ~8GB of memory.
  * Call this after encoding if you don't need to encode more prompts.
  * The encoder will be reloaded automatically if needed for a new prompt.
  */
-void flux_release_text_encoder(flux_ctx *ctx);
+void iris_release_text_encoder(iris_ctx *ctx);
 
 /*
  * Enable mmap mode for text encoder (--mmap).
  * Uses memory-mapped bf16 weights directly instead of converting to f32.
  * Reduces memory usage from ~16GB to ~8GB but is slower due to on-the-fly conversion.
- * Call this after flux_load_dir() and before first generation.
+ * Call this after iris_load_dir() and before first generation.
  */
-void flux_set_mmap(flux_ctx *ctx, int enable);
+void iris_set_mmap(iris_ctx *ctx, int enable);
 
 /*
  * Keep all models loaded between generations (server mode).
  * Prevents text encoder release and GPU cache clearing between requests.
  * Uses more memory (~16GB extra) but eliminates reload overhead.
  */
-void flux_set_keep_models_loaded(flux_ctx *ctx, int enable);
+void iris_set_keep_models_loaded(iris_ctx *ctx, int enable);
 
 /*
  * Check if model is distilled (4-step) or base (50-step with CFG).
  * Returns 1 for distilled, 0 for base.
  */
-int flux_is_distilled(flux_ctx *ctx);
+int iris_is_distilled(iris_ctx *ctx);
 
 /*
  * Load a LoRA adapter from a safetensors file.
@@ -143,32 +143,32 @@ int flux_is_distilled(flux_ctx *ctx);
  * Returns 0 on success, -1 on error.
  * Note: disables GPU bf16 path while LoRA is active (falls back to CPU).
  */
-int flux_load_lora(flux_ctx *ctx, const char *path, float scale);
+int iris_load_lora(iris_ctx *ctx, const char *path, float scale);
 
 /*
  * Unload the current LoRA adapter and resume normal (GPU-accelerated) inference.
  */
-void flux_unload_lora(flux_ctx *ctx);
+void iris_unload_lora(iris_ctx *ctx);
 
 /*
  * Check if model is Z-Image (S3-DiT architecture).
  * Returns 1 for Z-Image, 0 for Flux.
  */
-int flux_is_zimage(flux_ctx *ctx);
+int iris_is_zimage(iris_ctx *ctx);
 
 /*
  * Force base model mode (overrides autodetection).
- * Call after flux_load_dir() if model_index.json is missing.
+ * Call after iris_load_dir() if model_index.json is missing.
  */
-void flux_set_base_mode(flux_ctx *ctx);
+void iris_set_base_mode(iris_ctx *ctx);
 
 /*
  * Text-to-image generation.
- * Returns newly allocated image, caller must free with flux_image_free().
+ * Returns newly allocated image, caller must free with iris_image_free().
  * Returns NULL on error.
  */
-flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
-                          const flux_params *params);
+iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
+                          const iris_params *params);
 
 /*
  * Image-to-image generation.
@@ -176,30 +176,30 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
  * Uses in-context conditioning: the reference image is passed as additional
  * tokens that the model attends to during generation.
  */
-flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
-                         const flux_image *input, const flux_params *params);
+iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
+                         const iris_image *input, const iris_params *params);
 
 /*
  * Multi-reference generation (up to 4 reference images for klein).
  */
-flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
-                          const flux_image **refs, int num_refs,
-                          const flux_params *params);
+iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
+                          const iris_image **refs, int num_refs,
+                          const iris_params *params);
 
 /*
  * Debug: img2img using Python's exact inputs from /tmp/py_*.bin files.
  * Used for comparing C and Python implementations.
  */
-flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params);
+iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params);
 
 /*
  * Text-to-image generation with pre-computed embeddings.
  * text_emb: float array of shape [text_seq, text_dim]
  * text_seq: number of text tokens (typically 512)
  */
-flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
+iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
                                            const float *text_emb, int text_seq,
-                                           const flux_params *params);
+                                           const iris_params *params);
 
 /*
  * Generate image with external embeddings and external noise.
@@ -207,10 +207,10 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
  * noise: [latent_channels, height/16, width/16] in NCHW format
  * noise_size: total number of floats in noise array
  */
-flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
+iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
                                                      const float *text_emb, int text_seq,
                                                      const float *noise, int noise_size,
-                                                     const flux_params *params);
+                                                     const iris_params *params);
 
 /* ========================================================================
  * Image I/O
@@ -220,36 +220,36 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
  * Load image from file (PNG or PPM).
  * Returns NULL on error.
  */
-flux_image *flux_image_load(const char *path);
+iris_image *iris_image_load(const char *path);
 
 /*
  * Save image to file (format determined by extension).
  * Supports: .png, .ppm
  * Returns 0 on success, -1 on error.
  */
-int flux_image_save(const flux_image *img, const char *path);
+int iris_image_save(const iris_image *img, const char *path);
 
 /*
  * Save image to PNG with seed embedded as metadata.
  * The seed is stored in a tEXt chunk with keyword "flux:seed".
  * Returns 0 on success, -1 on error.
  */
-int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);
+int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t seed);
 
 /*
  * Create a new image with given dimensions.
  */
-flux_image *flux_image_create(int width, int height, int channels);
+iris_image *iris_image_create(int width, int height, int channels);
 
 /*
  * Free image memory.
  */
-void flux_image_free(flux_image *img);
+void iris_image_free(iris_image *img);
 
 /*
  * Resize image using bilinear interpolation.
  */
-flux_image *flux_image_resize(const flux_image *img, int new_width, int new_height);
+iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height);
 
 /* ========================================================================
  * Utility Functions
@@ -258,35 +258,35 @@ flux_image *flux_image_resize(const flux_image *img, int new_width, int new_heig
 /*
  * Set random seed for reproducible generation.
  */
-void flux_set_seed(int64_t seed);
+void iris_set_seed(int64_t seed);
 
 /*
  * Get model info string.
  */
-const char *flux_model_info(flux_ctx *ctx);
+const char *iris_model_info(iris_ctx *ctx);
 
 /*
  * Get text embedding dimension (7680 for 4B, varies by model).
  */
-int flux_text_dim(flux_ctx *ctx);
+int iris_text_dim(iris_ctx *ctx);
 
 /*
  * Check if model has non-commercial license (e.g., 9B model).
  */
-int flux_is_non_commercial(flux_ctx *ctx);
+int iris_is_non_commercial(iris_ctx *ctx);
 
 /*
  * Get last error message.
  */
-const char *flux_get_error(void);
+const char *iris_get_error(void);
 
 /*
  * Set step image callback to receive decoded images after each denoising step.
  * Useful for visualizing the generation process.
  * Pass NULL to disable. The callback receives images that must NOT be freed.
  */
-typedef void (*flux_step_image_cb_t)(int step, int total, const flux_image *img);
-void flux_set_step_image_callback(flux_ctx *ctx, flux_step_image_cb_t callback);
+typedef void (*iris_step_image_cb_t)(int step, int total, const iris_image *img);
+void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback);
 
 /* ========================================================================
  * Advanced / Low-level API
@@ -297,13 +297,13 @@ void flux_set_step_image_callback(flux_ctx *ctx, flux_step_image_cb_t callback);
  * Returns latent tensor [1, 128, H/16, W/16].
  * Caller must free() the returned pointer.
  */
-float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
+float *iris_encode_image(iris_ctx *ctx, const iris_image *img,
                          int *out_h, int *out_w);
 
 /*
  * Decode latent to image using VAE decoder.
  */
-flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
+iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
                                int latent_h, int latent_w);
 
 /*
@@ -311,7 +311,7 @@ flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
  * Returns embedding tensor [1, seq_len, 7680].
  * Caller must free() the returned pointer.
  */
-float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len);
+float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len);
 
 /*
  * Run single denoising step.
@@ -320,7 +320,7 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len);
  * text_emb: text embeddings
  * Returns velocity prediction.
  */
-float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
+float *iris_denoise_step(iris_ctx *ctx, const float *z, float t,
                          const float *text_emb, int text_len,
                          int latent_h, int latent_w);
 
@@ -328,4 +328,4 @@ float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
 }
 #endif
 
-#endif /* FLUX_H */
+#endif /* IRIS_H */

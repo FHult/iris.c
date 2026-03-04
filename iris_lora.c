@@ -1,5 +1,5 @@
 /*
- * flux_lora.c - LoRA support for the FLUX transformer
+ * iris_lora.c - LoRA support for the FLUX transformer
  *
  * Supports four safetensors formats (auto-detected):
  *   XLabs     - "double_blocks.N.processor.qkv_lora1.down.weight"

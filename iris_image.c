@@ -19,8 +19,8 @@
  * Image Creation and Management
  * ======================================================================== */
 
-flux_image *flux_image_create(int width, int height, int channels) {
-    flux_image *img = (flux_image *)malloc(sizeof(flux_image));
+iris_image *iris_image_create(int width, int height, int channels) {
+    iris_image *img = (iris_image *)malloc(sizeof(iris_image));
     if (!img) return NULL;
 
     img->width = width;
@@ -36,17 +36,17 @@ flux_image *flux_image_create(int width, int height, int channels) {
     return img;
 }
 
-void flux_image_free(flux_image *img) {
+void iris_image_free(iris_image *img) {
     if (img) {
         free(img->data);
         free(img);
     }
 }
 
-flux_image *flux_image_clone(const flux_image *img) {
+iris_image *iris_image_clone(const iris_image *img) {
     if (!img) return NULL;
 
-    flux_image *clone = flux_image_create(img->width, img->height, img->channels);
+    iris_image *clone = iris_image_create(img->width, img->height, img->channels);
     if (!clone) return NULL;
 
     memcpy(clone->data, img->data, img->width * img->height * img->channels);
@@ -57,7 +57,7 @@ flux_image *flux_image_clone(const flux_image *img) {
  * PPM/PGM Format (Simple, uncompressed)
  * ======================================================================== */
 
-static flux_image *load_ppm(FILE *f) {
+static iris_image *load_ppm(FILE *f) {
     char magic[3];
     int width, height, maxval;
 
@@ -82,19 +82,19 @@ static flux_image *load_ppm(FILE *f) {
         return NULL;  /* Unsupported format */
     }
 
-    flux_image *img = flux_image_create(width, height, channels);
+    iris_image *img = iris_image_create(width, height, channels);
     if (!img) return NULL;
 
     size_t size = width * height * channels;
     if (fread(img->data, 1, size, f) != size) {
-        flux_image_free(img);
+        iris_image_free(img);
         return NULL;
     }
 
     return img;
 }
 
-static int save_ppm(const flux_image *img, FILE *f) {
+static int save_ppm(const iris_image *img, FILE *f) {
     if (img->channels == 1) {
         fprintf(f, "P5\n");
     } else {
@@ -270,7 +270,7 @@ static void write_png_text_chunk(FILE *f, const char *keyword, const char *text)
     free(data);
 }
 
-static int save_png_with_metadata(const flux_image *img, FILE *f, int64_t seed, int has_seed) {
+static int save_png_with_metadata(const iris_image *img, FILE *f, int64_t seed, int has_seed) {
     /* PNG signature */
     const uint8_t signature[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
     fwrite(signature, 1, 8, f);
@@ -346,7 +346,7 @@ static int save_png_with_metadata(const flux_image *img, FILE *f, int64_t seed, 
     return 0;
 }
 
-static int save_png(const flux_image *img, FILE *f) {
+static int save_png(const iris_image *img, FILE *f) {
     return save_png_with_metadata(img, f, 0, 0);
 }
 
@@ -716,7 +716,7 @@ static void png_unfilter_row(uint8_t *row, const uint8_t *prev_row,
     }
 }
 
-static flux_image *load_png(FILE *f) {
+static iris_image *load_png(FILE *f) {
     /* Verify signature */
     uint8_t sig[8];
     if (fread(sig, 1, 8, f) != 8) return NULL;
@@ -797,7 +797,7 @@ static flux_image *load_png(FILE *f) {
     if (!raw) return NULL;
 
     /* Create image and apply filters */
-    flux_image *img = flux_image_create(width, height, channels);
+    iris_image *img = iris_image_create(width, height, channels);
     if (!img) {
         free(raw);
         return NULL;
@@ -825,7 +825,7 @@ static flux_image *load_png(FILE *f) {
  * JPEG Format (read-only)
  * ======================================================================== */
 
-static flux_image *load_jpeg(FILE *f) {
+static iris_image *load_jpeg(FILE *f) {
     /* Read entire file into memory and decode using the standalone jpeg.h implementation.
      * This keeps JPEG parsing in one place and avoids duplicated decoder code. */
     fseek(f, 0, SEEK_END);
@@ -845,7 +845,7 @@ static flux_image *load_jpeg(FILE *f) {
     free(file_data);
     if (!jpg) return NULL;
 
-    flux_image *img = flux_image_create(jpg->width, jpg->height, jpg->channels);
+    iris_image *img = iris_image_create(jpg->width, jpg->height, jpg->channels);
     if (!img) {
         jpeg_free(jpg);
         return NULL;
@@ -867,11 +867,11 @@ static const char *get_extension(const char *path) {
     return dot + 1;
 }
 
-flux_image *flux_image_load(const char *path) {
+iris_image *iris_image_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
-    flux_image *img = NULL;
+    iris_image *img = NULL;
     const char *ext = get_extension(path);
 
     if (strcasecmp(ext, "png") == 0) {
@@ -899,7 +899,7 @@ flux_image *flux_image_load(const char *path) {
     return img;
 }
 
-int flux_image_save(const flux_image *img, const char *path) {
+int iris_image_save(const iris_image *img, const char *path) {
     if (!img || !path) return -1;
 
     FILE *f = fopen(path, "wb");
@@ -921,7 +921,7 @@ int flux_image_save(const flux_image *img, const char *path) {
     return result;
 }
 
-int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed) {
+int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t seed) {
     if (!img || !path) return -1;
 
     FILE *f = fopen(path, "wb");
@@ -948,10 +948,10 @@ int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t s
  * Image Manipulation
  * ======================================================================== */
 
-flux_image *flux_image_resize(const flux_image *img, int new_width, int new_height) {
+iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height) {
     if (!img || new_width <= 0 || new_height <= 0) return NULL;
 
-    flux_image *resized = flux_image_create(new_width, new_height, img->channels);
+    iris_image *resized = iris_image_create(new_width, new_height, img->channels);
     if (!resized) return NULL;
 
     float scale_x = (float)img->width / new_width;
@@ -995,10 +995,10 @@ flux_image *flux_image_resize(const flux_image *img, int new_width, int new_heig
 }
 
 /* Convert image to specific number of channels */
-flux_image *flux_image_convert(const flux_image *img, int new_channels) {
+iris_image *iris_image_convert(const iris_image *img, int new_channels) {
     if (!img || new_channels < 1 || new_channels > 4) return NULL;
 
-    flux_image *converted = flux_image_create(img->width, img->height, new_channels);
+    iris_image *converted = iris_image_create(img->width, img->height, new_channels);
     if (!converted) return NULL;
 
     for (int y = 0; y < img->height; y++) {

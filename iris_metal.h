@@ -5,8 +5,8 @@
  * Provides significant speedup on Apple Silicon Macs.
  */
 
-#ifndef FLUX_METAL_H
-#define FLUX_METAL_H
+#ifndef IRIS_METAL_H
+#define IRIS_METAL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -20,17 +20,17 @@ extern "C" {
  * Returns 1 on success, 0 if Metal is not available.
  * Safe to call multiple times.
  */
-int flux_metal_init(void);
+int iris_metal_init(void);
 
 /*
  * Check if Metal acceleration is available and initialized.
  */
-int flux_metal_available(void);
+int iris_metal_available(void);
 
 /*
  * Cleanup Metal resources.
  */
-void flux_metal_cleanup(void);
+void iris_metal_cleanup(void);
 
 /*
  * Reset all GPU state (caches, pools, pending commands).
@@ -38,20 +38,20 @@ void flux_metal_cleanup(void);
  * before loading transformer) to ensure clean GPU state.
  * Device and pipelines are preserved; only data buffers are cleared.
  */
-void flux_metal_reset(void);
-void flux_metal_rope_cache_begin(void);
+void iris_metal_reset(void);
+void iris_metal_rope_cache_begin(void);
 
 /*
  * Reset transient GPU execution state while preserving weight/bf16 caches.
  * Intended for generation boundaries in long-lived interactive sessions.
  */
-void flux_metal_reset_transient(void);
+void iris_metal_reset_transient(void);
 
 /* Debug: Clear only specific caches (for isolating issues) */
-void flux_metal_clear_weight_cache_only(void);
-void flux_metal_clear_bf16_cache_only(void);
-void flux_metal_clear_f16_cache_only(void);
-void flux_metal_clear_activation_pool_only(void);
+void iris_metal_clear_weight_cache_only(void);
+void iris_metal_clear_bf16_cache_only(void);
+void iris_metal_clear_f16_cache_only(void);
+void iris_metal_clear_activation_pool_only(void);
 
 /*
  * GPU-accelerated matrix multiplication using MPS (generic).
@@ -63,7 +63,7 @@ void flux_metal_clear_activation_pool_only(void);
  * transpose_a: if non-zero, use A^T
  * transpose_b: if non-zero, use B^T
  */
-void flux_metal_sgemm(int transpose_a, int transpose_b,
+void iris_metal_sgemm(int transpose_a, int transpose_b,
                       int M, int N, int K,
                       float alpha,
                       const float *A, int lda,
@@ -72,10 +72,10 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                       float *C, int ldc);
 
 /*
- * Same as flux_metal_sgemm(), but caches B by pointer for static weights.
+ * Same as iris_metal_sgemm(), but caches B by pointer for static weights.
  * Use this only when B is immutable across calls (e.g., model parameters).
  */
-void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
+void iris_metal_sgemm_cached(int transpose_a, int transpose_b,
                              int M, int N, int K,
                              float alpha,
                              const float *A, int lda,
@@ -83,9 +83,9 @@ void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
                              float beta,
                              float *C, int ldc);
 
-/* Like flux_metal_sgemm_cached but fuses bias addition on the GPU before
+/* Like iris_metal_sgemm_cached but fuses bias addition on the GPU before
  * the result is copied back, avoiding a separate CPU bias pass. */
-void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
+void iris_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
                                   int M, int N, int K,
                                   float alpha,
                                   const float *A, int lda,
@@ -101,7 +101,7 @@ void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
  * A is f32, B is bf16 (weights), C is f32
  * This provides 2x memory bandwidth improvement for weight-bound operations.
  */
-void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
+void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
                            int M, int N, int K,
                            float alpha,
                            const float *A, int lda,
@@ -113,7 +113,7 @@ void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
  * 2D convolution using MPSGraph (NCHW/OIHW, explicit padding).
  * Returns 1 on success, 0 on failure.
  */
-int flux_metal_conv2d(float *out, const float *in,
+int iris_metal_conv2d(float *out, const float *in,
                       const float *weight, const float *bias,
                       int batch, int in_ch, int out_ch,
                       int H, int W, int kH, int kW,
@@ -123,7 +123,7 @@ int flux_metal_conv2d(float *out, const float *in,
  * Batch matrix multiplication on GPU.
  * Performs batch_count independent matrix multiplications.
  */
-void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
+void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
                             int M, int N, int K,
                             float alpha,
                             const float *A, int lda, int stride_a,
@@ -135,36 +135,36 @@ void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
 /*
  * Synchronize GPU operations (wait for completion).
  */
-void flux_metal_sync(void);
+void iris_metal_sync(void);
 
 /*
  * Wait until the Metal command queue is fully drained.
  * This is a stronger fence useful for debugging ordering/race issues.
  */
-void flux_metal_wait_idle(void);
+void iris_metal_wait_idle(void);
 
 /*
  * Begin a batch of GPU operations.
- * Operations after this call are encoded but not executed until flux_metal_end_batch().
+ * Operations after this call are encoded but not executed until iris_metal_end_batch().
  * This eliminates per-operation sync overhead.
  */
-void flux_metal_begin_batch(void);
+void iris_metal_begin_batch(void);
 
 /*
  * End a batch of GPU operations.
  * Commits all encoded operations and waits for completion.
  */
-void flux_metal_end_batch(void);
+void iris_metal_end_batch(void);
 
 /*
  * Check if currently in batch mode.
  */
-int flux_metal_in_batch(void);
+int iris_metal_in_batch(void);
 
 /*
  * Get GPU memory usage info (for debugging).
  */
-size_t flux_metal_memory_used(void);
+size_t iris_metal_memory_used(void);
 
 /* ========================================================================
  * GPU Tensor API - Keep activations on GPU between operations
@@ -175,65 +175,65 @@ size_t flux_metal_memory_used(void);
  * Tensors are backed by pooled Metal buffers with shared storage mode,
  * allowing zero-copy access from both CPU and GPU on Apple Silicon.
  */
-typedef struct flux_gpu_tensor *flux_gpu_tensor_t;
+typedef struct iris_gpu_tensor *iris_gpu_tensor_t;
 
 /*
  * Create a GPU tensor from CPU data.
  * Data is copied to GPU (or just referenced in shared memory mode).
  * Returns NULL on failure.
  */
-flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements);
+iris_gpu_tensor_t iris_gpu_tensor_create(const float *data, size_t num_elements);
 
 /*
  * Create an uninitialized GPU tensor (for output buffers).
  */
-flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements);
+iris_gpu_tensor_t iris_gpu_tensor_alloc(size_t num_elements);
 
 /*
  * Create a persistent GPU tensor that won't be released back to the pool.
  * Use this for tensors that need to stay on GPU between operations.
- * Call flux_gpu_tensor_free() when completely done with the tensor.
+ * Call iris_gpu_tensor_free() when completely done with the tensor.
  */
-flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements);
+iris_gpu_tensor_t iris_gpu_tensor_alloc_persistent(size_t num_elements);
 
 /*
  * Mark an existing tensor as persistent (won't return to pool on free).
  */
-void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent);
+void iris_gpu_tensor_set_persistent(iris_gpu_tensor_t tensor, int persistent);
 
 /*
  * Copy tensor data back to CPU.
  * Waits for any pending GPU operations on this tensor.
  */
-void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out);
+void iris_gpu_tensor_read(iris_gpu_tensor_t tensor, float *out);
 
 /*
  * Copy data from CPU to tensor.
  * Waits for any pending GPU operations on this tensor first.
  */
-void flux_gpu_tensor_write(flux_gpu_tensor_t tensor, const float *data);
+void iris_gpu_tensor_write(iris_gpu_tensor_t tensor, const float *data);
 
 /*
  * Get direct pointer to tensor data (shared memory mode).
  * WARNING: Caller must ensure no GPU operations are pending on this tensor.
  * On Apple Silicon unified memory, this provides zero-copy access.
  */
-float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor);
+float *iris_gpu_tensor_data(iris_gpu_tensor_t tensor);
 
 /*
  * Release a GPU tensor back to the pool.
  */
-void flux_gpu_tensor_free(flux_gpu_tensor_t tensor);
+void iris_gpu_tensor_free(iris_gpu_tensor_t tensor);
 
 /*
  * Get tensor element count.
  */
-size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor);
+size_t iris_gpu_tensor_size(iris_gpu_tensor_t tensor);
 
 /*
  * Check if tensor is in bf16/f16 format.
  */
-int flux_gpu_tensor_is_f16(flux_gpu_tensor_t tensor);
+int iris_gpu_tensor_is_f16(iris_gpu_tensor_t tensor);
 
 /* ========================================================================
  * GPU Operations on Tensors - Operations that keep data on GPU
@@ -249,7 +249,7 @@ int flux_gpu_tensor_is_f16(flux_gpu_tensor_t tensor);
  * Returns a new GPU tensor with the result.
  * Does NOT sync - GPU operation is queued.
  */
-flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
                                    const float *W, const float *b,
                                    int seq_len, int in_dim, int out_dim);
 
@@ -260,18 +260,18 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
  * out: [seq_len, out_dim] (f32)
  * Returns a new GPU tensor with the result.
  */
-flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16(iris_gpu_tensor_t x,
                                         const uint16_t *W_bf16,
                                         int seq_len, int in_dim, int out_dim);
 
 /*
  * GPU linear with bf16 weights - writes to pre-allocated output tensor.
- * Same as flux_gpu_linear_bf16 but allows reusing output buffers to avoid allocation overhead.
+ * Same as iris_gpu_linear_bf16 but allows reusing output buffers to avoid allocation overhead.
  * out: [seq_len, out_dim] (f32, pre-allocated)
  * Returns 1 on success, 0 on failure.
  */
-int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
-                              flux_gpu_tensor_t x,
+int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out,
+                              iris_gpu_tensor_t x,
                               const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
@@ -279,14 +279,14 @@ int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
  * GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline.
  * Uses native MPSDataTypeBFloat16.
  */
-flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16_bf16out(iris_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim);
 
 /*
  * Allocate bf16 GPU tensor (uses half the memory of f32).
  */
-flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements);
+iris_gpu_tensor_t iris_gpu_tensor_alloc_f16(size_t num_elements);
 
 /*
  * BFloat16 MPS attention for bf16 GPU tensors.
@@ -294,8 +294,8 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements);
  * Q, K, V, out must all be bf16 tensors (is_f16 = 1).
  * Returns 1 on success, 0 on failure.
  */
-int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
-                                flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_mps_bf16(iris_gpu_tensor_t out,
+                                iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                 int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /*
@@ -304,26 +304,26 @@ int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
  * Provides 2x memory bandwidth savings while keeping rest of pipeline in f32.
  * Returns 1 on success, 0 on failure.
  */
-int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
-                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_bf16(iris_gpu_tensor_t out,
+                            iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /*
  * Sync all pending GPU operations.
  * Call this before reading tensor data or at step boundaries.
  */
-void flux_gpu_sync(void);
+void iris_gpu_sync(void);
 
 /*
  * Begin a batch of GPU operations.
- * Operations are encoded but not executed until flux_gpu_batch_end().
+ * Operations are encoded but not executed until iris_gpu_batch_end().
  */
-void flux_gpu_batch_begin(void);
+void iris_gpu_batch_begin(void);
 
 /*
  * End batch and execute all queued operations.
  */
-void flux_gpu_batch_end(void);
+void iris_gpu_batch_end(void);
 
 /* ========================================================================
  * GPU Operation Chains - Keep data on GPU between operations
@@ -334,99 +334,99 @@ void flux_gpu_batch_end(void);
  * - Share the same command buffer (reduced dispatch overhead)
  * - Keep intermediate results on GPU (no CPU round-trips)
  * - Only sync at chain end
- * Must be ended with flux_gpu_chain_end().
+ * Must be ended with iris_gpu_chain_end().
  */
-void flux_gpu_chain_begin(void);
+void iris_gpu_chain_begin(void);
 
 /*
  * End an operation chain and execute all queued operations.
  * Results stay in GPU tensors until explicitly read.
  */
-void flux_gpu_chain_end(void);
+void iris_gpu_chain_end(void);
 
 /*
  * Check if currently in chain mode.
  */
-int flux_gpu_in_chain(void);
+int iris_gpu_in_chain(void);
 
 /* ========================================================================
  * GPU Tensor Operations - Keep data on GPU between operations
  * These functions operate on GPU tensors and keep data on GPU.
- * Use flux_gpu_batch_begin/end to batch operations efficiently.
+ * Use iris_gpu_batch_begin/end to batch operations efficiently.
  * ======================================================================== */
 
 /* AdaLN normalization on GPU: out = (1 + scale) * norm(x) + shift */
-void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_adaln_norm(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                          const float *shift, const float *scale,
                          int seq, int hidden, float eps);
 
 /* RMSNorm on f32 GPU tensors: out = rms_norm(x) * weight */
-void flux_gpu_rms_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_rms_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                             const float *weight, int seq, int hidden, float eps);
 
 /* QK RMSNorm on GPU: applies RMSNorm to Q and K in-place */
-void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_qk_rms_norm(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps);
 
 /* RoPE 2D on GPU: applies rotary position embeddings in-place (4-axis split-half, Flux style) */
-void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim);
 
 /* Single-stream RoPE for f32 tensors (consecutive-pair rotation, Z-Image style).
  * cos_freq, sin_freq: [seq, head_dim] with values duplicated for pairs. */
-void flux_gpu_rope_single_f32(flux_gpu_tensor_t x,
+void iris_gpu_rope_single_f32(iris_gpu_tensor_t x,
                                const float *cos_freq, const float *sin_freq,
                                int seq, int heads, int head_dim);
 
 /* Apply single-stream RoPE to Q and K tensors in one command buffer.
  * Uses the same [seq, head_dim] tables for both tensors. */
-void flux_gpu_rope_single_pair_f32(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_single_pair_f32(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                    const float *cos_freq, const float *sin_freq,
                                    int seq, int heads, int head_dim);
 
 /* Unified RoPE for text+image: applies different frequencies to text/image portions */
-void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                            const float *txt_cos, const float *txt_sin,
                            const float *img_cos, const float *img_sin,
                            int seq, int img_offset, int heads, int head_dim, int axis_dim);
 
 /* SiLU multiply on GPU: gate = silu(gate) * up */
-void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 
 /* Gated add on GPU: out += gate * proj */
-void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
-                        flux_gpu_tensor_t proj, int seq, int hidden);
+void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
+                        iris_gpu_tensor_t proj, int seq, int hidden);
 
 /* Split fused QKV+MLP output into separate tensors */
-void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
-                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
-                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+void iris_gpu_split_qkv_mlp(iris_gpu_tensor_t fused,
+                            iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
+                            iris_gpu_tensor_t gate, iris_gpu_tensor_t up,
                             int seq, int hidden, int mlp_hidden);
 
 /* Concatenate attention and MLP outputs */
-void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
-                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+void iris_gpu_concat_attn_mlp(iris_gpu_tensor_t attn, iris_gpu_tensor_t mlp,
+                              iris_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
 
 /* Fused attention on GPU tensors (no transpose needed) */
-int flux_gpu_attention_fused(flux_gpu_tensor_t out,
-                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_fused(iris_gpu_tensor_t out,
+                             iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /* Native BF16 attention on GPU tensors (all tensors must be bf16 format).
  * Uses bf16 compute shaders with f32 accumulation for numerical stability.
  * Returns 1 on success, 0 if tensors are not bf16 or shaders unavailable.
  */
-int flux_gpu_attention_bf16_native(flux_gpu_tensor_t out,
-                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_bf16_native(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                     int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /* Truly fused BF16 attention on GPU tensors - no intermediate score storage.
  * Uses custom Metal kernel with bf16 I/O and f32 internal computation.
  * Returns 1 on success, 0 if tensors are not bf16, seq_k > 1024, or shaders unavailable.
  */
-int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
-                                   flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
+                                   iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /* ========================================================================
@@ -435,44 +435,44 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
  * ======================================================================== */
 
 /* BF16 AdaLN normalization */
-void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
-                               flux_gpu_tensor_t shift_bf16, flux_gpu_tensor_t scale_bf16,
+void iris_gpu_adaln_norm_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                               iris_gpu_tensor_t shift_bf16, iris_gpu_tensor_t scale_bf16,
                                int seq, int hidden, float eps);
 
 /* BF16 QK RMSNorm (in-place) */
-void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
-                                flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
+void iris_gpu_qk_rms_norm_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                iris_gpu_tensor_t q_weight_bf16, iris_gpu_tensor_t k_weight_bf16,
                                 int seq, int heads, int head_dim, float eps);
 
 /* BF16 per-head RMSNorm (single tensor, for GQA with different Q/K head counts) */
-int flux_gpu_head_rms_norm_bf16(flux_gpu_tensor_t x, flux_gpu_tensor_t weight_bf16,
+int iris_gpu_head_rms_norm_bf16(iris_gpu_tensor_t x, iris_gpu_tensor_t weight_bf16,
                                  int seq, int heads, int head_dim, float eps);
 
 /* BF16 RMS Norm: out = rms_norm(x) * weight */
-void flux_gpu_rms_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
-                             flux_gpu_tensor_t weight, int seq, int hidden, float eps);
+void iris_gpu_rms_norm_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                             iris_gpu_tensor_t weight, int seq, int hidden, float eps);
 
 /* BF16 element-wise add: out = a + b */
-void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
+void iris_gpu_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tensor_t b, int n);
 
 /* BF16 buffer copy (GPU blit): dst = src */
-void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+void iris_gpu_copy_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 
 /* BF16 SiLU multiply: gate = silu(gate) * up */
-void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+void iris_gpu_silu_mul_bf16(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 
 /* BF16 Gated add: out += gate * proj */
-void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
-                              flux_gpu_tensor_t proj, int seq, int hidden);
+void iris_gpu_gated_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t gate_bf16,
+                              iris_gpu_tensor_t proj, int seq, int hidden);
 
 /* BF16 RoPE unified (text + image) */
-void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                  const float *txt_cos, const float *txt_sin,
                                  const float *img_cos, const float *img_sin,
                                  int seq, int img_offset, int heads, int head_dim, int axis_dim);
 
 /* BF16 RoPE 2D (single stream) */
-void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
+void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
                             const float *cos_freq, const float *sin_freq,
                             int seq, int heads, int head_dim, int axis_dim);
 
@@ -484,8 +484,8 @@ void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
  * Supports GQA where num_q_heads > num_kv_heads.
  * Returns 1 on success, 0 on failure.
  */
-int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
-                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                     const int *attention_mask,
                                     int seq, int num_q_heads, int num_kv_heads,
                                     int head_dim, float scale);
@@ -495,29 +495,29 @@ int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
  * K: [seq, num_kv_heads * head_dim] (bf16) - modified in-place
  * cos_cache, sin_cache: [seq, head_dim/2] (f32) - precomputed
  */
-void flux_gpu_rope_text_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                               const float *cos_cache, const float *sin_cache,
                               int seq, int num_q_heads, int num_kv_heads, int head_dim);
 
 /* Concatenate two bf16 sequences along seq dimension */
-void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
-                               flux_gpu_tensor_t a, flux_gpu_tensor_t b,
+void iris_gpu_concat_seq_bf16(iris_gpu_tensor_t out,
+                               iris_gpu_tensor_t a, iris_gpu_tensor_t b,
                                int seq_a, int seq_b, int hidden);
 
 /* Slice a bf16 sequence along seq dimension */
-void flux_gpu_slice_seq_bf16(flux_gpu_tensor_t out,
-                              flux_gpu_tensor_t in,
+void iris_gpu_slice_seq_bf16(iris_gpu_tensor_t out,
+                              iris_gpu_tensor_t in,
                               int seq_out, int hidden, int start);
 
 /* BF16 Split QKV+MLP output */
-void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
-                                  flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
-                                  flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+void iris_gpu_split_qkv_mlp_bf16(iris_gpu_tensor_t fused,
+                                  iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
+                                  iris_gpu_tensor_t gate, iris_gpu_tensor_t up,
                                   int seq, int hidden, int mlp_hidden);
 
 /* BF16 Concat attention + MLP outputs */
-void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
-                                    flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+void iris_gpu_concat_attn_mlp_bf16(iris_gpu_tensor_t attn, iris_gpu_tensor_t mlp,
+                                    iris_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
 
 /* ========================================================================
  * F32 VAE Tensor Operations - GPU-resident VAE decoder operations
@@ -528,18 +528,18 @@ void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp
  * gamma, beta: [channels] (CPU f32 pointers, cached on GPU)
  * num_groups: number of groups (e.g. 32)
  */
-void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_group_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                               const float *gamma, const float *beta,
                               int batch, int channels, int spatial, int num_groups, float eps);
 
 /* Swish/SiLU on f32 GPU tensor: out = x * sigmoid(x), in-place safe */
-void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n);
+void iris_gpu_swish_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x, int n);
 
 /* Element-wise add on f32 GPU tensors: out = a + b, in-place safe */
-void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
+void iris_gpu_add_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tensor_t b, int n);
 
 /* Nearest neighbor 2x upsample on f32 GPU tensor: [1, C, H, W] -> [1, C, 2H, 2W] (batch=1) */
-flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_upsample_nearest_2x_f32(iris_gpu_tensor_t x,
                                                      int channels, int H, int W);
 
 /* Conv2d on f32 GPU tensors using MPSGraph.
@@ -548,57 +548,57 @@ flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
  * bias: CPU f32 [out_ch] (cached on GPU)
  * Returns new GPU tensor [batch, out_ch, outH, outW] or NULL on failure.
  */
-flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        const float *weight, const float *bias,
                                        int batch, int in_ch, int out_ch,
                                        int H, int W, int kH, int kW,
                                        int stride, int padding);
 
 /* GPU blit copy for f32 tensors */
-void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 
 /* Transpose channel/spatial dims of a batched f32 GPU tensor.
  * to_nhwc=1: [B,C,S]->[B,S,C];  to_nhwc=0: [B,S,C]->[B,C,S]
  * Returns new tensor (caller must free) or NULL on failure. */
-flux_gpu_tensor_t flux_gpu_transpose_cs(flux_gpu_tensor_t src,
+iris_gpu_tensor_t iris_gpu_transpose_cs(iris_gpu_tensor_t src,
                                          int batch, int channels, int spatial,
                                          int to_nhwc);
 
 /* GPU blit copy for f32 tensors with element offsets */
-void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
-                               flux_gpu_tensor_t src, size_t src_offset,
+void iris_gpu_copy_region_f32(iris_gpu_tensor_t dst, size_t dst_offset,
+                               iris_gpu_tensor_t src, size_t src_offset,
                                size_t n);
 
 /* Convert f32 GPU tensor to bf16 (returns new tensor) */
-flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor);
+iris_gpu_tensor_t iris_gpu_tensor_f32_to_bf16(iris_gpu_tensor_t f32_tensor);
 
 /* Convert bf16 GPU tensor to f32 (returns new tensor) */
-flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor);
+iris_gpu_tensor_t iris_gpu_tensor_bf16_to_f32(iris_gpu_tensor_t bf16_tensor);
 
 /* Convert f32 → bf16 into pre-allocated tensor (no alloc, batch-safe) */
-int flux_gpu_convert_f32_to_bf16_into(flux_gpu_tensor_t bf16_out, flux_gpu_tensor_t f32_in);
+int iris_gpu_convert_f32_to_bf16_into(iris_gpu_tensor_t bf16_out, iris_gpu_tensor_t f32_in);
 
 /* Convert bf16 → f32 into pre-allocated tensor (no alloc, batch-safe) */
-int flux_gpu_convert_bf16_to_f32_into(flux_gpu_tensor_t f32_out, flux_gpu_tensor_t bf16_in);
+int iris_gpu_convert_bf16_to_f32_into(iris_gpu_tensor_t f32_out, iris_gpu_tensor_t bf16_in);
 
 /* BF16 native linear layer (all bf16) */
-flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16_native(iris_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim);
 
 /* BF16 native linear layer writing into a pre-allocated bf16 output tensor.
  * Returns 1 on success, 0 on failure. */
-int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
-                                     flux_gpu_tensor_t x,
+int iris_gpu_linear_bf16_native_into(iris_gpu_tensor_t out,
+                                     iris_gpu_tensor_t x,
                                      const uint16_t *W_bf16,
                                      int seq_len, int in_dim, int out_dim);
 
 /* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
-void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+void iris_gpu_transpose_to_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
                                        int seq, int heads, int head_dim);
 
 /* BF16 Transpose for attention output: [heads, seq, head_dim] -> [seq, heads*head_dim] */
-void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+void iris_gpu_transpose_from_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
                                          int seq, int heads, int head_dim);
 
 /*
@@ -612,19 +612,19 @@ void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t 
  * This does: out = softmax(Q @ K^T * scale) @ V
  * Softmax is done on CPU (between two GPU batches).
  */
-void flux_metal_attention(float *out,
+void iris_metal_attention(float *out,
                           const float *Q, const float *K, const float *V,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
 
 /*
- * Half-precision version of flux_metal_attention.
+ * Half-precision version of iris_metal_attention.
  * Same interface but uses f16 MPS matmuls internally for ~2x bandwidth savings.
  * Takes f32 inputs, converts to f16, computes attention, converts back to f32.
  * scores_scratch is unused (kept for interface compatibility).
  */
-void flux_metal_attention_bf16(float *out,
+void iris_metal_attention_bf16(float *out,
                                const float *Q, const float *K, const float *V,
                                float *scores_scratch,
                                int heads, int seq_q, int seq_k, int head_dim,
@@ -645,7 +645,7 @@ void flux_metal_attention_bf16(float *out,
  * All operations are fused in a single GPU kernel.
  * Returns 1 on success, 0 on failure (falls back to CPU).
  */
-int flux_metal_causal_attention(float *out,
+int iris_metal_causal_attention(float *out,
                                  const float *Q, const float *K, const float *V,
                                  const int *attention_mask,
                                  int seq, int num_q_heads, int num_kv_heads,
@@ -660,7 +660,7 @@ int flux_metal_causal_attention(float *out,
  * All operations are fused in a single GPU kernel.
  * Returns 1 on success, 0 on failure (falls back to CPU).
  */
-int flux_metal_attention_fused(float *out,
+int iris_metal_attention_fused(float *out,
                                const float *Q, const float *K, const float *V,
                                int seq_q, int seq_k, int num_heads, int head_dim,
                                float scale);
@@ -671,17 +671,17 @@ int flux_metal_attention_fused(float *out,
 
 /*
  * Initialize compute shaders from .metal file.
- * Called automatically by flux_metal_init() if shader file exists.
+ * Called automatically by iris_metal_init() if shader file exists.
  * Returns 1 on success, 0 on failure.
  */
-int flux_metal_init_shaders(void);
+int iris_metal_init_shaders(void);
 
 /*
  * GPU-accelerated RMSNorm.
  * out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]
  * x: [seq_len, hidden], weight: [hidden], out: [seq_len, hidden]
  */
-void flux_metal_rms_norm(float *out, const float *x, const float *weight,
+void iris_metal_rms_norm(float *out, const float *x, const float *weight,
                          int seq_len, int hidden, float eps);
 
 /*
@@ -690,7 +690,7 @@ void flux_metal_rms_norm(float *out, const float *x, const float *weight,
  * q, k: [seq, heads*head_dim] (modified in-place)
  * q_weight, k_weight: [head_dim]
  */
-void flux_metal_qk_rms_norm(float *q, float *k,
+void iris_metal_qk_rms_norm(float *q, float *k,
                             const float *q_weight, const float *k_weight,
                             int seq, int heads, int head_dim, float eps);
 
@@ -699,7 +699,7 @@ void flux_metal_qk_rms_norm(float *q, float *k,
  * out = (1 + scale) * layernorm(x) + shift
  * x: [seq_len, hidden], shift/scale: [hidden]
  */
-void flux_metal_adaln_norm(float *out, const float *x,
+void iris_metal_adaln_norm(float *out, const float *x,
                            const float *shift, const float *scale,
                            int seq_len, int hidden, float eps);
 
@@ -707,54 +707,54 @@ void flux_metal_adaln_norm(float *out, const float *x,
  * GPU-accelerated SiLU activation (in-place).
  * x = x * sigmoid(x)
  */
-void flux_metal_silu(float *x, int n);
+void iris_metal_silu(float *x, int n);
 
 /*
  * GPU-accelerated SiLU with multiply (SwiGLU style, in-place).
  * gate = silu(gate) * up
  */
-void flux_metal_silu_mul(float *gate, const float *up, int n);
+void iris_metal_silu_mul(float *gate, const float *up, int n);
 
 /*
  * GPU-accelerated softmax (row-wise, in-place).
  * x: [rows, cols], softmax applied to each row
  */
-void flux_metal_softmax(float *x, int rows, int cols);
+void iris_metal_softmax(float *x, int rows, int cols);
 
 /*
  * GPU-accelerated 2D RoPE (in-place).
  * x: [seq, heads*head_dim]
  * cos_freq, sin_freq: [seq, head_dim]
  */
-void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
+void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                         int seq, int heads, int head_dim, int axis_dim);
 
 /*
  * Check if compute shaders are available.
  */
-int flux_metal_shaders_available(void);
+int iris_metal_shaders_available(void);
 
 /*
  * Pre-warm the bf16→f16 conversion cache for a weight tensor.
  * Call this during model loading to avoid conversion overhead during inference.
  * This converts bf16 weights to f16 and caches the result.
  */
-void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
+void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 
 /*
  * Pre-warm the bf16 buffer cache for a weight tensor.
  * Copies bf16 data to a Metal GPU buffer so the first matmul call doesn't
  * pay the buffer creation cost.
  */
-void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
+void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
 
 /*
  * Parallel BF16 MTLBuffer creation for bulk warmup.
  * Creates Metal buffers for all ptrs[0..n-1] concurrently using GCD,
  * then inserts all into the BF16 cache under a single mutex lock.
- * Use instead of calling flux_metal_warmup_bf16_buffer() in a loop.
+ * Use instead of calling iris_metal_warmup_bf16_buffer() in a loop.
  */
-void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
+void iris_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
                                               const size_t *counts, int n);
 
 /* ========================================================================
@@ -764,21 +764,21 @@ void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
  * bf16 pipeline. All operations keep data in bf16
  * with f32 accumulation internally for numerical stability.
  *
- * To use this API from C code, include flux_metal.h and link with flux_metal.m
- * The MTLBuffer pointers should be obtained from flux_gpu_tensor via
- * flux_gpu_tensor_get_buffer() or created directly using Metal API.
+ * To use this API from C code, include iris_metal.h and link with iris_metal.m
+ * The MTLBuffer pointers should be obtained from iris_gpu_tensor via
+ * iris_gpu_tensor_get_buffer() or created directly using Metal API.
  * ======================================================================== */
 
 /*
  * Check if bf16 pipeline is available (all required shaders loaded).
  */
-int flux_bf16_pipeline_available(void);
+int iris_bf16_pipeline_available(void);
 
 /*
  * Bulk bf16 to f16 conversion using GPU (CPU memory in/out).
  * Used by the converter tool for fast one-time model conversion.
  */
-void flux_metal_bf16_to_f16_bulk(const uint16_t *input, uint16_t *output, int n);
+void iris_metal_bf16_to_f16_bulk(const uint16_t *input, uint16_t *output, int n);
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -791,34 +791,34 @@ void flux_metal_bf16_to_f16_bulk(const uint16_t *input, uint16_t *output, int n)
  * V: [heads, seq_k, head_dim] (bf16)
  * out: [heads, seq_q, head_dim] (bf16)
  */
-void flux_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
+void iris_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
                                        id<MTLBuffer> bufV, id<MTLBuffer> bufOut,
                                        int heads, int seq_q, int seq_k, int head_dim,
                                        float scale);
 
 /* Convert f32 GPU buffer to bf16 */
-void flux_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n);
+void iris_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n);
 
 /* Convert bf16 GPU buffer to f32 */
-void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n);
+void iris_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n);
 
 /* RMSNorm on bf16 buffers */
-void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
+void iris_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
                          int seq_len, int hidden, float eps);
 
 /* QK RMSNorm on bf16 buffers (in-place) */
-void flux_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
+void iris_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
                             id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
                             int seq, int heads, int head_dim, float eps);
 
 /* SiLU on bf16 buffer (in-place) */
-void flux_bf16_silu(id<MTLBuffer> x, int n);
+void iris_bf16_silu(id<MTLBuffer> x, int n);
 
 /* SiLU with multiply on bf16 buffers: gate = silu(gate) * up */
-void flux_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n);
+void iris_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n);
 
 /* RoPE on bf16 buffer (frequencies are f32) */
-void flux_bf16_rope_unified(id<MTLBuffer> x,
+void iris_bf16_rope_unified(id<MTLBuffer> x,
                              const float *txt_cos, const float *txt_sin,
                              const float *img_cos, const float *img_sin,
                              int seq, int img_offset, int heads, int head_dim);
@@ -829,4 +829,4 @@ void flux_bf16_rope_unified(id<MTLBuffer> x,
 }
 #endif
 
-#endif /* FLUX_METAL_H */
+#endif /* IRIS_METAL_H */

@@ -24,7 +24,7 @@
 static int bf16_debug_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
-        enabled = getenv("FLUX_BF16_DEBUG") ? 1 : 0;
+        enabled = getenv("IRIS_BF16_DEBUG") ? 1 : 0;
     }
     return enabled;
 }
@@ -67,13 +67,13 @@ static int run_causal_mpsgraph_f32(float *out, const float *Q, const float *K,
                                     const float *V, int seq, int num_q_heads,
                                     int num_kv_heads, int head_dim);
 
-/* BF16 causal SDPA graph cache — used by flux_gpu_causal_attention_bf16 for seq > 512.
+/* BF16 causal SDPA graph cache — used by iris_gpu_causal_attention_bf16 for seq > 512.
  * Keeps Q/K/V as BF16 GPU tensors throughout; no CPU round-trip. */
 static causal_graph_cache_t g_causal_graph_cache_bf16[MAX_CAUSAL_GRAPH_CACHE];
 static int g_causal_graph_count_bf16 = 0;
 static pthread_mutex_t g_causal_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int run_causal_mpsgraph_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t Q,
-                                     flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+static int run_causal_mpsgraph_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t Q,
+                                     iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                      int seq, int num_q_heads, int num_kv_heads,
                                      int head_dim);
 
@@ -167,7 +167,7 @@ static pthread_mutex_t g_conv_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* ========================================================================
  * Batch Execution State
  * When in batch mode, operations are encoded but not executed until
- * flux_metal_end_batch() is called.
+ * iris_metal_end_batch() is called.
  * ======================================================================== */
 
 #define MAX_BATCH_OUTPUTS 256
@@ -491,7 +491,7 @@ static void clear_activation_pool(void) {
  * Metal Initialization
  * ======================================================================== */
 
-int flux_metal_init(void) {
+int iris_metal_init(void) {
     if (g_initialized) return 1;
 
     @autoreleasepool {
@@ -522,28 +522,28 @@ int flux_metal_init(void) {
         g_initialized = 1;
 
         /* Load compute shaders (high thresholds keep them dormant for small ops) */
-        flux_metal_init_shaders();
+        iris_metal_init_shaders();
     }
 
     return 1;
 }
 
-int flux_metal_available(void) {
+int iris_metal_available(void) {
     return g_initialized;
 }
 
 static void clear_bf16_cache(void);
 static void clear_f16_cache(void);
 static void clear_rope_cache(void);
-void flux_metal_rope_cache_begin(void);
+void iris_metal_rope_cache_begin(void);
 
-void flux_metal_cleanup(void) {
+void iris_metal_cleanup(void) {
     if (!g_initialized) return;
 
     @autoreleasepool {
         /* End any pending batch */
         if (g_in_batch) {
-            flux_metal_end_batch();
+            iris_metal_end_batch();
         }
         clear_weight_cache();
         clear_bf16_cache();
@@ -556,22 +556,22 @@ void flux_metal_cleanup(void) {
     }
 }
 
-void flux_metal_reset(void) {
+void iris_metal_reset(void) {
     if (!g_initialized) return;
 
     @autoreleasepool {
         /* Wait for any pending GPU work */
-        flux_metal_sync();
+        iris_metal_sync();
 
         /* End any pending batch */
         if (g_in_batch) {
-            flux_metal_end_batch();
+            iris_metal_end_batch();
         }
 
         /* End any pending tensor batch or chain via the public APIs
          * (they check mode flags internally and are safe to call) */
-        flux_gpu_batch_end();
-        flux_gpu_chain_end();
+        iris_gpu_batch_end();
+        iris_gpu_chain_end();
 
         /* Clear all caches */
         clear_weight_cache();
@@ -592,14 +592,14 @@ void flux_metal_reset(void) {
     }
 }
 
-void flux_metal_reset_transient(void) {
+void iris_metal_reset_transient(void) {
     if (!g_initialized) return;
 
     @autoreleasepool {
         /* Drain in-flight work and close any open batch/chain scopes. */
-        flux_gpu_sync();
-        flux_gpu_batch_end();
-        flux_gpu_chain_end();
+        iris_gpu_sync();
+        iris_gpu_batch_end();
+        iris_gpu_chain_end();
 
         /* Drop transient execution state, but keep model/weight caches hot. */
         clear_rope_cache();
@@ -613,31 +613,31 @@ void flux_metal_reset_transient(void) {
 }
 
 /* Debug: Clear only specific caches (for isolating issues) */
-void flux_metal_clear_weight_cache_only(void) {
+void iris_metal_clear_weight_cache_only(void) {
     if (!g_initialized) return;
-    flux_metal_sync();
+    iris_metal_sync();
     clear_weight_cache();
 }
 
-void flux_metal_clear_bf16_cache_only(void) {
+void iris_metal_clear_bf16_cache_only(void) {
     if (!g_initialized) return;
-    flux_metal_sync();
+    iris_metal_sync();
     clear_bf16_cache();
 }
 
-void flux_metal_clear_f16_cache_only(void) {
+void iris_metal_clear_f16_cache_only(void) {
     if (!g_initialized) return;
-    flux_metal_sync();
+    iris_metal_sync();
     clear_f16_cache();
 }
 
-void flux_metal_clear_activation_pool_only(void) {
+void iris_metal_clear_activation_pool_only(void) {
     if (!g_initialized) return;
-    flux_metal_sync();
+    iris_metal_sync();
     clear_activation_pool();
 }
 
-void flux_metal_rope_cache_begin(void) {
+void iris_metal_rope_cache_begin(void) {
     if (!g_initialized) return;
     clear_rope_cache();
 }
@@ -646,7 +646,7 @@ void flux_metal_rope_cache_begin(void) {
  * Batch Execution Functions
  * ======================================================================== */
 
-void flux_metal_begin_batch(void) {
+void iris_metal_begin_batch(void) {
     if (!g_initialized || g_in_batch) return;
 
     @autoreleasepool {
@@ -659,7 +659,7 @@ void flux_metal_begin_batch(void) {
     }
 }
 
-void flux_metal_end_batch(void) {
+void iris_metal_end_batch(void) {
     if (!g_initialized || !g_in_batch) return;
 
     @autoreleasepool {
@@ -686,7 +686,7 @@ void flux_metal_end_batch(void) {
     }
 }
 
-int flux_metal_in_batch(void) {
+int iris_metal_in_batch(void) {
     return g_in_batch;
 }
 
@@ -694,7 +694,7 @@ int flux_metal_in_batch(void) {
  * Optimized Matrix Multiplication
  * ======================================================================== */
 
-static void flux_metal_sgemm_impl(int transpose_a, int transpose_b,
+static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
                                   int M, int N, int K,
                                   float alpha,
                                   const float *A, int lda,
@@ -863,14 +863,14 @@ static void flux_metal_sgemm_impl(int transpose_a, int transpose_b,
     }
 }
 
-void flux_metal_sgemm(int transpose_a, int transpose_b,
+void iris_metal_sgemm(int transpose_a, int transpose_b,
                       int M, int N, int K,
                       float alpha,
                       const float *A, int lda,
                       const float *B, int ldb,
                       float beta,
                       float *C, int ldc) {
-    flux_metal_sgemm_impl(transpose_a, transpose_b,
+    iris_metal_sgemm_impl(transpose_a, transpose_b,
                           M, N, K,
                           alpha,
                           A, lda,
@@ -881,14 +881,14 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                           0);
 }
 
-void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
+void iris_metal_sgemm_cached(int transpose_a, int transpose_b,
                              int M, int N, int K,
                              float alpha,
                              const float *A, int lda,
                              const float *B, int ldb,
                              float beta,
                              float *C, int ldc) {
-    flux_metal_sgemm_impl(transpose_a, transpose_b,
+    iris_metal_sgemm_impl(transpose_a, transpose_b,
                           M, N, K,
                           alpha,
                           A, lda,
@@ -899,7 +899,7 @@ void flux_metal_sgemm_cached(int transpose_a, int transpose_b,
                           1);
 }
 
-void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
+void iris_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
                                   int M, int N, int K,
                                   float alpha,
                                   const float *A, int lda,
@@ -907,7 +907,7 @@ void flux_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
                                   float beta,
                                   float *C, int ldc,
                                   const float *bias) {
-    flux_metal_sgemm_impl(transpose_a, transpose_b,
+    iris_metal_sgemm_impl(transpose_a, transpose_b,
                           M, N, K,
                           alpha,
                           A, lda,
@@ -1204,13 +1204,13 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
  * Pre-warm the bf16→f16 cache for a weight tensor.
  * This triggers the conversion and caching so it doesn't happen during inference.
  */
-void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
+void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
     if (!g_initialized || !bf16_weights || num_elements == 0) return;
     /* Just calling this function triggers the conversion and caching */
     (void)get_cached_bf16_as_f16_buffer(bf16_weights, num_elements);
 }
 
-void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements) {
+void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements) {
     if (!g_initialized || !bf16_weights || num_elements == 0) return;
     (void)get_cached_bf16_buffer(bf16_weights, num_elements);
 }
@@ -1222,7 +1222,7 @@ void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elem
  *
  * ARC note: bufs[] stores void* with manual +1 retain (__bridge_retained) so
  * buffers survive past the dispatch block. __bridge_transfer reclaims them. */
-void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
+void iris_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
                                               const size_t *counts, int n) {
     if (!g_initialized || n <= 0) return;
 
@@ -1273,7 +1273,7 @@ void flux_metal_warmup_bf16_buffers_parallel(const uint16_t **ptrs,
  * This provides 2x memory bandwidth for weights.
  * Note: bf16 is converted to f16 because MPS only supports mixed f32/f16 matmul.
  */
-void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
+void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
                            int M, int N, int K,
                            float alpha,
                            const float *A, int lda,
@@ -1485,7 +1485,7 @@ static conv2d_graph_cache_t *get_conv2d_graph_cache(int batch, int in_ch, int ou
     return entry;
 }
 
-int flux_metal_conv2d(float *out, const float *in,
+int iris_metal_conv2d(float *out, const float *in,
                       const float *weight, const float *bias,
                       int batch, int in_ch, int out_ch,
                       int H, int W, int kH, int kW,
@@ -1569,7 +1569,7 @@ int flux_metal_conv2d(float *out, const float *in,
     }
 }
 
-void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
+void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
                             int M, int N, int K,
                             float alpha,
                             const float *A, int lda, int stride_a,
@@ -1658,15 +1658,15 @@ void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
     }
 }
 
-void flux_metal_sync(void) {
+void iris_metal_sync(void) {
     /* This is a legacy no-op function. Actual GPU synchronization is handled by:
-     * - flux_gpu_sync() for tensor operations (g_tensor_cmd)
-     * - flux_metal_end_batch() for batch operations (g_batch_cmd)
-     * - flux_gpu_chain_end() for chain operations (g_chain_cmd)
+     * - iris_gpu_sync() for tensor operations (g_tensor_cmd)
+     * - iris_metal_end_batch() for batch operations (g_batch_cmd)
+     * - iris_gpu_chain_end() for chain operations (g_chain_cmd)
      * These are called explicitly where needed (e.g., at end of transformer forward). */
 }
 
-void flux_metal_wait_idle(void) {
+void iris_metal_wait_idle(void) {
     if (!g_initialized || !g_queue) return;
 
     @autoreleasepool {
@@ -1677,7 +1677,7 @@ void flux_metal_wait_idle(void) {
     }
 }
 
-size_t flux_metal_memory_used(void) {
+size_t iris_metal_memory_used(void) {
     if (!g_initialized || !g_device) return 0;
     return [g_device currentAllocatedSize];
 }
@@ -1693,7 +1693,7 @@ size_t flux_metal_memory_used(void) {
  * scores_scratch: [heads * seq_q * seq_k] (unused when GPU softmax available)
  * out: [heads, seq_q, head_dim]
  */
-void flux_metal_attention(float *out,
+void iris_metal_attention(float *out,
                           const float *Q, const float *K, const float *V,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
@@ -1812,9 +1812,9 @@ void flux_metal_attention(float *out,
 
             /* Copy, softmax on CPU, copy back */
             memcpy(scores_scratch, [bufScores contents], sizeScores);
-            extern void flux_softmax(float *x, int rows, int cols);
+            extern void iris_softmax(float *x, int rows, int cols);
             for (int h = 0; h < heads; h++) {
-                flux_softmax(scores_scratch + h * scores_stride, seq_q, seq_k);
+                iris_softmax(scores_scratch + h * scores_stride, seq_q, seq_k);
             }
             memcpy([bufScores contents], scores_scratch, sizeScores);
 
@@ -1885,18 +1885,18 @@ void flux_metal_attention(float *out,
 /* ========================================================================
  * Half-Precision Attention with Custom Metal Compute Shaders
  *
- * Same interface as flux_metal_attention but uses half-precision compute
+ * Same interface as iris_metal_attention but uses half-precision compute
  * shaders with f32 accumulation. This provides
  * ~2x memory bandwidth savings while maintaining numerical stability.
  *
- * Layout (same as flux_metal_attention):
+ * Layout (same as iris_metal_attention):
  * Q: [heads, seq_q, head_dim]
  * K: [heads, seq_k, head_dim]
  * V: [heads, seq_k, head_dim]
  * scores_scratch: unused (kept for interface compatibility)
  * out: [heads, seq_q, head_dim]
  * ======================================================================== */
-void flux_metal_attention_bf16(float *out,
+void iris_metal_attention_bf16(float *out,
                                const float *Q, const float *K, const float *V,
                                float *scores_scratch,
                                int heads, int seq_q, int seq_k, int head_dim,
@@ -1905,7 +1905,7 @@ void flux_metal_attention_bf16(float *out,
     if (!g_shaders_initialized || !g_bmm_half_qkt_pipeline ||
         !g_bmm_half_sv_pipeline || !g_softmax_half_pipeline) {
         /* Fall back to f32 attention if shaders not available */
-        flux_metal_attention(out, Q, K, V, scores_scratch,
+        iris_metal_attention(out, Q, K, V, scores_scratch,
                             heads, seq_q, seq_k, head_dim, scale);
         return;
     }
@@ -2055,7 +2055,7 @@ void flux_metal_attention_bf16(float *out,
  * Q, K, V: GPU buffers containing bf16 data [heads, seq_q/seq_k, head_dim]
  * out: GPU buffer to write bf16 result [heads, seq_q, head_dim]
  * ======================================================================== */
-void flux_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
+void iris_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
                                        id<MTLBuffer> bufV, id<MTLBuffer> bufOut,
                                        int heads, int seq_q, int seq_k, int head_dim,
                                        float scale) {
@@ -2158,7 +2158,7 @@ void flux_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
  * ======================================================================== */
 
 /* Check if bf16 pipeline is available */
-int flux_bf16_pipeline_available(void) {
+int iris_bf16_pipeline_available(void) {
     int ok = g_shaders_initialized &&
              g_rms_norm_bf16_pipeline &&
              g_qk_rms_norm_bf16_pipeline &&
@@ -2207,7 +2207,7 @@ int flux_bf16_pipeline_available(void) {
 }
 
 /* Convert f32 tensor to bf16 on GPU */
-void flux_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n) {
+void iris_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n) {
     if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return;
 
     @autoreleasepool {
@@ -2231,7 +2231,7 @@ void flux_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output
 }
 
 /* Convert bf16 tensor to f32 on GPU */
-void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n) {
+void iris_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n) {
     if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return;
 
     @autoreleasepool {
@@ -2255,7 +2255,7 @@ void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> outpu
 }
 
 /* RMSNorm on bf16 tensors */
-void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
+void iris_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
                          int seq_len, int hidden, float eps) {
     if (!g_shaders_initialized || !g_rms_norm_bf16_pipeline) return;
 
@@ -2281,7 +2281,7 @@ void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight
 }
 
 /* QK RMSNorm on bf16 tensors (in-place) */
-void flux_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
+void iris_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
                             id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
                             int seq, int heads, int head_dim, float eps) {
     if (!g_shaders_initialized || !g_qk_rms_norm_bf16_pipeline) return;
@@ -2309,7 +2309,7 @@ void flux_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
 }
 
 /* SiLU on bf16 tensors (in-place) */
-void flux_bf16_silu(id<MTLBuffer> x, int n) {
+void iris_bf16_silu(id<MTLBuffer> x, int n) {
     if (!g_shaders_initialized || !g_silu_bf16_pipeline) return;
 
     @autoreleasepool {
@@ -2332,7 +2332,7 @@ void flux_bf16_silu(id<MTLBuffer> x, int n) {
 }
 
 /* SiLU with multiply on bf16 tensors: gate = silu(gate) * up */
-void flux_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n) {
+void iris_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n) {
     if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;
 
     @autoreleasepool {
@@ -2356,7 +2356,7 @@ void flux_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n) {
 }
 
 /* RoPE on bf16 tensors */
-void flux_bf16_rope_unified(id<MTLBuffer> x,
+void iris_bf16_rope_unified(id<MTLBuffer> x,
                              const float *txt_cos, const float *txt_sin,
                              const float *img_cos, const float *img_sin,
                              int seq, int img_offset, int heads, int head_dim) {
@@ -2406,7 +2406,7 @@ void flux_bf16_rope_unified(id<MTLBuffer> x,
  * ======================================================================== */
 
 /* Internal tensor structure */
-struct flux_gpu_tensor {
+struct iris_gpu_tensor {
     id<MTLBuffer> buffer;
     size_t num_elements;
     int has_pending_work;  /* Flag to track if GPU work is pending */
@@ -2430,7 +2430,7 @@ static int tensor_chain_active(void) {
     return g_chain_mode;
 }
 
-flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements) {
+iris_gpu_tensor_t iris_gpu_tensor_create(const float *data, size_t num_elements) {
     if (!g_initialized || !data || num_elements == 0) return NULL;
 
     @autoreleasepool {
@@ -2444,7 +2444,7 @@ flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements)
         memcpy([buf contents], data, size);
 
         /* Allocate tensor structure */
-        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
         if (!tensor) {
             pool_release_buffer(buf);
             return NULL;
@@ -2460,7 +2460,7 @@ flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements)
     }
 }
 
-flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
+iris_gpu_tensor_t iris_gpu_tensor_alloc(size_t num_elements) {
     if (!g_initialized || num_elements == 0) return NULL;
 
     @autoreleasepool {
@@ -2473,7 +2473,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
         memset([buf contents], 0, size);
 
         /* Allocate tensor structure */
-        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
         if (!tensor) {
             pool_release_buffer(buf);
             return NULL;
@@ -2490,7 +2490,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
 }
 
 /* Allocate f16 GPU tensor (half the memory of f32) */
-flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements) {
+iris_gpu_tensor_t iris_gpu_tensor_alloc_f16(size_t num_elements) {
     if (!g_initialized || num_elements == 0) return NULL;
 
     @autoreleasepool {
@@ -2503,7 +2503,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements) {
             memset([buf contents], 0, size);
         }
 
-        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
         if (!tensor) {
             pool_release_buffer(buf);
             return NULL;
@@ -2519,7 +2519,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements) {
     }
 }
 
-flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
+iris_gpu_tensor_t iris_gpu_tensor_alloc_persistent(size_t num_elements) {
     if (!g_initialized || num_elements == 0) return NULL;
 
     @autoreleasepool {
@@ -2535,7 +2535,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
         }
 
         /* Allocate tensor structure */
-        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
         if (!tensor) {
             return NULL;
         }
@@ -2550,18 +2550,18 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
     }
 }
 
-void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent) {
+void iris_gpu_tensor_set_persistent(iris_gpu_tensor_t tensor, int persistent) {
     if (tensor) {
         tensor->persistent = persistent;
     }
 }
 
-void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out) {
+void iris_gpu_tensor_read(iris_gpu_tensor_t tensor, float *out) {
     if (!tensor || !out) return;
 
     /* If there's pending work, sync first */
     if (tensor->has_pending_work) {
-        flux_gpu_sync();
+        iris_gpu_sync();
         tensor->has_pending_work = 0;
     }
 
@@ -2570,12 +2570,12 @@ void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out) {
     memcpy(out, [tensor->buffer contents], size);
 }
 
-void flux_gpu_tensor_write(flux_gpu_tensor_t tensor, const float *data) {
+void iris_gpu_tensor_write(iris_gpu_tensor_t tensor, const float *data) {
     if (!tensor || !data) return;
 
     /* If there's pending work that reads this tensor, sync first */
     if (tensor->has_pending_work) {
-        flux_gpu_sync();
+        iris_gpu_sync();
         tensor->has_pending_work = 0;
     }
 
@@ -2585,12 +2585,12 @@ void flux_gpu_tensor_write(flux_gpu_tensor_t tensor, const float *data) {
     memcpy([tensor->buffer contents], data, size);
 }
 
-float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor) {
+float *iris_gpu_tensor_data(iris_gpu_tensor_t tensor) {
     if (!tensor) return NULL;
     return (float *)[tensor->buffer contents];
 }
 
-void flux_gpu_tensor_free(flux_gpu_tensor_t tensor) {
+void iris_gpu_tensor_free(iris_gpu_tensor_t tensor) {
     if (!tensor) return;
 
     if (tensor->persistent) {
@@ -2605,24 +2605,24 @@ void flux_gpu_tensor_free(flux_gpu_tensor_t tensor) {
     free(tensor);
 }
 
-size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor) {
+size_t iris_gpu_tensor_size(iris_gpu_tensor_t tensor) {
     if (!tensor) return 0;
     return tensor->num_elements;
 }
 
 /* Get the underlying Metal buffer from a GPU tensor (for use with bf16 API) */
-id<MTLBuffer> flux_gpu_tensor_get_buffer(flux_gpu_tensor_t tensor) {
+id<MTLBuffer> iris_gpu_tensor_get_buffer(iris_gpu_tensor_t tensor) {
     if (!tensor) return nil;
     return tensor->buffer;
 }
 
 /* Check if tensor is bf16/f16 format */
-int flux_gpu_tensor_is_f16(flux_gpu_tensor_t tensor) {
+int iris_gpu_tensor_is_f16(iris_gpu_tensor_t tensor) {
     if (!tensor) return 0;
     return tensor->is_f16;
 }
 
-void flux_gpu_sync(void) {
+void iris_gpu_sync(void) {
     if (!g_initialized) return;
 
     @autoreleasepool {
@@ -2644,7 +2644,7 @@ void flux_gpu_sync(void) {
     }
 }
 
-void flux_gpu_batch_begin(void) {
+void iris_gpu_batch_begin(void) {
     if (!g_initialized || g_tensor_batch_mode) return;
 
     @autoreleasepool {
@@ -2657,7 +2657,7 @@ void flux_gpu_batch_begin(void) {
     }
 }
 
-void flux_gpu_batch_end(void) {
+void iris_gpu_batch_end(void) {
     if (!g_initialized || !g_tensor_batch_mode) return;
 
     @autoreleasepool {
@@ -2677,7 +2677,7 @@ void flux_gpu_batch_end(void) {
  * Operation Chain API - Keep data on GPU between operations
  * ======================================================================== */
 
-void flux_gpu_chain_begin(void) {
+void iris_gpu_chain_begin(void) {
     if (!g_initialized || g_chain_mode) return;
 
     @autoreleasepool {
@@ -2689,7 +2689,7 @@ void flux_gpu_chain_begin(void) {
     }
 }
 
-void flux_gpu_chain_end(void) {
+void iris_gpu_chain_end(void) {
     if (!g_initialized || !g_chain_mode) return;
 
     @autoreleasepool {
@@ -2703,7 +2703,7 @@ void flux_gpu_chain_end(void) {
     }
 }
 
-int flux_gpu_in_chain(void) {
+int iris_gpu_in_chain(void) {
     return g_chain_mode;
 }
 
@@ -2724,21 +2724,21 @@ static id<MTLCommandBuffer> get_tensor_cmd(void) {
     return [g_queue commandBuffer];
 }
 
-flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
                                    const float *W, const float *b,
                                    int seq_len, int in_dim, int out_dim) {
     if (!g_initialized || !x || !W) return NULL;
 
     @autoreleasepool {
         size_t out_elements = (size_t)seq_len * out_dim;
-        flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elements);
+        iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elements);
         if (!out) return NULL;
 
         /* Get weight buffer (cached) */
         size_t sizeW = (size_t)out_dim * in_dim * sizeof(float);
         id<MTLBuffer> bufW = get_cached_weight_buffer(W, sizeW);
         if (!bufW) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -2816,21 +2816,21 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
 }
 
 /* GPU linear with bf16 weights - returns GPU tensor (stays on GPU) */
-flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16(iris_gpu_tensor_t x,
                                         const uint16_t *W_bf16,
                                         int seq_len, int in_dim, int out_dim) {
     if (!g_initialized || !x || !W_bf16) return NULL;
 
     @autoreleasepool {
         size_t out_elements = (size_t)seq_len * out_dim;
-        flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elements);
+        iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elements);
         if (!out) return NULL;
 
         /* Get cached f16 weight buffer (bf16 converted to f16) */
         size_t numW = (size_t)out_dim * in_dim;
         id<MTLBuffer> bufW = get_cached_bf16_as_f16_buffer(W_bf16, numW);
         if (!bufW) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -2893,9 +2893,9 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
 }
 
 /* GPU linear with bf16 weights - writes to pre-allocated output tensor.
- * Same as flux_gpu_linear_bf16 but avoids allocation overhead by reusing buffers. */
-int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
-                              flux_gpu_tensor_t x,
+ * Same as iris_gpu_linear_bf16 but avoids allocation overhead by reusing buffers. */
+int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out,
+                              iris_gpu_tensor_t x,
                               const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
     if (!g_initialized || !out || !x || !W_bf16) return 0;
@@ -2964,21 +2964,21 @@ int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
 
 /* GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline
  * Uses native bf16 (MPSDataTypeBFloat16). */
-flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16_bf16out(iris_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim) {
     if (!g_initialized || !x || !W_bf16) return NULL;
 
     @autoreleasepool {
         size_t out_elements = (size_t)seq_len * out_dim;
-        flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16(out_elements);  /* Same size as bf16 */
+        iris_gpu_tensor_t out = iris_gpu_tensor_alloc_f16(out_elements);  /* Same size as bf16 */
         if (!out) return NULL;
 
         /* Get cached bf16 weight buffer (native, no conversion) */
         size_t numW = (size_t)out_dim * in_dim;
         id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
         if (!bufW) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -3050,8 +3050,8 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
  * V: [seq_k, heads * head_dim] (f16)
  * out: [seq_q, heads * head_dim] (f16)
  * ======================================================================== */
-int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
-                                flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_mps_bf16(iris_gpu_tensor_t out,
+                                iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                 int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_initialized || !out || !Q || !K || !V) return 0;
     if (!Q->is_f16 || !K->is_f16 || !V->is_f16 || !out->is_f16) return 0;  /* is_f16 means 16-bit */
@@ -3136,9 +3136,9 @@ int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
             }
 
             /* Softmax on CPU (f32 precision) */
-            extern void flux_softmax(float *x, int rows, int cols);
+            extern void iris_softmax(float *x, int rows, int cols);
             int total_rows = num_heads * seq_q;
-            flux_softmax(scores_f32, total_rows, seq_k);
+            iris_softmax(scores_f32, total_rows, seq_k);
 
             /* f32 to f16 conversion */
             for (size_t i = 0; i < scores_elements; i++) {
@@ -3216,8 +3216,8 @@ int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
  * and converts output back to f32. Provides 2x memory bandwidth savings
  * on attention matmuls while keeping the rest of the pipeline in f32.
  * ======================================================================== */
-int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
-                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_bf16(iris_gpu_tensor_t out,
+                            iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_initialized || !out || !Q || !K || !V) return 0;
 
@@ -3228,22 +3228,22 @@ int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
         size_t out_elements = (size_t)seq_q * num_heads * head_dim;
 
         /* Allocate f16 tensors */
-        flux_gpu_tensor_t q_f16 = flux_gpu_tensor_alloc_f16(q_elements);
-        flux_gpu_tensor_t k_f16 = flux_gpu_tensor_alloc_f16(k_elements);
-        flux_gpu_tensor_t v_f16 = flux_gpu_tensor_alloc_f16(v_elements);
-        flux_gpu_tensor_t out_f16 = flux_gpu_tensor_alloc_f16(out_elements);
+        iris_gpu_tensor_t q_f16 = iris_gpu_tensor_alloc_f16(q_elements);
+        iris_gpu_tensor_t k_f16 = iris_gpu_tensor_alloc_f16(k_elements);
+        iris_gpu_tensor_t v_f16 = iris_gpu_tensor_alloc_f16(v_elements);
+        iris_gpu_tensor_t out_f16 = iris_gpu_tensor_alloc_f16(out_elements);
 
         if (!q_f16 || !k_f16 || !v_f16 || !out_f16) {
-            if (q_f16) flux_gpu_tensor_free(q_f16);
-            if (k_f16) flux_gpu_tensor_free(k_f16);
-            if (v_f16) flux_gpu_tensor_free(v_f16);
-            if (out_f16) flux_gpu_tensor_free(out_f16);
+            if (q_f16) iris_gpu_tensor_free(q_f16);
+            if (k_f16) iris_gpu_tensor_free(k_f16);
+            if (v_f16) iris_gpu_tensor_free(v_f16);
+            if (out_f16) iris_gpu_tensor_free(out_f16);
             return 0;
         }
 
         /* Sync to ensure f32 tensors are ready */
         if (Q->has_pending_work || K->has_pending_work || V->has_pending_work) {
-            flux_gpu_sync();
+            iris_gpu_sync();
         }
 
         /* Convert f32 to f16 on CPU (fast on unified memory) */
@@ -3265,13 +3265,13 @@ int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
         }
 
         /* Do f16 attention */
-        int success = flux_gpu_attention_mps_bf16(out_f16, q_f16, k_f16, v_f16,
+        int success = iris_gpu_attention_mps_bf16(out_f16, q_f16, k_f16, v_f16,
                                                    seq_q, seq_k, num_heads, head_dim, scale);
 
         if (success) {
             /* Sync and convert f16 output back to f32 */
             if (out_f16->has_pending_work) {
-                flux_gpu_sync();
+                iris_gpu_sync();
             }
 
             uint16_t *out_f16_data = (uint16_t *)[out_f16->buffer contents];
@@ -3282,10 +3282,10 @@ int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
             }
         }
 
-        flux_gpu_tensor_free(q_f16);
-        flux_gpu_tensor_free(k_f16);
-        flux_gpu_tensor_free(v_f16);
-        flux_gpu_tensor_free(out_f16);
+        iris_gpu_tensor_free(q_f16);
+        iris_gpu_tensor_free(k_f16);
+        iris_gpu_tensor_free(v_f16);
+        iris_gpu_tensor_free(out_f16);
 
         return success;
     }
@@ -3319,11 +3319,11 @@ static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_half_pipeline = nil;
 /* Note: BF16 pipelines are forward-declared at top of file */
 
-int flux_metal_shaders_available(void) {
+int iris_metal_shaders_available(void) {
     return g_shaders_initialized;
 }
 
-int flux_metal_init_shaders(void) {
+int iris_metal_init_shaders(void) {
     if (g_shaders_initialized) return 1;
     if (!g_initialized) return 0;
 
@@ -3682,7 +3682,7 @@ int flux_metal_init_shaders(void) {
         }
 
         g_shaders_initialized = 1;
-        if (flux_verbose)
+        if (iris_verbose)
             fprintf(stderr, "Metal shaders: compute kernels loaded\n");
         return 1;
     }
@@ -3693,7 +3693,7 @@ static id<MTLCommandBuffer> encode_compute_shader(void) {
     return g_in_batch ? g_batch_cmd : [g_queue commandBuffer];
 }
 
-void flux_metal_rms_norm(float *out, const float *x, const float *weight,
+void iris_metal_rms_norm(float *out, const float *x, const float *weight,
                          int seq_len, int hidden, float eps) {
     if (!g_shaders_initialized || !g_rms_norm_pipeline) return;
 
@@ -3749,7 +3749,7 @@ void flux_metal_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
-void flux_metal_qk_rms_norm(float *q, float *k,
+void iris_metal_qk_rms_norm(float *q, float *k,
                             const float *q_weight, const float *k_weight,
                             int seq, int heads, int head_dim, float eps) {
     if (!g_shaders_initialized || !g_qk_rms_norm_pipeline) return;
@@ -3802,7 +3802,7 @@ void flux_metal_qk_rms_norm(float *q, float *k,
     }
 }
 
-void flux_metal_adaln_norm(float *out, const float *x,
+void iris_metal_adaln_norm(float *out, const float *x,
                            const float *shift, const float *scale,
                            int seq_len, int hidden, float eps) {
     if (!g_shaders_initialized || !g_adaln_norm_pipeline) return;
@@ -3867,7 +3867,7 @@ void flux_metal_adaln_norm(float *out, const float *x,
     }
 }
 
-void flux_metal_silu(float *x, int n) {
+void iris_metal_silu(float *x, int n) {
     if (!g_shaders_initialized || !g_silu_pipeline || n <= 0) return;
 
     @autoreleasepool {
@@ -3908,7 +3908,7 @@ void flux_metal_silu(float *x, int n) {
     }
 }
 
-void flux_metal_silu_mul(float *gate, const float *up, int n) {
+void iris_metal_silu_mul(float *gate, const float *up, int n) {
     if (!g_shaders_initialized || !g_silu_mul_pipeline || n <= 0) return;
 
     @autoreleasepool {
@@ -3958,7 +3958,7 @@ void flux_metal_silu_mul(float *gate, const float *up, int n) {
     }
 }
 
-void flux_metal_softmax(float *x, int rows, int cols) {
+void iris_metal_softmax(float *x, int rows, int cols) {
     if (!g_shaders_initialized || !g_softmax_pipeline || rows <= 0 || cols <= 0) return;
 
     @autoreleasepool {
@@ -4000,7 +4000,7 @@ void flux_metal_softmax(float *x, int rows, int cols) {
     }
 }
 
-void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
+void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                         int seq, int heads, int head_dim, int axis_dim) {
     if (!g_shaders_initialized || !g_rope_2d_pipeline) return;
 
@@ -4058,7 +4058,7 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
  * ======================================================================== */
 
 /* GPU tensor version of AdaLN normalization */
-void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_adaln_norm(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                          const float *shift, const float *scale,
                          int seq, int hidden, float eps) {
     if (!g_shaders_initialized || !g_adaln_norm_pipeline || !out || !x) return;
@@ -4109,7 +4109,7 @@ void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 }
 
 /* GPU tensor version of QK RMSNorm */
-void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_qk_rms_norm(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps) {
     if (!g_shaders_initialized || !g_qk_rms_norm_pipeline || !q || !k) return;
@@ -4154,7 +4154,7 @@ void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 /* GPU tensor version of f32 RMSNorm: out = rms_norm(x) * weight
  * Uses pool buffers (not weight cache) because callers may pass temporary
  * fused weights that change per block/step. */
-void flux_gpu_rms_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_rms_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                             const float *weight, int seq, int hidden, float eps) {
     if (!g_shaders_initialized || !g_rms_norm_pipeline || !out || !x) return;
 
@@ -4195,7 +4195,7 @@ void flux_gpu_rms_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 }
 
 /* GPU tensor version of RoPE 2D */
-void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim) {
     if (!g_shaders_initialized || !g_rope_2d_pipeline || !x) return;
 
@@ -4245,7 +4245,7 @@ void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *s
 }
 
 /* GPU tensor version of unified RoPE for text+image */
-void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                            const float *txt_cos, const float *txt_sin,
                            const float *img_cos, const float *img_sin,
                            int seq, int img_offset, int heads, int head_dim, int axis_dim) {
@@ -4336,7 +4336,7 @@ void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 }
 
 static void encode_rope_single_f32(id<MTLCommandBuffer> cmdBuffer,
-                                   flux_gpu_tensor_t x,
+                                   iris_gpu_tensor_t x,
                                    id<MTLBuffer> bufCos, id<MTLBuffer> bufSin,
                                    int seq, int heads, int head_dim) {
     if (!x) return;
@@ -4364,7 +4364,7 @@ static void encode_rope_single_f32(id<MTLCommandBuffer> cmdBuffer,
 }
 
 /* Apply single-stream RoPE to one or two f32 tensors using the same frequency table. */
-void flux_gpu_rope_single_pair_f32(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_single_pair_f32(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                    const float *cos_freq, const float *sin_freq,
                                    int seq, int heads, int head_dim) {
     if (!g_shaders_initialized || !g_rope_unified_pipeline) return;
@@ -4394,14 +4394,14 @@ void flux_gpu_rope_single_pair_f32(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 /* GPU tensor version of single-stream RoPE for f32 tensors.
  * Uses the unified RoPE shader with consecutive-pair rotation.
  * All tokens use the same cos/sin table (no text/image split). */
-void flux_gpu_rope_single_f32(flux_gpu_tensor_t x,
+void iris_gpu_rope_single_f32(iris_gpu_tensor_t x,
                                const float *cos_freq, const float *sin_freq,
                                int seq, int heads, int head_dim) {
-    flux_gpu_rope_single_pair_f32(x, NULL, cos_freq, sin_freq, seq, heads, head_dim);
+    iris_gpu_rope_single_pair_f32(x, NULL, cos_freq, sin_freq, seq, heads, head_dim);
 }
 
 /* GPU tensor version of SiLU multiply */
-void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
+void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n) {
     if (!g_shaders_initialized || !g_silu_mul_pipeline || !gate || !up) return;
 
     @autoreleasepool {
@@ -4432,8 +4432,8 @@ void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
 }
 
 /* GPU tensor version of gated add: out += gate * proj */
-void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
-                        flux_gpu_tensor_t proj, int seq, int hidden) {
+void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
+                        iris_gpu_tensor_t proj, int seq, int hidden) {
     if (!g_shaders_initialized || !g_gated_add_pipeline || !out || !proj) return;
 
     @autoreleasepool {
@@ -4476,9 +4476,9 @@ void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
 }
 
 /* Split fused QKV+MLP output into separate tensors */
-void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
-                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
-                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+void iris_gpu_split_qkv_mlp(iris_gpu_tensor_t fused,
+                            iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
+                            iris_gpu_tensor_t gate, iris_gpu_tensor_t up,
                             int seq, int hidden, int mlp_hidden) {
     if (!g_shaders_initialized || !g_split_qkv_mlp_pipeline) return;
     if (!fused || !q || !k || !v || !gate || !up) return;
@@ -4526,8 +4526,8 @@ void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
 }
 
 /* Concatenate attention and MLP outputs */
-void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
-                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
+void iris_gpu_concat_attn_mlp(iris_gpu_tensor_t attn, iris_gpu_tensor_t mlp,
+                              iris_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
     if (!g_shaders_initialized || !g_concat_attn_mlp_pipeline) return;
     if (!attn || !mlp || !out) return;
 
@@ -4566,13 +4566,13 @@ void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
 
 /* Forward declarations for f32 MPSGraph SDPA path (defined after the BF16 counterparts) */
 static int prefer_custom_attn(void);
-static int flux_gpu_attention_mpsgraph_f32(flux_gpu_tensor_t out,
-                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+static int iris_gpu_attention_mpsgraph_f32(iris_gpu_tensor_t out,
+                                            iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /* GPU tensor version of fused attention (no transpose needed) */
-int flux_gpu_attention_fused(flux_gpu_tensor_t out,
-                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_fused(iris_gpu_tensor_t out,
+                             iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_shaders_initialized || !g_attention_fused_pipeline) return 0;
     if (!out || !Q || !K || !V) return 0;
@@ -4580,7 +4580,7 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
     /* Try MPSGraph native SDPA first (Flash Attention, no seq_k limit).
      * Falls through to custom kernel only if MPSGraph is unavailable. */
     if (!prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
-        if (flux_gpu_attention_mpsgraph_f32(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
+        if (iris_gpu_attention_mpsgraph_f32(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
     }
@@ -4638,10 +4638,10 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
  * Q, K, V: [heads, seq_q/seq_k, head_dim] in bf16
  * out: [heads, seq_q, head_dim] in bf16
  */
-int flux_gpu_attention_bf16_native(flux_gpu_tensor_t out,
-                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_bf16_native(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                     int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
-    if (!flux_bf16_pipeline_available()) return 0;
+    if (!iris_bf16_pipeline_available()) return 0;
     if (!out || !Q || !K || !V) return 0;
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
@@ -4744,11 +4744,11 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
 
     /* Prefer native SDPA (flash attention) when available for long sequences.
      * Can be disabled for debugging/regression comparisons by setting:
-     *   FLUX_USE_MANUAL_SDPA=1
+     *   IRIS_USE_MANUAL_SDPA=1
      */
     static int s_force_manual_sdpa = -1;
     if (s_force_manual_sdpa < 0) {
-        s_force_manual_sdpa = getenv("FLUX_USE_MANUAL_SDPA") ? 1 : 0;
+        s_force_manual_sdpa = getenv("IRIS_USE_MANUAL_SDPA") ? 1 : 0;
     }
 
     pthread_mutex_lock(&g_sdpa_graph_mutex);
@@ -4852,7 +4852,7 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache_f32(int seq_q, int seq_k, int nu
 
     static int s_force_manual_sdpa = -1;
     if (s_force_manual_sdpa < 0) {
-        s_force_manual_sdpa = getenv("FLUX_USE_MANUAL_SDPA") ? 1 : 0;
+        s_force_manual_sdpa = getenv("IRIS_USE_MANUAL_SDPA") ? 1 : 0;
     }
 
     pthread_mutex_lock(&g_sdpa_f32_graph_mutex);
@@ -5052,8 +5052,8 @@ static linear_graph_cache_t *get_linear_graph_cache_bf16(int seq_len, int in_dim
     return entry;
 }
 
-static int flux_gpu_attention_mpsgraph_bf16(flux_gpu_tensor_t out,
-                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+static int iris_gpu_attention_mpsgraph_bf16(iris_gpu_tensor_t out,
+                                            iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_initialized || !g_device) return 0;
     if (!out || !Q || !K || !V) return 0;
@@ -5132,11 +5132,11 @@ static int flux_gpu_attention_mpsgraph_bf16(flux_gpu_tensor_t out,
     }
 }
 
-/* Float32 MPSGraph SDPA — mirrors flux_gpu_attention_mpsgraph_bf16 but uses f32 throughout.
+/* Float32 MPSGraph SDPA — mirrors iris_gpu_attention_mpsgraph_bf16 but uses f32 throughout.
  * Input: Q, K, V as f32 GPU tensors in [seq, heads*head_dim] layout.
  * Output: f32 GPU tensor [seq, heads*head_dim]. */
-static int flux_gpu_attention_mpsgraph_f32(flux_gpu_tensor_t out,
-                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+static int iris_gpu_attention_mpsgraph_f32(iris_gpu_tensor_t out,
+                                            iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_initialized || !g_device) return 0;
     if (!out || !Q || !K || !V) return 0;
@@ -5217,17 +5217,17 @@ static int flux_gpu_attention_mpsgraph_f32(flux_gpu_tensor_t out,
  * This keeps computation in threadgroup memory without materializing scores.
  */
 /* MPSGraph attention is faster than our custom Metal kernel (~20% improvement).
- * Set FLUX_USE_CUSTOM_ATTN=1 to force using the custom kernel for comparison. */
+ * Set IRIS_USE_CUSTOM_ATTN=1 to force using the custom kernel for comparison. */
 static int prefer_custom_attn(void) {
     static int pref = -1;
     if (pref < 0) {
-        pref = getenv("FLUX_USE_CUSTOM_ATTN") ? 1 : 0;
+        pref = getenv("IRIS_USE_CUSTOM_ATTN") ? 1 : 0;
     }
     return pref;
 }
 
-int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
-                                   flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
+                                   iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
     if (!g_shaders_initialized) return 0;
     if (!out || !Q || !K || !V) return 0;
@@ -5236,7 +5236,7 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
     /* Try MPSGraph attention first (faster than custom kernel).
      * Fall back to custom kernel only if MPSGraph fails or is disabled. */
     if (!prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
-        if (flux_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
+        if (iris_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
     }
@@ -5294,7 +5294,7 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
     }
 
     if (NSClassFromString(@"MPSGraph")) {
-        if (flux_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
+        if (iris_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
     }
@@ -5315,8 +5315,8 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
  * ======================================================================== */
 
 /* BF16 AdaLN: out = (1 + scale) * layernorm(x) + shift */
-void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
-                               flux_gpu_tensor_t shift_bf16, flux_gpu_tensor_t scale_bf16,
+void iris_gpu_adaln_norm_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                               iris_gpu_tensor_t shift_bf16, iris_gpu_tensor_t scale_bf16,
                                int seq, int hidden, float eps) {
     if (!g_shaders_initialized || !g_adaln_norm_bf16_pipeline) return;
     if (!out || !x || !shift_bf16 || !scale_bf16) return;
@@ -5349,8 +5349,8 @@ void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 }
 
 /* BF16 QK RMSNorm (in-place on bf16 tensors) */
-void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
-                                flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
+void iris_gpu_qk_rms_norm_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                iris_gpu_tensor_t q_weight_bf16, iris_gpu_tensor_t k_weight_bf16,
                                 int seq, int heads, int head_dim, float eps) {
     if (!g_shaders_initialized || !g_qk_rms_norm_bf16_pipeline) return;
     if (!q || !k || !q_weight_bf16 || !k_weight_bf16) return;
@@ -5389,7 +5389,7 @@ void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
  * weight: [head_dim] (bf16)
  * Returns 1 on success, 0 on failure
  */
-int flux_gpu_head_rms_norm_bf16(flux_gpu_tensor_t x, flux_gpu_tensor_t weight_bf16,
+int iris_gpu_head_rms_norm_bf16(iris_gpu_tensor_t x, iris_gpu_tensor_t weight_bf16,
                                  int seq, int heads, int head_dim, float eps) {
     if (!g_shaders_initialized || !g_head_rms_norm_bf16_pipeline) return 0;
     if (!x || !weight_bf16) return 0;
@@ -5421,8 +5421,8 @@ int flux_gpu_head_rms_norm_bf16(flux_gpu_tensor_t x, flux_gpu_tensor_t weight_bf
 }
 
 /* BF16 RMS Norm on tensors: out = rms_norm(x) * weight */
-void flux_gpu_rms_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
-                             flux_gpu_tensor_t weight, int seq, int hidden, float eps) {
+void iris_gpu_rms_norm_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                             iris_gpu_tensor_t weight, int seq, int hidden, float eps) {
     if (!g_shaders_initialized || !g_rms_norm_bf16_pipeline) return;
     if (!out || !x || !weight) return;
     if (!out->is_f16 || !x->is_f16 || !weight->is_f16) return;
@@ -5455,7 +5455,7 @@ void flux_gpu_rms_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 }
 
 /* BF16 element-wise add: out = a + b (can be in-place: out = a) */
-void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n) {
+void iris_gpu_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tensor_t b, int n) {
     if (!g_shaders_initialized || !g_add_bf16_pipeline) return;
     if (!out || !a || !b) return;
     if (!out->is_f16 || !a->is_f16 || !b->is_f16) return;
@@ -5490,7 +5490,7 @@ void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tens
 }
 
 /* BF16 buffer copy using blit encoder (efficient GPU-side memcpy) */
-void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
+void iris_gpu_copy_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n) {
     if (!g_initialized || !dst || !src || n == 0) return;
     if (!dst->is_f16 || !src->is_f16) return;
 
@@ -5515,7 +5515,7 @@ void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) 
 }
 
 /* BF16 SiLU multiply: gate = silu(gate) * up */
-void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
+void iris_gpu_silu_mul_bf16(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n) {
     if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;
     if (!gate || !up || !gate->is_f16 || !up->is_f16) return;
 
@@ -5544,8 +5544,8 @@ void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n)
 }
 
 /* BF16 Gated add: out += gate * proj */
-void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
-                              flux_gpu_tensor_t proj, int seq, int hidden) {
+void iris_gpu_gated_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t gate_bf16,
+                              iris_gpu_tensor_t proj, int seq, int hidden) {
     if (!g_shaders_initialized || !g_gated_add_bf16_pipeline) return;
     if (!out || !gate_bf16 || !proj) return;
     if (!out->is_f16 || !gate_bf16->is_f16 || !proj->is_f16) return;
@@ -5575,7 +5575,7 @@ void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
 }
 
 /* BF16 RoPE unified (text + image) */
-void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                  const float *txt_cos, const float *txt_sin,
                                  const float *img_cos, const float *img_sin,
                                  int seq, int img_offset, int heads, int head_dim, int axis_dim) {
@@ -5649,7 +5649,7 @@ void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 }
 
 /* BF16 RoPE 2D (single stream) */
-void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
+void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
                             const float *cos_freq, const float *sin_freq,
                             int seq, int heads, int head_dim, int axis_dim) {
     if (!g_shaders_initialized || !g_rope_2d_bf16_pipeline) return;
@@ -5687,8 +5687,8 @@ void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
 }
 
 /* BF16 Causal Attention with GQA support (for text encoder) */
-int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
-                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                     const int *attention_mask,
                                     int seq, int num_q_heads, int num_kv_heads,
                                     int head_dim, float scale) {
@@ -5767,7 +5767,7 @@ int flux_gpu_causal_attention_bf16(flux_gpu_tensor_t out,
 }
 
 /* BF16 RoPE for text encoder (Qwen3 style) */
-void flux_gpu_rope_text_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                               const float *cos_cache, const float *sin_cache,
                               int seq, int num_q_heads, int num_kv_heads, int head_dim) {
     if (!g_shaders_initialized || !g_rope_bf16_pipeline) return;
@@ -5813,8 +5813,8 @@ void flux_gpu_rope_text_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 }
 
 /* Concatenate two bf16 sequences along seq dimension */
-void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
-                               flux_gpu_tensor_t a, flux_gpu_tensor_t b,
+void iris_gpu_concat_seq_bf16(iris_gpu_tensor_t out,
+                               iris_gpu_tensor_t a, iris_gpu_tensor_t b,
                                int seq_a, int seq_b, int hidden) {
     if (!g_shaders_initialized || !g_concat_seq_bf16_pipeline) return;
     if (!out || !a || !b) return;
@@ -5851,8 +5851,8 @@ void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
 }
 
 /* Slice a bf16 sequence along seq dimension */
-void flux_gpu_slice_seq_bf16(flux_gpu_tensor_t out,
-                              flux_gpu_tensor_t in,
+void iris_gpu_slice_seq_bf16(iris_gpu_tensor_t out,
+                              iris_gpu_tensor_t in,
                               int seq_out, int hidden, int start) {
     if (!g_shaders_initialized || !g_slice_seq_bf16_pipeline) return;
     if (!out || !in) return;
@@ -5885,11 +5885,11 @@ void flux_gpu_slice_seq_bf16(flux_gpu_tensor_t out,
 }
 
 /* Convert f32 GPU tensor to bf16 GPU tensor */
-flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor) {
+iris_gpu_tensor_t iris_gpu_tensor_f32_to_bf16(iris_gpu_tensor_t f32_tensor) {
     if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return NULL;
     if (!f32_tensor || f32_tensor->is_f16) return NULL;
 
-    flux_gpu_tensor_t bf16_tensor = flux_gpu_tensor_alloc_f16(f32_tensor->num_elements);
+    iris_gpu_tensor_t bf16_tensor = iris_gpu_tensor_alloc_f16(f32_tensor->num_elements);
     if (!bf16_tensor) return NULL;
 
     @autoreleasepool {
@@ -5920,11 +5920,11 @@ flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor) {
 }
 
 /* Convert bf16 GPU tensor to f32 GPU tensor */
-flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
+iris_gpu_tensor_t iris_gpu_tensor_bf16_to_f32(iris_gpu_tensor_t bf16_tensor) {
     if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return NULL;
     if (!bf16_tensor || !bf16_tensor->is_f16) return NULL;
 
-    flux_gpu_tensor_t f32_tensor = flux_gpu_tensor_alloc(bf16_tensor->num_elements);
+    iris_gpu_tensor_t f32_tensor = iris_gpu_tensor_alloc(bf16_tensor->num_elements);
     if (!f32_tensor) return NULL;
 
     @autoreleasepool {
@@ -5956,7 +5956,7 @@ flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
 
 /* Convert f32 GPU tensor to bf16, writing into pre-allocated bf16 tensor.
  * No allocation, batch-mode safe. */
-int flux_gpu_convert_f32_to_bf16_into(flux_gpu_tensor_t bf16_out, flux_gpu_tensor_t f32_in) {
+int iris_gpu_convert_f32_to_bf16_into(iris_gpu_tensor_t bf16_out, iris_gpu_tensor_t f32_in) {
     if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return 0;
     if (!bf16_out || !f32_in || !bf16_out->is_f16 || f32_in->is_f16) return 0;
 
@@ -5988,7 +5988,7 @@ int flux_gpu_convert_f32_to_bf16_into(flux_gpu_tensor_t bf16_out, flux_gpu_tenso
 
 /* Convert bf16 GPU tensor to f32, writing into pre-allocated f32 tensor.
  * No allocation, batch-mode safe. */
-int flux_gpu_convert_bf16_to_f32_into(flux_gpu_tensor_t f32_out, flux_gpu_tensor_t bf16_in) {
+int iris_gpu_convert_bf16_to_f32_into(iris_gpu_tensor_t f32_out, iris_gpu_tensor_t bf16_in) {
     if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return 0;
     if (!f32_out || !bf16_in || f32_out->is_f16 || !bf16_in->is_f16) return 0;
 
@@ -6018,16 +6018,16 @@ int flux_gpu_convert_bf16_to_f32_into(flux_gpu_tensor_t f32_out, flux_gpu_tensor
     return 1;
 }
 
-flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_linear_bf16_native(iris_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim) {
     if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
 
-    flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
     if (!out) return NULL;
 
-    if (!flux_gpu_linear_bf16_native_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
-        flux_gpu_tensor_free(out);
+    if (!iris_gpu_linear_bf16_native_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
+        iris_gpu_tensor_free(out);
         return NULL;
     }
 
@@ -6035,8 +6035,8 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
 }
 
 /* MPSGraph bf16 linear writing into a pre-allocated bf16 output tensor. */
-static int flux_gpu_linear_bf16_mpsgraph_into(flux_gpu_tensor_t out,
-                                              flux_gpu_tensor_t x,
+static int iris_gpu_linear_bf16_mpsgraph_into(iris_gpu_tensor_t out,
+                                              iris_gpu_tensor_t x,
                                               const uint16_t *W_bf16,
                                               int seq_len, int in_dim, int out_dim) {
     if (!g_initialized || !out || !x || !W_bf16) return 0;
@@ -6187,8 +6187,8 @@ static int flux_gpu_linear_bf16_mpsgraph_into(flux_gpu_tensor_t out,
     return 1;
 }
 
-int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
-                                     flux_gpu_tensor_t x,
+int iris_gpu_linear_bf16_native_into(iris_gpu_tensor_t out,
+                                     iris_gpu_tensor_t x,
                                      const uint16_t *W_bf16,
                                      int seq_len, int in_dim, int out_dim) {
     if (!g_shaders_initialized || !out || !x || !W_bf16) return 0;
@@ -6197,7 +6197,7 @@ int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
 
     /* MPSGraph linear is faster than our custom kernel. */
     if (bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
-        if (flux_gpu_linear_bf16_mpsgraph_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
+        if (iris_gpu_linear_bf16_mpsgraph_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
             return 1;
         }
     }
@@ -6243,9 +6243,9 @@ int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
 }
 
 /* BF16 Split QKV+MLP: split fused output into separate tensors */
-void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
-                                  flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
-                                  flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+void iris_gpu_split_qkv_mlp_bf16(iris_gpu_tensor_t fused,
+                                  iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
+                                  iris_gpu_tensor_t gate, iris_gpu_tensor_t up,
                                   int seq, int hidden, int mlp_hidden) {
     if (!g_shaders_initialized || !g_split_qkv_mlp_bf16_pipeline) return;
     if (!fused || !q || !k || !v || !gate || !up) return;
@@ -6291,8 +6291,8 @@ void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
 }
 
 /* BF16 Concat attention + MLP outputs */
-void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
-                                    flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
+void iris_gpu_concat_attn_mlp_bf16(iris_gpu_tensor_t attn, iris_gpu_tensor_t mlp,
+                                    iris_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
     if (!g_shaders_initialized || !g_concat_attn_mlp_bf16_pipeline) return;
     if (!attn || !mlp || !out) return;
     if (!attn->is_f16 || !mlp->is_f16 || !out->is_f16) return;
@@ -6325,7 +6325,7 @@ void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp
 }
 
 /* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
-void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+void iris_gpu_transpose_to_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
                                        int seq, int heads, int head_dim) {
     if (!g_shaders_initialized || !g_transpose_to_heads_bf16_pipeline) return;
     if (!in || !out || !in->is_f16 || !out->is_f16) return;
@@ -6359,7 +6359,7 @@ void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t ou
 }
 
 /* BF16 Transpose for attention output: [heads, seq, head_dim] -> [seq, heads*head_dim] */
-void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+void iris_gpu_transpose_from_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
                                          int seq, int heads, int head_dim) {
     if (!g_shaders_initialized || !g_transpose_from_heads_bf16_pipeline) return;
     if (!in || !out || !in->is_f16 || !out->is_f16) return;
@@ -6675,8 +6675,8 @@ static causal_graph_cache_t *get_causal_sdpa_graph_bf16(int seq, int num_q_heads
 /* Run BF16 causal SDPA via MPSGraph.  Takes GPU tensors directly — no CPU
  * conversion needed.  Respects batch mode: encodes into the live command buffer
  * when batch mode is active, otherwise commits and waits synchronously. */
-static int run_causal_mpsgraph_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t Q,
-                                     flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+static int run_causal_mpsgraph_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t Q,
+                                     iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                      int seq, int num_q_heads, int num_kv_heads,
                                      int head_dim) {
     causal_graph_cache_t *entry = get_causal_sdpa_graph_bf16(seq, num_q_heads,
@@ -6728,7 +6728,7 @@ static int run_causal_mpsgraph_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t Q,
  * Fused GPU kernel that processes all heads in parallel with causal masking.
  * ======================================================================== */
 
-int flux_metal_causal_attention(float *out,
+int iris_metal_causal_attention(float *out,
                                  const float *Q, const float *K, const float *V,
                                  const int *attention_mask,
                                  int seq, int num_q_heads, int num_kv_heads,
@@ -6833,7 +6833,7 @@ int flux_metal_causal_attention(float *out,
  * Works directly on [seq, hidden] layout without transpose.
  * Returns 1 on success, 0 to fall back to CPU.
  */
-int flux_metal_attention_fused(float *out,
+int iris_metal_attention_fused(float *out,
                                const float *Q, const float *K, const float *V,
                                int seq_q, int seq_k, int num_heads, int head_dim,
                                float scale) {
@@ -6919,7 +6919,7 @@ int flux_metal_attention_fused(float *out,
  * ======================================================================== */
 
 /* GroupNorm on f32 GPU tensors */
-void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+void iris_gpu_group_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                               const float *gamma, const float *beta,
                               int batch, int channels, int spatial, int num_groups, float eps) {
     if (!g_shaders_initialized || !g_group_norm_f32_pipeline) return;
@@ -6965,7 +6965,7 @@ void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 }
 
 /* Swish/SiLU on f32 GPU tensor */
-void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n) {
+void iris_gpu_swish_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x, int n) {
     if (!g_shaders_initialized || !g_swish_f32_pipeline) return;
     if (!out || !x || n <= 0) return;
 
@@ -6996,7 +6996,7 @@ void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n) {
 }
 
 /* Element-wise add on f32 GPU tensors */
-void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n) {
+void iris_gpu_add_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tensor_t b, int n) {
     if (!g_shaders_initialized || !g_add_f32_pipeline) return;
     if (!out || !a || !b || n <= 0) return;
 
@@ -7032,13 +7032,13 @@ void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tenso
 /* Transpose channel/spatial dims of a batched f32 GPU tensor.
  * to_nhwc=1: [B,C,S]->[B,S,C];  to_nhwc=0: [B,S,C]->[B,C,S]
  * Returns new tensor (caller must free) or NULL on failure. */
-flux_gpu_tensor_t flux_gpu_transpose_cs(flux_gpu_tensor_t src,
+iris_gpu_tensor_t iris_gpu_transpose_cs(iris_gpu_tensor_t src,
                                          int batch, int channels, int spatial,
                                          int to_nhwc) {
     if (!g_shaders_initialized || !g_vae_attn_transpose_pipeline) return NULL;
     if (!src || batch <= 0 || channels <= 0 || spatial <= 0) return NULL;
 
-    flux_gpu_tensor_t dst = flux_gpu_tensor_alloc((size_t)batch * channels * spatial);
+    iris_gpu_tensor_t dst = iris_gpu_tensor_alloc((size_t)batch * channels * spatial);
     if (!dst) return NULL;
 
     @autoreleasepool {
@@ -7070,7 +7070,7 @@ flux_gpu_tensor_t flux_gpu_transpose_cs(flux_gpu_tensor_t src,
 }
 
 /* Nearest neighbor 2x upsample on f32 GPU tensor */
-flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_upsample_nearest_2x_f32(iris_gpu_tensor_t x,
                                                      int channels, int H, int W) {
     if (!g_shaders_initialized || !g_upsample_nearest_2x_f32_pipeline) return NULL;
     if (!x || channels <= 0 || H <= 0 || W <= 0) return NULL;
@@ -7078,7 +7078,7 @@ flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
     int out_h = H * 2;
     int out_w = W * 2;
     size_t out_elems = (size_t)channels * out_h * out_w;
-    flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elems);
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elems);
     if (!out) return NULL;
 
     @autoreleasepool {
@@ -7112,7 +7112,7 @@ flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
 }
 
 /* GPU blit copy for f32 tensors */
-void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
+void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n) {
     if (!g_initialized || !dst || !src || n == 0) return;
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
@@ -7134,8 +7134,8 @@ void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
 }
 
 /* GPU blit copy for f32 tensors with element offsets */
-void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
-                               flux_gpu_tensor_t src, size_t src_offset,
+void iris_gpu_copy_region_f32(iris_gpu_tensor_t dst, size_t dst_offset,
+                               iris_gpu_tensor_t src, size_t src_offset,
                                size_t n) {
     if (!g_initialized || !dst || !src || n == 0) return;
     if (dst_offset + n > dst->num_elements) return;
@@ -7162,7 +7162,7 @@ void flux_gpu_copy_region_f32(flux_gpu_tensor_t dst, size_t dst_offset,
 }
 
 /* Conv2d on f32 GPU tensors using MPSGraph within the batch system */
-flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
+iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        const float *weight, const float *bias,
                                        int batch, int in_ch, int out_ch,
                                        int H, int W, int kH, int kW,
@@ -7184,20 +7184,20 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
     size_t w_bytes = (size_t)out_ch * in_ch * kH * kW * sizeof(float);
     size_t b_bytes = (size_t)out_ch * sizeof(float);
 
-    flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elems);
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elems);
     if (!out) return NULL;
 
     @autoreleasepool {
         id<MTLBuffer> w_buf = get_cached_weight_buffer(weight, w_bytes);
         id<MTLBuffer> b_buf = get_cached_weight_buffer(bias, b_bytes);
         if (!w_buf || !b_buf) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         if (!cmdBuffer) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -7208,7 +7208,7 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
             mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
         }
         if (!mpsCmd) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -7229,7 +7229,7 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
                                                    shape:cache->outShape
                                                 dataType:MPSDataTypeFloat32];
         if (!in_data || !w_data || !b_data || !out_data) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 
@@ -7247,7 +7247,7 @@ flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
                               resultsDictionary:results
                             executionDescriptor:nil];
         } @catch (NSException *exception) {
-            flux_gpu_tensor_free(out);
+            iris_gpu_tensor_free(out);
             return NULL;
         }
 

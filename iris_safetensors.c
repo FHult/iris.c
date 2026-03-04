@@ -1,5 +1,5 @@
 /*
- * flux_safetensors.c - Safetensors file format reader implementation
+ * iris_safetensors.c - Safetensors file format reader implementation
  */
 
 #include "iris_safetensors.h"

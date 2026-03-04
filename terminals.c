@@ -215,7 +215,7 @@ int kitty_display_png(const char *path) {
     return result;
 }
 
-int kitty_display_image(const flux_image *img) {
+int kitty_display_image(const iris_image *img) {
     if (!img || !img->data) return -1;
 
     size_t data_size = (size_t)img->width * img->height * img->channels;
@@ -299,11 +299,11 @@ int iterm2_display_png(const char *path) {
  * iTerm2 requires PNG format, so we encode to PNG via a temp file.
  * This is transparent to the caller - API matches kitty_display_image().
  */
-int iterm2_display_image(const flux_image *img) {
+int iterm2_display_image(const iris_image *img) {
     if (!img || !img->data) return -1;
 
     /* Create temp file for PNG */
-    char tmppath[] = "/tmp/flux_iterm_XXXXXX.png";
+    char tmppath[] = "/tmp/iris_iterm_XXXXXX.png";
     int fd = mkstemps(tmppath, 4);
     if (fd < 0) {
         fprintf(stderr, "iterm2: cannot create temp file\n");
@@ -312,7 +312,7 @@ int iterm2_display_image(const flux_image *img) {
     close(fd);
 
     /* Save image as PNG */
-    if (flux_image_save(img, tmppath) != 0) {
+    if (iris_image_save(img, tmppath) != 0) {
         unlink(tmppath);
         return -1;
     }
@@ -342,7 +342,7 @@ int terminal_display_png(const char *path, term_graphics_proto proto) {
     }
 }
 
-int terminal_display_image(const flux_image *img, term_graphics_proto proto) {
+int terminal_display_image(const iris_image *img, term_graphics_proto proto) {
     switch (proto) {
         case TERM_PROTO_KITTY:
             return kitty_display_image(img);

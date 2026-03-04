@@ -43,13 +43,13 @@
 #define ZI_BF16_SDPA_SEQ    1024    /* Prefer bf16 SDPA at large sequence lengths */
 #define ZI_MAX_SHARDS       32
 
-/* Cumulative zImage timing counters (defined in flux_sample.c). */
-extern double flux_timing_zi_total;
-extern double flux_timing_zi_embeddings;
-extern double flux_timing_zi_noise_refiner;
-extern double flux_timing_zi_context_refiner;
-extern double flux_timing_zi_main_blocks;
-extern double flux_timing_zi_final;
+/* Cumulative zImage timing counters (defined in iris_sample.c). */
+extern double iris_timing_zi_total;
+extern double iris_timing_zi_embeddings;
+extern double iris_timing_zi_noise_refiner;
+extern double iris_timing_zi_context_refiner;
+extern double iris_timing_zi_main_blocks;
+extern double iris_timing_zi_final;
 
 static inline double zi_time_ms(void) {
     struct timespec ts;
@@ -191,22 +191,22 @@ void zi_transformer_free(zi_transformer_t *tf);
  * Pre-allocated once for max sequence length, reused across all blocks. */
 typedef struct {
     int seq, dim, ffn_dim;
-    flux_gpu_tensor_t norm;     /* [seq, dim] */
-    flux_gpu_tensor_t fused;    /* [seq, max(3*dim, 2*ffn_dim)] */
-    flux_gpu_tensor_t q;        /* [seq, dim] */
-    flux_gpu_tensor_t k;        /* [seq, dim] */
-    flux_gpu_tensor_t v;        /* [seq, dim] */
-    flux_gpu_tensor_t attn_out; /* [seq, dim] */
-    flux_gpu_tensor_t proj;     /* [seq, dim] */
-    flux_gpu_tensor_t norm2;    /* [seq, dim] */
-    flux_gpu_tensor_t gate_up;  /* [seq, ffn_dim] */
-    flux_gpu_tensor_t up;       /* [seq, ffn_dim] */
-    flux_gpu_tensor_t down;     /* [seq, dim] */
-    /* BF16 attention scratch (for SDPA path via flux_gpu_attention_fused_bf16) */
-    flux_gpu_tensor_t q_bf16;       /* [seq, dim] bf16 */
-    flux_gpu_tensor_t k_bf16;       /* [seq, dim] bf16 */
-    flux_gpu_tensor_t v_bf16;       /* [seq, dim] bf16 */
-    flux_gpu_tensor_t attn_out_bf16;/* [seq, dim] bf16 */
+    iris_gpu_tensor_t norm;     /* [seq, dim] */
+    iris_gpu_tensor_t fused;    /* [seq, max(3*dim, 2*ffn_dim)] */
+    iris_gpu_tensor_t q;        /* [seq, dim] */
+    iris_gpu_tensor_t k;        /* [seq, dim] */
+    iris_gpu_tensor_t v;        /* [seq, dim] */
+    iris_gpu_tensor_t attn_out; /* [seq, dim] */
+    iris_gpu_tensor_t proj;     /* [seq, dim] */
+    iris_gpu_tensor_t norm2;    /* [seq, dim] */
+    iris_gpu_tensor_t gate_up;  /* [seq, ffn_dim] */
+    iris_gpu_tensor_t up;       /* [seq, ffn_dim] */
+    iris_gpu_tensor_t down;     /* [seq, dim] */
+    /* BF16 attention scratch (for SDPA path via iris_gpu_attention_fused_bf16) */
+    iris_gpu_tensor_t q_bf16;       /* [seq, dim] bf16 */
+    iris_gpu_tensor_t k_bf16;       /* [seq, dim] bf16 */
+    iris_gpu_tensor_t v_bf16;       /* [seq, dim] bf16 */
+    iris_gpu_tensor_t attn_out_bf16;/* [seq, dim] bf16 */
     float *mod;                     /* [4*dim] CPU modulation scratch */
     float *fused_attn_norm;         /* [dim] CPU fused RMS weight scratch */
     float *fused_ffn_norm;          /* [dim] CPU fused RMS weight scratch */
@@ -214,21 +214,21 @@ typedef struct {
 
 static void zi_gpu_scratch_free(zi_gpu_scratch_t *s) {
     if (!s) return;
-    if (s->norm) flux_gpu_tensor_free(s->norm);
-    if (s->fused) flux_gpu_tensor_free(s->fused);
-    if (s->q) flux_gpu_tensor_free(s->q);
-    if (s->k) flux_gpu_tensor_free(s->k);
-    if (s->v) flux_gpu_tensor_free(s->v);
-    if (s->attn_out) flux_gpu_tensor_free(s->attn_out);
-    if (s->proj) flux_gpu_tensor_free(s->proj);
-    if (s->norm2) flux_gpu_tensor_free(s->norm2);
-    if (s->gate_up) flux_gpu_tensor_free(s->gate_up);
-    if (s->up) flux_gpu_tensor_free(s->up);
-    if (s->down) flux_gpu_tensor_free(s->down);
-    if (s->q_bf16) flux_gpu_tensor_free(s->q_bf16);
-    if (s->k_bf16) flux_gpu_tensor_free(s->k_bf16);
-    if (s->v_bf16) flux_gpu_tensor_free(s->v_bf16);
-    if (s->attn_out_bf16) flux_gpu_tensor_free(s->attn_out_bf16);
+    if (s->norm) iris_gpu_tensor_free(s->norm);
+    if (s->fused) iris_gpu_tensor_free(s->fused);
+    if (s->q) iris_gpu_tensor_free(s->q);
+    if (s->k) iris_gpu_tensor_free(s->k);
+    if (s->v) iris_gpu_tensor_free(s->v);
+    if (s->attn_out) iris_gpu_tensor_free(s->attn_out);
+    if (s->proj) iris_gpu_tensor_free(s->proj);
+    if (s->norm2) iris_gpu_tensor_free(s->norm2);
+    if (s->gate_up) iris_gpu_tensor_free(s->gate_up);
+    if (s->up) iris_gpu_tensor_free(s->up);
+    if (s->down) iris_gpu_tensor_free(s->down);
+    if (s->q_bf16) iris_gpu_tensor_free(s->q_bf16);
+    if (s->k_bf16) iris_gpu_tensor_free(s->k_bf16);
+    if (s->v_bf16) iris_gpu_tensor_free(s->v_bf16);
+    if (s->attn_out_bf16) iris_gpu_tensor_free(s->attn_out_bf16);
     if (s->mod) free(s->mod);
     if (s->fused_attn_norm) free(s->fused_attn_norm);
     if (s->fused_ffn_norm) free(s->fused_ffn_norm);
@@ -243,17 +243,17 @@ static int zi_gpu_scratch_init(zi_gpu_scratch_t *s, int seq, int dim, int ffn_di
     int fused_dim = 3 * dim;
     if (2 * ffn_dim > fused_dim) fused_dim = 2 * ffn_dim;
 
-    s->norm = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->fused = flux_gpu_tensor_alloc((size_t)seq * fused_dim);
-    s->q = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->k = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->v = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->attn_out = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->proj = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->norm2 = flux_gpu_tensor_alloc((size_t)seq * dim);
-    s->gate_up = flux_gpu_tensor_alloc((size_t)seq * ffn_dim);
-    s->up = flux_gpu_tensor_alloc((size_t)seq * ffn_dim);
-    s->down = flux_gpu_tensor_alloc((size_t)seq * dim);
+    s->norm = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->fused = iris_gpu_tensor_alloc((size_t)seq * fused_dim);
+    s->q = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->k = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->v = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->attn_out = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->proj = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->norm2 = iris_gpu_tensor_alloc((size_t)seq * dim);
+    s->gate_up = iris_gpu_tensor_alloc((size_t)seq * ffn_dim);
+    s->up = iris_gpu_tensor_alloc((size_t)seq * ffn_dim);
+    s->down = iris_gpu_tensor_alloc((size_t)seq * dim);
 
     if (!s->norm || !s->fused || !s->q || !s->k || !s->v || !s->attn_out ||
         !s->proj || !s->norm2 || !s->gate_up || !s->up || !s->down) {
@@ -263,10 +263,10 @@ static int zi_gpu_scratch_init(zi_gpu_scratch_t *s, int seq, int dim, int ffn_di
 
     {
         size_t qkv_elems = (size_t)seq * dim;
-        s->q_bf16 = flux_gpu_tensor_alloc_f16(qkv_elems);
-        s->k_bf16 = flux_gpu_tensor_alloc_f16(qkv_elems);
-        s->v_bf16 = flux_gpu_tensor_alloc_f16(qkv_elems);
-        s->attn_out_bf16 = flux_gpu_tensor_alloc_f16(qkv_elems);
+        s->q_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
+        s->k_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
+        s->v_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
+        s->attn_out_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
         if (!s->q_bf16 || !s->k_bf16 || !s->v_bf16 || !s->attn_out_bf16) {
             zi_gpu_scratch_free(s);
             return 0;
@@ -314,28 +314,28 @@ static uint16_t *zi_concat3_bf16(const uint16_t *a, size_t na,
  * Tries bf16 weight path first (fast), falls back to f32 weights. The "into"
  * variant avoids allocating a new tensor each call, which matters when
  * running 30+ blocks per step. */
-static int zi_gpu_linear_into_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+static int zi_gpu_linear_into_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                                    const uint16_t *W_bf16, const float *W_f32,
                                    int seq_len, int in_dim, int out_dim) {
     size_t n = (size_t)seq_len * (size_t)out_dim;
 
     if (W_bf16) {
-        if (flux_gpu_linear_bf16_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
+        if (iris_gpu_linear_bf16_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
             return 1;
         }
-        flux_gpu_tensor_t tmp_bf16 = flux_gpu_linear_bf16(x, W_bf16, seq_len, in_dim, out_dim);
+        iris_gpu_tensor_t tmp_bf16 = iris_gpu_linear_bf16(x, W_bf16, seq_len, in_dim, out_dim);
         if (tmp_bf16) {
-            flux_gpu_copy_f32(out, tmp_bf16, n);
-            flux_gpu_tensor_free(tmp_bf16);
+            iris_gpu_copy_f32(out, tmp_bf16, n);
+            iris_gpu_tensor_free(tmp_bf16);
             return 1;
         }
     }
 
     if (W_f32) {
-        flux_gpu_tensor_t tmp_f32 = flux_gpu_linear(x, W_f32, NULL, seq_len, in_dim, out_dim);
+        iris_gpu_tensor_t tmp_f32 = iris_gpu_linear(x, W_f32, NULL, seq_len, in_dim, out_dim);
         if (tmp_f32) {
-            flux_gpu_copy_f32(out, tmp_f32, n);
-            flux_gpu_tensor_free(tmp_f32);
+            iris_gpu_copy_f32(out, tmp_f32, n);
+            iris_gpu_tensor_free(tmp_f32);
             return 1;
         }
     }
@@ -348,42 +348,42 @@ static int zi_gpu_linear_into_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
  * then falls back to f32 fused attention, then tries the other precision,
  * and finally falls back to the legacy f32->f16->f32 path. This cascading
  * fallback ensures attention works at any sequence length. */
-static int zi_gpu_attention(flux_gpu_tensor_t out_f32,
-                             flux_gpu_tensor_t q_f32, flux_gpu_tensor_t k_f32, flux_gpu_tensor_t v_f32,
+static int zi_gpu_attention(iris_gpu_tensor_t out_f32,
+                             iris_gpu_tensor_t q_f32, iris_gpu_tensor_t k_f32, iris_gpu_tensor_t v_f32,
                              int seq, int n_heads, int head_dim, float attn_scale,
                              zi_gpu_scratch_t *scratch) {
     int prefer_bf16 = (seq >= ZI_BF16_SDPA_SEQ);
 
     if (prefer_bf16) {
-        if (flux_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
-            flux_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
-            flux_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
-            flux_gpu_attention_fused_bf16(scratch->attn_out_bf16,
+        if (iris_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
+            iris_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
+            iris_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
+            iris_gpu_attention_fused_bf16(scratch->attn_out_bf16,
                                           scratch->q_bf16, scratch->k_bf16, scratch->v_bf16,
                                           seq, seq, n_heads, head_dim, attn_scale) &&
-            flux_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
+            iris_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
             return 1;
         }
     }
 
-    if (flux_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
+    if (iris_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
                                  seq, seq, n_heads, head_dim, attn_scale)) {
         return 1;
     }
 
     if (!prefer_bf16) {
-        if (flux_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
-            flux_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
-            flux_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
-            flux_gpu_attention_fused_bf16(scratch->attn_out_bf16,
+        if (iris_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
+            iris_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
+            iris_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
+            iris_gpu_attention_fused_bf16(scratch->attn_out_bf16,
                                           scratch->q_bf16, scratch->k_bf16, scratch->v_bf16,
                                           seq, seq, n_heads, head_dim, attn_scale) &&
-            flux_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
+            iris_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
             return 1;
         }
     }
 
-    return flux_gpu_attention_bf16(out_f32, q_f32, k_f32, v_f32,
+    return iris_gpu_attention_bf16(out_f32, q_f32, k_f32, v_f32,
                                     seq, seq, n_heads, head_dim, attn_scale);
 }
 
@@ -487,7 +487,7 @@ static int zi_gpu_rope_cache_prepare(zi_transformer_t *tf,
 
 static void zi_warmup_bf16_weights(zi_transformer_t *tf) {
     if (!tf || !tf->use_gpu) return;
-    if (!flux_metal_available()) return;
+    if (!iris_metal_available()) return;
 
     size_t attn_elems = (size_t)tf->dim * tf->dim;
     size_t ffn_up_elems = (size_t)tf->ffn_dim * tf->dim;
@@ -504,16 +504,16 @@ static void zi_warmup_bf16_weights(zi_transformer_t *tf) {
         for (int i = 0; i < n; i++) {
             zi_block_t *b = &blocks[i];
 
-            if (b->attn_q_weight_bf16) flux_metal_warmup_bf16(b->attn_q_weight_bf16, attn_elems);
-            if (b->attn_k_weight_bf16) flux_metal_warmup_bf16(b->attn_k_weight_bf16, attn_elems);
-            if (b->attn_v_weight_bf16) flux_metal_warmup_bf16(b->attn_v_weight_bf16, attn_elems);
-            if (b->attn_out_weight_bf16) flux_metal_warmup_bf16(b->attn_out_weight_bf16, attn_elems);
-            if (b->attn_qkv_weight_bf16) flux_metal_warmup_bf16(b->attn_qkv_weight_bf16, attn_elems * 3);
+            if (b->attn_q_weight_bf16) iris_metal_warmup_bf16(b->attn_q_weight_bf16, attn_elems);
+            if (b->attn_k_weight_bf16) iris_metal_warmup_bf16(b->attn_k_weight_bf16, attn_elems);
+            if (b->attn_v_weight_bf16) iris_metal_warmup_bf16(b->attn_v_weight_bf16, attn_elems);
+            if (b->attn_out_weight_bf16) iris_metal_warmup_bf16(b->attn_out_weight_bf16, attn_elems);
+            if (b->attn_qkv_weight_bf16) iris_metal_warmup_bf16(b->attn_qkv_weight_bf16, attn_elems * 3);
 
-            if (b->ffn_w1_bf16) flux_metal_warmup_bf16(b->ffn_w1_bf16, ffn_up_elems);
-            if (b->ffn_w2_bf16) flux_metal_warmup_bf16(b->ffn_w2_bf16, ffn_down_elems);
-            if (b->ffn_w3_bf16) flux_metal_warmup_bf16(b->ffn_w3_bf16, ffn_up_elems);
-            if (b->ffn_w13_weight_bf16) flux_metal_warmup_bf16(b->ffn_w13_weight_bf16, ffn_up_elems * 2);
+            if (b->ffn_w1_bf16) iris_metal_warmup_bf16(b->ffn_w1_bf16, ffn_up_elems);
+            if (b->ffn_w2_bf16) iris_metal_warmup_bf16(b->ffn_w2_bf16, ffn_down_elems);
+            if (b->ffn_w3_bf16) iris_metal_warmup_bf16(b->ffn_w3_bf16, ffn_up_elems);
+            if (b->ffn_w13_weight_bf16) iris_metal_warmup_bf16(b->ffn_w13_weight_bf16, ffn_up_elems * 2);
         }
     }
 }
@@ -569,14 +569,14 @@ static void zi_timestep_embed(zi_transformer_t *tf, float *out, float t) {
     float *hidden = (float *)malloc(mid * sizeof(float));
 
     /* Linear 0 */
-    flux_matmul_t(hidden, sin_emb, tf->t_emb_mlp0_weight, 1, 256, mid);
+    iris_matmul_t(hidden, sin_emb, tf->t_emb_mlp0_weight, 1, 256, mid);
     for (int i = 0; i < mid; i++) hidden[i] += tf->t_emb_mlp0_bias[i];
 
     /* SiLU */
-    flux_silu(hidden, mid);
+    iris_silu(hidden, mid);
 
     /* Linear 2 */
-    flux_matmul_t(out, hidden, tf->t_emb_mlp2_weight, 1, mid, tf->adaln_dim);
+    iris_matmul_t(out, hidden, tf->t_emb_mlp2_weight, 1, mid, tf->adaln_dim);
     for (int i = 0; i < tf->adaln_dim; i++) out[i] += tf->t_emb_mlp2_bias[i];
 
     free(hidden);
@@ -698,9 +698,9 @@ static void zi_attention(float *out, const float *x,
     float *v = k + seq * dim;
 
     /* Q, K, V projections */
-    flux_matmul_t(q, x, block->attn_q_weight, seq, dim, dim);
-    flux_matmul_t(k, x, block->attn_k_weight, seq, dim, dim);
-    flux_matmul_t(v, x, block->attn_v_weight, seq, dim, dim);
+    iris_matmul_t(q, x, block->attn_q_weight, seq, dim, dim);
+    iris_matmul_t(k, x, block->attn_k_weight, seq, dim, dim);
+    iris_matmul_t(v, x, block->attn_v_weight, seq, dim, dim);
 
     /* QK normalization */
     zi_qk_norm(q, block->attn_norm_q, seq, n_heads, head_dim, ZI_NORM_EPS);
@@ -740,7 +740,7 @@ static void zi_attention(float *out, const float *x,
         }
 
         /* Softmax */
-        flux_softmax(scores, seq, seq);
+        iris_softmax(scores, seq, seq);
 
         /* Scores @ V */
         for (int i = 0; i < seq; i++) {
@@ -756,7 +756,7 @@ static void zi_attention(float *out, const float *x,
     }
 
     /* Output projection */
-    flux_matmul_t(out, attn_out, block->attn_out_weight, seq, dim, dim);
+    iris_matmul_t(out, attn_out, block->attn_out_weight, seq, dim, dim);
 }
 
 /* SwiGLU FFN: silu(W1 @ x) * (W3 @ x) then W2 */
@@ -768,16 +768,16 @@ static void zi_ffn(float *out, const float *x, const zi_block_t *block,
     float *up = gate + seq * ffn_dim;
 
     /* W1 (gate) and W3 (up) projections */
-    flux_matmul_t(gate, x, block->ffn_w1, seq, dim, ffn_dim);
-    flux_matmul_t(up, x, block->ffn_w3, seq, dim, ffn_dim);
+    iris_matmul_t(gate, x, block->ffn_w1, seq, dim, ffn_dim);
+    iris_matmul_t(up, x, block->ffn_w3, seq, dim, ffn_dim);
 
     /* SiLU(gate) * up */
     int n = seq * ffn_dim;
-    flux_silu(gate, n);
+    iris_silu(gate, n);
     for (int i = 0; i < n; i++) gate[i] *= up[i];
 
     /* W2 (down) projection */
-    flux_matmul_t(out, gate, block->ffn_w2, seq, ffn_dim, dim);
+    iris_matmul_t(out, gate, block->ffn_w2, seq, ffn_dim, dim);
 }
 
 /* One S3-DiT block on CPU. Two modes: modulated (noise_refiner + main layers)
@@ -802,7 +802,7 @@ static void zi_block_forward(float *x, const zi_block_t *block,
     if (block->adaln_weight) {
         /* Modulated block: extract scale_msa, gate_msa, scale_mlp, gate_mlp */
         float mod[4 * dim];
-        flux_matmul_t(mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
+        iris_matmul_t(mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
         for (int i = 0; i < 4 * dim; i++) mod[i] += block->adaln_bias[i];
 
         float *scale_msa = mod;
@@ -894,7 +894,7 @@ static uint16_t *zi_f32_to_bf16(const float *src, size_t n) {
 /* Build a pre-assembled [seq, head_dim] RoPE cos/sin table by merging 3 axes.
  * pos_ids: [seq, 3] with (T, H, W) per position.
  * The table has cos/sin values laid out as consecutive pairs so that
- * flux_gpu_rope_2d (axis_dim=head_dim) applies rotation across the full head. */
+ * iris_gpu_rope_2d (axis_dim=head_dim) applies rotation across the full head. */
 static void zi_build_rope_table(float *cos_out, float *sin_out,
                                  const int *pos_ids, int seq,
                                  zi_transformer_t *tf) {
@@ -930,13 +930,13 @@ static void zi_build_rope_table(float *cos_out, float *sin_out,
  * CPU (one multiply per dim), then passes the fused weight to GPU RMSNorm to
  * avoid an extra GPU kernel. Uses fused QKV and W1/W3 matmuls when available.
  * Returns 0 on any failure so the caller can fall back to CPU. */
-static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
+static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                  const zi_block_t *block,
                                  const float *rope_cos, const float *rope_sin,
                                  const float *t_emb, const float *precomputed_mod, int seq,
                                  zi_transformer_t *tf,
                                  zi_gpu_scratch_t *scratch) {
-    if (!flux_metal_available() || !flux_metal_shaders_available()) return 0;
+    if (!iris_metal_available() || !iris_metal_shaders_available()) return 0;
     if (!hidden_gpu || !scratch) return 0;
 
     int dim = tf->dim;
@@ -951,7 +951,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
         if (!mod) {
             /* Fallback path: compute modulation on the fly. */
             float *scratch_mod = scratch->mod;
-            flux_matmul_t(scratch_mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
+            iris_matmul_t(scratch_mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
             for (int i = 0; i < 4 * dim; i++) scratch_mod[i] += block->adaln_bias[i];
 
             /* Apply 1+scale to scales, tanh to gates */
@@ -975,7 +975,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
             fused_attn_norm[i] = block->attn_norm1[i] * scale_msa[i];
 
         /* GPU: RMSNorm with fused weight (= rms_norm(x) * attn_norm1 * scale_msa) */
-        flux_gpu_rms_norm_f32(scratch->norm, hidden_gpu, fused_attn_norm,
+        iris_gpu_rms_norm_f32(scratch->norm, hidden_gpu, fused_attn_norm,
                                seq, dim, ZI_NORM_EPS);
 
         /* GPU: Q, K, V projections (fused when available). */
@@ -983,7 +983,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->attn_qkv_weight_bf16, NULL,
                                        seq, dim, 3 * dim)) {
-                flux_gpu_split_qkv_mlp(scratch->fused,
+                iris_gpu_split_qkv_mlp(scratch->fused,
                                        scratch->q, scratch->k, scratch->v,
                                        scratch->gate_up, scratch->up,
                                        seq, dim, 0);
@@ -1012,12 +1012,12 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
         }
 
         /* GPU: QK normalization */
-        flux_gpu_qk_rms_norm(scratch->q, scratch->k,
+        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
                               block->attn_norm_q, block->attn_norm_k,
                               seq, n_heads, head_dim, ZI_NORM_EPS);
 
         /* GPU: RoPE (full head_dim, pre-assembled 3-axis table) */
-        flux_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
                                       rope_cos, rope_sin,
                                       seq, n_heads, head_dim);
 
@@ -1034,9 +1034,9 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
                                     seq, dim, dim)) return 0;
 
         /* GPU: attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
-        flux_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
+        iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
                                seq, dim, ZI_NORM_EPS);
-        flux_gpu_gated_add(hidden_gpu, gate_msa, scratch->norm2, seq, dim);
+        iris_gpu_gated_add(hidden_gpu, gate_msa, scratch->norm2, seq, dim);
 
         /* CPU: fuse FFN norm weight * scale_mlp */
         float *fused_ffn_norm = scratch->fused_ffn_norm;
@@ -1044,7 +1044,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
             fused_ffn_norm[i] = block->ffn_norm1[i] * scale_mlp[i];
 
         /* GPU: FFN input norm with fused weight */
-        flux_gpu_rms_norm_f32(scratch->norm, hidden_gpu, fused_ffn_norm,
+        iris_gpu_rms_norm_f32(scratch->norm, hidden_gpu, fused_ffn_norm,
                                seq, dim, ZI_NORM_EPS);
 
         /* GPU: SwiGLU FFN (fused w1/w3 when available). */
@@ -1052,7 +1052,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->ffn_w13_weight_bf16, NULL,
                                        seq, dim, 2 * ffn_dim)) {
-                flux_gpu_split_qkv_mlp(scratch->fused,
+                iris_gpu_split_qkv_mlp(scratch->fused,
                                        scratch->q, scratch->k, scratch->v,
                                        scratch->gate_up, scratch->up,
                                        seq, 0, ffn_dim);
@@ -1072,7 +1072,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
                                         block->ffn_w3_bf16, block->ffn_w3,
                                         seq, dim, ffn_dim)) return 0;
         }
-        flux_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
+        iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
 
         /* GPU: FFN down projection */
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
@@ -1080,15 +1080,15 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
                                     seq, ffn_dim, dim)) return 0;
 
         /* GPU: ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
-        flux_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
+        iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
                                seq, dim, ZI_NORM_EPS);
-        flux_gpu_gated_add(hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
+        iris_gpu_gated_add(hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
 
     } else {
         /* ---- Unmodulated block (context_refiner) ---- */
 
         /* GPU: RMSNorm (plain weight, no scale) */
-        flux_gpu_rms_norm_f32(scratch->norm, hidden_gpu, block->attn_norm1,
+        iris_gpu_rms_norm_f32(scratch->norm, hidden_gpu, block->attn_norm1,
                                seq, dim, ZI_NORM_EPS);
 
         /* GPU: Q, K, V projections (fused when available). */
@@ -1096,7 +1096,7 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->attn_qkv_weight_bf16, NULL,
                                        seq, dim, 3 * dim)) {
-                flux_gpu_split_qkv_mlp(scratch->fused,
+                iris_gpu_split_qkv_mlp(scratch->fused,
                                        scratch->q, scratch->k, scratch->v,
                                        scratch->gate_up, scratch->up,
                                        seq, dim, 0);
@@ -1124,12 +1124,12 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
         }
 
         /* GPU: QK normalization */
-        flux_gpu_qk_rms_norm(scratch->q, scratch->k,
+        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
                               block->attn_norm_q, block->attn_norm_k,
                               seq, n_heads, head_dim, ZI_NORM_EPS);
 
         /* GPU: RoPE */
-        flux_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
                                       rope_cos, rope_sin,
                                       seq, n_heads, head_dim);
 
@@ -1146,18 +1146,18 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
                                     seq, dim, dim)) return 0;
 
         /* GPU: norm2(proj) + residual: x += norm2(attn_out) */
-        flux_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
+        iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
                                seq, dim, ZI_NORM_EPS);
-        flux_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
 
         /* GPU: FFN */
-        flux_gpu_rms_norm_f32(scratch->norm, hidden_gpu, block->ffn_norm1,
+        iris_gpu_rms_norm_f32(scratch->norm, hidden_gpu, block->ffn_norm1,
                                seq, dim, ZI_NORM_EPS);
         if (block->ffn_w13_weight_bf16) {
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->ffn_w13_weight_bf16, NULL,
                                        seq, dim, 2 * ffn_dim)) {
-                flux_gpu_split_qkv_mlp(scratch->fused,
+                iris_gpu_split_qkv_mlp(scratch->fused,
                                        scratch->q, scratch->k, scratch->v,
                                        scratch->gate_up, scratch->up,
                                        seq, 0, ffn_dim);
@@ -1177,15 +1177,15 @@ static int zi_block_forward_gpu(flux_gpu_tensor_t hidden_gpu,
                                         block->ffn_w3_bf16, block->ffn_w3,
                                         seq, dim, ffn_dim)) return 0;
         }
-        flux_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
+        iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
                                     block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
         /* GPU: ffn_norm2 + residual: x += norm2(ffn_out) */
-        flux_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
+        iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
                                seq, dim, ZI_NORM_EPS);
-        flux_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
     }
 
     return 1;
@@ -1198,7 +1198,7 @@ static int zi_precompute_block_modulation(float *mod_out, const zi_block_t *bloc
                                           const float *t_emb, int adaln_dim, int dim) {
     if (!mod_out || !block || !block->adaln_weight || !block->adaln_bias || !t_emb) return 0;
 
-    flux_matmul_t(mod_out, t_emb, block->adaln_weight, 1, adaln_dim, 4 * dim);
+    iris_matmul_t(mod_out, t_emb, block->adaln_weight, 1, adaln_dim, 4 * dim);
     for (int i = 0; i < 4 * dim; i++) mod_out[i] += block->adaln_bias[i];
 
     for (int i = 0; i < dim; i++) {
@@ -1260,33 +1260,33 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
                 cap_seq_len, tf->cap_feat_dim, ZI_NORM_EPS);
 
     /* === Embed image/caption (prefer GPU linear, fall back to CPU) === */
-    flux_gpu_tensor_t img_gpu = NULL;
-    flux_gpu_tensor_t cap_gpu = NULL;
+    iris_gpu_tensor_t img_gpu = NULL;
+    iris_gpu_tensor_t cap_gpu = NULL;
 
     /* Image projection on GPU */
-    flux_gpu_tensor_t img_patch_gpu = flux_gpu_tensor_create(img_patches, (size_t)img_seq * patch_feat);
+    iris_gpu_tensor_t img_patch_gpu = iris_gpu_tensor_create(img_patches, (size_t)img_seq * patch_feat);
     if (img_patch_gpu) {
-        img_gpu = flux_gpu_linear(img_patch_gpu, tf->x_emb_weight, tf->x_emb_bias,
+        img_gpu = iris_gpu_linear(img_patch_gpu, tf->x_emb_weight, tf->x_emb_bias,
                                   img_seq, patch_feat, dim);
-        flux_gpu_tensor_free(img_patch_gpu);
+        iris_gpu_tensor_free(img_patch_gpu);
     }
 
     /* Caption projection on GPU */
-    flux_gpu_tensor_t cap_norm_gpu = flux_gpu_tensor_create(cap_normed, (size_t)cap_seq_len * tf->cap_feat_dim);
+    iris_gpu_tensor_t cap_norm_gpu = iris_gpu_tensor_create(cap_normed, (size_t)cap_seq_len * tf->cap_feat_dim);
     if (cap_norm_gpu) {
-        cap_gpu = flux_gpu_linear(cap_norm_gpu, tf->cap_emb_linear_w, tf->cap_emb_linear_b,
+        cap_gpu = iris_gpu_linear(cap_norm_gpu, tf->cap_emb_linear_w, tf->cap_emb_linear_b,
                                   cap_seq_len, tf->cap_feat_dim, dim);
-        flux_gpu_tensor_free(cap_norm_gpu);
+        iris_gpu_tensor_free(cap_norm_gpu);
     }
 
     /* CPU fallback if either embedding projection failed */
     if (!img_gpu || !cap_gpu) {
         if (img_gpu) {
-            flux_gpu_tensor_free(img_gpu);
+            iris_gpu_tensor_free(img_gpu);
             img_gpu = NULL;
         }
         if (cap_gpu) {
-            flux_gpu_tensor_free(cap_gpu);
+            iris_gpu_tensor_free(cap_gpu);
             cap_gpu = NULL;
         }
 
@@ -1300,14 +1300,14 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
             return NULL;
         }
 
-        flux_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_seq, patch_feat, dim);
+        iris_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_seq, patch_feat, dim);
         for (int s = 0; s < img_seq; s++) {
             for (int i = 0; i < dim; i++) {
                 img_emb[s * dim + i] += tf->x_emb_bias[i];
             }
         }
 
-        flux_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
+        iris_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
                       cap_seq_len, tf->cap_feat_dim, dim);
         for (int s = 0; s < cap_seq_len; s++) {
             for (int i = 0; i < dim; i++) {
@@ -1315,8 +1315,8 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
             }
         }
 
-        img_gpu = flux_gpu_tensor_create(img_emb, (size_t)img_seq * dim);
-        cap_gpu = flux_gpu_tensor_create(cap_emb, (size_t)cap_seq_len * dim);
+        img_gpu = iris_gpu_tensor_create(img_emb, (size_t)img_seq * dim);
+        cap_gpu = iris_gpu_tensor_create(cap_emb, (size_t)cap_seq_len * dim);
         free(img_emb);
         free(cap_emb);
     }
@@ -1326,8 +1326,8 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
 
     /* === CPU: Pre-assemble RoPE tables (cached across steps) === */
     if (!zi_gpu_rope_cache_prepare(tf, cap_seq_len, H_tokens, W_tokens)) {
-        if (img_gpu) flux_gpu_tensor_free(img_gpu);
-        if (cap_gpu) flux_gpu_tensor_free(cap_gpu);
+        if (img_gpu) iris_gpu_tensor_free(img_gpu);
+        if (cap_gpu) iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
     const float *img_rope_cos = tf->gpu_img_rope_cos;
@@ -1340,18 +1340,18 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
 
     /* === GPU: Process embedded tokens === */
     if (!img_gpu || !cap_gpu) {
-        if (img_gpu) flux_gpu_tensor_free(img_gpu);
-        if (cap_gpu) flux_gpu_tensor_free(cap_gpu);
+        if (img_gpu) iris_gpu_tensor_free(img_gpu);
+        if (cap_gpu) iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
-    flux_gpu_tensor_set_persistent(img_gpu, 1);
-    flux_gpu_tensor_set_persistent(cap_gpu, 1);
+    iris_gpu_tensor_set_persistent(img_gpu, 1);
+    iris_gpu_tensor_set_persistent(cap_gpu, 1);
 
     /* Allocate scratch for max sequence length (unified_seq) */
     zi_gpu_scratch_t scratch;
     if (!zi_gpu_scratch_init(&scratch, unified_seq, dim, tf->ffn_dim)) {
-        flux_gpu_tensor_free(img_gpu);
-        flux_gpu_tensor_free(cap_gpu);
+        iris_gpu_tensor_free(img_gpu);
+        iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
 
@@ -1382,7 +1382,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         }
     }
 
-    flux_gpu_batch_begin();
+    iris_gpu_batch_begin();
 
     /* === Noise refiner: 2 modulated blocks on image tokens === */
     int gpu_ok = 1;
@@ -1394,8 +1394,8 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(img_gpu, &tf->noise_refiner[i],
                                        img_rope_cos, img_rope_sin,
                                        t_emb, block_mod, img_seq, tf, &scratch);
-        if (gpu_ok && flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
+        if (gpu_ok && iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
     }
     t_noise_ms = zi_time_ms() - stage_start;
 
@@ -1405,40 +1405,40 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(cap_gpu, &tf->context_refiner[i],
                                        cap_rope_cos, cap_rope_sin,
                                        NULL, NULL, cap_seq_len, tf, &scratch);
-        if (gpu_ok && flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
+        if (gpu_ok && iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
     }
     t_context_ms = zi_time_ms() - stage_start;
 
     if (!gpu_ok) {
-        flux_gpu_batch_end();
+        iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
         free(step_mod);
-        flux_gpu_tensor_free(img_gpu);
-        flux_gpu_tensor_free(cap_gpu);
+        iris_gpu_tensor_free(img_gpu);
+        iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
 
     /* === Concatenate: unified = [img, cap] === */
-    flux_gpu_tensor_t unified_gpu = flux_gpu_tensor_alloc(unified_seq * dim);
+    iris_gpu_tensor_t unified_gpu = iris_gpu_tensor_alloc(unified_seq * dim);
     if (!unified_gpu) {
-        flux_gpu_batch_end();
+        iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
         free(step_mod);
-        flux_gpu_tensor_free(img_gpu);
-        flux_gpu_tensor_free(cap_gpu);
+        iris_gpu_tensor_free(img_gpu);
+        iris_gpu_tensor_free(cap_gpu);
         return NULL;
     }
-    flux_gpu_tensor_set_persistent(unified_gpu, 1);
+    iris_gpu_tensor_set_persistent(unified_gpu, 1);
 
     /* Copy img then cap into unified entirely on GPU (no CPU sync). */
     size_t img_elems = (size_t)img_seq * dim;
     size_t cap_elems = (size_t)cap_seq_len * dim;
-    flux_gpu_copy_region_f32(unified_gpu, 0, img_gpu, 0, img_elems);
-    flux_gpu_copy_region_f32(unified_gpu, img_elems, cap_gpu, 0, cap_elems);
+    iris_gpu_copy_region_f32(unified_gpu, 0, img_gpu, 0, img_elems);
+    iris_gpu_copy_region_f32(unified_gpu, img_elems, cap_gpu, 0, cap_elems);
 
-    flux_gpu_tensor_free(img_gpu);
-    flux_gpu_tensor_free(cap_gpu);
+    iris_gpu_tensor_free(img_gpu);
+    iris_gpu_tensor_free(cap_gpu);
 
     /* === Main transformer: 30 modulated blocks on unified sequence === */
     stage_start = zi_time_ms();
@@ -1448,25 +1448,25 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(unified_gpu, &tf->layers[i],
                                        uni_rope_cos, uni_rope_sin,
                                        t_emb, block_mod, unified_seq, tf, &scratch);
-        if (gpu_ok && flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
+        if (gpu_ok && iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
     t_main_ms = zi_time_ms() - stage_start;
 
     if (!gpu_ok) {
-        flux_gpu_batch_end();
+        iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
         free(step_mod);
-        flux_gpu_tensor_free(unified_gpu);
+        iris_gpu_tensor_free(unified_gpu);
         return NULL;
     }
 
     /* === Final layer on GPU: slice image tokens -> LayerNorm+scale -> Linear === */
     stage_start = zi_time_ms();
     int out_ch = ps * ps * in_ch;
-    flux_gpu_tensor_t img_hidden_gpu = flux_gpu_tensor_alloc((size_t)img_seq * dim);
-    flux_gpu_tensor_t final_norm_gpu = flux_gpu_tensor_alloc((size_t)img_seq * dim);
-    flux_gpu_tensor_t final_out_gpu = NULL;
+    iris_gpu_tensor_t img_hidden_gpu = iris_gpu_tensor_alloc((size_t)img_seq * dim);
+    iris_gpu_tensor_t final_norm_gpu = iris_gpu_tensor_alloc((size_t)img_seq * dim);
+    iris_gpu_tensor_t final_out_gpu = NULL;
 
     /* Prepare final AdaLN parameters on CPU once per step. */
     float *final_scale = (float *)malloc(dim * sizeof(float));
@@ -1475,12 +1475,12 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     if (!img_hidden_gpu || !final_norm_gpu || !final_scale || !final_shift ||
         !final_scale_param ||
         !zi_final_compute_scale(final_scale, &tf->final_layer, t_emb, tf)) {
-        flux_gpu_batch_end();
+        iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
         free(step_mod);
-        flux_gpu_tensor_free(unified_gpu);
-        if (img_hidden_gpu) flux_gpu_tensor_free(img_hidden_gpu);
-        if (final_norm_gpu) flux_gpu_tensor_free(final_norm_gpu);
+        iris_gpu_tensor_free(unified_gpu);
+        if (img_hidden_gpu) iris_gpu_tensor_free(img_hidden_gpu);
+        if (final_norm_gpu) iris_gpu_tensor_free(final_norm_gpu);
         free(final_scale);
         free(final_shift);
         free(final_scale_param);
@@ -1489,50 +1489,50 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     for (int i = 0; i < dim; i++) final_scale_param[i] = final_scale[i] - 1.0f;
 
     /* Slice first img_seq tokens from unified hidden. */
-    flux_gpu_copy_region_f32(img_hidden_gpu, 0, unified_gpu, 0, (size_t)img_seq * dim);
-    flux_gpu_adaln_norm(final_norm_gpu, img_hidden_gpu,
+    iris_gpu_copy_region_f32(img_hidden_gpu, 0, unified_gpu, 0, (size_t)img_seq * dim);
+    iris_gpu_adaln_norm(final_norm_gpu, img_hidden_gpu,
                         final_shift, final_scale_param, img_seq, dim, 1e-6f);
-    final_out_gpu = flux_gpu_linear(final_norm_gpu, tf->final_layer.linear_weight, NULL,
+    final_out_gpu = iris_gpu_linear(final_norm_gpu, tf->final_layer.linear_weight, NULL,
                                     img_seq, dim, out_ch);
     if (!final_out_gpu) {
-        flux_gpu_batch_end();
+        iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
         free(step_mod);
-        flux_gpu_tensor_free(unified_gpu);
-        flux_gpu_tensor_free(img_hidden_gpu);
-        flux_gpu_tensor_free(final_norm_gpu);
+        iris_gpu_tensor_free(unified_gpu);
+        iris_gpu_tensor_free(img_hidden_gpu);
+        iris_gpu_tensor_free(final_norm_gpu);
         free(final_scale);
         free(final_shift);
         free(final_scale_param);
         return NULL;
     }
 
-    flux_gpu_batch_end();
+    iris_gpu_batch_end();
     zi_gpu_scratch_free(&scratch);
     free(step_mod);
-    flux_gpu_tensor_free(unified_gpu);
-    flux_gpu_tensor_free(img_hidden_gpu);
-    flux_gpu_tensor_free(final_norm_gpu);
+    iris_gpu_tensor_free(unified_gpu);
+    iris_gpu_tensor_free(img_hidden_gpu);
+    iris_gpu_tensor_free(final_norm_gpu);
     free(final_shift);
     free(final_scale_param);
 
     /* Read back final projected patches and add bias on CPU. */
     float *final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
     if (!final_out) {
-        flux_gpu_tensor_free(final_out_gpu);
+        iris_gpu_tensor_free(final_out_gpu);
         free(final_scale);
         return NULL;
     }
-    float *final_out_data = flux_gpu_tensor_data(final_out_gpu);
+    float *final_out_data = iris_gpu_tensor_data(final_out_gpu);
     memcpy(final_out, final_out_data, (size_t)img_seq * out_ch * sizeof(float));
-    flux_gpu_tensor_free(final_out_gpu);
+    iris_gpu_tensor_free(final_out_gpu);
     for (int s = 0; s < img_seq; s++) {
         for (int i = 0; i < out_ch; i++) {
             final_out[s * out_ch + i] += tf->final_layer.linear_bias[i];
         }
     }
-    if (flux_substep_callback)
-        flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
+    if (iris_substep_callback)
+        iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
     free(final_scale);
 
     /* === CPU: Unpatchify === */
@@ -1542,12 +1542,12 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     t_final_ms = zi_time_ms() - stage_start;
 
     /* Accumulate per-step zImage GPU timing. */
-    flux_timing_zi_embeddings += t_embed_ms;
-    flux_timing_zi_noise_refiner += t_noise_ms;
-    flux_timing_zi_context_refiner += t_context_ms;
-    flux_timing_zi_main_blocks += t_main_ms;
-    flux_timing_zi_final += t_final_ms;
-    flux_timing_zi_total += t_embed_ms + t_noise_ms + t_context_ms + t_main_ms + t_final_ms;
+    iris_timing_zi_embeddings += t_embed_ms;
+    iris_timing_zi_noise_refiner += t_noise_ms;
+    iris_timing_zi_context_refiner += t_context_ms;
+    iris_timing_zi_main_blocks += t_main_ms;
+    iris_timing_zi_final += t_final_ms;
+    iris_timing_zi_total += t_embed_ms + t_noise_ms + t_context_ms + t_main_ms + t_final_ms;
 
     return output;
 }
@@ -1565,9 +1565,9 @@ static int zi_final_compute_scale(float *scale, const zi_final_t *fl,
 
     float silu_emb[256];
     memcpy(silu_emb, t_emb, tf->adaln_dim * sizeof(float));
-    flux_silu(silu_emb, tf->adaln_dim);
+    iris_silu(silu_emb, tf->adaln_dim);
 
-    flux_matmul_t(scale, silu_emb, fl->adaln_weight, 1, tf->adaln_dim, tf->dim);
+    iris_matmul_t(scale, silu_emb, fl->adaln_weight, 1, tf->adaln_dim, tf->dim);
     for (int i = 0; i < tf->dim; i++) scale[i] = 1.0f + scale[i] + fl->adaln_bias[i];
     return 1;
 }
@@ -1612,7 +1612,7 @@ static void zi_final_forward(float *out, const float *x, const zi_final_t *fl,
     }
 
     /* Linear projection: dim -> out_dim */
-    flux_matmul_t(out, normed, fl->linear_weight, seq, dim, out_dim);
+    iris_matmul_t(out, normed, fl->linear_weight, seq, dim, out_dim);
     for (int s = 0; s < seq; s++)
         for (int i = 0; i < out_dim; i++)
             out[s * out_dim + i] += fl->linear_bias[i];
@@ -1776,7 +1776,7 @@ float *zi_transformer_forward(zi_transformer_t *tf,
         free(img_patches);
         return NULL;
     }
-    flux_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_padded, patch_feat, dim);
+    iris_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_padded, patch_feat, dim);
     for (int s = 0; s < img_padded; s++)
         for (int i = 0; i < dim; i++)
             img_emb[s * dim + i] += tf->x_emb_bias[i];
@@ -1814,7 +1814,7 @@ float *zi_transformer_forward(zi_transformer_t *tf,
                 cap_padded, tf->cap_feat_dim, ZI_NORM_EPS);
     free(cap_padded_feats);
 
-    flux_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
+    iris_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
                   cap_padded, tf->cap_feat_dim, dim);
     for (int s = 0; s < cap_padded; s++)
         for (int i = 0; i < dim; i++)
@@ -1887,16 +1887,16 @@ float *zi_transformer_forward(zi_transformer_t *tf,
     for (int i = 0; i < tf->n_refiner; i++) {
         zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, img_mask,
                           t_emb, img_padded, tf);
-        if (flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
+        if (iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
     }
 
     /* 6. Context refiner: caption-only self-attention without modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
         zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, cap_mask,
                           NULL, cap_padded, tf);
-        if (flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
+        if (iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
     }
 
     /* 7. Build unified sequence: [image_tokens, caption_tokens] */
@@ -1937,8 +1937,8 @@ float *zi_transformer_forward(zi_transformer_t *tf,
     for (int i = 0; i < tf->n_layers; i++) {
         zi_block_forward(unified, &tf->layers[i], unified_pos, unified_mask,
                           t_emb, unified_seq, tf);
-        if (flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
+        if (iris_substep_callback)
+            iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
 
     free(unified_pos);
@@ -1957,8 +1957,8 @@ float *zi_transformer_forward(zi_transformer_t *tf,
     }
     zi_final_forward(final_out, img_out, &tf->final_layer, t_emb, img_seq, tf);
     free(img_out);
-    if (flux_substep_callback)
-        flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
+    if (iris_substep_callback)
+        iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
 
     /* 10. Unpatchify: [n_patches, 64] -> [16, latent_h, latent_w] */
     float *output = (float *)calloc(in_ch * latent_h * latent_w, sizeof(float));
@@ -2263,7 +2263,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     tf->num_sf_files = n_files;
     for (int i = 0; i < n_files; i++) tf->sf_files[i] = files[i];
 
-    if (flux_verbose)
+    if (iris_verbose)
         fprintf(stderr, "  Loading Z-Image transformer (%d shards)...\n", n_files);
 
     /* Determine FFN dimension from weights */
@@ -2286,10 +2286,10 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     /* Check if GPU acceleration is available */
     int use_gpu = 0;
 #ifdef USE_METAL
-    if (flux_metal_available() && flux_metal_shaders_available()) {
+    if (iris_metal_available() && iris_metal_shaders_available()) {
         use_gpu = 1;
         tf->use_gpu = 1;
-        if (flux_verbose)
+        if (iris_verbose)
             fprintf(stderr, "  Z-Image: GPU acceleration enabled (bf16 weights)\n");
     }
 #endif
@@ -2297,7 +2297,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     int mmap_f32_weights = (!use_gpu && zi_all_tensors_f32(files, n_files));
     tf->mmap_f32_weights = mmap_f32_weights;
     if (mmap_f32_weights) {
-        if (flux_verbose)
+        if (iris_verbose)
             fprintf(stderr, "  Z-Image: CPU mmap mode enabled (zero-copy f32 weights)\n");
     }
 
@@ -2407,7 +2407,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
         tf->num_sf_files = 0;
     }
 
-    if (flux_verbose) {
+    if (iris_verbose) {
         fprintf(stderr, "  Z-Image transformer loaded: dim=%d, heads=%d, layers=%d+%d+%d, ffn=%d\n",
                 dim, n_heads, n_refiner, n_refiner, n_layers, tf->ffn_dim);
     }

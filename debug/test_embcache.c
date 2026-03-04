@@ -12,8 +12,8 @@
  *   - Overwrite: same slot prompt evicts old entry
  *   - NULL and edge-case safety
  *
- * Build: gcc -O2 -I. -o /tmp/flux_test_embcache debug/test_embcache.c embcache.c -lm
- * Run:   /tmp/flux_test_embcache
+ * Build: gcc -O2 -I. -o /tmp/iris_test_embcache debug/test_embcache.c embcache.c -lm
+ * Run:   /tmp/iris_test_embcache
  */
 
 #include <stdio.h>

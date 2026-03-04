@@ -14,9 +14,9 @@ else
     source web/venv/bin/activate
 fi
 
-# Check for flux binary
-if [ ! -f "./flux" ]; then
-    echo "Error: flux binary not found. Build it first:"
+# Check for iris binary
+if [ ! -f "./iris" ]; then
+    echo "Error: iris binary not found. Build it first:"
     echo "  make mps    # Apple Silicon (fastest)"
     echo "  make blas   # CPU with BLAS acceleration"
     echo "  make generic  # Pure C fallback"

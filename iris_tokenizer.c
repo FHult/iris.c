@@ -30,7 +30,7 @@ typedef struct {
 } bpe_merge_t;
 
 /* Tokenizer context */
-struct flux_tokenizer {
+struct iris_tokenizer {
     /* Vocabulary */
     char **vocab;           /* id -> token string */
     int vocab_size;
@@ -54,7 +54,7 @@ struct flux_tokenizer {
 };
 
 /* Forward declarations */
-void flux_tokenizer_free(flux_tokenizer *tok);
+void iris_tokenizer_free(iris_tokenizer *tok);
 
 /* ========================================================================
  * Hash Table Functions
@@ -201,7 +201,7 @@ static char **pretokenize(const char *text, int *num_tokens) {
  * ======================================================================== */
 
 /* Tokenize a single word using BPE */
-static int *bpe_tokenize_word(flux_tokenizer *tok, const char *word,
+static int *bpe_tokenize_word(iris_tokenizer *tok, const char *word,
                               int *num_tokens) {
     int len = strlen(word);
     if (len == 0) {
@@ -287,22 +287,22 @@ static int *bpe_tokenize_word(flux_tokenizer *tok, const char *word,
 
 #define TOK_MAGIC "FTOK"
 
-flux_tokenizer *flux_tokenizer_load(const char *path) {
+iris_tokenizer *iris_tokenizer_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "flux_tokenizer_load: cannot open %s\n", path);
+        fprintf(stderr, "iris_tokenizer_load: cannot open %s\n", path);
         return NULL;
     }
 
     /* Check magic */
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, TOK_MAGIC, 4) != 0) {
-        fprintf(stderr, "flux_tokenizer_load: invalid magic\n");
+        fprintf(stderr, "iris_tokenizer_load: invalid magic\n");
         fclose(f);
         return NULL;
     }
 
-    flux_tokenizer *tok = calloc(1, sizeof(flux_tokenizer));
+    iris_tokenizer *tok = calloc(1, sizeof(iris_tokenizer));
     if (!tok) {
         fclose(f);
         return NULL;
@@ -323,8 +323,8 @@ flux_tokenizer *flux_tokenizer_load(const char *path) {
     tok->add_eos = (config[7] >> 1) & 1;
 
     tok->hash_size = tok->vocab_size * 2 + 1;
-    if (tok->hash_size < FLUX_VOCAB_HASH_SIZE)
-        tok->hash_size = FLUX_VOCAB_HASH_SIZE;
+    if (tok->hash_size < IRIS_VOCAB_HASH_SIZE)
+        tok->hash_size = IRIS_VOCAB_HASH_SIZE;
 
     /* Allocate vocabulary */
     tok->vocab = malloc(tok->vocab_size * sizeof(char *));
@@ -363,13 +363,13 @@ flux_tokenizer *flux_tokenizer_load(const char *path) {
     return tok;
 
 error:
-    fprintf(stderr, "flux_tokenizer_load: error reading tokenizer\n");
+    fprintf(stderr, "iris_tokenizer_load: error reading tokenizer\n");
     fclose(f);
-    flux_tokenizer_free(tok);
+    iris_tokenizer_free(tok);
     return NULL;
 }
 
-void flux_tokenizer_free(flux_tokenizer *tok) {
+void iris_tokenizer_free(iris_tokenizer *tok) {
     if (!tok) return;
 
     if (tok->vocab) {
@@ -394,7 +394,7 @@ void flux_tokenizer_free(flux_tokenizer *tok) {
  * Main Tokenization API
  * ======================================================================== */
 
-int *flux_tokenize(flux_tokenizer *tok, const char *text,
+int *iris_tokenize(iris_tokenizer *tok, const char *text,
                    int *num_tokens, int max_len) {
     if (!tok || !text) {
         *num_tokens = 0;
@@ -449,7 +449,7 @@ int *flux_tokenize(flux_tokenizer *tok, const char *text,
 }
 
 /* Decode tokens back to text */
-char *flux_detokenize(flux_tokenizer *tok, const int *tokens, int num_tokens) {
+char *iris_detokenize(iris_tokenizer *tok, const int *tokens, int num_tokens) {
     if (!tok || !tokens || num_tokens <= 0) {
         return strdup("");
     }
@@ -485,18 +485,18 @@ char *flux_detokenize(flux_tokenizer *tok, const int *tokens, int num_tokens) {
 }
 
 /* Get vocabulary size */
-int flux_tokenizer_vocab_size(flux_tokenizer *tok) {
+int iris_tokenizer_vocab_size(iris_tokenizer *tok) {
     return tok ? tok->vocab_size : 0;
 }
 
 /* Get token string by ID */
-const char *flux_tokenizer_get_token(flux_tokenizer *tok, int id) {
+const char *iris_tokenizer_get_token(iris_tokenizer *tok, int id) {
     if (!tok || id < 0 || id >= tok->vocab_size) return NULL;
     return tok->vocab[id];
 }
 
 /* Get token ID by string */
-int flux_tokenizer_get_id(flux_tokenizer *tok, const char *token) {
+int iris_tokenizer_get_id(iris_tokenizer *tok, const char *token) {
     if (!tok || !token) return -1;
     return vocab_hash_lookup(tok->vocab_hash, tok->hash_size, token);
 }
@@ -509,8 +509,8 @@ int flux_tokenizer_get_id(flux_tokenizer *tok, const char *token) {
  * Create a simple tokenizer that just does character-level tokenization.
  * Used as fallback or for testing.
  */
-flux_tokenizer *flux_tokenizer_create_simple(void) {
-    flux_tokenizer *tok = calloc(1, sizeof(flux_tokenizer));
+iris_tokenizer *iris_tokenizer_create_simple(void) {
+    iris_tokenizer *tok = calloc(1, sizeof(iris_tokenizer));
     if (!tok) return NULL;
 
     /* ASCII printable characters + some special tokens */
@@ -521,14 +521,14 @@ flux_tokenizer *flux_tokenizer_create_simple(void) {
     tok->unk_id = 257;
     tok->bos_id = 258;
     tok->eos_id = 259;
-    tok->max_length = FLUX_MAX_SEQ_LEN;
+    tok->max_length = IRIS_MAX_SEQ_LEN;
     tok->add_bos = 1;
     tok->add_eos = 1;
 
     tok->vocab = malloc(tok->vocab_size * sizeof(char *));
     tok->vocab_hash = calloc(tok->hash_size, sizeof(vocab_entry_t));
     if (!tok->vocab || !tok->vocab_hash) {
-        flux_tokenizer_free(tok);
+        iris_tokenizer_free(tok);
         return NULL;
     }
 

@@ -28,17 +28,17 @@
 /* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
-/* fast_expf is defined in flux_kernels.h */
+/* fast_expf is defined in iris_kernels.h */
 
 /* Progress callbacks - set by caller before inference */
-flux_substep_callback_t flux_substep_callback = NULL;
-flux_step_callback_t flux_step_callback = NULL;
-flux_phase_callback_t flux_phase_callback = NULL;
-flux_step_image_callback_t flux_step_image_callback = NULL;
-void *flux_step_image_vae = NULL;
-flux_text_progress_callback_t flux_text_progress_callback = NULL;
-flux_vae_progress_callback_t flux_vae_progress_callback = NULL;
-int flux_verbose = 0;
+iris_substep_callback_t iris_substep_callback = NULL;
+iris_step_callback_t iris_step_callback = NULL;
+iris_phase_callback_t iris_phase_callback = NULL;
+iris_step_image_callback_t iris_step_image_callback = NULL;
+void *iris_step_image_vae = NULL;
+iris_text_progress_callback_t iris_text_progress_callback = NULL;
+iris_vae_progress_callback_t iris_vae_progress_callback = NULL;
+int iris_verbose = 0;
 
 /* ========================================================================
  * Random Number Generator (xoshiro256**)
@@ -67,7 +67,7 @@ static uint64_t xoshiro256ss(void) {
     return result;
 }
 
-void flux_rng_seed(uint64_t seed) {
+void iris_rng_seed(uint64_t seed) {
     /* SplitMix64 to initialize state from seed */
     for (int i = 0; i < 4; i++) {
         seed += 0x9e3779b97f4a7c15ULL;
@@ -78,28 +78,28 @@ void flux_rng_seed(uint64_t seed) {
     }
 }
 
-float flux_random_uniform(void) {
+float iris_random_uniform(void) {
     return (xoshiro256ss() >> 11) * (1.0 / 9007199254740992.0);
 }
 
-float flux_random_normal(void) {
+float iris_random_normal(void) {
     /* Box-Muller transform */
-    float u1 = flux_random_uniform();
-    float u2 = flux_random_uniform();
+    float u1 = iris_random_uniform();
+    float u2 = iris_random_uniform();
     /* Avoid log(0) */
-    while (u1 == 0.0f) u1 = flux_random_uniform();
+    while (u1 == 0.0f) u1 = iris_random_uniform();
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979323846f * u2);
 }
 
-void flux_randn(float *out, int n) {
+void iris_randn(float *out, int n) {
     for (int i = 0; i < n; i++) {
-        out[i] = flux_random_normal();
+        out[i] = iris_random_normal();
     }
 }
 
-void flux_rand(float *out, int n) {
+void iris_rand(float *out, int n) {
     for (int i = 0; i < n; i++) {
-        out[i] = flux_random_uniform();
+        out[i] = iris_random_uniform();
     }
 }
 
@@ -107,25 +107,25 @@ void flux_rand(float *out, int n) {
  * Basic Element-wise Operations
  * ======================================================================== */
 
-void flux_add(float *out, const float *a, const float *b, int n) {
+void iris_add(float *out, const float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) {
         out[i] = a[i] + b[i];
     }
 }
 
-void flux_add_inplace(float *a, const float *b, int n) {
+void iris_add_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) {
         a[i] += b[i];
     }
 }
 
-void flux_mul_inplace(float *a, const float *b, int n) {
+void iris_mul_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) {
         a[i] *= b[i];
     }
 }
 
-void flux_axpy(float *a, float scale, const float *b, int n) {
+void iris_axpy(float *a, float scale, const float *b, int n) {
     for (int i = 0; i < n; i++) {
         a[i] += scale * b[i];
     }
@@ -140,14 +140,14 @@ void flux_axpy(float *a, float scale, const float *b, int n) {
  * otherwise falls back to BLAS sgemm or a naive triple loop. This is the
  * backbone operation: every linear projection in the transformer, text
  * encoder, and VAE bottleneck goes through here. */
-void flux_matmul(float *C, const float *A, const float *B,
+void iris_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
 
 #ifdef USE_METAL
     size_t matrix_elements = (size_t)M * N;
-    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
-        flux_metal_sgemm(0, 0,  /* no transpose */
+    if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        iris_metal_sgemm(0, 0,  /* no transpose */
                          M, N, K,
                          1.0f,
                          A, K,
@@ -177,14 +177,14 @@ void flux_matmul(float *C, const float *A, const float *B,
 #endif
 }
 
-void flux_matmul_t(float *C, const float *A, const float *B,
+void iris_matmul_t(float *C, const float *A, const float *B,
                    int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[N,K]^T */
 
 #ifdef USE_METAL
     size_t matrix_elements = (size_t)M * N;
-    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
-        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
+    if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        iris_metal_sgemm(0, 1,  /* no transpose A, transpose B */
                          M, N, K,
                          1.0f,
                          A, K,
@@ -214,14 +214,14 @@ void flux_matmul_t(float *C, const float *A, const float *B,
 #endif
 }
 
-void flux_linear(float *y, const float *x, const float *W, const float *b,
+void iris_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out] */
 
 #ifdef USE_METAL
     /* Use Metal GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
-    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+    if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         /* Metal sgemm: C = alpha * A @ B^T
          * A[M, K] = x[seq_len, in_dim]
          * B[N, K] = W[out_dim, in_dim] (transposed)
@@ -229,7 +229,7 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
          */
         if (b != NULL) {
             /* Fuse bias into the GPU kernel before readback */
-            flux_metal_sgemm_cached_bias(0, 1,
+            iris_metal_sgemm_cached_bias(0, 1,
                                          seq_len, out_dim, in_dim,
                                          1.0f,
                                          x, in_dim,
@@ -238,7 +238,7 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
                                          y, out_dim,
                                          b);
         } else {
-            flux_metal_sgemm_cached(0, 1,
+            iris_metal_sgemm_cached(0, 1,
                                     seq_len, out_dim, in_dim,
                                     1.0f,
                                     x, in_dim,
@@ -286,25 +286,25 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
 #endif
 }
 
-void flux_linear_nobias(float *y, const float *x, const float *W,
+void iris_linear_nobias(float *y, const float *x, const float *W,
                         int seq_len, int in_dim, int out_dim) {
-    flux_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
+    iris_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
-void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
+void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                              int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
 
 #ifdef USE_METAL
     /* Use Metal GPU for bf16 matmul - provides 2x memory bandwidth */
     size_t matrix_elements = (size_t)seq_len * out_dim;
-    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+    if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         /* Metal bf16 sgemm: C = alpha * A @ B^T
          * A[M, K] = x[seq_len, in_dim] (f32)
          * B[N, K] = W[out_dim, in_dim] (bf16, transposed)
          * C[M, N] = y[seq_len, out_dim] (f32)
          */
-        flux_metal_sgemm_bf16(0, 1,  /* no transpose A, transpose B */
+        iris_metal_sgemm_bf16(0, 1,  /* no transpose A, transpose B */
                               seq_len, out_dim, in_dim,
                               1.0f,
                               x, in_dim,
@@ -325,7 +325,7 @@ void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         memcpy(&W_f32[i], &f32_bits, sizeof(float));
     }
 
-    flux_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+    iris_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
     free(W_f32);
 }
 
@@ -333,15 +333,15 @@ void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
  * GPU Batch Operations
  * ======================================================================== */
 
-void flux_gpu_begin_batch(void) {
+void iris_gpu_begin_batch(void) {
 #ifdef USE_METAL
-    flux_metal_begin_batch();
+    iris_metal_begin_batch();
 #endif
 }
 
-void flux_gpu_end_batch(void) {
+void iris_gpu_end_batch(void) {
 #ifdef USE_METAL
-    flux_metal_end_batch();
+    iris_metal_end_batch();
 #endif
 }
 
@@ -354,7 +354,7 @@ void flux_gpu_end_batch(void) {
  * Tiles spatially to bound memory usage for large feature maps. This is the
  * standard approach for BLAS/GPU-friendly convolution, used throughout the
  * VAE encoder and decoder. */
-void flux_conv2d(float *out, const float *in, const float *weight, const float *bias,
+void iris_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int batch, int in_ch, int out_ch, int H, int W,
                  int kH, int kW, int stride, int padding) {
     int outH = (H + 2 * padding - kH) / stride + 1;
@@ -479,14 +479,14 @@ naive_fallback:
  * Normalization
  * ======================================================================== */
 
-void flux_rms_norm(float *out, const float *x, const float *weight,
+void iris_rms_norm(float *out, const float *x, const float *weight,
                    int seq_len, int hidden, float eps) {
 #ifdef USE_METAL
     /* Use GPU for RMSNorm only for very large tensors
      * The CPU-GPU sync overhead usually outweighs benefits for smaller ops */
     size_t elements = (size_t)seq_len * hidden;
-    if (flux_metal_shaders_available() && elements >= 1024 * 1024) {
-        flux_metal_rms_norm(out, x, weight, seq_len, hidden, eps);
+    if (iris_metal_shaders_available() && elements >= 1024 * 1024) {
+        iris_metal_rms_norm(out, x, weight, seq_len, hidden, eps);
         return;
     }
 #endif
@@ -510,7 +510,7 @@ void flux_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
-void flux_group_norm(float *out, const float *x, const float *gamma, const float *beta,
+void iris_group_norm(float *out, const float *x, const float *gamma, const float *beta,
                      int batch, int channels, int H, int W, int num_groups, float eps) {
     int channels_per_group = channels / num_groups;
     int spatial = H * W;
@@ -554,7 +554,7 @@ void flux_group_norm(float *out, const float *x, const float *gamma, const float
     }
 }
 
-void flux_batch_norm(float *out, const float *x,
+void iris_batch_norm(float *out, const float *x,
                      const float *running_mean, const float *running_var,
                      const float *gamma, const float *beta,
                      int batch, int channels, int H, int W, float eps) {
@@ -580,11 +580,11 @@ void flux_batch_norm(float *out, const float *x,
  * Activation Functions
  * ======================================================================== */
 
-void flux_silu(float *x, int n) {
+void iris_silu(float *x, int n) {
 #ifdef USE_METAL
     /* Use GPU for very large arrays (overhead not worth it for small ones) */
-    if (flux_metal_shaders_available() && n >= 4 * 1024 * 1024) {
-        flux_metal_silu(x, n);
+    if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
+        iris_metal_silu(x, n);
         return;
     }
 #endif
@@ -596,10 +596,10 @@ void flux_silu(float *x, int n) {
 }
 
 /* Fused SiLU(gate) * up in a single pass - avoids double memory traversal */
-void flux_silu_mul(float *gate, const float *up, int n) {
+void iris_silu_mul(float *gate, const float *up, int n) {
 #ifdef USE_METAL
-    if (flux_metal_shaders_available() && n >= 4 * 1024 * 1024) {
-        flux_metal_silu_mul(gate, up, n);
+    if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
+        iris_metal_silu_mul(gate, up, n);
         return;
     }
 #endif
@@ -611,7 +611,7 @@ void flux_silu_mul(float *gate, const float *up, int n) {
 }
 
 /* CPU-only softmax. Safe to call from worker threads (no Metal dispatch). */
-void flux_softmax_cpu(float *x, int rows, int cols) {
+void iris_softmax_cpu(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;
 
@@ -636,16 +636,16 @@ void flux_softmax_cpu(float *x, int rows, int cols) {
     }
 }
 
-void flux_softmax(float *x, int rows, int cols) {
+void iris_softmax(float *x, int rows, int cols) {
 #ifdef USE_METAL
     /* Use GPU only for very large softmax operations
      * Sync overhead usually dominates for smaller ops */
-    if (flux_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
-        flux_metal_softmax(x, rows, cols);
+    if (iris_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
+        iris_metal_softmax(x, rows, cols);
         return;
     }
 #endif
-    flux_softmax_cpu(x, rows, cols);
+    iris_softmax_cpu(x, rows, cols);
 }
 
 /* ========================================================================
@@ -655,8 +655,8 @@ void flux_softmax(float *x, int rows, int cols) {
 /* Scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V.
  * This is the naive implementation that materializes the full seq_q x seq_k
  * attention matrix. Used only for small sequences; the transformer's main
- * attention path uses flux_flash_attention() or the GPU kernel instead. */
-void flux_attention(float *out, const float *Q, const float *K, const float *V,
+ * attention path uses iris_flash_attention() or the GPU kernel instead. */
+void iris_attention(float *out, const float *Q, const float *K, const float *V,
                     int batch, int heads, int seq_q, int seq_k, int head_dim,
                     float scale) {
     /* Allocate attention scores */
@@ -681,7 +681,7 @@ void flux_attention(float *out, const float *Q, const float *K, const float *V,
             }
 
             /* softmax */
-            flux_softmax(scores, seq_q, seq_k);
+            iris_softmax(scores, seq_q, seq_k);
 
             /* out = scores @ V */
             for (int i = 0; i < seq_q; i++) {
@@ -899,7 +899,7 @@ static void flash_attention_head_tiled(float *out,
  *
  * Memory usage: O(seq_q + tile_size²) instead of O(seq_q * seq_k)
  */
-void flux_flash_attention(float *out, const float *Q, const float *K, const float *V,
+void iris_flash_attention(float *out, const float *Q, const float *K, const float *V,
                           int seq_q, int seq_k, int heads, int head_dim, float scale) {
     /* Tile sizes for cache efficiency */
     int q_tile_size = 32;  /* Process 32 queries at a time */
@@ -998,7 +998,7 @@ void flux_flash_attention(float *out, const float *Q, const float *K, const floa
  * the Flux convention (4-axis, split-half); Z-Image uses consecutive pairs
  * via a separate kernel. RoPE lets the transformer learn relative position
  * from the dot-product structure of Q and K. */
-void flux_apply_rope(float *x, const float *freqs,
+void iris_apply_rope(float *x, const float *freqs,
                      int batch, int seq, int heads, int head_dim) {
     /* x: [batch, seq, heads, head_dim]
      * freqs: [seq, head_dim/2, 2] (cos, sin)
@@ -1026,7 +1026,7 @@ void flux_apply_rope(float *x, const float *freqs,
     }
 }
 
-void flux_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
+void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
     int half_dim = dim / 2;
 
     for (int s = 0; s < seq; s++) {
@@ -1044,7 +1044,7 @@ void flux_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, flo
  * Pooling and Reshape
  * ======================================================================== */
 
-void flux_upsample_nearest(float *out, const float *in,
+void iris_upsample_nearest(float *out, const float *in,
                            int batch, int channels, int H, int W,
                            int scale_h, int scale_w) {
     int outH = H * scale_h;
@@ -1070,7 +1070,7 @@ void flux_upsample_nearest(float *out, const float *in,
  * [batch, channels, H, W] -> [batch, channels*ps*ps, H/ps, W/ps].
  * The transformer operates on these patch tokens, not individual spatial
  * positions, reducing sequence length by ps*ps (4x for ps=2). */
-void flux_patchify(float *out, const float *in,
+void iris_patchify(float *out, const float *in,
                    int batch, int channels, int H, int W, int patch_size) {
     /* [B, C, H, W] -> [B, C*p*p, H/p, W/p] */
     int p = patch_size;
@@ -1099,7 +1099,7 @@ void flux_patchify(float *out, const float *in,
     }
 }
 
-void flux_unpatchify(float *out, const float *in,
+void iris_unpatchify(float *out, const float *in,
                      int batch, int channels, int H, int W, int patch_size) {
     /* [B, C*p*p, H, W] -> [B, C, H*p, W*p] */
     int p = patch_size;
@@ -1132,6 +1132,6 @@ void flux_unpatchify(float *out, const float *in,
  * Utility Functions
  * ======================================================================== */
 
-void flux_copy(float *dst, const float *src, int n) {
+void iris_copy(float *dst, const float *src, int n) {
     memcpy(dst, src, n * sizeof(float));
 }

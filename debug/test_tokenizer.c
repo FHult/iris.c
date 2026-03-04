@@ -11,11 +11,11 @@
  * flux-klein-model directory.
  *
  * Build:
- *   gcc -O2 -I. -o /tmp/flux_test_tokenizer \
- *       debug/test_tokenizer.c flux_qwen3_tokenizer.c flux_kernels.c -lm
+ *   gcc -O2 -I. -o /tmp/iris_test_tokenizer \
+ *       debug/test_tokenizer.c iris_qwen3_tokenizer.c iris_kernels.c -lm
  * Run:
- *   /tmp/flux_test_tokenizer                    # auto-finds tokenizer.json
- *   /tmp/flux_test_tokenizer /path/to/tokenizer.json
+ *   /tmp/iris_test_tokenizer                    # auto-finds tokenizer.json
+ *   /tmp/iris_test_tokenizer /path/to/tokenizer.json
  */
 
 #include <stdio.h>

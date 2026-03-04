@@ -130,7 +130,7 @@ def detect_zimage_model_dir(explicit_dir: Optional[str]) -> Optional[Path]:
     return None
 
 
-def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
+def run_test(iris_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     """Run a single test case. Returns (passed, message)."""
     if "output" in test:
         output_path = test["output"]
@@ -139,7 +139,7 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
             output_path = f.name
 
     cmd = [
-        flux_binary,
+        iris_binary,
         "-d", model_dir,
         "-p", test["prompt"],
         "--seed", str(test["seed"]),
@@ -164,7 +164,7 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, "timeout (300s)"
     except FileNotFoundError:
-        return False, f"binary not found: {flux_binary}"
+        return False, f"binary not found: {iris_binary}"
 
     # If the test has no reference image, it's a visual-check-only test.
     if "reference" not in test:
@@ -206,14 +206,14 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         return False, f"mean_diff={mean_diff:.2f} > {threshold} (max={max_diff:.0f})"
 
 
-def run_server_mode_test(flux_binary: str, model_dir: str) -> tuple[bool, str]:
+def run_server_mode_test(iris_binary: str, model_dir: str) -> tuple[bool, str]:
     """
     Smoke-test the --server JSON IPC mode.
 
     Spawns the binary with --server, sends one generation request via stdin,
     reads stdout events until 'complete' or 'error', then verifies the output.
     """
-    output_path = "/tmp/flux_server_mode_test.png"
+    output_path = "/tmp/iris_server_mode_test.png"
     request = {
         "prompt": "A simple blue circle",
         "output": output_path,
@@ -226,14 +226,14 @@ def run_server_mode_test(flux_binary: str, model_dir: str) -> tuple[bool, str]:
 
     try:
         proc = subprocess.Popen(
-            [flux_binary, "-d", model_dir, "--server"],
+            [iris_binary, "-d", model_dir, "--server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
         )
     except FileNotFoundError:
-        return False, f"binary not found: {flux_binary}"
+        return False, f"binary not found: {iris_binary}"
 
     try:
         proc.stdin.write(json.dumps(request) + "\n")
@@ -327,7 +327,7 @@ def main():
 
     for i, (test, model_dir) in enumerate(scheduled_tests, 1):
         print(f"[{i}/{total}] {test['name']}...")
-        ok, msg = run_test(args.flux_binary, test, model_dir)
+        ok, msg = run_test(args.iris_binary, test, model_dir)
 
         if ok:
             print(f"    PASS: {msg}")
@@ -340,10 +340,10 @@ def main():
         print(f"[{j}/{total}] {test['name']}...")
 
         # Step 1: Generate a reference image to use as img2img input.
-        ref_path = "/tmp/flux_test_ref_1024.png"
+        ref_path = "/tmp/iris_test_ref_1024.png"
         print(f"    Step 1: Generating 1024x1024 reference image...")
         ref_cmd = [
-            args.flux_binary, "-d", args.model_dir,
+            args.iris_binary, "-d", args.model_dir,
             "-p", "A red sports car parked on a sunny city street",
             "--seed", "42", "--steps", "4",
             "-W", "1024", "-H", "1024", "-o", ref_path,
@@ -363,13 +363,13 @@ def main():
 
         # Step 2: Run img2img with the reference — this should trigger
         # the attention budget shrinking and print a resize note.
-        output_path = "/tmp/flux_test_img2img_1024.png"
+        output_path = "/tmp/iris_test_img2img_1024.png"
         print(f"    Step 2: Running img2img with attention budget "
               f"shrinking (reference should be auto-resized)...")
         test_with_input = dict(test)
         test_with_input["input"] = ref_path
         test_with_input["output"] = output_path
-        ok, msg = run_test(args.flux_binary, test_with_input, args.model_dir)
+        ok, msg = run_test(args.iris_binary, test_with_input, args.model_dir)
 
         if ok:
             print(f"    Step 2: Done ({output_path})")
@@ -385,7 +385,7 @@ def main():
     if run_server_test:
         server_idx = len(scheduled_tests) + len(full_tests_to_run) + 1
         print(f"[{server_idx}/{total}] Server-mode IPC smoke test...")
-        ok, msg = run_server_mode_test(args.flux_binary, args.model_dir)
+        ok, msg = run_server_mode_test(args.iris_binary, args.model_dir)
         if ok:
             print(f"    PASS: {msg}")
             passed += 1

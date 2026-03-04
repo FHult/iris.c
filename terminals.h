@@ -44,7 +44,7 @@ int kitty_display_png(const char *path);
  * Sends raw RGB/RGBA pixels directly (no encoding needed).
  * Returns 0 on success, -1 on error.
  */
-int kitty_display_image(const flux_image *img);
+int kitty_display_image(const iris_image *img);
 
 /* ======================================================================
  * iTerm2 Inline Image Protocol
@@ -61,7 +61,7 @@ int iterm2_display_png(const char *path);
  * Internally encodes to PNG (iTerm2 requires an image format).
  * Returns 0 on success, -1 on error.
  */
-int iterm2_display_image(const flux_image *img);
+int iterm2_display_image(const iris_image *img);
 
 /* ======================================================================
  * Zoom Setting
@@ -89,6 +89,6 @@ int terminal_display_png(const char *path, term_graphics_proto proto);
  * For iTerm2: internally encodes to PNG first.
  * Returns 0 on success, -1 on error.
  */
-int terminal_display_image(const flux_image *img, term_graphics_proto proto);
+int terminal_display_image(const iris_image *img, term_graphics_proto proto);
 
 #endif /* TERMINALS_H */

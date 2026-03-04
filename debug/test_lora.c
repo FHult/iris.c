@@ -6,7 +6,7 @@
  *   2. Correctness: known weights produce expected output
  *   3. Rank-1 case: easy to verify by hand
  *
- * Build: gcc -O2 -I.. -o /tmp/test_lora debug/test_lora.c ../flux_lora.c ../flux_safetensors.c -lm
+ * Build: gcc -O2 -I.. -o /tmp/test_lora debug/test_lora.c ../iris_lora.c ../iris_safetensors.c -lm
  * Run:   /tmp/test_lora
  */
 

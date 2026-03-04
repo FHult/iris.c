@@ -60,7 +60,7 @@ typedef struct {
 } vae_upsample_t;
 
 /* VAE context */
-typedef struct flux_vae {
+typedef struct iris_vae {
     /* Configuration */
     int z_channels;         /* 32 (Flux) or 16 (Z-Image) */
     int latent_channels;    /* z_channels * 4: 128 (Flux) or 64 (Z-Image) */
@@ -114,75 +114,14 @@ typedef struct flux_vae {
     float *post_quant_conv_weight;  /* [z_ch, z_ch, 1, 1] - decoder */
     float *post_quant_conv_bias;    /* [z_ch] */
 
-    /* Working memory (dynamically allocated based on actual image size) */
-    int max_h, max_w;           /* Maximum supported dimensions */
-    int cur_alloc_h, cur_alloc_w;  /* Currently allocated dimensions (0 if not allocated) */
+    /* Working memory (allocated for max image size at load time) */
+    int max_h, max_w;
     float *work1, *work2, *work3;
     size_t work_size;
-} flux_vae_t;
+} iris_vae_t;
 
 /* Forward declarations */
-void flux_vae_free(flux_vae_t *vae);
-
-/*
- * Ensure VAE work buffers are allocated for the given image dimensions.
- * Buffers are reused if already large enough, otherwise reallocated.
- * Returns 0 on success, -1 on allocation failure.
- */
-static int vae_ensure_work_buffers(flux_vae_t *vae, int H, int W) {
-    /* Check if existing allocation is sufficient */
-    if (vae->work1 && vae->work2 && vae->work3 &&
-        vae->cur_alloc_h >= H && vae->cur_alloc_w >= W) {
-        return 0;  /* Already have enough */
-    }
-
-    /* Calculate required size:
-     * - Encoder peak: 512 channels at H/8 × W/8
-     * - Decoder peak: 128 channels at H × W (full resolution)
-     * - work3 needs 4x for attention/resblock operations
-     * Use 4 * 128 * H * W = 512 * H * W to cover all cases with margin
-     */
-    size_t max_spatial = (size_t)H * W;
-    size_t max_channels = 128;  /* base_channels at full resolution */
-    size_t new_size = 4 * max_channels * max_spatial * sizeof(float);
-
-    /* Free existing if too small */
-    if (vae->work_size < new_size) {
-        free(vae->work1);
-        free(vae->work2);
-        free(vae->work3);
-        vae->work1 = vae->work2 = vae->work3 = NULL;
-        vae->work_size = 0;
-        vae->cur_alloc_h = vae->cur_alloc_w = 0;
-    }
-
-    /* Allocate if needed */
-    if (!vae->work1) {
-        vae->work1 = malloc(new_size);
-        vae->work2 = malloc(new_size);
-        vae->work3 = malloc(new_size);
-
-        if (!vae->work1 || !vae->work2 || !vae->work3) {
-            free(vae->work1);
-            free(vae->work2);
-            free(vae->work3);
-            vae->work1 = vae->work2 = vae->work3 = NULL;
-            vae->work_size = 0;
-            vae->cur_alloc_h = vae->cur_alloc_w = 0;
-            return -1;
-        }
-
-        vae->work_size = new_size;
-        vae->cur_alloc_h = H;
-        vae->cur_alloc_w = W;
-
-        /* Log the allocation for debugging */
-        fprintf(stderr, "[VAE] Allocated work buffers for %dx%d (%.1f MB total)\n",
-                W, H, (3.0 * new_size) / (1024.0 * 1024.0));
-    }
-
-    return 0;
-}
+void iris_vae_free(iris_vae_t *vae);
 
 /* ========================================================================
  * Helper Functions
@@ -193,17 +132,17 @@ static void vae_conv2d(float *out, const float *in,
                        int batch, int in_ch, int out_ch, int H, int W,
                        int kH, int kW, int stride, int padding) {
 #ifdef USE_METAL
-    if (!flux_metal_available()) {
-        flux_metal_init();
+    if (!iris_metal_available()) {
+        iris_metal_init();
     }
-    if (flux_metal_available() &&
-        flux_metal_conv2d(out, in, weight, bias,
+    if (iris_metal_available() &&
+        iris_metal_conv2d(out, in, weight, bias,
                           batch, in_ch, out_ch, H, W,
                           kH, kW, stride, padding)) {
         return;
     }
 #endif
-    flux_conv2d(out, in, weight, bias, batch, in_ch, out_ch,
+    iris_conv2d(out, in, weight, bias, batch, in_ch, out_ch,
                 H, W, kH, kW, stride, padding);
 }
 
@@ -236,7 +175,7 @@ static void vae_pad_right_bottom(float *out, const float *in,
 
 /* Swish activation in-place */
 static void swish_inplace(float *x, int n) {
-    flux_silu(x, n);
+    iris_silu(x, n);
 }
 
 /* ResNet residual block: norm -> swish -> conv -> norm -> swish -> conv,
@@ -257,13 +196,13 @@ static void resblock_forward(float *out, const float *x,
         vae_conv2d(out, x, block->skip_weight, block->skip_bias,
                     batch, in_ch, out_ch, H, W, 1, 1, 1, 0);
     } else {
-        flux_copy(out, x, batch * in_ch * spatial);
+        iris_copy(out, x, batch * in_ch * spatial);
     }
 
     /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2 */
 
     /* GroupNorm + Swish */
-    flux_group_norm(work, x, block->norm1_weight, block->norm1_bias,
+    iris_group_norm(work, x, block->norm1_weight, block->norm1_bias,
                     batch, in_ch, H, W, num_groups, eps);
     swish_inplace(work, batch * in_ch * spatial);
 
@@ -273,7 +212,7 @@ static void resblock_forward(float *out, const float *x,
                 batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
 
     /* GroupNorm + Swish */
-    flux_group_norm(work, conv1_out, block->norm2_weight, block->norm2_bias,
+    iris_group_norm(work, conv1_out, block->norm2_weight, block->norm2_bias,
                     batch, out_ch, H, W, num_groups, eps);
     swish_inplace(work, batch * out_ch * spatial);
 
@@ -282,7 +221,7 @@ static void resblock_forward(float *out, const float *x,
                 batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
 
     /* Add residual */
-    flux_add_inplace(out, conv1_out, batch * out_ch * spatial);
+    iris_add_inplace(out, conv1_out, batch * out_ch * spatial);
 }
 
 /* Single-head self-attention over spatial dimensions. Reshapes [C,H,W]
@@ -299,7 +238,7 @@ static int attnblock_forward(float *out, const float *x,
     int spatial = H * W;
 
     /* GroupNorm */
-    flux_group_norm(work, x, block->norm_weight, block->norm_bias,
+    iris_group_norm(work, x, block->norm_weight, block->norm_bias,
                     batch, ch, H, W, num_groups, eps);
 
     /* Project to Q, K, V using 1x1 convs */
@@ -353,13 +292,13 @@ static int attnblock_forward(float *out, const float *x,
         }
 
         /* Q @ K^T using BLAS: [HW, C] @ [C, HW] -> [HW, HW] */
-        flux_matmul_t(scores, q_t, k_t, spatial, ch, spatial);
+        iris_matmul_t(scores, q_t, k_t, spatial, ch, spatial);
 
         /* Softmax */
-        flux_softmax(scores, spatial, spatial);
+        iris_softmax(scores, spatial, spatial);
 
         /* scores @ V using BLAS: [HW, HW] @ [HW, C] -> [HW, C] */
-        flux_matmul(o_t, scores, v_t, spatial, spatial, ch);
+        iris_matmul(o_t, scores, v_t, spatial, spatial, ch);
 
         /* Transpose output back [HW, C] -> [C, HW] */
         for (int c = 0; c < ch; c++) {
@@ -380,7 +319,7 @@ static int attnblock_forward(float *out, const float *x,
                 batch, ch, ch, H, W, 1, 1, 1, 0);
 
     /* Add residual */
-    flux_add(out, x, work, batch * ch * spatial);
+    iris_add(out, x, work, batch * ch * spatial);
     return 0;
 }
 
@@ -394,7 +333,7 @@ static int attnblock_forward(float *out, const float *x,
  * Flux uses batch normalization; Z-Image uses (latent - shift) * scale.
  * Output: [batch, latent_ch, H/16, W/16] where latent_ch is 128 (Flux) or
  * 64 (Z-Image) after patchification. */
-float *flux_vae_encode(flux_vae_t *vae, const float *img,
+float *iris_vae_encode(iris_vae_t *vae, const float *img,
                        int batch, int H, int W,
                        int *out_h, int *out_w) {
     /*
@@ -404,12 +343,6 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
      * -> patchify 2x2 -> [B, 128, H/16, W/16]
      * -> batch_norm
      */
-
-    /* Ensure work buffers are allocated for this image size */
-    if (vae_ensure_work_buffers(vae, H, W) < 0) {
-        fprintf(stderr, "VAE encode: failed to allocate work buffers for %dx%d\n", W, H);
-        return NULL;
-    }
 
     int ch_mult[4] = {1, 2, 4, 4};
     float *x = vae->work1;
@@ -434,9 +367,9 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
             vae_resblock_t *block = &vae->enc_down_blocks[block_idx++];
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            flux_copy(x, work, batch * ch_out * cur_h * cur_w);
-            if (flux_vae_progress_callback)
-                flux_vae_progress_callback(progress++, total_blocks);
+            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (iris_vae_progress_callback)
+                iris_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Downsample (except last level) */
@@ -454,7 +387,7 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
                        batch, ch_out, ch_out, padded_h, padded_w, 3, 3, 2, 0);
             cur_h = new_h;
             cur_w = new_w;
-            flux_copy(x, work, batch * ch_out * cur_h * cur_w);
+            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
         }
     }
 
@@ -463,22 +396,22 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     /* Mid block: resblock -> attn -> resblock */
     resblock_forward(work, x, &vae->enc_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->enc_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
 
     /* Output: norm -> swish -> conv */
-    flux_group_norm(work, x, vae->enc_norm_out_weight, vae->enc_norm_out_bias,
+    iris_group_norm(work, x, vae->enc_norm_out_weight, vae->enc_norm_out_bias,
                     batch, mid_ch, cur_h, cur_w, vae->num_groups, vae->eps);
     swish_inplace(work, batch * mid_ch * cur_h * cur_w);
 
@@ -491,7 +424,7 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     if (vae->quant_conv_weight) {
         vae_conv2d(work, x, vae->quant_conv_weight, vae->quant_conv_bias,
                    batch, z_ch, z_ch, cur_h, cur_w, 1, 1, 1, 0);
-        flux_copy(x, work, batch * z_ch * cur_h * cur_w);
+        iris_copy(x, work, batch * z_ch * cur_h * cur_w);
     }
 
     /* Take mean only (first 32 channels) */
@@ -512,7 +445,7 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     int patch_w = latent_w / 2;
     int lat_ch = vae->latent_channels;
     float *latent = (float *)malloc(batch * lat_ch * patch_h * patch_w * sizeof(float));
-    flux_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
+    iris_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
     free(mean);
 
     /* Normalize latent space */
@@ -523,9 +456,9 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
             latent[i] = (latent[i] - vae->shift_factor) * vae->scaling_factor;
     } else {
         /* Flux: batch normalize */
-        flux_batch_norm(work, latent, vae->bn_mean, vae->bn_var, NULL, NULL,
+        iris_batch_norm(work, latent, vae->bn_mean, vae->bn_var, NULL, NULL,
                         batch, lat_ch, patch_h, patch_w, vae->eps);
-        flux_copy(latent, work, batch * lat_ch * patch_h * patch_w);
+        iris_copy(latent, work, batch * lat_ch * patch_h * patch_w);
     }
 
     *out_h = patch_h;
@@ -540,7 +473,7 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
 #ifdef USE_METAL
 
 /* GPU resblock: all operations on GPU, returns new tensor */
-static flux_gpu_tensor_t resblock_forward_gpu(flux_gpu_tensor_t x,
+static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
                                                const vae_resblock_t *block,
                                                int batch, int H, int W,
                                                int num_groups, float eps) {
@@ -550,45 +483,45 @@ static flux_gpu_tensor_t resblock_forward_gpu(flux_gpu_tensor_t x,
     int n = batch * out_ch * spatial;
 
     /* Skip connection */
-    flux_gpu_tensor_t skip;
+    iris_gpu_tensor_t skip;
     if (in_ch != out_ch) {
-        skip = flux_gpu_conv2d_f32(x, block->skip_weight, block->skip_bias,
+        skip = iris_gpu_conv2d_f32(x, block->skip_weight, block->skip_bias,
                                     batch, in_ch, out_ch, H, W, 1, 1, 1, 0);
     } else {
-        skip = flux_gpu_tensor_alloc((size_t)n);
-        flux_gpu_copy_f32(skip, x, (size_t)n);
+        skip = iris_gpu_tensor_alloc((size_t)n);
+        iris_gpu_copy_f32(skip, x, (size_t)n);
     }
     if (!skip) return NULL;
 
     /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2 */
-    flux_gpu_tensor_t work = flux_gpu_tensor_alloc((size_t)batch * in_ch * spatial);
-    if (!work) { flux_gpu_tensor_free(skip); return NULL; }
+    iris_gpu_tensor_t work = iris_gpu_tensor_alloc((size_t)batch * in_ch * spatial);
+    if (!work) { iris_gpu_tensor_free(skip); return NULL; }
 
-    flux_gpu_group_norm_f32(work, x, block->norm1_weight, block->norm1_bias,
+    iris_gpu_group_norm_f32(work, x, block->norm1_weight, block->norm1_bias,
                              batch, in_ch, spatial, num_groups, eps);
-    flux_gpu_swish_f32(work, work, batch * in_ch * spatial);
+    iris_gpu_swish_f32(work, work, batch * in_ch * spatial);
 
-    flux_gpu_tensor_t conv1_out = flux_gpu_conv2d_f32(work, block->conv1_weight, block->conv1_bias,
+    iris_gpu_tensor_t conv1_out = iris_gpu_conv2d_f32(work, block->conv1_weight, block->conv1_bias,
                                                        batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
-    flux_gpu_tensor_free(work);
-    if (!conv1_out) { flux_gpu_tensor_free(skip); return NULL; }
+    iris_gpu_tensor_free(work);
+    if (!conv1_out) { iris_gpu_tensor_free(skip); return NULL; }
 
-    work = flux_gpu_tensor_alloc((size_t)batch * out_ch * spatial);
-    if (!work) { flux_gpu_tensor_free(skip); flux_gpu_tensor_free(conv1_out); return NULL; }
+    work = iris_gpu_tensor_alloc((size_t)batch * out_ch * spatial);
+    if (!work) { iris_gpu_tensor_free(skip); iris_gpu_tensor_free(conv1_out); return NULL; }
 
-    flux_gpu_group_norm_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
+    iris_gpu_group_norm_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
                              batch, out_ch, spatial, num_groups, eps);
-    flux_gpu_swish_f32(work, work, batch * out_ch * spatial);
-    flux_gpu_tensor_free(conv1_out);
+    iris_gpu_swish_f32(work, work, batch * out_ch * spatial);
+    iris_gpu_tensor_free(conv1_out);
 
-    conv1_out = flux_gpu_conv2d_f32(work, block->conv2_weight, block->conv2_bias,
+    conv1_out = iris_gpu_conv2d_f32(work, block->conv2_weight, block->conv2_bias,
                                      batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
-    flux_gpu_tensor_free(work);
-    if (!conv1_out) { flux_gpu_tensor_free(skip); return NULL; }
+    iris_gpu_tensor_free(work);
+    if (!conv1_out) { iris_gpu_tensor_free(skip); return NULL; }
 
     /* Residual: skip += conv_out */
-    flux_gpu_add_f32(skip, skip, conv1_out, n);
-    flux_gpu_tensor_free(conv1_out);
+    iris_gpu_add_f32(skip, skip, conv1_out, n);
+    iris_gpu_tensor_free(conv1_out);
 
     return skip;
 }
@@ -597,7 +530,7 @@ static flux_gpu_tensor_t resblock_forward_gpu(flux_gpu_tensor_t x,
  * x: [batch, channels, H, W] f32 GPU tensor (NCHW layout).
  * Returns new GPU tensor on success, NULL on failure (caller uses CPU fallback).
  * Only batch=1 is supported; returns NULL for batch>1. */
-static flux_gpu_tensor_t attnblock_forward_gpu(flux_gpu_tensor_t x,
+static iris_gpu_tensor_t attnblock_forward_gpu(iris_gpu_tensor_t x,
                                                 const vae_attnblock_t *block,
                                                 int batch, int H, int W,
                                                 int num_groups, float eps) {
@@ -606,78 +539,73 @@ static flux_gpu_tensor_t attnblock_forward_gpu(flux_gpu_tensor_t x,
     float scale = 1.0f / sqrtf((float)ch);
 
     /* GroupNorm */
-    flux_gpu_tensor_t norm = flux_gpu_tensor_alloc((size_t)ch * sp);
+    iris_gpu_tensor_t norm = iris_gpu_tensor_alloc((size_t)ch * sp);
     if (!norm) return NULL;
-    flux_gpu_group_norm_f32(norm, x, block->norm_weight, block->norm_bias,
+    iris_gpu_group_norm_f32(norm, x, block->norm_weight, block->norm_bias,
                              batch, ch, sp, num_groups, eps);
 
     /* Q / K / V projections (1x1 conv, NCHW output) */
-    flux_gpu_tensor_t q = flux_gpu_conv2d_f32(norm, block->q_weight, block->q_bias,
+    iris_gpu_tensor_t q = iris_gpu_conv2d_f32(norm, block->q_weight, block->q_bias,
                                                batch, ch, ch, H, W, 1, 1, 1, 0);
-    flux_gpu_tensor_t k = flux_gpu_conv2d_f32(norm, block->k_weight, block->k_bias,
+    iris_gpu_tensor_t k = iris_gpu_conv2d_f32(norm, block->k_weight, block->k_bias,
                                                batch, ch, ch, H, W, 1, 1, 1, 0);
-    flux_gpu_tensor_t v = flux_gpu_conv2d_f32(norm, block->v_weight, block->v_bias,
+    iris_gpu_tensor_t v = iris_gpu_conv2d_f32(norm, block->v_weight, block->v_bias,
                                                batch, ch, ch, H, W, 1, 1, 1, 0);
-    flux_gpu_tensor_free(norm);
+    iris_gpu_tensor_free(norm);
     if (!q || !k || !v) {
-        flux_gpu_tensor_free(q); flux_gpu_tensor_free(k); flux_gpu_tensor_free(v);
+        iris_gpu_tensor_free(q); iris_gpu_tensor_free(k); iris_gpu_tensor_free(v);
         return NULL;
     }
 
     /* Transpose Q/K/V: [B,C,S] -> [B,S,C] for attention kernel */
-    flux_gpu_tensor_t qt = flux_gpu_transpose_cs(q, batch, ch, sp, 1);
-    flux_gpu_tensor_t kt = flux_gpu_transpose_cs(k, batch, ch, sp, 1);
-    flux_gpu_tensor_t vt = flux_gpu_transpose_cs(v, batch, ch, sp, 1);
-    flux_gpu_tensor_free(q); flux_gpu_tensor_free(k); flux_gpu_tensor_free(v);
+    iris_gpu_tensor_t qt = iris_gpu_transpose_cs(q, batch, ch, sp, 1);
+    iris_gpu_tensor_t kt = iris_gpu_transpose_cs(k, batch, ch, sp, 1);
+    iris_gpu_tensor_t vt = iris_gpu_transpose_cs(v, batch, ch, sp, 1);
+    iris_gpu_tensor_free(q); iris_gpu_tensor_free(k); iris_gpu_tensor_free(v);
     if (!qt || !kt || !vt) {
-        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+        iris_gpu_tensor_free(qt); iris_gpu_tensor_free(kt); iris_gpu_tensor_free(vt);
         return NULL;
     }
 
     /* Single-head attention: seq=sp, num_heads=1, head_dim=ch */
-    flux_gpu_tensor_t attn = flux_gpu_tensor_alloc((size_t)sp * ch);
+    iris_gpu_tensor_t attn = iris_gpu_tensor_alloc((size_t)sp * ch);
     if (!attn) {
-        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+        iris_gpu_tensor_free(qt); iris_gpu_tensor_free(kt); iris_gpu_tensor_free(vt);
         return NULL;
     }
-    if (!flux_gpu_attention_fused(attn, qt, kt, vt, sp, sp, 1, ch, scale)) {
-        flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
-        flux_gpu_tensor_free(attn);
+    if (!iris_gpu_attention_fused(attn, qt, kt, vt, sp, sp, 1, ch, scale)) {
+        iris_gpu_tensor_free(qt); iris_gpu_tensor_free(kt); iris_gpu_tensor_free(vt);
+        iris_gpu_tensor_free(attn);
         return NULL;
     }
-    flux_gpu_tensor_free(qt); flux_gpu_tensor_free(kt); flux_gpu_tensor_free(vt);
+    iris_gpu_tensor_free(qt); iris_gpu_tensor_free(kt); iris_gpu_tensor_free(vt);
 
     /* Transpose output back: [B,S,C] -> [B,C,S] = NCHW */
-    flux_gpu_tensor_t attn_nchw = flux_gpu_transpose_cs(attn, batch, ch, sp, 0);
-    flux_gpu_tensor_free(attn);
+    iris_gpu_tensor_t attn_nchw = iris_gpu_transpose_cs(attn, batch, ch, sp, 0);
+    iris_gpu_tensor_free(attn);
     if (!attn_nchw) return NULL;
 
     /* Output projection (1x1 conv) */
-    flux_gpu_tensor_t proj = flux_gpu_conv2d_f32(attn_nchw, block->out_weight, block->out_bias,
+    iris_gpu_tensor_t proj = iris_gpu_conv2d_f32(attn_nchw, block->out_weight, block->out_bias,
                                                    batch, ch, ch, H, W, 1, 1, 1, 0);
-    flux_gpu_tensor_free(attn_nchw);
+    iris_gpu_tensor_free(attn_nchw);
     if (!proj) return NULL;
 
     /* Residual: result = x + proj */
-    flux_gpu_tensor_t result = flux_gpu_tensor_alloc((size_t)ch * sp);
-    if (!result) { flux_gpu_tensor_free(proj); return NULL; }
-    flux_gpu_add_f32(result, x, proj, ch * sp);
-    flux_gpu_tensor_free(proj);
+    iris_gpu_tensor_t result = iris_gpu_tensor_alloc((size_t)ch * sp);
+    if (!result) { iris_gpu_tensor_free(proj); return NULL; }
+    iris_gpu_add_f32(result, x, proj, ch * sp);
+    iris_gpu_tensor_free(proj);
     return result;
 }
 
 /* GPU-resident VAE decode.
  * Returns NULL on failure (caller falls back to CPU path). */
-static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
+static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w) {
-    if (!flux_metal_available()) return NULL;
+    if (!iris_metal_available()) return NULL;
 
     int ch_mult[4] = {1, 2, 4, 4};
-
-    /* Ensure work buffers are allocated (needed for CPU portions of GPU path) */
-    int out_H = latent_h * 16;
-    int out_W = latent_w * 16;
-    if (vae_ensure_work_buffers(vae, out_H, out_W) < 0) return NULL;
 
     /* Denormalize + unpatchify on CPU (small data, fast) */
     float *cpu_x = vae->work1;
@@ -685,7 +613,7 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     int lat_ch = vae->latent_channels;
 
     int z_spatial = latent_h * latent_w;
-    flux_copy(cpu_x, latent, batch * lat_ch * z_spatial);
+    iris_copy(cpu_x, latent, batch * lat_ch * z_spatial);
 
     if (vae->scaling_factor != 0.0f) {
         /* Z-Image: latent = latent / scaling + shift */
@@ -708,33 +636,33 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
 
     int unpatch_h = latent_h * 2;
     int unpatch_w = latent_w * 2;
-    flux_unpatchify(cpu_work, cpu_x, batch, vae->z_channels, latent_h, latent_w, 2);
-    flux_copy(cpu_x, cpu_work, batch * vae->z_channels * unpatch_h * unpatch_w);
+    iris_unpatchify(cpu_work, cpu_x, batch, vae->z_channels, latent_h, latent_w, 2);
+    iris_copy(cpu_x, cpu_work, batch * vae->z_channels * unpatch_h * unpatch_w);
     int cur_h = unpatch_h, cur_w = unpatch_w;
 
     /* Upload to GPU and start batch */
     size_t x_size = (size_t)batch * vae->z_channels * cur_h * cur_w;
-    flux_gpu_tensor_t x = flux_gpu_tensor_create(cpu_x, x_size);
+    iris_gpu_tensor_t x = iris_gpu_tensor_create(cpu_x, x_size);
     if (!x) return NULL;
 
-    flux_gpu_batch_begin();
-    flux_gpu_tensor_t t;
+    iris_gpu_batch_begin();
+    iris_gpu_tensor_t t;
 
     /* Post-quantization conv (1x1) - Flux only */
     if (vae->post_quant_conv_weight) {
-        t = flux_gpu_conv2d_f32(x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
+        t = iris_gpu_conv2d_f32(x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
                                 batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-        flux_gpu_tensor_free(x);
-        if (!t) { flux_gpu_batch_end(); return NULL; }
+        iris_gpu_tensor_free(x);
+        if (!t) { iris_gpu_batch_end(); return NULL; }
         x = t;
     }
 
     /* Conv in: z_channels -> 512 */
     int mid_ch = vae->base_channels * ch_mult[3];
-    t = flux_gpu_conv2d_f32(x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
+    t = iris_gpu_conv2d_f32(x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
                              batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
-    flux_gpu_tensor_free(x);
-    if (!t) { flux_gpu_batch_end(); return NULL; }
+    iris_gpu_tensor_free(x);
+    if (!t) { iris_gpu_batch_end(); return NULL; }
     x = t;
 
     /* Mid block: resblock1 */
@@ -742,44 +670,44 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);
 
     t = resblock_forward_gpu(x, &vae->dec_mid_block1, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    flux_gpu_tensor_free(x);
-    if (!t) { flux_gpu_batch_end(); return NULL; }
+    iris_gpu_tensor_free(x);
+    if (!t) { iris_gpu_batch_end(); return NULL; }
     x = t;
-    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
     /* Mid block attention: GPU path (stays in batch); CPU fallback on failure */
     {
-        flux_gpu_tensor_t ar =
+        iris_gpu_tensor_t ar =
             attnblock_forward_gpu(x, &vae->dec_mid_attn, batch, cur_h, cur_w,
                                   vae->num_groups, vae->eps);
         if (ar) {
-            flux_gpu_tensor_free(x);
+            iris_gpu_tensor_free(x);
             x = ar;
         } else {
             /* CPU fallback: sync, compute, re-upload, restart batch */
             size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
-            flux_gpu_batch_end();
-            flux_gpu_tensor_read(x, cpu_work);
+            iris_gpu_batch_end();
+            iris_gpu_tensor_read(x, cpu_work);
             if (attnblock_forward(cpu_x, cpu_work, &vae->dec_mid_attn,
                                    vae->work3, batch, cur_h, cur_w,
                                    vae->num_groups, vae->eps) < 0) {
-                flux_gpu_tensor_free(x);
+                iris_gpu_tensor_free(x);
                 return NULL;
             }
-            flux_gpu_tensor_free(x);
-            x = flux_gpu_tensor_create(cpu_x, attn_size);
+            iris_gpu_tensor_free(x);
+            x = iris_gpu_tensor_create(cpu_x, attn_size);
             if (!x) return NULL;
-            flux_gpu_batch_begin();
+            iris_gpu_batch_begin();
         }
-        if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+        if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
     }
 
     /* Mid block: resblock2 */
     t = resblock_forward_gpu(x, &vae->dec_mid_block2, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    flux_gpu_tensor_free(x);
-    if (!t) { flux_gpu_batch_end(); return NULL; }
+    iris_gpu_tensor_free(x);
+    if (!t) { iris_gpu_batch_end(); return NULL; }
     x = t;
-    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
     int block_idx = 0;
     int up_idx = 0;
@@ -791,10 +719,10 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
         for (int r = 0; r < vae->num_res_blocks + 1; r++) {
             vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
             t = resblock_forward_gpu(x, block, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            flux_gpu_tensor_free(x);
-            if (!t) { flux_gpu_batch_end(); return NULL; }
+            iris_gpu_tensor_free(x);
+            if (!t) { iris_gpu_batch_end(); return NULL; }
             x = t;
-            if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+            if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Upsample (except level 0) */
@@ -803,14 +731,14 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
             int new_h = cur_h * 2;
             int new_w = cur_w * 2;
 
-            t = flux_gpu_upsample_nearest_2x_f32(x, ch_out, cur_h, cur_w);
-            flux_gpu_tensor_free(x);
-            if (!t) { flux_gpu_batch_end(); return NULL; }
+            t = iris_gpu_upsample_nearest_2x_f32(x, ch_out, cur_h, cur_w);
+            iris_gpu_tensor_free(x);
+            if (!t) { iris_gpu_batch_end(); return NULL; }
 
-            x = flux_gpu_conv2d_f32(t, us->conv_weight, us->conv_bias,
+            x = iris_gpu_conv2d_f32(t, us->conv_weight, us->conv_bias,
                                      batch, ch_out, ch_out, new_h, new_w, 3, 3, 1, 1);
-            flux_gpu_tensor_free(t);
-            if (!x) { flux_gpu_batch_end(); return NULL; }
+            iris_gpu_tensor_free(t);
+            if (!x) { iris_gpu_batch_end(); return NULL; }
 
             cur_h = new_h;
             cur_w = new_w;
@@ -820,31 +748,31 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
     /* Output: norm -> swish -> conv_out */
     int out_ch = vae->base_channels;  /* 128 */
     size_t final_size = (size_t)batch * out_ch * cur_h * cur_w;
-    t = flux_gpu_tensor_alloc(final_size);
-    if (!t) { flux_gpu_tensor_free(x); flux_gpu_batch_end(); return NULL; }
-    flux_gpu_group_norm_f32(t, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
+    t = iris_gpu_tensor_alloc(final_size);
+    if (!t) { iris_gpu_tensor_free(x); iris_gpu_batch_end(); return NULL; }
+    iris_gpu_group_norm_f32(t, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
                              batch, out_ch, cur_h * cur_w, vae->num_groups, vae->eps);
-    flux_gpu_swish_f32(t, t, (int)final_size);
-    flux_gpu_tensor_free(x);
+    iris_gpu_swish_f32(t, t, (int)final_size);
+    iris_gpu_tensor_free(x);
 
-    x = flux_gpu_conv2d_f32(t, vae->dec_conv_out_weight, vae->dec_conv_out_bias,
+    x = iris_gpu_conv2d_f32(t, vae->dec_conv_out_weight, vae->dec_conv_out_bias,
                              batch, out_ch, 3, cur_h, cur_w, 3, 3, 1, 1);
-    flux_gpu_tensor_free(t);
-    if (!x) { flux_gpu_batch_end(); return NULL; }
+    iris_gpu_tensor_free(t);
+    if (!x) { iris_gpu_batch_end(); return NULL; }
 
     /* Execute everything and read result */
-    flux_gpu_batch_end();
+    iris_gpu_batch_end();
 
     int H = cur_h;
     int W = cur_w;
     size_t rgb_size = (size_t)batch * 3 * H * W;
     float *rgb = (float *)malloc(rgb_size * sizeof(float));
-    if (!rgb) { flux_gpu_tensor_free(x); return NULL; }
-    flux_gpu_tensor_read(x, rgb);
-    flux_gpu_tensor_free(x);
+    if (!rgb) { iris_gpu_tensor_free(x); return NULL; }
+    iris_gpu_tensor_read(x, rgb);
+    iris_gpu_tensor_free(x);
 
     /* Convert to image */
-    flux_image *img = flux_image_create(W, H, 3);
+    iris_image *img = iris_image_create(W, H, 3);
     if (!img) { free(rgb); return NULL; }
 
     for (int y = 0; y < H; y++) {
@@ -875,12 +803,12 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
  * the decoder CNN (up_blocks double resolution 3 times). Converts the
  * float output to uint8 RGB. Tries GPU-resident decode first for speed,
  * falling back to CPU on failure. */
-flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
+iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
 #ifdef USE_METAL
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
-    if (flux_metal_available()) {
-        flux_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
+    if (iris_metal_available()) {
+        iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
         if (gpu_result) return gpu_result;
         /* Fall through to CPU path on failure */
     }
@@ -895,16 +823,6 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
      * -> [B, 3, H, W]
      */
 
-    /* Calculate output image dimensions (latent is H/16 x W/16) */
-    int out_H = latent_h * 16;
-    int out_W = latent_w * 16;
-
-    /* Ensure work buffers are allocated for this image size */
-    if (vae_ensure_work_buffers(vae, out_H, out_W) < 0) {
-        fprintf(stderr, "VAE decode: failed to allocate work buffers for %dx%d\n", out_W, out_H);
-        return NULL;
-    }
-
     int ch_mult[4] = {1, 2, 4, 4};
     float *x = vae->work1;
     float *work = vae->work2;
@@ -912,7 +830,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 
     /* Denormalize latent space */
     int z_spatial = latent_h * latent_w;
-    flux_copy(x, latent, batch * lat_ch * z_spatial);
+    iris_copy(x, latent, batch * lat_ch * z_spatial);
 
     if (vae->scaling_factor != 0.0f) {
         /* Z-Image: latent = latent / scaling + shift */
@@ -936,8 +854,8 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     /* Unpatchify: [B, latent_ch, H/16, W/16] -> [B, z_ch, H/8, W/8] */
     int unpatch_h = latent_h * 2;
     int unpatch_w = latent_w * 2;
-    flux_unpatchify(work, x, batch, vae->z_channels, latent_h, latent_w, 2);
-    flux_copy(x, work, batch * vae->z_channels * unpatch_h * unpatch_w);
+    iris_unpatchify(work, x, batch, vae->z_channels, latent_h, latent_w, 2);
+    iris_copy(x, work, batch * vae->z_channels * unpatch_h * unpatch_w);
 
     int cur_h = unpatch_h, cur_w = unpatch_w;
 
@@ -945,14 +863,14 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     if (vae->post_quant_conv_weight) {
         vae_conv2d(work, x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
                     batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-        flux_copy(x, work, batch * vae->z_channels * cur_h * cur_w);
+        iris_copy(x, work, batch * vae->z_channels * cur_h * cur_w);
     }
 
     /* Conv in: 32 -> 512 */
     int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
     vae_conv2d(work, x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
                 batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
-    flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
 
     /* Mid block: resblock -> attn -> resblock */
     int progress = 0;
@@ -960,19 +878,19 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 
     resblock_forward(work, x, &vae->dec_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->dec_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
-    if (flux_vae_progress_callback)
-        flux_vae_progress_callback(progress++, total_blocks);
+    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (iris_vae_progress_callback)
+        iris_vae_progress_callback(progress++, total_blocks);
 
     int block_idx = 0;
     int up_idx = 0;
@@ -986,9 +904,9 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
             vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            flux_copy(x, work, batch * ch_out * cur_h * cur_w);
-            if (flux_vae_progress_callback)
-                flux_vae_progress_callback(progress++, total_blocks);
+            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (iris_vae_progress_callback)
+                iris_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Upsample (except level 0) */
@@ -998,7 +916,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
             int new_w = cur_w * 2;
 
             /* Nearest neighbor upsample */
-            flux_upsample_nearest(work, x, batch, ch_out, cur_h, cur_w, 2, 2);
+            iris_upsample_nearest(work, x, batch, ch_out, cur_h, cur_w, 2, 2);
 
             /* Conv for refinement */
             vae_conv2d(x, work, us->conv_weight, us->conv_bias,
@@ -1012,7 +930,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     int out_ch = vae->base_channels;  /* 128 */
 
     /* Output: norm -> swish -> conv */
-    flux_group_norm(work, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
+    iris_group_norm(work, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
                     batch, out_ch, cur_h, cur_w, vae->num_groups, vae->eps);
     swish_inplace(work, batch * out_ch * cur_h * cur_w);
 
@@ -1024,7 +942,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     int H = cur_h;
     int W = cur_w;
 
-    flux_image *img = flux_image_create(W, H, 3);
+    iris_image *img = iris_image_create(W, H, 3);
     if (!img) return NULL;
 
     /* Denormalize from [-1, 1] to [0, 255] and convert to uint8 */
@@ -1134,8 +1052,8 @@ static void free_attnblock(vae_attnblock_t *block) {
     free(block->out_bias);
 }
 
-flux_vae_t *flux_vae_load(FILE *f) {
-    flux_vae_t *vae = calloc(1, sizeof(flux_vae_t));
+iris_vae_t *iris_vae_load(FILE *f) {
+    iris_vae_t *vae = calloc(1, sizeof(iris_vae_t));
     if (!vae) return NULL;
 
     /* Read config */
@@ -1152,10 +1070,10 @@ flux_vae_t *flux_vae_load(FILE *f) {
     vae->scaling_factor = 0.0f;
     vae->shift_factor = 0.0f;
 
-    vae->ch_mult[0] = FLUX_VAE_CH_MULT_0;
-    vae->ch_mult[1] = FLUX_VAE_CH_MULT_1;
-    vae->ch_mult[2] = FLUX_VAE_CH_MULT_2;
-    vae->ch_mult[3] = FLUX_VAE_CH_MULT_3;
+    vae->ch_mult[0] = IRIS_VAE_CH_MULT_0;
+    vae->ch_mult[1] = IRIS_VAE_CH_MULT_1;
+    vae->ch_mult[2] = IRIS_VAE_CH_MULT_2;
+    vae->ch_mult[3] = IRIS_VAE_CH_MULT_3;
     vae->eps = 1e-4f;  /* batch_norm_eps from config */
 
     /* Read encoder conv_in */
@@ -1238,11 +1156,11 @@ flux_vae_t *flux_vae_load(FILE *f) {
     return vae;
 
 error:
-    flux_vae_free(vae);
+    iris_vae_free(vae);
     return NULL;
 }
 
-void flux_vae_free(flux_vae_t *vae) {
+void iris_vae_free(iris_vae_t *vae) {
     if (!vae) return;
 
     free(vae->enc_conv_in_weight);
@@ -1318,7 +1236,7 @@ void flux_vae_free(flux_vae_t *vae) {
  * ======================================================================== */
 
 /* Convert image to tensor [B, 3, H, W] normalized to [-1, 1] */
-float *flux_image_to_tensor(const flux_image *img) {
+float *iris_image_to_tensor(const iris_image *img) {
     int H = img->height;
     int W = img->width;
     int C = img->channels;
@@ -1445,11 +1363,11 @@ static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
  * VAE variants. Builds the full encoder and decoder weight hierarchy:
  * conv_in -> down_blocks (4 levels, channel multipliers [1,2,4,4]) ->
  * mid_block -> up_blocks -> conv_out. Also loads batch norm stats if present. */
-flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
+iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                           int z_channels,
                                           float scaling_factor,
                                           float shift_factor) {
-    flux_vae_t *vae = calloc(1, sizeof(flux_vae_t));
+    iris_vae_t *vae = calloc(1, sizeof(iris_vae_t));
     if (!vae) return NULL;
 
     char name[256];
@@ -1461,8 +1379,8 @@ flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
     vae->base_channels = 128;
     vae->num_res_blocks = 2;
     vae->num_groups = 32;
-    vae->max_h = FLUX_VAE_MAX_DIM;
-    vae->max_w = FLUX_VAE_MAX_DIM;
+    vae->max_h = IRIS_VAE_MAX_DIM;
+    vae->max_w = IRIS_VAE_MAX_DIM;
     vae->scaling_factor = scaling_factor;
     vae->shift_factor = shift_factor;
     vae->eps = (scaling_factor != 0.0f) ? 1e-6f : 1e-4f;
@@ -1589,21 +1507,23 @@ flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
         for (int i = 0; i < lc; i++) vae->bn_var[i] = 1.0f;
     }
 
-    /* Work buffers are now allocated on-demand in encode/decode functions
-     * based on actual image dimensions. This saves significant memory
-     * when generating smaller images (e.g., 256x256 uses ~100MB instead of 6GB).
-     */
-    vae->work1 = NULL;
-    vae->work2 = NULL;
-    vae->work3 = NULL;
-    vae->work_size = 0;
-    vae->cur_alloc_h = 0;
-    vae->cur_alloc_w = 0;
+    /* Allocate work buffers for max supported image size */
+    size_t max_spatial = (size_t)vae->max_h * vae->max_w;
+    size_t max_channels = vae->base_channels;  /* 128 at full resolution */
+    vae->work_size = 4 * max_channels * max_spatial * sizeof(float);
+    vae->work1 = malloc(vae->work_size);
+    vae->work2 = malloc(vae->work_size);
+    vae->work3 = malloc(vae->work_size);
+
+    if (!vae->work1 || !vae->work2 || !vae->work3) {
+        iris_vae_free(vae);
+        return NULL;
+    }
 
     return vae;
 }
 
 /* Backward-compatible wrapper: loads with Flux defaults (z_channels=32, no scaling) */
-flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {
-    return flux_vae_load_safetensors_ex(sf, 32, 0.0f, 0.0f);
+iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf) {
+    return iris_vae_load_safetensors_ex(sf, 32, 0.0f, 0.0f);
 }
