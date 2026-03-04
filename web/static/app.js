@@ -1728,6 +1728,159 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // -------------------------------------------------------------------------
+    // Outpaint panel
+    // -------------------------------------------------------------------------
+    const outpaintPanel     = document.getElementById('outpaint-panel');
+    const outpaintThumb     = document.getElementById('outpaint-thumb');
+    const outpaintNewSize   = document.getElementById('outpaint-new-size');
+    const outpaintPromptIn  = document.getElementById('outpaint-prompt');
+    const outpaintSubmitBtn = document.getElementById('outpaint-submit-btn');
+    const outpaintCancelBtn = document.getElementById('outpaint-cancel-btn');
+    const outpaintCloseBtn  = document.getElementById('outpaint-close-btn');
+    const outpaintLoraNotice = document.getElementById('outpaint-lora-notice');
+    const outpaintDownloadLoraBtn = document.getElementById('outpaint-download-lora-btn');
+    const lightboxOutpaintBtn = document.getElementById('lightbox-outpaint-btn');
+
+    const OUTPAINT_LORA = 'flux-outpaint-lora.safetensors';
+
+    let _outpaintSourceItem = null;  // history item for current outpaint session
+
+    function _outpaintLoraAvailable() {
+        return availableLoras.some(l => l.filename === OUTPAINT_LORA);
+    }
+
+    function openOutpaintPanel(item) {
+        _outpaintSourceItem = item;
+        // Reset selects
+        document.querySelectorAll('.outpaint-amount').forEach(s => s.value = '0');
+        if (outpaintPromptIn) outpaintPromptIn.value = '';
+        if (outpaintNewSize) outpaintNewSize.textContent = `${item.width} × ${item.height}`;
+        // Thumbnail
+        if (outpaintThumb) {
+            outpaintThumb.innerHTML = `<img src="${item.image_url}?t=${item.created_at}" alt="source">`;
+        }
+        // LoRA availability
+        const loraOk = _outpaintLoraAvailable();
+        if (outpaintLoraNotice) outpaintLoraNotice.style.display = loraOk ? 'none' : 'flex';
+        if (outpaintSubmitBtn) outpaintSubmitBtn.disabled = !loraOk;
+        if (outpaintPanel) outpaintPanel.style.display = 'flex';
+    }
+
+    function closeOutpaintPanel() {
+        if (outpaintPanel) outpaintPanel.style.display = 'none';
+        _outpaintSourceItem = null;
+    }
+
+    // Update size preview when selects change
+    document.querySelectorAll('.outpaint-amount').forEach(sel => {
+        sel.addEventListener('change', () => {
+            if (!_outpaintSourceItem) return;
+            const top    = parseFloat(document.querySelector('[data-dir="top"]').value)    || 0;
+            const bottom = parseFloat(document.querySelector('[data-dir="bottom"]').value) || 0;
+            const left   = parseFloat(document.querySelector('[data-dir="left"]').value)   || 0;
+            const right  = parseFloat(document.querySelector('[data-dir="right"]').value)  || 0;
+            const w = _outpaintSourceItem.width;
+            const h = _outpaintSourceItem.height;
+            const newW = Math.round((w + w * left  + w * right)  / 16) * 16;
+            const newH = Math.round((h + h * top   + h * bottom) / 16) * 16;
+            const warn = (newW > 1792 || newH > 1792) ? ' ⚠ exceeds 1792px max' : '';
+            if (outpaintNewSize) outpaintNewSize.textContent = `${newW} × ${newH}${warn}`;
+        });
+    });
+
+    if (lightboxOutpaintBtn) {
+        lightboxOutpaintBtn.addEventListener('click', () => {
+            const item = lightboxItems[lightboxIndex];
+            if (!item) return;
+            closeLightbox();
+            openOutpaintPanel(item);
+        });
+    }
+
+    if (outpaintCloseBtn) outpaintCloseBtn.addEventListener('click', closeOutpaintPanel);
+    if (outpaintCancelBtn) outpaintCancelBtn.addEventListener('click', closeOutpaintPanel);
+
+    if (outpaintDownloadLoraBtn) {
+        outpaintDownloadLoraBtn.addEventListener('click', () => {
+            closeOutpaintPanel();
+            // Open LoRA panel to the curated entry
+            if (loraBrowseBtn) loraBrowseBtn.click();
+        });
+    }
+
+    if (outpaintSubmitBtn) {
+        outpaintSubmitBtn.addEventListener('click', async () => {
+            if (!_outpaintSourceItem) return;
+            const item = _outpaintSourceItem;
+
+            const top    = parseFloat(document.querySelector('[data-dir="top"]').value)    || 0;
+            const bottom = parseFloat(document.querySelector('[data-dir="bottom"]').value) || 0;
+            const left   = parseFloat(document.querySelector('[data-dir="left"]').value)   || 0;
+            const right  = parseFloat(document.querySelector('[data-dir="right"]').value)  || 0;
+
+            if (top === 0 && bottom === 0 && left === 0 && right === 0) {
+                showError('Select at least one direction to expand');
+                return;
+            }
+
+            // Convert percentages to pixel amounts (server snaps to 16px grid)
+            const pixTop    = Math.round(item.height * top    / 16) * 16;
+            const pixBottom = Math.round(item.height * bottom / 16) * 16;
+            const pixLeft   = Math.round(item.width  * left   / 16) * 16;
+            const pixRight  = Math.round(item.width  * right  / 16) * 16;
+
+            outpaintSubmitBtn.disabled = true;
+            outpaintSubmitBtn.textContent = 'Preparing…';
+
+            try {
+                const imageBase64 = await fetchImageAsBase64(
+                    `${item.image_url}?t=${item.created_at}`
+                );
+
+                const prepResp = await fetch('/outpaint-prep', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        image: imageBase64,
+                        top: pixTop, bottom: pixBottom,
+                        left: pixLeft, right: pixRight,
+                    }),
+                });
+                const prep = await prepResp.json();
+                if (!prepResp.ok) {
+                    showError(prep.error || 'Outpaint prep failed');
+                    return;
+                }
+
+                const prompt = (outpaintPromptIn && outpaintPromptIn.value.trim())
+                    || item.prompt;
+
+                closeOutpaintPanel();
+                await addToQueue({
+                    prompt,
+                    width:  prep.width,
+                    height: prep.height,
+                    steps:  item.steps,
+                    seed:   null,
+                    referenceImages: [prep.padded_image],
+                    img2img_strength: 0.85,
+                    lora: OUTPAINT_LORA,
+                    lora_scale: 1.0,
+                    style: null,
+                    guidance: null,
+                    schedule: null,
+                });
+            } catch (err) {
+                console.error('Outpaint failed:', err);
+                showError('Outpaint failed — check console for details');
+            } finally {
+                outpaintSubmitBtn.disabled = false;
+                outpaintSubmitBtn.textContent = 'Outpaint';
+            }
+        });
+    }
+
     // Use current output image as img2img input
     useAsInputBtn.addEventListener('click', () => {
         const img = outputArea.querySelector('img');

@@ -1337,6 +1337,106 @@ def save_crop():
     })
 
 
+@app.route("/outpaint-prep", methods=["POST"])
+def outpaint_prep():
+    """Pad an image with neutral grey fill for outpainting.
+
+    Request JSON:
+        image   – base64 data-URI of the source image
+        top     – extra pixels to add above (snapped to 16px grid)
+        bottom  – extra pixels to add below
+        left    – extra pixels to add to the left
+        right   – extra pixels to add to the right
+
+    Response JSON:
+        padded_image  – base64 data-URI of the padded PNG
+        width         – new canvas width
+        height        – new canvas height
+        orig_x        – x offset of original image in canvas
+        orig_y        – y offset of original image in canvas
+    """
+    from PIL import Image as PILImage
+    import io as _io
+
+    data = request.json or {}
+    image_b64 = data.get("image")
+    if not image_b64:
+        return jsonify({"error": "Image data required"}), 400
+
+    try:
+        raw = base64.b64decode(image_b64.split(",")[-1])
+        src = PILImage.open(_io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        return jsonify({"error": f"Invalid image: {e}"}), 400
+
+    orig_w, orig_h = src.size
+
+    # Parse and snap padding amounts to 16-pixel grid
+    def _snap(v):
+        v = max(0, int(v or 0))
+        return round(v / 16) * 16
+
+    pad_top    = _snap(data.get("top",    0))
+    pad_bottom = _snap(data.get("bottom", 0))
+    pad_left   = _snap(data.get("left",   0))
+    pad_right  = _snap(data.get("right",  0))
+
+    new_w = orig_w + pad_left + pad_right
+    new_h = orig_h + pad_top  + pad_bottom
+
+    if new_w > 1792 or new_h > 1792:
+        return jsonify({"error": "Padded size exceeds maximum (1792 px)"}), 400
+
+    if new_w == orig_w and new_h == orig_h:
+        return jsonify({"error": "No expansion selected"}), 400
+
+    # Create padded canvas with neutral grey fill (128,128,128)
+    canvas = PILImage.new("RGB", (new_w, new_h), (128, 128, 128))
+    canvas.paste(src, (pad_left, pad_top))
+
+    # Mirror-blend a thin strip from each edge into the padding zone so the
+    # seam blends more gracefully (8 px fade using Image.blend)
+    FADE = min(8, pad_top, pad_bottom, pad_left, pad_right,
+               orig_w // 4, orig_h // 4)
+    if FADE > 0:
+        # Top edge
+        if pad_top > 0:
+            strip = src.crop((0, 0, orig_w, FADE)).transpose(PILImage.FLIP_TOP_BOTTOM)
+            grey  = PILImage.new("RGB", (orig_w, FADE), (128, 128, 128))
+            blend = PILImage.blend(strip, grey, 0.5)
+            canvas.paste(blend, (pad_left, pad_top - FADE))
+        # Bottom edge
+        if pad_bottom > 0:
+            strip = src.crop((0, orig_h - FADE, orig_w, orig_h)).transpose(PILImage.FLIP_TOP_BOTTOM)
+            grey  = PILImage.new("RGB", (orig_w, FADE), (128, 128, 128))
+            blend = PILImage.blend(strip, grey, 0.5)
+            canvas.paste(blend, (pad_left, pad_top + orig_h))
+        # Left edge
+        if pad_left > 0:
+            strip = src.crop((0, 0, FADE, orig_h)).transpose(PILImage.FLIP_LEFT_RIGHT)
+            grey  = PILImage.new("RGB", (FADE, orig_h), (128, 128, 128))
+            blend = PILImage.blend(strip, grey, 0.5)
+            canvas.paste(blend, (pad_left - FADE, pad_top))
+        # Right edge
+        if pad_right > 0:
+            strip = src.crop((orig_w - FADE, 0, orig_w, orig_h)).transpose(PILImage.FLIP_LEFT_RIGHT)
+            grey  = PILImage.new("RGB", (FADE, orig_h), (128, 128, 128))
+            blend = PILImage.blend(strip, grey, 0.5)
+            canvas.paste(blend, (pad_left + orig_w, pad_top))
+
+    buf = _io.BytesIO()
+    canvas.save(buf, format="PNG")
+    encoded = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    return jsonify({
+        "padded_image": encoded,
+        "width":  new_w,
+        "height": new_h,
+        "orig_x": pad_left,
+        "orig_y": pad_top,
+    })
+
+
 @app.route("/server-status")
 def server_status():
     """Get server status including ready state and current job."""

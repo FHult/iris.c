@@ -926,3 +926,89 @@ class TestCancelJob:
                 "current_job was not cleared by restart() — stuck-server bug regression"
         finally:
             srv.flux_server = original_server
+
+
+# ---------------------------------------------------------------------------
+# /outpaint-prep  POST
+# ---------------------------------------------------------------------------
+
+class TestOutpaintPrep:
+    def test_missing_image_returns_400(self, client):
+        r = client.post("/outpaint-prep", json={"top": 128})
+        assert r.status_code == 400
+        assert "error" in r.get_json()
+
+    def test_invalid_image_returns_400(self, client):
+        r = client.post("/outpaint-prep", json={
+            "image": "data:image/png;base64,notvalidbase64!!!",
+            "top": 64,
+        })
+        assert r.status_code == 400
+
+    def test_no_expansion_returns_400(self, client):
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "top": 0, "bottom": 0, "left": 0, "right": 0,
+        })
+        assert r.status_code == 400
+        assert "No expansion" in r.get_json()["error"]
+
+    def test_valid_top_expansion(self, client):
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "top": 16,
+        })
+        assert r.status_code == 200
+        data = r.get_json()
+        assert "padded_image" in data
+        assert data["padded_image"].startswith("data:image/png;base64,")
+        assert data["width"] == 1          # original 1px wide
+        assert data["height"] == 17        # 1 + 16 (snapped to 16? no: 16 already multiple)
+        assert data["orig_x"] == 0
+        assert data["orig_y"] == 16
+
+    def test_all_directions(self, client):
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "top": 16, "bottom": 16, "left": 16, "right": 16,
+        })
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["width"] == 33     # 1 + 16 + 16
+        assert data["height"] == 33    # 1 + 16 + 16
+        assert data["orig_x"] == 16
+        assert data["orig_y"] == 16
+
+    def test_size_snapped_to_16(self, client):
+        """Fractional pixel values should be snapped to nearest 16px multiple."""
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "top": 10,   # → snaps to 16
+        })
+        assert r.status_code == 200
+        data = r.get_json()
+        # top=10 → snapped to 16
+        assert data["height"] == 1 + 16
+
+    def test_exceeds_max_returns_400(self, client):
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "top": 1792, "bottom": 1792,
+        })
+        assert r.status_code == 400
+        assert "1792" in r.get_json()["error"]
+
+    def test_returns_base64_decodable_png(self, client):
+        import base64, io
+        from PIL import Image as PILImage
+        r = client.post("/outpaint-prep", json={
+            "image": _tiny_png_b64(),
+            "right": 16,
+        })
+        assert r.status_code == 200
+        padded_b64 = r.get_json()["padded_image"].split(",")[1]
+        img_bytes = base64.b64decode(padded_b64)
+        img = PILImage.open(io.BytesIO(img_bytes))
+        assert img.format == "PNG"
+        assert img.width == 17   # 1 + 16
+        assert img.height == 1
