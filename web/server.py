@@ -87,6 +87,8 @@ MODEL_SLOTS = [
 _model_download_progress = {}  # key -> {done, error}
 THUMB_DIR = SCRIPT_DIR / "output" / "thumbs"
 HISTORY_FILE = OUTPUT_DIR / "history.json"
+CONFIG_FILE = None          # set in main() after OUTPUT_DIR is known
+_hf_token = os.environ.get("HF_TOKEN", "")
 THUMB_SIZE = 200  # Max dimension for thumbnails
 
 app = Flask(__name__, static_folder="static")
@@ -1922,7 +1924,7 @@ def download_model_endpoint():
     def do_download():
         script = PROJECT_DIR / "download_model.sh"
         cmd = ["bash", str(script), slot["sh_arg"]]
-        token = os.environ.get("HF_TOKEN", "")
+        token = _hf_token
         if token:
             cmd += ["--token", token]
         try:
@@ -2066,9 +2068,8 @@ def download_lora():
         if not repo:
             return jsonify({"error": "repo is required for huggingface source"}), 400
         url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-        hf_token = os.environ.get("HF_TOKEN", "")
-        if hf_token:
-            extra_headers["Authorization"] = f"Bearer {hf_token}"
+        if _hf_token:
+            extra_headers["Authorization"] = f"Bearer {_hf_token}"
 
     _download_progress[dl_id] = {"percent": 0, "done": False, "error": None}
     threading.Thread(
@@ -2143,6 +2144,40 @@ def cancel_job(job_id):
     return jsonify({"status": "cancelled"})
 
 
+def _load_config():
+    global _hf_token
+    if CONFIG_FILE and CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+            if not os.environ.get("HF_TOKEN"):
+                _hf_token = data.get("hf_token", "")
+        except Exception:
+            pass
+
+
+def _save_config():
+    if CONFIG_FILE:
+        try:
+            CONFIG_FILE.write_text(json.dumps({"hf_token": _hf_token}))
+        except Exception:
+            pass
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    return jsonify({"hf_token_set": bool(_hf_token)})
+
+
+@app.route("/settings", methods=["POST"])
+def post_settings():
+    global _hf_token
+    data = request.json or {}
+    if "hf_token" in data:
+        _hf_token = data["hf_token"].strip()
+        _save_config()
+    return jsonify({"ok": True})
+
+
 def main():
     global iris_server, model_dir_path
 
@@ -2182,6 +2217,10 @@ def main():
 
     # Ensure output directory exists
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+    global CONFIG_FILE
+    CONFIG_FILE = OUTPUT_DIR / "config.json"
+    _load_config()
 
     # Load history from disk
     load_history_from_disk()

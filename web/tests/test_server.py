@@ -558,8 +558,12 @@ class TestDeleteModel:
         r = client.post("/delete-model", json={"key": "nonexistent"})
         assert r.status_code == 400
 
-    def test_not_downloaded_returns_400(self, client):
+    def test_not_downloaded_returns_400(self, client, tmp_path):
+        import server as srv
+        orig = srv.PROJECT_DIR
+        srv.PROJECT_DIR = tmp_path  # empty dir — no model present
         r = client.post("/delete-model", json={"key": "flux-klein-4b-base"})
+        srv.PROJECT_DIR = orig
         assert r.status_code == 400
 
     def test_deletes_directory(self, client, tmp_path):
@@ -591,6 +595,49 @@ class TestDeleteModel:
         srv.iris_server = orig_srv
         srv.PROJECT_DIR = orig_dir
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /settings  GET + POST
+# ---------------------------------------------------------------------------
+
+class TestSettings:
+    def test_get_settings_no_token(self, client):
+        import server as srv
+        orig = srv._hf_token
+        srv._hf_token = ""
+        r = client.get("/settings")
+        assert r.status_code == 200
+        assert r.get_json()["hf_token_set"] is False
+        srv._hf_token = orig
+
+    def test_get_settings_with_token(self, client):
+        import server as srv
+        orig = srv._hf_token
+        srv._hf_token = "hf_abc123"
+        r = client.get("/settings")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["hf_token_set"] is True
+        assert "hf_abc123" not in str(data)
+        srv._hf_token = orig
+
+    def test_post_settings_sets_token(self, client):
+        import server as srv
+        orig = srv._hf_token
+        r = client.post("/settings", json={"hf_token": "hf_test"})
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+        assert srv._hf_token == "hf_test"
+        srv._hf_token = orig
+
+    def test_post_settings_clears_token(self, client):
+        import server as srv
+        orig = srv._hf_token
+        srv._hf_token = "hf_existing"
+        client.post("/settings", json={"hf_token": ""})
+        assert srv._hf_token == ""
+        srv._hf_token = orig
 
 
 # ---------------------------------------------------------------------------

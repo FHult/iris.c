@@ -100,6 +100,31 @@ header .subtitle {
     justify-content: center;
 }
 
+.settings-btn {
+    background: none;
+    border: none;
+    font-size: 1.1rem;
+    cursor: pointer;
+    color: var(--text-secondary);
+    padding: 2px 6px;
+    opacity: 0.7;
+}
+
+.settings-btn:hover { opacity: 1; }
+
+.settings-panel-content { padding: 4px 0 8px; }
+
+.settings-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.settings-row label {
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
 .model-switch-btn {
     font-size: 0.7rem;
     padding: 2px 8px;

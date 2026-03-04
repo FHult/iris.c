@@ -378,6 +378,45 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAvailableModels();
     // ── End model switcher ────────────────────────────────────────────────────
 
+    // ── Settings panel ────────────────────────────────────────────────────────
+    const settingsBtn = document.getElementById('settings-btn');
+    const settingsPanel = document.getElementById('settings-panel');
+    const settingsPanelClose = document.getElementById('settings-panel-close');
+    const hfTokenInput = document.getElementById('hf-token-input');
+    const hfTokenSaveBtn = document.getElementById('hf-token-save-btn');
+    const hfTokenStatus = document.getElementById('hf-token-status');
+
+    settingsBtn.addEventListener('click', () => {
+        const open = settingsPanel.style.display === 'none';
+        settingsPanel.style.display = open ? '' : 'none';
+        if (open) loadHfTokenStatus();
+    });
+    settingsPanelClose.addEventListener('click', () => { settingsPanel.style.display = 'none'; });
+
+    function loadHfTokenStatus() {
+        fetch('/settings').then(r => r.json()).then(data => {
+            hfTokenStatus.textContent = data.hf_token_set ? 'Token is configured.' : 'No token set.';
+            hfTokenInput.value = '';
+            hfTokenInput.placeholder = data.hf_token_set ? '(token saved — enter new to replace)' : 'hf_...';
+        }).catch(() => {});
+    }
+
+    hfTokenSaveBtn.addEventListener('click', () => {
+        const token = hfTokenInput.value.trim();
+        fetch('/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({hf_token: token}),
+        }).then(r => r.json()).then(data => {
+            if (data.ok) {
+                hfTokenStatus.textContent = token ? 'Token saved.' : 'Token cleared.';
+                hfTokenInput.value = '';
+                hfTokenInput.placeholder = token ? '(token saved — enter new to replace)' : 'hf_...';
+            }
+        }).catch(() => { hfTokenStatus.textContent = 'Save failed.'; });
+    });
+    // ── End settings panel ────────────────────────────────────────────────────
+
     // Ctrl+Enter to generate
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
