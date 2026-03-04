@@ -217,7 +217,7 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
  * ====================================================================== */
 
 static int create_tmpdir(void) {
-    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/flux-XXXXXX");
+    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/iris-XXXXXX");
     if (mkdtemp(state.tmpdir) == NULL) {
         fprintf(stderr, "Error: Cannot create temp directory: %s\n",
                 strerror(errno));

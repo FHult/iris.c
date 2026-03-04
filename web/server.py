@@ -188,8 +188,8 @@ JOB_CLEANUP_AGE = 3600  # Remove completed jobs after 1 hour
 JOB_CLEANUP_INTERVAL = 300  # Check every 5 minutes
 
 # Flux server process manager
-flux_server = None
-flux_server_lock = threading.Lock()
+iris_server = None
+iris_server_lock = threading.Lock()
 
 # Global model dir (set in main(), used by LoRA endpoints)
 model_dir_path = None
@@ -554,11 +554,11 @@ class Job:
         self.step_images = {}
 
 
-class FluxServer:
+class IrisServer:
     """Manages a persistent flux process in server mode."""
 
-    def __init__(self, flux_binary, model_dir):
-        self.flux_binary = flux_binary
+    def __init__(self, iris_binary, model_dir):
+        self.iris_binary = iris_binary
         self.model_dir = model_dir
         self.process = None
         self.ready = False
@@ -572,7 +572,7 @@ class FluxServer:
     def start(self):
         """Start the flux server process."""
         cmd = [
-            str(self.flux_binary),
+            str(self.iris_binary),
             "-d", str(self.model_dir),
             "--server",
         ]
@@ -860,7 +860,7 @@ class FluxServer:
 
 def process_job_queue():
     """Process the next job in the queue if the server is free."""
-    global flux_server, job_queue_dispatching
+    global iris_server, job_queue_dispatching
     with job_queue_lock:
         if not job_queue:
             return
@@ -870,7 +870,7 @@ def process_job_queue():
         # from also popping a job in that gap.
         if job_queue_dispatching:
             return
-        if flux_server and flux_server.current_job:
+        if iris_server and iris_server.current_job:
             return
         # Claim the next job atomically while still holding the lock
         queued = job_queue.pop(0)
@@ -885,7 +885,7 @@ def process_job_queue():
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(
+        iris_server.generate(
             job,
             queued['prompt'],
             queued['width'],
@@ -917,7 +917,7 @@ def process_job_queue():
 
 def queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths=None, show_steps=True, guidance=None, schedule=None, lora_name=None, lora_scale=1.0, img2img_strength=1.0, negative_prompt=''):
     """Queue a generation job. Starts immediately if server is free, otherwise queues."""
-    global flux_server
+    global iris_server
 
     queued_job = {
         'job': job,
@@ -939,7 +939,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
 
     with job_queue_lock:
         # Check if server is busy
-        if flux_server and flux_server.current_job:
+        if iris_server and iris_server.current_job:
             # Queue the job
             job_queue.append(queued_job)
             position = len(job_queue)
@@ -952,7 +952,7 @@ def queue_generation(job, prompt, width, height, steps, seed, input_image_path, 
     job.put_event(("status", job.to_dict()))
 
     try:
-        flux_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt)
+        iris_server.generate(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
@@ -974,7 +974,7 @@ def index():
 @app.route("/generate", methods=["POST"])
 def generate():
     """Start a new image generation job."""
-    global flux_server
+    global iris_server
 
     data = request.json or {}
 
@@ -1464,7 +1464,7 @@ def outpaint_prep():
 @app.route("/server-status")
 def server_status():
     """Get server status including ready state and current job."""
-    global flux_server
+    global iris_server
     status = {
         "ready": False,
         "busy": False,
@@ -1472,11 +1472,11 @@ def server_status():
         "queue_length": 0,
     }
 
-    if flux_server:
-        status["ready"] = flux_server.ready
-        if flux_server.current_job:
+    if iris_server:
+        status["ready"] = iris_server.ready
+        if iris_server.current_job:
             status["busy"] = True
-            status["current_job"] = flux_server.current_job.id
+            status["current_job"] = iris_server.current_job.id
 
     with job_queue_lock:
         status["queue_length"] = len(job_queue)
@@ -1487,12 +1487,12 @@ def server_status():
 @app.route("/model-info")
 def model_info():
     """Get loaded model information."""
-    global flux_server
-    if not flux_server or not flux_server.ready:
+    global iris_server
+    if not iris_server or not iris_server.ready:
         return jsonify({"error": "Server not ready"}), 503
     return jsonify({
-        "model": flux_server.model_info,
-        "is_distilled": flux_server.is_distilled,
+        "model": iris_server.model_info,
+        "is_distilled": iris_server.is_distilled,
     })
 
 
@@ -1505,8 +1505,8 @@ def active_jobs():
     }
 
     # Get currently running job
-    if flux_server and flux_server.current_job:
-        job = flux_server.current_job
+    if iris_server and iris_server.current_job:
+        job = iris_server.current_job
         d = job.to_dict()
         d["prompt"] = job.prompt
         d["width"] = job.width
@@ -1846,8 +1846,8 @@ def available_models_endpoint():
     for slot in MODEL_SLOTS:
         slot_dir = PROJECT_DIR / slot["key"]
         downloaded = (slot_dir / "transformer").is_dir()
-        is_current = (flux_server is not None and
-                      Path(flux_server.model_dir).resolve() == slot_dir.resolve())
+        is_current = (iris_server is not None and
+                      Path(iris_server.model_dir).resolve() == slot_dir.resolve())
         slots.append({
             "key": slot["key"],
             "label": slot["label"],
@@ -1856,14 +1856,14 @@ def available_models_endpoint():
             "current": is_current,
             "downloadable": slot.get("sh_arg") is not None,
         })
-    current_name = Path(flux_server.model_dir).name if flux_server else None
+    current_name = Path(iris_server.model_dir).name if iris_server else None
     return jsonify({"current_model_dir": current_name, "slots": slots})
 
 
 @app.route("/switch-model", methods=["POST"])
 def switch_model():
     """Switch the loaded model to a different directory (restarts the flux process)."""
-    global flux_server, model_dir_path
+    global iris_server, model_dir_path
     data = request.json or {}
     key = data.get("key", "").strip()
     slot = next((s for s in MODEL_SLOTS if s["key"] == key), None)
@@ -1872,16 +1872,16 @@ def switch_model():
     new_dir = PROJECT_DIR / key
     if not (new_dir / "transformer").is_dir():
         return jsonify({"error": "Model not downloaded yet"}), 400
-    if flux_server and Path(flux_server.model_dir).resolve() == new_dir.resolve():
+    if iris_server and Path(iris_server.model_dir).resolve() == new_dir.resolve():
         return jsonify({"error": "Already loaded"}), 400
     with job_queue_lock:
-        busy = bool(flux_server and flux_server.current_job) or bool(job_queue)
+        busy = bool(iris_server and iris_server.current_job) or bool(job_queue)
     if busy:
         return jsonify({"error": "Cannot switch while jobs are running or queued"}), 409
 
     def do_switch():
         global model_dir_path
-        flux_server.switch(new_dir)
+        iris_server.switch(new_dir)
         model_dir_path = new_dir
 
     threading.Thread(target=do_switch, daemon=True).start()
@@ -2052,7 +2052,7 @@ def download_lora_progress(dl_id):
 @app.route("/cancel/<job_id>", methods=["POST"])
 def cancel_job(job_id):
     """Cancel a running or queued job."""
-    global flux_server
+    global iris_server
 
     with jobs_lock:
         job = jobs.get(job_id)
@@ -2079,7 +2079,7 @@ def cancel_job(job_id):
                 return jsonify({"status": "cancelled"})
 
     # Job is currently running - need to restart flux server
-    if flux_server and flux_server.current_job and flux_server.current_job.id == job_id:
+    if iris_server and iris_server.current_job and iris_server.current_job.id == job_id:
         job.status = "cancelled"
         job.error = "Cancelled by user"
         job.put_event(("error", {"message": "Cancelled"}))
@@ -2089,7 +2089,7 @@ def cancel_job(job_id):
         # Restart the flux server to stop the current generation
         # Do this in a background thread to not block the response
         def restart_and_process_queue():
-            flux_server.restart()
+            iris_server.restart()
             process_job_queue()
 
         restart_thread = threading.Thread(target=restart_and_process_queue, daemon=True)
@@ -2107,7 +2107,7 @@ def cancel_job(job_id):
 
 
 def main():
-    global flux_server, model_dir_path
+    global iris_server, model_dir_path
 
     parser = argparse.ArgumentParser(description="FLUX.2 Web UI Server")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
@@ -2158,8 +2158,8 @@ def main():
 
     # Start flux server (persistent model)
     print("Starting flux server with persistent model...")
-    flux_server = FluxServer(args.iris_binary, args.model_dir)
-    flux_server.start()
+    iris_server = IrisServer(args.iris_binary, args.model_dir)
+    iris_server.start()
 
     print(f"\nFLUX.2 Web UI")
     print(f"  URL: http://{args.host}:{args.port}")
@@ -2172,7 +2172,7 @@ def main():
         app.run(host=args.host, port=args.port, threaded=True)
     finally:
         print("\nStopping flux server...")
-        flux_server.stop()
+        iris_server.stop()
 
 
 if __name__ == "__main__":

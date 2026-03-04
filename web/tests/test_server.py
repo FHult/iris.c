@@ -34,7 +34,7 @@ def client(tmp_path):
 
     # No real model or binary
     srv.model_dir_path = tmp_path / "model"
-    srv.flux_server = None
+    srv.iris_server = None
 
     # Clear shared state between tests
     srv.history.clear()
@@ -683,7 +683,7 @@ class TestAvailableModels:
             assert "downloadable" in slot
 
     def test_no_server_current_is_null(self, client):
-        # client fixture sets flux_server = None
+        # client fixture sets iris_server = None
         r = client.get("/available-models")
         data = r.get_json()
         assert data["current_model_dir"] is None
@@ -890,7 +890,7 @@ class TestCancelJob:
         import server as srv
         import threading
 
-        # Set up a fake FluxServer-like object whose restart() we can observe
+        # Set up a fake IrisServer-like object whose restart() we can observe
         class FakeServer:
             def __init__(self):
                 self.model_dir = "/fake/model"
@@ -910,8 +910,8 @@ class TestCancelJob:
         with srv.jobs_lock:
             srv.jobs["running01"] = job
 
-        original_server = srv.flux_server
-        srv.flux_server = fake_server
+        original_server = srv.iris_server
+        srv.iris_server = fake_server
         try:
             r = client.post("/cancel/running01")
             assert r.status_code == 200
@@ -926,7 +926,7 @@ class TestCancelJob:
             assert fake_server.current_job is None, \
                 "current_job was not cleared by restart() — stuck-server bug regression"
         finally:
-            srv.flux_server = original_server
+            srv.iris_server = original_server
 
 
 # ---------------------------------------------------------------------------
