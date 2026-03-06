@@ -516,6 +516,14 @@ static int run_server_mode(iris_ctx *ctx) {
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
+        if (steps < 1 || steps > IRIS_MAX_STEPS) {
+            printf("{\"event\":\"error\",\"message\":\"Steps must be 1-%d\"}\n", IRIS_MAX_STEPS);
+            fflush(stdout);
+            free(prompt); free(output_path); free(input_path);
+            free(negative_prompt); free(schedule); free(req_lora_path);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+            continue;
+        }
 
         /* Apply LoRA if requested (per-request hot-swap) */
         if (req_lora_path) {

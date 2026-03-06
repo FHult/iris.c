@@ -744,8 +744,17 @@ static iris_image *load_png(FILE *f) {
             interlace = fgetc(f);
             fseek(f, 4, SEEK_CUR);  /* Skip CRC */
         } else if (strcmp(chunk_type, "IDAT") == 0) {
-            /* Accumulate IDAT chunks */
-            idat_data = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
+            /* Accumulate IDAT chunks (cap total at 256 MB) */
+            if (chunk_len > 256 * 1024 * 1024 || idat_len + chunk_len > 256 * 1024 * 1024) {
+                free(idat_data);
+                return NULL;
+            }
+            uint8_t *new_idat = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
+            if (!new_idat) {
+                free(idat_data);
+                return NULL;
+            }
+            idat_data = new_idat;
             if (fread(idat_data + idat_len, 1, chunk_len, f) != chunk_len) {
                 free(idat_data);
                 return NULL;
@@ -761,6 +770,12 @@ static iris_image *load_png(FILE *f) {
     }
 
     if (width == 0 || height == 0 || !idat_data) {
+        free(idat_data);
+        return NULL;
+    }
+
+    /* Reject unreasonably large images (>32K pixels per side) */
+    if (width > 32768 || height > 32768) {
         free(idat_data);
         return NULL;
     }
