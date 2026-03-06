@@ -526,7 +526,7 @@ void iris_set_base_mode(iris_ctx *ctx) {
     ctx->is_distilled = 0;
     ctx->default_steps = 50;
     ctx->default_guidance = 4.0f;
-    const char *size_label = ctx->is_non_commercial ? "9B" : "4B";
+    const char *size_label = (ctx->num_heads * 128 > 3072) ? "9B" : "4B";
     snprintf(ctx->model_name, sizeof(ctx->model_name),
              "FLUX.2-klein-base-%s", size_label);
 }
@@ -788,6 +788,11 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
      * where latent_ch = in_ch * ps * ps = 64 */
     int latent_ch = in_ch * ps * ps;
     float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    if (!latent) {
+        free(denoised);
+        set_error("Out of memory allocating latent");
+        return NULL;
+    }
     iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
     free(denoised);
 
@@ -1110,6 +1115,10 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
 
     /* Copy external noise */
     float *z = (float *)malloc(expected_noise_size * sizeof(float));
+    if (!z) {
+        set_error("Out of memory");
+        return NULL;
+    }
     memcpy(z, noise, expected_noise_size * sizeof(float));
 
     /* Get schedule */

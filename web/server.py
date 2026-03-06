@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -1218,7 +1219,6 @@ def progress(job_id):
 
 def _is_safe_job_id(job_id):
     """Return True if job_id is a safe hex string (prevents path traversal)."""
-    import re
     return bool(re.fullmatch(r'[a-f0-9]{1,64}', job_id or ''))
 
 
