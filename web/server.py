@@ -438,7 +438,9 @@ def load_history_from_disk():
         with open(HISTORY_FILE) as f:
             data = json.load(f)
         for item in data:
-            job_id = item["id"]
+            job_id = item.get("id")
+            if not job_id:
+                continue
             output_path = OUTPUT_DIR / f"{job_id}.png"
             if not output_path.exists():
                 continue
@@ -695,7 +697,7 @@ class IrisServer:
 
             if event_type == "status":
                 seed = event.get("seed")
-                if seed:
+                if seed is not None:
                     job.seed = seed
                     job.put_event(("status", job.to_dict()))
 
@@ -1044,17 +1046,20 @@ def generate():
     if style and style in STYLE_PRESETS:
         generation_prompt = prompt + STYLE_PRESETS[style]["suffix"]
 
-    width = int(data.get("width", 512))
-    height = int(data.get("height", 512))
-    steps = int(data.get("steps", 4))
+    try:
+        width = int(data.get("width", 512))
+        height = int(data.get("height", 512))
+        steps = int(data.get("steps", 4))
+        lora_scale = float(data.get("lora_scale", 1.0))
+        img2img_strength = float(data.get("img2img_strength", 1.0))
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"Invalid numeric parameter: {e}"}), 400
     seed = data.get("seed")
     show_steps = bool(data.get("show_steps", True))
     guidance = data.get("guidance")  # None = auto (1.0 distilled, 4.0 base)
     schedule = data.get("schedule")  # "sigmoid" (default), "linear", "power"
     batch_id = data.get("batch_id")  # Groups variation batches
     lora_name = data.get("lora") or None       # LoRA filename (relative, inside loras/ dir)
-    lora_scale = float(data.get("lora_scale", 1.0))
-    img2img_strength = float(data.get("img2img_strength", 1.0))
     negative_prompt = (data.get("negative_prompt") or "").strip()
 
     # Prevent path traversal via lora_name

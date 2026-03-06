@@ -1110,6 +1110,9 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     state.seed = -1;
     state.power_alpha = 2.0f;
 
+    /* Seed the PRNG for random seed generation */
+    srand((unsigned)time(NULL));
+
     /* Initialize embedding cache */
     emb_cache_init();
 
