@@ -1057,6 +1057,10 @@ def generate():
     img2img_strength = float(data.get("img2img_strength", 1.0))
     negative_prompt = (data.get("negative_prompt") or "").strip()
 
+    # Prevent path traversal via lora_name
+    if lora_name and ("/" in lora_name or "\\" in lora_name or ".." in lora_name):
+        return jsonify({"error": "Invalid lora name"}), 400
+
     # Validate dimensions
     if width < 64 or width > 1792 or width % 16 != 0:
         return jsonify({"error": "Width must be 64-1792 and divisible by 16"}), 400
@@ -1207,9 +1211,17 @@ def progress(job_id):
     )
 
 
+def _is_safe_job_id(job_id):
+    """Return True if job_id is a safe hex string (prevents path traversal)."""
+    import re
+    return bool(re.fullmatch(r'[a-f0-9]{1,64}', job_id or ''))
+
+
 @app.route("/image/<job_id>")
 def get_image(job_id):
     """Serve a generated image."""
+    if not _is_safe_job_id(job_id):
+        return jsonify({"error": "Invalid job id"}), 400
     # Check active jobs first
     with jobs_lock:
         job = jobs.get(job_id)
@@ -1255,6 +1267,8 @@ def get_step_image(job_id, step):
 @app.route("/thumb/<job_id>")
 def get_thumb(job_id):
     """Serve a thumbnail for a generated image."""
+    if not _is_safe_job_id(job_id):
+        return jsonify({"error": "Invalid job id"}), 400
     THUMB_DIR.mkdir(exist_ok=True)
     thumb_path = THUMB_DIR / f"{job_id}.jpg"
 
@@ -2155,6 +2169,8 @@ def download_lora():
         version_filter = (data.get("civitai_version_filter") or "").strip().lower()
         if not civitai_model_id:
             return jsonify({"error": "civitai_model_id required for civitai source"}), 400
+        if not str(civitai_model_id).isdigit():
+            return jsonify({"error": "Invalid civitai_model_id"}), 400
         try:
             api_url = f"https://civitai.com/api/v1/models/{civitai_model_id}"
             api_headers = {"User-Agent": "flux2.c/1.0"}
@@ -2272,6 +2288,7 @@ def _save_config():
     if CONFIG_FILE:
         try:
             CONFIG_FILE.write_text(json.dumps({"hf_token": _hf_token}))
+            CONFIG_FILE.chmod(0o600)  # owner read/write only — token is sensitive
         except Exception:
             pass
 
