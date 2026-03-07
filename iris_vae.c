@@ -434,6 +434,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     int z_spatial = latent_h * latent_w;
 
     float *mean = (float *)malloc(batch * vae->z_channels * z_spatial * sizeof(float));
+    if (!mean) return NULL;
     for (int b = 0; b < batch; b++) {
         memcpy(mean + b * vae->z_channels * z_spatial,
                x + b * z_ch * z_spatial,
@@ -445,6 +446,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     int patch_w = latent_w / 2;
     int lat_ch = vae->latent_channels;
     float *latent = (float *)malloc(batch * lat_ch * patch_h * patch_w * sizeof(float));
+    if (!latent) { free(mean); return NULL; }
     iris_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
     free(mean);
 

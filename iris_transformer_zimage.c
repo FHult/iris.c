@@ -567,6 +567,7 @@ static void zi_timestep_embed(zi_transformer_t *tf, float *out, float t) {
     /* MLP: Linear(256 -> mid) + SiLU + Linear(mid -> adaln_dim) */
     int mid = tf->t_emb_mid_size;
     float *hidden = (float *)malloc(mid * sizeof(float));
+    if (!hidden) { memset(out, 0, tf->adaln_dim * sizeof(float)); return; }
 
     /* Linear 0 */
     iris_matmul_t(hidden, sin_emb, tf->t_emb_mlp0_weight, 1, 256, mid);

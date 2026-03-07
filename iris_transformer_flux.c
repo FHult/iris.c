@@ -1058,6 +1058,12 @@ static void get_cached_img_rope(iris_transformer_t *tf, int patch_h, int patch_w
     if (tf->cached_img_rope_sin) free(tf->cached_img_rope_sin);
     tf->cached_img_rope_cos = (float *)malloc(size);
     tf->cached_img_rope_sin = (float *)malloc(size);
+    if (!tf->cached_img_rope_cos || !tf->cached_img_rope_sin) {
+        free(tf->cached_img_rope_cos); tf->cached_img_rope_cos = NULL;
+        free(tf->cached_img_rope_sin); tf->cached_img_rope_sin = NULL;
+        *cos_out = NULL; *sin_out = NULL;
+        return;
+    }
     tf->cached_img_h = patch_h;
     tf->cached_img_w = patch_w;
 
@@ -1089,6 +1095,12 @@ static void get_cached_ref_rope(iris_transformer_t *tf, int patch_h, int patch_w
     if (tf->cached_ref_rope_sin) free(tf->cached_ref_rope_sin);
     tf->cached_ref_rope_cos = (float *)malloc(size);
     tf->cached_ref_rope_sin = (float *)malloc(size);
+    if (!tf->cached_ref_rope_cos || !tf->cached_ref_rope_sin) {
+        free(tf->cached_ref_rope_cos); tf->cached_ref_rope_cos = NULL;
+        free(tf->cached_ref_rope_sin); tf->cached_ref_rope_sin = NULL;
+        *cos_out = NULL; *sin_out = NULL;
+        return;
+    }
     tf->cached_ref_h = patch_h;
     tf->cached_ref_w = patch_w;
     tf->cached_ref_t_offset = t_offset;
@@ -1119,6 +1131,12 @@ static void get_cached_txt_rope(iris_transformer_t *tf, int txt_seq,
     if (tf->cached_txt_rope_sin) free(tf->cached_txt_rope_sin);
     tf->cached_txt_rope_cos = (float *)malloc(size);
     tf->cached_txt_rope_sin = (float *)malloc(size);
+    if (!tf->cached_txt_rope_cos || !tf->cached_txt_rope_sin) {
+        free(tf->cached_txt_rope_cos); tf->cached_txt_rope_cos = NULL;
+        free(tf->cached_txt_rope_sin); tf->cached_txt_rope_sin = NULL;
+        *cos_out = NULL; *sin_out = NULL;
+        return;
+    }
     tf->cached_txt_seq = txt_seq;
 
     compute_rope_text(tf->cached_txt_rope_cos, tf->cached_txt_rope_sin,
@@ -1159,6 +1177,12 @@ static void get_cached_combined_rope(iris_transformer_t *tf,
     if (tf->cached_combined_rope_sin) free(tf->cached_combined_rope_sin);
     tf->cached_combined_rope_cos = (float *)malloc(combined_size);
     tf->cached_combined_rope_sin = (float *)malloc(combined_size);
+    if (!tf->cached_combined_rope_cos || !tf->cached_combined_rope_sin) {
+        free(tf->cached_combined_rope_cos); tf->cached_combined_rope_cos = NULL;
+        free(tf->cached_combined_rope_sin); tf->cached_combined_rope_sin = NULL;
+        *cos_out = NULL; *sin_out = NULL;
+        return;
+    }
     tf->cached_combined_img_h = img_h;
     tf->cached_combined_img_w = img_w;
     tf->cached_combined_ref_h = ref_h;
@@ -3586,6 +3610,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
      */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) return NULL;
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -3604,6 +3629,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
      */
     int channels = tf->latent_channels;
     float *img_transposed = (float *)malloc(img_seq * channels * sizeof(float));
+    if (!img_transposed) { free(t_emb); return NULL; }
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             img_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
@@ -3723,6 +3749,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
      * Python uses [txt, img] order for concatenation
      */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) { free(t_emb); return NULL; }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, img_hidden,
            img_seq * hidden * sizeof(float));
@@ -4078,6 +4105,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) return NULL;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -4093,6 +4121,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
 
     /* Transpose and concatenate image latents: [target, reference] */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    if (!combined_transposed) { free(t_emb); return NULL; }
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4130,6 +4159,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    if (!combined_hidden) { free(t_emb); return NULL; }
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
     free(combined_transposed);
@@ -4172,6 +4202,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
 
     /* Concatenate for single blocks: [txt, combined_img] */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) { free(combined_hidden); free(t_emb); return NULL; }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
@@ -4330,6 +4361,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Transpose and concatenate all image latents */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    if (!combined_transposed) { free(t_emb); return NULL; }
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4374,6 +4406,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    if (!combined_hidden) { free(t_emb); return NULL; }
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
     free(combined_transposed);
@@ -4415,6 +4448,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Concatenate for single blocks */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) { free(combined_hidden); free(t_emb); return NULL; }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);

@@ -60,6 +60,7 @@ void iris_reset_timing(void) {
  */
 float *iris_linear_schedule(int num_steps) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     for (int i = 0; i <= num_steps; i++) {
         schedule[i] = 1.0f - (float)i / (float)num_steps;
     }
@@ -73,6 +74,7 @@ float *iris_linear_schedule(int num_steps) {
  */
 float *iris_power_schedule(int num_steps, float alpha) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     for (int i = 0; i <= num_steps; i++) {
         float t = (float)i / (float)num_steps;
         schedule[i] = 1.0f - powf(t, alpha);
@@ -86,6 +88,7 @@ float *iris_power_schedule(int num_steps, float alpha) {
  */
 float *iris_sigmoid_schedule(int num_steps, float shift) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
 
     for (int i = 0; i <= num_steps; i++) {
         float t = (float)i / (float)num_steps;
@@ -107,6 +110,7 @@ float *iris_sigmoid_schedule(int num_steps, float shift) {
  */
 float *iris_resolution_schedule(int num_steps, int height, int width) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
 
     /* Compute shift based on resolution */
     int pixels = height * width;
@@ -166,6 +170,7 @@ static float generalized_time_snr_shift(float t, float mu, float sigma) {
 
 float *iris_official_schedule(int num_steps, int image_seq_len) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     float mu = compute_empirical_mu(image_seq_len, num_steps);
 
     for (int i = 0; i <= num_steps; i++) {
@@ -196,6 +201,7 @@ float *iris_official_schedule(int num_steps, int image_seq_len) {
 float *iris_zimage_schedule(int num_steps, int image_seq_len) {
     (void)image_seq_len;  /* Not used for static shift */
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     const float shift = 3.0f;
     const float sigma_max = 1.0f;
     const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
@@ -288,6 +294,7 @@ float *iris_sample_euler(void *transformer, void *text_encoder,
 
     /* Working buffers */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     float *v_cond = NULL;
 
     iris_copy(z_curr, z, latent_size);
@@ -376,6 +383,7 @@ float *iris_sample_euler_zimage(void *transformer,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -503,6 +511,7 @@ float *iris_sample_euler_with_refs(void *transformer, void *text_encoder,
 
     /* Working buffer */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     /* Reset timing counters */
@@ -580,6 +589,7 @@ float *iris_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -660,6 +670,7 @@ float *iris_sample_euler_cfg(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -740,6 +751,7 @@ float *iris_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -821,6 +833,7 @@ float *iris_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -902,6 +915,7 @@ float *iris_sample_euler_ancestral(void *transformer,
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *noise = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr || !noise) { free(z_curr); free(noise); return NULL; }
 
     iris_copy(z_curr, z, latent_size);
 
@@ -965,6 +979,7 @@ float *iris_sample_heun(void *transformer,
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *z_pred = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr || !z_pred) { free(z_curr); free(z_pred); return NULL; }
 
     iris_copy(z_curr, z, latent_size);
 
@@ -1033,6 +1048,7 @@ float *iris_sample_heun(void *transformer,
 float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed) {
     int target_size = batch * channels * h * w;
     float *noise = (float *)malloc(target_size * sizeof(float));
+    if (!noise) return NULL;
 
     if (seed >= 0) {
         iris_rng_seed((uint64_t)seed);
@@ -1049,6 +1065,7 @@ float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed) {
     int max_w = NOISE_MAX_LATENT_DIM;
     int max_size = batch * channels * max_h * max_w;
     float *max_noise = (float *)malloc(max_size * sizeof(float));
+    if (!max_noise) { free(noise); return NULL; }
     iris_randn(max_noise, max_size);
 
     /* Subsample to target size using nearest-neighbor */
