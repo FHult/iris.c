@@ -1528,8 +1528,9 @@ static int open_safetensors_shards(const char *model_dir,
     return 0;
 }
 
-/* Allocate working memory for Qwen3 model based on architecture fields. */
-static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
+/* Allocate working memory for Qwen3 model based on architecture fields.
+ * Returns 0 on success, -1 on allocation failure (caller should free model). */
+static int qwen3_alloc_work_buffers(qwen3_model_t *model) {
     int seq_len = QWEN3_MAX_SEQ_LEN;
     int hidden = model->hidden_size;
     int num_heads = model->num_heads;
@@ -1556,6 +1557,17 @@ static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
     }
+
+    if (!model->hidden_state || !model->residual || !model->q_buf ||
+        !model->k_buf || !model->v_buf || !model->attn_scores ||
+        !model->attn_out || !model->mlp_gate || !model->mlp_up ||
+        !model->mlp_out || !model->norm_buf || !model->attn_q_head ||
+        !model->attn_v_head || !model->attn_out_head ||
+        !model->layer_outputs[0] || !model->layer_outputs[1] ||
+        !model->layer_outputs[2])
+        return -1;
+
+    return 0;
 }
 
 /* Eager-mode model loading: reads all weights into RAM upfront. Parses
@@ -1617,11 +1629,14 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     int half_dim = model->head_dim / 2;
     model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
     model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin)
+        goto error;
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        model->head_dim, model->rope_theta);
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
+    if (qwen3_alloc_work_buffers(model) != 0)
+        goto error;
 
     return model;
 
@@ -1696,11 +1711,14 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     int half_dim = model->head_dim / 2;
     model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
     model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin)
+        goto error;
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        model->head_dim, model->rope_theta);
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
+    if (qwen3_alloc_work_buffers(model) != 0)
+        goto error;
 
 #ifdef USE_METAL
     /* Pre-compile all MPSGraph linear graphs by running a dummy GPU forward pass.
@@ -1860,6 +1878,10 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
 
     /* Pad to max length */
     int *attention_mask = malloc(QWEN3_MAX_SEQ_LEN * sizeof(int));
+    if (!attention_mask) {
+        free(tokens);
+        return NULL;
+    }
     int *padded_tokens = qwen3_pad_tokens(tokens, num_tokens, QWEN3_MAX_SEQ_LEN, attention_mask);
     free(tokens);
 

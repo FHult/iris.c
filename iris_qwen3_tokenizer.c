@@ -978,7 +978,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     for (int i = 0; i < n && total < max_len; i++) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); free(user_tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = user_tokens[i];
     }
@@ -989,7 +991,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     for (int i = 0; i < n && total < max_len; i++) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); free(prompt_tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = prompt_tokens[i];
     }
@@ -999,7 +1003,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     if (total < max_len) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = QWEN3_IM_END_ID;
     }
@@ -1007,7 +1013,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     for (int i = 0; i < n && total < max_len; i++) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); free(newline_tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = newline_tokens[i];
     }
@@ -1017,7 +1025,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     if (total < max_len) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = QWEN3_IM_START_ID;
     }
@@ -1027,7 +1037,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     for (int i = 0; i < n && total < max_len; i++) {
         if (total >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
+            int *tmp = realloc(tokens, capacity * sizeof(int));
+            if (!tmp) { free(tokens); free(asst_tokens); *num_tokens = 0; return NULL; }
+            tokens = tmp;
         }
         tokens[total++] = asst_tokens[i];
     }
@@ -1038,7 +1050,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
         if (total < max_len) {
             if (total >= capacity) {
                 capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
+                int *tmp = realloc(tokens, capacity * sizeof(int));
+                if (!tmp) { free(tokens); *num_tokens = 0; return NULL; }
+                tokens = tmp;
             }
             tokens[total++] = QWEN3_THINK_START_ID;
         }
@@ -1046,7 +1060,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
         for (int i = 0; i < n && total < max_len; i++) {
             if (total >= capacity) {
                 capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
+                int *tmp = realloc(tokens, capacity * sizeof(int));
+                if (!tmp) { free(tokens); free(think_newlines); *num_tokens = 0; return NULL; }
+                tokens = tmp;
             }
             tokens[total++] = think_newlines[i];
         }
@@ -1055,7 +1071,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
         if (total < max_len) {
             if (total >= capacity) {
                 capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
+                int *tmp = realloc(tokens, capacity * sizeof(int));
+                if (!tmp) { free(tokens); *num_tokens = 0; return NULL; }
+                tokens = tmp;
             }
             tokens[total++] = QWEN3_THINK_END_ID;
         }
@@ -1064,7 +1082,9 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
         for (int i = 0; i < n && total < max_len; i++) {
             if (total >= capacity) {
                 capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
+                int *tmp = realloc(tokens, capacity * sizeof(int));
+                if (!tmp) { free(tokens); free(think_newlines); *num_tokens = 0; return NULL; }
+                tokens = tmp;
             }
             tokens[total++] = think_newlines[i];
         }
