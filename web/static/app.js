@@ -1250,15 +1250,18 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    async function fetchImageAsBase64(url) {
-        const resp = await fetch(url.split('?')[0]);
-        const blob = await resp.blob();
+    function blobToDataURL(blob) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(reader.result);
             reader.onerror = reject;
             reader.readAsDataURL(blob);
         });
+    }
+
+    async function fetchImageAsBase64(url) {
+        const resp = await fetch(url.split('?')[0]);
+        return blobToDataURL(await resp.blob());
     }
 
     async function addToQueue(params) {
@@ -1621,13 +1624,7 @@ document.addEventListener('DOMContentLoaded', () => {
     refInputs.forEach((input, slot) => {
         input.addEventListener('change', (e) => {
             const file = e.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (event) => {
-                    setReferenceImage(slot, event.target.result);
-                };
-                reader.readAsDataURL(file);
-            }
+            if (file) blobToDataURL(file).then(d => setReferenceImage(slot, d));
         });
     });
 
@@ -1740,13 +1737,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Fall back to file drop
             const file = e.dataTransfer.files[0];
-            if (file && file.type.startsWith('image/')) {
-                const reader = new FileReader();
-                reader.onload = (event) => {
-                    setReferenceImage(slot, event.target.result);
-                };
-                reader.readAsDataURL(file);
-            }
+            if (file && file.type.startsWith('image/'))
+                blobToDataURL(file).then(d => setReferenceImage(slot, d));
         });
     });
 
@@ -2068,13 +2060,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Fetch an image URL and set it into a specific slot
     async function loadImageIntoSlot(url, slot) {
         try {
-            const response = await fetch(url);
-            const blob = await response.blob();
-            const reader = new FileReader();
-            reader.onload = () => {
-                setReferenceImage(slot, reader.result);
-            };
-            reader.readAsDataURL(blob);
+            setReferenceImage(slot, await fetchImageAsBase64(url));
         } catch (err) {
             console.error('Failed to load image into slot:', err);
         }
@@ -3243,12 +3229,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const blob = item.getAsFile();
                 if (!blob) continue;
 
-                const reader = new FileReader();
-                reader.onload = (event) => {
-                    const slot = findFirstEmptySlot();
-                    setReferenceImage(slot, event.target.result);
-                };
-                reader.readAsDataURL(blob);
+                blobToDataURL(blob).then(d => setReferenceImage(findFirstEmptySlot(), d));
                 break;
             }
         }
