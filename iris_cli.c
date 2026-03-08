@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -25,6 +26,32 @@
 #ifdef USE_METAL
 #include "iris_metal.h"
 #endif
+
+/* ======================================================================
+ * Cryptographic RNG seed
+ * ====================================================================== */
+
+/* Generate a cryptographically random seed value for image generation.
+ * Uses arc4random_buf on Apple platforms, /dev/urandom elsewhere.
+ * Falls back to time(NULL) only if /dev/urandom is unavailable. */
+static int64_t random_seed(void) {
+#ifdef __APPLE__
+    uint64_t val;
+    arc4random_buf(&val, sizeof(val));
+    return (int64_t)(val & (uint64_t)INT64_MAX);
+#else
+    int64_t val = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        (void)fread(&val, sizeof(val), 1, f);
+        fclose(f);
+        val &= INT64_MAX;
+    } else {
+        val = (int64_t)time(NULL);
+    }
+    return val;
+#endif
+}
 
 /* ======================================================================
  * Constants
@@ -251,9 +278,16 @@ static void display_image(const char *path) {
     }
     if (state.open_enabled) {
 #ifdef __APPLE__
-        char cmd[CLI_MAX_PATH + 16];
-        snprintf(cmd, sizeof(cmd), "open \"%s\" 2>/dev/null &", path);
-        system(cmd);
+        /* Use fork+exec instead of system() to avoid shell injection risk.
+         * The child execs /usr/bin/open directly; no shell is involved. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+            execl("/usr/bin/open", "open", path, (char *)NULL);
+            _exit(1);
+        }
+        /* Parent continues without waiting — child is fire-and-forget. */
 #endif
     }
 }
@@ -352,7 +386,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     if (state.seed >= 0) {
         actual_seed = state.seed;
     } else {
-        actual_seed = (int64_t)time(NULL) ^ (int64_t)rand();
+        actual_seed = random_seed();
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
@@ -494,7 +528,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     if (state.seed >= 0) {
         actual_seed = state.seed;
     } else {
-        actual_seed = (int64_t)time(NULL) ^ (int64_t)rand();
+        actual_seed = random_seed();
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
@@ -825,7 +859,7 @@ static void cmd_explore(char *arg) {
     if (!iris_is_distilled(state.ctx)) {
         /* Base model: use iris_generate() for CFG support */
         for (int i = 0; i < count; i++) {
-            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            int64_t seed = random_seed();
             params.seed = seed;
 
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
@@ -871,7 +905,7 @@ static void cmd_explore(char *arg) {
         }
 
         for (int i = 0; i < count; i++) {
-            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            int64_t seed = random_seed();
             params.seed = seed;
 
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
@@ -1109,9 +1143,6 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     state.guidance = 0.0f;  /* 0 = auto from model type */
     state.seed = -1;
     state.power_alpha = 2.0f;
-
-    /* Seed the PRNG for random seed generation */
-    srand((unsigned)time(NULL));
 
     /* Initialize embedding cache */
     emb_cache_init();

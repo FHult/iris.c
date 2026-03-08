@@ -220,21 +220,103 @@ static double timer_end(void) {
  * Simple JSON Helpers (for server mode)
  * ======================================================================== */
 
-/* Extract string value from JSON (returns malloc'd string, caller must free) */
-static char *json_get_string(const char *json, const char *key) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
+/*
+ * Skip a JSON value starting at *p, advancing *p past it.
+ * Handles strings, objects, arrays, and scalars (numbers/bool/null).
+ * Used by json_find_key to skip values while scanning for a target key.
+ */
+static void skip_json_value(const char **p) {
+    if (**p == '"') {
+        (*p)++;
+        while (**p && **p != '"') {
+            if (**p == '\\' && *(*p + 1)) (*p) += 2;
+            else (*p)++;
+        }
+        if (**p == '"') (*p)++;
+    } else if (**p == '{' || **p == '[') {
+        int depth = 1;
+        (*p)++;
+        while (**p && depth > 0) {
+            if (**p == '"') {
+                (*p)++;
+                while (**p && **p != '"') {
+                    if (**p == '\\' && *(*p + 1)) (*p) += 2;
+                    else (*p)++;
+                }
+                if (**p == '"') (*p)++;
+            } else if (**p == '{' || **p == '[') {
+                depth++; (*p)++;
+            } else if (**p == '}' || **p == ']') {
+                depth--; (*p)++;
+            } else {
+                (*p)++;
+            }
+        }
+    } else {
+        /* Number, bool, null: advance to next delimiter */
+        while (**p && **p != ',' && **p != '}' && **p != ']' && **p != '\n') (*p)++;
+    }
+}
 
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-    if (*p != '"') return NULL;
+/*
+ * Find `key` as a top-level key in a JSON object and return a pointer to
+ * the start of its value (past the colon and whitespace).
+ *
+ * Only matches true top-level keys; skips over string values and nested
+ * objects/arrays structurally, preventing false matches caused by a key
+ * name appearing inside a string value.
+ *
+ * Returns NULL if the key is not found.
+ */
+static const char *json_find_key(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+    size_t klen = strlen(key);
+
+    const char *p = json;
+    while (*p && *p != '{') p++;
+    if (!*p) return NULL;
+    p++;
+
+    while (*p) {
+        /* Skip whitespace and commas between members */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (!*p || *p == '}') break;
+
+        /* Expect a quoted key */
+        if (*p != '"') return NULL;
+        p++;
+        const char *ks = p;
+        while (*p && *p != '"') {
+            if (*p == '\\' && *(p + 1)) p += 2;
+            else p++;
+        }
+        int match = ((size_t)(p - ks) == klen && memcmp(ks, key, klen) == 0);
+        if (*p == '"') p++;
+
+        /* Skip colon */
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ':') return NULL;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (match) return p;
+
+        /* Not our key: skip the value and continue */
+        skip_json_value(&p);
+    }
+    return NULL;
+}
+
+/* Extract string value from JSON (returns malloc'd string, caller must free).
+ * Only matches top-level keys — immune to injection via value content. */
+static char *json_get_string(const char *json, const char *key) {
+    const char *p = json_find_key(json, key);
+    if (!p || *p != '"') return NULL;
     p++;
 
     const char *end = p;
     while (*end && *end != '"') {
-        if (*end == '\\' && *(end+1)) end += 2;
+        if (*end == '\\' && *(end + 1)) end += 2;
         else end++;
     }
 
@@ -248,68 +330,35 @@ static char *json_get_string(const char *json, const char *key) {
 
 /* Extract integer value from JSON */
 static int json_get_int(const char *json, const char *key, int default_val) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
+    const char *p = json_find_key(json, key);
     if (!p) return default_val;
-
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-
-    /* Handle null */
     if (strncmp(p, "null", 4) == 0) return default_val;
-
     return atoi(p);
 }
 
 /* Extract int64 value from JSON */
 static int64_t json_get_int64(const char *json, const char *key, int64_t default_val) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
+    const char *p = json_find_key(json, key);
     if (!p) return default_val;
-
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-
-    /* Handle null */
     if (strncmp(p, "null", 4) == 0) return default_val;
-
     return atoll(p);
 }
 
 /* Extract boolean value from JSON */
 static int json_get_bool(const char *json, const char *key, int default_val) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
+    const char *p = json_find_key(json, key);
     if (!p) return default_val;
-
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-
-    /* Handle null */
     if (strncmp(p, "null", 4) == 0) return default_val;
-    /* Handle true/false */
     if (strncmp(p, "true", 4) == 0) return 1;
     if (strncmp(p, "false", 5) == 0) return 0;
-    /* Handle numeric 0/1 */
     return atoi(p) != 0;
 }
 
 /* Extract float value from JSON */
 static float json_get_float(const char *json, const char *key, float default_val) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
+    const char *p = json_find_key(json, key);
     if (!p) return default_val;
-
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-
-    /* Handle null */
     if (strncmp(p, "null", 4) == 0) return default_val;
-
     return (float)atof(p);
 }
 
@@ -317,32 +366,24 @@ static float json_get_float(const char *json, const char *key, float default_val
  * Returns number of strings found, or 0 if key not found or not an array.
  * The paths array must be pre-allocated with max_paths capacity. */
 static int json_get_string_array(const char *json, const char *key, char **paths, int max_paths) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return 0;
-
-    p += strlen(pattern);
-    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-    if (*p != '[') return 0;
-    p++; /* skip '[' */
+    const char *p = json_find_key(json, key);
+    if (!p || *p != '[') return 0;
+    p++;
 
     int count = 0;
     while (*p && *p != ']' && count < max_paths) {
-        /* Skip whitespace and commas */
         while (*p && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
         if (*p == ']' || !*p) break;
 
         if (*p != '"') {
-            /* Skip non-string values */
             while (*p && *p != ',' && *p != ']') p++;
             continue;
         }
-        p++; /* skip opening quote */
+        p++;
 
         const char *end = p;
         while (*end && *end != '"') {
-            if (*end == '\\' && *(end+1)) end += 2;
+            if (*end == '\\' && *(end + 1)) end += 2;
             else end++;
         }
 
@@ -357,10 +398,76 @@ static int json_get_string_array(const char *json, const char *key, char **paths
         }
 
         p = end;
-        if (*p == '"') p++; /* skip closing quote */
+        if (*p == '"') p++;
     }
 
     return count;
+}
+
+/*
+ * Write a JSON-safe escaped string value (with surrounding quotes) to stdout.
+ * Escapes backslash, double-quote, and control characters per RFC 8259.
+ * Use this instead of printf("%s") whenever a string comes from user input
+ * or could contain arbitrary characters.
+ */
+static void json_print_escaped(const char *s) {
+    putchar('"');
+    if (s) {
+        while (*s) {
+            unsigned char c = (unsigned char)*s++;
+            if      (c == '"')  { putchar('\\'); putchar('"'); }
+            else if (c == '\\') { putchar('\\'); putchar('\\'); }
+            else if (c == '\n') { putchar('\\'); putchar('n'); }
+            else if (c == '\r') { putchar('\\'); putchar('r'); }
+            else if (c == '\t') { putchar('\\'); putchar('t'); }
+            else if (c < 0x20)  { printf("\\u%04x", c); }
+            else                { putchar(c); }
+        }
+    }
+    putchar('"');
+}
+
+/*
+ * Return 1 if path contains no ".." components (directory traversal prevention).
+ * Rejects empty paths and any path component equal to "..".
+ */
+static int path_is_safe(const char *path) {
+    if (!path || !path[0]) return 0;
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *end = p;
+        while (*end && *end != '/') end++;
+        if ((size_t)(end - p) == 2 && p[0] == '.' && p[1] == '.')
+            return 0;
+        p = end;
+    }
+    return 1;
+}
+
+/*
+ * Generate a cryptographically random seed.
+ * Uses arc4random_buf on Apple platforms, /dev/urandom elsewhere.
+ * Falls back to time(NULL) only if /dev/urandom is unavailable.
+ */
+static int64_t random_seed(void) {
+#ifdef __APPLE__
+    uint64_t val;
+    arc4random_buf(&val, sizeof(val));
+    return (int64_t)(val & (uint64_t)INT64_MAX);
+#else
+    int64_t val = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        (void)fread(&val, sizeof(val), 1, f);
+        fclose(f);
+        val &= INT64_MAX;
+    } else {
+        val = (int64_t)time(NULL);
+    }
+    return val;
+#endif
 }
 
 /* ========================================================================
@@ -408,7 +515,8 @@ static void server_phase_callback(const char *phase, int done) {
         double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
                          (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
 
-        printf("{\"event\":\"phase\",\"phase\":\"%s\",\"elapsed\":%.2f}\n", phase, elapsed);
+        printf("{\"event\":\"phase\",\"phase\":"); json_print_escaped(phase);
+        printf(",\"elapsed\":%.2f}\n", elapsed);
         fflush(stdout);
     } else {
         /* Phase finished */
@@ -417,8 +525,8 @@ static void server_phase_callback(const char *phase, int done) {
         double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
                          (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
 
-        printf("{\"event\":\"phase_done\",\"phase\":\"%s\",\"phase_time\":%.2f,\"elapsed\":%.2f}\n",
-               phase, phase_time, elapsed);
+        printf("{\"event\":\"phase_done\",\"phase\":"); json_print_escaped(phase);
+        printf(",\"phase_time\":%.2f,\"elapsed\":%.2f}\n", phase_time, elapsed);
         fflush(stdout);
     }
 }
@@ -438,8 +546,9 @@ static void server_step_image_callback(int step, int total, const iris_image *im
         double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
                          (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
 
-        printf("{\"event\":\"step_image\",\"step\":%d,\"total\":%d,\"path\":\"%s\",\"elapsed\":%.2f}\n",
-               step, total, step_path, elapsed);
+        printf("{\"event\":\"step_image\",\"step\":%d,\"total\":%d,\"path\":", step, total);
+        json_print_escaped(step_path);
+        printf(",\"elapsed\":%.2f}\n", elapsed);
         fflush(stdout);
     }
 }
@@ -457,8 +566,8 @@ static int run_server_mode(iris_ctx *ctx) {
     iris_substep_callback = NULL;
 
     fprintf(stderr, "Server mode: ready for requests\n");
-    printf("{\"event\":\"ready\",\"model\":\"%s\",\"is_distilled\":%s,\"is_zimage\":%s}\n",
-           iris_model_info(ctx),
+    printf("{\"event\":\"ready\",\"model\":"); json_print_escaped(iris_model_info(ctx));
+    printf(",\"is_distilled\":%s,\"is_zimage\":%s}\n",
            iris_is_distilled(ctx) ? "true" : "false",
            iris_is_zimage(ctx) ? "true" : "false");
     fflush(stdout);
@@ -525,6 +634,23 @@ static int run_server_mode(iris_ctx *ctx) {
             continue;
         }
 
+        /* Reject paths containing ".." to prevent directory traversal */
+        {
+            int unsafe = !path_is_safe(output_path) ||
+                         (input_path && !path_is_safe(input_path)) ||
+                         (req_lora_path && !path_is_safe(req_lora_path));
+            for (int i = 0; i < num_refs && !unsafe; i++)
+                if (!path_is_safe(ref_paths[i])) unsafe = 1;
+            if (unsafe) {
+                printf("{\"event\":\"error\",\"message\":\"Unsafe file path\"}\n");
+                fflush(stdout);
+                free(prompt); free(output_path); free(input_path);
+                free(negative_prompt); free(schedule); free(req_lora_path);
+                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+                continue;
+            }
+        }
+
         /* Apply LoRA if requested (per-request hot-swap) */
         if (req_lora_path) {
             if (iris_load_lora(ctx, req_lora_path, req_lora_scale) != 0) {
@@ -535,8 +661,8 @@ static int run_server_mode(iris_ctx *ctx) {
             iris_unload_lora(ctx);
         }
 
-        /* Set seed */
-        int64_t actual_seed = (seed >= 0) ? seed : (int64_t)time(NULL);
+        /* Set seed — use cryptographic RNG when caller doesn't specify one */
+        int64_t actual_seed = (seed >= 0) ? seed : random_seed();
         iris_set_seed(actual_seed);
 
         /* Initialize generation timing */
@@ -638,7 +764,10 @@ static int run_server_mode(iris_ctx *ctx) {
         }
 
         if (!output) {
-            printf("{\"event\":\"error\",\"message\":\"Generation failed: %s\"}\n", iris_get_error());
+            const char *err = iris_get_error();
+            char errbuf[512];
+            snprintf(errbuf, sizeof(errbuf), "Generation failed: %s", err ? err : "unknown error");
+            printf("{\"event\":\"error\",\"message\":"); json_print_escaped(errbuf); printf("}\n");
             fflush(stdout);
             free(prompt); free(output_path); free(input_path);
             free(negative_prompt);
@@ -666,8 +795,8 @@ static int run_server_mode(iris_ctx *ctx) {
                             (complete_tv.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
 
         /* Report success */
-        printf("{\"event\":\"complete\",\"output\":\"%s\",\"seed\":%lld,\"total_time\":%.2f}\n",
-               output_path, (long long)actual_seed, total_time);
+        printf("{\"event\":\"complete\",\"output\":"); json_print_escaped(output_path);
+        printf(",\"seed\":%lld,\"total_time\":%.2f}\n", (long long)actual_seed, total_time);
         fflush(stdout);
 
         free(prompt); free(output_path); free(input_path);

@@ -73,6 +73,10 @@ static iris_image *load_ppm(FILE *f) {
     if (fscanf(f, "%d %d %d", &width, &height, &maxval) != 3) return NULL;
     fgetc(f);  /* Skip single whitespace after maxval */
 
+    /* Reject invalid or unreasonably large dimensions, and non-8-bit depth */
+    if (width <= 0 || height <= 0 || width > 32768 || height > 32768 || maxval != 255)
+        return NULL;
+
     int channels;
     if (strcmp(magic, "P6") == 0) {
         channels = 3;  /* RGB */
@@ -235,14 +239,11 @@ static void write_png_chunk(FILE *f, const char *type, const uint8_t *data, size
         fwrite(data, 1, len, f);
     }
 
-    /* CRC (over type + data) */
-    uint8_t *crc_data = (uint8_t *)malloc(4 + len);
-    memcpy(crc_data, type, 4);
-    if (len > 0 && data) {
-        memcpy(crc_data + 4, data, len);
-    }
-    uint32_t crc = png_crc(crc_data, 4 + len);
-    free(crc_data);
+    /* CRC computed incrementally over type then data — no allocation needed */
+    uint32_t crc = update_crc(0xffffffffu, (const uint8_t *)type, 4);
+    if (len > 0 && data)
+        crc = update_crc(crc, data, len);
+    crc ^= 0xffffffffu;
 
     uint8_t crc_bytes[4] = {
         (crc >> 24) & 0xff,
@@ -804,8 +805,10 @@ static iris_image *load_png(FILE *f) {
             return NULL;
     }
 
-    /* Decompress */
-    size_t raw_len = height * (1 + width * channels);
+    /* Decompress.
+     * Compute raw_len in size_t to avoid 32-bit overflow at max dimensions
+     * (32768 × 4 channels × 32768 rows = ~4 GB, overflows int but not size_t). */
+    size_t raw_len = (size_t)height * (1 + (size_t)width * (size_t)channels);
     uint8_t *raw = inflate_zlib(idat_data, idat_len, raw_len);
     free(idat_data);
 

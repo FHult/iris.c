@@ -35,6 +35,28 @@
 See `memory/perf_backlog.md` for full backlog. See `memory/gap_analysis.md` for
 revised gap analysis (corrects initial review assumptions after deep code read).
 
+### New items from 2026-03-08 review (not yet scheduled):
+- P-1 (HIGH): Embedding cache unused in server mode — `run_server_mode()` calls
+  `emb_cache_init()` but never calls `emb_cache_lookup_ex`/`emb_cache_store`. Fix:
+  wire the same cache path as the interactive CLI distilled branch.
+- P-2 (MEDIUM): O(N²) tensor lookup — `safetensors_find()` is linear scan;
+  replace with a hash table keyed on tensor name.
+- P-3 (LOW): `write_png_chunk` allocated per-chunk CRC temp buffer — FIXED as
+  side-effect of S-5 security fix (now uses incremental `update_crc`).
+- P-4 (LOW): PNG writer uses uncompressed deflate (store mode). Implement level-1
+  Huffman-only deflate (~50 lines) for 30-50% size reduction without dependencies.
+- SC-1 (CRITICAL): Server mode processes requests serially — one generation blocks
+  all subsequent accepts. Add a request queue and process on a background thread.
+- SC-2 (HIGH): No request cancellation — add `volatile int iris_cancel_requested`
+  flag checked between denoising steps; set via SIGTERM or `{"event":"cancel"}` msg.
+- SC-3 (MEDIUM): Single-entry embedding cache — expand to 16-entry LRU for server
+  deployments with repeated style presets.
+- SC-4 (MEDIUM): All model components co-resident. Text encoder offload to a
+  separate process via socket is architecturally trivial (see `iris_encode_text()`).
+- SC-5 (MEDIUM): No batch generation API — add batch dimension to all tensor ops.
+- SH roadmap: (1) text encoder service, (2) pipeline parallelism between layer
+  groups, (3) batch support, (4) tensor parallelism. See 2026-03-08 review doc.
+
 KEY CORRECTION: BF16 attention already uses Apple native SDPA
 (`scaledDotProductAttentionWithQueryTensor` on macOS 14+). The "1024 seq_k limit"
 was wrong — it's ~7552 for custom kernel, unlimited for MPSGraph path. The BF16
