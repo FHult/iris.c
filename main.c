@@ -33,6 +33,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -471,338 +472,505 @@ static int64_t random_seed(void) {
 }
 
 /* ========================================================================
- * Server Mode
+ * Server Mode — threaded request queue with cancel support (SC-1, SC-2)
  * ======================================================================== */
 
-/* Track phase timing for server mode */
-static struct timeval server_phase_start_tv;
-static struct timeval server_step_start_tv;
-static struct timeval server_generation_start_tv;
+/* ---- Job descriptor ---- */
+#define SERVER_QUEUE_MAX 8
 
-/* Current output path base for step images (set before each generation) */
-static char server_step_image_base[512] = {0};
+typedef struct {
+    char    job_id[32];
+    char   *prompt;
+    char   *output_path;
+    char   *input_path;
+    char   *ref_paths[4];
+    int     num_refs;
+    int     width, height, steps;
+    int64_t seed;
+    int     show_steps;
+    float   guidance;
+    float   img2img_strength;
+    char   *negative_prompt;
+    int     linear_schedule;
+    int     power_schedule;
+    float   power_alpha;
+    char   *lora_path;
+    float   lora_scale;
+} server_job_t;
 
-/* Server mode progress callback - output JSON status updates */
+/* ---- Queue state (protected by queue_mutex) ---- */
+static server_job_t *job_queue[SERVER_QUEUE_MAX];
+static int  queue_head = 0, queue_tail = 0, queue_count = 0;
+static int  server_shutdown = 0;
+static char current_job_id[32] = {0}; /* job running in worker, "" if idle */
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  queue_cond  = PTHREAD_COND_INITIALIZER;
+
+/* stdout mutex — prevents interleaving between main and worker thread */
+static pthread_mutex_t stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Job ID counter (main thread only) */
+static int next_job_id = 0;
+
+/* ---- Per-worker timing/state (worker thread only) ---- */
+static struct timeval worker_gen_start;
+static struct timeval worker_phase_start;
+static struct timeval worker_step_start;
+static char worker_step_base[512] = {0};
+static char worker_job_id[32]     = {0};
+
+static void server_free_job(server_job_t *job) {
+    if (!job) return;
+    free(job->prompt);
+    free(job->output_path);
+    free(job->input_path);
+    free(job->negative_prompt);
+    free(job->lora_path);
+    for (int i = 0; i < job->num_refs; i++) free(job->ref_paths[i]);
+    free(job);
+}
+
+/* ---- Callbacks (called from worker thread only) ---- */
+
 static void server_step_callback(int step, int total) {
     struct timeval now;
     gettimeofday(&now, NULL);
-
-    /* Calculate step time (time since last step or phase start) */
-    double step_time = (now.tv_sec - server_step_start_tv.tv_sec) +
-                       (now.tv_usec - server_step_start_tv.tv_usec) / 1000000.0;
-
-    /* Calculate elapsed time since generation started */
-    double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
-                     (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
-
-    printf("{\"event\":\"progress\",\"step\":%d,\"total\":%d,\"step_time\":%.2f,\"elapsed\":%.2f}\n",
-           step, total, step_time, elapsed);
+    double step_time = (now.tv_sec - worker_step_start.tv_sec) +
+                       (now.tv_usec - worker_step_start.tv_usec) / 1000000.0;
+    double elapsed   = (now.tv_sec - worker_gen_start.tv_sec) +
+                       (now.tv_usec - worker_gen_start.tv_usec) / 1000000.0;
+    pthread_mutex_lock(&stdout_mutex);
+    printf("{\"event\":\"progress\",\"job_id\":\"%s\",\"step\":%d,\"total\":%d,"
+           "\"step_time\":%.2f,\"elapsed\":%.2f}\n",
+           worker_job_id, step, total, step_time, elapsed);
     fflush(stdout);
-
-    /* Update step start time for next step */
-    server_step_start_tv = now;
+    pthread_mutex_unlock(&stdout_mutex);
+    worker_step_start = now;
 }
 
 static void server_phase_callback(const char *phase, int done) {
     struct timeval now;
     gettimeofday(&now, NULL);
-
     if (!done) {
-        /* Phase starting */
-        server_phase_start_tv = now;
-        server_step_start_tv = now;
-
-        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
-                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
-
-        printf("{\"event\":\"phase\",\"phase\":"); json_print_escaped(phase);
+        worker_phase_start = now;
+        worker_step_start  = now;
+        double elapsed = (now.tv_sec - worker_gen_start.tv_sec) +
+                         (now.tv_usec - worker_gen_start.tv_usec) / 1000000.0;
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"phase\",\"job_id\":\"%s\",\"phase\":", worker_job_id);
+        json_print_escaped(phase);
         printf(",\"elapsed\":%.2f}\n", elapsed);
         fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
     } else {
-        /* Phase finished */
-        double phase_time = (now.tv_sec - server_phase_start_tv.tv_sec) +
-                            (now.tv_usec - server_phase_start_tv.tv_usec) / 1000000.0;
-        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
-                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
-
-        printf("{\"event\":\"phase_done\",\"phase\":"); json_print_escaped(phase);
+        double phase_time = (now.tv_sec - worker_phase_start.tv_sec) +
+                            (now.tv_usec - worker_phase_start.tv_usec) / 1000000.0;
+        double elapsed    = (now.tv_sec - worker_gen_start.tv_sec) +
+                            (now.tv_usec - worker_gen_start.tv_usec) / 1000000.0;
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"phase_done\",\"job_id\":\"%s\",\"phase\":", worker_job_id);
+        json_print_escaped(phase);
         printf(",\"phase_time\":%.2f,\"elapsed\":%.2f}\n", phase_time, elapsed);
         fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
     }
 }
 
-/* Server mode step image callback - save intermediate image and emit JSON */
 static void server_step_image_callback(int step, int total, const iris_image *img) {
-    if (!server_step_image_base[0]) return;
-
-    /* Build step image path: /path/to/output_step_N.png */
+    if (!worker_step_base[0]) return;
     char step_path[600];
-    snprintf(step_path, sizeof(step_path), "%s_step_%d.png", server_step_image_base, step);
-
-    /* Save the intermediate image */
+    snprintf(step_path, sizeof(step_path), "%s_step_%d.png", worker_step_base, step);
     if (iris_image_save(img, step_path) == 0) {
         struct timeval now;
         gettimeofday(&now, NULL);
-        double elapsed = (now.tv_sec - server_generation_start_tv.tv_sec) +
-                         (now.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
-
-        printf("{\"event\":\"step_image\",\"step\":%d,\"total\":%d,\"path\":", step, total);
+        double elapsed = (now.tv_sec - worker_gen_start.tv_sec) +
+                         (now.tv_usec - worker_gen_start.tv_usec) / 1000000.0;
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"step_image\",\"job_id\":\"%s\",\"step\":%d,\"total\":%d,\"path\":",
+               worker_job_id, step, total);
         json_print_escaped(step_path);
         printf(",\"elapsed\":%.2f}\n", elapsed);
         fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
     }
 }
 
-/* Run server mode - keeps model loaded and processes JSON requests from stdin */
+/* ---- Worker: execute one job ---- */
+static void server_run_job(iris_ctx *ctx, server_job_t *job) {
+    strncpy(worker_job_id, job->job_id, sizeof(worker_job_id) - 1);
+    worker_job_id[sizeof(worker_job_id) - 1] = '\0';
+
+    /* Apply LoRA */
+    if (job->lora_path) {
+        if (iris_load_lora(ctx, job->lora_path, job->lora_scale) != 0)
+            fprintf(stderr, "Warning: Failed to load LoRA from %s\n", job->lora_path);
+    } else {
+        iris_unload_lora(ctx);
+    }
+
+    /* Set seed */
+    int64_t actual_seed = (job->seed >= 0) ? job->seed : random_seed();
+    iris_set_seed(actual_seed);
+
+    /* Initialize timing */
+    gettimeofday(&worker_gen_start, NULL);
+    worker_phase_start = worker_gen_start;
+    worker_step_start  = worker_gen_start;
+
+    /* Step image base path */
+    strncpy(worker_step_base, job->output_path, sizeof(worker_step_base) - 1);
+    worker_step_base[sizeof(worker_step_base) - 1] = '\0';
+    size_t base_len = strlen(worker_step_base);
+    if (base_len > 4 && strcmp(worker_step_base + base_len - 4, ".png") == 0)
+        worker_step_base[base_len - 4] = '\0';
+
+    if (job->show_steps)
+        iris_set_step_image_callback(ctx, server_step_image_callback);
+    else
+        iris_set_step_image_callback(ctx, NULL);
+
+    pthread_mutex_lock(&stdout_mutex);
+    printf("{\"event\":\"status\",\"job_id\":\"%s\",\"seed\":%lld}\n",
+           job->job_id, (long long)actual_seed);
+    fflush(stdout);
+    pthread_mutex_unlock(&stdout_mutex);
+
+    iris_params params = {
+        .width            = job->width,
+        .height           = job->height,
+        .num_steps        = job->steps,
+        .seed             = actual_seed,
+        .guidance         = job->guidance,
+        .img2img_strength = job->img2img_strength,
+        .negative_prompt  = (job->negative_prompt && job->negative_prompt[0])
+                                ? job->negative_prompt : NULL,
+        .linear_schedule  = job->linear_schedule,
+        .power_schedule   = job->power_schedule,
+        .power_alpha      = job->power_alpha,
+    };
+
+    iris_image *output = NULL;
+    if (job->num_refs > 0) {
+        iris_image *refs[4] = {NULL, NULL, NULL, NULL};
+        int loaded_refs = 0, load_error = 0;
+        for (int i = 0; i < job->num_refs && !load_error; i++) {
+            refs[i] = iris_image_load(job->ref_paths[i]);
+            if (!refs[i]) {
+                pthread_mutex_lock(&stdout_mutex);
+                printf("{\"event\":\"error\",\"job_id\":\"%s\","
+                       "\"message\":\"Failed to load reference image %d\"}\n",
+                       job->job_id, i + 1);
+                fflush(stdout);
+                pthread_mutex_unlock(&stdout_mutex);
+                load_error = 1;
+            } else {
+                loaded_refs++;
+            }
+        }
+        if (!load_error)
+            output = iris_multiref(ctx, job->prompt,
+                                   (const iris_image **)refs, loaded_refs, &params);
+        for (int i = 0; i < loaded_refs; i++) iris_image_free(refs[i]);
+        if (load_error) return;
+    } else if (job->input_path && job->input_path[0]) {
+        iris_image *input = iris_image_load(job->input_path);
+        if (!input) {
+            pthread_mutex_lock(&stdout_mutex);
+            printf("{\"event\":\"error\",\"job_id\":\"%s\","
+                   "\"message\":\"Failed to load input image\"}\n", job->job_id);
+            fflush(stdout);
+            pthread_mutex_unlock(&stdout_mutex);
+            return;
+        }
+        output = iris_img2img(ctx, job->prompt, input, &params);
+        iris_image_free(input);
+    } else {
+        output = iris_generate(ctx, job->prompt, &params);
+    }
+
+    /* Check for cancellation (iris_cancel_requested set while generation ran) */
+    if (iris_cancel_requested) {
+        iris_image_free(output);
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"cancelled\",\"job_id\":\"%s\"}\n", job->job_id);
+        fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
+        return;
+    }
+
+    if (!output) {
+        const char *err = iris_get_error();
+        char errbuf[512];
+        snprintf(errbuf, sizeof(errbuf), "Generation failed: %s", err ? err : "unknown error");
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"error\",\"job_id\":\"%s\",\"message\":", job->job_id);
+        json_print_escaped(errbuf);
+        printf("}\n");
+        fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
+        return;
+    }
+
+    if (iris_image_save_with_seed(output, job->output_path, actual_seed) != 0) {
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"error\",\"job_id\":\"%s\","
+               "\"message\":\"Failed to save image\"}\n", job->job_id);
+        fflush(stdout);
+        pthread_mutex_unlock(&stdout_mutex);
+        iris_image_free(output);
+        return;
+    }
+    iris_image_free(output);
+
+    struct timeval complete_tv;
+    gettimeofday(&complete_tv, NULL);
+    double total_time = (complete_tv.tv_sec - worker_gen_start.tv_sec) +
+                        (complete_tv.tv_usec - worker_gen_start.tv_usec) / 1000000.0;
+
+    pthread_mutex_lock(&stdout_mutex);
+    printf("{\"event\":\"complete\",\"job_id\":\"%s\",\"output\":", job->job_id);
+    json_print_escaped(job->output_path);
+    printf(",\"seed\":%lld,\"total_time\":%.2f}\n", (long long)actual_seed, total_time);
+    fflush(stdout);
+    pthread_mutex_unlock(&stdout_mutex);
+}
+
+/* ---- Worker thread ---- */
+static void *server_worker(void *arg) {
+    iris_ctx *ctx = (iris_ctx *)arg;
+    for (;;) {
+        pthread_mutex_lock(&queue_mutex);
+        while (queue_count == 0 && !server_shutdown)
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+        if (server_shutdown && queue_count == 0) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+        server_job_t *job = job_queue[queue_head];
+        job_queue[queue_head] = NULL;
+        queue_head = (queue_head + 1) % SERVER_QUEUE_MAX;
+        queue_count--;
+        strncpy(current_job_id, job->job_id, sizeof(current_job_id) - 1);
+        current_job_id[sizeof(current_job_id) - 1] = '\0';
+        iris_cancel_requested = 0;
+        pthread_mutex_unlock(&queue_mutex);
+
+        server_run_job(ctx, job);
+        server_free_job(job);
+
+        pthread_mutex_lock(&queue_mutex);
+        current_job_id[0] = '\0';
+        pthread_mutex_unlock(&queue_mutex);
+    }
+    return NULL;
+}
+
+/* ---- Main server loop ---- */
 static int run_server_mode(iris_ctx *ctx) {
     char line[65536];
 
-    /* Initialize embedding cache for repeat-prompt acceleration */
     emb_cache_init();
-
-    /* Set up server-mode callbacks */
-    iris_step_callback = server_step_callback;
-    iris_phase_callback = server_phase_callback;
+    iris_step_callback    = server_step_callback;
+    iris_phase_callback   = server_phase_callback;
     iris_substep_callback = NULL;
 
-    fprintf(stderr, "Server mode: ready for requests\n");
+    pthread_mutex_lock(&stdout_mutex);
     printf("{\"event\":\"ready\",\"model\":"); json_print_escaped(iris_model_info(ctx));
     printf(",\"is_distilled\":%s,\"is_zimage\":%s}\n",
            iris_is_distilled(ctx) ? "true" : "false",
            iris_is_zimage(ctx) ? "true" : "false");
     fflush(stdout);
+    pthread_mutex_unlock(&stdout_mutex);
+
+    fprintf(stderr, "Server mode: ready for requests\n");
+
+    pthread_t worker;
+    pthread_create(&worker, NULL, server_worker, ctx);
 
     while (fgets(line, sizeof(line), stdin) != NULL) {
-        /* Skip empty lines */
         size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
-        }
         if (len == 0) continue;
 
-        /* Parse JSON request */
-        char *prompt = json_get_string(line, "prompt");
-        char *output_path = json_get_string(line, "output");
-        char *input_path = json_get_string(line, "input_image");
-        char *ref_paths[4] = {NULL, NULL, NULL, NULL};
-        int num_refs = json_get_string_array(line, "reference_images", ref_paths, 4);
-        int width = json_get_int(line, "width", DEFAULT_WIDTH);
-        int height = json_get_int(line, "height", DEFAULT_HEIGHT);
-        int steps = json_get_int(line, "steps", DEFAULT_STEPS);
-        int64_t seed = json_get_int64(line, "seed", -1);
-        int show_steps = json_get_bool(line, "show_steps", 1);
-        float guidance = json_get_float(line, "guidance", 0.0f);
-        float img2img_strength = json_get_float(line, "img2img_strength", 1.0f);
-        char *negative_prompt = json_get_string(line, "negative_prompt");
-        char *schedule = json_get_string(line, "schedule");
-        char *req_lora_path = json_get_string(line, "lora");
+        /* Handle cancel events */
+        char *event_type = json_get_string(line, "event");
+        if (event_type && strcmp(event_type, "cancel") == 0) {
+            char *cid = json_get_string(line, "job_id");
+            if (cid) {
+                int cancelled = 0;
+                pthread_mutex_lock(&queue_mutex);
+                /* Search queue for this job */
+                for (int i = 0; i < queue_count && !cancelled; i++) {
+                    int idx = (queue_head + i) % SERVER_QUEUE_MAX;
+                    if (job_queue[idx] && strcmp(job_queue[idx]->job_id, cid) == 0) {
+                        server_free_job(job_queue[idx]);
+                        /* Close gap in circular buffer */
+                        for (int j = i; j < queue_count - 1; j++) {
+                            int a = (queue_head + j)     % SERVER_QUEUE_MAX;
+                            int b = (queue_head + j + 1) % SERVER_QUEUE_MAX;
+                            job_queue[a] = job_queue[b];
+                        }
+                        job_queue[(queue_head + queue_count - 1) % SERVER_QUEUE_MAX] = NULL;
+                        queue_count--;
+                        cancelled = 1;
+                    }
+                }
+                /* If not queued, check if it is the running job */
+                if (!cancelled && current_job_id[0] && strcmp(current_job_id, cid) == 0) {
+                    iris_cancel_requested = 1;
+                    cancelled = 1;
+                }
+                pthread_mutex_unlock(&queue_mutex);
+
+                pthread_mutex_lock(&stdout_mutex);
+                if (cancelled)
+                    printf("{\"event\":\"cancelled\",\"job_id\":\"%s\"}\n", cid);
+                else
+                    printf("{\"event\":\"error\",\"message\":\"Unknown job_id\"}\n");
+                fflush(stdout);
+                pthread_mutex_unlock(&stdout_mutex);
+                free(cid);
+            }
+            free(event_type);
+            continue;
+        }
+        free(event_type);
+
+        /* Parse generate request */
+        char *prompt         = json_get_string(line, "prompt");
+        char *output_path    = json_get_string(line, "output");
+        char *input_path     = json_get_string(line, "input_image");
+        char *ref_paths[4]   = {NULL, NULL, NULL, NULL};
+        int   num_refs       = json_get_string_array(line, "reference_images", ref_paths, 4);
+        int   width          = json_get_int(line, "width",  DEFAULT_WIDTH);
+        int   height         = json_get_int(line, "height", DEFAULT_HEIGHT);
+        int   steps          = json_get_int(line, "steps",  DEFAULT_STEPS);
+        int64_t seed         = json_get_int64(line, "seed", -1);
+        int   show_steps     = json_get_bool(line, "show_steps", 1);
+        float guidance       = json_get_float(line, "guidance", 0.0f);
+        float img2img_str    = json_get_float(line, "img2img_strength", 1.0f);
+        char *neg_prompt     = json_get_string(line, "negative_prompt");
+        char *schedule       = json_get_string(line, "schedule");
+        char *req_lora       = json_get_string(line, "lora");
         float req_lora_scale = json_get_float(line, "lora_scale", 1.0f);
 
-        /* Validate request */
-        if (!prompt || !output_path) {
-            printf("{\"event\":\"error\",\"message\":\"Missing prompt or output\"}\n");
-            fflush(stdout);
-            free(prompt); free(output_path); free(input_path);
-            free(negative_prompt); free(schedule); free(req_lora_path);
-            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-            continue;
-        }
+/* Helper: emit an error JSON line (no job_id yet) and free parsed strings */
+#define EARLY_ERROR(msg) do { \
+    pthread_mutex_lock(&stdout_mutex); \
+    printf("{\"event\":\"error\",\"message\":\"%s\"}\n", (msg)); \
+    fflush(stdout); \
+    pthread_mutex_unlock(&stdout_mutex); \
+    free(prompt); free(output_path); free(input_path); \
+    free(neg_prompt); free(schedule); free(req_lora); \
+    for (int _i = 0; _i < num_refs; _i++) free(ref_paths[_i]); \
+    continue; \
+} while(0)
 
-        /* Validate parameters */
-        if (width < 64 || width > 1792 || width % 16 != 0) {
-            printf("{\"event\":\"error\",\"message\":\"Width must be 64-1792 and divisible by 16\"}\n");
-            fflush(stdout);
-            free(prompt); free(output_path); free(input_path);
-            free(negative_prompt); free(schedule); free(req_lora_path);
-            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-            continue;
-        }
-        if (height < 64 || height > 1792 || height % 16 != 0) {
-            printf("{\"event\":\"error\",\"message\":\"Height must be 64-1792 and divisible by 16\"}\n");
-            fflush(stdout);
-            free(prompt); free(output_path); free(input_path);
-            free(negative_prompt); free(schedule); free(req_lora_path);
-            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-            continue;
-        }
+        if (!prompt || !output_path)
+            EARLY_ERROR("Missing prompt or output");
+        if (width < 64 || width > 1792 || width % 16 != 0)
+            EARLY_ERROR("Width must be 64-1792 and divisible by 16");
+        if (height < 64 || height > 1792 || height % 16 != 0)
+            EARLY_ERROR("Height must be 64-1792 and divisible by 16");
         if (steps < 1 || steps > IRIS_MAX_STEPS) {
+            pthread_mutex_lock(&stdout_mutex);
             printf("{\"event\":\"error\",\"message\":\"Steps must be 1-%d\"}\n", IRIS_MAX_STEPS);
             fflush(stdout);
+            pthread_mutex_unlock(&stdout_mutex);
             free(prompt); free(output_path); free(input_path);
-            free(negative_prompt); free(schedule); free(req_lora_path);
+            free(neg_prompt); free(schedule); free(req_lora);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
-
-        /* Reject paths containing ".." to prevent directory traversal */
         {
             int unsafe = !path_is_safe(output_path) ||
                          (input_path && !path_is_safe(input_path)) ||
-                         (req_lora_path && !path_is_safe(req_lora_path));
+                         (req_lora    && !path_is_safe(req_lora));
             for (int i = 0; i < num_refs && !unsafe; i++)
                 if (!path_is_safe(ref_paths[i])) unsafe = 1;
-            if (unsafe) {
-                printf("{\"event\":\"error\",\"message\":\"Unsafe file path\"}\n");
-                fflush(stdout);
-                free(prompt); free(output_path); free(input_path);
-                free(negative_prompt); free(schedule); free(req_lora_path);
-                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-                continue;
-            }
+            if (unsafe) EARLY_ERROR("Unsafe file path");
         }
 
-        /* Apply LoRA if requested (per-request hot-swap) */
-        if (req_lora_path) {
-            if (iris_load_lora(ctx, req_lora_path, req_lora_scale) != 0) {
-                fprintf(stderr, "Warning: Failed to load LoRA from %s\n", req_lora_path);
-            }
-            free(req_lora_path);
-        } else {
-            iris_unload_lora(ctx);
+#undef EARLY_ERROR
+
+        /* Check queue capacity */
+        pthread_mutex_lock(&queue_mutex);
+        if (queue_count >= SERVER_QUEUE_MAX) {
+            pthread_mutex_unlock(&queue_mutex);
+            pthread_mutex_lock(&stdout_mutex);
+            printf("{\"event\":\"error\",\"message\":\"Server queue full, try again later\"}\n");
+            fflush(stdout);
+            pthread_mutex_unlock(&stdout_mutex);
+            free(prompt); free(output_path); free(input_path);
+            free(neg_prompt); free(schedule); free(req_lora);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+            continue;
         }
 
-        /* Set seed — use cryptographic RNG when caller doesn't specify one */
-        int64_t actual_seed = (seed >= 0) ? seed : random_seed();
-        iris_set_seed(actual_seed);
-
-        /* Initialize generation timing */
-        gettimeofday(&server_generation_start_tv, NULL);
-        server_phase_start_tv = server_generation_start_tv;
-        server_step_start_tv = server_generation_start_tv;
-
-        /* Set up step image base path (output_path without .png extension) */
-        strncpy(server_step_image_base, output_path, sizeof(server_step_image_base) - 1);
-        server_step_image_base[sizeof(server_step_image_base) - 1] = '\0';
-        size_t base_len = strlen(server_step_image_base);
-        if (base_len > 4 && strcmp(server_step_image_base + base_len - 4, ".png") == 0) {
-            server_step_image_base[base_len - 4] = '\0';
+        /* Build job — takes ownership of all malloc'd strings */
+        server_job_t *job = (server_job_t *)calloc(1, sizeof(server_job_t));
+        if (!job) {
+            pthread_mutex_unlock(&queue_mutex);
+            pthread_mutex_lock(&stdout_mutex);
+            printf("{\"event\":\"error\",\"message\":\"Out of memory\"}\n");
+            fflush(stdout);
+            pthread_mutex_unlock(&stdout_mutex);
+            free(prompt); free(output_path); free(input_path);
+            free(neg_prompt); free(schedule); free(req_lora);
+            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+            continue;
         }
 
-        /* Enable/disable step image callback based on show_steps parameter */
-        if (show_steps) {
-            iris_set_step_image_callback(ctx, server_step_image_callback);
-        } else {
-            iris_set_step_image_callback(ctx, NULL);
-        }
+        snprintf(job->job_id, sizeof(job->job_id), "job_%06d", ++next_job_id);
+        job->prompt          = prompt;
+        job->output_path     = output_path;
+        job->input_path      = input_path;
+        job->num_refs        = num_refs;
+        for (int i = 0; i < num_refs; i++) job->ref_paths[i] = ref_paths[i];
+        job->width           = width;
+        job->height          = height;
+        job->steps           = steps;
+        job->seed            = seed;
+        job->show_steps      = show_steps;
+        job->guidance        = guidance;
+        job->img2img_strength = img2img_str;
+        job->negative_prompt = neg_prompt;
+        job->lora_path       = req_lora;
+        job->lora_scale      = req_lora_scale;
+        job->power_alpha     = 2.0f; /* default; overridden below if power schedule */
 
-        /* Report seed */
-        printf("{\"event\":\"status\",\"seed\":%lld}\n", (long long)actual_seed);
-        fflush(stdout);
-
-        /* Set up params */
-        iris_params params = {
-            .width = width,
-            .height = height,
-            .num_steps = steps,
-            .seed = actual_seed,
-            .guidance = guidance,
-            .img2img_strength = img2img_strength,
-            .negative_prompt = (negative_prompt && negative_prompt[0]) ? negative_prompt : NULL,
-        };
-
-        /* Apply schedule if specified */
         if (schedule) {
-            if (strcmp(schedule, "linear") == 0) {
-                params.linear_schedule = 1;
-            } else if (strcmp(schedule, "power") == 0) {
-                params.power_schedule = 1;
-                params.power_alpha = json_get_float(line, "power_alpha", 2.0f);
+            if (strcmp(schedule, "linear") == 0)
+                job->linear_schedule = 1;
+            else if (strcmp(schedule, "power") == 0) {
+                job->power_schedule = 1;
+                job->power_alpha    = json_get_float(line, "power_alpha", 2.0f);
             }
             free(schedule);
         }
 
-        /* Generate */
-        iris_image *output = NULL;
-        if (num_refs > 0) {
-            /* Multi-reference mode */
-            iris_image *refs[4] = {NULL, NULL, NULL, NULL};
-            int loaded_refs = 0;
-            int load_error = 0;
+        /* Enqueue */
+        job_queue[queue_tail] = job;
+        queue_tail = (queue_tail + 1) % SERVER_QUEUE_MAX;
+        int position = queue_count + 1; /* 1 = next behind current job */
+        queue_count++;
+        pthread_cond_signal(&queue_cond);
+        pthread_mutex_unlock(&queue_mutex);
 
-            for (int i = 0; i < num_refs && !load_error; i++) {
-                refs[i] = iris_image_load(ref_paths[i]);
-                if (!refs[i]) {
-                    printf("{\"event\":\"error\",\"message\":\"Failed to load reference image %d\"}\n", i + 1);
-                    fflush(stdout);
-                    load_error = 1;
-                } else {
-                    loaded_refs++;
-                }
-            }
-
-            if (!load_error) {
-                output = iris_multiref(ctx, prompt, (const iris_image **)refs, loaded_refs, &params);
-            }
-
-            /* Free loaded reference images */
-            for (int i = 0; i < loaded_refs; i++) {
-                iris_image_free(refs[i]);
-            }
-
-            if (load_error) {
-                free(prompt); free(output_path); free(input_path);
-                free(negative_prompt);
-                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-                continue;
-            }
-        } else if (input_path && strlen(input_path) > 0) {
-            /* Img2img mode (backwards compatibility) */
-            iris_image *input = iris_image_load(input_path);
-            if (!input) {
-                printf("{\"event\":\"error\",\"message\":\"Failed to load input image\"}\n");
-                fflush(stdout);
-                free(prompt); free(output_path); free(input_path);
-                free(negative_prompt);
-                for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-                continue;
-            }
-            output = iris_img2img(ctx, prompt, input, &params);
-            iris_image_free(input);
-        } else {
-            /* Text-to-image mode */
-            output = iris_generate(ctx, prompt, &params);
-        }
-
-        if (!output) {
-            const char *err = iris_get_error();
-            char errbuf[512];
-            snprintf(errbuf, sizeof(errbuf), "Generation failed: %s", err ? err : "unknown error");
-            printf("{\"event\":\"error\",\"message\":"); json_print_escaped(errbuf); printf("}\n");
-            fflush(stdout);
-            free(prompt); free(output_path); free(input_path);
-            free(negative_prompt);
-            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-            continue;
-        }
-
-        /* Save output */
-        if (iris_image_save_with_seed(output, output_path, actual_seed) != 0) {
-            printf("{\"event\":\"error\",\"message\":\"Failed to save image\"}\n");
-            fflush(stdout);
-            iris_image_free(output);
-            free(prompt); free(output_path); free(input_path);
-            free(negative_prompt);
-            for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
-            continue;
-        }
-
-        iris_image_free(output);
-
-        /* Calculate total generation time */
-        struct timeval complete_tv;
-        gettimeofday(&complete_tv, NULL);
-        double total_time = (complete_tv.tv_sec - server_generation_start_tv.tv_sec) +
-                            (complete_tv.tv_usec - server_generation_start_tv.tv_usec) / 1000000.0;
-
-        /* Report success */
-        printf("{\"event\":\"complete\",\"output\":"); json_print_escaped(output_path);
-        printf(",\"seed\":%lld,\"total_time\":%.2f}\n", (long long)actual_seed, total_time);
+        pthread_mutex_lock(&stdout_mutex);
+        printf("{\"event\":\"queued\",\"job_id\":\"%s\",\"position\":%d}\n",
+               job->job_id, position);
         fflush(stdout);
-
-        free(prompt); free(output_path); free(input_path);
-        free(negative_prompt);
-        for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
+        pthread_mutex_unlock(&stdout_mutex);
     }
+
+    /* EOF: drain queue and shut down worker */
+    pthread_mutex_lock(&queue_mutex);
+    server_shutdown = 1;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+    pthread_join(worker, NULL);
 
     emb_cache_free();
     return 0;

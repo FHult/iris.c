@@ -314,6 +314,7 @@ float *iris_sample_euler(void *transformer, void *text_encoder,
         /* Notify step start */
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Predict velocity with conditioning */
         v_cond = iris_transformer_forward(tf, z_curr, h, w,
@@ -420,6 +421,7 @@ float *iris_sample_euler_zimage(void *transformer,
 
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); free(step_latent); return NULL; }
 
         /* Run Z-Image transformer */
         float *model_out = zi_transformer_forward(tf, z_curr, h, w,
@@ -529,6 +531,7 @@ float *iris_sample_euler_with_refs(void *transformer, void *text_encoder,
         /* Notify step start */
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Predict velocity with reference image conditioning */
         float *v = iris_transformer_forward_with_refs(tf,
@@ -605,6 +608,7 @@ float *iris_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
 
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Predict velocity with multiple reference images */
         float *v = iris_transformer_forward_with_multi_refs(tf,
@@ -686,6 +690,7 @@ float *iris_sample_euler_cfg(void *transformer, void *text_encoder,
 
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Unconditioned prediction */
         float *v_uncond = iris_transformer_forward(tf, z_curr, h, w,
@@ -767,6 +772,7 @@ float *iris_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
 
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Unconditioned prediction (with ref) */
         float *v_uncond = iris_transformer_forward_with_refs(tf,
@@ -849,6 +855,7 @@ float *iris_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
 
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
+        if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         /* Unconditioned prediction (with refs) */
         float *v_uncond = iris_transformer_forward_with_multi_refs(tf,
@@ -923,6 +930,8 @@ float *iris_sample_euler_ancestral(void *transformer,
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
+
+        if (iris_cancel_requested) { free(z_curr); free(noise); return NULL; }
 
         /* Predict velocity */
         float *v = iris_transformer_forward(tf, z_curr, h, w,

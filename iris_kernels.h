@@ -285,6 +285,13 @@ typedef void (*iris_phase_callback_t)(const char *phase, int done);
 extern iris_phase_callback_t iris_phase_callback;
 
 /*
+ * Cancel flag - set to non-zero to request early termination of the denoising loop.
+ * The sampling functions check this between steps and return NULL when set.
+ * The caller is responsible for resetting it to 0 before starting a new generation.
+ */
+extern volatile int iris_cancel_requested;
+
+/*
  * Step image callback - called after each denoising step with decoded image.
  * step: current step (1-based)
  * total: total number of steps

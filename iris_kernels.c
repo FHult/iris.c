@@ -40,6 +40,9 @@ iris_text_progress_callback_t iris_text_progress_callback = NULL;
 iris_vae_progress_callback_t iris_vae_progress_callback = NULL;
 int iris_verbose = 0;
 
+/* Cancel flag: set to non-zero to abort the denoising loop at the next step boundary */
+volatile int iris_cancel_requested = 0;
+
 /* ========================================================================
  * Random Number Generator (xoshiro256**)
  * ======================================================================== */
