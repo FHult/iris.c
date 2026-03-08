@@ -25,6 +25,7 @@
 #include "iris_kernels.h"
 #include "iris_cli.h"
 #include "embcache.h"
+#include "iris_qwen3.h"
 #include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -684,7 +685,34 @@ static void server_run_job(iris_ctx *ctx, server_job_t *job) {
         }
         output = iris_img2img(ctx, job->prompt, input, &params);
         iris_image_free(input);
+    } else if (iris_is_distilled(ctx)) {
+        /* Distilled txt2img: use embedding cache for repeated prompts */
+        int text_dim = iris_text_dim(ctx);
+        int seq_len  = QWEN3_MAX_SEQ_LEN;
+        int emb_elements = 0;
+        float *embeddings = emb_cache_lookup_ex(job->prompt, &emb_elements);
+        if (embeddings) {
+            if (text_dim <= 0 || emb_elements <= 0 || (emb_elements % text_dim) != 0) {
+                free(embeddings);
+                embeddings = NULL;
+            } else {
+                seq_len = emb_elements / text_dim;
+            }
+        }
+        if (embeddings) {
+            output = iris_generate_with_embeddings(ctx, embeddings, seq_len, &params);
+            free(embeddings);
+        } else {
+            embeddings = iris_encode_text(ctx, job->prompt, &seq_len);
+            if (embeddings) {
+                emb_cache_store(job->prompt, embeddings, seq_len * text_dim);
+                iris_release_text_encoder(ctx);
+                output = iris_generate_with_embeddings(ctx, embeddings, seq_len, &params);
+                free(embeddings);
+            }
+        }
     } else {
+        /* Base model txt2img: CFG requires two encodings, skip cache */
         output = iris_generate(ctx, job->prompt, &params);
     }
 
