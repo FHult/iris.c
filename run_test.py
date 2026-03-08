@@ -65,6 +65,19 @@ TESTS = [
         "reference": "test_vectors/reference_img2img_strength035_256x256_seed456.png",
         "mean_diff_threshold": 20,
     },
+    {
+        # strength=0.0 in iris means full denoising from scratch (no img2img
+        # conditioning), equivalent to txt2img. Tests that the binary handles
+        # this boundary value without crashing and produces a valid output.
+        "name": "256x256 img2img strength=0.0 boundary (no crash, valid output)",
+        "prompt": "A colorful oil painting of a cat",
+        "seed": 456,
+        "steps": 4,
+        "width": 256,
+        "height": 256,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "img2img_strength": 0.0,
+    },
 ]
 
 # Full-only tests: these are slow and require visual inspection.
@@ -289,10 +302,29 @@ FLUX_MODEL_SEARCH_ORDER = [
     "flux-klein-4b", "flux-klein-model", "flux-klein-9b",
     "flux-klein-4b-base", "flux-klein-9b-base",
 ]
+FLUX_BASE_MODEL_SEARCH_ORDER = ["flux-klein-4b-base", "flux-klein-9b-base"]
+
+# Optional base-model smoke test: exercises the CFG code path (double forward
+# pass per step). Runs only when a base-model directory is detected.
+BASE_MODEL_SMOKE_TEST = {
+    "name": "Base model smoke test (2 steps, 64x64, CFG path)",
+    "prompt": "A simple mountain landscape",
+    "seed": 1,
+    "steps": 2,
+    "width": 64,
+    "height": 64,
+}
 
 
 def detect_flux_model_dir() -> Optional[str]:
     for name in FLUX_MODEL_SEARCH_ORDER:
+        if Path(name).is_dir():
+            return name
+    return None
+
+
+def detect_base_model_dir() -> Optional[str]:
+    for name in FLUX_BASE_MODEL_SEARCH_ORDER:
         if Path(name).is_dir():
             return name
     return None
@@ -334,6 +366,15 @@ def main():
             print("Skipping optional Z-Image smoke test.")
         else:
             print("No Z-Image model dir detected; skipping optional Z-Image smoke test.")
+
+    # Optional base-model coverage (CFG path): run only in non-quick mode.
+    base_model_dir = detect_base_model_dir()
+    if not args.quick:
+        if base_model_dir:
+            print(f"Detected base model dir: {base_model_dir}")
+            scheduled_tests.append((BASE_MODEL_SMOKE_TEST, base_model_dir))
+        else:
+            print("No base model dir detected; skipping optional base model smoke test.")
 
     # Server-mode IPC test runs in non-quick mode.
     run_server_test = not args.quick

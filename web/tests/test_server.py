@@ -326,6 +326,88 @@ class TestGenerateValidation:
 
 
 # ---------------------------------------------------------------------------
+# /generate — additional edge cases (types, path traversal, boundaries)
+# ---------------------------------------------------------------------------
+
+class TestGenerateEdgeCases:
+    def test_non_json_body_returns_4xx(self, client):
+        """Plain-text body → Flask returns 415 (wrong content type) or 400."""
+        r = client.post("/generate", data="not json", content_type="text/plain")
+        assert r.status_code in (400, 415)
+
+    def test_form_data_body_returns_4xx(self, client):
+        """Form-encoded body is not JSON → Flask returns 415 or 400."""
+        r = client.post("/generate", data={"prompt": "a cat"},
+                        content_type="application/x-www-form-urlencoded")
+        assert r.status_code in (400, 415)
+
+    def test_empty_json_object_returns_400(self, client):
+        """Empty JSON object → prompt missing → 400."""
+        r = client.post("/generate", json={})
+        assert r.status_code == 400
+
+    def test_steps_as_non_numeric_string_returns_400(self, client):
+        """steps='four' → int() raises ValueError → 400."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": "four",
+        })
+        assert r.status_code == 400
+
+    def test_width_as_null_returns_400(self, client):
+        """width=null → int(None) raises TypeError → 400."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": None, "height": 512, "steps": 4,
+        })
+        assert r.status_code == 400
+
+    def test_lora_path_traversal_slash_rejected(self, client):
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+            "lora": "../../etc/passwd",
+        })
+        assert r.status_code == 400
+
+    def test_lora_path_traversal_dotdot_rejected(self, client):
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+            "lora": "..evil",
+        })
+        assert r.status_code == 400
+
+    def test_img2img_strength_zero_accepted(self, client):
+        """strength=0.0 is a valid boundary — job should be queued (200)."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+            "img2img_strength": 0.0,
+        })
+        assert r.status_code == 200
+
+    def test_img2img_strength_one_accepted(self, client):
+        """strength=1.0 is the default — must be accepted (200)."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+            "img2img_strength": 1.0,
+        })
+        assert r.status_code == 200
+
+    def test_reference_images_as_string_returns_400(self, client):
+        """reference_images as a bare string (not a list) should return 400."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+            "reference_images": "not a list",
+        })
+        assert r.status_code == 400
+
+    def test_response_includes_job_id(self, client):
+        """A valid request must return a job_id in the response body."""
+        r = client.post("/generate", json={
+            "prompt": "a cat", "width": 512, "height": 512, "steps": 4,
+        })
+        assert r.status_code == 200
+        assert "job_id" in r.get_json()
+
+
+# ---------------------------------------------------------------------------
 # Per-slot reference image strength normalisation (unit tests)
 # ---------------------------------------------------------------------------
 
