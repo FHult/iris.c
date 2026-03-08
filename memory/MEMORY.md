@@ -45,10 +45,13 @@ revised gap analysis (corrects initial review assumptions after deep code read).
   side-effect of S-5 security fix (now uses incremental `update_crc`).
 - P-4 (LOW): PNG writer uses uncompressed deflate (store mode). Implement level-1
   Huffman-only deflate (~50 lines) for 30-50% size reduction without dependencies.
-- SC-1 (CRITICAL): Server mode processes requests serially — one generation blocks
-  all subsequent accepts. Add a request queue and process on a background thread.
-- SC-2 (HIGH): No request cancellation — add `volatile int iris_cancel_requested`
-  flag checked between denoising steps; set via SIGTERM or `{"event":"cancel"}` msg.
+- SC-1 ✓ DONE (d6cc02a): Threaded request queue — SERVER_QUEUE_MAX=8 bounded
+  circular queue; worker thread dequeues jobs; main thread enqueues and replies
+  immediately with {"event":"queued","job_id":"..."}; stdout_mutex prevents
+  output interleaving; clean shutdown on EOF via server_shutdown flag + join.
+- SC-2 ✓ DONE (d6cc02a): Request cancellation — iris_cancel_requested volatile
+  int in iris_kernels; all 8 denoising loops check it between steps; main thread
+  handles {"event":"cancel","job_id":"..."} by dequeuing or setting the flag.
 - SC-3 (MEDIUM): Single-entry embedding cache — expand to 16-entry LRU for server
   deployments with repeated style presets.
 - SC-4 (MEDIUM): All model components co-resident. Text encoder offload to a
