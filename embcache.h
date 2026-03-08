@@ -7,8 +7,9 @@
 /* ========================================================================
  * Embedding Cache with 4-bit Quantization
  *
- * Caches text embeddings in 4-bit quantized form to save memory.
- * Used in CLI mode to avoid re-encoding when the same prompt is used.
+ * 16-entry LRU cache for text embeddings in 4-bit quantized form.
+ * Used to skip the expensive Qwen3 forward pass on repeated prompts
+ * (server mode style-preset cycling, CLI iterative workflows, etc.).
  *
  * 4-bit quantization uses block-wise min/max scaling:
  * - Divide embedding into blocks of 32 values
@@ -35,6 +36,7 @@ typedef struct {
     char *prompt;              /* The prompt string (owned) */
     emb_quantized_t *emb;      /* Quantized embedding */
     uint64_t hash;             /* Hash of prompt for quick comparison */
+    uint64_t last_used;        /* Logical timestamp for LRU eviction */
 } emb_cache_entry_t;
 
 /* ========================================================================

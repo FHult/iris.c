@@ -1,7 +1,7 @@
 /* ========================================================================
  * Embedding Cache with 4-bit Quantization
  *
- * Implements a simple single-entry cache for CLI prompt embeddings.
+ * 16-entry LRU cache for text embeddings.
  * Uses 4-bit block quantization to reduce memory from 15.7 MB to ~2 MB.
  * ======================================================================== */
 
@@ -135,17 +135,19 @@ void emb_quantized_free(emb_quantized_t *q) {
 }
 
 /* ========================================================================
- * Multi-Slot Cache
+ * 16-entry LRU Cache
  *
- * Uses EMB_CACHE_SLOTS independent slots indexed by hash(prompt) % SLOTS.
- * Multiple slots allow caching both real prompt and empty prompt (for CFG),
- * plus handles prompt iteration workflows.
+ * Linear scan over EMB_CACHE_SLOTS entries (16 is small enough that
+ * O(N) lookup is faster than any hash-table overhead). Each access
+ * updates last_used with a monotonic clock; eviction picks the entry
+ * with the smallest last_used value.
  * ======================================================================== */
 
-#define EMB_CACHE_SLOTS 4
+#define EMB_CACHE_SLOTS 16
 
 static emb_cache_entry_t g_cache[EMB_CACHE_SLOTS];
-static int g_cache_initialized = 0;
+static int      g_cache_initialized = 0;
+static uint64_t g_cache_clock       = 0;
 
 static void clear_slot(int slot) {
     free(g_cache[slot].prompt);
@@ -156,51 +158,63 @@ static void clear_slot(int slot) {
 void emb_cache_init(void) {
     if (g_cache_initialized) return;
     memset(g_cache, 0, sizeof(g_cache));
+    g_cache_clock = 0;
     g_cache_initialized = 1;
 }
 
-/* Store quantized text embeddings keyed by prompt string. Used in
- * interactive CLI mode to skip the expensive Qwen3 forward pass when
- * the same prompt is reused. Replaces the existing entry since the
- * cache holds a single prompt (the common case is iterating on one). */
+/* Store quantized text embeddings keyed by prompt string.
+ * If the prompt already exists, update its embedding in place and refresh
+ * its LRU timestamp. Otherwise claim an empty slot or evict the LRU entry. */
 void emb_cache_store(const char *prompt, const float *embedding, int num_elements) {
     if (!prompt || !embedding || num_elements <= 0) return;
     if (!g_cache_initialized) emb_cache_init();
 
     uint64_t hash = hash_string(prompt);
-    int slot = (int)(hash % EMB_CACHE_SLOTS);
 
-    /* Clear existing entry in this slot */
-    clear_slot(slot);
-
-    /* Store new entry */
-    g_cache[slot].prompt = strdup(prompt);
-    g_cache[slot].hash = hash;
-    g_cache[slot].emb = emb_quantize_4bit(embedding, num_elements);
-
-    if (!g_cache[slot].prompt || !g_cache[slot].emb) {
-        clear_slot(slot);
+    /* Update existing entry if present */
+    for (int i = 0; i < EMB_CACHE_SLOTS; i++) {
+        if (!g_cache[i].prompt || g_cache[i].hash != hash) continue;
+        if (strcmp(g_cache[i].prompt, prompt) != 0) continue;
+        emb_quantized_free(g_cache[i].emb);
+        g_cache[i].emb       = emb_quantize_4bit(embedding, num_elements);
+        g_cache[i].last_used = ++g_cache_clock;
+        if (!g_cache[i].emb) clear_slot(i);
+        return;
     }
+
+    /* Find an empty slot, or the LRU slot */
+    int target = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < EMB_CACHE_SLOTS; i++) {
+        if (!g_cache[i].prompt) { target = i; break; }
+        if (g_cache[i].last_used < oldest) {
+            oldest = g_cache[i].last_used;
+            target = i;
+        }
+    }
+
+    clear_slot(target);
+    g_cache[target].prompt    = strdup(prompt);
+    g_cache[target].hash      = hash;
+    g_cache[target].last_used = ++g_cache_clock;
+    g_cache[target].emb       = emb_quantize_4bit(embedding, num_elements);
+    if (!g_cache[target].prompt || !g_cache[target].emb)
+        clear_slot(target);
 }
 
 float *emb_cache_lookup_ex(const char *prompt, int *num_elements) {
     if (!prompt || !g_cache_initialized) return NULL;
 
     uint64_t hash = hash_string(prompt);
-    int slot = (int)(hash % EMB_CACHE_SLOTS);
-
-    if (!g_cache[slot].prompt || !g_cache[slot].emb) return NULL;
-
-    /* Quick hash check first */
-    if (hash != g_cache[slot].hash) return NULL;
-
-    /* Full string comparison */
-    if (strcmp(prompt, g_cache[slot].prompt) != 0) return NULL;
-
-    if (num_elements) *num_elements = g_cache[slot].emb->num_elements;
-
-    /* Cache hit - dequantize and return */
-    return emb_dequantize_4bit(g_cache[slot].emb);
+    for (int i = 0; i < EMB_CACHE_SLOTS; i++) {
+        if (!g_cache[i].prompt || g_cache[i].hash != hash) continue;
+        if (strcmp(g_cache[i].prompt, prompt) != 0) continue;
+        /* Hit — refresh LRU timestamp */
+        g_cache[i].last_used = ++g_cache_clock;
+        if (num_elements) *num_elements = g_cache[i].emb->num_elements;
+        return emb_dequantize_4bit(g_cache[i].emb);
+    }
+    return NULL;
 }
 
 float *emb_cache_lookup(const char *prompt) {
@@ -211,12 +225,11 @@ int emb_cache_has(const char *prompt) {
     if (!prompt || !g_cache_initialized) return 0;
 
     uint64_t hash = hash_string(prompt);
-    int slot = (int)(hash % EMB_CACHE_SLOTS);
-
-    if (!g_cache[slot].prompt) return 0;
-    if (hash != g_cache[slot].hash) return 0;
-
-    return strcmp(prompt, g_cache[slot].prompt) == 0;
+    for (int i = 0; i < EMB_CACHE_SLOTS; i++) {
+        if (!g_cache[i].prompt || g_cache[i].hash != hash) continue;
+        if (strcmp(g_cache[i].prompt, prompt) == 0) return 1;
+    }
+    return 0;
 }
 
 void emb_cache_clear(void) {
