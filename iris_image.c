@@ -156,9 +156,6 @@ static uint32_t update_crc(uint32_t crc, const uint8_t *buf, size_t len) {
     return c;
 }
 
-static uint32_t png_crc(const uint8_t *buf, size_t len) {
-    return update_crc(0xffffffffu, buf, len) ^ 0xffffffffu;
-}
 
 /* Adler-32 checksum for zlib */
 static uint32_t adler32(const uint8_t *data, size_t len) {
