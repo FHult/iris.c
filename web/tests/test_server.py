@@ -1431,3 +1431,78 @@ class TestNegativePrompt:
             job = srv.jobs.get(job_id)
         assert job is not None
         assert job.negative_prompt == ""
+
+
+class TestHiresFixIntermediate:
+    """hires_fix_intermediate flag stored on job, persisted in history."""
+
+    def test_default_is_false(self, client):
+        """History items have hires_fix_intermediate=False by default."""
+        _seed_history(1)
+        r = client.get("/history")
+        item = r.get_json()[0]
+        assert "hires_fix_intermediate" in item
+        assert item["hires_fix_intermediate"] is False
+
+    def test_generate_stores_flag_true(self, client):
+        """POST /generate with hires_fix_intermediate=true stores it on the job."""
+        import server as srv
+        r = client.post("/generate", json={
+            "prompt": "a forest",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+            "hires_fix_intermediate": True,
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        with srv.jobs_lock:
+            job = srv.jobs.get(job_id)
+        assert job is not None
+        assert job.hires_fix_intermediate is True
+
+    def test_generate_flag_defaults_false(self, client):
+        """POST /generate without hires_fix_intermediate defaults to False."""
+        import server as srv
+        r = client.post("/generate", json={
+            "prompt": "a mountain",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        with srv.jobs_lock:
+            job = srv.jobs.get(job_id)
+        assert job is not None
+        assert job.hires_fix_intermediate is False
+
+    def test_round_trip_via_disk(self, client, tmp_path):
+        """hires_fix_intermediate=True survives save→load cycle."""
+        import server as srv
+
+        srv.OUTPUT_DIR = tmp_path
+        srv.HISTORY_FILE = tmp_path / "history.json"
+
+        job_id = "hiresrt1"
+        job = srv.Job(job_id, prompt="draft", width=512, height=512, steps=4)
+        job.hires_fix_intermediate = True
+        job.seed = 1
+        job.status = "complete"
+        out = tmp_path / f"{job_id}.png"
+        out.touch()
+        job.output_path = out
+
+        srv.history.insert(0, job)
+        srv.history_by_id[job_id] = job
+
+        with srv.history_lock:
+            srv.save_history()
+
+        srv.history.clear()
+        srv.history_by_id.clear()
+        srv.load_history_from_disk()
+
+        loaded = srv.history_by_id.get(job_id)
+        assert loaded is not None
+        assert loaded.hires_fix_intermediate is True
