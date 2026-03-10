@@ -1156,7 +1156,7 @@ int main(int argc, char *argv[]) {
             case 'v': output_level = OUTPUT_VERBOSE; iris_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
-                fprintf(stderr, "FLUX.2 klein v2.5.3\n");
+                fprintf(stderr, "FLUX.2 klein v2.5.4\n");
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
