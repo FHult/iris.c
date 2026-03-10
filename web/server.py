@@ -460,6 +460,7 @@ def load_history_from_disk():
             job.schedule = item.get("schedule")
             job.img2img_strength = item.get("img2img_strength", 1.0)
             job.negative_prompt = item.get("negative_prompt", '')
+            job.hires_fix_intermediate = item.get("hires_fix_intermediate", False)
             job.status = "complete"
             job.output_path = output_path
             history.append(job)
@@ -500,6 +501,7 @@ class Job:
         self.schedule = None    # None = default (sigmoid)
         self.img2img_strength = 1.0
         self.negative_prompt = ''  # empty = no negative conditioning
+        self.hires_fix_intermediate = False  # True = pass-1 draft, hidden from history
 
     def subscribe(self):
         """Create a new subscriber queue for an SSE connection."""
@@ -552,6 +554,7 @@ class Job:
             "schedule": self.schedule,
             "img2img_strength": self.img2img_strength,
             "negative_prompt": self.negative_prompt,
+            "hires_fix_intermediate": self.hires_fix_intermediate,
             "image_url": f"/image/{self.id}",
             "thumb_url": f"/thumb/{self.id}",
         }
@@ -1062,6 +1065,7 @@ def generate():
     batch_id = data.get("batch_id")  # Groups variation batches
     lora_name = data.get("lora") or None       # LoRA filename (relative, inside loras/ dir)
     negative_prompt = (data.get("negative_prompt") or "").strip()
+    hires_fix_intermediate = bool(data.get("hires_fix_intermediate", False))
 
     # Prevent path traversal via lora_name
     if lora_name and ("/" in lora_name or "\\" in lora_name or ".." in lora_name):
@@ -1157,6 +1161,7 @@ def generate():
     job.schedule = schedule
     job.img2img_strength = img2img_strength
     job.negative_prompt = negative_prompt
+    job.hires_fix_intermediate = hires_fix_intermediate
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:

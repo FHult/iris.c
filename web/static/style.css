@@ -2818,3 +2818,21 @@ footer a:hover {
 .outpaint-submit {
     min-width: 90px;
 }
+
+#hires-fix-controls {
+    display: none;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.4rem;
+    padding-left: 1.5rem;
+}
+
+#hires-fix-controls label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+#hires-fix-controls input[type="range"] {
+    width: 110px;
+}
