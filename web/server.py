@@ -1841,16 +1841,24 @@ STYLE_PRESETS = {
     },
 }
 
-# Step count guidance
+# Step count guidance (distilled models use 1-8; base models use 10-50+)
 STEP_GUIDANCE = {
-    1: {"label": "Fastest", "description": "Very quick, loose interpretation", "quality": "draft"},
-    2: {"label": "Fast", "description": "Quick with decent coherence", "quality": "good"},
-    3: {"label": "Balanced", "description": "Good balance of speed and quality", "quality": "good"},
-    4: {"label": "Standard", "description": "Recommended default, good prompt adherence", "quality": "high"},
-    5: {"label": "Quality", "description": "Higher fidelity, slower", "quality": "high"},
-    6: {"label": "High Quality", "description": "Detailed output, recommended for complex prompts", "quality": "very_high"},
-    7: {"label": "Maximum", "description": "Best quality, slowest", "quality": "very_high"},
-    8: {"label": "Ultra", "description": "Maximum detail and coherence", "quality": "maximum"},
+    1:  {"label": "Fastest",      "description": "Very quick, loose interpretation",               "quality": "draft"},
+    2:  {"label": "Fast",         "description": "Quick with decent coherence",                     "quality": "good"},
+    3:  {"label": "Balanced",     "description": "Good balance of speed and quality",               "quality": "good"},
+    4:  {"label": "Standard",     "description": "Recommended default, good prompt adherence",      "quality": "high"},
+    5:  {"label": "Quality",      "description": "Higher fidelity, slower",                         "quality": "high"},
+    6:  {"label": "High Quality", "description": "Detailed output, recommended for complex prompts","quality": "very_high"},
+    7:  {"label": "Maximum",      "description": "Best quality, slowest",                           "quality": "very_high"},
+    8:  {"label": "Ultra",        "description": "Maximum detail and coherence",                    "quality": "maximum"},
+    # Base model range
+    10: {"label": "Quick draft",  "description": "Fast base model run, rough output",               "quality": "draft"},
+    15: {"label": "Draft",        "description": "Usable output, some detail missing",              "quality": "good"},
+    20: {"label": "Balanced",     "description": "Good quality, recommended starting point",        "quality": "high"},
+    25: {"label": "Quality",      "description": "Strong detail and prompt adherence",              "quality": "high"},
+    30: {"label": "High Quality", "description": "Refined output, good for complex prompts",        "quality": "very_high"},
+    40: {"label": "Very High",    "description": "Near-maximum quality",                            "quality": "very_high"},
+    50: {"label": "Maximum",      "description": "Best base model quality",                         "quality": "maximum"},
 }
 
 

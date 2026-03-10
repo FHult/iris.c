@@ -1480,11 +1480,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (styleHint) {
                     styleHint.textContent = preset.description;
                 }
-                // Update recommended steps
+                // Update recommended steps, scaled to current model type.
+                // preset.recommended_steps is calibrated for distilled (1-8 range).
+                // Base models need ~5x more steps; Z-Image needs ~2.5x.
                 if (preset.recommended_steps) {
-                    stepsInput.value = preset.recommended_steps;
-                    stepsValue.textContent = preset.recommended_steps;
-                    updateStepHint(preset.recommended_steps);
+                    let steps = preset.recommended_steps;
+                    if (!_currentModelIsDistilled && !_currentModelIsZimage) {
+                        steps = Math.min(Math.round(steps * 5), parseInt(stepsInput.max));
+                    } else if (_currentModelIsZimage) {
+                        steps = Math.min(Math.round(steps * 2.5), parseInt(stepsInput.max));
+                    }
+                    stepsInput.value = steps;
+                    stepsValue.textContent = steps;
+                    updateStepHint(steps);
                 }
             } else {
                 if (styleHint) {
@@ -2879,10 +2887,23 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // Update step hint based on current value
+    // Update step hint based on current value.
+    // Falls back to range buckets for values not in the guidance table (e.g. base models).
     function updateStepHint(steps) {
-        if (stepsHint && stepGuidance[steps]) {
+        if (!stepsHint) return;
+        if (stepGuidance[steps]) {
             stepsHint.textContent = `(${stepGuidance[steps].label})`;
+        } else if (stepGuidance[String(steps)]) {
+            stepsHint.textContent = `(${stepGuidance[String(steps)].label})`;
+        } else {
+            // Range fallback for base model step counts
+            const keys = Object.keys(stepGuidance).map(Number).filter(k => !isNaN(k)).sort((a, b) => a - b);
+            const closest = keys.reduce((prev, curr) => Math.abs(curr - steps) < Math.abs(prev - steps) ? curr : prev, keys[0]);
+            if (closest !== undefined && stepGuidance[closest]) {
+                stepsHint.textContent = `(${stepGuidance[closest].label})`;
+            } else {
+                stepsHint.textContent = '';
+            }
         }
     }
 
@@ -2914,11 +2935,19 @@ document.addEventListener('DOMContentLoaded', () => {
                     enhanceBtn.title = 'Prompt enhanced! Click to revert';
                 }
 
-                // Update steps if recommended
-                if (data.recommended_steps && data.recommended_steps !== parseInt(stepsInput.value)) {
-                    stepsInput.value = data.recommended_steps;
-                    stepsValue.textContent = data.recommended_steps;
-                    updateStepHint(data.recommended_steps);
+                // Update steps if recommended, scaled to current model type
+                if (data.recommended_steps) {
+                    let steps = data.recommended_steps;
+                    if (!_currentModelIsDistilled && !_currentModelIsZimage) {
+                        steps = Math.min(Math.round(steps * 5), parseInt(stepsInput.max));
+                    } else if (_currentModelIsZimage) {
+                        steps = Math.min(Math.round(steps * 2.5), parseInt(stepsInput.max));
+                    }
+                    if (steps !== parseInt(stepsInput.value)) {
+                        stepsInput.value = steps;
+                        stepsValue.textContent = steps;
+                        updateStepHint(steps);
+                    }
                 }
             }
         } catch (error) {

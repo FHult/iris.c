@@ -97,6 +97,16 @@
                             </div>
                         </div>
                         <div id="prompt-history-dropdown" class="prompt-history-dropdown"></div>
+                        <details class="prompt-tips">
+                            <summary>Prompt tips</summary>
+                            <ul>
+                                <li><strong>Lighting:</strong> golden hour, overcast diffuse, dramatic rim lighting, soft studio light</li>
+                                <li><strong>Camera:</strong> shallow depth of field, wide angle, macro, 50mm lens, aerial view</li>
+                                <li><strong>Detail:</strong> sharp focus, fine textures, intricate detail, high resolution</li>
+                                <li><strong>Style anchor:</strong> photorealistic, oil painting, watercolor, cinematic still</li>
+                                <li><strong>Avoid vague words:</strong> "beautiful", "amazing", "high quality" — be specific instead</li>
+                            </ul>
+                        </details>
                         <div id="template-dropdown" class="template-dropdown">
                             <div class="template-dropdown-header">
                                 <span class="template-dropdown-title">Templates</span>
@@ -207,7 +217,7 @@
                             <input type="number" id="seed" name="seed" placeholder="Random">
                         </div>
                         <div class="form-group">
-                            <label for="variations">Variations</label>
+                            <label for="variations">Variations <span class="label-hint">(generate N seeds, pick best)</span></label>
                             <div class="variations-control">
                                 <button type="button" id="variations-dec" class="variations-btn">-</button>
                                 <span id="variations-value">1</span>

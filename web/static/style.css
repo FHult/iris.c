@@ -2836,3 +2836,30 @@ footer a:hover {
 #hires-fix-controls input[type="range"] {
     width: 110px;
 }
+
+.prompt-tips {
+    margin-top: 0.4rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.prompt-tips summary {
+    cursor: pointer;
+    user-select: none;
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+.prompt-tips summary:hover {
+    opacity: 1;
+}
+
+.prompt-tips ul {
+    margin: 0.4rem 0 0 1rem;
+    padding: 0;
+    line-height: 1.6;
+}
+
+.prompt-tips li {
+    margin-bottom: 0.15rem;
+}
