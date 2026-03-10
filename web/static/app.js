@@ -206,6 +206,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let _currentModelIsDistilled = true;
     let _currentModelIsZimage = false;
 
+    // Hi-res fix two-pass state: null when inactive, or { finalParams } during pass 1.
+    let hiresFixState = null;
+
     // Set steps and hint to the model's natural default.
     // Called on initial load and after every model switch.
     function applyModelDefaults(isDistilled, isZimage) {
@@ -225,8 +228,8 @@ document.addEventListener('DOMContentLoaded', () => {
         stepsValue.textContent = defaultSteps;
         updateStepHint(defaultSteps);
 
-        // Z-Image: hide CFG controls, reference images, negative prompt
-        const hideForZimage = ['advanced-controls', 'reference-images-group', 'negative-prompt-group'];
+        // Z-Image: hide CFG controls, reference images, negative prompt, hi-res fix
+        const hideForZimage = ['advanced-controls', 'reference-images-group', 'negative-prompt-group', 'hires-fix-group'];
         hideForZimage.forEach(id => {
             const el = document.getElementById(id);
             if (el) el.style.display = isZimage ? 'none' : '';
@@ -1247,6 +1250,8 @@ document.addEventListener('DOMContentLoaded', () => {
             lora: loraSelect ? loraSelect.value || null : null,
             lora_scale: loraScaleInput ? parseFloat(loraScaleInput.value) : 1.0,
             negative_prompt: document.getElementById('negative-prompt').value.trim() || null,
+            hires_fix: document.getElementById('hires-fix')?.checked || false,
+            hires_fix_strength: parseFloat(document.getElementById('hires-fix-strength')?.value || '0.30'),
         };
     }
 
@@ -1442,6 +1447,22 @@ document.addEventListener('DOMContentLoaded', () => {
             heightSelect.value = h;
         }
     });
+
+    // Hi-res fix checkbox — show/hide strength slider
+    const hiresFixCheckbox = document.getElementById('hires-fix');
+    const hiresFixControls = document.getElementById('hires-fix-controls');
+    const hiresFixStrengthInput = document.getElementById('hires-fix-strength');
+    const hiresFixStrengthValue = document.getElementById('hires-fix-strength-value');
+    if (hiresFixCheckbox && hiresFixControls) {
+        hiresFixCheckbox.addEventListener('change', () => {
+            hiresFixControls.style.display = hiresFixCheckbox.checked ? 'flex' : 'none';
+        });
+    }
+    if (hiresFixStrengthInput && hiresFixStrengthValue) {
+        hiresFixStrengthInput.addEventListener('input', () => {
+            hiresFixStrengthValue.textContent = parseFloat(hiresFixStrengthInput.value).toFixed(2);
+        });
+    }
 
     // Update steps display and hint
     stepsInput.addEventListener('input', () => {
@@ -1835,6 +1856,38 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // Hi-res fix: two-pass generation. Pass 1 generates a draft at ~512px,
+    // pass 2 runs img2img at the target resolution to add fine detail.
+    async function generateWithHiresFix(params) {
+        const { width, height, hires_fix_strength } = params;
+        const HIRES_AREA = 512 * 512;
+
+        // Skip if already small enough
+        if (width * height <= HIRES_AREA) {
+            return generateImage(params);
+        }
+
+        const scale = Math.sqrt(HIRES_AREA / (width * height));
+        const p1w = Math.max(64, Math.round(width * scale / 16) * 16);
+        const p1h = Math.max(64, Math.round(height * scale / 16) * 16);
+
+        // Store final params so the complete handler can dispatch pass 2
+        hiresFixState = { finalParams: params };
+
+        const p1Params = {
+            ...params,
+            width: p1w,
+            height: p1h,
+            hires_fix: false,
+            hires_fix_intermediate: true,
+        };
+
+        progressPrompt.textContent = `[Pass 1/2] ${params.prompt}`;
+        progressPrompt.title = params.prompt;
+
+        return generateImage(p1Params);
+    }
+
     if (upscaleBtn) {
         upscaleBtn.addEventListener('click', async () => {
             const img = outputArea.querySelector('img');
@@ -2096,7 +2149,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentEventSource = null;
             }
 
-            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength, negative_prompt } = params;
+            const { prompt, width, height, steps, seed, referenceImages, style, guidance, schedule, batchId, lora, lora_scale, img2img_strength, negative_prompt, hires_fix_intermediate } = params;
 
             // Store current generation params for vary/remix
             currentGeneration = { prompt, width, height, steps, guidance, schedule, lora, lora_scale };
@@ -2139,6 +2192,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     lora_scale: lora_scale || 1.0,
                     img2img_strength: img2img_strength || 1.0,
                     negative_prompt: negative_prompt || null,
+                    hires_fix_intermediate: hires_fix_intermediate || false,
                 }),
             })
             .then(response => response.json().then(data => ({ response, data })))
@@ -2174,6 +2228,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const extraVariations = variationsCount - 1;
 
+        const useHiresFix = params.hires_fix
+            && !_currentModelIsZimage
+            && (params.width * params.height > 512 * 512);
+
         if (isGenerating) {
             // Already generating — queue everything (main first, then extras)
             addToQueue(params);
@@ -2185,7 +2243,9 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             // Generate main job first, then queue extras after it's submitted
             try {
-                const mainPromise = generateImage(params);
+                const mainPromise = useHiresFix
+                    ? generateWithHiresFix(params)
+                    : generateImage(params);
                 // Queue extras after main job's fetch has been sent
                 for (let i = 0; i < extraVariations; i++) {
                     addToQueue({ ...params, seed: null });
@@ -2210,11 +2270,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         currentEventSource.addEventListener('progress', (e) => {
             const data = JSON.parse(e.data);
-            const percent = (data.progress / data.total_steps) * 100;
+            const phaseOffset = hiresFixState ? 0 : 0;
+            const phaseScale = hiresFixState ? 0.5 : 1.0;
+            const percent = phaseOffset + (data.progress / data.total_steps) * 100 * phaseScale;
             const stepTime = data.step_time ? ` (${data.step_time.toFixed(1)}s/step)` : '';
             const remaining = data.total_steps - data.progress;
             const eta = (data.step_time && remaining > 0) ? ` ~${(data.step_time * remaining).toFixed(0)}s left` : '';
-            showProgress(`${data.phase} - Step ${data.progress}/${data.total_steps}${stepTime}${eta}`, percent);
+            const phaseLabel = hiresFixState ? 'Pass 1/2 ' : '';
+            showProgress(`${phaseLabel}${data.phase} - Step ${data.progress}/${data.total_steps}${stepTime}${eta}`, percent);
         });
 
         currentEventSource.addEventListener('step_image', (e) => {
@@ -2257,15 +2320,41 @@ document.addEventListener('DOMContentLoaded', () => {
             showProgress(`Queued (position ${data.position}/${data.total})`, 0);
         });
 
-        currentEventSource.addEventListener('complete', (e) => {
+        currentEventSource.addEventListener('complete', async (e) => {
             const data = JSON.parse(e.data);
+            currentEventSource.close();
+            currentEventSource = null;
+            currentJobId = null;
+
+            if (hiresFixState) {
+                // Pass 1 done — dispatch pass 2 at full resolution
+                const finalParams = hiresFixState.finalParams;
+                hiresFixState = null;
+                showProgress('Pass 1/2 done, starting pass 2/2...', 50);
+                try {
+                    const base64 = await fetchImageAsBase64(data.image_url);
+                    progressPrompt.textContent = `[Pass 2/2] ${finalParams.prompt}`;
+                    progressPrompt.title = finalParams.prompt;
+                    await generateImage({
+                        ...finalParams,
+                        referenceImages: [{ data: base64, strength: 1.0, mode: 'composition' }],
+                        img2img_strength: finalParams.hires_fix_strength,
+                        hires_fix: false,
+                        hires_fix_intermediate: false,
+                        seed: null,
+                    });
+                } catch (err) {
+                    showError('Hi-res fix pass 2 failed: ' + err.message);
+                    setGenerating(false);
+                }
+                // pass 2's own complete event will call onComplete
+                return;
+            }
+
             const totalTime = data.total_time ? ` in ${data.total_time.toFixed(1)}s` : '';
             showProgress(`Complete${totalTime}!`, 100);
             displayImage(data.image_url);
             setGenerating(false);
-            currentEventSource.close();
-            currentEventSource = null;
-            currentJobId = null;
             // Refresh history
             loadHistory();
             if (onComplete) onComplete();
@@ -2282,6 +2371,7 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 showError(errorMsg);
             }
+            hiresFixState = null;
             setGenerating(false);
             currentEventSource.close();
             currentEventSource = null;
@@ -2890,9 +2980,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderHistory() {
-        let history = historySearchQuery
-            ? cachedHistory.filter(h => h.prompt.toLowerCase().includes(historySearchQuery))
-            : cachedHistory;
+        let history = cachedHistory.filter(h => !h.hires_fix_intermediate);
+        if (historySearchQuery) history = history.filter(h => h.prompt.toLowerCase().includes(historySearchQuery));
         if (historyFavoritesOnly) history = history.filter(h => h.favorited);
         historyGrid.innerHTML = '';
 
