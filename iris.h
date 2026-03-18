@@ -84,12 +84,17 @@ typedef struct {
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
     float img2img_strength; /* img2img denoising strength 0.0-1.0 (default: 1.0 = in-context conditioning) */
     const char *negative_prompt; /* Negative prompt for CFG uncond pass (base models only; NULL = empty string) */
+    /* Style reference (--sref). Path 1 (training-free RoPE attenuation) is v2.6.
+     * Full IP-Adapter conditioning (requires trained weights) is v2.7. */
+    const char *sref_paths[4]; /* Up to 4 style reference image paths; NULL-terminated */
+    int         sref_count;    /* Number of style reference images (0 = disabled) */
+    float       sref_scale;    /* Style influence 0.0–1.0 (default 0.7) */
 } iris_params;
 
 /* Default parameters */
 #define IRIS_DEFAULT_WIDTH  256
 #define IRIS_DEFAULT_HEIGHT 256
-#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL }
+#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL, {NULL,NULL,NULL,NULL}, 0, 0.7f }
 
 /* ========================================================================
  * Core API

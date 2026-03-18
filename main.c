@@ -1040,6 +1040,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --lora-scale N    LoRA strength (default: 1.0, range: 0.0-2.0)\n");
     fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n");
     fprintf(stderr, "  -N, --negative TEXT   Negative prompt for CFG (base models only; ignored for distilled)\n\n");
+    fprintf(stderr, "Style reference (approximate, training-free — v2.6):\n");
+    fprintf(stderr, "      --sref PATH       Style reference image (up to 4 --sref flags)\n");
+    fprintf(stderr, "      --sref-scale N    Style influence 0.0-1.0 (default: 0.7)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -1097,6 +1100,8 @@ int main(int argc, char *argv[]) {
         {"lora-scale",       required_argument, 0, 261},
         {"img2img-strength", required_argument, 0, 262},
         {"negative",         required_argument, 0, 'N'},
+        {"sref",             required_argument, 0, 263},
+        {"sref-scale",       required_argument, 0, 264},
         {0, 0, 0, 0}
     };
 
@@ -1115,7 +1120,8 @@ int main(int argc, char *argv[]) {
         .num_steps = 0,   /* 0 = auto from model type */
         .seed = -1,
         .guidance = 0.0f, /* 0 = auto from model type */
-        .power_alpha = 2.0f
+        .power_alpha = 2.0f,
+        .sref_scale = 0.7f
     };
 
     int width_set = 0, height_set = 0, steps_set = 0;
@@ -1175,6 +1181,14 @@ int main(int argc, char *argv[]) {
             case 261: lora_scale = (float)atof(optarg); break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
             case 'N': params.negative_prompt = optarg; break;
+            case 263:
+                if (params.sref_count < 4) {
+                    params.sref_paths[params.sref_count++] = optarg;
+                } else {
+                    fprintf(stderr, "Warning: maximum 4 style reference images supported\n");
+                }
+                break;
+            case 264: params.sref_scale = (float)atof(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -1240,6 +1254,12 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    /* --sref: not yet implemented (v2.6 target) */
+    if (params.sref_count > 0) {
+        fprintf(stderr, "Error: --sref is not yet implemented (planned for v2.6)\n");
+        return 1;
     }
 
     /* Validate parameters */
