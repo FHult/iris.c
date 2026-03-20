@@ -858,6 +858,10 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+    /* For distilled models, default guidance (1.0) has no effect on negative prompts.
+     * Nudge to 1.5 so the negative steers generation without adding many extra steps. */
+    if (ctx->is_distilled && p.negative_prompt && p.negative_prompt[0] && p.guidance <= 0)
+        guidance = 1.5f;
 
     /* Ensure dimensions are divisible by 16 */
     p.width = (p.width / 16) * 16;
@@ -879,7 +883,8 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    int use_cfg = !ctx->is_distilled || (p.negative_prompt && p.negative_prompt[0]);
+    if (use_cfg) {
         const char *neg = p.negative_prompt ? p.negative_prompt : "";
         text_emb_uncond = iris_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
@@ -913,7 +918,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     /* Sample */
     float *latent;
-    if (ctx->is_distilled) {
+    if (!text_emb_uncond) {
         latent = iris_sample_euler(
             ctx->transformer, ctx->qwen3_encoder,
             z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
@@ -1304,6 +1309,8 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     /* Resolve steps and guidance */
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+    if (ctx->is_distilled && p.negative_prompt && p.negative_prompt[0] && p.guidance <= 0)
+        guidance = 1.5f;
 
     /* Encode text */
     int text_seq;
@@ -1316,7 +1323,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    if (!ctx->is_distilled || (p.negative_prompt && p.negative_prompt[0])) {
         const char *neg = p.negative_prompt ? p.negative_prompt : "";
         text_emb_uncond = iris_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
@@ -1402,7 +1409,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         free(img_latent);
 
         int remaining = num_steps - start_step;
-        if (ctx->is_distilled) {
+        if (!text_emb_uncond) {
             latent = iris_sample_euler(ctx->transformer, ctx->qwen3_encoder,
                                        z_blend, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
                                        text_emb, text_seq,
@@ -1426,7 +1433,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
         int t_offset = 10;
 
-        if (ctx->is_distilled) {
+        if (!text_emb_uncond) {
             latent = iris_sample_euler_with_refs(
                 ctx->transformer, ctx->qwen3_encoder,
                 z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
@@ -1523,6 +1530,8 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     /* Resolve steps and guidance */
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+    if (ctx->is_distilled && p.negative_prompt && p.negative_prompt[0] && p.guidance <= 0)
+        guidance = 1.5f;
 
     /* Encode text */
     int text_seq;
@@ -1534,7 +1543,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    if (!ctx->is_distilled || (p.negative_prompt && p.negative_prompt[0])) {
         const char *neg = p.negative_prompt ? p.negative_prompt : "";
         text_emb_uncond = iris_encode_text(ctx, neg, &text_seq_uncond);
         if (!text_emb_uncond) {
@@ -1652,7 +1661,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     /* Sample with multi-reference conditioning */
     float *latent;
-    if (ctx->is_distilled) {
+    if (!text_emb_uncond) {
         latent = iris_sample_euler_with_multi_refs(
             ctx->transformer, ctx->qwen3_encoder,
             z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,

@@ -1039,7 +1039,11 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --lora PATH       Load LoRA adapter (XLabs, Kohya, or Diffusers .safetensors)\n");
     fprintf(stderr, "      --lora-scale N    LoRA strength (default: 1.0, range: 0.0-2.0)\n");
     fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n");
-    fprintf(stderr, "  -N, --negative TEXT   Negative prompt for CFG (base models only; ignored for distilled)\n\n");
+    fprintf(stderr, "  -N, --negative TEXT   Negative prompt (base models: CFG; distilled: soft guidance at 1.5)\n");
+    fprintf(stderr, "      --vary-from PATH  Base image to vary (noise-injection img2img)\n");
+    fprintf(stderr, "      --vary-subtle     Subtle variation from --vary-from (strength 0.2)\n");
+    fprintf(stderr, "      --vary-strong     Strong variation from --vary-from (strength 0.6)\n");
+    fprintf(stderr, "      --vary-strength N Custom variation strength 0.0-1.0\n\n");
     fprintf(stderr, "Style reference (approximate, training-free — v2.6):\n");
     fprintf(stderr, "      --sref PATH       Style reference image (up to 4 --sref flags)\n");
     fprintf(stderr, "      --sref-scale N    Style influence 0.0-1.0 (default: 0.7)\n\n");
@@ -1102,6 +1106,10 @@ int main(int argc, char *argv[]) {
         {"negative",         required_argument, 0, 'N'},
         {"sref",             required_argument, 0, 263},
         {"sref-scale",       required_argument, 0, 264},
+        {"vary-from",        required_argument, 0, 265},
+        {"vary-subtle",      no_argument,       0, 266},
+        {"vary-strong",      no_argument,       0, 267},
+        {"vary-strength",    required_argument, 0, 268},
         {0, 0, 0, 0}
     };
 
@@ -1123,6 +1131,8 @@ int main(int argc, char *argv[]) {
         .power_alpha = 2.0f,
         .sref_scale = 0.7f
     };
+
+    char *vary_from = NULL;
 
     int width_set = 0, height_set = 0, steps_set = 0;
     int use_mmap = 1;  /* mmap is default (fastest on MPS) */
@@ -1189,6 +1199,10 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case 264: params.sref_scale = (float)atof(optarg); break;
+            case 265: vary_from = optarg; break;
+            case 266: params.img2img_strength = 0.2f; break;
+            case 267: params.img2img_strength = 0.6f; break;
+            case 268: params.img2img_strength = (float)atof(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -1397,6 +1411,19 @@ int main(int argc, char *argv[]) {
             cli_graphics_proto = graphics_proto;
             iris_set_step_image_callback(ctx, cli_step_image_callback);
         }
+    }
+
+    /* --vary-from: add the base image as an input, default strength to subtle if
+     * the user didn't specify --vary-subtle/--vary-strong/--vary-strength */
+    if (vary_from) {
+        if (num_inputs < MAX_INPUT_IMAGES) {
+            input_paths[num_inputs++] = vary_from;
+        } else {
+            fprintf(stderr, "Warning: maximum %d input images; --vary-from ignored\n",
+                    MAX_INPUT_IMAGES);
+        }
+        if (params.img2img_strength >= 1.0f)
+            params.img2img_strength = 0.2f; /* default subtle */
     }
 
     /* Generate image */
