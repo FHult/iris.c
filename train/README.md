@@ -59,22 +59,26 @@ source train/.venv/bin/activate
 
 ### 2. Set up the data directory (once)
 
-`train/data/` is the canonical data root. It can be a real directory (if local disk
-has ≥ 450 GB free) or a symlink to an external SSD. The setup script detects
-available space and guides the choice:
+`train/data/` is always a real local directory. Only `train/data/raw/` (the large
+raw source downloads — ~257 GB) may be symlinked to an external SSD. Everything
+needed during training (shards, precomputed caches, checkpoints) stays local to
+eliminate TB4 disconnection risk.
 
 ```bash
 bash train/scripts/setup_data_dir.sh
 ```
 
-To force a specific path (e.g. external SSD already mounted):
+The script checks available local space and either:
+- Creates `train/data/raw/` locally (if ≥ 800 GB free), or
+- Symlinks `train/data/raw/ → /Volumes/YourSSD/raw/` (large downloads go there)
+
+If the external SSD hasn't arrived yet, run without `--external` — raw/ is created
+as a local stub and you can re-run later to convert it:
 
 ```bash
+# When SSD arrives
 bash train/scripts/setup_data_dir.sh --external /Volumes/IrisData
 ```
-
-After setup, all scripts and configs use `train/data/` regardless of where the
-data physically lives. The symlink is transparent.
 
 ### 3. Today — pre-filter LAION parquet + download warmstart weights
 

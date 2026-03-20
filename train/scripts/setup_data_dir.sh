@@ -1,16 +1,30 @@
 #!/bin/bash
 # train/scripts/setup_data_dir.sh — Set up the training data directory.
 #
-# Creates the canonical train/data/ layout as either:
-#   A) A real directory tree on the internal SSD (if ≥ 450 GB free), OR
-#   B) A symlink to an external volume (e.g. /Volumes/IrisData)
+# train/data/ is ALWAYS a real local directory.
+# train/data/raw/ is the only subdirectory that may be symlinked to an external
+# SSD — the raw source datasets (LAION ~150 GB, JourneyDB ~80 GB, COYO ~25 GB)
+# are only needed during Phase 1–2 data preparation.
 #
-# After this script runs, all training scripts and configs can use
-# train/data/ as the data root regardless of where the actual data lives.
+# Everything else (shards, precomputed, weights, checkpoints) stays local to
+# eliminate TB4 disconnection risk during multi-day unattended training.
+#
+# Space requirements:
+#   raw/ on external SSD:        ~257 GB
+#   Local (recommended minimum):
+#     shards/                    ~260 GB  (read every training step — must be local)
+#     precomputed/qwen3/         ~143 GB  (saves 200ms/step)
+#     precomputed/vae/           ~198 GB  (saves 180ms/step)
+#     weights/ + checkpoints/    ~16 GB
+#   Minimum local total:         ~617 GB
 #
 # Usage:
 #   bash train/scripts/setup_data_dir.sh
+#
+# Force raw/ to external path now (e.g. SSD already mounted):
 #   bash train/scripts/setup_data_dir.sh --external /Volumes/IrisData
+#
+# Force everything local:
 #   bash train/scripts/setup_data_dir.sh --local
 
 set -e
@@ -18,11 +32,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DIR="$(dirname "$SCRIPT_DIR")"
 DATA_DIR="$TRAIN_DIR/data"
-REQUIRED_GB=450
+RAW_DIR="$DATA_DIR/raw"
+
+LOCAL_IDEAL_GB=617   # shards + qwen3 + vae + weights + checkpoints
+
 EXTERNAL_PATH=""
 FORCE_LOCAL=false
 
-# ── Parse args ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
         --external) EXTERNAL_PATH="$2"; shift 2 ;;
@@ -31,132 +47,91 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "==================================================================="
-echo "  iris.c IP-Adapter training data directory setup"
-echo "==================================================================="
-echo ""
-
-# ── Sub-directory layout to create ───────────────────────────────────────────
-SUBDIRS=(
-    "raw/laion"
-    "raw/journeydb"
-    "raw/coyo"
-    "raw/wikiart"
-    "shards"
-    "precomputed/qwen3"
-    "precomputed/vae"
-    "precomputed/siglip"
-    "embeddings"
-    "dedup_ids"
-    "checkpoints"
-    "weights"
-    "logs"
-)
-
-create_layout() {
-    local root="$1"
-    echo "Creating directory structure under $root ..."
-    for subdir in "${SUBDIRS[@]}"; do
-        mkdir -p "$root/$subdir"
-    done
-    echo "  Done."
+# ── Helper: create always-local subdirs ───────────────────────────────────────
+create_local_layout() {
+    echo "Creating local directory structure under $DATA_DIR ..."
+    mkdir -p \
+        "$DATA_DIR/shards" \
+        "$DATA_DIR/precomputed/qwen3" \
+        "$DATA_DIR/precomputed/vae" \
+        "$DATA_DIR/precomputed/siglip" \
+        "$DATA_DIR/embeddings" \
+        "$DATA_DIR/dedup_ids" \
+        "$DATA_DIR/weights" \
+        "$DATA_DIR/checkpoints" \
+        "$DATA_DIR/logs"
+    echo "  Done (shards/, precomputed/, weights/, checkpoints/ — all local)."
 }
 
-# ── Handle --external flag ────────────────────────────────────────────────────
-if [[ -n "$EXTERNAL_PATH" ]]; then
-    if [[ ! -d "$EXTERNAL_PATH" ]]; then
-        echo "Error: external path not found: $EXTERNAL_PATH"
-        echo "Mount the drive first, then re-run."
-        exit 1
-    fi
-    create_layout "$EXTERNAL_PATH"
-    # Remove stub dir if it exists (but not if it's already a symlink to somewhere else)
-    if [[ -L "$DATA_DIR" ]]; then
-        rm "$DATA_DIR"
-    elif [[ -d "$DATA_DIR" ]]; then
-        # Keep README but remove if it's an empty stub
-        non_readme=$(find "$DATA_DIR" -mindepth 1 -not -name "README.md" | head -1)
-        if [[ -z "$non_readme" ]]; then
-            rm -rf "$DATA_DIR"
+# ── Helper: create raw/ as a real local directory ─────────────────────────────
+create_raw_local() {
+    mkdir -p \
+        "$RAW_DIR/laion" \
+        "$RAW_DIR/journeydb" \
+        "$RAW_DIR/coyo" \
+        "$RAW_DIR/wikiart"
+    echo "  raw/ created locally."
+}
+
+# ── Helper: symlink raw/ to external SSD ─────────────────────────────────────
+symlink_raw() {
+    local ext="$1"
+    local ext_raw="$ext/raw"
+
+    # Create subdirs on the external volume
+    mkdir -p \
+        "$ext_raw/laion" \
+        "$ext_raw/journeydb" \
+        "$ext_raw/coyo" \
+        "$ext_raw/wikiart"
+
+    # Remove existing empty raw/ stub
+    if [[ -L "$RAW_DIR" ]]; then
+        rm "$RAW_DIR"
+    elif [[ -d "$RAW_DIR" ]]; then
+        if [[ -z "$(ls -A "$RAW_DIR" 2>/dev/null)" ]]; then
+            rmdir "$RAW_DIR"
         else
-            echo "Warning: $DATA_DIR is a non-empty directory — not replacing with symlink."
-            echo "Move or delete it first, then re-run with --external."
+            echo "Warning: $RAW_DIR is non-empty. Cannot replace with symlink."
+            echo "Move its contents to $ext_raw/ first, then re-run."
             exit 1
         fi
     fi
-    ln -s "$EXTERNAL_PATH" "$DATA_DIR"
-    echo ""
-    echo "Symlink created: $DATA_DIR -> $EXTERNAL_PATH"
-    echo ""
-    _print_next_steps "$DATA_DIR"
-    exit 0
-fi
 
-# ── Check internal disk space ─────────────────────────────────────────────────
-AVAILABLE_GB=$(df -g "$TRAIN_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
-if [[ -z "$AVAILABLE_GB" ]]; then
-    # df -g not available (Linux fallback)
-    AVAILABLE_GB=$(df -BG "$TRAIN_DIR" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4}')
-fi
-AVAILABLE_GB="${AVAILABLE_GB:-0}"
+    ln -s "$ext_raw" "$RAW_DIR"
+    echo "  Symlink: train/data/raw/ -> $ext_raw"
+    echo "  (shards/, precomputed/, weights/, checkpoints/ remain local)"
+}
 
-echo "Internal disk available: ${AVAILABLE_GB} GB (required: ${REQUIRED_GB} GB)"
-echo ""
-
-# ── Decision: local or symlink ────────────────────────────────────────────────
-USE_LOCAL=false
-if $FORCE_LOCAL; then
-    USE_LOCAL=true
-elif [[ "$AVAILABLE_GB" -ge "$REQUIRED_GB" ]]; then
-    echo "Sufficient space for local storage."
-    echo ""
-    echo "Recommendation: store training shards + precomputed caches locally."
-    echo "  Benefits: eliminates TB4 disconnection risk during multi-day training."
-    echo "  Raw source datasets (~257 GB) can stay on external SSD after sharding."
-    echo ""
-    read -r -p "Use internal SSD for train/data/? [Y/n] " REPLY
-    REPLY="${REPLY:-Y}"
-    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-        USE_LOCAL=true
-    fi
-fi
-
-if $USE_LOCAL; then
-    # ── Option A: local directory ─────────────────────────────────────────────
-    if [[ -L "$DATA_DIR" ]]; then
-        echo "Removing existing symlink $DATA_DIR ..."
-        rm "$DATA_DIR"
-    fi
-    create_layout "$DATA_DIR"
-    echo ""
-    echo "train/data/ is ready as a local directory."
-
-else
-    # ── Option B: symlink to external volume ──────────────────────────────────
-    echo ""
-    echo "Not enough local space (or external preferred)."
-    echo ""
-
+# ── Helper: prompt for external volume path ───────────────────────────────────
+prompt_external() {
     # Try to auto-detect mounted external volumes
-    DETECTED=""
-    for vol in /Volumes/IrisData /Volumes/iris_data /Volumes/IrisDataSSD; do
+    local detected=""
+    for vol in /Volumes/IrisData /Volumes/iris_data /Volumes/IrisDataSSD /Volumes/Samsung /Volumes/SanDisk; do
         if [[ -d "$vol" ]]; then
-            DETECTED="$vol"
+            detected="$vol"
             break
         fi
     done
 
-    if [[ -n "$DETECTED" ]]; then
-        echo "Detected external volume: $DETECTED"
-        read -r -p "Use $DETECTED as data root? [Y/n] " REPLY
+    if [[ -n "$detected" ]]; then
+        echo "Detected external volume: $detected"
+        read -r -p "Symlink train/data/raw/ -> $detected/raw/? [Y/n] " REPLY
         REPLY="${REPLY:-Y}"
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            EXTERNAL_PATH="$DETECTED"
+            EXTERNAL_PATH="$detected"
         fi
     fi
 
     if [[ -z "$EXTERNAL_PATH" ]]; then
-        read -r -p "Enter external volume path (e.g. /Volumes/IrisData): " EXTERNAL_PATH
+        echo ""
+        echo "External SSD not yet mounted."
+        echo "Creating train/data/raw/ as a local stub for now."
+        echo ""
+        echo "When the SSD arrives, run:"
+        echo "  bash train/scripts/setup_data_dir.sh --external /Volumes/YourDriveName"
+        create_raw_local
+        return
     fi
 
     if [[ ! -d "$EXTERNAL_PATH" ]]; then
@@ -164,44 +139,92 @@ else
         exit 1
     fi
 
-    create_layout "$EXTERNAL_PATH"
+    symlink_raw "$EXTERNAL_PATH"
+}
 
-    if [[ -L "$DATA_DIR" ]]; then
-        rm "$DATA_DIR"
-    elif [[ -d "$DATA_DIR" ]]; then
-        non_readme=$(find "$DATA_DIR" -mindepth 1 -not -name "README.md" | head -1)
-        if [[ -z "$non_readme" ]]; then
-            rm -rf "$DATA_DIR"
-        else
-            echo "Warning: $DATA_DIR is a non-empty directory. Move it first."
-            exit 1
-        fi
-    fi
-
-    ln -s "$EXTERNAL_PATH" "$DATA_DIR"
+# ── Print next steps ──────────────────────────────────────────────────────────
+print_next_steps() {
     echo ""
-    echo "Symlink created: $DATA_DIR -> $EXTERNAL_PATH"
+    echo "==================================================================="
+    echo "  train/data/ is ready. What you can do right now:"
+    echo ""
+    echo "  # Pre-filter LAION metadata (~1 hour, no images needed)"
+    echo "  python train/scripts/prepare_laion.py \\"
+    echo "    --output train/data/raw/laion_filtered.parquet"
+    echo ""
+    echo "  # Download WikiArt (~2 GB, tiny — goes to train/data/raw/wikiart/)"
+    echo "  huggingface-cli download Artificio/WikiArt \\"
+    echo "    --repo-type dataset --local-dir train/data/raw/wikiart"
+    echo ""
+    echo "  # Download warmstart weights (~5.3 GB → train/data/weights/)"
+    echo "  huggingface-cli download InstantX/FLUX.1-dev-IP-Adapter \\"
+    echo "    --local-dir train/data/weights/flux_dev_ipadapter"
+    echo ""
+    echo "  When external SSD arrives:"
+    echo "    bash train/scripts/download_datasets.sh"
+    echo "==================================================================="
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+echo "==================================================================="
+echo "  iris.c IP-Adapter training data directory setup"
+echo "==================================================================="
+echo ""
+
+# Always create local layout first
+create_local_layout
+echo ""
+
+# Get available local space
+AVAILABLE_GB=$(df -g "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+if [[ -z "$AVAILABLE_GB" ]]; then
+    AVAILABLE_GB=$(df -BG "$DATA_DIR" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4}')
+fi
+AVAILABLE_GB="${AVAILABLE_GB:-0}"
+
+echo "Internal disk available: ${AVAILABLE_GB} GB"
+echo "  Ideal local minimum (shards + Qwen3 + VAE): ${LOCAL_IDEAL_GB} GB"
+echo ""
+
+# Decide what to do with raw/
+if $FORCE_LOCAL; then
+    echo "--local: creating raw/ locally."
+    create_raw_local
+
+elif [[ -n "$EXTERNAL_PATH" ]]; then
+    # Explicit external path provided on command line
+    if [[ ! -d "$EXTERNAL_PATH" ]]; then
+        echo "Error: external path not found: $EXTERNAL_PATH"
+        echo "Mount the drive first, then re-run."
+        exit 1
+    fi
+    symlink_raw "$EXTERNAL_PATH"
+
+elif [[ "$AVAILABLE_GB" -ge 800 ]]; then
+    # Plenty of space — keep everything local
+    echo "Plenty of local space. Creating raw/ locally."
+    echo "Raw source datasets (~257 GB) can download directly to train/data/raw/."
+    echo "After sharding, raw/ can be deleted to reclaim space."
+    create_raw_local
+
+else
+    # Not enough for ideal local setup — recommend symlinking raw/ to external
+    echo "Local space may be tight for raw datasets (~257 GB) alongside training data."
+    echo ""
+    echo "Recommended split:"
+    echo "  train/data/raw/          → symlink to external SSD  (~257 GB)"
+    echo "  train/data/shards/       → local  (~260 GB, read every training step)"
+    echo "  train/data/precomputed/  → local  (~341 GB, saves 14h training time)"
+    echo "  train/data/weights/ etc  → local  (~16 GB)"
+    echo ""
+    echo "If no external SSD yet, raw/ will be a local stub — re-run with"
+    echo "--external when the SSD arrives to convert it to a symlink."
+    echo ""
+
+    prompt_external
 fi
 
-# ── Next steps ────────────────────────────────────────────────────────────────
-echo ""
-echo "==================================================================="
-echo "  Next steps"
-echo "==================================================================="
-echo ""
-echo "1. Pre-filter LAION metadata (no images needed, ~1 hour):"
-echo "   python train/scripts/prepare_laion.py \\"
-echo "     --output train/data/raw/laion_filtered.parquet"
-echo ""
-echo "2. Download datasets — see train/README.md Step 2:"
-echo "   bash train/scripts/download_datasets.sh"
-echo "   (uses train/data/ automatically)"
-echo ""
-echo "3. After downloads, run the preprocessing pipeline:"
-echo "   caffeinate -i -d bash train/scripts/run_preprocessing.sh"
-echo "   (builds shards, deduplicates, recaptions, precomputes)"
-echo ""
-echo "4. Train:"
-echo "   caffeinate -i -d python train/train_ip_adapter.py \\"
-echo "     --config train/configs/stage1_512px.yaml"
-echo ""
+print_next_steps
