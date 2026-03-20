@@ -17,8 +17,8 @@ adapter:
   perceiver_heads: 16
 
 data:
-  shard_path: "/Volumes/IrisData/shards"
-  qwen3_cache_dir: "/Volumes/IrisData/precomputed/qwen3"    # reuse Stage 1 cache
+  shard_path: "train/data/shards"
+  qwen3_cache_dir: "train/data/precomputed/qwen3"    # reuse Stage 1 cache
   vae_cache_dir: null                      # 768px latents not pre-computed (different size)
   siglip_cache_dir: null
   batch_size: 1                            # reduced at 768px (activation budget)

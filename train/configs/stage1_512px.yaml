@@ -17,11 +17,11 @@ adapter:
   perceiver_heads: 16
 
 data:
-  shard_path: "/Volumes/IrisData/shards"
+  shard_path: "train/data/shards"
   # Pre-computed encoder caches (see train/scripts/precompute_*.py)
   # Set to null to compute at runtime (slower but no storage needed)
-  qwen3_cache_dir: "/Volumes/IrisData/precomputed/qwen3"    # ~143 GB, saves ~200ms/step
-  vae_cache_dir: "/Volumes/IrisData/precomputed/vae"        # ~198 GB, saves ~180ms/step
+  qwen3_cache_dir: "train/data/precomputed/qwen3"    # ~143 GB, saves ~200ms/step
+  vae_cache_dir: "train/data/precomputed/vae"        # ~198 GB, saves ~180ms/step
   siglip_cache_dir: null                                     # ~420 GB — skip if space tight
   batch_size: 2
   prefetch_batches: 6

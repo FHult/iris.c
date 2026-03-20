@@ -1,0 +1,5 @@
+# Ignore all data contents — train/data/ is either a symlink or a large local dir.
+# The directory stub (README.md, .gitignore) is checked in; data is not.
+*
+!.gitignore
+!README.md

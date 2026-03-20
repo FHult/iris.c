@@ -57,77 +57,99 @@ bash train/setup.sh
 source train/.venv/bin/activate
 ```
 
-### 2. Today — pre-filter LAION parquet + download warmstart weights
+### 2. Set up the data directory (once)
+
+`train/data/` is the canonical data root. It can be a real directory (if local disk
+has ≥ 450 GB free) or a symlink to an external SSD. The setup script detects
+available space and guides the choice:
+
+```bash
+bash train/scripts/setup_data_dir.sh
+```
+
+To force a specific path (e.g. external SSD already mounted):
+
+```bash
+bash train/scripts/setup_data_dir.sh --external /Volumes/IrisData
+```
+
+After setup, all scripts and configs use `train/data/` regardless of where the
+data physically lives. The symlink is transparent.
+
+### 3. Today — pre-filter LAION parquet + download warmstart weights
 
 ```bash
 source train/.venv/bin/activate
 
 # Pre-filter LAION metadata (no images, runs on internal storage, ~1 hour)
-python train/scripts/prepare_laion.py --output laion_filtered.parquet
+python train/scripts/prepare_laion.py \
+  --output train/data/raw/laion_filtered.parquet
 
-# Download Perceiver Resampler warmstart weights (5.3 GB, to internal storage)
+# Download Perceiver Resampler warmstart weights (5.3 GB)
 huggingface-cli download InstantX/FLUX.1-dev-IP-Adapter \
-  --local-dir ~/iris_data_staging/flux_dev_ipadapter
+  --local-dir train/data/weights/flux_dev_ipadapter
 
-# Download WikiArt (1.7 GB, tiny — can go anywhere)
+# Download WikiArt (1.7 GB, tiny)
 huggingface-cli download Artificio/WikiArt \
-  --repo-type dataset --local-dir ~/iris_data_staging/wikiart
+  --repo-type dataset --local-dir train/data/raw/wikiart
 ```
 
-### 3. Tomorrow — when external SSD arrives
+### 4. When external SSD arrives — download remaining datasets
 
 ```bash
-# Create directory structure and print download commands for all 3 terminals
-bash train/scripts/download_datasets.sh \
-  --ssd /Volumes/IrisData \
-  --laion laion_filtered.parquet
+# Print download commands for all 3 terminals
+bash train/scripts/download_datasets.sh
 ```
 
-### 4. After downloads complete — pre-process data (B2)
+### 5. After downloads complete — pre-process data (B2)
 
-Run all under `caffeinate -i -d` (2–3 days total, unattended):
+The convenience script runs the full pipeline in one invocation:
+
+```bash
+caffeinate -i -d bash train/scripts/run_preprocessing.sh
+# Add --siglip to also precompute SigLIP features (~420 GB extra)
+```
+
+Or run steps individually:
 
 ```bash
 source train/.venv/bin/activate
 
 # Step A: Deduplicate LAION (~1.5h embed + 20min FAISS)
 python train/scripts/clip_dedup.py all \
-  --shards /Volumes/IrisData/raw/laion \
-  --embeddings /Volumes/IrisData/embeddings \
-  --output /Volumes/IrisData/dedup_ids
+  --shards train/data/raw/laion \
+  --embeddings train/data/embeddings \
+  --output train/data/dedup_ids
 
 # Step B: Merge all sources into unified shards (uses COMPUTE_WORKERS=6 P-cores)
 python train/scripts/build_shards.py \
-  --sources /Volumes/IrisData/raw/laion \
-            /Volumes/IrisData/raw/journeydb \
-            /Volumes/IrisData/raw/coyo \
-            /Volumes/IrisData/raw/wikiart \
-  --output /Volumes/IrisData/shards \
-  --blocklist /Volumes/IrisData/dedup_ids/duplicate_ids.txt
+  --sources train/data/raw/laion \
+            train/data/raw/journeydb \
+            train/data/raw/coyo \
+            train/data/raw/wikiart \
+  --output train/data/shards \
+  --blocklist train/data/dedup_ids/duplicate_ids.txt
 
 # Step C: Filter pass (uses PERF_CORES=8 P-cores)
-python train/scripts/filter_shards.py --shards /Volumes/IrisData/shards
+python train/scripts/filter_shards.py --shards train/data/shards
 
 # Step D: Re-caption short captions (run two processes in separate terminals)
-# Terminal 1: python train/scripts/recaption.py --shards /Volumes/IrisData/shards --shard_start 0 --shard_end 474
-# Terminal 2: python train/scripts/recaption.py --shards /Volumes/IrisData/shards --shard_start 475 --shard_end 949
+# Terminal 1: python train/scripts/recaption.py --shards train/data/shards --shard_start 0 --shard_end 474
+# Terminal 2: python train/scripts/recaption.py --shards train/data/shards --shard_start 475 --shard_end 949
 
-# Step E: Pre-compute frozen encoders (decide based on available storage)
-# Qwen3 (~143 GB, saves 200ms/step = 6.7h Stage 1) — recommended
+# Step E: Pre-compute frozen encoders
 python train/scripts/precompute_qwen3.py \
-  --shards /Volumes/IrisData/shards \
-  --output /Volumes/IrisData/precomputed/qwen3
+  --shards train/data/shards --output train/data/precomputed/qwen3
 
-# VAE (~198 GB, saves 180ms/step = 6.0h Stage 1) — recommended
 python train/scripts/precompute_vae.py \
-  --shards /Volumes/IrisData/shards \
-  --output /Volumes/IrisData/precomputed/vae
+  --shards train/data/shards --output train/data/precomputed/vae
 
-# SigLIP (~420 GB, saves 50ms/step = 1.7h Stage 1) — only if space permits
-# python train/scripts/precompute_siglip.py --shards /Volumes/IrisData/shards --output /Volumes/IrisData/precomputed/siglip
+# SigLIP (~420 GB) — only if space permits after Qwen3+VAE
+# python train/scripts/precompute_siglip.py \
+#   --shards train/data/shards --output train/data/precomputed/siglip
 ```
 
-### 5. Train (B4)
+### 6. Train (B4)
 
 ```bash
 caffeinate -i -d \

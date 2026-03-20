@@ -17,14 +17,14 @@ Design:
 Usage:
     source train/.venv/bin/activate
     python train/scripts/build_shards.py \\
-        --sources /Volumes/IrisData/raw/laion \\
-                  /Volumes/IrisData/raw/journeydb \\
-                  /Volumes/IrisData/raw/coyo \\
-                  /Volumes/IrisData/raw/wikiart \\
-        --output /Volumes/IrisData/shards \\
+        --sources train/data/raw/laion \\
+                  train/data/raw/journeydb \\
+                  train/data/raw/coyo \\
+                  train/data/raw/wikiart \\
+        --output train/data/shards \\
         --shard_size 5000 \\
         --workers 6 \\
-        --blocklist /Volumes/IrisData/dedup_ids/duplicate_ids.txt
+        --blocklist train/data/dedup_ids/duplicate_ids.txt
 
 CPU allocation:
     COMPUTE_WORKERS = PERF_CORES - 2 = 6 on M1 Max.

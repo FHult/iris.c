@@ -19,19 +19,19 @@ Usage:
 
     # Step 1: embed (run under caffeinate, ~1.5h)
     python train/scripts/clip_dedup.py embed \\
-        --shards /Volumes/IrisData/shards \\
-        --embeddings /Volumes/IrisData/embeddings
+        --shards train/data/shards \\
+        --embeddings train/data/embeddings
 
     # Step 2: index + deduplicate (~20min)
     python train/scripts/clip_dedup.py dedup \\
-        --embeddings /Volumes/IrisData/embeddings \\
-        --output /Volumes/IrisData/dedup_ids
+        --embeddings train/data/embeddings \\
+        --output train/data/dedup_ids
 
     # Or run both in sequence:
     python train/scripts/clip_dedup.py all \\
-        --shards /Volumes/IrisData/shards \\
-        --embeddings /Volumes/IrisData/embeddings \\
-        --output /Volumes/IrisData/dedup_ids
+        --shards train/data/shards \\
+        --embeddings train/data/embeddings \\
+        --output train/data/dedup_ids
 
 Reference: plans/ip-adapter-training.md §2.3
 """

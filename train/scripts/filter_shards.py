@@ -14,7 +14,7 @@ Expected loss: ~3–5% → ~1.55M usable unique images from 1.6M input.
 Usage:
     source train/.venv/bin/activate
     python train/scripts/filter_shards.py \\
-        --shards /Volumes/IrisData/shards
+        --shards train/data/shards
 
 Reference: plans/ip-adapter-training.md §2.6
 """

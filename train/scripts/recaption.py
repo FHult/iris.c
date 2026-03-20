@@ -16,12 +16,12 @@ Run two parallel processes (covering ~475 shards each) to finish in ~2 days:
 
     # Terminal 1
     python train/scripts/recaption.py \\
-        --shards /Volumes/IrisData/shards \\
+        --shards train/data/shards \\
         --shard_start 0 --shard_end 474
 
     # Terminal 2
     python train/scripts/recaption.py \\
-        --shards /Volumes/IrisData/shards \\
+        --shards train/data/shards \\
         --shard_start 475 --shard_end 949
 
 CPU allocation: PERF_CORES // 2 per process (2 processes share the GPU evenly).
