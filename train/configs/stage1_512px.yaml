@@ -1,0 +1,52 @@
+# train/configs/stage1_512px.yaml
+# Stage 1 training configuration — 512px, ~105K steps
+# Expected wall-clock: ~1.84 days on M1 Max 32GB (scenario B: Qwen3+VAE pre-computed)
+
+model:
+  flux_model_dir: "flux-klein-model"       # path to Flux Klein 4B weights
+  qwen3_model_dir: "flux-klein-model"      # Qwen3 4B encoder (same dir)
+  siglip_model: "google/siglip-so400m-patch14-384"
+  warmstart_path: null                     # set to InstantX adapter path to warmstart Perceiver
+
+adapter:
+  num_blocks: 25                           # 5 double + 20 single for Klein 4B
+  hidden_dim: 3072
+  num_image_tokens: 128
+  siglip_dim: 1152
+  perceiver_depth: 4
+  perceiver_heads: 16
+
+data:
+  shard_path: "/Volumes/IrisData/shards"
+  precomputed_qwen3: "/Volumes/IrisData/precomputed/qwen3"   # null if not pre-computed
+  precomputed_vae: "/Volumes/IrisData/precomputed/vae"       # null if not pre-computed
+  precomputed_siglip: null                                    # skip — 420GB
+  image_size: 512
+  batch_size: 2
+  prefetch_batches: 4
+  num_prefetch_threads: 2
+
+training:
+  num_steps: 105000
+  warmup_steps: 1000
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  ema_update_every: 10                     # update EMA every N steps (saves ~23min total)
+
+  # Null conditioning dropout for scale control at inference
+  image_dropout_prob: 0.30                 # 30%: zero out ip_embeds
+  text_dropout_prob: 0.10                  # 10%: use empty text prompt
+
+output:
+  checkpoint_dir: "checkpoints/stage1"
+  checkpoint_every: 2000                   # steps between checkpoints (TB4 safety)
+  keep_last_n: 5
+  log_every: 100
+  eval_every: 2000
+  eval_prompts_path: "train/configs/eval_prompts.txt"
+
+logging:
+  wandb_project: "iris-ip-adapter"
+  wandb_run_name: "stage1-512px"

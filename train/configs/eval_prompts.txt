@@ -1,0 +1,10 @@
+# eval_prompts.txt — fixed (prompt, style_ref_image) pairs for checkpoint eval.
+# Format: prompt | style_ref_path
+# Used during training to monitor style transfer quality across checkpoints.
+# Add local paths to representative style reference images.
+
+a portrait of a woman | eval_refs/watercolor_portrait.jpg
+a landscape with mountains | eval_refs/impressionist_landscape.jpg
+a cat sitting on a windowsill | eval_refs/oil_painting_style.jpg
+a futuristic city at night | eval_refs/neon_noir_style.jpg
+a bowl of fruit on a table | eval_refs/charcoal_sketch_style.jpg
