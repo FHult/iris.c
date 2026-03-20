@@ -29,8 +29,8 @@ pip install mlx mlx-lm
 # Flux Klein MLX inference (mflux provides the frozen Flux forward pass)
 pip install mflux
 
-# Data / I/O
-pip install safetensors webdataset huggingface_hub datasets pyarrow pandas
+# Data / I/O (huggingface_hub[cli] installs the 'hf' CLI binary)
+pip install safetensors webdataset "huggingface_hub[cli]" datasets pyarrow pandas
 
 # Image processing (turbojpeg is 2-4x faster than Pillow for JPEG decode)
 # PyTurboJPEG requires libjpeg-turbo system library: brew install libjpeg-turbo

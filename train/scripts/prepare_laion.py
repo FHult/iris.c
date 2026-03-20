@@ -60,11 +60,11 @@ def main():
         if seen % 100_000 == 0:
             print(f"  Scanned {seen:,} | kept {len(rows):,} | skipped {skipped:,}", flush=True)
 
-        score = row.get("aesthetic_score") or row.get("AESTHETIC_SCORE") or 0.0
-        width = row.get("width") or row.get("WIDTH") or 0
-        height = row.get("height") or row.get("HEIGHT") or 0
-        url = row.get("url") or row.get("URL") or ""
-        caption = row.get("text") or row.get("TEXT") or ""
+        score = row.get("aesthetic") or row.get("aesthetic_score") or row.get("AESTHETIC_SCORE") or 0.0
+        width = row.get("WIDTH") or row.get("width") or 0
+        height = row.get("HEIGHT") or row.get("height") or 0
+        url = row.get("URL") or row.get("url") or ""
+        caption = row.get("TEXT") or row.get("text") or ""
 
         if score < args.min_aesthetic or width < args.min_size or height < args.min_size:
             skipped += 1

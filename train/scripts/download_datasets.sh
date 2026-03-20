@@ -80,7 +80,7 @@ echo "========================================================================"
 echo ""
 echo "── WikiArt (1.7 GB, fast) ──────────────────────────────────────────────"
 echo "Run:"
-echo "  huggingface-cli download Artificio/WikiArt \\"
+echo "  hf download Artificio/WikiArt \\"
 echo "    --repo-type dataset \\"
 echo "    --local-dir $DATA_ROOT/raw/wikiart"
 echo "  # Prepend style label to captions: 'An impressionist painting showing {caption}'"
@@ -89,7 +89,7 @@ echo "  # Prepend style label to captions: 'An impressionist painting showing {c
 echo ""
 echo "── IP-Adapter warmstart weights (5.3 GB) ──────────────────────────────"
 echo "Run:"
-echo "  huggingface-cli download InstantX/FLUX.1-dev-IP-Adapter \\"
+echo "  hf download InstantX/FLUX.1-dev-IP-Adapter \\"
 echo "    --local-dir $DATA_ROOT/weights/flux_dev_ipadapter"
 echo "  # Only image_proj.* keys transfer to Klein 4B (Perceiver Resampler warmstart)"
 
@@ -126,7 +126,7 @@ echo ""
 echo "── TERMINAL 2: JourneyDB (~80 GB, non-commercial research) ────────────"
 cat <<JDB
   caffeinate -i -d \\
-  huggingface-cli download JourneyDB/JourneyDB \\
+  hf download JourneyDB/JourneyDB \\
     --repo-type dataset \\
     --local-dir $DATA_ROOT/raw/journeydb \\
     2>&1 | tee $DATA_ROOT/logs/journeydb_download.log

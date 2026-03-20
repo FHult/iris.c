@@ -90,11 +90,11 @@ python train/scripts/prepare_laion.py \
   --output train/data/raw/laion_filtered.parquet
 
 # Download Perceiver Resampler warmstart weights (5.3 GB)
-huggingface-cli download InstantX/FLUX.1-dev-IP-Adapter \
+hf download InstantX/FLUX.1-dev-IP-Adapter \
   --local-dir train/data/weights/flux_dev_ipadapter
 
 # Download WikiArt (1.7 GB, tiny)
-huggingface-cli download Artificio/WikiArt \
+hf download Artificio/WikiArt \
   --repo-type dataset --local-dir train/data/raw/wikiart
 ```
 
