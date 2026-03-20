@@ -39,8 +39,8 @@ revised gap analysis (corrects initial review assumptions after deep code read).
 - P-1 (HIGH): Embedding cache unused in server mode — `run_server_mode()` calls
   `emb_cache_init()` but never calls `emb_cache_lookup_ex`/`emb_cache_store`. Fix:
   wire the same cache path as the interactive CLI distilled branch.
-- P-2 (MEDIUM): O(N²) tensor lookup — `safetensors_find()` is linear scan;
-  replace with a hash table keyed on tensor name.
+- P-2: REMOVED — `safetensors_find()` scans ~2048 entries once per weight load.
+  Real cost is ~15ms/generation (0.1-0.3% of total). Not worth the complexity.
 - P-3 (LOW): `write_png_chunk` allocated per-chunk CRC temp buffer — FIXED as
   side-effect of S-5 security fix (now uses incremental `update_crc`).
 - P-4 (LOW): PNG writer uses uncompressed deflate (store mode). Implement level-1
