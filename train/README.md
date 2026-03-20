@@ -14,17 +14,26 @@ Roadmap context in [plans/roadmap.md](../plans/roadmap.md).
 train/
   ip_adapter/               Reusable model code (importable Python package)
     __init__.py
-    model.py                IPAdapterKlein + PerceiverResampler (MLX)
+    model.py                IPAdapterKlein + PerceiverResampler + inject() (MLX)
     loss.py                 Flow matching loss + fused Metal kernel
     ema.py                  Exponential moving average of adapter weights
-    dataset.py              WebDataset loader with two-level async prefetch
+    dataset.py              Two-level async prefetch: tarfile shard + turbojpeg sample
+                            Multi-resolution bucketing, GPU augmentation (augment_mlx)
+                            Pre-computed embed loading (Qwen3/VAE/SigLIP 4-bit/int8)
+    utils.py                Performance core detection (sysctl hw.perflevel0.logicalcpu)
   scripts/
-    prepare_laion.py        Pre-filter LAION-Aesthetics-v2 parquet (run today)
+    prepare_laion.py        Pre-filter LAION-Aesthetics-v2 parquet
     download_datasets.sh    Kick off all dataset downloads (run when SSD arrives)
-    build_shards.py         Merge raw downloads → WebDataset shards (TODO)
-    precompute_encoders.py  Pre-compute Qwen3/VAE/SigLIP features (TODO)
-    clip_dedup.py           CLIP-based deduplication via FAISS (TODO)
-    recaption.py            Moondream re-captioning for short captions (TODO)
+    build_shards.py         Merge raw downloads → unified WebDataset shards
+                            multiprocessing.Pool(COMPUTE_WORKERS=6), turbojpeg, zstd-1
+    filter_shards.py        Validate shards: drop corrupt/small/bad-caption records
+                            multiprocessing.Pool(PERF_CORES=8), rewrites in place
+    clip_dedup.py           CLIP-based deduplication via clip-retrieval + FAISS
+                            --num_prepro_workers PERF_CORES; writes duplicate_ids.txt
+    recaption.py            Moondream re-captioning (style-focused prompt, 2 parallel procs)
+    precompute_qwen3.py     4-bit quantise Qwen3 text embeddings (~143 GB, saves 200ms/step)
+    precompute_vae.py       int8 quantise VAE latents (~198 GB, saves 180ms/step)
+    precompute_siglip.py    4-bit quantise SigLIP features (~420 GB, saves 50ms/step)
   configs/
     stage1_512px.yaml       Stage 1 training config (512px, ~105K steps)
     stage2_768px.yaml       Stage 2 training config (768px, ~20K steps)
@@ -76,9 +85,46 @@ bash train/scripts/download_datasets.sh \
 
 ### 4. After downloads complete — pre-process data (B2)
 
+Run all under `caffeinate -i -d` (2–3 days total, unattended):
+
 ```bash
-# TODO: run after scripts/clip_dedup.py, recaption.py, build_shards.py are complete
-# python train/scripts/build_shards.py --ssd /Volumes/IrisData
+source train/.venv/bin/activate
+
+# Step A: Deduplicate LAION (~1.5h embed + 20min FAISS)
+python train/scripts/clip_dedup.py all \
+  --shards /Volumes/IrisData/raw/laion \
+  --embeddings /Volumes/IrisData/embeddings \
+  --output /Volumes/IrisData/dedup_ids
+
+# Step B: Merge all sources into unified shards (uses COMPUTE_WORKERS=6 P-cores)
+python train/scripts/build_shards.py \
+  --sources /Volumes/IrisData/raw/laion \
+            /Volumes/IrisData/raw/journeydb \
+            /Volumes/IrisData/raw/coyo \
+            /Volumes/IrisData/raw/wikiart \
+  --output /Volumes/IrisData/shards \
+  --blocklist /Volumes/IrisData/dedup_ids/duplicate_ids.txt
+
+# Step C: Filter pass (uses PERF_CORES=8 P-cores)
+python train/scripts/filter_shards.py --shards /Volumes/IrisData/shards
+
+# Step D: Re-caption short captions (run two processes in separate terminals)
+# Terminal 1: python train/scripts/recaption.py --shards /Volumes/IrisData/shards --shard_start 0 --shard_end 474
+# Terminal 2: python train/scripts/recaption.py --shards /Volumes/IrisData/shards --shard_start 475 --shard_end 949
+
+# Step E: Pre-compute frozen encoders (decide based on available storage)
+# Qwen3 (~143 GB, saves 200ms/step = 6.7h Stage 1) — recommended
+python train/scripts/precompute_qwen3.py \
+  --shards /Volumes/IrisData/shards \
+  --output /Volumes/IrisData/precomputed/qwen3
+
+# VAE (~198 GB, saves 180ms/step = 6.0h Stage 1) — recommended
+python train/scripts/precompute_vae.py \
+  --shards /Volumes/IrisData/shards \
+  --output /Volumes/IrisData/precomputed/vae
+
+# SigLIP (~420 GB, saves 50ms/step = 1.7h Stage 1) — only if space permits
+# python train/scripts/precompute_siglip.py --shards /Volumes/IrisData/shards --output /Volumes/IrisData/precomputed/siglip
 ```
 
 ### 5. Train (B4)

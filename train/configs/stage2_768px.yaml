@@ -18,11 +18,10 @@ adapter:
 
 data:
   shard_path: "/Volumes/IrisData/shards"
-  precomputed_qwen3: "/Volumes/IrisData/precomputed/qwen3"
-  precomputed_vae: null                    # 768px VAE latents not pre-computed
-  precomputed_siglip: null
-  image_size: 768
-  batch_size: 1                            # reduced at 768px
+  qwen3_cache_dir: "/Volumes/IrisData/precomputed/qwen3"    # reuse Stage 1 cache
+  vae_cache_dir: null                      # 768px latents not pre-computed (different size)
+  siglip_cache_dir: null
+  batch_size: 1                            # reduced at 768px (activation budget)
   prefetch_batches: 4
   num_prefetch_threads: 2
 

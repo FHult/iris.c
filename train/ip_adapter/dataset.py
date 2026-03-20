@@ -1,211 +1,381 @@
 """
-train/ip_adapter/dataset.py — WebDataset loader with two-level async prefetch.
+train/ip_adapter/dataset.py — Two-level async prefetch loader for IP-Adapter training.
 
-Two-level prefetch:
-  Level 1 (shard): background thread decompresses the next tar shard while
-                   the current shard is being consumed.
-  Level 2 (sample): background thread decodes + preprocesses the next batch
-                    while the GPU runs the current step.
+Two-level prefetch pipeline (plans/ip-adapter-training.md §3.4):
+  Level 1 (shard thread)  — pre-decompresses the next tar into a memory dict
+                            while the current shard is being consumed. Eliminates
+                            the 0.5–2s pause at each of ~310 shard boundaries.
+  Level 2 (sample thread) — decodes JPEG (turbojpeg) + dequantises pre-computed
+                            embeds + builds batches. Overlap with GPU step.
+  GPU (main thread)       — training step; never sees shard boundary stalls.
 
-CPU core targeting:
-  img2dataset shard writing uses --processes_count to target performance cores.
-  During training, the prefetch thread pool is sized based on os.cpu_count()
-  filtered to performance cores (P-cores on M1 Max = 8).
+CPU allocation:
+  Prefetch threads: always 2 (GPU is the bottleneck — more adds noise).
+  JPEG decode: turbojpeg (2–4× faster than Pillow). Falls back to Pillow if unavailable.
+  Shard workers target P-cores via daemon threads (OS routes to P-cores at user QoS).
 
-  On macOS, performance cores can be targeted via QoS:
-    thread.daemon = True
-    # Apple's Grand Central Dispatch routes background QoS to E-cores,
-    # userInitiated/userInteractive routes to P-cores.
-    # Python threads don't expose QoS directly, but setting thread priority
-    # via ctypes is possible (see _set_pcores() below).
+Multi-resolution bucketing (§3.9):
+  BUCKETS = [(512,512), (512,768), (768,512), (640,640), (512,896), (896,512)]
+  Each batch uses one bucket; images are resized to that bucket's (H,W).
+  No 256px — degenerate for Flux's patchification.
 
-Usage:
-    loader = make_prefetch_loader(config, batch_size=2)
-    for batch in loader:
-        images, captions, style_refs = batch
+GPU augmentation (§3.10):
+  augment_mlx(): random horizontal flip + random crop (pad to +32px, crop to target).
+  Runs in MLX on GPU after the batch is transferred — no CPU→GPU copy penalty.
+
+Pre-computed embed loading:
+  If data/qwen3_q4/{id}.npz exists → dequantise and return (no Qwen3 forward pass).
+  If data/vae_int8/{id}.npz exists → dequantise and return (no VAE encode).
+  If data/siglip_q4/{id}.npz exists → dequantise and return (no SigLIP forward pass).
+  Falls back to None for each encoder when pre-computed cache is absent.
 """
 
+import io
 import os
 import queue
+import random
+import sys
+import tarfile
 import threading
-from typing import Iterator, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 try:
-    import webdataset as wds
-    from PIL import Image
-    import io
-    _HAS_DEPS = True
+    from turbojpeg import TurboJPEG as _TurboJPEG
+    _HAS_TURBOJPEG = True
 except ImportError:
-    _HAS_DEPS = False
+    _HAS_TURBOJPEG = False
+
+from .utils import PERF_CORES as _PERF_CORES
 
 
-from .utils import PERF_CORES as _PERF_CORE_COUNT
+# ---------------------------------------------------------------------------
+# Multi-resolution training buckets (§3.9)
+# ---------------------------------------------------------------------------
+
+BUCKETS: List[Tuple[int, int]] = [
+    (512, 512),
+    (512, 768),
+    (768, 512),
+    (640, 640),
+    (512, 896),
+    (896, 512),
+]
+
+# Do NOT add 256px — degenerate for Flux's patchification.
 
 
-def _check_deps():
-    if not _HAS_DEPS:
-        raise ImportError(
-            "Missing: pip install webdataset Pillow\n"
-            "Run: source train/.venv/bin/activate"
-        )
+def _select_bucket(w: int, h: int) -> Tuple[int, int]:
+    """Return the bucket (bH, bW) closest in aspect ratio to the source image."""
+    if w == 0 or h == 0:
+        return BUCKETS[0]
+    aspect = w / h
+    best = min(BUCKETS, key=lambda b: abs(b[1] / b[0] - aspect))
+    return best  # (H, W)
 
 
-def _decode_image(data: bytes, size: int) -> Optional[np.ndarray]:
-    """Decode JPEG bytes → RGB numpy [H, W, 3] uint8, resized to size×size."""
+# ---------------------------------------------------------------------------
+# JPEG decode / encode helpers
+# ---------------------------------------------------------------------------
+
+def _make_jpeg():
+    """Return a per-thread TurboJPEG instance (not process-safe to pass across forks)."""
+    if _HAS_TURBOJPEG:
+        return _TurboJPEG()
+    return None
+
+
+def _decode_jpeg(raw: bytes, tj=None) -> Optional[np.ndarray]:
+    """
+    Decode JPEG bytes → HWC uint8 RGB numpy array.
+    Uses turbojpeg (2–4× faster) when available, falls back to Pillow.
+    """
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        if img.width != size or img.height != size:
-            img = img.resize((size, size), Image.LANCZOS)
-        return np.array(img, dtype=np.uint8)
+        if tj is not None:
+            return tj.decode(raw)
+        from PIL import Image
+        return np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
     except Exception:
         return None
 
 
-def _normalize_image(img: np.ndarray) -> np.ndarray:
-    """uint8 [H,W,3] → float32 [3,H,W] in [-1, 1]."""
+def _resize_to_bucket(img: np.ndarray, bucket_h: int, bucket_w: int) -> np.ndarray:
+    """Resize HWC numpy image to (bucket_h, bucket_w) using Pillow LANCZOS."""
+    h, w = img.shape[:2]
+    if h == bucket_h and w == bucket_w:
+        return img
+    from PIL import Image
+    return np.array(
+        Image.fromarray(img).resize((bucket_w, bucket_h), Image.LANCZOS),
+        dtype=np.uint8,
+    )
+
+
+def _normalize(img: np.ndarray) -> np.ndarray:
+    """uint8 HWC → float32 CHW in [-1, 1]."""
     return (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
 
 
-def _make_webdataset(
-    shard_path: str,
-    image_size: int,
-    image_dropout_prob: float = 0.0,
-    text_dropout_prob: float = 0.0,
-    shuffle_buffer: int = 10000,
-) -> Iterator:
+# ---------------------------------------------------------------------------
+# GPU augmentation (§3.10)
+# ---------------------------------------------------------------------------
+
+def augment_mlx(img, bucket_h: int, bucket_w: int):
     """
-    Build a WebDataset iterator over shards in shard_path.
+    MLX GPU augmentation: random horizontal flip + random crop.
+    img: MLX array [B, H_pad, W_pad, C] or [H_pad, W_pad, C]
+    Pads source by 32px per side then crops to (bucket_h, bucket_w).
 
-    Each sample yields (image_pixels, caption, style_ref_pixels) where:
-      - image_pixels: float32 [3, H, W] normalised to [-1, 1] — training target
-      - caption: str — text prompt
-      - style_ref_pixels: float32 [3, H, W] or None (if same-image self-supervised)
-
-    For style reference training, we use a second randomly-sampled image from
-    the same batch as the style reference (self-supervised style learning).
-    The IP-Adapter is trained to reconstruct the target image given the style
-    of the reference — when target == reference it learns identity; diversity
-    in the batch provides style variation.
+    Called AFTER image is an MLX array — no CPU→GPU copy penalty.
+    Eliminates one copy vs doing augmentation on CPU.
     """
-    _check_deps()
+    import mlx.core as mx
 
-    pattern = os.path.join(shard_path, "*.tar")
-    dataset = (
-        wds.WebDataset(pattern, resampled=True, shardshuffle=True)
-        .shuffle(shuffle_buffer)
-        .decode("pil")
-        .to_tuple("jpg;png", "txt", handler=wds.warn_and_continue)
-    )
+    # Random horizontal flip
+    if mx.random.uniform().item() > 0.5:
+        img = mx.flip(img, axis=-2)  # flip width axis (last spatial)
 
-    for img_data, caption in dataset:
-        # Decode target image
-        if isinstance(img_data, bytes):
-            img = _decode_image(img_data, image_size)
-        else:
-            # Already decoded by webdataset
-            img = np.array(img_data.convert("RGB").resize(
-                (image_size, image_size), Image.LANCZOS
-            ), dtype=np.uint8)
+    # Random crop from padded image
+    # Images are pre-padded to (bucket_h + 32, bucket_w + 32) in the prefetch thread
+    max_h_offset = 32
+    max_w_offset = 32
+    h_off = int(mx.random.randint(0, max_h_offset).item())
+    w_off = int(mx.random.randint(0, max_w_offset).item())
 
-        if img is None:
+    if img.ndim == 4:  # batched [B, H, W, C]
+        return img[:, h_off:h_off + bucket_h, w_off:w_off + bucket_w, :]
+    else:  # single [H, W, C]
+        return img[h_off:h_off + bucket_h, w_off:w_off + bucket_w, :]
+
+
+# ---------------------------------------------------------------------------
+# Pre-computed embed loaders
+# ---------------------------------------------------------------------------
+
+def _load_qwen3_embed(rec_id: str, qwen3_dir: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Load 4-bit quantised Qwen3 text embedding.
+    Returns float16 [seq, 7680] or None if not available.
+    """
+    if not qwen3_dir:
+        return None
+    path = os.path.join(qwen3_dir, f"{rec_id}.npz")
+    if not os.path.exists(path):
+        return None
+    try:
+        d = np.load(path)
+        q, scale = d["q"], d["scale"]
+        lo = (q & 0x0F).astype(np.int8)
+        hi = ((q >> 4) & 0x0F).astype(np.int8)
+        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
+        full[:, 0::2] = lo
+        full[:, 1::2] = hi
+        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+    except Exception:
+        return None
+
+
+def _load_vae_latent(rec_id: str, vae_dir: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Load int8 quantised VAE latent.
+    Returns float16 [32, H/8, W/8] or None if not available.
+    """
+    if not vae_dir:
+        return None
+    path = os.path.join(vae_dir, f"{rec_id}.npz")
+    if not os.path.exists(path):
+        return None
+    try:
+        d = np.load(path)
+        return (d["q"].astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
+    except Exception:
+        return None
+
+
+def _load_siglip_embed(rec_id: str, siglip_dir: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Load 4-bit quantised SigLIP features.
+    Returns float16 [729, 1152] or None if not available.
+    """
+    if not siglip_dir:
+        return None
+    path = os.path.join(siglip_dir, f"{rec_id}.npz")
+    if not os.path.exists(path):
+        return None
+    try:
+        d = np.load(path)
+        q, scale = d["q"], d["scale"]
+        lo = (q & 0x0F).astype(np.int8)
+        hi = ((q >> 4) & 0x0F).astype(np.int8)
+        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
+        full[:, 0::2] = lo
+        full[:, 1::2] = hi
+        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Shard content iteration
+# ---------------------------------------------------------------------------
+
+def _iter_shard_contents(contents: Dict[str, bytes]) -> list:
+    """
+    Parse {filename: bytes} dict (pre-decompressed shard) into list of record dicts.
+    Returns [{"id": str, "jpg": bytes, "txt": str}, ...]
+    """
+    keys: Dict[str, Dict[str, str]] = {}
+    for name in contents:
+        stem, _, ext = name.rpartition(".")
+        if stem not in keys:
+            keys[stem] = {}
+        keys[stem][ext.lower()] = name
+
+    records = []
+    for stem, exts in keys.items():
+        jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
+        txt_key = exts.get("txt") or exts.get("caption")
+        if not jpg_key or not txt_key:
             continue
+        txt = contents[txt_key].decode("utf-8", errors="replace").strip()
+        records.append({"id": stem, "jpg": contents[jpg_key], "txt": txt})
+    return records
 
-        # Null conditioning dropout
-        import random
-        if random.random() < image_dropout_prob:
-            style_ref = np.zeros_like(img)  # zeroed style reference
-        else:
-            style_ref = img  # self-supervised: same image as style ref
 
-        if random.random() < text_dropout_prob:
-            caption = ""
-
-        yield _normalize_image(img), caption, _normalize_image(style_ref)
-
+# ---------------------------------------------------------------------------
+# Main loader
+# ---------------------------------------------------------------------------
 
 def make_prefetch_loader(
-    shard_path: str,
-    image_size: int,
+    shard_paths: List[str],
     batch_size: int = 2,
-    prefetch_batches: int = 4,
-    num_threads: int = 2,
     image_dropout_prob: float = 0.30,
     text_dropout_prob: float = 0.10,
-    shuffle_buffer: int = 10000,
+    sample_buffer: int = 6,
+    bucket: Optional[Tuple[int, int]] = None,
+    qwen3_cache_dir: Optional[str] = None,
+    vae_cache_dir: Optional[str] = None,
+    siglip_cache_dir: Optional[str] = None,
 ) -> Iterator:
     """
-    Two-level prefetch loader: fills a queue with pre-decoded batches.
+    Two-level prefetch pipeline (§3.4).
 
-    num_threads: number of prefetch threads (default 2, targeting P-cores)
-    prefetch_batches: queue depth in batches (default 4)
+    shard_paths:          list of .tar shard file paths (in any order; shuffled internally)
+    batch_size:           images per batch (default 2)
+    image_dropout_prob:   null image conditioning dropout rate (default 0.30)
+    text_dropout_prob:    null text conditioning dropout rate (default 0.10)
+    sample_buffer:        max batches in the level-2 queue (default 6)
+    bucket:               (H, W) training resolution; if None, randomly selects from BUCKETS
+    qwen3_cache_dir:      path to pre-computed Qwen3 .npz files (data/qwen3_q4/)
+    vae_cache_dir:        path to pre-computed VAE .npz files (data/vae_int8/)
+    siglip_cache_dir:     path to pre-computed SigLIP .npz files (data/siglip_q4/)
 
-    Returns batches of (images, captions, style_refs):
-      images:     float32 numpy [B, 3, H, W]
-      captions:   list of str, len B
-      style_refs: float32 numpy [B, 3, H, W]
+    Yields batches of:
+      images:      float32 numpy [B, C, H+32, W+32] — padded for GPU crop augmentation
+      captions:    list of str, len B (empty string if text dropout)
+      style_refs:  float32 numpy [B, C, H+32, W+32] — same image (self-supervised)
+      text_embeds: float16 numpy [B, seq, 7680] or None (if no Qwen3 cache)
+      vae_latents: float16 numpy [B, 32, H/8, W/8] or None (if no VAE cache)
+      siglip_feats:float16 numpy [B, 729, 1152] or None (if no SigLIP cache)
+      bucket_hw:   (H, W) tuple for this batch
     """
-    _check_deps()
+    paths = list(shard_paths)
 
-    q: queue.Queue = queue.Queue(maxsize=prefetch_batches * num_threads)
-    stop_event = threading.Event()
+    shard_q: queue.Queue = queue.Queue(maxsize=2)
+    sample_q: queue.Queue = queue.Queue(maxsize=sample_buffer)
 
-    def _worker():
-        gen = _make_webdataset(
-            shard_path, image_size,
-            image_dropout_prob=image_dropout_prob,
-            text_dropout_prob=text_dropout_prob,
-            shuffle_buffer=shuffle_buffer,
-        )
-        imgs_buf, caps_buf, refs_buf = [], [], []
-        for img, cap, ref in gen:
-            if stop_event.is_set():
-                break
-            imgs_buf.append(img)
-            caps_buf.append(cap)
-            refs_buf.append(ref)
-            if len(imgs_buf) == batch_size:
-                batch = (
-                    np.stack(imgs_buf),
-                    list(caps_buf),
-                    np.stack(refs_buf),
-                )
-                q.put(batch)
-                imgs_buf, caps_buf, refs_buf = [], [], []
-
-    # Launch prefetch threads (use daemon so they die with the main process)
-    threads = []
-    for _ in range(num_threads):
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        threads.append(t)
-
-    try:
+    # ---- Level 1: shard decompressor thread --------------------------------
+    def shard_loader():
+        rng = random.Random()
         while True:
-            batch = q.get(timeout=60)
-            yield batch
-    finally:
-        stop_event.set()
+            rng.shuffle(paths)
+            for path in paths:
+                try:
+                    with tarfile.open(path) as tar:
+                        contents = {
+                            m.name: tar.extractfile(m).read()
+                            for m in tar.getmembers()
+                            if m.isfile()
+                        }
+                    shard_q.put(contents)
+                except Exception as e:
+                    print(f"Shard error {path}: {e}", file=sys.stderr)
+        # unreachable — infinite loop for resampled training
 
+    # ---- Level 2: sample decoder + batch builder thread -------------------
+    def sample_decoder():
+        tj = _make_jpeg()
+        rng = random.Random()
 
-def make_shard_writer(
-    output_path: str,
-    shard_size: int = 5000,
-    num_workers: int = None,
-) -> None:
-    """
-    Utility called by build_shards.py — not used during training.
-    Documents the shard writing config for reference.
+        while True:
+            contents = shard_q.get()
+            records = _iter_shard_contents(contents)
+            rng.shuffle(records)
 
-    num_workers: defaults to P-core count (8 on M1 Max)
-    shard_size: 5000 images/shard at ~76KB avg JPEG = ~380MB/shard
-    """
-    if num_workers is None:
-        # Target performance cores on Apple Silicon
-        num_workers = min(_PERF_CORE_COUNT, os.cpu_count() or 4)
-    return dict(
-        output_path=output_path,
-        shard_size=shard_size,
-        num_workers=num_workers,
-    )
+            # Pick bucket for this shard
+            if bucket is not None:
+                bH, bW = bucket
+            else:
+                bH, bW = rng.choice(BUCKETS)
+
+            # Pad target size by 32px for GPU random-crop augmentation
+            pad_h, pad_w = bH + 32, bW + 32
+
+            imgs_buf, caps_buf, refs_buf = [], [], []
+            temb_buf, vlat_buf, sfeat_buf = [], [], []
+
+            for rec in records:
+                # Decode image
+                img = _decode_jpeg(rec["jpg"], tj)
+                if img is None:
+                    continue
+
+                # Resize to padded bucket size
+                img = _resize_to_bucket(img, pad_h, pad_w)
+
+                # Null conditioning dropout (decided here, outside MLX compiled region)
+                if rng.random() < image_dropout_prob:
+                    style_ref = np.zeros_like(img)
+                else:
+                    style_ref = img.copy()
+
+                caption = rec["txt"]
+                if rng.random() < text_dropout_prob:
+                    caption = ""
+
+                # Pre-computed embeds (CPU-trivial dequant)
+                text_emb = _load_qwen3_embed(rec["id"], qwen3_cache_dir)
+                vae_lat = _load_vae_latent(rec["id"], vae_cache_dir)
+                siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
+
+                imgs_buf.append(_normalize(img))
+                refs_buf.append(_normalize(style_ref))
+                caps_buf.append(caption)
+                temb_buf.append(text_emb)
+                vlat_buf.append(vae_lat)
+                sfeat_buf.append(siglip_feat)
+
+                if len(imgs_buf) == batch_size:
+                    # Stack arrays; keep None for missing caches
+                    t_arr = np.stack(temb_buf) if temb_buf[0] is not None else None
+                    v_arr = np.stack(vlat_buf) if vlat_buf[0] is not None else None
+                    s_arr = np.stack(sfeat_buf) if sfeat_buf[0] is not None else None
+
+                    sample_q.put((
+                        np.stack(imgs_buf),     # [B, C, H+32, W+32]
+                        list(caps_buf),
+                        np.stack(refs_buf),
+                        t_arr,
+                        v_arr,
+                        s_arr,
+                        (bH, bW),
+                    ))
+                    imgs_buf, caps_buf, refs_buf = [], [], []
+                    temb_buf, vlat_buf, sfeat_buf = [], [], []
+
+    threading.Thread(target=shard_loader, daemon=True).start()
+    threading.Thread(target=sample_decoder, daemon=True).start()
+
+    while True:
+        yield sample_q.get(timeout=120)

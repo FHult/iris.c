@@ -1,0 +1,246 @@
+"""
+train/scripts/precompute_vae.py — Pre-compute and int8-quantise VAE latents.
+
+Saves ~180ms per training step = ~6.0 hours over Stage 1 (105K steps).
+Storage: ~198 GB at int8 (vs ~1.6 TB at float32).
+
+Run ONCE after build_shards.py + filter_shards.py complete.
+Takes ~6 hours on M1 Max (1.55M images × ~14ms encode).
+
+Output: one .npz file per sample under data/vae_int8/{id}.npz
+  - q:     int8 [32, H/8, W/8]   — per-channel absmax quantised latent
+  - scale: float16 [32, 1, 1]    — per-channel absmax / 127
+
+At training time, load with load_vae_latent() (see bottom of this file).
+Dequantization in the prefetch thread is CPU-trivial.
+
+Quantisation format:
+  int8 per channel, scale = abs(arr).max(axis=(1,2)) / 127.0
+
+CPU allocation:
+  VAE encode is GPU-bound; outer shard loop runs 2 parallel processes.
+  Each process initialises its own MLX Metal context.
+
+Reference: plans/ip-adapter-training.md §2.7
+"""
+
+import argparse
+import glob
+import io
+import multiprocessing
+import os
+import sys
+import tarfile
+
+import numpy as np
+
+try:
+    import subprocess
+    _PERF_CORES = int(subprocess.check_output(
+        ["sysctl", "-n", "hw.perflevel0.logicalcpu"], text=True).strip())
+except Exception:
+    _PERF_CORES = os.cpu_count() or 4
+
+
+# ---------------------------------------------------------------------------
+# Quantisation helpers
+# ---------------------------------------------------------------------------
+
+def quantize_int8(arr: np.ndarray):
+    """
+    Per-channel absmax int8 quantisation.
+    arr: float32 [32, H, W] (VAE latent channels)
+    Returns:
+      q:     int8 [32, H, W]
+      scale: float16 [32, 1, 1]
+    """
+    scale = np.abs(arr).max(axis=(1, 2), keepdims=True) / 127.0
+    scale = np.where(scale == 0, 1e-8, scale)
+    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
+    return q, scale.astype(np.float16)
+
+
+def load_vae_latent(npz_path: str) -> np.ndarray:
+    """
+    Dequantise a saved VAE latent.
+    Returns float16 [32, H/8, W/8].
+    Called from the training prefetch thread.
+    """
+    d = np.load(npz_path)
+    return (d["q"].astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
+
+
+# ---------------------------------------------------------------------------
+# Image preprocessing for VAE
+# ---------------------------------------------------------------------------
+
+def preprocess_vae(jpg_bytes: bytes, image_size: int = 512) -> np.ndarray:
+    """
+    Decode JPEG and prepare for VAE encoder.
+    Returns float32 [1, 3, H, W] in [-1, 1].
+    """
+    try:
+        from turbojpeg import TurboJPEG
+        tj = TurboJPEG()
+        img = tj.decode(jpg_bytes)  # HWC uint8 RGB
+    except ImportError:
+        from PIL import Image as PilImage
+        img = np.array(
+            PilImage.open(io.BytesIO(jpg_bytes)).convert("RGB")
+               .resize((image_size, image_size), PilImage.LANCZOS),
+            dtype=np.uint8
+        )
+
+    if img.shape[0] != image_size or img.shape[1] != image_size:
+        from PIL import Image as PilImage
+        img = np.array(
+            PilImage.fromarray(img).resize((image_size, image_size), PilImage.LANCZOS),
+            dtype=np.uint8
+        )
+
+    # HWC → CHW, uint8 → float32 in [-1, 1]
+    img_f = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+    return img_f[np.newaxis]  # [1, 3, H, W]
+
+
+# ---------------------------------------------------------------------------
+# Shard iteration
+# ---------------------------------------------------------------------------
+
+def iter_shard(shard_path: str):
+    """Yield (id, jpg_bytes) from a .tar shard."""
+    try:
+        with tarfile.open(shard_path) as tar:
+            members = {m.name: m for m in tar.getmembers() if m.isfile()}
+            keys = {}
+            for name in members:
+                stem, _, ext = name.rpartition(".")
+                if stem not in keys:
+                    keys[stem] = {}
+                keys[stem][ext.lower()] = name
+
+            for stem, exts in keys.items():
+                jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
+                if not jpg_key:
+                    continue
+                jpg = tar.extractfile(members[jpg_key]).read()
+                yield stem, jpg
+    except Exception as e:
+        print(f"Warning: {shard_path}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+def process_shard(args) -> dict:
+    """
+    Worker: encode all images in one shard through VAE and save quantised latents.
+    """
+    shard_path, output_dir, model_path, image_size = args
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mflux import Flux1  # VAE is part of mflux model
+    except ImportError:
+        print("mflux not available. Run: pip install mflux", file=sys.stderr)
+        return {"shard": shard_path, "written": 0, "error": True}
+
+    # Load only the VAE (not the full transformer)
+    try:
+        flux = Flux1.from_pretrained(model_path, quantize=4)
+        vae = flux.vae
+        vae.freeze()
+    except Exception as e:
+        print(f"Failed to load VAE from {model_path}: {e}", file=sys.stderr)
+        return {"shard": shard_path, "written": 0, "error": True}
+
+    written = 0
+    for rec_id, jpg_bytes in iter_shard(shard_path):
+        out_path = os.path.join(output_dir, f"{rec_id}.npz")
+        if os.path.exists(out_path):
+            written += 1
+            continue  # resume-safe
+
+        try:
+            img_np = preprocess_vae(jpg_bytes, image_size)
+            img_mx = mx.array(img_np)  # [1, 3, H, W]
+
+            latent = vae.encode(img_mx)  # [1, 32, H/8, W/8]
+            mx.eval(latent)
+            latent_np = np.array(latent[0])  # [32, H/8, W/8]
+
+            q, scale = quantize_int8(latent_np.astype(np.float32))
+            np.savez(out_path, q=q, scale=scale)
+            written += 1
+
+        except Exception as e:
+            print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+
+    return {"shard": shard_path, "written": written, "error": False}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pre-compute int8 quantised VAE latents"
+    )
+    parser.add_argument(
+        "--shards", required=True,
+        help="Directory containing .tar shards"
+    )
+    parser.add_argument(
+        "--output", default="data/vae_int8",
+        help="Output directory for .npz files (default: data/vae_int8)"
+    )
+    parser.add_argument(
+        "--model", default="flux-klein-4b",
+        help="Model ID or path (default: flux-klein-4b)"
+    )
+    parser.add_argument(
+        "--image_size", type=int, default=512,
+        help="Image size fed to VAE (default 512)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=2,
+        help="Parallel processes (default 2; GPU shared so >2 contends)"
+    )
+    args = parser.parse_args()
+
+    shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
+    if not shards:
+        print(f"No .tar files in {args.shards}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.output, exist_ok=True)
+
+    print(f"Pre-computing VAE latents for {len(shards)} shards")
+    print(f"  Model:   {args.model}")
+    print(f"  Output:  {args.output}")
+    print(f"  Workers: {args.workers}")
+    latent_h = args.image_size // 8
+    bytes_per = 32 * latent_h * latent_h  # int8
+    total_gb = len(shards) * 5000 * bytes_per / 1e9
+    print(f"  Storage estimate: ~{total_gb:.0f} GB")
+    print()
+
+    work_items = [(s, args.output, args.model, args.image_size) for s in shards]
+
+    with multiprocessing.Pool(processes=args.workers) as pool:
+        results = pool.map(process_shard, work_items)
+
+    total = sum(r["written"] for r in results)
+    errors = sum(1 for r in results if r["error"])
+    print(f"\nDone. {total:,} latents saved to {args.output}/")
+    if errors:
+        print(f"  {errors} shards had errors (check stderr)")
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()

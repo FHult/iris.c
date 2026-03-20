@@ -132,6 +132,47 @@ class IPAdapterKlein(nn.Module):
         v = mx.einsum("btd,nde->bnte", ip_embeds, self.to_v_ip_stacked)
         return k, v
 
+    def inject(
+        self,
+        img_q: mx.array,
+        k_ip: mx.array,
+        v_ip: mx.array,
+        block_idx: int,
+    ) -> mx.array:
+        """
+        Compute IP-Adapter attention output for one block using batched SDPA.
+
+        Uses mx.fast.scaled_dot_product_attention (Flash Attention, Metal-backed)
+        instead of manual softmax attention — 25→1 Metal SDPA call per block,
+        saving ~0.2s/step vs manual softmax. (§3.5, optimisations table)
+
+        img_q:     [B, num_heads, img_seq, head_dim] — image Q from the block
+        k_ip:      [B, 128, 3072]                    — slice of get_kv_all output
+        v_ip:      [B, 128, 3072]                    — slice of get_kv_all output
+        block_idx: which ip_scale scalar to apply
+
+        Returns:
+          ip_contribution: [B, img_seq, 3072] scaled by self.scale[block_idx]
+        """
+        head_dim = self.hidden_dim // 24  # 3072 / 24 = 128
+        scale = float(head_dim ** -0.5)
+
+        # Reshape K/V to [B, num_heads, 128, head_dim] for batched SDPA
+        B, T, D = k_ip.shape
+        num_heads = D // head_dim
+        k = k_ip.reshape(B, T, num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v_ip.reshape(B, T, num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # mx.fast.scaled_dot_product_attention: Flash Attention, 1 Metal dispatch
+        # img_q: [B, num_heads, img_seq, head_dim]
+        # k, v:  [B, num_heads, 128, head_dim]
+        attn = mx.fast.scaled_dot_product_attention(img_q, k, v, scale=scale)
+        # attn: [B, num_heads, img_seq, head_dim] → [B, img_seq, D]
+        B2, H, S, hd = attn.shape
+        attn_out = attn.transpose(0, 2, 1, 3).reshape(B2, S, H * hd)
+
+        return self.scale[block_idx] * attn_out
+
     def load_resampler_weights(self, weights: dict) -> None:
         """
         Load Perceiver Resampler weights transferred from InstantX

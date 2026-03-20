@@ -18,12 +18,13 @@ adapter:
 
 data:
   shard_path: "/Volumes/IrisData/shards"
-  precomputed_qwen3: "/Volumes/IrisData/precomputed/qwen3"   # null if not pre-computed
-  precomputed_vae: "/Volumes/IrisData/precomputed/vae"       # null if not pre-computed
-  precomputed_siglip: null                                    # skip — 420GB
-  image_size: 512
+  # Pre-computed encoder caches (see train/scripts/precompute_*.py)
+  # Set to null to compute at runtime (slower but no storage needed)
+  qwen3_cache_dir: "/Volumes/IrisData/precomputed/qwen3"    # ~143 GB, saves ~200ms/step
+  vae_cache_dir: "/Volumes/IrisData/precomputed/vae"        # ~198 GB, saves ~180ms/step
+  siglip_cache_dir: null                                     # ~420 GB — skip if space tight
   batch_size: 2
-  prefetch_batches: 4
+  prefetch_batches: 6
   num_prefetch_threads: 2
 
 training:

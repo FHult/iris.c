@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import fused_flow_noise, get_schedule_values
 from ip_adapter.ema import update_ema, save_ema, _flatten
-from ip_adapter.dataset import make_prefetch_loader
+from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 
 # ── mflux: Flux Klein 4B MLX inference ───────────────────────────────────────
 try:
@@ -289,40 +289,61 @@ def train(config: dict) -> None:
     compiled_loss_and_grad = mx.compile(loss_and_grad, inputs=state, outputs=state)
 
     # ── Data loader ───────────────────────────────────────────────────────────
+    shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
+    if not shard_paths:
+        raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
+
     loader = make_prefetch_loader(
-        shard_path=dcfg["shard_path"],
-        image_size=dcfg["image_size"],
+        shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
-        prefetch_batches=dcfg["prefetch_batches"],
-        num_threads=dcfg["num_prefetch_threads"],
         image_dropout_prob=tcfg["image_dropout_prob"],
         text_dropout_prob=tcfg["text_dropout_prob"],
+        sample_buffer=dcfg.get("prefetch_batches", 6),
+        qwen3_cache_dir=dcfg.get("qwen3_cache_dir"),
+        vae_cache_dir=dcfg.get("vae_cache_dir"),
+        siglip_cache_dir=dcfg.get("siglip_cache_dir"),
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    print(f"\nTraining: {tcfg['num_steps']:,} steps, "
-          f"batch_size={dcfg['batch_size']}, image_size={dcfg['image_size']}px\n")
+    print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
 
     step = 0
     t0 = time.time()
     log_interval = ocfg["log_every"]
 
-    for images_np, captions, style_refs_np in loader:
+    for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
             break
 
-        # Convert to MLX arrays
-        images = mx.array(images_np, dtype=mx.bfloat16)
+        bH, bW = bucket_hw
 
-        # Null conditioning flags — computed on CPU, passed into compiled graph
+        # Convert to MLX — images are padded (H+32, W+32) for GPU crop augmentation
+        images = mx.array(images_np, dtype=mx.bfloat16)   # [B, C, H+32, W+32]
+
+        # GPU augmentation: random horizontal flip + random crop (§3.10)
+        # Done in MLX on GPU — no CPU→GPU copy penalty
+        images = augment_mlx(images, bH, bW)               # [B, C, bH, bW]
+
+        # Null conditioning flags — decided OUTSIDE compiled region (§3.7)
         use_null_image = mx.array(random.random() < tcfg["image_dropout_prob"])
         use_null_text = mx.array(random.random() < tcfg["text_dropout_prob"])
 
-        # Encode frozen models (use precomputed cache if available)
-        captions_in = [""] * len(captions) if bool(use_null_text.item()) else captions
-        text_embeds = _encode_text(text_encoder, captions_in)
-        latents = _vae_encode(vae, images)
-        siglip_feats = siglip(images)
+        # Encode frozen models — use pre-computed cache if available (§2.7)
+        if vae_np is not None:
+            latents = mx.array(vae_np, dtype=mx.bfloat16)
+        else:
+            latents = _vae_encode(vae, images)
+
+        if text_np is not None:
+            text_embeds = mx.array(text_np, dtype=mx.bfloat16)
+        else:
+            captions_in = [""] * len(captions) if bool(use_null_text.item()) else captions
+            text_embeds = _encode_text(text_encoder, captions_in)
+
+        if siglip_np is not None:
+            siglip_feats = mx.array(siglip_np, dtype=mx.bfloat16)
+        else:
+            siglip_feats = siglip(images)
 
         # Forward + backward (compiled)
         loss_val, grads = compiled_loss_and_grad(
