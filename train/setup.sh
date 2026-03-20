@@ -33,7 +33,8 @@ pip install mflux
 pip install safetensors webdataset huggingface_hub datasets pyarrow pandas
 
 # Image processing (turbojpeg is 2-4x faster than Pillow for JPEG decode)
-pip install Pillow libjpeg-turbo-python
+# PyTurboJPEG requires libjpeg-turbo system library: brew install libjpeg-turbo
+pip install Pillow PyTurboJPEG
 
 # Dataset tools
 pip install img2dataset clip-retrieval faiss-cpu
