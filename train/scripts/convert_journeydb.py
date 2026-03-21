@@ -56,7 +56,13 @@ def load_annotations(anno_tgz_path: str) -> dict:
 
                     # Normalise key — support both formats
                     img_path = (obj.get("img_path") or obj.get("Key") or "").strip()
-                    caption  = (obj.get("caption") or obj.get("Prompt") or "").strip()
+                    # Prefer Task2.Caption (clean NL description) over raw prompt
+                    task2    = obj.get("Task2") or {}
+                    caption  = (obj.get("caption")
+                                or task2.get("Caption")
+                                or obj.get("prompt")
+                                or obj.get("Prompt")
+                                or "").strip()
 
                     if img_path and caption:
                         # Key by basename without extension
