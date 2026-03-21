@@ -273,6 +273,10 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed for shuffle"
     )
+    parser.add_argument(
+        "--start-idx", type=int, default=0,
+        help="Starting shard index (use to append to an existing output dir)"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -295,13 +299,14 @@ def main():
 
     n_shards = math.ceil(len(records) / args.shard_size)
     workers = min(args.workers, n_shards)
-    print(f"  Output: {n_shards} shards × {args.shard_size} images")
+    start_idx = args.start_idx
+    print(f"  Output: {n_shards} shards × {args.shard_size} images (starting at {start_idx:06d})")
     print(f"  Workers: {workers} processes (targeting P-cores on Apple Silicon)")
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
 
     # Split shard index ranges across workers (interleaved, not contiguous)
-    # Worker 0 → shards 0, W, 2W,...  Worker 1 → shards 1, W+1, 2W+1,...
-    shard_ranges = [list(range(i, n_shards, workers)) for i in range(workers)]
+    # Worker 0 → shards start_idx+0, start_idx+W, ...  Worker 1 → start_idx+1, ...
+    shard_ranges = [list(range(start_idx + i, start_idx + n_shards, workers)) for i in range(workers)]
 
     # Split record list across workers corresponding to shard ranges
     # Worker w processes records[w*shard_size : (w+1)*shard_size, (w+W)*shard_size...]
