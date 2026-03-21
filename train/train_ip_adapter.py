@@ -48,7 +48,7 @@ from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 
 # ── mflux: Flux Klein 4B MLX inference ───────────────────────────────────────
 try:
-    from mflux import Flux1
+    from mflux.models.flux2 import Flux2Klein
     _HAS_MFLUX = True
 except ImportError:
     _HAS_MFLUX = False
@@ -177,7 +177,7 @@ def train(config: dict) -> None:
         raise RuntimeError("pip install mflux")
 
     print("Loading Flux Klein 4B (frozen) ...")
-    flux = Flux1.from_pretrained(path=mcfg["flux_model_dir"], quantize=None)
+    flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
 
     print("Loading SigLIP SO400M (frozen) ...")
@@ -197,8 +197,12 @@ def train(config: dict) -> None:
     # Uses grad_checkpoint from mlx_lm (plans/ip-adapter-training.md §3.2).
     if _HAS_GRAD_CHECKPOINT:
         try:
-            from mflux.models.transformer.transformer_block import Flux2TransformerBlock
-            from mflux.models.transformer.single_transformer_block import Flux2SingleTransformerBlock
+            from mflux.models.flux2.model.flux2_transformer.transformer_block import (
+                Flux2TransformerBlock,
+            )
+            from mflux.models.flux2.model.flux2_transformer.single_transformer_block import (
+                Flux2SingleTransformerBlock,
+            )
             grad_checkpoint(Flux2TransformerBlock)
             grad_checkpoint(Flux2SingleTransformerBlock)
             print("Gradient checkpointing applied to Flux transformer blocks")
@@ -400,69 +404,341 @@ def train(config: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Integration stubs — filled in once mflux API is confirmed
+# SigLIP wrappers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SigLIPMLXWrapper:
+    """Thin wrapper around an mlx_vlm SigLIP vision model."""
+
+    def __init__(self, vision_model):
+        self._model = vision_model
+
+    def freeze(self):
+        if hasattr(self._model, "freeze"):
+            self._model.freeze()
+
+    def __call__(self, images: mx.array) -> mx.array:
+        return self._model(images).astype(mx.bfloat16)  # [B, 729, 1152]
+
+
+class _SigLIPTorchWrapper:
+    """Wraps a transformers SigLIP vision model with numpy bridge for MLX."""
+
+    def __init__(self, hf_model):
+        self._model = hf_model
+
+    def freeze(self):
+        pass  # always frozen; no MLX-style freeze needed
+
+    def __call__(self, images: mx.array) -> mx.array:
+        import torch
+        import numpy as np
+        imgs_np = np.array(images.astype(mx.float32))
+        imgs_t = torch.from_numpy(imgs_np)
+        with torch.no_grad():
+            out = self._model(pixel_values=imgs_t).last_hidden_state  # [B, 729, 1152]
+        return mx.array(out.numpy()).astype(mx.bfloat16)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Text encoder bundle
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TextEncoderBundle:
+    """Bundles Qwen3 encoder + tokenizer so _encode_text can tokenise and encode."""
+
+    def __init__(self, encoder, tokenizer):
+        self.encoder = encoder
+        self.tokenizer = tokenizer
+
+    def freeze(self):
+        self.encoder.freeze()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_siglip(model_name: str):
     """
     Load SigLIP SO400M vision encoder (frozen).
-    Implementation: load via mflux or transformers.
-    Input: [B, 3, 384, 384] normalised to [-1, 1]
+    Tries mlx_vlm first; falls back to transformers + torch.
+
+    Input:  [B, 3, 384, 384] normalised to [-1, 1]
     Output: [B, 729, 1152]
+
+    In practice SigLIP features are pre-computed by precompute_siglip.py.
+    This path is only hit when siglip_cache_dir is None.
     """
-    raise NotImplementedError(
-        "Implement _load_siglip:\n"
-        "  Option A: from mlx_vlm or transformers (CLIPVisionModel equivalent)\n"
-        "  Option B: iris_siglip.py — pure MLX SigLIP from safetensors weights"
-    )
+    try:
+        from mlx_vlm import load as vlm_load
+        model, _ = vlm_load(model_name)
+        model.eval()
+        vm = model.vision_model if hasattr(model, "vision_model") else model
+        return _SigLIPMLXWrapper(vm)
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoModel
+        hf_model = AutoModel.from_pretrained(model_name).vision_model.eval()
+        return _SigLIPTorchWrapper(hf_model)
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot load SigLIP '{model_name}': {e}\n"
+            "Install mlx-vlm: pip install mlx-vlm\n"
+            "Or pre-compute features: python train/scripts/precompute_siglip.py "
+            "--shards train/data/shards --output train/data/precomputed/siglip"
+        ) from e
 
 
 def _load_vae(flux):
     """Extract VAE encoder from the loaded Flux object."""
-    return flux.vae  # mflux exposes .vae
+    return flux.vae
 
 
 def _load_text_encoder(flux):
-    """Extract Qwen3 text encoder from the loaded Flux object."""
-    return flux.text_encoder  # mflux exposes .text_encoder or similar
+    """Return a _TextEncoderBundle (encoder + tokenizer) from the Flux object."""
+    return _TextEncoderBundle(flux.text_encoder, flux.tokenizers["qwen3"])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Encode helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _vae_encode(vae, images: mx.array) -> mx.array:
     """
     Encode images to VAE latents.
     images: [B, 3, H, W] BF16 in [-1, 1]
-    Returns: [B, 32, H/8, W/8] latents (Flux VAE: 32 latent channels)
+    Returns: [B, 32, H/8, W/8]
     """
-    raise NotImplementedError("Wire to mflux VAE encoder")
+    return vae.encode(images)
 
 
-def _encode_text(text_encoder, captions: list) -> mx.array:
+def _encode_text(text_encoder: _TextEncoderBundle, captions: list) -> mx.array:
     """
-    Encode text captions using Qwen3 (Q4 quantized, frozen).
-    Returns: [B, seq, text_dim] text embeddings
+    Encode text captions using Qwen3 (frozen).
+    Returns: [B, seq, text_dim] BF16
     """
-    raise NotImplementedError("Wire to mflux Qwen3 text encoder")
-
-
-def _flux_forward_with_ip(flux, noisy_latents, text_embeds, t_int,
-                           k_ip_all, v_ip_all, ip_scale) -> mx.array:
-    """
-    Run Flux Klein 4B forward pass with IP-Adapter injection.
-
-    Requires subclassing mflux Flux2TransformerBlock to accept and inject
-    k_ip / v_ip at each block (plans/ip-adapter-training.md §3.5):
-
-        if k_ip is not None:
-            ip_attn = mx.fast.scaled_dot_product_attention(
-                img_q, k_ip, v_ip, scale=(head_dim ** -0.5)
-            )
-            hidden_states = hidden_states + ip_scale * ip_attn.reshape(...)
-
-    See plans/ip-adapter-training.md §3.5 for the full patched block signature.
-    """
-    raise NotImplementedError(
-        "Subclass Flux2Transformer to inject IP K/V — see plans §3.5"
+    tokens = text_encoder.tokenizer.tokenize(captions)
+    embeds = text_encoder.encoder.get_prompt_embeds(
+        input_ids=tokens.input_ids,
+        attention_mask=tokens.attention_mask,
+        hidden_state_layers=(9, 18, 27),
     )
+    return embeds.astype(mx.bfloat16)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flux forward pass with IP-Adapter injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flux_forward_with_ip(
+    flux,
+    noisy_latents: mx.array,
+    text_embeds: mx.array,
+    t_int: mx.array,
+    k_ip_all: mx.array,
+    v_ip_all: mx.array,
+    ip_scale: mx.array,
+) -> mx.array:
+    """
+    Flux Klein 4B forward pass with IP-Adapter injection.
+
+    Manually replays the transformer forward pass so that after each double-stream
+    block's standard attention we add:
+        ip_out = SDPA(img_Q, k_ip[i], v_ip[i])
+        hidden_states += ip_scale[i] * ip_out
+
+    For single-stream blocks the same injection is applied to the image portion of
+    the concatenated [TEXT | IMAGE] sequence.
+
+    Args:
+        flux:           frozen Flux2Klein model
+        noisy_latents:  [B, 32, H/8, W/8] noisy latents in VAE space
+        text_embeds:    [B, seq_txt, 7680] Qwen3 embeddings
+        t_int:          [B] or [1] integer timestep in [0, 1000)
+        k_ip_all:       [B, num_blocks, 128, 3072] IP keys
+        v_ip_all:       [B, num_blocks, 128, 3072] IP values
+        ip_scale:       [num_blocks] per-block scale (from adapter.scale)
+
+    Returns:
+        pred: [B, 32, H/8, W/8] velocity prediction in VAE latent space
+    """
+    tr = flux.transformer
+
+    # ── Step 1: patchify + pack noisy latents ─────────────────────────────────
+    # VAE latents: [B, 32, Lh, Lw]  (Lh = H/8, Lw = W/8)
+    # Patchify:    [B, 128, pH, pW]  (pH = Lh/2 = H/16)
+    # Pack:        [B, seq_img, 128]
+    B, C, Lh, Lw = noisy_latents.shape
+    pH, pW = Lh // 2, Lw // 2
+
+    h = noisy_latents.reshape(B, C, pH, 2, pW, 2)   # [B, 32, pH, 2, pW, 2]
+    h = h.transpose(0, 1, 3, 5, 2, 4)               # [B, 32, 2, 2, pH, pW]
+    h = h.reshape(B, C * 4, pH, pW)                  # [B, 128, pH, pW]
+    hidden_states = h.reshape(B, 128, pH * pW).transpose(0, 2, 1)  # [B, seq_img, 128]
+    seq_img = pH * pW
+
+    # ── Step 2: position IDs ──────────────────────────────────────────────────
+    h_grid = mx.broadcast_to(
+        mx.arange(pH, dtype=mx.int32)[:, None], (pH, pW)
+    ).reshape(-1)
+    w_grid = mx.broadcast_to(
+        mx.arange(pW, dtype=mx.int32)[None, :], (pH, pW)
+    ).reshape(-1)
+    img_ids = mx.stack(
+        [mx.zeros(seq_img, dtype=mx.int32), h_grid, w_grid,
+         mx.zeros(seq_img, dtype=mx.int32)],
+        axis=1,
+    )  # [seq_img, 4]
+
+    seq_txt = text_embeds.shape[1]
+    txt_ids = mx.stack(
+        [mx.zeros(seq_txt, dtype=mx.int32),
+         mx.zeros(seq_txt, dtype=mx.int32),
+         mx.zeros(seq_txt, dtype=mx.int32),
+         mx.arange(seq_txt, dtype=mx.int32)],
+        axis=1,
+    )  # [seq_txt, 4]
+
+    # ── Step 3: timestep embedding ────────────────────────────────────────────
+    # Klein 4B: guidance_embeds=False, so pass guidance=None
+    if not isinstance(t_int, mx.array):
+        timestep = mx.array(t_int, dtype=hidden_states.dtype)
+    else:
+        timestep = t_int.astype(hidden_states.dtype)
+    if timestep.ndim == 0:
+        timestep = mx.full((B,), float(timestep.item()), dtype=hidden_states.dtype)
+    elif timestep.shape[0] == 1 and B > 1:
+        timestep = mx.broadcast_to(timestep, (B,))
+
+    temb = tr.time_guidance_embed(timestep, guidance=None)
+    temb = temb.astype(mx.bfloat16)
+
+    # ── Step 4: project inputs ────────────────────────────────────────────────
+    hidden_states = tr.x_embedder(hidden_states)            # [B, seq_img, inner_dim]
+    encoder_hidden_states = tr.context_embedder(text_embeds)  # [B, seq_txt, inner_dim]
+
+    # ── Step 5: RoPE ──────────────────────────────────────────────────────────
+    image_rotary_emb = tr.pos_embed(img_ids)
+    text_rotary_emb = tr.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        mx.concatenate([text_rotary_emb[0], image_rotary_emb[0]], axis=0),
+        mx.concatenate([text_rotary_emb[1], image_rotary_emb[1]], axis=0),
+    )
+
+    # ── Step 6: double-stream modulation (shared across all double blocks) ────
+    temb_mod_params_img = tr.double_stream_modulation_img(temb)
+    temb_mod_params_txt = tr.double_stream_modulation_txt(temb)
+    # Unpack the AdaLN-Zero shift/scale for IP Q extraction (same for all blocks)
+    (shift_msa_img, scale_msa_img, _), _ = temb_mod_params_img
+
+    # ── Step 7: double-stream blocks + IP injection ───────────────────────────
+    for i, block in enumerate(tr.transformer_blocks):
+        h_before = hidden_states  # save pre-block state to recompute Q
+
+        encoder_hidden_states, hidden_states = block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb_mod_params_img=temb_mod_params_img,
+            temb_mod_params_txt=temb_mod_params_txt,
+            image_rotary_emb=concat_rotary_emb,
+        )
+
+        # Recompute normalised image hidden state to extract Q for IP attention
+        norm_h = block.norm1(h_before)
+        norm_h = (1 + scale_msa_img) * norm_h + shift_msa_img  # [B, seq_img, inner_dim]
+
+        # Q projection + RMSNorm (matches double-block attention path)
+        q_ip = block.attn.to_q(norm_h)
+        bsz, s_img, d_inner = q_ip.shape
+        H = block.attn.heads
+        Hd = block.attn.dim_head
+        q_ip = q_ip.reshape(bsz, s_img, H, Hd)
+        q_ip = block.attn.norm_q(q_ip.astype(mx.float32)).astype(mx.bfloat16)
+        q_ip = q_ip.transpose(0, 2, 1, 3)  # [B, heads, seq_img, head_dim]
+
+        # IP K/V for this block: k_ip_all[:, i] is [B, 128, inner_dim]
+        k_i = k_ip_all[:, i, :, :]  # [B, 128, inner_dim]
+        v_i = v_ip_all[:, i, :, :]
+        k_i = k_i.reshape(bsz, -1, H, Hd).transpose(0, 2, 1, 3)
+        v_i = v_i.reshape(bsz, -1, H, Hd).transpose(0, 2, 1, 3)
+
+        ip_out = mx.fast.scaled_dot_product_attention(
+            q_ip, k_i, v_i, scale=Hd ** -0.5,
+        )  # [B, heads, seq_img, head_dim]
+        ip_out = ip_out.transpose(0, 2, 1, 3).reshape(bsz, s_img, d_inner)
+
+        hidden_states = hidden_states + ip_scale[i] * ip_out
+
+    # ── Step 8: merge streams ─────────────────────────────────────────────────
+    hidden_states = mx.concatenate([encoder_hidden_states, hidden_states], axis=1)
+
+    # ── Step 9: single-stream modulation (shared across all single blocks) ────
+    temb_mod_params_single = tr.single_stream_modulation(temb)[0]
+    mod_shift_s, mod_scale_s, _ = temb_mod_params_single
+
+    n_double = len(tr.transformer_blocks)  # 5 for Klein 4B
+
+    # ── Step 10: single-stream blocks + IP injection ──────────────────────────
+    for j, block in enumerate(tr.single_transformer_blocks):
+        h_before_s = hidden_states
+
+        hidden_states = block(
+            hidden_states=hidden_states,
+            temb_mod_params=temb_mod_params_single,
+            image_rotary_emb=concat_rotary_emb,
+        )
+
+        # IP injection for image tokens: recompute Q from image portion
+        block_ip_idx = n_double + j
+
+        norm_h_full = block.norm(h_before_s)
+        norm_h_full = (1 + mod_scale_s) * norm_h_full + mod_shift_s
+        img_norm_h = norm_h_full[:, seq_txt:, :]  # [B, seq_img, inner_dim]
+
+        # Fused QKV+MLP projection — extract Q only
+        proj_img = block.attn.to_qkv_mlp_proj(img_norm_h)
+        qkv_img, _ = mx.split(proj_img, [block.attn.inner_dim * 3], axis=-1)
+        q_ip_s, _, _ = mx.split(qkv_img, 3, axis=-1)
+
+        bsz2, s2, d2 = q_ip_s.shape
+        H_s = block.attn.heads
+        Hd_s = block.attn.dim_head
+        q_ip_s = q_ip_s.reshape(bsz2, s2, H_s, Hd_s)
+        q_ip_s = block.attn.norm_q(q_ip_s.astype(mx.float32)).astype(mx.bfloat16)
+        q_ip_s = q_ip_s.transpose(0, 2, 1, 3)  # [B, heads, seq_img, head_dim]
+
+        k_i2 = k_ip_all[:, block_ip_idx, :, :]
+        v_i2 = v_ip_all[:, block_ip_idx, :, :]
+        k_i2 = k_i2.reshape(bsz2, -1, H_s, Hd_s).transpose(0, 2, 1, 3)
+        v_i2 = v_i2.reshape(bsz2, -1, H_s, Hd_s).transpose(0, 2, 1, 3)
+
+        ip_out_s = mx.fast.scaled_dot_product_attention(
+            q_ip_s, k_i2, v_i2, scale=Hd_s ** -0.5,
+        )
+        ip_out_s = ip_out_s.transpose(0, 2, 1, 3).reshape(bsz2, s2, d2)
+
+        # Add IP contribution to image portion of hidden_states
+        hidden_states = mx.concatenate([
+            hidden_states[:, :seq_txt, :],
+            hidden_states[:, seq_txt:, :] + ip_scale[block_ip_idx] * ip_out_s,
+        ], axis=1)
+
+    # ── Step 11: extract image tokens, final norm + proj ─────────────────────
+    hidden_states = hidden_states[:, seq_txt:, :]
+    hidden_states = tr.norm_out(hidden_states, temb)
+    hidden_states = tr.proj_out(hidden_states)  # [B, seq_img, 128]
+
+    # ── Step 12: unpack → unatchify → latent space ────────────────────────────
+    # [B, seq_img, 128] → [B, 128, pH, pW] → [B, 32, H/8, W/8]
+    pred = hidden_states.transpose(0, 2, 1).reshape(B, C * 4, pH, pW)
+    pred = pred.reshape(B, C, 2, 2, pH, pW)
+    pred = pred.transpose(0, 1, 4, 2, 5, 3)  # [B, C, pH, 2, pW, 2]
+    pred = pred.reshape(B, C, Lh, Lw)         # [B, 32, H/8, W/8]
+
+    return pred
 
 
 # ─────────────────────────────────────────────────────────────────────────────
