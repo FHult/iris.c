@@ -117,7 +117,6 @@ cat <<LAION
     --encode_quality 85 \\
     --processes_count \$PERF_CORES \\
     --thread_count \$IO_THREADS \\
-    --save_additional_columns '["aesthetic"]' \\
     2>&1 | tee $DATA_ROOT/logs/laion_download.log
 LAION
 
@@ -129,6 +128,7 @@ cat <<JDB
   hf download JourneyDB/JourneyDB \\
     --repo-type dataset \\
     --local-dir $DATA_ROOT/raw/journeydb \\
+    --include "data/train/**" \\
     2>&1 | tee $DATA_ROOT/logs/journeydb_download.log
 JDB
 
