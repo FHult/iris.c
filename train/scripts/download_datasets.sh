@@ -123,12 +123,17 @@ LAION
 # ── Terminal 2: JourneyDB (~80 GB) ───────────────────────────────────────────
 echo ""
 echo "── TERMINAL 2: JourneyDB (~80 GB, non-commercial research) ────────────"
+echo "Note: accept terms at https://huggingface.co/datasets/JourneyDB/JourneyDB first"
 cat <<JDB
   caffeinate -i -d \\
-  hf download JourneyDB/JourneyDB \\
-    --repo-type dataset \\
-    --local-dir $DATA_ROOT/raw/journeydb \\
-    --include "data/train/**" \\
+  python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'JourneyDB/JourneyDB',
+    repo_type='dataset',
+    local_dir='$DATA_ROOT/raw/journeydb',
+    allow_patterns=['data/train/**'],
+)" \\
     2>&1 | tee $DATA_ROOT/logs/journeydb_download.log
 JDB
 
