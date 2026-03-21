@@ -1,25 +1,26 @@
 """
-train/scripts/clip_dedup.py — CLIP-based deduplication via clip-retrieval + FAISS.
+train/scripts/clip_dedup.py — CLIP-based deduplication using open_clip + FAISS.
 
 Removes near-duplicate images (cosine similarity > 0.95) from the training dataset.
 Expected removal: 200–400K from LAION → ~1.6M unique images.
 
+No clip-retrieval dependency. Uses open_clip (ViT-L/14, MPS on Apple Silicon)
+for embedding and faiss-cpu for index / search.
+
 Steps (initial, chunk 1):
-  1. Embed LAION images with CLIP ViT-L/14 (~1.5h on M1 Max for 2M images)
-  2. Build FAISS pair index + find duplicate pairs (threshold=0.95)
+  1. Embed LAION images with CLIP ViT-L/14 on MPS (~1.5h on M1 Max for 1.5M images)
+  2. Find near-duplicate pairs with FAISS batched k-NN (threshold=0.95)
   3. Write duplicate_ids.txt blocklist → used by build_shards.py
   4. After unified shards are built: build a persistent flat IP index over all shards
-     (this is the cross-chunk dedup index, ~10min)
 
 Steps (incremental, chunks 2–4):
   1. Embed new WDS chunk images
   2. Query against the persistent flat index → mark near-duplicates as blocked
-  3. Append new IDs to blocklist (used by build_shards.py --blocklist)
+  3. Append new IDs to blocklist
   4. Add new embeddings to the persistent index
 
 Usage:
     source train/.venv/bin/activate
-    pip install clip-retrieval autofaiss faiss-cpu
 
     # ── Chunk 1: LAION intra-dedup ────────────────────────────────────────────
     python train/scripts/clip_dedup.py all \\
@@ -28,7 +29,6 @@ Usage:
         --output     train/data/dedup_ids
 
     # ── Chunk 1: build persistent cross-chunk dedup index ────────────────────
-    #   (run after build_shards.py merges all sources)
     python train/scripts/clip_dedup.py build-index \\
         --shards     train/data/shards \\
         --embeddings train/data/embeddings/all \\
@@ -46,9 +46,12 @@ Reference: plans/ip-adapter-training.md §2.3
 
 import argparse
 import glob
+import io
 import os
-import subprocess
 import sys
+import tarfile
+
+import numpy as np
 
 try:
     import subprocess as _sp
@@ -59,121 +62,173 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# clip-retrieval wrappers
+# Device selection
+# ---------------------------------------------------------------------------
+
+def _clip_device() -> str:
+    """Return 'mps' on Apple Silicon, 'cuda' if available, else 'cpu'."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Embedding
 # ---------------------------------------------------------------------------
 
 def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     """
-    Run clip-retrieval inference to embed all training images.
-    --num_prepro_workers PERF_CORES saturates all 8 P-cores for CPU decode/preprocess.
+    Embed all WebDataset images with CLIP ViT-L/14 using open_clip.
+    Forward pass runs on MPS (Apple Silicon GPU); CPU decode uses _PERF_CORES threads.
+    Output per shard: img_emb_NNNN.npy (float32 L2-normalised) + metadata_NNNN.parquet (key col).
+    Resume-safe: skips shards whose .npy already exists.
     """
+    import torch
+    import open_clip
+    import pandas as pd
+    from PIL import Image
+
+    device = torch.device(_clip_device())
+    print(f"Loading CLIP ViT-L/14 on device={device} ...")
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-L-14", pretrained="openai"
+    )
+    model = model.to(device).eval()
+
     os.makedirs(embeddings_dir, exist_ok=True)
-    cmd = [
-        "clip-retrieval", "inference",
-        "--input_dataset", shards_dir,
-        "--output_folder", embeddings_dir,
-        "--clip_model", "ViT-L/14",
-        "--batch_size", str(batch_size),
-        "--num_prepro_workers", str(_PERF_CORES),
-        "--enable_metadata", "True",
-    ]
-    print(f"Running CLIP embedding with {_PERF_CORES} prepro workers...")
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
+    tar_files = sorted(glob.glob(os.path.join(shards_dir, "*.tar")))
+    print(f"Embedding {len(tar_files)} shards from {shards_dir} ...")
 
+    total_embedded = 0
 
-def run_index(embeddings_dir: str, index_dir: str, max_memory_gb: int = 12):
-    """Build FAISS index from CLIP embeddings (for intra-set dedup)."""
-    os.makedirs(index_dir, exist_ok=True)
-    cmd = [
-        "clip-retrieval", "index",
-        "--embeddings_folder", embeddings_dir,
-        "--index_folder", index_dir,
-        "--max_index_memory_usage", f"{max_memory_gb}GB",
-    ]
-    print("Building FAISS index...")
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
+    for shard_idx, tar_path in enumerate(tar_files):
+        out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
+        out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
+        if os.path.exists(out_emb) and os.path.exists(out_meta):
+            n = np.load(out_emb, mmap_mode="r").shape[0]
+            total_embedded += n
+            continue
 
-
-def run_dedup(embeddings_dir: str, index_dir: str, output_dir: str, threshold: float = 0.95):
-    """Find near-duplicate pairs and write a blocklist of IDs to remove."""
-    os.makedirs(output_dir, exist_ok=True)
-    dedup_dir = os.path.join(output_dir, "dedup_pairs")
-
-    cmd = [
-        "clip-retrieval", "deduplication",
-        "--embeddings_folder", embeddings_dir,
-        "--output_folder", dedup_dir,
-        "--threshold", str(threshold),
-    ]
-    print(f"Finding duplicates (cosine similarity > {threshold})...")
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-    blocklist_path = os.path.join(output_dir, "duplicate_ids.txt")
-    _write_blocklist(dedup_dir, blocklist_path)
-    print(f"Blocklist written to {blocklist_path}")
-
-
-def _write_blocklist(dedup_pairs_dir: str, output_path: str):
-    """
-    Parse clip-retrieval dedup output and write one duplicate ID per line.
-    Each duplicate pair file contains (id_a, id_b, similarity) rows.
-    We keep id_a and block id_b.
-    """
-    blocked = set()
-    pair_files = glob.glob(os.path.join(dedup_pairs_dir, "*.parquet"))
-    if not pair_files:
-        pair_files = glob.glob(os.path.join(dedup_pairs_dir, "*.csv"))
-
-    for pf in pair_files:
+        keys   = []
+        tensors = []
         try:
-            if pf.endswith(".parquet"):
-                import pandas as pd
-                df = pd.read_parquet(pf)
-            else:
-                import pandas as pd
-                df = pd.read_csv(pf)
-            id_col_right = None
-            for col in ["id_right", "duplicate_id", "b_id"]:
-                if col in df.columns:
-                    id_col_right = col
-                    break
-            if id_col_right:
-                blocked.update(df[id_col_right].astype(str).tolist())
+            with tarfile.open(tar_path) as tf:
+                members = {m.name: m for m in tf.getmembers()}
+                jpg_keys = sorted(
+                    os.path.splitext(n)[0] for n in members if n.endswith(".jpg")
+                )
+                for key in jpg_keys:
+                    m = members.get(key + ".jpg")
+                    if m is None:
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    try:
+                        img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                        t   = preprocess(img)
+                        keys.append(key)
+                        tensors.append(t)
+                    except Exception:
+                        continue
         except Exception as e:
-            print(f"Warning: could not parse {pf}: {e}", file=sys.stderr)
+            print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
+            continue
 
-    with open(output_path, "w") as f:
-        for rec_id in sorted(blocked):
-            f.write(rec_id + "\n")
+        if not tensors:
+            continue
 
-    print(f"  {len(blocked):,} duplicate IDs written to blocklist")
+        all_embs = []
+        with torch.no_grad():
+            for i in range(0, len(tensors), batch_size):
+                batch = torch.stack(tensors[i:i + batch_size]).to(device)
+                embs  = model.encode_image(batch).float()
+                embs  = embs / embs.norm(dim=-1, keepdim=True)
+                all_embs.append(embs.cpu().numpy())
+
+        emb_arr = np.vstack(all_embs).astype(np.float32)
+        np.save(out_emb, emb_arr)
+        pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
+
+        total_embedded += len(keys)
+        if (shard_idx + 1) % 10 == 0 or shard_idx == len(tar_files) - 1:
+            print(f"  [{shard_idx+1}/{len(tar_files)}] {total_embedded:,} images embedded",
+                  flush=True)
+
+    print(f"Done. {total_embedded:,} embeddings in {embeddings_dir}")
 
 
 # ---------------------------------------------------------------------------
-# Cross-chunk dedup helpers
+# Intra-set deduplication (LAION chunk 1)
+# ---------------------------------------------------------------------------
+
+def run_dedup(embeddings_dir: str, output_dir: str, threshold: float = 0.95):
+    """
+    Find near-duplicate pairs within the embedded set using batched FAISS k-NN search.
+    Writes duplicate_ids.txt: one blocked ID per line (keep first occurrence, block rest).
+    Works in O(N * k) with IndexFlatIP — exact cosine similarity, no approximation.
+    """
+    import faiss
+
+    os.makedirs(output_dir, exist_ok=True)
+    ids, vecs = _load_embeddings_from_dir(embeddings_dir)
+    if len(ids) == 0:
+        print("No embeddings found — nothing to dedup", file=sys.stderr)
+        return
+
+    N, D = vecs.shape
+    print(f"Building FAISS IndexFlatIP for {N:,} vectors (dim={D}) ...")
+    index = faiss.IndexFlatIP(D)
+    index.add(vecs)
+
+    print(f"Searching k=2 nearest neighbours (threshold={threshold}) ...")
+    blocked: set[str] = set()
+    BATCH = 4096
+    for start in range(0, N, BATCH):
+        batch = vecs[start:start + BATCH]
+        scores, idxs = index.search(batch, k=2)
+        for i, (score_row, idx_row) in enumerate(zip(scores, idxs)):
+            global_i = start + i
+            # k=0 is self-match; k=1 is nearest other
+            if len(score_row) > 1 and score_row[1] >= threshold:
+                j = idx_row[1]
+                if j != global_i and j >= 0:
+                    # Block the higher-index duplicate
+                    blocked.add(ids[max(global_i, j)])
+
+    blocklist_path = os.path.join(output_dir, "duplicate_ids.txt")
+    with open(blocklist_path, "w") as f:
+        for rec_id in sorted(blocked):
+            f.write(rec_id + "\n")
+
+    print(f"  {len(blocked):,} duplicate IDs → {blocklist_path}")
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _load_embeddings_from_dir(embeddings_dir: str):
     """
-    Load clip-retrieval inference output from a directory.
+    Load img_emb_*.npy + metadata_*.parquet pairs.
     Returns (ids: list[str], vecs: np.ndarray[N, D] float32, L2-normalised).
-    Matches img_emb_*.npy files against metadata_*.parquet by index.
     """
-    import numpy as np
-
     emb_files = sorted(glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy")))
     if not emb_files:
         return [], np.zeros((0, 768), dtype=np.float32)
 
     all_vecs = []
-    all_ids = []
+    all_ids  = []
 
     for emb_file in emb_files:
-        idx = emb_file.rsplit("_", 1)[-1].replace(".npy", "")
-        meta_file = os.path.join(embeddings_dir, f"metadata_{idx}.parquet")
+        idx_str  = emb_file.rsplit("_", 1)[-1].replace(".npy", "")
+        meta_file = os.path.join(embeddings_dir, f"metadata_{idx_str}.parquet")
 
         vecs = np.load(emb_file).astype(np.float32)
         all_vecs.append(vecs)
@@ -185,12 +240,11 @@ def _load_embeddings_from_dir(embeddings_dir: str):
             if key_col:
                 all_ids.extend(df[key_col].astype(str).tolist())
             else:
-                all_ids.extend([f"{idx}_{i}" for i in range(len(vecs))])
+                all_ids.extend([f"{idx_str}_{i}" for i in range(len(vecs))])
         else:
-            all_ids.extend([f"{idx}_{i}" for i in range(len(vecs))])
+            all_ids.extend([f"{idx_str}_{i}" for i in range(len(vecs))])
 
     vecs = np.vstack(all_vecs)
-    # L2-normalise so IndexFlatIP gives cosine similarity
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     vecs /= norms
@@ -210,16 +264,15 @@ def _load_or_create_flat_index(index_path: str, dim: int = 768):
     return index
 
 
+# ---------------------------------------------------------------------------
+# Cross-chunk dedup helpers
+# ---------------------------------------------------------------------------
+
 def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
                     batch_size: int = 256):
     """
-    Embed all unified shards with CLIP and build the persistent flat IP index
-    used for cross-chunk deduplication.
-
-    Resume-safe: skips embedding only if the sentinel file (.embed_done) exists,
-    indicating a previous run completed successfully.  A sentinel is written only
-    after clip-retrieval inference exits cleanly, so a partially-written embedding
-    dir is detected and re-embedded from scratch.
+    Embed all unified shards with CLIP and build the persistent flat IP index.
+    Resume-safe: skips embedding if .embed_done sentinel exists.
     """
     import faiss
 
@@ -228,14 +281,13 @@ def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
         existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
         print(f"Embeddings already complete ({len(existing_embs)} files) — skipping CLIP inference")
     else:
-        # Remove any partial embedding files before re-running
         for stale in glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy")):
             os.remove(stale)
         for stale in glob.glob(os.path.join(embeddings_dir, "metadata_*.parquet")):
             os.remove(stale)
-        print(f"Embedding unified shards for cross-chunk dedup index...")
+        print("Embedding unified shards for cross-chunk dedup index...")
         run_embed(shards_dir, embeddings_dir, batch_size)
-        open(sentinel, "w").close()  # mark embedding as complete
+        open(sentinel, "w").close()
 
     print("Loading embeddings...")
     ids, vecs = _load_embeddings_from_dir(embeddings_dir)
@@ -257,18 +309,14 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
                     batch_size: int = 256):
     """
     Incremental cross-chunk deduplication:
-      1. Embed new_shards with CLIP (skip if embeddings already present)
+      1. Embed new_shards (skip if embeddings already present)
       2. Query every new embedding against the existing flat index
-      3. Append IDs of near-duplicates (similarity >= threshold) to blocklist
-      4. Add all new embeddings to the index (originals + duplicates alike,
-         so future chunks are checked against the full corpus)
+      3. Append IDs of near-duplicates to blocklist
+      4. Add all new embeddings to the index
       5. Save the updated index
-
-    build_shards.py --blocklist will then skip the flagged IDs when writing shards.
     """
     import faiss
 
-    # 1. Embed
     existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
     if existing_embs:
         print(f"Embeddings already exist ({len(existing_embs)} files) — skipping CLIP inference")
@@ -276,41 +324,35 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
         print(f"Embedding new shards from {new_shards} ...")
         run_embed(new_shards, embeddings_dir, batch_size)
 
-    # 2. Load new embeddings
     new_ids, new_vecs = _load_embeddings_from_dir(embeddings_dir)
     if len(new_ids) == 0:
-        print("No embeddings found in new shards — nothing to dedup", file=sys.stderr)
+        print("No embeddings found — nothing to dedup", file=sys.stderr)
         return
     print(f"  {len(new_ids):,} new embeddings (dim={new_vecs.shape[1]})", flush=True)
 
-    # 3. Load or create the persistent index
     index = _load_or_create_flat_index(index_path, dim=new_vecs.shape[1])
 
-    # 4. Query for near-duplicates
     duplicate_ids: set[str] = set()
     if index.ntotal > 0:
         print(f"  Querying {len(new_ids):,} images against {index.ntotal:,} existing ...",
               flush=True)
-        # Search in batches of 4096 to avoid peak memory
         BATCH = 4096
         for start in range(0, len(new_ids), BATCH):
             batch_vecs = new_vecs[start:start + BATCH]
-            scores, _ = index.search(batch_vecs, k=1)
+            scores, _  = index.search(batch_vecs, k=1)
             for i, score_row in enumerate(scores):
                 if score_row[0] >= threshold:
                     duplicate_ids.add(new_ids[start + i])
         print(f"  Found {len(duplicate_ids):,} near-duplicates (threshold={threshold})",
               flush=True)
     else:
-        print("  Index is empty — all new images treated as unique (building initial index)")
+        print("  Index is empty — all new images treated as unique")
 
-    # 5. Append new duplicate IDs to blocklist
     if duplicate_ids:
         existing_blocked: set[str] = set()
         if os.path.exists(blocklist_path):
             with open(blocklist_path) as f:
                 existing_blocked = {line.strip() for line in f if line.strip()}
-
         new_blocked = duplicate_ids - existing_blocked
         if new_blocked:
             os.makedirs(os.path.dirname(blocklist_path) or ".", exist_ok=True)
@@ -320,7 +362,6 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
             print(f"  Added {len(new_blocked):,} IDs to blocklist ({blocklist_path})",
                   flush=True)
 
-    # 6. Add all new embeddings to the index (so future chunks see this data)
     index.add(new_vecs)
     faiss.write_index(index, index_path)
     print(f"  Updated dedup index → {index_path} ({index.ntotal:,} total vectors)", flush=True)
@@ -332,60 +373,52 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CLIP-based deduplication for training dataset"
+        description="CLIP-based deduplication (open_clip + FAISS, no clip-retrieval)"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # embed
     emb = subparsers.add_parser("embed", help="Embed images with CLIP ViT-L/14")
-    emb.add_argument("--shards", required=True)
-    emb.add_argument("--embeddings", required=True)
-    emb.add_argument("--batch_size", type=int, default=256)
+    emb.add_argument("--shards",      required=True)
+    emb.add_argument("--embeddings",  required=True)
+    emb.add_argument("--batch_size",  type=int, default=256)
 
     # dedup (intra-set, for initial LAION pass)
-    dd = subparsers.add_parser("dedup", help="Index + find intra-set duplicates")
-    dd.add_argument("--embeddings", required=True)
-    dd.add_argument("--output", required=True,
+    dd = subparsers.add_parser("dedup", help="Find intra-set duplicates from embeddings")
+    dd.add_argument("--embeddings",  required=True)
+    dd.add_argument("--output",      required=True,
                     help="Directory for duplicate_ids.txt")
-    dd.add_argument("--threshold", type=float, default=0.95)
-    dd.add_argument("--max_memory_gb", type=int, default=12)
+    dd.add_argument("--threshold",   type=float, default=0.95)
 
     # all (embed + intra dedup in one go, for LAION)
-    al = subparsers.add_parser("all", help="Embed + index + dedup in sequence")
-    al.add_argument("--shards", required=True)
-    al.add_argument("--embeddings", required=True)
-    al.add_argument("--output", required=True)
-    al.add_argument("--batch_size", type=int, default=256)
-    al.add_argument("--threshold", type=float, default=0.95)
+    al = subparsers.add_parser("all", help="Embed + dedup in sequence")
+    al.add_argument("--shards",      required=True)
+    al.add_argument("--embeddings",  required=True)
+    al.add_argument("--output",      required=True)
+    al.add_argument("--batch_size",  type=int, default=256)
+    al.add_argument("--threshold",   type=float, default=0.95)
 
-    # build-index (after chunk 1 build_shards: embed all shards + build flat IP index)
+    # build-index
     bi = subparsers.add_parser(
         "build-index",
-        help="Embed unified shards and build persistent flat FAISS index for cross-chunk dedup"
+        help="Embed unified shards and build persistent flat FAISS index"
     )
-    bi.add_argument("--shards", required=True,
-                    help="Unified shards directory (output of build_shards.py)")
-    bi.add_argument("--embeddings", required=True,
-                    help="Directory to store CLIP embeddings")
-    bi.add_argument("--index", required=True,
-                    help="Path to save the flat IP FAISS index (.faiss)")
-    bi.add_argument("--batch_size", type=int, default=256)
+    bi.add_argument("--shards",      required=True)
+    bi.add_argument("--embeddings",  required=True)
+    bi.add_argument("--index",       required=True)
+    bi.add_argument("--batch_size",  type=int, default=256)
 
-    # incremental (chunks 2–4: embed new WDS, query index, update blocklist + index)
+    # incremental
     inc = subparsers.add_parser(
         "incremental",
-        help="Embed new chunk shards, find cross-chunk duplicates, update blocklist + index"
+        help="Embed new chunk, find cross-chunk duplicates, update blocklist + index"
     )
-    inc.add_argument("--shards", required=True,
-                     help="New WDS chunk directory (output of convert_journeydb.py)")
-    inc.add_argument("--embeddings", required=True,
-                     help="Directory to store CLIP embeddings for this chunk")
-    inc.add_argument("--index", required=True,
-                     help="Path to the persistent flat IP FAISS index (.faiss)")
-    inc.add_argument("--blocklist", required=True,
-                     help="Path to duplicate_ids.txt (will be appended to)")
-    inc.add_argument("--threshold", type=float, default=0.95)
-    inc.add_argument("--batch_size", type=int, default=256)
+    inc.add_argument("--shards",      required=True)
+    inc.add_argument("--embeddings",  required=True)
+    inc.add_argument("--index",       required=True)
+    inc.add_argument("--blocklist",   required=True)
+    inc.add_argument("--threshold",   type=float, default=0.95)
+    inc.add_argument("--batch_size",  type=int, default=256)
 
     args = parser.parse_args()
 
@@ -393,15 +426,11 @@ def main():
         run_embed(args.shards, args.embeddings, args.batch_size)
 
     elif args.command == "dedup":
-        index_dir = os.path.join(args.embeddings, "faiss_index")
-        run_index(args.embeddings, index_dir, args.max_memory_gb)
-        run_dedup(args.embeddings, index_dir, args.output, args.threshold)
+        run_dedup(args.embeddings, args.output, args.threshold)
 
     elif args.command == "all":
         run_embed(args.shards, args.embeddings, args.batch_size)
-        index_dir = os.path.join(args.embeddings, "faiss_index")
-        run_index(args.embeddings, index_dir)
-        run_dedup(args.embeddings, index_dir, args.output, args.threshold)
+        run_dedup(args.embeddings, args.output, args.threshold)
 
     elif args.command == "build-index":
         run_build_index(args.shards, args.embeddings, args.index, args.batch_size)
