@@ -145,9 +145,20 @@ def main():
         "--workers", type=int, default=_PERF_CORES,
         help=f"Parallel workers (default {_PERF_CORES} = all P-cores)"
     )
+    parser.add_argument(
+        "--start-idx", type=int, default=0,
+        help="Only filter shards whose numeric index >= this value (use to "
+             "filter only newly appended shards without re-processing old ones)"
+    )
     args = parser.parse_args()
 
-    shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
+    all_shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
+    if args.start_idx > 0:
+        shards = [s for s in all_shards
+                  if int(os.path.splitext(os.path.basename(s))[0]) >= args.start_idx]
+        print(f"--start-idx {args.start_idx}: filtering {len(shards)}/{len(all_shards)} shards")
+    else:
+        shards = all_shards
     if not shards:
         print(f"No .tar files found in {args.shards}", file=sys.stderr)
         sys.exit(1)

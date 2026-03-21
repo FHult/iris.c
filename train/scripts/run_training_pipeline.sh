@@ -206,6 +206,20 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  Done"
     fi
 
+    # ── 1f2. Build persistent cross-chunk dedup index ─────────────────────────
+    DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
+    ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
+    if [[ -f "$DEDUP_INDEX" ]]; then
+        log "[5c/8] Cross-chunk dedup index already built — skipping"
+    else
+        log "[5c/8] Building cross-chunk dedup index from unified shards (~1.5h)..."
+        python "$SCRIPT_DIR/clip_dedup.py" build-index \
+            --shards     "$SHARDS_DIR" \
+            --embeddings "$ALL_EMBEDDINGS" \
+            --index      "$DEDUP_INDEX"
+        log "  Done: $DEDUP_INDEX"
+    fi
+
     # ── 1g. Create anchor set (once, before any incremental chunks) ───────────
     ANCHOR_DIR="$DATA_ROOT/anchor_shards"
     if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
@@ -283,6 +297,9 @@ elif [[ "$CHUNK" -ge 2 && "$CHUNK" -le 4 ]]; then
     QWEN3_DIR="$DATA_ROOT/precomputed/qwen3"
     VAE_DIR="$DATA_ROOT/precomputed/vae"
     CKPT_DIR="${CKPT_DIR:-checkpoints/stage1}"
+    DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
+    DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+    CHUNK_EMBEDDINGS="$DATA_ROOT/embeddings/chunk${CHUNK}"
 
     # ── 1. Download JourneyDB chunk N ─────────────────────────────────────────
     # Count how many of the expected files are present
@@ -336,23 +353,43 @@ PYEOF
         log "  Done: $(count_tars "$JDB_WDS") shards in $JDB_WDS"
     fi
 
+    # ── 2b. Cross-chunk dedup: flag images already seen in previous chunks ────
+    DEDUP_DONE="$SHARDS_DIR/.deduped_chunk${CHUNK}"
+    if [[ -f "$DEDUP_DONE" ]]; then
+        log "[2b/6] Cross-chunk dedup already done for chunk $CHUNK — skipping"
+    elif [[ ! -f "$DEDUP_INDEX" ]]; then
+        log "[2b/6] WARNING: no dedup index found at $DEDUP_INDEX"
+        log "         Skipping cross-chunk dedup (run build-index on chunk 1 shards first)"
+    else
+        log "[2b/6] Running cross-chunk dedup (query $JDB_WDS against existing index)..."
+        python "$SCRIPT_DIR/clip_dedup.py" incremental \
+            --shards     "$JDB_WDS" \
+            --embeddings "$CHUNK_EMBEDDINGS" \
+            --index      "$DEDUP_INDEX" \
+            --blocklist  "$DEDUP_IDS"
+        touch "$DEDUP_DONE"
+        log "  Done: updated blocklist at $DEDUP_IDS"
+    fi
+
     # ── 3. Build + filter new shards (appended to main shards/) ──────────────
     FILTER_DONE="$SHARDS_DIR/.filtered_chunk${CHUNK}"
     if [[ -f "$FILTER_DONE" ]]; then
         log "[3/6] Chunk $CHUNK shards already built and filtered — skipping"
     else
-        # Determine start index (= number of existing shards)
+        # Capture shard count before appending — needed for filter --start-idx
         EXISTING=$(count_tars "$SHARDS_DIR")
         log "[3/6] Building new shards for chunk $CHUNK (appending after shard $EXISTING)..."
         python "$SCRIPT_DIR/build_shards.py" \
-            --sources "$JDB_WDS" \
-            --output  "$SHARDS_DIR" \
-            --start-idx "$EXISTING"
+            --sources   "$JDB_WDS" \
+            --output    "$SHARDS_DIR" \
+            --start-idx "$EXISTING" \
+            --blocklist "$DEDUP_IDS"
         log "  Done: $(count_tars "$SHARDS_DIR") total shards (was $EXISTING)"
 
-        log "       Filtering new shards..."
-        # Filter only the new shards by globbing the new index range
-        python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR"
+        log "       Filtering new shards only (--start-idx $EXISTING)..."
+        python "$SCRIPT_DIR/filter_shards.py" \
+            --shards    "$SHARDS_DIR" \
+            --start-idx "$EXISTING"
         touch "$FILTER_DONE"
         log "  Done"
     fi
