@@ -41,8 +41,6 @@ output:
   checkpoint_every: 1000
   keep_last_n: 5
   log_every: 50
-  eval_every: 1000
-  eval_prompts_path: "train/configs/eval_prompts.txt"
 
 logging:
   wandb_project: "iris-ip-adapter"

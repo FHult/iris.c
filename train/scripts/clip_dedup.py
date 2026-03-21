@@ -214,17 +214,28 @@ def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
                     batch_size: int = 256):
     """
     Embed all unified shards with CLIP and build the persistent flat IP index
-    used for cross-chunk deduplication.  Safe to re-run: skips embedding if
-    img_emb_*.npy files already exist.
+    used for cross-chunk deduplication.
+
+    Resume-safe: skips embedding only if the sentinel file (.embed_done) exists,
+    indicating a previous run completed successfully.  A sentinel is written only
+    after clip-retrieval inference exits cleanly, so a partially-written embedding
+    dir is detected and re-embedded from scratch.
     """
     import faiss
 
-    existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
-    if existing_embs:
-        print(f"Embeddings already exist ({len(existing_embs)} files) — skipping CLIP inference")
+    sentinel = os.path.join(embeddings_dir, ".embed_done")
+    if os.path.exists(sentinel):
+        existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
+        print(f"Embeddings already complete ({len(existing_embs)} files) — skipping CLIP inference")
     else:
+        # Remove any partial embedding files before re-running
+        for stale in glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy")):
+            os.remove(stale)
+        for stale in glob.glob(os.path.join(embeddings_dir, "metadata_*.parquet")):
+            os.remove(stale)
         print(f"Embedding unified shards for cross-chunk dedup index...")
         run_embed(shards_dir, embeddings_dir, batch_size)
+        open(sentinel, "w").close()  # mark embedding as complete
 
     print("Loading embeddings...")
     ids, vecs = _load_embeddings_from_dir(embeddings_dir)

@@ -30,7 +30,7 @@ def make_caption(row) -> str:
     if style and desc:
         return f"{style} painting: {desc}"
     elif style:
-        return f"A {style} painting"
+        return f"An artwork painted in the {style} style"
     return desc
 
 

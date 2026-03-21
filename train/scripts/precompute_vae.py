@@ -143,14 +143,14 @@ def process_shard(args) -> dict:
     try:
         import mlx.core as mx
         import mlx.nn as nn
-        from mflux import Flux1  # VAE is part of mflux model
+        from mflux.models.flux2 import Flux2Klein
     except ImportError:
         print("mflux not available. Run: pip install mflux", file=sys.stderr)
         return {"shard": shard_path, "written": 0, "error": True}
 
     # Load only the VAE (not the full transformer)
     try:
-        flux = Flux1.from_pretrained(model_path, quantize=4)
+        flux = Flux2Klein(model_path=model_path, quantize=None)
         vae = flux.vae
         vae.freeze()
     except Exception as e:
@@ -207,8 +207,8 @@ def main():
         help="Image size fed to VAE (default 512)"
     )
     parser.add_argument(
-        "--workers", type=int, default=2,
-        help="Parallel processes (default 2; GPU shared so >2 contends)"
+        "--workers", type=int, default=1,
+        help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
     args = parser.parse_args()
 

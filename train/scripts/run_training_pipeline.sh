@@ -227,10 +227,10 @@ if [[ "$CHUNK" -eq 1 ]]; then
     else
         log "[5b/8] Creating anchor set (10k diverse samples from non-JourneyDB sources)..."
         python "$SCRIPT_DIR/create_anchor_set.py" \
-            --shards  "$SHARDS_DIR" \
-            --output  "$ANCHOR_DIR" \
-            --n       10000 \
-            --sources laion wikiart coyo
+            --shards           "$SHARDS_DIR" \
+            --output           "$ANCHOR_DIR" \
+            --n                10000 \
+            --exclude-sources  journeydb
         log "  Done: anchor set in $ANCHOR_DIR"
     fi
 
@@ -312,7 +312,14 @@ elif [[ "$CHUNK" -ge 2 && "$CHUNK" -le 4 ]]; then
         3) TGZ_GLOB="$JDB_RAW/data/train/imgs/1[0-4][0-9].tgz" ;;
         4) TGZ_GLOB="$JDB_RAW/data/train/imgs/1[5-9][0-9].tgz" ;;
     esac
-    PRESENT=$(ls $TGZ_GLOB 2>/dev/null | wc -l || echo 0)
+    if [[ "$CHUNK" -eq 4 ]]; then
+        # 150–199 matched by TGZ_GLOB, plus 200.tgz and 201.tgz
+        PRESENT=$(ls $TGZ_GLOB \
+                     "$JDB_RAW/data/train/imgs/200.tgz" \
+                     "$JDB_RAW/data/train/imgs/201.tgz" 2>/dev/null | wc -l)
+    else
+        PRESENT=$(ls $TGZ_GLOB 2>/dev/null | wc -l || echo 0)
+    fi
 
     if [[ "$PRESENT" -eq "$EXPECTED_TGZ_COUNT" ]] || \
        [[ "$CHUNK" -eq 4 && "$PRESENT" -ge 50 ]]; then
@@ -338,7 +345,11 @@ snapshot_download(
 )
 print('Download complete.')
 PYEOF
-        log "  Done: $(ls $TGZ_GLOB 2>/dev/null | wc -l) files in $JDB_RAW"
+        if [[ "$CHUNK" -eq 4 ]]; then
+            log "  Done: $(ls $TGZ_GLOB "$JDB_RAW/data/train/imgs/200.tgz" "$JDB_RAW/data/train/imgs/201.tgz" 2>/dev/null | wc -l) files in $JDB_RAW"
+        else
+            log "  Done: $(ls $TGZ_GLOB 2>/dev/null | wc -l) files in $JDB_RAW"
+        fi
     fi
 
     # ── 2. Convert chunk N to WebDataset ─────────────────────────────────────

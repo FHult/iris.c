@@ -124,29 +124,26 @@ def _normalize(img: np.ndarray) -> np.ndarray:
 def augment_mlx(img, bucket_h: int, bucket_w: int):
     """
     MLX GPU augmentation: random horizontal flip + random crop.
-    img: MLX array [B, H_pad, W_pad, C] or [H_pad, W_pad, C]
-    Pads source by 32px per side then crops to (bucket_h, bucket_w).
+    img: MLX array [B, C, H_pad, W_pad] — BCHW format from the prefetch thread.
+    Images are pre-padded to (bucket_h + 32, bucket_w + 32).
 
-    Called AFTER image is an MLX array — no CPU→GPU copy penalty.
-    Eliminates one copy vs doing augmentation on CPU.
+    Uses Python random (not mx.random) to avoid GPU→CPU sync stalls.
     """
     import mlx.core as mx
 
-    # Random horizontal flip
-    if mx.random.uniform().item() > 0.5:
-        img = mx.flip(img, axis=-2)  # flip width axis (last spatial)
+    # Random horizontal flip (axis=-1 = W axis in BCHW)
+    if random.random() > 0.5:
+        img = mx.flip(img, axis=-1)
 
-    # Random crop from padded image
-    # Images are pre-padded to (bucket_h + 32, bucket_w + 32) in the prefetch thread
-    max_h_offset = 32
-    max_w_offset = 32
-    h_off = int(mx.random.randint(0, max_h_offset).item())
-    w_off = int(mx.random.randint(0, max_w_offset).item())
+    # Random crop offsets — Python random avoids GPU sync
+    h_off = random.randint(0, 31)
+    w_off = random.randint(0, 31)
 
-    if img.ndim == 4:  # batched [B, H, W, C]
-        return img[:, h_off:h_off + bucket_h, w_off:w_off + bucket_w, :]
-    else:  # single [H, W, C]
-        return img[h_off:h_off + bucket_h, w_off:w_off + bucket_w, :]
+    # BCHW crop: keep all channels, slice H and W
+    if img.ndim == 4:  # [B, C, H_pad, W_pad]
+        return img[:, :, h_off:h_off + bucket_h, w_off:w_off + bucket_w]
+    else:  # [C, H_pad, W_pad]
+        return img[:, h_off:h_off + bucket_h, w_off:w_off + bucket_w]
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +173,18 @@ def _load_qwen3_embed(rec_id: str, qwen3_dir: Optional[str]) -> Optional[np.ndar
         return None
 
 
-def _load_vae_latent(rec_id: str, vae_dir: Optional[str]) -> Optional[np.ndarray]:
+def _load_vae_latent(
+    rec_id: str,
+    vae_dir: Optional[str],
+    expected_hw: Optional[Tuple[int, int]] = None,
+) -> Optional[np.ndarray]:
     """
     Load int8 quantised VAE latent.
     Returns float16 [32, H/8, W/8] or None if not available.
+
+    expected_hw: (H//8, W//8) of the current training bucket.  If the stored
+    latent has a different spatial shape the cache entry is from a different
+    resolution and we return None so the caller falls back to inline VAE encode.
     """
     if not vae_dir:
         return None
@@ -188,7 +193,11 @@ def _load_vae_latent(rec_id: str, vae_dir: Optional[str]) -> Optional[np.ndarray
         return None
     try:
         d = np.load(path)
-        return (d["q"].astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
+        latent = (d["q"].astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
+        if expected_hw is not None:
+            if latent.shape[1] != expected_hw[0] or latent.shape[2] != expected_hw[1]:
+                return None
+        return latent
     except Exception:
         return None
 
@@ -363,7 +372,11 @@ def make_prefetch_loader(
 
                 # Pre-computed embeds (CPU-trivial dequant)
                 text_emb = _load_qwen3_embed(rec["id"], qwen3_cache_dir)
-                vae_lat = _load_vae_latent(rec["id"], vae_cache_dir)
+                # VAE cache was encoded at a fixed resolution; reject entries whose
+                # spatial shape doesn't match the current training bucket.
+                vae_lat = _load_vae_latent(
+                    rec["id"], vae_cache_dir, expected_hw=(bH // 8, bW // 8)
+                )
                 siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
 
                 imgs_buf.append(_normalize(img))

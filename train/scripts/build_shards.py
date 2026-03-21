@@ -35,6 +35,7 @@ Reference: plans/ip-adapter-training.md §2.5
 """
 
 import argparse
+import collections
 import glob
 import io
 import math
@@ -114,53 +115,34 @@ def _is_valid_caption(caption: str) -> bool:
     return True
 
 
-def _iter_shard(shard_path: str):
-    """
-    Yield {id, jpg, txt} dicts from a WebDataset tar shard.
-    Handles both img2dataset-style (__key__) and raw key naming.
-    """
-    try:
-        with tarfile.open(shard_path) as tar:
-            members = {m.name: m for m in tar.getmembers() if m.isfile()}
-            # Group by stem (everything before the last dot)
-            keys = {}
-            for name in members:
-                stem, _, ext = name.rpartition(".")
-                if stem not in keys:
-                    keys[stem] = {}
-                keys[stem][ext.lower()] = name
-
-            for stem, exts in keys.items():
-                jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
-                txt_key = exts.get("txt") or exts.get("caption")
-                if not jpg_key or not txt_key:
-                    continue
-                jpg_data = tar.extractfile(members[jpg_key]).read()
-                txt_data = tar.extractfile(members[txt_key]).read().decode(
-                    "utf-8", errors="replace"
-                ).strip()
-                yield {"id": stem, "jpg": jpg_data, "txt": txt_data}
-    except Exception as e:
-        print(f"Warning: failed to read {shard_path}: {e}", file=sys.stderr)
-
-
 def _collect_records(source_dirs: list) -> list:
     """
     Enumerate all records from all source shard directories.
-    Returns list of (shard_path, record_id, relative_position) tuples.
-    Actual JPEG decode is deferred to workers.
+    Returns list of {"shard": path, "id": stem, "txt": str} — NO jpg bytes.
+    JPEG bytes are read on demand in workers, one source shard at a time,
+    to avoid loading the entire dataset (~200 GB) into RAM at once.
     """
     records = []
     for src_dir in source_dirs:
-        shards = sorted(glob.glob(os.path.join(src_dir, "*.tar")))
-        for shard_path in shards:
-            for rec in _iter_shard(shard_path):
-                records.append({
-                    "shard": shard_path,
-                    "id": rec["id"],
-                    "jpg": rec["jpg"],
-                    "txt": rec["txt"],
-                })
+        for shard_path in sorted(glob.glob(os.path.join(src_dir, "*.tar"))):
+            try:
+                with tarfile.open(shard_path) as tar:
+                    members = {m.name: m for m in tar.getmembers() if m.isfile()}
+                    keys = {}
+                    for name in members:
+                        stem, _, ext = name.rpartition(".")
+                        keys.setdefault(stem, {})[ext.lower()] = name
+                    for stem, exts in keys.items():
+                        jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
+                        txt_key = exts.get("txt") or exts.get("caption")
+                        if not jpg_key or not txt_key:
+                            continue
+                        txt = tar.extractfile(members[txt_key]).read().decode(
+                            "utf-8", errors="replace"
+                        ).strip()
+                        records.append({"shard": shard_path, "id": stem, "txt": txt})
+            except Exception as e:
+                print(f"Warning: failed to read {shard_path}: {e}", file=sys.stderr)
     return records
 
 
@@ -173,6 +155,11 @@ def _write_shard_range(args) -> dict:
     Worker: write a non-overlapping range of output shards.
     Each worker gets shard indices [i, i+workers, i+2*workers, ...].
     No locks needed — each worker owns its shard files exclusively.
+
+    Records contain only metadata (shard path, id, txt) — no pre-loaded jpg bytes.
+    Worker groups records by source shard and opens each source shard once to read
+    jpegs sequentially, keeping peak memory to one source shard's worth of images
+    rather than the full dataset.
     """
     shard_ids, records, output_dir, shard_size, blocklist, quality = args
     blocklist_set = set(blocklist)
@@ -180,6 +167,33 @@ def _write_shard_range(args) -> dict:
     # Per-process turbojpeg instance (not process-safe to pass from parent)
     if _HAS_TURBOJPEG:
         tj = TurboJPEG()
+
+    # Sort records by source shard path to open each source shard exactly once.
+    # Records were pre-shuffled globally before slicing to this worker, so the
+    # output distribution is random despite the sequential source-shard read order.
+    by_source = collections.defaultdict(list)
+    for i, rec in enumerate(records):
+        by_source[rec["shard"]].append((i, rec))
+
+    # Load jpg bytes one source shard at a time; build a flat index by record id.
+    # Peak RAM = jpegs in the largest source shard × this worker's fraction.
+    jpg_cache: dict = {}  # id → raw jpg bytes
+    for src_path in sorted(by_source.keys()):
+        needed = {rec["id"] for _, rec in by_source[src_path]}
+        try:
+            with tarfile.open(src_path) as src_tar:
+                src_members = {m.name: m for m in src_tar.getmembers() if m.isfile()}
+                stem_to_jpg = {}
+                for name in src_members:
+                    stem, _, ext = name.rpartition(".")
+                    if ext.lower() in ("jpg", "jpeg", "png") and stem in needed:
+                        stem_to_jpg.setdefault(stem, name)
+                for stem in needed:
+                    jpg_name = stem_to_jpg.get(stem)
+                    if jpg_name:
+                        jpg_cache[stem] = src_tar.extractfile(src_members[jpg_name]).read()
+        except Exception as e:
+            print(f"Warning: failed to read source {src_path}: {e}", file=sys.stderr)
 
     idx = 0
     written_total = 0
@@ -202,14 +216,19 @@ def _write_shard_range(args) -> dict:
                     skipped += 1
                     continue
 
+                raw_jpg = jpg_cache.get(rec["id"])
+                if raw_jpg is None:
+                    skipped += 1
+                    continue
+
                 try:
                     # Decode to validate dimensions + re-encode at target quality
                     if _HAS_TURBOJPEG:
-                        img = tj.decode(rec["jpg"])  # numpy HWC RGB
+                        img = tj.decode(raw_jpg)  # numpy HWC RGB
                         h, w = img.shape[:2]
                     else:
                         from PIL import Image as PilImage
-                        img = PilImage.open(io.BytesIO(rec["jpg"])).convert("RGB")
+                        img = PilImage.open(io.BytesIO(raw_jpg)).convert("RGB")
                         w, h = img.size
 
                     if w < 256 or h < 256:

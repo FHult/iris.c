@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -65,24 +66,59 @@ except ImportError:
 # LR schedule (plans/ip-adapter-training.md §3.11)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int):
+def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
+                      start_step: int = 0):
     """
     Linear warmup then cosine decay.
     Uses optim.join_schedules matching plans/ip-adapter-training.md §3.11.
+
+    start_step: if resuming, pass the loaded step so the schedule continues
+    from the correct position rather than restarting warmup from scratch.
+
+    eta_min is set proportionally to lr_max (1% of peak) so that chunks with
+    lower lr (e.g. 1e-5) still have a meaningful decay range instead of
+    collapsing to the hardcoded 1e-6 floor.
     """
+    eta_min = max(1e-8, lr_max * 0.01)
     decay_steps = total_steps - warmup_steps
-    return optim.join_schedules(
-        [
-            optim.linear_schedule(1e-6, lr_max, steps=warmup_steps),
-            optim.cosine_decay(lr_max, decay_steps=decay_steps, eta_min=1e-6),
-        ],
-        [warmup_steps],
-    )
+
+    if start_step == 0:
+        return optim.join_schedules(
+            [
+                optim.linear_schedule(1e-8, lr_max, steps=warmup_steps),
+                optim.cosine_decay(lr_max, decay_steps=decay_steps, eta_min=eta_min),
+            ],
+            [warmup_steps],
+        )
+
+    # Resume: fast-forward to the correct LR position
+    if start_step < warmup_steps:
+        current_lr = lr_max * start_step / max(1, warmup_steps)
+        remaining_warmup = warmup_steps - start_step
+        return optim.join_schedules(
+            [
+                optim.linear_schedule(current_lr, lr_max, steps=remaining_warmup),
+                optim.cosine_decay(lr_max, decay_steps=decay_steps, eta_min=eta_min),
+            ],
+            [remaining_warmup],
+        )
+    else:
+        # Already in cosine decay phase
+        decay_done = start_step - warmup_steps
+        decay_total = max(1, total_steps - warmup_steps)
+        progress = min(1.0, decay_done / decay_total)
+        current_lr = eta_min + 0.5 * (lr_max - eta_min) * (1.0 + math.cos(math.pi * progress))
+        remaining_decay = max(1, decay_total - decay_done)
+        return optim.cosine_decay(current_lr, decay_steps=remaining_decay, eta_min=eta_min)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Async checkpoint save (plans/ip-adapter-training.md §3.12)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Lock serialises _purge_old_checkpoints across concurrent async writer threads.
+_ckpt_lock = threading.Lock()
+
 
 def save_checkpoint_async(
     adapter: IPAdapterKlein,
@@ -113,7 +149,9 @@ def save_checkpoint_async(
         save_file(payload, ckpt_path)
         size_mb = os.path.getsize(ckpt_path) / 1e6
         print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
-        _purge_old_checkpoints(output_dir, keep_last_n)
+        # Serialise purge so two concurrent threads don't race on the file list
+        with _ckpt_lock:
+            _purge_old_checkpoints(output_dir, keep_last_n)
 
     threading.Thread(target=_write, daemon=True).start()
 
@@ -122,10 +160,14 @@ def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
     files = sorted(f for f in glob.glob(os.path.join(directory, "step_*.safetensors"))
                    if "ema." not in f)
     for f in files[:-keep_last_n]:
-        os.remove(f)
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass  # already removed by a concurrent thread
 
 
 def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
+    """Load adapter weights from a step_*.safetensors checkpoint (skips ema.* keys)."""
     from safetensors import safe_open
     params = {}
     with safe_open(path, framework="numpy") as f:
@@ -134,6 +176,34 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
                 params[k] = mx.array(f.get_tensor(k))
     _nested_update(adapter, params)
     print(f"Loaded checkpoint: {path}")
+
+
+def load_ema_from_checkpoint(path: str) -> Optional[dict]:
+    """
+    Load EMA parameters from a step_*.safetensors checkpoint.
+    Returns a nested dict matching adapter.parameters() structure, or None if
+    the file contains no ema.* keys (e.g. a best.safetensors EMA export).
+    """
+    from safetensors import safe_open
+    flat: dict = {}
+    with safe_open(path, framework="numpy") as f:
+        for k in f.keys():
+            if k.startswith("ema."):
+                flat[k[4:]] = mx.array(f.get_tensor(k))  # strip "ema." prefix
+    if not flat:
+        return None
+    return _flat_to_nested(flat)
+
+
+def step_from_checkpoint_path(path: str) -> int:
+    """Parse the step number from a step_NNNNNNN.safetensors filename, or 0."""
+    name = os.path.basename(path)
+    if name.startswith("step_") and name.endswith(".safetensors"):
+        try:
+            return int(name[5:-len(".safetensors")])
+        except ValueError:
+            pass
+    return 0
 
 
 def _nested_update(model: nn.Module, flat: dict) -> None:
@@ -145,6 +215,18 @@ def _nested_update(model: nn.Module, flat: dict) -> None:
             d = d.setdefault(part, {})
         d[parts[-1]] = val
     model.update(nested)
+
+
+def _flat_to_nested(flat: dict) -> dict:
+    """Convert a flat dot-separated key dict to a nested dict."""
+    nested: dict = {}
+    for key, val in flat.items():
+        parts = key.split(".")
+        d = nested
+        for part in parts[:-1]:
+            d = d.setdefault(part, {})
+        d[parts[-1]] = val
+    return nested
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,17 +314,28 @@ def train(config: dict) -> None:
             siglip_dim=acfg["siglip_dim"],
             perceiver_heads=acfg["perceiver_heads"],
         )
-        if warmstart and os.path.isfile(warmstart):
-            # Resume from a previous checkpoint (stage 2)
-            load_checkpoint(adapter, warmstart)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    start_step = 0
+    loaded_ema: Optional[dict] = None
+    if warmstart and os.path.isfile(warmstart):
+        load_checkpoint(adapter, warmstart)
+        start_step = step_from_checkpoint_path(warmstart)
+        loaded_ema = load_ema_from_checkpoint(warmstart)
+        if start_step > 0:
+            print(f"  Resuming from step {start_step:,}")
+        if loaded_ema is not None:
+            print(f"  Loaded EMA from checkpoint")
 
     # ── Optimizer with built-in cosine+warmup schedule ────────────────────────
     # MLX schedule object passed directly to AdamW — it advances each step.
-    # (plans/ip-adapter-training.md §3.11)
+    # start_step fast-forwards the schedule so LR continues from where it left
+    # off rather than restarting warmup.  (plans/ip-adapter-training.md §3.11)
     lr_schedule = make_lr_schedule(
         tcfg["learning_rate"],
         tcfg["warmup_steps"],
         tcfg["num_steps"],
+        start_step=start_step,
     )
     optimizer = optim.AdamW(
         learning_rate=lr_schedule,
@@ -250,8 +343,11 @@ def train(config: dict) -> None:
         weight_decay=tcfg["weight_decay"],
     )
 
-    # ── EMA initialised to model's current parameters ─────────────────────────
-    ema_params = adapter.parameters()
+    # ── EMA: use loaded EMA weights if resuming, else start from adapter ──────
+    if loaded_ema is not None:
+        ema_params = loaded_ema
+    else:
+        ema_params = adapter.parameters()
 
     # ── Compiled loss + backward ──────────────────────────────────────────────
     # state list must include mx.random.state so noise sampling isn't baked
@@ -272,8 +368,9 @@ def train(config: dict) -> None:
         # Batched K/V: 2 Metal dispatches for all 25 blocks
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-        # Sample timestep in [0, 1000]; get alpha/sigma for v-prediction
-        t_int = mx.random.randint(0, 1000, shape=(1,))
+        # Sample per-sample timestep in [0, 1000]; get alpha/sigma for v-prediction
+        B = latents.shape[0]
+        t_int = mx.random.randint(0, 1000, shape=(B,))
         alpha_t, sigma_t = get_schedule_values(t_int)
 
         noise = mx.random.normal(latents.shape, dtype=latents.dtype)
@@ -313,7 +410,7 @@ def train(config: dict) -> None:
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
 
-    step = 0
+    step = start_step
     t0 = time.time()
     log_interval = ocfg["log_every"]
 
@@ -342,6 +439,8 @@ def train(config: dict) -> None:
 
         if text_np is not None:
             text_embeds = mx.array(text_np, dtype=mx.bfloat16)
+            if bool(use_null_text.item()):
+                text_embeds = mx.zeros_like(text_embeds)
         else:
             captions_in = [""] * len(captions) if bool(use_null_text.item()) else captions
             text_embeds = _encode_text(text_encoder, captions_in)

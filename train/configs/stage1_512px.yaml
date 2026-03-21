@@ -45,8 +45,6 @@ output:
   checkpoint_every: 2000                   # steps between checkpoints (TB4 safety)
   keep_last_n: 5
   log_every: 100
-  eval_every: 2000
-  eval_prompts_path: "train/configs/eval_prompts.txt"
 
 logging:
   wandb_project: "iris-ip-adapter"

@@ -45,41 +45,31 @@ except Exception:
 def fused_flow_noise(
     latent: mx.array,
     noise: mx.array,
-    alpha_t: float,
-    sigma_t: float,
+    alpha_t: mx.array,
+    sigma_t: mx.array,
 ):
     """
-    Compute (noisy, target) for v-prediction flow matching in one Metal pass.
+    Compute (noisy, target) for v-prediction flow matching.
 
-    latent:  clean latent [B, C, H, W] or any shape, float32
+    latent:  clean latent [B, C, H, W], bfloat16 or float32
     noise:   Gaussian noise, same shape as latent
-    alpha_t: noise schedule alpha value (e.g. 1-t for linear flow)
-    sigma_t: noise schedule sigma value (e.g. t for linear flow)
+    alpha_t: [B] or scalar mx.array — noise schedule alpha
+    sigma_t: [B] or scalar mx.array — noise schedule sigma
+
+    For per-sample timesteps (alpha_t shape [B]), broadcasts over [B, C, H, W].
 
     Returns:
       noisy:  alpha_t * latent + sigma_t * noise
       target: alpha_t * noise  - sigma_t * latent  (v-prediction target)
     """
-    if _HAS_METAL_KERNEL:
-        flat = latent.reshape(-1).astype(mx.float32)
-        flat_n = noise.reshape(-1).astype(mx.float32)
-        alpha_arr = mx.array([alpha_t], dtype=mx.float32)
-        sigma_arr = mx.array([sigma_t], dtype=mx.float32)
-        n = flat.shape[0]
+    # Reshape scalar [B] to [B,1,1,1] for broadcast over [B,C,H,W]
+    while alpha_t.ndim < latent.ndim:
+        alpha_t = alpha_t[..., None]
+    while sigma_t.ndim < latent.ndim:
+        sigma_t = sigma_t[..., None]
 
-        noisy_flat, target_flat = _fused_flow_kernel(
-            inputs=[flat, flat_n, alpha_arr, sigma_arr],
-            output_shapes=[(n,), (n,)],
-            output_dtypes=[mx.float32, mx.float32],
-            grid=(n, 1, 1),
-            threadgroup=(256, 1, 1),
-        )
-        noisy = noisy_flat.reshape(latent.shape).astype(latent.dtype)
-        target = target_flat.reshape(latent.shape).astype(latent.dtype)
-    else:
-        noisy = alpha_t * latent + sigma_t * noise
-        target = alpha_t * noise - sigma_t * latent
-
+    noisy = alpha_t * latent + sigma_t * noise
+    target = alpha_t * noise - sigma_t * latent
     return noisy, target
 
 
@@ -87,19 +77,18 @@ def get_schedule_values(t_int: mx.array):
     """
     Convert integer timestep t in [0, 1000] to (alpha_t, sigma_t).
     Linear flow matching: alpha = 1 - t/1000, sigma = t/1000.
+    Returns mx.arrays of the same shape as t_int (no GPU→CPU sync).
     """
     t_frac = t_int.astype(mx.float32) / 1000.0
-    alpha_t = 1.0 - t_frac
-    sigma_t = t_frac
-    return float(alpha_t.item()), float(sigma_t.item())
+    return 1.0 - t_frac, t_frac
 
 
 def flow_matching_loss(
     model_velocity: mx.array,
     latent: mx.array,
     noise: mx.array,
-    alpha_t: float,
-    sigma_t: float,
+    alpha_t: mx.array,
+    sigma_t: mx.array,
 ) -> mx.array:
     """
     Scalar MSE loss between predicted velocity and v-prediction target.

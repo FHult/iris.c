@@ -148,11 +148,12 @@ def process_shard(args) -> dict:
             inputs = tokenizer(text, return_tensors="mlx")
             tokens = inputs["input_ids"]
 
-            # Run encoder; extract layers 8, 17, 26 (0-indexed) and concatenate
+            # Run encoder; extract layers 9, 18, 27 (0-indexed) and concatenate
             # to match Flux Klein 4B text_dim=7680 (3 × 2560)
+            # Indices must match train_ip_adapter.py hidden_state_layers=(9, 18, 27)
             outputs = model(tokens, output_hidden_states=True)
             h = outputs.hidden_states  # list of [1, seq, 2560]
-            emb = mx.concatenate([h[8], h[17], h[26]], axis=-1)  # [1, seq, 7680]
+            emb = mx.concatenate([h[9], h[18], h[27]], axis=-1)  # [1, seq, 7680]
             emb_np = np.array(emb[0])  # [seq, 7680]
 
             q_packed, scale = quantize_4bit_seq(emb_np.astype(np.float32))
@@ -186,8 +187,8 @@ def main():
         help="HuggingFace model ID or local path for Qwen3 (default: Qwen/Qwen3-4B)"
     )
     parser.add_argument(
-        "--workers", type=int, default=2,
-        help="Parallel processes (default 2; GPU is shared so >2 contends)"
+        "--workers", type=int, default=1,
+        help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
     args = parser.parse_args()
 
