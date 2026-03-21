@@ -1,14 +1,14 @@
 #!/bin/bash
-# train/scripts/run_preprocessing.sh — Full preprocessing pipeline.
+# train/scripts/run_shard_and_precompute.sh — Full preprocessing pipeline.
 #
 # Run this ONCE after all dataset downloads complete (after download_datasets.sh).
 # Wraps the entire pipeline in a single caffeinate invocation.
 #
 # Usage:
-#   caffeinate -i -d bash train/scripts/run_preprocessing.sh
+#   caffeinate -i -d bash train/scripts/run_shard_and_precompute.sh
 #
 # Override data root if train/data is not already set up:
-#   DATA_ROOT=/Volumes/IrisData caffeinate -i -d bash train/scripts/run_preprocessing.sh
+#   DATA_ROOT=/Volumes/IrisData caffeinate -i -d bash train/scripts/run_shard_and_precompute.sh
 #
 # Steps:
 #   1. CLIP deduplication (~1.5h embed + 20min FAISS)

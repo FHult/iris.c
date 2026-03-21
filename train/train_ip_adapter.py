@@ -490,9 +490,9 @@ def main():
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
     if args.lr is not None:
-        config["training"]["lr"] = args.lr
+        config["training"]["learning_rate"] = args.lr
     if args.max_steps is not None:
-        config["training"]["max_steps"] = args.max_steps
+        config["training"]["num_steps"] = args.max_steps
     if args.anchor_shards is not None:
         config["data"]["anchor_shard_dir"] = args.anchor_shards
 

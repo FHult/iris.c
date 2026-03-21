@@ -66,6 +66,7 @@ def filter_shard(shard_path: str) -> dict:
         tj = TurboJPEG()
 
     kept_records = []
+    original_count = 0
 
     try:
         with tarfile.open(shard_path) as tar:
@@ -82,6 +83,8 @@ def filter_shard(shard_path: str) -> dict:
                 txt_key = exts.get("txt") or exts.get("caption")
                 if not jpg_key or not txt_key:
                     continue
+
+                original_count += 1
 
                 txt = tar.extractfile(members[txt_key]).read().decode(
                     "utf-8", errors="replace"
@@ -108,11 +111,6 @@ def filter_shard(shard_path: str) -> dict:
         print(f"Error reading {shard_path}: {e}", file=sys.stderr)
         return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True}
 
-    original_count = len(kept_records) + (
-        # Count dropped: original - kept
-        0  # we only have kept; compute drop from original
-    )
-
     # Rewrite shard in a temp file then atomically replace
     tmp_path = shard_path + ".tmp"
     try:
@@ -128,9 +126,11 @@ def filter_shard(shard_path: str) -> dict:
         print(f"Error rewriting {shard_path}: {e}", file=sys.stderr)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return {"shard": shard_path, "kept": len(kept_records), "dropped": 0, "error": True}
+        return {"shard": shard_path, "kept": len(kept_records),
+                "dropped": original_count - len(kept_records), "error": True}
 
-    return {"shard": shard_path, "kept": len(kept_records), "dropped": 0, "error": False}
+    return {"shard": shard_path, "kept": len(kept_records),
+            "dropped": original_count - len(kept_records), "error": False}
 
 
 def main():

@@ -141,6 +141,18 @@ def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int):
                         total_skipped += 1
                         continue
 
+                    if min_size > 0:
+                        try:
+                            from PIL import Image as _Img
+                            import io as _io
+                            img = _Img.open(_io.BytesIO(jpg_bytes))
+                            if img.width < min_size or img.height < min_size:
+                                total_skipped += 1
+                                continue
+                        except Exception:
+                            total_skipped += 1
+                            continue
+
                     key = f"journeydb_{global_idx:08d}"
                     buf.append((key, jpg_bytes, caption))
                     global_idx += 1

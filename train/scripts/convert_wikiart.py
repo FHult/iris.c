@@ -118,7 +118,7 @@ def main():
         print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
         total_written += len(buf)
 
-    print(f"\nDone. {total_written:,} images written to {args.shard_idx if False else args.output}, "
+    print(f"\nDone. {total_written:,} images written to {args.output}, "
           f"{total_skipped:,} skipped.")
 
 
