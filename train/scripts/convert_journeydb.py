@@ -67,7 +67,8 @@ def load_annotations(anno_tgz_path: str) -> dict:
     return captions
 
 
-def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int):
+def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int,
+            start_tgz: int | None = None, end_tgz: int | None = None):
     os.makedirs(output_dir, exist_ok=True)
 
     # ── Load annotations ──────────────────────────────────────────────────────
@@ -86,11 +87,31 @@ def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int):
 
     # ── Find image tgz archives ───────────────────────────────────────────────
     imgs_dir = os.path.join(input_dir, "data", "train", "imgs")
-    tgz_files = sorted(glob.glob(os.path.join(imgs_dir, "*.tgz")))
-    if not tgz_files:
-        raise FileNotFoundError(f"No .tgz files found in {imgs_dir}")
+    all_tgz = sorted(glob.glob(os.path.join(imgs_dir, "*.tgz")))
 
-    print(f"Found {len(tgz_files)} image archives.", flush=True)
+    def _tgz_num(p: str) -> int:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        try:
+            return int(stem)
+        except ValueError:
+            return -1  # non-numeric names (e.g. annotation tgz) — excluded
+
+    tgz_files = [
+        f for f in all_tgz
+        if _tgz_num(f) >= 0
+        and (start_tgz is None or _tgz_num(f) >= start_tgz)
+        and (end_tgz   is None or _tgz_num(f) <= end_tgz)
+    ]
+    if not tgz_files:
+        raise FileNotFoundError(
+            f"No .tgz files found in {imgs_dir} "
+            f"(start_tgz={start_tgz}, end_tgz={end_tgz})"
+        )
+
+    range_str = ""
+    if start_tgz is not None or end_tgz is not None:
+        range_str = f" (filtered: start={start_tgz}, end={end_tgz})"
+    print(f"Found {len(tgz_files)} image archives{range_str}.", flush=True)
 
     # ── Convert ───────────────────────────────────────────────────────────────
     shard_idx    = 0
@@ -178,8 +199,13 @@ def main():
     parser.add_argument("--output",     default="train/data/raw/journeydb_wds")
     parser.add_argument("--shard-size", type=int, default=5000)
     parser.add_argument("--min-size",   type=int, default=256)
+    parser.add_argument("--start-tgz",  type=int, default=None,
+                        help="First tgz archive number to include (e.g. 50 for chunk 2)")
+    parser.add_argument("--end-tgz",    type=int, default=None,
+                        help="Last tgz archive number to include, inclusive (e.g. 99 for chunk 2)")
     args = parser.parse_args()
-    convert(args.input, args.output, args.shard_size, args.min_size)
+    convert(args.input, args.output, args.shard_size, args.min_size,
+            start_tgz=args.start_tgz, end_tgz=args.end_tgz)
 
 
 if __name__ == "__main__":

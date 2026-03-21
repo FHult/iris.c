@@ -11,10 +11,12 @@ The anchor set is kept on local disk permanently and never deleted between chunk
 Usage:
     source train/.venv/bin/activate
     python train/scripts/create_anchor_set.py \
-        --shards train/data/shards \
+        --shards train/data/raw/laion train/data/raw/wikiart_wds \
         --output train/data/anchor_shards \
-        --n 10000 \
-        --exclude-sources journeydb
+        --n 10000
+
+    Pass only the source directories you want in the anchor set.
+    Omit JourneyDB to exclude synthetic-prompt images.
 
 Output: ~1.5 GB of webdataset tar shards in train/data/anchor_shards/
 """
@@ -50,33 +52,36 @@ def _iter_shard(path: str):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shards",  required=True, help="Source shard directory")
+    parser.add_argument("--shards",  required=True, nargs="+",
+                        help="One or more source shard directories (pass each source "
+                             "you want to include; omit JourneyDB to exclude it)")
     parser.add_argument("--output",  required=True, help="Output anchor shard directory")
     parser.add_argument("--n",       type=int, default=10_000,
                         help="Number of anchor samples to keep (default 10000)")
     parser.add_argument("--shard-size", type=int, default=1000,
                         help="Records per output shard (default 1000)")
-    parser.add_argument("--exclude-sources", nargs="*", default=["journeydb"],
-                        help="Exclude records whose ID starts with these prefixes "
-                             "(default: journeydb — keep only diverse non-synthetic sources)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
     os.makedirs(args.output, exist_ok=True)
 
-    exclude = set(args.exclude_sources or [])
-
     # ── Collect candidate records (reservoir sample to avoid loading all into RAM) ─
-    print(f"Scanning shards in {args.shards} ...")
-    shard_paths = sorted(
-        os.path.join(args.shards, f)
-        for f in os.listdir(args.shards)
-        if f.endswith(".tar")
-    )
+    shard_paths = []
+    for shards_dir in args.shards:
+        if not os.path.isdir(shards_dir):
+            print(f"  Warning: --shards directory not found: {shards_dir} — skipping")
+            continue
+        shard_paths.extend(sorted(
+            os.path.join(shards_dir, f)
+            for f in os.listdir(shards_dir)
+            if f.endswith(".tar")
+        ))
     if not shard_paths:
-        print("No .tar shards found.")
+        print("No .tar shards found in any of the provided --shards directories.")
         return
+
+    print(f"Scanning {len(shard_paths)} shards across {len(args.shards)} source dir(s)...")
 
     # Reservoir sampling: keep N records uniformly at random
     reservoir = []
@@ -84,11 +89,6 @@ def main():
 
     for shard_path in shard_paths:
         for rec in _iter_shard(shard_path):
-            # Skip excluded sources
-            rec_id = rec["id"]
-            if any(rec_id.startswith(src) for src in exclude):
-                continue
-
             total_seen += 1
             if len(reservoir) < args.n:
                 reservoir.append(rec)
