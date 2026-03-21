@@ -1302,6 +1302,100 @@ memory delta; batch_size remains 1.
 
 ---
 
+## Phase 5b: Incremental Training on Additional Data Chunks
+
+**Context:** The full JourneyDB dataset (~3 TB) and other large sources exceed the 2 TB SSD.
+Training proceeds in chunks: download a subset, train, delete raw data, download next subset, resume.
+
+### Approach
+
+Each chunk follows this cycle:
+
+```
+1. Download raw chunk N to SSD          (~150–300 GB)
+2. build_shards + filter_shards         (merge into shards/)
+3. precompute_qwen3 + precompute_vae    (extend precomputed/)
+4. Resume training from last checkpoint (~20,000–40,000 steps per chunk)
+5. Delete raw chunk N from SSD          (free ~150–300 GB)
+6. Repeat with chunk N+1
+```
+
+Resume training with lower LR (prevent large weight updates on already-learned content):
+
+```bash
+python train/train_ip_adapter.py \
+  --config train/configs/stage1_512px.yaml \
+  --resume_from checkpoints/stage1/step_XXXXX.safetensors \
+  --max_steps 40000 \
+  --lr 3e-5 \
+  --output_dir checkpoints/stage1_chunk2
+```
+
+LR schedule per chunk:
+| Chunk | LR | Rationale |
+|---|---|---|
+| 1 (initial) | 1e-4 | Full learning from warmstart |
+| 2 | 3e-5 | Consolidate without overwriting |
+| 3+ | 1e-5 | Fine adjustment only |
+
+### Distribution Shift Mitigation
+
+**Risk:** Training exclusively on JourneyDB (synthetic Midjourney style) in later chunks
+causes the model to drift — it forgets the aesthetic diversity from LAION/WikiArt/COYO.
+
+**Mitigations:**
+
+1. **Anchor replay set** — keep a fixed 10,000-sample subset from chunk 1 (diverse LAION +
+   WikiArt) on local disk (~1.5 GB). Mix 20% anchor samples into every subsequent chunk's
+   shard set. `build_shards.py --anchor train/data/anchor_shards/` handles this automatically
+   (see below).
+
+2. **Mixed chunk composition** — never train a chunk that is >70% from a single source.
+   If chunk 2 is JourneyDB 050-099, mix in COYO or WikiArt shards to keep source diversity.
+
+3. **EMA weights** — use EMA checkpoint (not raw weights) as the base for each new chunk.
+   EMA smooths out within-chunk drift before it compounds across chunks.
+
+4. **Loss monitoring** — if anchor-set validation loss increases >15% relative to the
+   previous chunk's final loss, reduce LR further or increase anchor mixing ratio.
+
+### Anchor Set Creation
+
+Run once after Phase 2, before starting Phase 4:
+
+```bash
+python train/scripts/create_anchor_set.py \
+  --shards train/data/shards \
+  --output train/data/anchor_shards \
+  --n 10000 \
+  --sources laion wikiart coyo    # exclude journeydb from anchor
+```
+
+The anchor set lives on local disk permanently (~1.5 GB) and is never deleted between chunks.
+
+### Storage Budget Per Chunk
+
+| Item | Size | Disk | Delete after chunk? |
+|---|---|---|---|
+| Raw images (one chunk) | ~150–300 GB | SSD | Yes |
+| Chunk shards | ~80–150 GB | SSD | Yes (after precompute) |
+| Precomputed embeds | ~50–100 GB | Local | Yes (after training) |
+| Anchor shards | ~1.5 GB | Local | Never |
+| Checkpoints (EMA) | ~500 MB | Local | Keep last 2 only |
+
+Peak SSD usage per cycle: ~600 GB (well within 1.8 TB).
+
+### Recommended JourneyDB Chunking
+
+| Chunk | Files | Approx images | LR |
+|---|---|---|---|
+| 1 (current) | 000–049 | ~1M | 1e-4 |
+| 2 | 050–099 | ~1M | 3e-5 |
+| 3 | 100–149 | ~1M | 1e-5 |
+| 4 | 150–201 | ~1M | 1e-5 |
+
+---
+
 ## Phase 6: Export and Integrate into iris.c
 **Duration: 2–4 weeks active development**
 

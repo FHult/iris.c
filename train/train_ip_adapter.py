@@ -302,6 +302,8 @@ def train(config: dict) -> None:
         qwen3_cache_dir=dcfg.get("qwen3_cache_dir"),
         vae_cache_dir=dcfg.get("vae_cache_dir"),
         siglip_cache_dir=dcfg.get("siglip_cache_dir"),
+        anchor_shard_dir=dcfg.get("anchor_shard_dir"),
+        anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -472,6 +474,12 @@ def main():
     parser.add_argument("--config", required=True, help="YAML config file")
     parser.add_argument("--resume", default=None,
                         help="Resume from checkpoint .safetensors path")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override learning rate from config (use lower LR for later chunks)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Override max_steps from config")
+    parser.add_argument("--anchor-shards", default=None,
+                        help="Path to anchor shard directory mixed into every chunk (20%% of batches)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate config without training")
     args = parser.parse_args()
@@ -481,6 +489,12 @@ def main():
 
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
+    if args.lr is not None:
+        config["training"]["lr"] = args.lr
+    if args.max_steps is not None:
+        config["training"]["max_steps"] = args.max_steps
+    if args.anchor_shards is not None:
+        config["data"]["anchor_shard_dir"] = args.anchor_shards
 
     if args.dry_run:
         print("Config OK:")

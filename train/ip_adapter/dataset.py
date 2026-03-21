@@ -257,11 +257,16 @@ def make_prefetch_loader(
     qwen3_cache_dir: Optional[str] = None,
     vae_cache_dir: Optional[str] = None,
     siglip_cache_dir: Optional[str] = None,
+    anchor_shard_dir: Optional[str] = None,
+    anchor_mix_ratio: float = 0.20,
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
 
     shard_paths:          list of .tar shard file paths (in any order; shuffled internally)
+    anchor_shard_dir:     path to anchor shards mixed in at anchor_mix_ratio (default 20%).
+                          Use during incremental/chunked training to prevent distribution shift.
+    anchor_mix_ratio:     fraction of batches drawn from anchor set (default 0.20)
     batch_size:           images per batch (default 2)
     image_dropout_prob:   null image conditioning dropout rate (default 0.30)
     text_dropout_prob:    null text conditioning dropout rate (default 0.10)
@@ -281,6 +286,13 @@ def make_prefetch_loader(
       bucket_hw:   (H, W) tuple for this batch
     """
     paths = list(shard_paths)
+    anchor_paths: List[str] = []
+    if anchor_shard_dir and os.path.isdir(anchor_shard_dir):
+        anchor_paths = sorted(
+            os.path.join(anchor_shard_dir, f)
+            for f in os.listdir(anchor_shard_dir)
+            if f.endswith(".tar")
+        )
 
     shard_q: queue.Queue = queue.Queue(maxsize=2)
     sample_q: queue.Queue = queue.Queue(maxsize=sample_buffer)
@@ -289,8 +301,13 @@ def make_prefetch_loader(
     def shard_loader():
         rng = random.Random()
         while True:
-            rng.shuffle(paths)
-            for path in paths:
+            # Build this epoch's shard list: mix anchor shards at anchor_mix_ratio
+            epoch_paths = list(paths)
+            if anchor_paths:
+                n_anchor = max(1, int(len(epoch_paths) * anchor_mix_ratio / (1 - anchor_mix_ratio)))
+                epoch_paths += rng.choices(anchor_paths, k=n_anchor)
+            rng.shuffle(epoch_paths)
+            for path in epoch_paths:
                 try:
                     with tarfile.open(path) as tar:
                         contents = {
