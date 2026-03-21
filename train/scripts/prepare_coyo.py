@@ -73,7 +73,7 @@ def main():
         width   = row.get("width") or 0
         height  = row.get("height") or 0
         aesthetic  = row.get("aesthetic_score_laion_v2") or 0.0
-        clip_sim   = row.get("similarity") or 0.0
+        clip_sim   = row.get("clip_similarity_vitb32") or 0.0
         nsfw       = row.get("nsfw_score_opennsfw2") or 1.0
         watermark  = row.get("watermark_score") or 1.0
 
