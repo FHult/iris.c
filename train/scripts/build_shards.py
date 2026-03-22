@@ -171,104 +171,113 @@ def _write_shard_range(args) -> dict:
     Each worker gets shard indices [i, i+workers, i+2*workers, ...].
     No locks needed — each worker owns its shard files exclusively.
 
-    Records contain only metadata (shard path, id, txt) — no pre-loaded jpg bytes.
-    Worker groups records by source shard and opens each source shard once to read
-    jpegs sequentially, keeping peak memory to one source shard's worth of images
-    rather than the full dataset.
+    Memory design: all output tars are opened upfront, then source shards are
+    processed one at a time. Peak RAM = jpegs in ONE source shard (~750 MB),
+    not the full dataset (which caused kernel panics from swap exhaustion).
     """
     shard_ids, records, output_dir, shard_size, blocklist, quality = args
     blocklist_set = set(blocklist)
 
-    # Per-process turbojpeg instance (not process-safe to pass from parent)
     if _HAS_TURBOJPEG:
         tj = TurboJPEG()
 
-    # Sort records by source shard path to open each source shard exactly once.
-    # Records were pre-shuffled globally before slicing to this worker, so the
-    # output distribution is random despite the sequential source-shard read order.
-    by_source = collections.defaultdict(list)
-    for i, rec in enumerate(records):
-        by_source[rec["shard"]].append((i, rec))
-
-    # Load jpg bytes one source shard at a time; build a flat index by record id.
-    # Peak RAM = jpegs in the largest source shard × this worker's fraction.
-    jpg_cache: dict = {}  # id → raw jpg bytes
-    for src_path in sorted(by_source.keys()):
-        needed = {rec["id"] for _, rec in by_source[src_path]}
-        try:
-            with tarfile.open(src_path) as src_tar:
-                src_members = {m.name: m for m in src_tar.getmembers() if m.isfile()}
-                stem_to_jpg = {}
-                for name in src_members:
-                    stem, _, ext = name.rpartition(".")
-                    if ext.lower() in ("jpg", "jpeg", "png") and stem in needed:
-                        stem_to_jpg.setdefault(stem, name)
-                for stem in needed:
-                    jpg_name = stem_to_jpg.get(stem)
-                    if jpg_name:
-                        jpg_cache[stem] = src_tar.extractfile(src_members[jpg_name]).read()
-        except Exception as e:
-            print(f"Warning: failed to read source {src_path}: {e}", file=sys.stderr)
-
-    idx = 0
-    written_total = 0
+    # Phase 1: filter by blocklist + caption (no I/O), assign to output shards.
+    shard_plan = {}   # shard_id -> [rec, ...]
+    rec_idx = 0
     skipped = 0
-
     for shard_id in shard_ids:
-        shard_path = os.path.join(output_dir, f"{shard_id:06d}.tar")
-        written = 0
+        shard_recs = []
+        while len(shard_recs) < shard_size and rec_idx < len(records):
+            rec = records[rec_idx]
+            rec_idx += 1
+            if rec["id"] in blocklist_set or not _is_valid_caption(rec["txt"]):
+                skipped += 1
+                continue
+            shard_recs.append(rec)
+        if shard_recs:
+            shard_plan[shard_id] = shard_recs
 
-        with tarfile.open(shard_path, "w") as tar:
-            while written < shard_size and idx < len(records):
-                rec = records[idx]
-                idx += 1
+    if not shard_plan:
+        return {"written": 0, "skipped": skipped}
 
-                if rec["id"] in blocklist_set:
+    # Build source-shard → [(output_shard_id, rec)] index.
+    by_source = collections.defaultdict(list)
+    for shard_id, recs in shard_plan.items():
+        for rec in recs:
+            by_source[rec["shard"]].append((shard_id, rec))
+
+    # Phase 2: open all output tars, stream one source shard at a time.
+    # Each source shard's jpegs are loaded, written directly to output tars,
+    # then released — peak RAM stays bounded to one source shard's worth.
+    out_tars = {}
+    out_counts = {}
+    for shard_id in shard_plan:
+        out_tars[shard_id] = tarfile.open(
+            os.path.join(output_dir, f"{shard_id:06d}.tar"), "w"
+        )
+        out_counts[shard_id] = 0
+
+    total_written = 0
+    try:
+        for src_path in sorted(by_source.keys()):
+            items = by_source[src_path]
+            needed = {rec["id"] for _, rec in items}
+
+            jpg_raw = {}
+            try:
+                with tarfile.open(src_path) as src_tar:
+                    members = {m.name: m for m in src_tar.getmembers() if m.isfile()}
+                    stem_to_file = {}
+                    for name in members:
+                        stem, _, ext = name.rpartition(".")
+                        if ext.lower() in ("jpg", "jpeg", "png") and stem in needed:
+                            stem_to_file.setdefault(stem, name)
+                    for stem in needed:
+                        if stem in stem_to_file:
+                            jpg_raw[stem] = src_tar.extractfile(
+                                members[stem_to_file[stem]]
+                            ).read()
+            except Exception as e:
+                print(f"Warning: failed to read {src_path}: {e}", file=sys.stderr)
+
+            for shard_id, rec in items:
+                raw = jpg_raw.get(rec["id"])
+                if raw is None:
                     skipped += 1
                     continue
-
-                if not _is_valid_caption(rec["txt"]):
-                    skipped += 1
-                    continue
-
-                raw_jpg = jpg_cache.get(rec["id"])
-                if raw_jpg is None:
-                    skipped += 1
-                    continue
-
                 try:
-                    # Decode to validate dimensions + re-encode at target quality
                     if _HAS_TURBOJPEG:
-                        img = tj.decode(raw_jpg)  # numpy HWC RGB
+                        img = tj.decode(raw)
                         h, w = img.shape[:2]
-                    else:
-                        from PIL import Image as PilImage
-                        img = PilImage.open(io.BytesIO(raw_jpg)).convert("RGB")
-                        w, h = img.size
-
-                    if w < 256 or h < 256:
-                        skipped += 1
-                        continue
-
-                    # Re-encode at quality=85 for consistent shard size
-                    if _HAS_TURBOJPEG:
+                        if w < 256 or h < 256:
+                            skipped += 1
+                            continue
                         jpg_out = tj.encode(img, quality=quality)
                     else:
+                        from PIL import Image as PilImage
+                        img = PilImage.open(io.BytesIO(raw)).convert("RGB")
+                        w, h = img.size
+                        if w < 256 or h < 256:
+                            skipped += 1
+                            continue
                         buf = io.BytesIO()
                         img.save(buf, format="JPEG", quality=quality)
                         jpg_out = buf.getvalue()
 
-                    key = f"{shard_id:06d}_{written:04d}"
-                    _tar_add(tar, f"{key}.jpg", jpg_out)
-                    _tar_add(tar, f"{key}.txt", rec["txt"].encode("utf-8"))
-                    written += 1
-                    written_total += 1
-
+                    n = out_counts[shard_id]
+                    key = f"{shard_id:06d}_{n:04d}"
+                    _tar_add(out_tars[shard_id], f"{key}.jpg", jpg_out)
+                    _tar_add(out_tars[shard_id], f"{key}.txt", rec["txt"].encode("utf-8"))
+                    out_counts[shard_id] += 1
+                    total_written += 1
                 except Exception:
                     skipped += 1
-                    continue
+            # jpg_raw released here — GC reclaims memory before next source shard
+    finally:
+        for tar in out_tars.values():
+            tar.close()
 
-    return {"written": written_total, "skipped": skipped}
+    return {"written": total_written, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
