@@ -62,14 +62,27 @@ step_status() {
 # ── Counts (gathered once, reused throughout) ─────────────────────────────────
 LAION_TARS=$(count_tars "$DATA_ROOT/raw/laion")
 COYO_TARS=$(count_tars "$DATA_ROOT/raw/coyo")
-JDB_WDS_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds")
 WIKIART_WDS_TARS=$(count_tars "$DATA_ROOT/raw/wikiart_wds")
+# JourneyDB is downloaded and converted in 4 phases across training chunks.
+# Chunk 1 writes to journeydb_wds/; chunks 2-4 each write to journeydb_wds_chunkN/.
+JDB_WDS_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds")
+JDB_WDS2_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds_chunk2")
+JDB_WDS3_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds_chunk3")
+JDB_WDS4_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds_chunk4")
 DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
 SHARDS_DIR="$DATA_ROOT/shards"
 DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
 ANCHOR_DIR="$DATA_ROOT/anchor_shards"
 PRECOMP_DIR="$DATA_ROOT/precomputed"
 CKPT_DIR="$TRAIN_DIR/checkpoints"
+
+# JourneyDB per-phase summary for display (phase N: shard count or ⬜ if not yet downloaded)
+_jdb_phase() {
+    local n="$1" tars="$2" label="$3"
+    if [[ $tars -gt 0 ]]; then printf "ph.%s:%s(%s)" "$n" "$tars" "$label"
+    else printf "ph.%s:⬜" "$n"; fi
+}
+JDB_PHASE_INFO="$(_jdb_phase 1 $JDB_WDS_TARS 000-049)  $(_jdb_phase 2 $JDB_WDS2_TARS 050-099)  $(_jdb_phase 3 $JDB_WDS3_TARS 100-149)  $(_jdb_phase 4 $JDB_WDS4_TARS 150-201)"
 
 SHARD_COUNT=$(count_tars "$SHARDS_DIR")
 QWEN3_COUNT=$(count_files "$PRECOMP_DIR/qwen3" "*.npz")
@@ -159,7 +172,7 @@ echo ""
 echo "── Steps ────────────────────────────────────────────────────────"
 step_status "[1/9] Verify downloads" \
     "[[ $LAION_TARS -gt 0 ]]" "" \
-    "(LAION:$LAION_TARS COYO:$COYO_TARS JDB_WDS:$JDB_WDS_TARS)"
+    "(LAION: $LAION_TARS shards  COYO: $COYO_TARS shards)"
 
 step_status "[2a/9] WikiArt → WDS" \
     "[[ $WIKIART_WDS_TARS -gt 0 ]]" "" \
@@ -167,7 +180,7 @@ step_status "[2a/9] WikiArt → WDS" \
 
 step_status "[2b/9] JourneyDB → WDS" \
     "[[ $JDB_WDS_TARS -gt 0 ]]" "" \
-    "($JDB_WDS_TARS shards)"
+    "($JDB_PHASE_INFO)"
 
 step_status "[3/9] CLIP deduplication" \
     "[[ -f $DEDUP_IDS ]]" \
