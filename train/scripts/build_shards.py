@@ -115,34 +115,49 @@ def _is_valid_caption(caption: str) -> bool:
     return True
 
 
-def _collect_records(source_dirs: list) -> list:
+def _collect_records_from_shard(shard_path: str) -> list:
+    """Read metadata (id + caption) from a single source shard — no JPEG bytes."""
+    records = []
+    try:
+        with tarfile.open(shard_path) as tar:
+            members = {m.name: m for m in tar.getmembers() if m.isfile()}
+            keys = {}
+            for name in members:
+                stem, _, ext = name.rpartition(".")
+                keys.setdefault(stem, {})[ext.lower()] = name
+            for stem, exts in keys.items():
+                jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
+                txt_key = exts.get("txt") or exts.get("caption")
+                if not jpg_key or not txt_key:
+                    continue
+                txt = tar.extractfile(members[txt_key]).read().decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                records.append({"shard": shard_path, "id": stem, "txt": txt})
+    except Exception as e:
+        print(f"Warning: failed to read {shard_path}: {e}", file=sys.stderr)
+    return records
+
+
+def _collect_records(source_dirs: list, workers: int = 1) -> list:
     """
     Enumerate all records from all source shard directories.
     Returns list of {"shard": path, "id": stem, "txt": str} — NO jpg bytes.
     JPEG bytes are read on demand in workers, one source shard at a time,
     to avoid loading the entire dataset (~200 GB) into RAM at once.
     """
-    records = []
+    all_shards = []
     for src_dir in source_dirs:
-        for shard_path in sorted(glob.glob(os.path.join(src_dir, "*.tar"))):
-            try:
-                with tarfile.open(shard_path) as tar:
-                    members = {m.name: m for m in tar.getmembers() if m.isfile()}
-                    keys = {}
-                    for name in members:
-                        stem, _, ext = name.rpartition(".")
-                        keys.setdefault(stem, {})[ext.lower()] = name
-                    for stem, exts in keys.items():
-                        jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
-                        txt_key = exts.get("txt") or exts.get("caption")
-                        if not jpg_key or not txt_key:
-                            continue
-                        txt = tar.extractfile(members[txt_key]).read().decode(
-                            "utf-8", errors="replace"
-                        ).strip()
-                        records.append({"shard": shard_path, "id": stem, "txt": txt})
-            except Exception as e:
-                print(f"Warning: failed to read {shard_path}: {e}", file=sys.stderr)
+        all_shards.extend(sorted(glob.glob(os.path.join(src_dir, "*.tar"))))
+
+    if workers > 1:
+        with multiprocessing.Pool(processes=workers) as pool:
+            batches = pool.map(_collect_records_from_shard, all_shards)
+        return [r for batch in batches for r in batch]
+
+    records = []
+    for shard_path in all_shards:
+        records.extend(_collect_records_from_shard(shard_path))
     return records
 
 
@@ -300,8 +315,8 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    print(f"Collecting records from {len(args.sources)} source(s)...")
-    records = _collect_records(args.sources)
+    print(f"Collecting records from {len(args.sources)} source(s) using {args.workers} workers...")
+    records = _collect_records(args.sources, workers=args.workers)
     print(f"  Found {len(records):,} total records")
 
     # Shuffle globally before splitting to workers
