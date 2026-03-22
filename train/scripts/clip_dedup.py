@@ -4,7 +4,7 @@ train/scripts/clip_dedup.py — CLIP-based deduplication using open_clip + FAISS
 Removes near-duplicate images (cosine similarity > 0.95) from the training dataset.
 Expected removal: 200–400K from LAION → ~1.6M unique images.
 
-No clip-retrieval dependency. Uses open_clip (ViT-L/14, MPS on Apple Silicon)
+No clip-retrieval dependency. Uses open_clip (ViT-L-14-quickgelu, MPS on Apple Silicon)
 for embedding and faiss-cpu for index / search.
 
 Steps (initial, chunk 1):
@@ -104,7 +104,7 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     device = torch.device(_clip_device())
     print(f"Loading CLIP ViT-L/14 on device={device} ...")
     model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14", pretrained="openai"
+        "ViT-L-14-quickgelu", pretrained="openai"
     )
     model = model.to(device).eval()
 
