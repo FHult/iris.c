@@ -70,7 +70,16 @@ def filter_shard(shard_path: str) -> dict:
 
     try:
         with tarfile.open(shard_path) as tar:
-            members = {m.name: m for m in tar.getmembers() if m.isfile()}
+            # Use iteration instead of getmembers() so that truncated tars
+            # (missing end-of-archive block) are handled gracefully: we read
+            # as many members as possible and silently stop at the truncation.
+            members = {}
+            try:
+                for m in tar:
+                    if m.isfile():
+                        members[m.name] = m
+            except Exception:
+                pass  # truncated — use whatever was read before EOF
             keys = {}
             for name in members:
                 stem, _, ext = name.rpartition(".")

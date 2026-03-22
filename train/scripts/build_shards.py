@@ -242,8 +242,17 @@ def _write_shard_range(args) -> dict:
     # overlapping disk reads with CPU encode/write of the current shard.
     # Output tars are opened lazily on first write so that a crash mid-run
     # does not leave empty stub files that would be mistaken for completed shards.
+    # Each shard is written to a .tar.tmp temp file and atomically renamed to .tar
+    # only when it reaches shard_size records.  A re-run will skip any .tar that
+    # already exists on disk (from a previous complete run) even if shard_id >=
+    # write_from, preventing a restart from truncating finished shards.
+    shard_plan = {sid: recs for sid, recs in shard_plan.items()
+                  if not os.path.exists(os.path.join(output_dir, f"{sid:06d}.tar"))}
+    if not shard_plan:
+        return {"written": 0, "skipped": skipped}
     out_tars = {}
     out_counts = {shard_id: 0 for shard_id in shard_plan}
+    completed_count = 0
 
     total_written = 0
     try:
@@ -294,31 +303,38 @@ def _write_shard_range(args) -> dict:
                         jpg_out = buf.getvalue()
 
                     if shard_id not in out_tars:
-                        out_tars[shard_id] = tarfile.open(
-                            os.path.join(output_dir, f"{shard_id:06d}.tar"), "w"
-                        )
+                        tmp_path = os.path.join(output_dir, f"{shard_id:06d}.tar.tmp")
+                        out_tars[shard_id] = tarfile.open(tmp_path, "w")
                     n = out_counts[shard_id]
                     key = f"{shard_id:06d}_{n:04d}"
                     _tar_add(out_tars[shard_id], f"{key}.jpg", jpg_out)
                     _tar_add(out_tars[shard_id], f"{key}.txt", rec["txt"].encode("utf-8"))
                     out_counts[shard_id] += 1
                     total_written += 1
+                    # Atomically publish when the shard is full.
+                    if out_counts[shard_id] >= shard_size:
+                        out_tars[shard_id].close()
+                        del out_tars[shard_id]
+                        tmp_path = os.path.join(output_dir, f"{shard_id:06d}.tar.tmp")
+                        final_path = os.path.join(output_dir, f"{shard_id:06d}.tar")
+                        os.replace(tmp_path, final_path)
+                        completed_count += 1
                 except Exception:
                     skipped += 1
             # jpg_raw released here — GC reclaims before next shard is fetched
 
             # Heartbeat every 5 source shards so pipeline_status.sh shows progress.
             if (i + 1) % 5 == 0 or (i + 1) == len(src_paths):
-                shards_open = len(out_tars)
-                shards_full = sum(1 for c in out_counts.values() if c >= shard_size)
                 print(
                     f"[worker {worker_idx}] src {i+1}/{len(src_paths)} "
                     f"| written {total_written:,} records "
-                    f"| shards {shards_full}/{shards_open} full",
+                    f"| shards {completed_count}/{len(shard_plan)} done",
                     flush=True,
                 )
         executor.shutdown(wait=True)
     finally:
+        # Close any incomplete tars — they stay as .tar.tmp (not renamed).
+        # A re-run will clean them up and restart those shards from scratch.
         for tar in out_tars.values():
             tar.close()
 
@@ -368,6 +384,16 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
+
+    # Clean up any .tar.tmp files left by a previously interrupted run.
+    stale_tmps = glob.glob(os.path.join(args.output, "*.tar.tmp"))
+    if stale_tmps:
+        print(f"Cleaning up {len(stale_tmps)} orphaned .tar.tmp files from previous run...")
+        for p in stale_tmps:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     print(f"Collecting records from {len(args.sources)} source(s) using {args.workers} workers...")
     records = _collect_records(args.sources, workers=args.workers)
