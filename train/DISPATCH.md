@@ -22,7 +22,7 @@ The pipeline has **9 sequential steps** across ~3 weeks of compute:
 | 2a | WikiArt → WebDataset | 5 min | `raw/wikiart_wds/` (104 shards) |
 | 2b | JourneyDB → WebDataset | 30 min | `raw/journeydb_wds/` (210 shards) |
 | 3 | CLIP deduplication | 2 h | `dedup_ids/duplicate_ids.txt` |
-| 4 | Build unified shards | 2–4 h | `shards/*.tar` (~495 shards, 5000 img each) |
+| 4 | Build unified shards | 2–4 h | `shards/*.tar` (5000 img/shard) |
 | 5 | Filter shards | 30 min | shards rewritten in place |
 | 6 | Cross-chunk dedup index | 1 h | `dedup_ids/dedup_index.faiss` |
 | 7 | Anchor set | 5 min | `anchor_shards/` |
@@ -192,7 +192,7 @@ raw/
   coyo/             COYO-700M subset (~50 shards)
   journeydb_wds/    JourneyDB converted to WDS (210 shards)
   wikiart_wds/      WikiArt converted to WDS (104 shards)
-shards/             Merged unified shards (~495 × 5000 images)
+shards/             Merged unified shards (5000 images/shard)
 anchor_shards/      Fixed anchor set (~10K images, mixed in at training time)
 dedup_ids/
   duplicate_ids.txt Blocklist from CLIP dedup (124,340 IDs)
