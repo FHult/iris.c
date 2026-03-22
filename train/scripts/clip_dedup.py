@@ -51,6 +51,10 @@ import os
 import sys
 import tarfile
 
+# Must be set before numpy/FAISS import; libomp on Apple Silicon crashes under
+# multi-threaded barrier release (SIGSEGV in __kmp_hyper_barrier_release).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import numpy as np
 
 try:
@@ -284,6 +288,7 @@ def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
     Resume-safe: skips embedding if .embed_done sentinel exists.
     """
     import faiss
+    faiss.omp_set_num_threads(1)
 
     sentinel = os.path.join(embeddings_dir, ".embed_done")
     if os.path.exists(sentinel):
