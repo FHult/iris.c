@@ -124,7 +124,7 @@ source "$VENV"
 
 # ── Helper: count .tar files in a directory ───────────────────────────────────
 # Use find (exits 0 even on no matches); ls|wc fails under set -o pipefail.
-count_tars() { find "${1}" -maxdepth 1 -name "*.tar" 2>/dev/null | wc -l; }
+count_tars() { find -L "${1}" -maxdepth 1 -name "*.tar" 2>/dev/null | wc -l; }
 
 # ── Helper: auto-detect latest checkpoint ────────────────────────────────────
 latest_checkpoint() {

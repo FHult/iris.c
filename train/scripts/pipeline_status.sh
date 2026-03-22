@@ -37,7 +37,7 @@ if [[ -z "$DATA_ROOT" ]]; then
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-count_files() { find "${1}" -maxdepth 1 -name "${2:-*}" 2>/dev/null | wc -l | tr -d ' '; }
+count_files() { find -L "${1}" -maxdepth 1 -name "${2:-*}" 2>/dev/null | wc -l | tr -d ' '; }
 count_tars()  { count_files "${1}" "*.tar"; }
 du_h()        { du -sh "$1" 2>/dev/null | cut -f1; }
 ts()          { date '+%Y-%m-%d %H:%M:%S'; }
