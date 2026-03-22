@@ -413,6 +413,7 @@ def train(config: dict) -> None:
     step = start_step
     t0 = time.time()
     log_interval = ocfg["log_every"]
+    loss_history: list[float] = []  # rolling window for smoothed loss
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
@@ -477,12 +478,25 @@ def train(config: dict) -> None:
             steps_per_sec = log_interval / elapsed
             loss_scalar = float(loss_val.item())
             lr_now = float(optimizer.learning_rate)
-            print(f"step {step:>7,}  loss {loss_scalar:.4f}  "
-                  f"lr {lr_now:.2e}  {steps_per_sec:.2f} steps/s")
+            loss_history.append(loss_scalar)
+            if len(loss_history) > 20:
+                loss_history.pop(0)
+            loss_smooth = sum(loss_history) / len(loss_history)
+            steps_remaining = tcfg["num_steps"] - step
+            eta_s = steps_remaining / steps_per_sec if steps_per_sec > 0 else 0
+            eta_h, eta_m = divmod(int(eta_s) // 60, 60)
+            print(
+                f"step {step:>7,}/{tcfg['num_steps']:,}"
+                f"  loss {loss_scalar:.4f} (avg {loss_smooth:.4f})"
+                f"  lr {lr_now:.2e}"
+                f"  {steps_per_sec:.2f} steps/s"
+                f"  ETA {eta_h}h{eta_m:02d}m",
+                flush=True,
+            )
             if wandb_run:
                 wandb_run.log(
-                    {"loss": loss_scalar, "lr": lr_now,
-                     "steps_per_sec": steps_per_sec},
+                    {"loss": loss_scalar, "loss_smooth": loss_smooth,
+                     "lr": lr_now, "steps_per_sec": steps_per_sec},
                     step=step,
                 )
             t0 = time.time()

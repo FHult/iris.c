@@ -193,7 +193,8 @@ def run_dedup(embeddings_dir: str, output_dir: str, threshold: float = 0.95):
     print(f"Searching k=2 nearest neighbours (threshold={threshold}) ...")
     blocked: set[str] = set()
     BATCH = 4096
-    for start in range(0, N, BATCH):
+    n_batches = (N + BATCH - 1) // BATCH
+    for b_idx, start in enumerate(range(0, N, BATCH), 1):
         batch = vecs[start:start + BATCH]
         scores, idxs = index.search(batch, k=2)
         for i, (score_row, idx_row) in enumerate(zip(scores, idxs)):
@@ -204,6 +205,11 @@ def run_dedup(embeddings_dir: str, output_dir: str, threshold: float = 0.95):
                 if j != global_i and j >= 0:
                     # Block the higher-index duplicate
                     blocked.add(ids[max(global_i, j)])
+        if b_idx % 50 == 0 or b_idx == n_batches:
+            print(
+                f"  [{min(start + BATCH, N):,}/{N:,}] {len(blocked):,} duplicates found",
+                flush=True,
+            )
 
     blocklist_path = os.path.join(output_dir, "duplicate_ids.txt")
     with open(blocklist_path, "w") as f:
@@ -303,7 +309,9 @@ def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
     index.add(vecs)
 
     os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
-    faiss.write_index(index, index_path)
+    tmp_path = index_path + ".tmp"
+    faiss.write_index(index, tmp_path)
+    os.replace(tmp_path, index_path)
     print(f"  Saved dedup index → {index_path} ({index.ntotal:,} vectors)")
 
 
@@ -341,12 +349,20 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
         print(f"  Querying {len(new_ids):,} images against {index.ntotal:,} existing ...",
               flush=True)
         BATCH = 4096
-        for start in range(0, len(new_ids), BATCH):
+        n_new = len(new_ids)
+        n_batches = (n_new + BATCH - 1) // BATCH
+        for b_idx, start in enumerate(range(0, n_new, BATCH), 1):
             batch_vecs = new_vecs[start:start + BATCH]
             scores, _  = index.search(batch_vecs, k=1)
             for i, score_row in enumerate(scores):
                 if score_row[0] >= threshold:
                     duplicate_ids.add(new_ids[start + i])
+            if b_idx % 50 == 0 or b_idx == n_batches:
+                print(
+                    f"  [{min(start + BATCH, n_new):,}/{n_new:,}]"
+                    f" {len(duplicate_ids):,} near-duplicates so far",
+                    flush=True,
+                )
         print(f"  Found {len(duplicate_ids):,} near-duplicates (threshold={threshold})",
               flush=True)
     else:
@@ -367,7 +383,9 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
                   flush=True)
 
     index.add(new_vecs)
-    faiss.write_index(index, index_path)
+    tmp_path = index_path + ".tmp"
+    faiss.write_index(index, tmp_path)
+    os.replace(tmp_path, index_path)
     print(f"  Updated dedup index → {index_path} ({index.ntotal:,} total vectors)", flush=True)
 
 

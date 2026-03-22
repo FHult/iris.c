@@ -209,8 +209,25 @@ def main():
     work_items = [(s, args.output, args.model) for s in shards]
 
     # Use Pool with 2 workers: GPU is shared, more workers causes contention
+    import time as _time
+    results = []
+    t_start = _time.time()
     with multiprocessing.Pool(processes=args.workers) as pool:
-        results = pool.map(process_shard, work_items)
+        for done, result in enumerate(
+            pool.imap_unordered(process_shard, work_items, chunksize=1), 1
+        ):
+            results.append(result)
+            written_so_far = sum(r["written"] for r in results)
+            errs_so_far = sum(1 for r in results if r["error"])
+            elapsed = _time.time() - t_start
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (len(work_items) - done) / rate if rate > 0 else 0
+            err_str = f"  errors={errs_so_far}" if errs_so_far else ""
+            print(
+                f"  [{done}/{len(work_items)}] {written_so_far:,} embeddings"
+                f"{err_str}  {rate:.2f} shards/s  ETA {eta/60:.0f}m",
+                flush=True,
+            )
 
     total = sum(r["written"] for r in results)
     errors = sum(1 for r in results if r["error"])

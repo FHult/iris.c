@@ -152,6 +152,16 @@ def main():
     )
     args = parser.parse_args()
 
+    # Clean up any orphaned .tmp files left by a previously interrupted run
+    stale_tmps = glob.glob(os.path.join(args.shards, "*.tar.tmp"))
+    if stale_tmps:
+        print(f"Cleaning up {len(stale_tmps)} orphaned .tmp files from previous run...")
+        for p in stale_tmps:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
     all_shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if args.start_idx > 0:
         shards = [s for s in all_shards
@@ -166,8 +176,28 @@ def main():
     print(f"Filtering {len(shards)} shards with {args.workers} workers...")
     print(f"turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (slower fallback)'}")
 
+    import time as _time
+    results = []
+    t_start = _time.time()
     with multiprocessing.Pool(processes=args.workers) as pool:
-        results = pool.map(filter_shard, shards)
+        for done, result in enumerate(
+            pool.imap_unordered(filter_shard, shards, chunksize=1), 1
+        ):
+            results.append(result)
+            if done % 10 == 0 or done == len(shards):
+                kept_so_far = sum(r["kept"] for r in results)
+                dropped_so_far = sum(r["dropped"] for r in results)
+                errs_so_far = sum(1 for r in results if r["error"])
+                elapsed = _time.time() - t_start
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (len(shards) - done) / rate if rate > 0 else 0
+                err_str = f"  errors={errs_so_far}" if errs_so_far else ""
+                print(
+                    f"  [{done}/{len(shards)}] kept={kept_so_far:,}"
+                    f"  dropped={dropped_so_far:,}{err_str}"
+                    f"  {rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                    flush=True,
+                )
 
     total_kept = sum(r["kept"] for r in results)
     errors = sum(1 for r in results if r["error"])
@@ -175,7 +205,8 @@ def main():
     print(f"  Kept:   {total_kept:,} valid records")
     print(f"  Shards: {len(shards)}")
     if errors:
-        print(f"  Errors: {errors} shards had read/write errors")
+        print(f"  Errors: {errors} shards had read/write errors", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
