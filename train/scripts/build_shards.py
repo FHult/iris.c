@@ -36,6 +36,7 @@ Reference: plans/ip-adapter-training.md §2.5
 
 import argparse
 import collections
+import concurrent.futures
 import glob
 import io
 import math
@@ -165,17 +166,38 @@ def _collect_records(source_dirs: list, workers: int = 1) -> list:
 # Worker function (runs in separate process — no GIL)
 # ---------------------------------------------------------------------------
 
+def _load_jpegs_from_shard(src_path: str, needed: set) -> dict:
+    """Load jpeg bytes for a set of record ids from a source tar. I/O only."""
+    jpg_raw = {}
+    try:
+        with tarfile.open(src_path) as src_tar:
+            members = {m.name: m for m in src_tar.getmembers() if m.isfile()}
+            stem_to_file = {}
+            for name in members:
+                stem, _, ext = name.rpartition(".")
+                if ext.lower() in ("jpg", "jpeg", "png") and stem in needed:
+                    stem_to_file.setdefault(stem, name)
+            for stem in needed:
+                if stem in stem_to_file:
+                    jpg_raw[stem] = src_tar.extractfile(members[stem_to_file[stem]]).read()
+    except Exception as e:
+        print(f"Warning: failed to read {src_path}: {e}", file=sys.stderr)
+    return jpg_raw
+
+
 def _write_shard_range(args) -> dict:
     """
     Worker: write a non-overlapping range of output shards.
     Each worker gets shard indices [i, i+workers, i+2*workers, ...].
     No locks needed — each worker owns its shard files exclusively.
 
-    Memory design: all output tars are opened upfront, then source shards are
-    processed one at a time. Peak RAM = jpegs in ONE source shard (~750 MB),
-    not the full dataset (which caused kernel panics from swap exhaustion).
+    Memory design: process one source shard at a time, prefetching the next in
+    a background thread to overlap I/O with CPU. Peak RAM ≈ 2 source shards per
+    worker (~1.5 GB) vs the original unbounded accumulation that exhausted swap.
+    Workers are staggered so they access different source shards simultaneously,
+    keeping SSD throughput high.
     """
-    shard_ids, records, output_dir, shard_size, blocklist, quality = args
+    shard_ids, records, output_dir, shard_size, blocklist, quality, worker_idx, n_workers = args
     blocklist_set = set(blocklist)
 
     if _HAS_TURBOJPEG:
@@ -206,9 +228,15 @@ def _write_shard_range(args) -> dict:
         for rec in recs:
             by_source[rec["shard"]].append((shard_id, rec))
 
-    # Phase 2: open all output tars, stream one source shard at a time.
-    # Each source shard's jpegs are loaded, written directly to output tars,
-    # then released — peak RAM stays bounded to one source shard's worth.
+    # Stagger source shard order so workers read different files concurrently,
+    # spreading I/O across the SSD instead of all hammering the same file.
+    src_paths = sorted(by_source.keys())
+    offset = (worker_idx * max(1, len(src_paths) // max(n_workers, 1))) % len(src_paths)
+    src_paths = src_paths[offset:] + src_paths[:offset]
+
+    # Phase 2: open all output tars, stream source shards with 1-ahead prefetch.
+    # Prefetch runs in a background thread (I/O-bound, GIL released during read),
+    # overlapping disk reads with CPU encode/write of the current shard.
     out_tars = {}
     out_counts = {}
     for shard_id in shard_plan:
@@ -219,26 +247,26 @@ def _write_shard_range(args) -> dict:
 
     total_written = 0
     try:
-        for src_path in sorted(by_source.keys()):
-            items = by_source[src_path]
-            needed = {rec["id"] for _, rec in items}
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Kick off load of first shard
+        future = executor.submit(
+            _load_jpegs_from_shard,
+            src_paths[0],
+            {rec["id"] for _, rec in by_source[src_paths[0]]},
+        ) if src_paths else None
 
-            jpg_raw = {}
-            try:
-                with tarfile.open(src_path) as src_tar:
-                    members = {m.name: m for m in src_tar.getmembers() if m.isfile()}
-                    stem_to_file = {}
-                    for name in members:
-                        stem, _, ext = name.rpartition(".")
-                        if ext.lower() in ("jpg", "jpeg", "png") and stem in needed:
-                            stem_to_file.setdefault(stem, name)
-                    for stem in needed:
-                        if stem in stem_to_file:
-                            jpg_raw[stem] = src_tar.extractfile(
-                                members[stem_to_file[stem]]
-                            ).read()
-            except Exception as e:
-                print(f"Warning: failed to read {src_path}: {e}", file=sys.stderr)
+        for i, src_path in enumerate(src_paths):
+            jpg_raw = future.result()  # wait for current shard's data
+            # Prefetch next shard while we process this one
+            if i + 1 < len(src_paths):
+                next_path = src_paths[i + 1]
+                future = executor.submit(
+                    _load_jpegs_from_shard,
+                    next_path,
+                    {rec["id"] for _, rec in by_source[next_path]},
+                )
+            else:
+                future = None
 
             for shard_id, rec in items:
                 raw = jpg_raw.get(rec["id"])
@@ -272,7 +300,8 @@ def _write_shard_range(args) -> dict:
                     total_written += 1
                 except Exception:
                     skipped += 1
-            # jpg_raw released here — GC reclaims memory before next source shard
+            # jpg_raw released here — GC reclaims before next shard is fetched
+        executor.shutdown(wait=False)
     finally:
         for tar in out_tars.values():
             tar.close()
@@ -347,39 +376,11 @@ def main():
     print(f"  Workers: {workers} processes (targeting P-cores on Apple Silicon)")
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
 
-    # Split shard index ranges across workers (interleaved, not contiguous)
+    # Split shard index ranges across workers (interleaved, not contiguous).
     # Worker 0 → shards start_idx+0, start_idx+W, ...  Worker 1 → start_idx+1, ...
     shard_ranges = [list(range(start_idx + i, start_idx + n_shards, workers)) for i in range(workers)]
 
-    # Split record list across workers corresponding to shard ranges
-    # Worker w processes records[w*shard_size : (w+1)*shard_size, (w+W)*shard_size...]
-    # Simpler: each worker gets the full record list but advances its own idx.
-    # With interleaved shards, slice the records for each worker:
-    worker_record_slices = []
-    for w in range(workers):
-        # Worker w writes shards shard_ranges[w]; each shard has shard_size records.
-        # Records are laid out in order: records for shard 0 first, then shard 1, etc.
-        # With interleaved shard ownership we need to re-slice appropriately.
-        # Easiest correct approach: give each worker the full list; each worker
-        # processes shard_ranges[w] shards sequentially using global offset.
-        worker_record_slices.append(records)  # shared read-only; workers index by shard_id
-
-    # Repack args for pool.map: each worker gets its shard_ids + full records
-    work_items = [
-        (
-            shard_ranges[w],
-            records,
-            args.output,
-            args.shard_size,
-            blocklist,
-            args.quality,
-        )
-        for w in range(workers)
-    ]
-
-    # Rebuild: give each worker only its slice of records to avoid memory duplication.
-    # Worker w owns every workers-th shard, so it processes records in those positions.
-    # Simplest correct split: worker w processes record indices [w*chunk ... (w+1)*chunk).
+    # Give each worker a contiguous slice of the shuffled record list.
     chunk = math.ceil(len(records) / workers)
     work_items = [
         (
@@ -389,6 +390,8 @@ def main():
             args.shard_size,
             blocklist,
             args.quality,
+            w,        # worker_idx — used to stagger source-shard read order
+            workers,  # n_workers
         )
         for w in range(workers)
     ]
