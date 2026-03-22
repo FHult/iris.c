@@ -82,12 +82,14 @@ BUILD_LOG=/tmp/build_shards.log
 PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 || true)
 TRAIN_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1 || true)
 
-# ── Expected shard total (for progress display only) ──────────────────────────
-# Parse from build_shards log: "Written: N images across M shards" or "of M total"
-TOTAL_SHARDS_EST=495
+# ── Expected shard total (for in-progress display only) ───────────────────────
+# Parse from build_shards log: "writing 000000–XXXXXX of N total"
+# Only used when build is actively running; not used for done detection.
+# Do NOT use the "across N shards" completion line — that reflects the pre-filter
+# planned count (e.g. 495), while filter_shards may later remove empty shards.
+TOTAL_SHARDS_EST=""
 if [[ -f "$BUILD_LOG" ]]; then
-    parsed=$(grep -oE 'across ([0-9]+) shards' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
-    [[ -z "$parsed" ]] && parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
+    parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
     [[ -n "$parsed" ]] && TOTAL_SHARDS_EST="$parsed"
 fi
 
@@ -115,7 +117,11 @@ hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9,]+/[0-9,]+\] [0-9,]+ duplicates found'
 [[ -n "$hb" ]] && DEDUP_RUN_INFO="$hb"
 
 # Step 4 — build_shards: "[worker N] src X/Y | written N records | shards A/B full"
-BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing..."
+if [[ -n "$TOTAL_SHARDS_EST" ]]; then
+    BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing..."
+else
+    BUILD_RUN_INFO="$SHARD_COUNT shards written so far..."
+fi
 hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
 [[ -n "$hb" ]] && BUILD_RUN_INFO="$hb"
 
@@ -176,7 +182,7 @@ step_status "[4/9] Build unified shards" \
     "$BUILD_RUN_INFO"
 
 step_status "[5/9] Filter shards" \
-    "[[ -f $DATA_ROOT/.done_filter ]]" \
+    "[[ -f $SHARDS_DIR/.filtered_chunk1 ]]" \
     "$FILTER_RUNNING" \
     "done" "$FILTER_RUN_INFO"
 
@@ -190,13 +196,13 @@ step_status "[7/9] Anchor set" \
     "($ANCHOR_COUNT shards)"
 
 step_status "[8a/9] Precompute Qwen3 embeddings" \
-    "[[ $QWEN3_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0 ]]" \
+    "[[ -f $PRECOMP_DIR/qwen3/.done || ($QWEN3_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0) ]]" \
     "$QWEN3_RUNNING" \
     "($QWEN3_COUNT/$SHARD_COUNT shards)" \
     "$QWEN3_RUN_INFO"
 
 step_status "[8b/9] Precompute VAE latents" \
-    "[[ $VAE_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0 ]]" \
+    "[[ -f $PRECOMP_DIR/vae/.done || ($VAE_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0) ]]" \
     "$VAE_RUNNING" \
     "($VAE_COUNT/$SHARD_COUNT shards)" \
     "$VAE_RUN_INFO"
