@@ -147,12 +147,13 @@ if [[ "$CHUNK" -eq 1 ]]; then
     log "  JourneyDB tgz 0-49:   $JDB_TGZS (expect 50)"
 
     [[ "$LAION_TARS" -gt 0 ]] || die "LAION shards not found in $DATA_ROOT/raw/laion/ — run img2dataset first"
-    [[ "$JDB_TGZS" -eq 50 ]]  || {
-        log "  WARNING: JourneyDB chunk 1 has $JDB_TGZS/50 files. Still downloading?"
+    [[ "$JDB_TGZS" -eq 50 || $(count_tars "$DATA_ROOT/raw/journeydb_wds") -gt 0 ]]  || {
+        log "  WARNING: JourneyDB chunk 1 has $JDB_TGZS/50 files and no WDS conversion found. Still downloading?"
         log "  Continuing with what is available..."
     }
-    [[ -d "$DATA_ROOT/raw/wikiart/data" || -d "$DATA_ROOT/raw/wikiart" ]] || \
-        die "WikiArt not found in $DATA_ROOT/raw/wikiart/"
+    [[ -d "$DATA_ROOT/raw/wikiart/data" || -d "$DATA_ROOT/raw/wikiart" || \
+       $(count_tars "$DATA_ROOT/raw/wikiart_wds") -gt 0 ]] || \
+        die "WikiArt not found — expected raw/wikiart/ or raw/wikiart_wds/"
 
     # ── 1b. Convert WikiArt ───────────────────────────────────────────────────
     WIKIART_WDS="$DATA_ROOT/raw/wikiart_wds"
