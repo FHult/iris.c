@@ -257,6 +257,7 @@ def _write_shard_range(args) -> dict:
 
         for i, src_path in enumerate(src_paths):
             jpg_raw = future.result()  # wait for current shard's data
+            items = by_source[src_path]
             # Prefetch next shard while we process this one
             if i + 1 < len(src_paths):
                 next_path = src_paths[i + 1]
