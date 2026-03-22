@@ -175,6 +175,9 @@ def run_dedup(embeddings_dir: str, output_dir: str, threshold: float = 0.95):
     Works in O(N * k) with IndexFlatIP — exact cosine similarity, no approximation.
     """
     import faiss
+    # OpenMP parallelism in FAISS is unstable on Apple Silicon (macOS) — crashes in
+    # __kmp_suspend_initialize_thread with near-null pointer dereference.
+    faiss.omp_set_num_threads(1)
 
     os.makedirs(output_dir, exist_ok=True)
     ids, vecs = _load_embeddings_from_dir(embeddings_dir)
@@ -316,6 +319,7 @@ def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
       5. Save the updated index
     """
     import faiss
+    faiss.omp_set_num_threads(1)
 
     existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
     if existing_embs:

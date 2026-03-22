@@ -165,6 +165,10 @@ if [[ "$CHUNK" -eq 1 ]]; then
             --output "$WIKIART_WDS" \
             --shard-size 1000
         log "  Done: $(count_tars "$WIKIART_WDS") WikiArt shards"
+        if [[ -d "$DATA_ROOT/raw/wikiart" ]]; then
+            log "  Removing original WikiArt source (~1.6 GB)..."
+            rm -rf "$DATA_ROOT/raw/wikiart"
+        fi
     fi
 
     # ── 1c. Convert JourneyDB chunk 1 ────────────────────────────────────────
@@ -179,6 +183,10 @@ if [[ "$CHUNK" -eq 1 ]]; then
             --shard-size 5000 \
             --start-tgz  0 --end-tgz 49
         log "  Done: $(count_tars "$JDB_WDS") JourneyDB shards"
+        if [[ -d "$DATA_ROOT/raw/journeydb" ]]; then
+            log "  Removing original JourneyDB tgz archives (~730 GB)..."
+            rm -rf "$DATA_ROOT/raw/journeydb"
+        fi
     fi
 
     # ── 1d. CLIP deduplication (LAION only) ───────────────────────────────────
@@ -192,6 +200,10 @@ if [[ "$CHUNK" -eq 1 ]]; then
             --embeddings "$DATA_ROOT/embeddings" \
             --output     "$DATA_ROOT/dedup_ids"
         log "  Done: duplicate IDs in $DEDUP_IDS"
+        if [[ -d "$DATA_ROOT/embeddings" ]]; then
+            log "  Removing CLIP embeddings (~3 GB, no longer needed after dedup)..."
+            rm -rf "$DATA_ROOT/embeddings"
+        fi
     fi
 
     # ── 1e. Build unified shards ──────────────────────────────────────────────
