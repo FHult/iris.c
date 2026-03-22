@@ -82,16 +82,22 @@ BUILD_LOG=/tmp/build_shards.log
 PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 || true)
 TRAIN_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1 || true)
 
-# ── Expected shard total ──────────────────────────────────────────────────────
-# Parse from the running build_shards log if available; otherwise use estimate.
-TOTAL_SHARDS_EST=933
+# ── Expected shard total (for progress display only) ──────────────────────────
+# Parse from build_shards log: "Written: N images across M shards" or "of M total"
+TOTAL_SHARDS_EST=495
 if [[ -f "$BUILD_LOG" ]]; then
-    parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
+    parsed=$(grep -oE 'across ([0-9]+) shards' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
+    [[ -z "$parsed" ]] && parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
     [[ -n "$parsed" ]] && TOTAL_SHARDS_EST="$parsed"
 fi
 
 # ── Process state ─────────────────────────────────────────────────────────────
 BUILD_RUNNING=false;  pgrep -f build_shards     &>/dev/null && BUILD_RUNNING=true
+
+# ── Build_shards done condition ───────────────────────────────────────────────
+# Match run_training_pipeline.sh logic: done if any shards exist and not running.
+BUILD_DONE=false
+if [[ $SHARD_COUNT -gt 0 && $BUILD_RUNNING == false ]]; then BUILD_DONE=true; fi
 FILTER_RUNNING=false; pgrep -f filter_shards    &>/dev/null && FILTER_RUNNING=true
 QWEN3_RUNNING=false;  pgrep -f precompute_qwen3 &>/dev/null && QWEN3_RUNNING=true
 VAE_RUNNING=false;    pgrep -f precompute_vae   &>/dev/null && VAE_RUNNING=true
@@ -111,7 +117,7 @@ hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9,]+/[0-9,]+\] [0-9,]+ duplicates found'
 # Step 4 — build_shards: "[worker N] src X/Y | written N records | shards A/B full"
 BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing..."
 hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
-[[ -n "$hb" ]] && BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST | $hb"
+[[ -n "$hb" ]] && BUILD_RUN_INFO="$hb"
 
 # Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm"
 FILTER_RUN_INFO="running..."
@@ -164,9 +170,9 @@ step_status "[3/9] CLIP deduplication" \
     "$DEDUP_RUN_INFO"
 
 step_status "[4/9] Build unified shards" \
-    "[[ $SHARD_COUNT -ge $TOTAL_SHARDS_EST ]]" \
+    "$BUILD_DONE" \
     "$BUILD_RUNNING" \
-    "($SHARD_COUNT/$TOTAL_SHARDS_EST shards)" \
+    "($SHARD_COUNT shards)" \
     "$BUILD_RUN_INFO"
 
 step_status "[5/9] Filter shards" \
