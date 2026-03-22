@@ -76,6 +76,7 @@ DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
 ANCHOR_DIR="$DATA_ROOT/anchor_shards"
 PRECOMP_DIR="$DATA_ROOT/precomputed"
 CKPT_DIR="$TRAIN_DIR/checkpoints"
+LOCK_FILE="$DATA_ROOT/logs/pipeline.lock"
 
 # JourneyDB per-phase summary for display (phase N: shard count or ⬜ if not yet downloaded)
 _jdb_phase() {
@@ -184,8 +185,8 @@ if [[ -n "$TOTAL_SHARDS_EST" ]]; then
 else
     BUILD_RUN_INFO="$SHARD_COUNT shards written so far..."
 fi
-hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
-[[ -z "$hb" ]] && hb=$(last_match "${TRAIN_LOG:-}" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
+hb=$(last_match "${TRAIN_LOG:-}" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
+[[ -z "$hb" ]] && hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
 [[ -n "$hb" ]] && BUILD_RUN_INFO="$hb"
 
 # Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm"
@@ -243,7 +244,7 @@ step_status "[2b/9] JourneyDB → WDS" \
 
 step_status "[3/9] CLIP deduplication" \
     "[[ -f $DEDUP_IDS ]]" \
-    "pgrep -f clip_dedup" \
+    "pgrep -f 'clip_dedup.py all'" \
     "($DEDUP_LINES IDs blocked)" \
     "$DEDUP_RUN_INFO"
 
@@ -256,7 +257,7 @@ step_status "[4/9] Build unified shards" \
 step_status "[5/9] Filter shards" \
     "[[ -f $SHARDS_DIR/.filtered_chunk1 ]]" \
     "$FILTER_RUNNING" \
-    "done" "$FILTER_RUN_INFO"
+    "($SHARD_COUNT shards)" "$FILTER_RUN_INFO"
 
 step_status "[6/9] Cross-chunk dedup index" \
     "[[ -f $DEDUP_INDEX ]]" \

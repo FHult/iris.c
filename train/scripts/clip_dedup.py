@@ -110,21 +110,29 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
 
     os.makedirs(embeddings_dir, exist_ok=True)
     tar_files = sorted(glob.glob(os.path.join(shards_dir, "*.tar")))
-    print(f"Embedding {len(tar_files)} shards from {shards_dir} ...")
 
-    total_embedded = 0
-    already_done = 0
+    # Pre-scan: accumulate counts for already-embedded shards and build the
+    # pending list so rate/ETA are computed only over shards that need work.
     import time as _time
-    t_start = _time.time()
-
+    total_embedded = 0
+    pending = []  # (original_shard_idx, tar_path)
     for shard_idx, tar_path in enumerate(tar_files):
         out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
         out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
         if os.path.exists(out_emb) and os.path.exists(out_meta):
-            n = np.load(out_emb, mmap_mode="r").shape[0]
-            total_embedded += n
-            already_done += 1
-            continue
+            total_embedded += np.load(out_emb, mmap_mode="r").shape[0]
+        else:
+            pending.append((shard_idx, tar_path))
+
+    print(
+        f"Embedding {len(tar_files)} shards from {shards_dir}  "
+        f"({len(pending)} to process, {len(tar_files)-len(pending)} already done) ..."
+    )
+
+    t_start = _time.time()
+    for batch_idx, (shard_idx, tar_path) in enumerate(pending):
+        out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
+        out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
 
         keys   = []
         tensors = []
@@ -168,13 +176,12 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
         pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
 
         total_embedded += len(keys)
-        if (shard_idx + 1) % 10 == 0 or shard_idx == len(tar_files) - 1:
+        if (batch_idx + 1) % 10 == 0 or batch_idx == len(pending) - 1:
             elapsed = _time.time() - t_start
-            shards_done = shard_idx + 1 - already_done
-            rate = shards_done / elapsed if elapsed > 0 else 0
-            eta = (len(tar_files) - shard_idx - 1) / rate if rate > 0 else 0
+            rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+            eta = (len(pending) - batch_idx - 1) / rate if rate > 0 else 0
             print(
-                f"  [{shard_idx+1}/{len(tar_files)}] {total_embedded:,} images embedded"
+                f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
                 f"  {rate:.1f} shards/s  ETA {eta/60:.0f}m",
                 flush=True,
             )

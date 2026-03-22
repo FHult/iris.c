@@ -363,9 +363,9 @@ if [[ "$CHUNK" -eq 1 ]]; then
     PREFETCH2_LOG="$DATA_ROOT/logs/prefetch_chunk2.log"
     PREFETCH2_PID=""
     if [[ $(count_tars "$JDB_WDS_CHUNK2") -gt 0 || -f "$PREFETCH2_DONE" ]]; then
-        log "[9/9] JDB chunk 2 already downloaded or converted — no prefetch needed"
+        log "[1i/9] JDB chunk 2 already downloaded or converted — no prefetch needed"
     else
-        log "[9/9] Launching JDB chunk 2 background prefetch (~800 GB, resumable)..."
+        log "[1i/9] Launching JDB chunk 2 background prefetch (~800 GB, resumable)..."
         mkdir -p "$JDB_RAW" "$DATA_ROOT/logs"
         (python3 - <<PYEOF
 from huggingface_hub import snapshot_download
