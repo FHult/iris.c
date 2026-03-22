@@ -1,9 +1,10 @@
 #!/bin/bash
 # train/scripts/pipeline_status.sh — Training pipeline status report.
 #
-# Prints a full status snapshot: all 9 pipeline steps, active log tail,
-# disk usage. Auto-detects DATA_ROOT from common SSD mount points so a
-# single call gives a complete picture with no follow-up queries needed.
+# Prints a full status snapshot: all 9 pipeline steps with live heartbeat
+# progress from each step's log, active log tail, disk usage.
+# Auto-detects DATA_ROOT from common SSD mount points so a single call
+# gives a complete picture with no follow-up queries needed.
 #
 # Usage:
 #   bash train/scripts/pipeline_status.sh
@@ -24,8 +25,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Auto-detect DATA_ROOT ─────────────────────────────────────────────────────
-# Probe common mount points in priority order; pick the first that looks like a
-# populated data root (has shards/, raw/, or dedup_ids/). Falls back to train/data.
 if [[ -z "$DATA_ROOT" ]]; then
     for candidate in /Volumes/2TBSSD /Volumes/IrisData /Volumes/TrainData "$TRAIN_DIR/data"; do
         if [[ -d "$candidate" ]] && \
@@ -43,14 +42,20 @@ count_tars()  { count_files "${1}" "*.tar"; }
 du_h()        { du -sh "$1" 2>/dev/null | cut -f1; }
 ts()          { date '+%Y-%m-%d %H:%M:%S'; }
 
+# last_match <file> <egrep-pattern>
+# Returns the last line in <file> matching <pattern>, stripped of leading whitespace.
+last_match() {
+    [[ -f "${1:-}" ]] && grep -E "$2" "$1" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true
+}
+
 step_status() {
     local label="$1" done_cond="$2" run_cond="$3"
     if eval "$done_cond" &>/dev/null; then
-        printf "  ✅ %-40s %s\n" "$label" "$4"
+        printf "  ✅ %-42s %s\n" "$label" "$4"
     elif [[ -n "$run_cond" ]] && eval "$run_cond" &>/dev/null; then
-        printf "  ⏳ %-40s %s\n" "$label" "$5"
+        printf "  ⏳ %-42s %s\n" "$label" "$5"
     else
-        printf "  ⬜ %-40s %s\n" "$label" "${6:-Pending}"
+        printf "  ⬜ %-42s %s\n" "$label" "${6:-Pending}"
     fi
 }
 
@@ -61,7 +66,6 @@ JDB_WDS_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds")
 WIKIART_WDS_TARS=$(count_tars "$DATA_ROOT/raw/wikiart_wds")
 DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
 SHARDS_DIR="$DATA_ROOT/shards"
-SHARDS_DONE="$SHARDS_DIR/.filtered_chunk1"
 DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
 ANCHOR_DIR="$DATA_ROOT/anchor_shards"
 PRECOMP_DIR="$DATA_ROOT/precomputed"
@@ -73,14 +77,64 @@ VAE_COUNT=$(count_files "$PRECOMP_DIR/vae" "*.npz")
 ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
 CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | tr -d ' ')
 
+# ── Log file discovery ────────────────────────────────────────────────────────
+BUILD_LOG=/tmp/build_shards.log
+PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 || true)
+TRAIN_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1 || true)
+
 # ── Expected shard total ──────────────────────────────────────────────────────
 # Parse from the running build_shards log if available; otherwise use estimate.
 TOTAL_SHARDS_EST=933
-BUILD_LOG=/tmp/build_shards.log
 if [[ -f "$BUILD_LOG" ]]; then
     parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
     [[ -n "$parsed" ]] && TOTAL_SHARDS_EST="$parsed"
 fi
+
+# ── Process state ─────────────────────────────────────────────────────────────
+BUILD_RUNNING=false;  pgrep -f build_shards     &>/dev/null && BUILD_RUNNING=true
+FILTER_RUNNING=false; pgrep -f filter_shards    &>/dev/null && FILTER_RUNNING=true
+QWEN3_RUNNING=false;  pgrep -f precompute_qwen3 &>/dev/null && QWEN3_RUNNING=true
+VAE_RUNNING=false;    pgrep -f precompute_vae   &>/dev/null && VAE_RUNNING=true
+SIGLIP_RUNNING=false; pgrep -f precompute_siglip &>/dev/null && SIGLIP_RUNNING=true
+TRAIN_RUNNING=false;  pgrep -f train_ip_adapter &>/dev/null && TRAIN_RUNNING=true
+
+# ── Heartbeat progress lines (from logs) ──────────────────────────────────────
+# Each running step emits heartbeat lines we can parse for live progress.
+
+# Step 3 — clip_dedup: "[X/N] X duplicates found"
+DEDUP_LINES=0
+[[ -f "$DEDUP_IDS" ]] && DEDUP_LINES=$(wc -l < "$DEDUP_IDS" | tr -d ' ')
+DEDUP_RUN_INFO="running..."
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9,]+/[0-9,]+\] [0-9,]+ duplicates found')
+[[ -n "$hb" ]] && DEDUP_RUN_INFO="$hb"
+
+# Step 4 — build_shards: "[worker N] src X/Y | written N records | shards A/B full"
+BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing..."
+hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
+[[ -n "$hb" ]] && BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST | $hb"
+
+# Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm"
+FILTER_RUN_INFO="running..."
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] kept=')
+[[ -n "$hb" ]] && FILTER_RUN_INFO="$hb"
+
+# Step 8a — precompute_qwen3: "[X/Y] N,NNN embeddings  X.XX shards/s  ETA Xm"
+QWEN3_RUN_INFO="$QWEN3_COUNT/$SHARD_COUNT shards, running..."
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ embeddings')
+[[ -n "$hb" ]] && QWEN3_RUN_INFO="$hb"
+
+# Step 8b — precompute_vae: "[X/Y] N,NNN latents  X.XX shards/s  ETA Xm"
+VAE_RUN_INFO="$VAE_COUNT/$SHARD_COUNT shards, running..."
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
+[[ -n "$hb" ]] && VAE_RUN_INFO="$hb"
+
+# Step 9 — training: "step X,XXX/105,000  loss X.XXXX (avg X.XXXX)  lr ...  ETA Xh XXm"
+LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors 2>/dev/null | grep -v ema | head -1)
+LATEST_STEP=""
+[[ -n "$LATEST_CKPT" ]] && LATEST_STEP="($(basename "$LATEST_CKPT" .safetensors)) "
+TRAIN_RUN_INFO="${LATEST_STEP}running..."
+hb=$(last_match "$TRAIN_LOG" 'steps/s.*ETA [0-9]+h')
+[[ -n "$hb" ]] && TRAIN_RUN_INFO="$hb"
 
 # ── Header ────────────────────────────────────────────────────────────────────
 echo "================================================================="
@@ -103,26 +157,22 @@ step_status "[2b/9] JourneyDB → WDS" \
     "[[ $JDB_WDS_TARS -gt 0 ]]" "" \
     "($JDB_WDS_TARS shards)"
 
-DEDUP_LINES=0
-[[ -f "$DEDUP_IDS" ]] && DEDUP_LINES=$(wc -l < "$DEDUP_IDS" | tr -d ' ')
 step_status "[3/9] CLIP deduplication" \
     "[[ -f $DEDUP_IDS ]]" \
     "pgrep -f clip_dedup" \
     "($DEDUP_LINES IDs blocked)" \
-    "running..."
+    "$DEDUP_RUN_INFO"
 
-BUILD_RUNNING=false
-pgrep -f build_shards &>/dev/null && BUILD_RUNNING=true
 step_status "[4/9] Build unified shards" \
     "[[ $SHARD_COUNT -ge $TOTAL_SHARDS_EST ]]" \
     "$BUILD_RUNNING" \
     "($SHARD_COUNT/$TOTAL_SHARDS_EST shards)" \
-    "($SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing...)"
+    "$BUILD_RUN_INFO"
 
 step_status "[5/9] Filter shards" \
-    "[[ -f $SHARDS_DONE ]]" \
-    "pgrep -f filter_shards" \
-    "done" "running..."
+    "[[ -f $DATA_ROOT/.done_filter ]]" \
+    "$FILTER_RUNNING" \
+    "done" "$FILTER_RUN_INFO"
 
 step_status "[6/9] Cross-chunk dedup index" \
     "[[ -f $DEDUP_INDEX ]]" \
@@ -133,30 +183,23 @@ step_status "[7/9] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
     "($ANCHOR_COUNT shards)"
 
-QWEN3_RUNNING=false; pgrep -f precompute_qwen3 &>/dev/null && QWEN3_RUNNING=true
-VAE_RUNNING=false;   pgrep -f precompute_vae   &>/dev/null && VAE_RUNNING=true
-
 step_status "[8a/9] Precompute Qwen3 embeddings" \
     "[[ $QWEN3_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0 ]]" \
     "$QWEN3_RUNNING" \
     "($QWEN3_COUNT/$SHARD_COUNT shards)" \
-    "($QWEN3_COUNT/$SHARD_COUNT shards, running...)"
+    "$QWEN3_RUN_INFO"
 
 step_status "[8b/9] Precompute VAE latents" \
     "[[ $VAE_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0 ]]" \
     "$VAE_RUNNING" \
     "($VAE_COUNT/$SHARD_COUNT shards)" \
-    "($VAE_COUNT/$SHARD_COUNT shards, running...)"
+    "$VAE_RUN_INFO"
 
-TRAIN_RUNNING=false; pgrep -f train_ip_adapter &>/dev/null && TRAIN_RUNNING=true
-LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors 2>/dev/null | grep -v ema | head -1)
-LATEST_STEP=""
-[[ -n "$LATEST_CKPT" ]] && LATEST_STEP="(latest: $(basename "$LATEST_CKPT" .safetensors))"
 step_status "[9/9] Train" \
     "[[ $CKPT_COUNT -gt 0 ]]" \
     "$TRAIN_RUNNING" \
-    "$LATEST_STEP ($CKPT_COUNT checkpoints)" \
-    "running... $LATEST_STEP"
+    "${LATEST_STEP}($CKPT_COUNT checkpoints)" \
+    "$TRAIN_RUN_INFO"
 
 # ── Active processes (names only) ─────────────────────────────────────────────
 echo ""
@@ -184,18 +227,18 @@ else
 fi
 
 # ── Active log tail ───────────────────────────────────────────────────────────
-# Show the most relevant log for the currently running step so no separate
-# progress query is needed. Priority: build_shards → precompute → pipeline.
+# Show the most relevant log for the currently running step.
+# Priority: build_shards → precompute/filter → training → most recent
 echo ""
 echo "── Active log ───────────────────────────────────────────────────"
 ACTIVE_LOG=""
 if $BUILD_RUNNING && [[ -f "$BUILD_LOG" ]]; then
     ACTIVE_LOG="$BUILD_LOG"
-elif $QWEN3_RUNNING || $VAE_RUNNING; then
-    ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1)
-    [[ -z "$ACTIVE_LOG" ]] && ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/*.log 2>/dev/null | head -1)
+elif $FILTER_RUNNING || $QWEN3_RUNNING || $VAE_RUNNING || $SIGLIP_RUNNING; then
+    ACTIVE_LOG="${PRECOMPUTE_LOG:-}"
+    [[ -z "$ACTIVE_LOG" ]] && ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/*.log 2>/dev/null | head -1 || true)
 elif $TRAIN_RUNNING; then
-    ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1)
+    ACTIVE_LOG="${TRAIN_LOG:-}"
 fi
 # Fall back to most recent log if nothing running
 if [[ -z "$ACTIVE_LOG" ]]; then
@@ -204,12 +247,12 @@ if [[ -z "$ACTIVE_LOG" ]]; then
         "$DATA_ROOT/logs"/pipeline_chunk*.log \
         "$DATA_ROOT/logs"/*.log \
         "$TRAIN_DIR/data/logs"/pipeline_chunk*.log \
-        2>/dev/null | head -1)
+        2>/dev/null | head -1 || true)
 fi
 
 if [[ -n "$ACTIVE_LOG" ]]; then
     echo "  $ACTIVE_LOG"
-    tail -10 "$ACTIVE_LOG" | while read -r line; do echo "  $line"; done
+    tail -15 "$ACTIVE_LOG" | while read -r line; do echo "  $line"; done
 else
     echo "  (no log found)"
 fi

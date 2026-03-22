@@ -49,7 +49,14 @@ All scripts work from any working directory. All long-running scripts launch in 
 ```bash
 bash train/scripts/pipeline_status.sh
 ```
-Shows all 9 steps (✅/⏳/⬜), active process names, tmux sessions, last 10 lines of the active log, and disk layout. **This is usually the first command to run.** Auto-detects `/Volumes/2TBSSD` so no flags needed.
+Shows all 9 steps (✅/⏳/⬜), active process names, tmux sessions, last 15 lines of the active log, and disk layout. **This is usually the first command to run.** Auto-detects `/Volumes/2TBSSD` so no flags needed.
+
+For running steps, each line shows the **most recent heartbeat** parsed from the step's log — no separate progress query needed:
+- `build_shards`: `[worker N] src X/Y | written N records | shards A/B full`
+- `filter_shards`: `[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm`
+- `precompute_qwen3/vae/siglip`: `[X/Y] N,NNN embeddings/latents/features  X.XX shards/s  ETA Xm`
+- `clip_dedup`: `[X/N] N duplicates found`
+- `train_ip_adapter`: `step X,XXX/105,000  loss X.XXXX (avg X.XXXX)  lr X  X.XX steps/s  ETA Xh XXm`
 
 ---
 
@@ -99,8 +106,12 @@ Auto-detects the latest checkpoint in `checkpoints/`, infers the current chunk f
 bash train/scripts/pipeline_logs.sh              # last 60 lines
 bash train/scripts/pipeline_logs.sh --lines 200  # more context
 bash train/scripts/pipeline_logs.sh --follow     # stream live (Ctrl-C to exit)
+bash train/scripts/pipeline_logs.sh --progress   # heartbeat lines only (best for dispatch)
+bash train/scripts/pipeline_logs.sh --all        # list all log files
 ```
 Auto-selects the most relevant log for what is currently running: build_shards → `/tmp/build_shards.log`, precompute → `DATA_ROOT/logs/precompute*.log`, training → `DATA_ROOT/logs/pipeline_chunk*.log`.
+
+`--progress` filters to only heartbeat lines (worker updates, shard counts, step/loss lines), removing startup noise and model output. This is the recommended mode for Claude CoWork Dispatch progress checks.
 
 ---
 
