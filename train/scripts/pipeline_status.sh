@@ -137,8 +137,11 @@ CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | t
 
 # ── Log file discovery ────────────────────────────────────────────────────────
 BUILD_LOG=/tmp/build_shards.log
-PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 || true)
 TRAIN_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1 || true)
+# Dedicated precompute log (legacy); fall back to the pipeline chunk log which
+# captures all step output via tee when no separate precompute log exists.
+PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 || true)
+[[ -z "$PRECOMPUTE_LOG" ]] && PRECOMPUTE_LOG="${TRAIN_LOG:-}"
 
 # ── Expected shard total (for in-progress display only) ───────────────────────
 # Parse from build_shards log: "writing 000000–XXXXXX of N total"
@@ -306,8 +309,10 @@ fi
 echo ""
 echo "── Active log ───────────────────────────────────────────────────"
 ACTIVE_LOG=""
-if $BUILD_RUNNING && [[ -f "$BUILD_LOG" ]]; then
-    ACTIVE_LOG="$BUILD_LOG"
+if $BUILD_RUNNING; then
+    # Prefer live pipeline log; fall back to /tmp/build_shards.log for heartbeat
+    ACTIVE_LOG="${TRAIN_LOG:-}"
+    [[ -z "$ACTIVE_LOG" && -f "$BUILD_LOG" ]] && ACTIVE_LOG="$BUILD_LOG"
 elif $FILTER_RUNNING || $QWEN3_RUNNING || $VAE_RUNNING || $SIGLIP_RUNNING; then
     ACTIVE_LOG="${PRECOMPUTE_LOG:-}"
     [[ -z "$ACTIVE_LOG" ]] && ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/*.log 2>/dev/null | head -1 || true)

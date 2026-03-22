@@ -269,7 +269,7 @@ if [[ "$CHUNK" -eq 1 ]]; then
 
         BUILD_ARGS=("--sources" "${SOURCES[@]}" "--output" "$SHARDS_DIR")
         [[ -f "$DEDUP_IDS" ]] && BUILD_ARGS+=("--blocklist" "$DEDUP_IDS")
-        python "$SCRIPT_DIR/build_shards.py" "${BUILD_ARGS[@]}"
+        python "$SCRIPT_DIR/build_shards.py" "${BUILD_ARGS[@]}" 2>&1 | tee /tmp/build_shards.log
         log "  Done: $(count_tars "$SHARDS_DIR") unified shards"
     fi
 
