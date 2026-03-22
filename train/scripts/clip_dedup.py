@@ -347,10 +347,8 @@ def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
         existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
         print(f"Embeddings already complete ({len(existing_embs)} files) — skipping CLIP inference")
     else:
-        for stale in glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy")):
-            os.remove(stale)
-        for stale in glob.glob(os.path.join(embeddings_dir, "metadata_*.parquet")):
-            os.remove(stale)
+        # run_embed is resume-safe (skips shards whose .npy already exists),
+        # so do NOT delete partial results here — let it pick up where it left off.
         print("Embedding unified shards for cross-chunk dedup index...")
         run_embed(shards_dir, embeddings_dir, batch_size)
         open(sentinel, "w").close()
