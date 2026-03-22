@@ -50,6 +50,7 @@ import io
 import os
 import sys
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 
 # Must be set before numpy/FAISS import; libomp on Apple Silicon crashes under
 # multi-threaded barrier release (SIGSEGV in __kmp_hyper_barrier_release).
@@ -89,17 +90,53 @@ def _clip_device() -> str:
 # Embedding
 # ---------------------------------------------------------------------------
 
-def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
+def _decode_shard(tar_path: str, preprocess) -> tuple:
+    """
+    Open one .tar shard and decode all JPEG images into preprocessed tensors.
+    Runs in a background thread so I/O + CPU decode overlaps with GPU inference.
+    Returns (keys, tensors) or (None, None) on hard error.
+    """
+    from PIL import Image as _PilImage
+    keys: list[str] = []
+    tensors = []
+    try:
+        with tarfile.open(tar_path) as tf:
+            members = {m.name: m for m in tf.getmembers()}
+            jpg_keys = sorted(
+                os.path.splitext(n)[0] for n in members if n.endswith(".jpg")
+            )
+            for key in jpg_keys:
+                m = members.get(key + ".jpg")
+                if m is None:
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                try:
+                    img = _PilImage.open(io.BytesIO(f.read())).convert("RGB")
+                    tensors.append(preprocess(img))
+                    keys.append(key)
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
+        return None, None
+    return keys, tensors
+
+
+def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
     """
     Embed all WebDataset images with CLIP ViT-L/14 using open_clip.
-    Forward pass runs on MPS (Apple Silicon GPU); CPU decode uses _PERF_CORES threads.
-    Output per shard: img_emb_NNNN.npy (float32 L2-normalised) + metadata_NNNN.parquet (key col).
+    Forward pass runs on MPS (Apple Silicon GPU).
+    Uses a background thread to prefetch+decode the next shard while the GPU
+    processes the current one, overlapping CPU decode with GPU inference.
+    Output per shard: img_emb_NNNN.npy (float32 L2-normalised) + metadata_NNNN.parquet.
     Resume-safe: skips shards whose .npy already exists.
     """
     import torch
     import open_clip
     import pandas as pd
-    from PIL import Image
+    import time as _time
 
     device = torch.device(_clip_device())
     print(f"Loading CLIP ViT-L/14 on device={device} ...")
@@ -111,9 +148,8 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     os.makedirs(embeddings_dir, exist_ok=True)
     tar_files = sorted(glob.glob(os.path.join(shards_dir, "*.tar")))
 
-    # Pre-scan: accumulate counts for already-embedded shards and build the
-    # pending list so rate/ETA are computed only over shards that need work.
-    import time as _time
+    # Pre-scan: accumulate counts for already-embedded shards; build pending list
+    # so rate/ETA are computed only over shards that actually need work.
     total_embedded = 0
     pending = []  # (original_shard_idx, tar_path)
     for shard_idx, tar_path in enumerate(tar_files):
@@ -132,65 +168,54 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     t_start = _time.time()
     t_last_hb = t_start
     interval_rates = []
-    for batch_idx, (shard_idx, tar_path) in enumerate(pending):
-        out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
-        out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
 
-        keys   = []
-        tensors = []
-        try:
-            with tarfile.open(tar_path) as tf:
-                members = {m.name: m for m in tf.getmembers()}
-                jpg_keys = sorted(
-                    os.path.splitext(n)[0] for n in members if n.endswith(".jpg")
+    # One background thread prefetches the next shard's images while the GPU
+    # processes the current shard — overlaps I/O+PIL decode with MPS inference.
+    with ThreadPoolExecutor(max_workers=1) as loader:
+        # Kick off the first shard immediately
+        next_future = loader.submit(_decode_shard, pending[0][1], preprocess) if pending else None
+
+        for batch_idx, (shard_idx, tar_path) in enumerate(pending):
+            out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
+            out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
+
+            # Collect result for this shard (already loading in background)
+            keys, tensors = next_future.result()
+
+            # Immediately kick off decoding the next shard
+            if batch_idx + 1 < len(pending):
+                next_future = loader.submit(_decode_shard, pending[batch_idx + 1][1], preprocess)
+
+            if keys is None or not tensors:
+                continue
+
+            # GPU inference — runs while the next shard is being decoded above
+            all_embs = []
+            with torch.no_grad():
+                for i in range(0, len(tensors), batch_size):
+                    batch = torch.stack(tensors[i:i + batch_size]).to(device)
+                    embs  = model.encode_image(batch).float()
+                    embs  = embs / embs.norm(dim=-1, keepdim=True)
+                    all_embs.append(embs.cpu().numpy())
+
+            emb_arr = np.vstack(all_embs).astype(np.float32)
+            np.save(out_emb, emb_arr)
+            pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
+
+            total_embedded += len(keys)
+            if (batch_idx + 1) % 10 == 0 or batch_idx == len(pending) - 1:
+                t_now = _time.time()
+                interval_time = t_now - t_last_hb
+                if interval_time > 0:
+                    interval_rates.append((batch_idx % 10 + 1) / interval_time)
+                avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
+                eta = (len(pending) - batch_idx - 1) / avg_rate if avg_rate > 0 else 0
+                t_last_hb = t_now
+                print(
+                    f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
+                    f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                    flush=True,
                 )
-                for key in jpg_keys:
-                    m = members.get(key + ".jpg")
-                    if m is None:
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    try:
-                        img = Image.open(io.BytesIO(f.read())).convert("RGB")
-                        t   = preprocess(img)
-                        keys.append(key)
-                        tensors.append(t)
-                    except Exception:
-                        continue
-        except Exception as e:
-            print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
-            continue
-
-        if not tensors:
-            continue
-
-        all_embs = []
-        with torch.no_grad():
-            for i in range(0, len(tensors), batch_size):
-                batch = torch.stack(tensors[i:i + batch_size]).to(device)
-                embs  = model.encode_image(batch).float()
-                embs  = embs / embs.norm(dim=-1, keepdim=True)
-                all_embs.append(embs.cpu().numpy())
-
-        emb_arr = np.vstack(all_embs).astype(np.float32)
-        np.save(out_emb, emb_arr)
-        pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
-
-        total_embedded += len(keys)
-        if (batch_idx + 1) % 10 == 0 or batch_idx == len(pending) - 1:
-            t_now = _time.time()
-            interval_time = t_now - t_last_hb
-            if interval_time > 0:
-                interval_rates.append((batch_idx % 10 + 1) / interval_time)
-            avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
-            eta = (len(pending) - batch_idx - 1) / avg_rate if avg_rate > 0 else 0
-            t_last_hb = t_now
-            print(
-                f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
-                f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
-                flush=True,
-            )
 
     print(f"Done. {total_embedded:,} embeddings in {embeddings_dir}")
 
