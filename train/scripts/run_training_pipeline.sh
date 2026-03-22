@@ -4,6 +4,13 @@
 # Handles the full lifecycle from raw downloads through training, including
 # incremental chunked training on additional JourneyDB data.
 #
+# ── Recommended: run inside tmux so the pipeline survives shell disconnects ───
+#
+#   tmux new-session -d -s pipeline \
+#     "caffeinate -i -d bash train/scripts/run_training_pipeline.sh \
+#         --data-root /Volumes/2TBSSD 2>&1 | tee train/data/logs/pipeline_tmux.log"
+#   tmux attach -t pipeline          # attach to watch progress
+#
 # ── Stage 1 (initial): convert → dedup → shard → precompute → train ──────────
 #
 #   caffeinate -i -d bash train/scripts/run_training_pipeline.sh \
@@ -88,6 +95,10 @@ TRAIN_STEPS="${OVERRIDE_STEPS:-${CHUNK_STEPS[$CHUNK]}}"
 # ── Early checks (before logging so we can fail cleanly) ─────────────────────
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: data root not found: $DATA_ROOT — run setup_data_dir.sh first" >&2; exit 1; }
 [[ -f "$VENV" ]]      || { echo "ERROR: venv not found: $VENV — run train/setup.sh first" >&2; exit 1; }
+if [[ -z "${TMUX:-}" ]]; then
+    echo "WARNING: not running inside tmux — pipeline will be killed if this shell exits." >&2
+    echo "         Recommended: tmux new-session -d -s pipeline \"caffeinate -i -d bash $0 $*\"" >&2
+fi
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 mkdir -p "$DATA_ROOT/logs"
