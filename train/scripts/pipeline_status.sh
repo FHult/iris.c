@@ -280,18 +280,39 @@ step_status "[9/9] Train" \
     "${LATEST_STEP}($CKPT_COUNT checkpoints)" \
     "$TRAIN_RUN_INFO"
 
-# ── Active processes (names only) ─────────────────────────────────────────────
+# ── Active processes ──────────────────────────────────────────────────────────
+# Show the pipeline as one entry (top-level PID only) plus individual step processes.
 echo ""
 echo "── Active processes ─────────────────────────────────────────────"
-PROC_LINES=$(pgrep -a -l -f "build_shards|clip_dedup|filter_shards|precompute_qwen3|precompute_vae|precompute_siglip|train_ip_adapter|caffeinate|run_training_pipeline|run_shard_and_precompute" 2>/dev/null \
-    | grep -v "grep\|pipeline_status")
-if [[ -n "$PROC_LINES" ]]; then
-    echo "$PROC_LINES" | while read -r pid rest; do
+# Top-level pipeline shell: run_training_pipeline.sh whose parent is NOT also
+# run_training_pipeline.sh (i.e. the root of the process tree, not subshells).
+PIPELINE_ROOT=""
+while IFS= read -r pid; do
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    parent_cmd=$(ps -o comm= -p "$ppid" 2>/dev/null || true)
+    if [[ "$parent_cmd" != "bash" ]] || ! ps -o args= -p "$ppid" 2>/dev/null | grep -q "run_training_pipeline"; then
+        PIPELINE_ROOT="$pid"
+        break
+    fi
+done < <(pgrep -f "run_training_pipeline" 2>/dev/null | sort -n)
+
+if [[ -n "$PIPELINE_ROOT" ]]; then
+    lock_chunk=$(grep '^chunk=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2)
+    printf "  PID %-8s run_training_pipeline.sh%s\n" "$PIPELINE_ROOT" \
+        "${lock_chunk:+  (chunk $lock_chunk)}"
+fi
+
+# Step-level worker processes (exclude pipeline shell subprocesses)
+STEP_PROCS=$(pgrep -a -l -f "build_shards|clip_dedup\.py|filter_shards|precompute_qwen3|precompute_vae|precompute_siglip|train_ip_adapter" 2>/dev/null \
+    | grep -v "grep\|pipeline_status" || true)
+if [[ -n "$STEP_PROCS" ]]; then
+    echo "$STEP_PROCS" | while read -r pid rest; do
         script=$(echo "$rest" | grep -oE '[^ /]+\.(py|sh)' | head -1)
-        [[ -z "$script" ]] && script=$(echo "$rest" | awk '{print $1}' | xargs basename 2>/dev/null)
         printf "  PID %-8s %s\n" "$pid" "$script"
     done
-else
+fi
+
+if [[ -z "$PIPELINE_ROOT" && -z "$STEP_PROCS" ]]; then
     echo "  (none)"
 fi
 
