@@ -9,6 +9,7 @@ indistinguishable in output quality.
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils as mx_utils
 
 
 def update_ema(
@@ -22,7 +23,7 @@ def update_ema(
     Returns updated ema_params dict (does not mutate in place).
     Based on plans/ip-adapter-training.md §3.11.
     """
-    return mx.tree_map(
+    return mx_utils.tree_map(
         lambda e, m: decay * e + (1.0 - decay) * m,
         ema_params,
         model.parameters(),

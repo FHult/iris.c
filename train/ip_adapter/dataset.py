@@ -133,7 +133,7 @@ def augment_mlx(img, bucket_h: int, bucket_w: int):
 
     # Random horizontal flip (axis=-1 = W axis in BCHW)
     if random.random() > 0.5:
-        img = mx.flip(img, axis=-1)
+        img = img[..., ::-1]
 
     # Random crop offsets — Python random avoids GPU sync
     h_off = random.randint(0, 31)
@@ -163,8 +163,14 @@ def _load_qwen3_embed(rec_id: str, qwen3_dir: Optional[str]) -> Optional[np.ndar
     try:
         d = np.load(path)
         q, scale = d["q"], d["scale"]
-        lo = (q & 0x0F).astype(np.int8)
-        hi = ((q >> 4) & 0x0F).astype(np.int8)
+        # Use explicit out= buffers to prevent numpy's refcount-based in-place
+        # ufunc optimisation from reusing q's memory for the first operation,
+        # which would corrupt q before the second nibble can be extracted.
+        lo = np.empty(q.shape, dtype=np.int8)
+        hi = np.empty(q.shape, dtype=np.int8)
+        np.bitwise_and(q, np.int8(0x0F), out=lo)
+        np.right_shift(q, 4, out=hi)
+        np.bitwise_and(hi, np.int8(0x0F), out=hi)
         full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
         full[:, 0::2] = lo
         full[:, 1::2] = hi
@@ -215,8 +221,11 @@ def _load_siglip_embed(rec_id: str, siglip_dir: Optional[str]) -> Optional[np.nd
     try:
         d = np.load(path)
         q, scale = d["q"], d["scale"]
-        lo = (q & 0x0F).astype(np.int8)
-        hi = ((q >> 4) & 0x0F).astype(np.int8)
+        lo = np.empty(q.shape, dtype=np.int8)
+        hi = np.empty(q.shape, dtype=np.int8)
+        np.bitwise_and(q, np.int8(0x0F), out=lo)
+        np.right_shift(q, 4, out=hi)
+        np.bitwise_and(hi, np.int8(0x0F), out=hi)
         full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
         full[:, 0::2] = lo
         full[:, 1::2] = hi
