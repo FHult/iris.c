@@ -144,15 +144,16 @@ PRECOMPUTE_LOG=$(ls -t "$DATA_ROOT/logs"/precompute*.log 2>/dev/null | head -1 |
 [[ -z "$PRECOMPUTE_LOG" ]] && PRECOMPUTE_LOG="${TRAIN_LOG:-}"
 
 # ── Expected shard total (for in-progress display only) ───────────────────────
-# Parse from build_shards log: "writing 000000–XXXXXX of N total"
+# Parse from build_shards log or pipeline chunk log: "of N total"
 # Only used when build is actively running; not used for done detection.
 # Do NOT use the "across N shards" completion line — that reflects the pre-filter
-# planned count (e.g. 495), while filter_shards may later remove empty shards.
+# planned count, while filter_shards may later remove empty shards.
 TOTAL_SHARDS_EST=""
-if [[ -f "$BUILD_LOG" ]]; then
-    parsed=$(grep -oE 'of ([0-9]+) total' "$BUILD_LOG" | tail -1 | grep -oE '[0-9]+')
-    [[ -n "$parsed" ]] && TOTAL_SHARDS_EST="$parsed"
-fi
+for _log in "$BUILD_LOG" "${TRAIN_LOG:-}"; do
+    [[ -z "$_log" || ! -f "$_log" ]] && continue
+    parsed=$(grep -oE 'of ([0-9]+) total' "$_log" | tail -1 | grep -oE '[0-9]+')
+    if [[ -n "$parsed" ]]; then TOTAL_SHARDS_EST="$parsed"; break; fi
+done
 
 # ── Process state ─────────────────────────────────────────────────────────────
 BUILD_RUNNING=false;  pgrep -f build_shards     &>/dev/null && BUILD_RUNNING=true
@@ -177,13 +178,14 @@ DEDUP_RUN_INFO="running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9,]+/[0-9,]+\] [0-9,]+ duplicates found')
 [[ -n "$hb" ]] && DEDUP_RUN_INFO="$hb"
 
-# Step 4 — build_shards: "[worker N] src X/Y | written N records | shards A/B full"
+# Step 4 — build_shards: "[worker N] src X/Y | written N records | shards A/B done"
 if [[ -n "$TOTAL_SHARDS_EST" ]]; then
     BUILD_RUN_INFO="$SHARD_COUNT/$TOTAL_SHARDS_EST shards, writing..."
 else
     BUILD_RUN_INFO="$SHARD_COUNT shards written so far..."
 fi
 hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
+[[ -z "$hb" ]] && hb=$(last_match "${TRAIN_LOG:-}" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
 [[ -n "$hb" ]] && BUILD_RUN_INFO="$hb"
 
 # Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm"
