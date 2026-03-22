@@ -258,7 +258,7 @@ step_status "[6/9] Cross-chunk dedup index" \
 
 step_status "[7/9] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
-    "($ANCHOR_COUNT shards)"
+    "($ANCHOR_COUNT shards · built from raw sources, independent of steps 4-6)"
 
 step_status "[8a/9] Precompute Qwen3 embeddings" \
     "[[ -f $PRECOMP_DIR/qwen3/.done || ($QWEN3_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0) ]]" \
