@@ -197,14 +197,17 @@ def _write_shard_range(args) -> dict:
     Workers are staggered so they access different source shards simultaneously,
     keeping SSD throughput high.
     """
-    shard_ids, records, output_dir, shard_size, blocklist, quality, worker_idx, n_workers = args
+    shard_ids, records, output_dir, shard_size, blocklist, quality, worker_idx, n_workers, write_from = args
     blocklist_set = set(blocklist)
 
     if _HAS_TURBOJPEG:
         tj = TurboJPEG()
 
     # Phase 1: filter by blocklist + caption (no I/O), assign to output shards.
-    shard_plan = {}   # shard_id -> [rec, ...]
+    # shard_ids covers the FULL range from 0 so that record consumption matches
+    # a fresh run exactly. Shards before write_from are consumed but not written,
+    # which ensures resumed workers pick up at the correct record position.
+    shard_plan = {}   # shard_id -> [rec, ...]  (only shard_id >= write_from)
     rec_idx = 0
     skipped = 0
     for shard_id in shard_ids:
@@ -216,7 +219,7 @@ def _write_shard_range(args) -> dict:
                 skipped += 1
                 continue
             shard_recs.append(rec)
-        if shard_recs:
+        if shard_recs and shard_id >= write_from:
             shard_plan[shard_id] = shard_recs
 
     if not shard_plan:
@@ -373,26 +376,29 @@ def main():
     n_shards = math.ceil(len(records) / args.shard_size)
     workers = min(args.workers, n_shards)
     start_idx = args.start_idx
-    print(f"  Output: {n_shards} shards × {args.shard_size} images (starting at {start_idx:06d})")
+    print(f"  Output: {n_shards} new shards × {args.shard_size} images (writing {start_idx:06d}–{start_idx+n_shards-1:06d} of {total_shards} total)")
     print(f"  Workers: {workers} processes (targeting P-cores on Apple Silicon)")
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
 
-    # Split shard index ranges across workers (interleaved, not contiguous).
-    # Worker 0 → shards start_idx+0, start_idx+W, ...  Worker 1 → start_idx+1, ...
-    shard_ranges = [list(range(start_idx + i, start_idx + n_shards, workers)) for i in range(workers)]
+    # Total shards across the full run (0 … start_idx + n_shards - 1).
+    # Workers always receive the full range from 0 so their record consumption
+    # matches a fresh run; write_from tells them to skip writing shards < start_idx.
+    total_shards = start_idx + n_shards
+    full_shard_ranges = [list(range(i, total_shards, workers)) for i in range(workers)]
 
     # Give each worker a contiguous slice of the shuffled record list.
     chunk = math.ceil(len(records) / workers)
     work_items = [
         (
-            shard_ranges[w],
+            full_shard_ranges[w],
             records[w * chunk : (w + 1) * chunk],
             args.output,
             args.shard_size,
             blocklist,
             args.quality,
-            w,        # worker_idx — used to stagger source-shard read order
-            workers,  # n_workers
+            w,          # worker_idx — used to stagger source-shard read order
+            workers,    # n_workers
+            start_idx,  # write_from — skip writing shards already on disk
         )
         for w in range(workers)
     ]
