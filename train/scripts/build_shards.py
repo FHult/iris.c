@@ -240,13 +240,10 @@ def _write_shard_range(args) -> dict:
     # Phase 2: open all output tars, stream source shards with 1-ahead prefetch.
     # Prefetch runs in a background thread (I/O-bound, GIL released during read),
     # overlapping disk reads with CPU encode/write of the current shard.
+    # Output tars are opened lazily on first write so that a crash mid-run
+    # does not leave empty stub files that would be mistaken for completed shards.
     out_tars = {}
-    out_counts = {}
-    for shard_id in shard_plan:
-        out_tars[shard_id] = tarfile.open(
-            os.path.join(output_dir, f"{shard_id:06d}.tar"), "w"
-        )
-        out_counts[shard_id] = 0
+    out_counts = {shard_id: 0 for shard_id in shard_plan}
 
     total_written = 0
     try:
@@ -296,6 +293,10 @@ def _write_shard_range(args) -> dict:
                         img.save(buf, format="JPEG", quality=quality)
                         jpg_out = buf.getvalue()
 
+                    if shard_id not in out_tars:
+                        out_tars[shard_id] = tarfile.open(
+                            os.path.join(output_dir, f"{shard_id:06d}.tar"), "w"
+                        )
                     n = out_counts[shard_id]
                     key = f"{shard_id:06d}_{n:04d}"
                     _tar_add(out_tars[shard_id], f"{key}.jpg", jpg_out)

@@ -116,16 +116,19 @@ prompt_external() {
 
     if [[ -n "$detected" ]]; then
         echo "Detected external volume: $detected"
-        read -r -p "Symlink train/data/raw/ -> $detected/raw/? [Y/n] " REPLY
-        REPLY="${REPLY:-Y}"
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            EXTERNAL_PATH="$detected"
+        # Skip interactive prompt when no TTY (remote/phone dispatch)
+        if [[ -t 0 ]]; then
+            read -r -p "Symlink train/data/raw/ -> $detected/raw/? [Y/n] " REPLY
+            REPLY="${REPLY:-Y}"
+            [[ "$REPLY" =~ ^[Yy]$ ]] && EXTERNAL_PATH="$detected"
+        else
+            echo "  (no TTY — pass --external $detected to symlink automatically)"
         fi
     fi
 
     if [[ -z "$EXTERNAL_PATH" ]]; then
         echo ""
-        echo "External SSD not yet mounted."
+        echo "External SSD not yet mounted (or not confirmed)."
         echo "Creating train/data/raw/ as a local stub for now."
         echo ""
         echo "When the SSD arrives, run:"

@@ -4,8 +4,12 @@
 # Run this ONCE after all dataset downloads complete (after download_datasets.sh).
 # Wraps the entire pipeline in a single caffeinate invocation.
 #
-# Usage:
-#   caffeinate -i -d bash train/scripts/run_shard_and_precompute.sh
+# ── Recommended: run inside tmux so the pipeline survives shell disconnects ───
+#
+#   tmux new-session -d -s precompute \
+#     "caffeinate -i -d bash train/scripts/run_shard_and_precompute.sh \
+#         --data-root /Volumes/2TBSSD 2>&1 | tee train/data/logs/precompute_tmux.log"
+#   tmux attach -t precompute
 #
 # Override data root if train/data is not already set up:
 #   DATA_ROOT=/Volumes/IrisData caffeinate -i -d bash train/scripts/run_shard_and_precompute.sh
@@ -53,6 +57,11 @@ if [[ ! -d "$DATA_ROOT" ]]; then
     exit 1
 fi
 
+if [[ -z "${TMUX:-}" ]]; then
+    echo "WARNING: not running inside tmux — pipeline will be killed if this shell exits." >&2
+    echo "         Recommended: tmux new-session -d -s precompute \"caffeinate -i -d bash $0 $*\"" >&2
+fi
+
 # ── Step 1: CLIP deduplication ────────────────────────────────────────────────
 echo "[1/5] CLIP deduplication (~2h)..."
 python "$SCRIPT_DIR/clip_dedup.py" all \
@@ -64,9 +73,9 @@ python "$SCRIPT_DIR/clip_dedup.py" all \
 echo "[2/5] Merging sources into unified shards..."
 python "$SCRIPT_DIR/build_shards.py" \
     --sources "$DATA_ROOT/raw/laion" \
-              "$DATA_ROOT/raw/journeydb" \
+              "$DATA_ROOT/raw/journeydb_wds" \
               "$DATA_ROOT/raw/coyo" \
-              "$DATA_ROOT/raw/wikiart" \
+              "$DATA_ROOT/raw/wikiart_wds" \
     --output "$DATA_ROOT/shards" \
     --blocklist "$DATA_ROOT/dedup_ids/duplicate_ids.txt"
 
