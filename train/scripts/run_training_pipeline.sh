@@ -89,6 +89,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Apply per-chunk defaults unless overridden
+if [[ "$CHUNK" -lt 1 || "$CHUNK" -gt 4 ]]; then
+    echo "ERROR: --chunk must be 1–4, got: $CHUNK" >&2; exit 1
+fi
 TRAIN_LR="${OVERRIDE_LR:-${CHUNK_LR[$CHUNK]}}"
 TRAIN_STEPS="${OVERRIDE_STEPS:-${CHUNK_STEPS[$CHUNK]}}"
 
@@ -384,6 +387,7 @@ snapshot_download(
 )
 print('Download complete.')
 PYEOF
+        [[ $? -eq 0 ]] || die "HuggingFace snapshot_download failed for chunk $CHUNK"
         # Recount after download
         shopt -s nullglob
         case $CHUNK in

@@ -318,6 +318,7 @@ def make_prefetch_loader(
     # ---- Level 1: shard decompressor thread --------------------------------
     def shard_loader():
         rng = random.Random()
+        consecutive_errors = 0
         while True:
             # Build this epoch's shard list: mix anchor shards at anchor_mix_ratio
             epoch_paths = list(paths)
@@ -334,9 +335,16 @@ def make_prefetch_loader(
                             if m.isfile()
                         }
                     shard_q.put(contents)
+                    consecutive_errors = 0
                 except Exception as e:
                     print(f"Shard error {path}: {e}", file=sys.stderr)
-        # unreachable — infinite loop for resampled training
+                    consecutive_errors += 1
+                    if consecutive_errors >= 10:
+                        # Too many consecutive failures — signal consumer to stop
+                        shard_q.put(None)
+                        print("FATAL: 10 consecutive shard errors — stopping loader",
+                              file=sys.stderr)
+                        return
 
     # ---- Level 2: sample decoder + batch builder thread -------------------
     def sample_decoder():
@@ -417,4 +425,10 @@ def make_prefetch_loader(
     threading.Thread(target=sample_decoder, daemon=True).start()
 
     while True:
-        yield sample_q.get(timeout=120)
+        try:
+            item = sample_q.get(timeout=120)
+        except queue.Empty:
+            raise RuntimeError(
+                "sample_q timeout (120s) — shard_loader or sample_decoder likely crashed"
+            )
+        yield item

@@ -24,7 +24,7 @@
 # Recaption (step 2b) is optional and runs separately in two terminals.
 # SigLIP precompute is excluded by default (420 GB); add --siglip to enable.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DIR="$(dirname "$SCRIPT_DIR")"
@@ -62,46 +62,84 @@ if [[ -z "${TMUX:-}" ]]; then
     echo "         Recommended: tmux new-session -d -s precompute \"caffeinate -i -d bash $0 $*\"" >&2
 fi
 
+# Sentinel files — each step writes one on success; re-run skips the step.
+DONE_DEDUP="$DATA_ROOT/.done_dedup"
+DONE_SHARDS="$DATA_ROOT/.done_shards"
+DONE_FILTER="$DATA_ROOT/.done_filter"
+DONE_QWEN3="$DATA_ROOT/.done_qwen3"
+DONE_VAE="$DATA_ROOT/.done_vae"
+DONE_SIGLIP="$DATA_ROOT/.done_siglip"
+
 # ── Step 1: CLIP deduplication ────────────────────────────────────────────────
-echo "[1/5] CLIP deduplication (~2h)..."
-python "$SCRIPT_DIR/clip_dedup.py" all \
-    --shards "$DATA_ROOT/raw/laion" \
-    --embeddings "$DATA_ROOT/embeddings" \
-    --output "$DATA_ROOT/dedup_ids"
+if [[ -f "$DONE_DEDUP" ]]; then
+    echo "[1/5] CLIP deduplication — already done, skipping."
+else
+    echo "[1/5] CLIP deduplication (~2h)..."
+    python "$SCRIPT_DIR/clip_dedup.py" all \
+        --shards "$DATA_ROOT/raw/laion" \
+        --embeddings "$DATA_ROOT/embeddings" \
+        --output "$DATA_ROOT/dedup_ids"
+    touch "$DONE_DEDUP"
+fi
 
 # ── Step 2: Merge and shuffle into unified shards ─────────────────────────────
-echo "[2/5] Merging sources into unified shards..."
-python "$SCRIPT_DIR/build_shards.py" \
-    --sources "$DATA_ROOT/raw/laion" \
-              "$DATA_ROOT/raw/journeydb_wds" \
-              "$DATA_ROOT/raw/coyo" \
-              "$DATA_ROOT/raw/wikiart_wds" \
-    --output "$DATA_ROOT/shards" \
-    --blocklist "$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+if [[ -f "$DONE_SHARDS" ]]; then
+    echo "[2/5] Build shards — already done, skipping."
+else
+    echo "[2/5] Merging sources into unified shards..."
+    python "$SCRIPT_DIR/build_shards.py" \
+        --sources "$DATA_ROOT/raw/laion" \
+                  "$DATA_ROOT/raw/journeydb_wds" \
+                  "$DATA_ROOT/raw/coyo" \
+                  "$DATA_ROOT/raw/wikiart_wds" \
+        --output "$DATA_ROOT/shards" \
+        --blocklist "$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+    touch "$DONE_SHARDS"
+fi
 
 # ── Step 3: Filter pass ───────────────────────────────────────────────────────
-echo "[3/5] Filter pass (validate all shards)..."
-python "$SCRIPT_DIR/filter_shards.py" \
-    --shards "$DATA_ROOT/shards"
+if [[ -f "$DONE_FILTER" ]]; then
+    echo "[3/5] Filter pass — already done, skipping."
+else
+    echo "[3/5] Filter pass (validate all shards)..."
+    python "$SCRIPT_DIR/filter_shards.py" \
+        --shards "$DATA_ROOT/shards"
+    touch "$DONE_FILTER"
+fi
 
 # ── Step 4: Precompute Qwen3 (~8h, ~143 GB) ──────────────────────────────────
-echo "[4/5] Precomputing Qwen3 text embeddings (~8h)..."
-python "$SCRIPT_DIR/precompute_qwen3.py" \
-    --shards "$DATA_ROOT/shards" \
-    --output "$DATA_ROOT/precomputed/qwen3"
+if [[ -f "$DONE_QWEN3" ]]; then
+    echo "[4/5] Qwen3 precompute — already done, skipping."
+else
+    echo "[4/5] Precomputing Qwen3 text embeddings (~8h)..."
+    python "$SCRIPT_DIR/precompute_qwen3.py" \
+        --shards "$DATA_ROOT/shards" \
+        --output "$DATA_ROOT/precomputed/qwen3"
+    touch "$DONE_QWEN3"
+fi
 
 # ── Step 5: Precompute VAE latents (~6h, ~198 GB) ────────────────────────────
-echo "[5/5] Precomputing VAE latents (~6h)..."
-python "$SCRIPT_DIR/precompute_vae.py" \
-    --shards "$DATA_ROOT/shards" \
-    --output "$DATA_ROOT/precomputed/vae"
+if [[ -f "$DONE_VAE" ]]; then
+    echo "[5/5] VAE precompute — already done, skipping."
+else
+    echo "[5/5] Precomputing VAE latents (~6h)..."
+    python "$SCRIPT_DIR/precompute_vae.py" \
+        --shards "$DATA_ROOT/shards" \
+        --output "$DATA_ROOT/precomputed/vae"
+    touch "$DONE_VAE"
+fi
 
 # ── Optional: SigLIP (~420 GB) ────────────────────────────────────────────────
 if $ENABLE_SIGLIP; then
-    echo "[+] Precomputing SigLIP features (~420 GB)..."
-    python "$SCRIPT_DIR/precompute_siglip.py" \
-        --shards "$DATA_ROOT/shards" \
-        --output "$DATA_ROOT/precomputed/siglip"
+    if [[ -f "$DONE_SIGLIP" ]]; then
+        echo "[+] SigLIP precompute — already done, skipping."
+    else
+        echo "[+] Precomputing SigLIP features (~420 GB)..."
+        python "$SCRIPT_DIR/precompute_siglip.py" \
+            --shards "$DATA_ROOT/shards" \
+            --output "$DATA_ROOT/precomputed/siglip"
+        touch "$DONE_SIGLIP"
+    fi
 fi
 
 echo ""
