@@ -194,6 +194,9 @@ def main():
     import time as _time
     results = []
     t_start = _time.time()
+    t_last_hb = t_start
+    interval_rates = []
+    last_done = 0
     with multiprocessing.Pool(processes=args.workers) as pool:
         for done, result in enumerate(
             pool.imap_unordered(filter_shard, shards, chunksize=1), 1
@@ -203,14 +206,19 @@ def main():
                 kept_so_far = sum(r["kept"] for r in results)
                 dropped_so_far = sum(r["dropped"] for r in results)
                 errs_so_far = sum(1 for r in results if r["error"])
-                elapsed = _time.time() - t_start
-                rate = done / elapsed if elapsed > 0 else 0
-                eta = (len(shards) - done) / rate if rate > 0 else 0
+                t_now = _time.time()
+                interval_time = t_now - t_last_hb
+                if interval_time > 0:
+                    interval_rates.append((done - last_done) / interval_time)
+                avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
+                eta = (len(shards) - done) / avg_rate if avg_rate > 0 else 0
+                t_last_hb = t_now
+                last_done = done
                 err_str = f"  errors={errs_so_far}" if errs_so_far else ""
                 print(
                     f"  [{done}/{len(shards)}] kept={kept_so_far:,}"
                     f"  dropped={dropped_so_far:,}{err_str}"
-                    f"  {rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                    f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
                     flush=True,
                 )
 

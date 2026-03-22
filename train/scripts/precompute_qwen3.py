@@ -212,6 +212,8 @@ def main():
     import time as _time
     results = []
     t_start = _time.time()
+    t_last_hb = t_start
+    interval_rates = []
     with multiprocessing.Pool(processes=args.workers) as pool:
         for done, result in enumerate(
             pool.imap_unordered(process_shard, work_items, chunksize=1), 1
@@ -219,13 +221,17 @@ def main():
             results.append(result)
             written_so_far = sum(r["written"] for r in results)
             errs_so_far = sum(1 for r in results if r["error"])
-            elapsed = _time.time() - t_start
-            rate = done / elapsed if elapsed > 0 else 0
-            eta = (len(work_items) - done) / rate if rate > 0 else 0
+            t_now = _time.time()
+            interval_time = t_now - t_last_hb
+            if interval_time > 0:
+                interval_rates.append(1.0 / interval_time)
+            avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
+            eta = (len(work_items) - done) / avg_rate if avg_rate > 0 else 0
+            t_last_hb = t_now
             err_str = f"  errors={errs_so_far}" if errs_so_far else ""
             print(
                 f"  [{done}/{len(work_items)}] {written_so_far:,} embeddings"
-                f"{err_str}  {rate:.2f} shards/s  ETA {eta/60:.0f}m",
+                f"{err_str}  {avg_rate:.2f} shards/s  ETA {eta/60:.0f}m",
                 flush=True,
             )
 

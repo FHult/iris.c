@@ -130,6 +130,8 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     )
 
     t_start = _time.time()
+    t_last_hb = t_start
+    interval_rates = []
     for batch_idx, (shard_idx, tar_path) in enumerate(pending):
         out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
         out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
@@ -177,12 +179,16 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
 
         total_embedded += len(keys)
         if (batch_idx + 1) % 10 == 0 or batch_idx == len(pending) - 1:
-            elapsed = _time.time() - t_start
-            rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(pending) - batch_idx - 1) / rate if rate > 0 else 0
+            t_now = _time.time()
+            interval_time = t_now - t_last_hb
+            if interval_time > 0:
+                interval_rates.append((batch_idx % 10 + 1) / interval_time)
+            avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
+            eta = (len(pending) - batch_idx - 1) / avg_rate if avg_rate > 0 else 0
+            t_last_hb = t_now
             print(
                 f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
-                f"  {rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
                 flush=True,
             )
 
