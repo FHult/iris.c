@@ -103,8 +103,44 @@ if [[ -z "${TMUX:-}" ]]; then
     echo "         Recommended: tmux new-session -d -s pipeline \"caffeinate -i -d bash $0 $*\"" >&2
 fi
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Pipeline lock — prevent concurrent runs against the same DATA_ROOT ────────
 mkdir -p "$DATA_ROOT/logs"
+LOCK_FILE="$DATA_ROOT/logs/pipeline.lock"
+
+_acquire_lock() {
+    local lock_content
+    lock_content="$(printf 'pid=%s\nhost=%s\nchunk=%s\ndata_root=%s\nstarted=%s\ncmdline=%s\n' \
+        "$$" "$(hostname)" "$CHUNK" "$DATA_ROOT" "$(date '+%Y-%m-%d %H:%M:%S')" "$0 $*")"
+    if ( set -C; echo "$lock_content" > "$LOCK_FILE" ) 2>/dev/null; then
+        return 0  # acquired
+    fi
+    # Lock exists — check whether owner is still alive
+    local existing_pid
+    existing_pid=$(grep '^pid=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo "ERROR: pipeline already running. Lock: $LOCK_FILE" >&2
+        echo "" >&2
+        cat "$LOCK_FILE" >&2
+        echo "" >&2
+        echo "To force-clear a stale lock: rm $LOCK_FILE" >&2
+        return 1
+    fi
+    # Stale lock — remove and retry once
+    echo "WARNING: removing stale lock (PID ${existing_pid:-unknown} not running)" >&2
+    rm -f "$LOCK_FILE"
+    if ( set -C; echo "$lock_content" > "$LOCK_FILE" ) 2>/dev/null; then
+        return 0
+    fi
+    echo "ERROR: failed to acquire lock after removing stale lock" >&2
+    return 1
+}
+
+_release_lock() { [[ "${LOCK_FILE:-}" == "$DATA_ROOT/logs/pipeline.lock" ]] && rm -f "$LOCK_FILE"; }
+
+_acquire_lock "$@" || exit 1
+trap _release_lock EXIT INT TERM
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 LOG="$DATA_ROOT/logs/pipeline_chunk${CHUNK}_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -118,6 +154,7 @@ log "  DATA_ROOT: $DATA_ROOT"
 log "  CONFIG:    $CONFIG"
 log "  LR:        $TRAIN_LR    STEPS: $TRAIN_STEPS"
 log "  Log:       $LOG"
+log "  Lock:      $LOCK_FILE  (PID $$)"
 log "================================================================="
 
 source "$VENV"
