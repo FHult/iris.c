@@ -306,7 +306,18 @@ def _write_shard_range(args) -> dict:
                 except Exception:
                     skipped += 1
             # jpg_raw released here — GC reclaims before next shard is fetched
-        executor.shutdown(wait=False)
+
+            # Heartbeat every 5 source shards so pipeline_status.sh shows progress.
+            if (i + 1) % 5 == 0 or (i + 1) == len(src_paths):
+                shards_open = len(out_tars)
+                shards_full = sum(1 for c in out_counts.values() if c >= shard_size)
+                print(
+                    f"[worker {worker_idx}] src {i+1}/{len(src_paths)} "
+                    f"| written {total_written:,} records "
+                    f"| shards {shards_full}/{shards_open} full",
+                    flush=True,
+                )
+        executor.shutdown(wait=True)
     finally:
         for tar in out_tars.values():
             tar.close()
@@ -369,7 +380,10 @@ def main():
 
     # Load blocklist
     blocklist = []
-    if args.blocklist and os.path.exists(args.blocklist):
+    if args.blocklist:
+        if not os.path.exists(args.blocklist):
+            print(f"ERROR: blocklist file not found: {args.blocklist}", file=sys.stderr)
+            sys.exit(1)
         with open(args.blocklist) as f:
             blocklist = [line.strip() for line in f if line.strip()]
         print(f"  Blocklist: {len(blocklist):,} duplicate IDs to skip")
