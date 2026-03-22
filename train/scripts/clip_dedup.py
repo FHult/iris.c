@@ -53,7 +53,10 @@ import tarfile
 
 # Must be set before numpy/FAISS import; libomp on Apple Silicon crashes under
 # multi-threaded barrier release (SIGSEGV in __kmp_hyper_barrier_release).
+# KMP_DUPLICATE_LIB_OK suppresses abort when torch and faiss each bring their
+# own libomp copy — safe here since we pin to 1 thread anyway.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 
