@@ -282,25 +282,40 @@ if [[ "$CHUNK" -eq 1 ]]; then
     QWEN3_DIR="$DATA_ROOT/precomputed/qwen3"
     VAE_DIR="$DATA_ROOT/precomputed/vae"
 
-    log "[8a/9] Precomputing Qwen3 text embeddings (~8h, ~143 GB)..."
-    python "$SCRIPT_DIR/precompute_qwen3.py" \
-        --shards "$SHARDS_DIR" \
-        --output "$QWEN3_DIR"
-    log "  Done: $QWEN3_DIR"
+    if [[ -f "$QWEN3_DIR/.done" ]]; then
+        log "[8a/9] Qwen3 embeddings already precomputed — skipping"
+    else
+        log "[8a/9] Precomputing Qwen3 text embeddings (~8h, ~143 GB)..."
+        python "$SCRIPT_DIR/precompute_qwen3.py" \
+            --shards "$SHARDS_DIR" \
+            --output "$QWEN3_DIR"
+        touch "$QWEN3_DIR/.done"
+        log "  Done: $QWEN3_DIR"
+    fi
 
-    log "[8b/9] Precomputing VAE latents (~6h, ~198 GB)..."
-    python "$SCRIPT_DIR/precompute_vae.py" \
-        --shards "$SHARDS_DIR" \
-        --output "$VAE_DIR"
-    log "  Done: $VAE_DIR"
+    if [[ -f "$VAE_DIR/.done" ]]; then
+        log "[8b/9] VAE latents already precomputed — skipping"
+    else
+        log "[8b/9] Precomputing VAE latents (~6h, ~198 GB)..."
+        python "$SCRIPT_DIR/precompute_vae.py" \
+            --shards "$SHARDS_DIR" \
+            --output "$VAE_DIR"
+        touch "$VAE_DIR/.done"
+        log "  Done: $VAE_DIR"
+    fi
 
     if $ENABLE_SIGLIP; then
         SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
-        log "[8c/9] Precomputing SigLIP features (~420 GB)..."
-        python "$SCRIPT_DIR/precompute_siglip.py" \
-            --shards "$SHARDS_DIR" \
-            --output "$SIGLIP_DIR"
-        log "  Done: $SIGLIP_DIR"
+        if [[ -f "$SIGLIP_DIR/.done" ]]; then
+            log "[8c/9] SigLIP features already precomputed — skipping"
+        else
+            log "[8c/9] Precomputing SigLIP features (~420 GB)..."
+            python "$SCRIPT_DIR/precompute_siglip.py" \
+                --shards "$SHARDS_DIR" \
+                --output "$SIGLIP_DIR"
+            touch "$SIGLIP_DIR/.done"
+            log "  Done: $SIGLIP_DIR"
+        fi
     fi
 
     # ── 1i. Train ─────────────────────────────────────────────────────────────
