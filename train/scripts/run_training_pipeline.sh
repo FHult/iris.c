@@ -318,7 +318,38 @@ if [[ "$CHUNK" -eq 1 ]]; then
         fi
     fi
 
-    # ── 1i. Train ─────────────────────────────────────────────────────────────
+    # ── 1i. Background-prefetch JDB chunk 2 (front-run next phase, GPU-bound window) ──
+    JDB_RAW="$DATA_ROOT/raw/journeydb"
+    JDB_WDS_CHUNK2="$DATA_ROOT/raw/journeydb_wds_chunk2"
+    PREFETCH2_DONE="$JDB_RAW/.prefetch_chunk2_done"
+    PREFETCH2_PID_FILE="$JDB_RAW/.prefetch_chunk2_pid"
+    PREFETCH2_LOG="$DATA_ROOT/logs/prefetch_chunk2.log"
+    PREFETCH2_PID=""
+    if [[ $(count_tars "$JDB_WDS_CHUNK2") -gt 0 || -f "$PREFETCH2_DONE" ]]; then
+        log "[9/9] JDB chunk 2 already downloaded or converted — no prefetch needed"
+    else
+        log "[9/9] Launching JDB chunk 2 background prefetch (~800 GB, resumable)..."
+        mkdir -p "$JDB_RAW" "$DATA_ROOT/logs"
+        (python3 - <<PYEOF
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'JourneyDB/JourneyDB',
+    repo_type='dataset',
+    local_dir='${JDB_RAW}',
+    allow_patterns=[
+        'data/train/imgs/0[5-9][0-9].tgz',
+        'data/train/train_anno_realease_repath.jsonl.tgz',
+    ],
+)
+PYEOF
+        touch "${PREFETCH2_DONE}"
+        ) >> "$PREFETCH2_LOG" 2>&1 &
+        PREFETCH2_PID=$!
+        echo "$PREFETCH2_PID" > "$PREFETCH2_PID_FILE"
+        log "  Prefetch PID $PREFETCH2_PID → $PREFETCH2_LOG"
+    fi
+
+    # ── 1j. Train ─────────────────────────────────────────────────────────────
     if $SKIP_TRAIN; then
         log "[9/9] --skip-train set — data prep complete."
         log "  To train:  caffeinate -i -d python train/train_ip_adapter.py \\"
@@ -333,6 +364,13 @@ if [[ "$CHUNK" -eq 1 ]]; then
 
         python "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
         log "Stage 1 training complete."
+
+        # Wait for prefetch if it's still running
+        if [[ -n "$PREFETCH2_PID" ]] && kill -0 "$PREFETCH2_PID" 2>/dev/null; then
+            log "Training done. Waiting for JDB chunk 2 prefetch (PID $PREFETCH2_PID)..."
+            wait "$PREFETCH2_PID" || true
+            log "Prefetch complete."
+        fi
     fi
 
 # ═════════════════════════════════════════════════════════════════════════════

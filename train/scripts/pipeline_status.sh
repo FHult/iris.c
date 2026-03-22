@@ -71,6 +71,7 @@ JDB_WDS3_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds_chunk3")
 JDB_WDS4_TARS=$(count_tars "$DATA_ROOT/raw/journeydb_wds_chunk4")
 DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
 SHARDS_DIR="$DATA_ROOT/shards"
+SHARD_COUNT=$(count_tars "$SHARDS_DIR")
 DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
 ANCHOR_DIR="$DATA_ROOT/anchor_shards"
 PRECOMP_DIR="$DATA_ROOT/precomputed"
@@ -84,7 +85,51 @@ _jdb_phase() {
 }
 JDB_PHASE_INFO="$(_jdb_phase 1 $JDB_WDS_TARS 000-049)  $(_jdb_phase 2 $JDB_WDS2_TARS 050-099)  $(_jdb_phase 3 $JDB_WDS3_TARS 100-149)  $(_jdb_phase 4 $JDB_WDS4_TARS 150-201)"
 
-SHARD_COUNT=$(count_tars "$SHARDS_DIR")
+# ── Per-source raw state for step 1 detail lines ──────────────────────────────
+WIKIART_RAW_EXISTS=false; [[ -d "$DATA_ROOT/raw/wikiart" ]] && WIKIART_RAW_EXISTS=true
+JDB_IMGS_DIR="$DATA_ROOT/raw/journeydb/data/train/imgs"
+JDB_RAW1_TGZS=$(count_files "$JDB_IMGS_DIR" "0[0-4][0-9].tgz")
+JDB_RAW2_TGZS=$(count_files "$JDB_IMGS_DIR" "0[5-9][0-9].tgz")
+JDB_RAW3_TGZS=$(count_files "$JDB_IMGS_DIR" "1[0-4][0-9].tgz")
+JDB_RAW4_TGZS=$(( $(count_files "$JDB_IMGS_DIR" "1[5-9][0-9].tgz") + $(count_files "$JDB_IMGS_DIR" "20[01].tgz") ))
+JDB_PREFETCH2_RUNNING=false; JDB_PREFETCH2_DONE=false
+_pf_pid_file="$DATA_ROOT/raw/journeydb/.prefetch_chunk2_pid"
+[[ -f "$DATA_ROOT/raw/journeydb/.prefetch_chunk2_done" ]] && JDB_PREFETCH2_DONE=true
+if [[ -f "$_pf_pid_file" ]]; then
+    _pf_pid=$(cat "$_pf_pid_file" 2>/dev/null)
+    kill -0 "$_pf_pid" 2>/dev/null && JDB_PREFETCH2_RUNNING=true
+fi
+
+# Helper: per-source state string for step 1 detail lines
+_jdb_src_state() {
+    local raw="$1" expected="$2" wds="$3" extra="${4:-pending}"
+    if [[ $raw -gt 0 ]]; then echo "${raw}/${expected} tgz · WDS ${wds} shards"
+    elif [[ $wds -gt 0 ]]; then echo "raw deleted · WDS ready (${wds} shards)"
+    else echo "$extra"; fi
+}
+
+if [[ $LAION_TARS -gt 0 ]]; then         LAION_STATE="${LAION_TARS} tars"
+elif [[ $SHARD_COUNT -gt 0 ]]; then       LAION_STATE="raw deleted · used in step 4"
+else                                       LAION_STATE="not downloaded"; fi
+
+if [[ $COYO_TARS -gt 0 ]]; then           COYO_STATE="${COYO_TARS} tars"
+elif [[ $SHARD_COUNT -gt 0 ]]; then       COYO_STATE="raw deleted · used in step 4"
+else                                       COYO_STATE="not downloaded"; fi
+
+if $WIKIART_RAW_EXISTS; then
+    WIKIART_STATE="raw present"
+    [[ $WIKIART_WDS_TARS -gt 0 ]] && WIKIART_STATE+=" · WDS ${WIKIART_WDS_TARS} shards"
+elif [[ $WIKIART_WDS_TARS -gt 0 ]]; then  WIKIART_STATE="raw deleted · WDS ready (${WIKIART_WDS_TARS} shards)"
+else                                       WIKIART_STATE="not downloaded"; fi
+
+JDB1_STATE=$(_jdb_src_state $JDB_RAW1_TGZS 50 $JDB_WDS_TARS)
+if $JDB_PREFETCH2_RUNNING; then   JDB2_EXTRA="prefetching in background..."
+elif $JDB_PREFETCH2_DONE; then    JDB2_EXTRA="prefetch done · not converted yet"
+else                               JDB2_EXTRA="pending"; fi
+JDB2_STATE=$(_jdb_src_state $JDB_RAW2_TGZS 50 $JDB_WDS2_TARS "$JDB2_EXTRA")
+JDB3_STATE=$(_jdb_src_state $JDB_RAW3_TGZS 50 $JDB_WDS3_TARS)
+JDB4_STATE=$(_jdb_src_state $JDB_RAW4_TGZS 52 $JDB_WDS4_TARS)
+
 QWEN3_COUNT=$(count_files "$PRECOMP_DIR/qwen3" "*.npz")
 VAE_COUNT=$(count_files "$PRECOMP_DIR/vae" "*.npz")
 ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
@@ -171,8 +216,12 @@ echo ""
 # ── Steps ─────────────────────────────────────────────────────────────────────
 echo "── Steps ────────────────────────────────────────────────────────"
 step_status "[1/9] Verify downloads" \
-    "[[ $LAION_TARS -gt 0 ]]" "" \
-    "(LAION: $LAION_TARS shards  COYO: $COYO_TARS shards)"
+    "[[ $LAION_TARS -gt 0 || $SHARD_COUNT -gt 0 || $WIKIART_WDS_TARS -gt 0 || $JDB_WDS_TARS -gt 0 ]]" "" \
+    ""
+printf "       LAION:   %-40s COYO: %s\n" "$LAION_STATE" "$COYO_STATE"
+printf "       WikiArt: %s\n" "$WIKIART_STATE"
+printf "       JDB ph.1(000-049): %-36s ph.2(050-099): %s\n" "$JDB1_STATE" "$JDB2_STATE"
+printf "       JDB ph.3(100-149): %-36s ph.4(150-201): %s\n" "$JDB3_STATE" "$JDB4_STATE"
 
 step_status "[2a/9] WikiArt → WDS" \
     "[[ $WIKIART_WDS_TARS -gt 0 ]]" "" \
