@@ -94,9 +94,20 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     """
     Open one .tar shard and decode all JPEG images into preprocessed tensors.
     Runs in a background thread so I/O + CPU decode overlaps with GPU inference.
+    Uses TurboJPEG when available (3-5x faster than PIL for JPEG decode).
     Returns (keys, tensors) or (None, None) on hard error.
     """
     from PIL import Image as _PilImage
+    try:
+        from turbojpeg import TurboJPEG as _TJ
+        _tj = _TJ()
+        def _decode_jpeg(data):
+            rgb = _tj.decode(data)          # HWC uint8 BGR
+            return _PilImage.fromarray(rgb[:, :, ::-1])  # BGR→RGB PIL
+    except ImportError:
+        def _decode_jpeg(data):
+            return _PilImage.open(io.BytesIO(data)).convert("RGB")
+
     keys: list[str] = []
     tensors = []
     try:
@@ -113,7 +124,7 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
                 if f is None:
                     continue
                 try:
-                    img = _PilImage.open(io.BytesIO(f.read())).convert("RGB")
+                    img = _decode_jpeg(f.read())
                     tensors.append(preprocess(img))
                     keys.append(key)
                 except Exception:
