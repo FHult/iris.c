@@ -333,10 +333,19 @@ def _write_shard_range(args) -> dict:
                 )
         executor.shutdown(wait=True)
     finally:
-        # Close any incomplete tars — they stay as .tar.tmp (not renamed).
-        # A re-run will clean them up and restart those shards from scratch.
-        for tar in out_tars.values():
+        # Close remaining open tars and publish any that have content.
+        # Shards often don't reach shard_size exactly (images skipped due to
+        # decode errors or blocklist), so we must publish partial shards too.
+        # Only truly empty shards (0 records written) stay as .tar.tmp to be
+        # cleaned up on the next run.
+        for shard_id, tar in list(out_tars.items()):
             tar.close()
+            if out_counts.get(shard_id, 0) > 0:
+                tmp_path = os.path.join(output_dir, f"{shard_id:06d}.tar.tmp")
+                final_path = os.path.join(output_dir, f"{shard_id:06d}.tar")
+                if os.path.exists(tmp_path):
+                    os.replace(tmp_path, final_path)
+                    completed_count += 1
 
     return {"written": total_written, "skipped": skipped}
 
