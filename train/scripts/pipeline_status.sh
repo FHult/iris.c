@@ -193,6 +193,11 @@ FILTER_RUN_INFO="running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] kept=')
 [[ -n "$hb" ]] && FILTER_RUN_INFO="$hb"
 
+# Step 6 — clip_dedup build-index: "[X/Y] N,NNN images embedded  X.X shards/s  ETA Xm"
+DEDUP_INDEX_RUN_INFO="building..."
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ images embedded')
+[[ -n "$hb" ]] && DEDUP_INDEX_RUN_INFO="$hb"
+
 # Step 8a — precompute_qwen3: "[X/Y] N,NNN embeddings  X.XX shards/s  ETA Xm"
 QWEN3_RUN_INFO="$QWEN3_COUNT/$SHARD_COUNT shards, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ embeddings')
@@ -256,7 +261,7 @@ step_status "[5/9] Filter shards" \
 step_status "[6/9] Cross-chunk dedup index" \
     "[[ -f $DEDUP_INDEX ]]" \
     "pgrep -f 'clip_dedup.*build-index'" \
-    "($(du_h "$DEDUP_INDEX"))" "building..."
+    "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
 
 step_status "[7/9] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \

@@ -113,6 +113,9 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
     print(f"Embedding {len(tar_files)} shards from {shards_dir} ...")
 
     total_embedded = 0
+    already_done = 0
+    import time as _time
+    t_start = _time.time()
 
     for shard_idx, tar_path in enumerate(tar_files):
         out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
@@ -120,6 +123,7 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
         if os.path.exists(out_emb) and os.path.exists(out_meta):
             n = np.load(out_emb, mmap_mode="r").shape[0]
             total_embedded += n
+            already_done += 1
             continue
 
         keys   = []
@@ -165,8 +169,15 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 256):
 
         total_embedded += len(keys)
         if (shard_idx + 1) % 10 == 0 or shard_idx == len(tar_files) - 1:
-            print(f"  [{shard_idx+1}/{len(tar_files)}] {total_embedded:,} images embedded",
-                  flush=True)
+            elapsed = _time.time() - t_start
+            shards_done = shard_idx + 1 - already_done
+            rate = shards_done / elapsed if elapsed > 0 else 0
+            eta = (len(tar_files) - shard_idx - 1) / rate if rate > 0 else 0
+            print(
+                f"  [{shard_idx+1}/{len(tar_files)}] {total_embedded:,} images embedded"
+                f"  {rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                flush=True,
+            )
 
     print(f"Done. {total_embedded:,} embeddings in {embeddings_dir}")
 
