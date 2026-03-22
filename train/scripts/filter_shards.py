@@ -113,6 +113,7 @@ def filter_shard(shard_path: str) -> dict:
 
     # Rewrite shard in a temp file then atomically replace
     tmp_path = shard_path + ".tmp"
+    done_path = shard_path + ".filtered"
     try:
         with tarfile.open(tmp_path, "w") as out_tar:
             for i, rec in enumerate(kept_records):
@@ -122,6 +123,7 @@ def filter_shard(shard_path: str) -> dict:
                     info.size = len(data)
                     out_tar.addfile(info, io.BytesIO(data))
         os.replace(tmp_path, shard_path)
+        open(done_path, "w").close()  # mark as done after successful replace
     except Exception as e:
         print(f"Error rewriting {shard_path}: {e}", file=sys.stderr)
         if os.path.exists(tmp_path):
@@ -164,14 +166,18 @@ def main():
 
     all_shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if args.start_idx > 0:
-        shards = [s for s in all_shards
-                  if int(os.path.splitext(os.path.basename(s))[0]) >= args.start_idx]
-        print(f"--start-idx {args.start_idx}: filtering {len(shards)}/{len(all_shards)} shards")
-    else:
-        shards = all_shards
+        all_shards = [s for s in all_shards
+                      if int(os.path.splitext(os.path.basename(s))[0]) >= args.start_idx]
+        print(f"--start-idx {args.start_idx}: {len(all_shards)} shards in range")
+
+    # Skip shards already successfully filtered in a previous run
+    shards = [s for s in all_shards if not os.path.exists(s + ".filtered")]
+    already_done = len(all_shards) - len(shards)
+    if already_done:
+        print(f"Skipping {already_done} already-filtered shards (resume)")
     if not shards:
-        print(f"No .tar files found in {args.shards}", file=sys.stderr)
-        sys.exit(1)
+        print(f"All shards already filtered.")
+        return
 
     print(f"Filtering {len(shards)} shards with {args.workers} workers...")
     print(f"turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (slower fallback)'}")
