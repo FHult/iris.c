@@ -258,8 +258,9 @@ if [[ "$CHUNK" -eq 1 ]]; then
         fi
     fi
 
-    # ── 1e. Build unified shards ──────────────────────────────────────────────
+    # ── 1e. Build unified shards (+ concurrent filter) ────────────────────────
     SHARDS_DIR="$DATA_ROOT/shards"
+    FILTER_DONE="$SHARDS_DIR/.filtered_chunk1"
     if [[ $(count_tars "$SHARDS_DIR") -gt 0 ]]; then
         log "[4/9] Unified shards already built ($(count_tars "$SHARDS_DIR") shards) — skipping"
     else
@@ -269,12 +270,32 @@ if [[ "$CHUNK" -eq 1 ]]; then
 
         BUILD_ARGS=("--sources" "${SOURCES[@]}" "--output" "$SHARDS_DIR")
         [[ -f "$DEDUP_IDS" ]] && BUILD_ARGS+=("--blocklist" "$DEDUP_IDS")
+
+        # Filter shards as they arrive: build_shards publishes atomically (tmp→rename),
+        # so filter_shards never sees a partial shard.  Per-shard .filtered sentinels
+        # make repeated runs idempotent.  Output goes to a separate log to avoid
+        # interleaving with build_shards progress lines.
+        FILTER_BG_LOG="$DATA_ROOT/logs/filter_background.log"
+        (while true; do
+            python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR" \
+                >> "$FILTER_BG_LOG" 2>&1 || true
+            sleep 60
+        done) &
+        FILTER_LOOP_PID=$!
+
         python "$SCRIPT_DIR/build_shards.py" "${BUILD_ARGS[@]}" 2>&1 | tee /tmp/build_shards.log
         log "  Done: $(count_tars "$SHARDS_DIR") unified shards"
+
+        # Stop loop; final pass catches any shards written in the last 60s window
+        kill "$FILTER_LOOP_PID" 2>/dev/null || true
+        wait "$FILTER_LOOP_PID" 2>/dev/null || true
+        log "[5/9] Final filter pass..."
+        python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR"
+        touch "$FILTER_DONE"
+        log "  Done"
     fi
 
     # ── 1f. Filter shards ─────────────────────────────────────────────────────
-    FILTER_DONE="$SHARDS_DIR/.filtered_chunk1"
     if [[ -f "$FILTER_DONE" ]]; then
         log "[5/9] Shards already filtered — skipping"
     else
@@ -282,6 +303,23 @@ if [[ "$CHUNK" -eq 1 ]]; then
         python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR"
         touch "$FILTER_DONE"
         log "  Done"
+    fi
+
+    # ── 1g. Launch anchor set creation in background (runs during step 6) ─────
+    # Independent of the dedup index: samples directly from raw source dirs.
+    ANCHOR_DIR="$DATA_ROOT/anchor_shards"
+    ANCHOR_SOURCES=("$DATA_ROOT/raw/laion" "$WIKIART_WDS")
+    [[ "${COYO_TARS:-0}" -gt 0 ]] && ANCHOR_SOURCES+=("$DATA_ROOT/raw/coyo")
+    ANCHOR_PID=""
+    if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
+        log "[7/9] Anchor set already exists ($(count_tars "$ANCHOR_DIR") shards) — skipping"
+    else
+        log "[7/9] Creating anchor set in background (runs concurrently with step 6)..."
+        python "$SCRIPT_DIR/create_anchor_set.py" \
+            --shards  "${ANCHOR_SOURCES[@]}" \
+            --output  "$ANCHOR_DIR" \
+            --n       10000 &
+        ANCHOR_PID=$!
     fi
 
     # ── 1f2. Build persistent cross-chunk dedup index ─────────────────────────
@@ -298,20 +336,10 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  Done: $DEDUP_INDEX"
     fi
 
-    # ── 1g. Create anchor set (once, before any incremental chunks) ───────────
-    # Sample from non-JourneyDB sources directly (LAION + WikiArt [+ COYO]).
-    # Passing source dirs directly avoids fragile ID-prefix filtering on unified shards.
-    ANCHOR_DIR="$DATA_ROOT/anchor_shards"
-    if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
-        log "[7/9] Anchor set already exists ($(count_tars "$ANCHOR_DIR") shards) — skipping"
-    else
-        log "[7/9] Creating anchor set (10k diverse samples from non-JourneyDB sources)..."
-        ANCHOR_SOURCES=("$DATA_ROOT/raw/laion" "$WIKIART_WDS")
-        [[ "${COYO_TARS:-0}" -gt 0 ]] && ANCHOR_SOURCES+=("$DATA_ROOT/raw/coyo")
-        python "$SCRIPT_DIR/create_anchor_set.py" \
-            --shards  "${ANCHOR_SOURCES[@]}" \
-            --output  "$ANCHOR_DIR" \
-            --n       10000
+    # Join anchor set background process (step 7)
+    if [[ -n "$ANCHOR_PID" ]]; then
+        log "[7/9] Waiting for anchor set creation..."
+        wait "$ANCHOR_PID" || die "create_anchor_set.py failed"
         log "  Done: anchor set in $ANCHOR_DIR"
     fi
 
