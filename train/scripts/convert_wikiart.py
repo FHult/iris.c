@@ -35,7 +35,8 @@ def make_caption(row) -> str:
 
 
 def write_shard(records: list, path: str):
-    with tarfile.open(path, "w") as tf:
+    tmp_path = path + ".tmp"
+    with tarfile.open(tmp_path, "w") as tf:
         for i, (key, jpg_bytes, caption) in enumerate(records):
             # jpg
             jpg_info = tarfile.TarInfo(name=f"{key}.jpg")
@@ -46,6 +47,7 @@ def write_shard(records: list, path: str):
             txt_info = tarfile.TarInfo(name=f"{key}.txt")
             txt_info.size = len(txt_bytes)
             tf.addfile(txt_info, io.BytesIO(txt_bytes))
+    os.replace(tmp_path, path)
 
 
 def main():
@@ -106,18 +108,24 @@ def main():
 
             if len(buf) >= args.shard_size:
                 shard_path = os.path.join(args.output, f"{shard_idx:06d}.tar")
-                write_shard(buf, shard_path)
-                print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
-                total_written += len(buf)
+                if os.path.exists(shard_path):
+                    print(f"  Shard {shard_idx:06d}.tar already exists — skipping ({len(buf)} records consumed)", flush=True)
+                else:
+                    write_shard(buf, shard_path)
+                    print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
+                    total_written += len(buf)
                 shard_idx += 1
                 buf = []
 
     # flush remainder
     if buf:
         shard_path = os.path.join(args.output, f"{shard_idx:06d}.tar")
-        write_shard(buf, shard_path)
-        print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
-        total_written += len(buf)
+        if os.path.exists(shard_path):
+            print(f"  Shard {shard_idx:06d}.tar already exists — skipping ({len(buf)} records consumed)", flush=True)
+        else:
+            write_shard(buf, shard_path)
+            print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
+            total_written += len(buf)
 
     print(f"\nDone. {total_written:,} images written to {args.output}, "
           f"{total_skipped:,} skipped.")

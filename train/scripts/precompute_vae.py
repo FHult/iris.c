@@ -171,6 +171,34 @@ def _encode_batch(vae, rec_ids: list, imgs_np: list, output_dir: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Per-worker model state (populated once via Pool initializer)
+# ---------------------------------------------------------------------------
+
+_W: dict = {}
+
+
+def _worker_init(model_path: str, image_size: int) -> None:
+    """Load VAE once per worker process."""
+    global _W
+    try:
+        import mlx.core as mx  # noqa: F401
+        from mflux.models.flux2 import Flux2Klein
+    except ImportError:
+        print("mflux not available. Run: pip install mflux", file=sys.stderr)
+        raise
+    flux = Flux2Klein(model_path=model_path, quantize=None)
+    vae = flux.vae
+    vae.freeze()
+    _W["vae"] = vae
+    try:
+        from turbojpeg import TurboJPEG
+        _W["tj"] = TurboJPEG()
+    except ImportError:
+        _W["tj"] = None
+    _W["image_size"] = image_size
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
@@ -183,29 +211,12 @@ def process_shard(args) -> dict:
       Phase 2: 1-ahead prefetch — while GPU encodes batch N, P-core threads
                decode+preprocess batch N+1 in parallel, hiding CPU latency.
     """
-    shard_path, output_dir, model_path, image_size, batch_size = args
+    shard_path, output_dir, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        import mlx.core as mx
-        from mflux.models.flux2 import Flux2Klein
-    except ImportError:
-        print("mflux not available. Run: pip install mflux", file=sys.stderr)
-        return {"shard": shard_path, "written": 0, "error": True}
-
-    try:
-        flux = Flux2Klein(model_path=model_path, quantize=None)
-        vae = flux.vae
-        vae.freeze()
-    except Exception as e:
-        print(f"Failed to load VAE from {model_path}: {e}", file=sys.stderr)
-        return {"shard": shard_path, "written": 0, "error": True}
-
-    try:
-        from turbojpeg import TurboJPEG
-        tj = TurboJPEG()
-    except ImportError:
-        tj = None
+    vae = _W["vae"]
+    tj = _W["tj"]
+    image_size = _W["image_size"]
 
     # Phase 1: sequential tar read — collect pending (id, bytes) pairs
     written = 0
@@ -309,14 +320,18 @@ def main():
     print(f"  Storage estimate: ~{total_gb:.0f} GB")
     print()
 
-    work_items = [(s, args.output, args.model, args.image_size, args.batch_size) for s in shards]
+    work_items = [(s, args.output, args.batch_size) for s in shards]
 
     import time as _time
     results = []
     t_start = _time.time()
     t_last_hb = t_start
     interval_rates = []
-    with multiprocessing.Pool(processes=args.workers) as pool:
+    with multiprocessing.Pool(
+        processes=args.workers,
+        initializer=_worker_init,
+        initargs=(args.model, args.image_size),
+    ) as pool:
         for done, result in enumerate(
             pool.imap_unordered(process_shard, work_items, chunksize=1), 1
         ):

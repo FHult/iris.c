@@ -384,6 +384,18 @@ def process_shard(args) -> dict:
     shard_path, qwen3_out, vae_out, siglip_out, \
         qwen3_batch, vae_batch, siglip_batch = args
 
+    try:
+        return _process_shard_inner(
+            shard_path, qwen3_out, vae_out, siglip_out,
+            qwen3_batch, vae_batch, siglip_batch,
+        )
+    except Exception as e:
+        print(f"Error processing {os.path.basename(shard_path)}: {e}", file=sys.stderr)
+        return {"shard": shard_path, "wq": 0, "wv": 0, "ws": 0, "error": True}
+
+
+def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
+                          qwen3_batch, vae_batch, siglip_batch) -> dict:
     for d in filter(None, [qwen3_out, vae_out, siglip_out]):
         os.makedirs(d, exist_ok=True)
 

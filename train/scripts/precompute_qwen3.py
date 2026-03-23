@@ -110,12 +110,36 @@ def iter_shard(shard_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Per-worker model state (populated once via Pool initializer)
+# ---------------------------------------------------------------------------
+
+_W: dict = {}
+
+
+def _worker_init(model_path: str) -> None:
+    """Load Qwen3 model once per worker process."""
+    global _W
+    try:
+        import mlx.core as mx  # noqa: F401
+        from mlx_lm import load as mlx_lm_load
+    except ImportError:
+        print("mlx_lm not available. Run: pip install mlx-lm", file=sys.stderr)
+        raise
+    model, tokenizer = mlx_lm_load(model_path)
+    model.eval()
+    _W["model"] = model
+    _W["tokenizer"] = tokenizer
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _encode_single(model, tokenizer, rec_id, caption, output_dir):
+def _encode_single(rec_id, caption, output_dir):
     """Encode one caption. Returns True on success. Used as fallback from batch path."""
     import mlx.core as mx
+    model = _W["model"]
+    tokenizer = _W["tokenizer"]
     try:
         chat = [{"role": "user", "content": caption}]
         text = tokenizer.apply_chat_template(
@@ -137,21 +161,14 @@ def _encode_single(model, tokenizer, rec_id, caption, output_dir):
 def process_shard(args) -> dict:
     """
     Worker: encode all captions in one shard and save quantised embeddings.
-    Loads text encoder once per worker process (not once per shard).
+    Model is loaded once per worker process via Pool initializer, not per shard.
     Captions are processed in batches (sorted by length to minimise padding waste).
     """
-    shard_path, output_dir, model_path, batch_size = args
+    shard_path, output_dir, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        import mlx.core as mx
-        from mlx_lm import load as mlx_lm_load
-    except ImportError:
-        print("mlx_lm not available. Run: pip install mlx-lm", file=sys.stderr)
-        return {"shard": shard_path, "written": 0, "error": True}
-
-    model, tokenizer = mlx_lm_load(model_path)
-    model.eval()
+    model = _W["model"]
+    tokenizer = _W["tokenizer"]
 
     # Collect all pending (id, caption) pairs, skipping already-done
     written = 0
@@ -215,7 +232,7 @@ def process_shard(args) -> dict:
         except Exception as e:
             print(f"  Batch {i // batch_size} failed ({e}), retrying single-item", file=sys.stderr)
             for rec_id, caption, _ in batch:
-                if _encode_single(model, tokenizer, rec_id, caption, output_dir):
+                if _encode_single(rec_id, caption, output_dir):
                     written += 1
 
     return {"shard": shard_path, "written": written, "error": False}
@@ -267,7 +284,7 @@ def main():
     print(f"  Storage estimate: ~{len(shards) * 0.46:.0f} GB")
     print()
 
-    work_items = [(s, args.output, args.model, args.batch_size) for s in shards]
+    work_items = [(s, args.output, args.batch_size) for s in shards]
 
     # Use Pool with 2 workers: GPU is shared, more workers causes contention
     import time as _time
@@ -275,7 +292,11 @@ def main():
     t_start = _time.time()
     t_last_hb = t_start
     interval_rates = []
-    with multiprocessing.Pool(processes=args.workers) as pool:
+    with multiprocessing.Pool(
+        processes=args.workers,
+        initializer=_worker_init,
+        initargs=(args.model,),
+    ) as pool:
         for done, result in enumerate(
             pool.imap_unordered(process_shard, work_items, chunksize=1), 1
         ):

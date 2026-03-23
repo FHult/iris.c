@@ -117,11 +117,14 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     try:
         with tarfile.open(tar_path) as tf:
             members = {m.name: m for m in tf.getmembers()}
-            jpg_keys = sorted(
-                os.path.splitext(n)[0] for n in members if n.endswith(".jpg")
-            )
-            for key in jpg_keys:
-                m = members.get(key + ".jpg")
+            _img_exts = (".jpg", ".jpeg", ".png")
+            stem_to_name: dict = {}
+            for n in members:
+                stem, ext = os.path.splitext(n)
+                if ext.lower() in _img_exts:
+                    stem_to_name.setdefault(stem, n)  # first match wins
+            for key in sorted(stem_to_name.keys()):
+                m = members.get(stem_to_name[key])
                 if m is None:
                     continue
                 f = tf.extractfile(m)

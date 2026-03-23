@@ -142,6 +142,41 @@ def iter_shard(shard_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Per-worker model state (populated once via Pool initializer)
+# ---------------------------------------------------------------------------
+
+_W: dict = {}
+
+
+def _worker_init() -> None:
+    """Load SigLIP model once per worker process."""
+    global _W
+    try:
+        import mlx.core as mx  # noqa: F401
+        try:
+            from mlx_vlm import load as vlm_load
+            model, _processor = vlm_load("google/siglip-so400m-patch14-384")
+            model.eval()
+            _W["model_state"] = (True, model)
+        except Exception:
+            from transformers import AutoModel
+            import torch
+            hf_model = AutoModel.from_pretrained(
+                "google/siglip-so400m-patch14-384"
+            ).vision_model.eval()
+            _W["model_state"] = (False, hf_model)
+    except ImportError as e:
+        print(f"Missing dependency: {e}", file=sys.stderr)
+        print("Run: pip install mlx-vlm transformers", file=sys.stderr)
+        raise
+    try:
+        from turbojpeg import TurboJPEG
+        _W["tj"] = TurboJPEG()
+    except ImportError:
+        _W["tj"] = None
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
@@ -203,31 +238,8 @@ def process_shard(args) -> dict:
     shard_path, output_dir, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        import mlx.core as mx
-        try:
-            from mlx_vlm import load as vlm_load
-            model, processor = vlm_load("google/siglip-so400m-patch14-384")
-            model.eval()
-            model_state = (True, model)
-        except Exception:
-            _use_mlx_vlm = False
-            from transformers import AutoModel, AutoProcessor
-            import torch
-            hf_model = AutoModel.from_pretrained(
-                "google/siglip-so400m-patch14-384"
-            ).vision_model.eval()
-            model_state = (False, hf_model)
-    except ImportError as e:
-        print(f"Missing dependency: {e}", file=sys.stderr)
-        print("Run: pip install mlx-vlm transformers", file=sys.stderr)
-        return {"shard": shard_path, "written": 0, "error": True}
-
-    try:
-        from turbojpeg import TurboJPEG
-        tj = TurboJPEG()
-    except ImportError:
-        tj = None
+    model_state = _W["model_state"]
+    tj = _W["tj"]
 
     # Phase 1: sequential tar read — collect pending (id, bytes) pairs
     written = 0
@@ -331,7 +343,10 @@ def main():
     t_start = _time.time()
     t_last_hb = t_start
     interval_rates = []
-    with multiprocessing.Pool(processes=args.workers) as pool:
+    with multiprocessing.Pool(
+        processes=args.workers,
+        initializer=_worker_init,
+    ) as pool:
         for done, result in enumerate(
             pool.imap_unordered(process_shard, work_items, chunksize=1), 1
         ):

@@ -345,17 +345,20 @@ if [[ "$CHUNK" -eq 1 ]]; then
         fi
     fi
 
-    # ── 1g. Launch anchor set in background (from filtered+recaptioned shards) ─
-    # Launched after recaption so anchors have final captions. Finishes well within
-    # the 14h precompute window.
+    # ── 1g. Launch anchor set in background (LAION + WikiArt only, no JourneyDB) ─
+    # JourneyDB uses synthetic Midjourney-style prompts; anchors should be natural
+    # language only so they don't skew the style distribution during chunk training.
+    # LAION is never deleted; WIKIART_WDS was just converted above and still exists.
     ANCHOR_DIR="$DATA_ROOT/anchor_shards"
+    ANCHOR_SOURCES=("$DATA_ROOT/raw/laion" "$WIKIART_WDS")
+    [[ "${COYO_TARS:-0}" -gt 0 ]] && ANCHOR_SOURCES+=("$DATA_ROOT/raw/coyo")
     ANCHOR_PID=""
     if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
         log "[7/9] Anchor set already exists ($(count_tars "$ANCHOR_DIR") shards) — skipping"
     else
-        log "[7/9] Creating anchor set in background (from $SHARDS_DIR)..."
+        log "[7/9] Creating anchor set in background (LAION + WikiArt, no JourneyDB)..."
         python "$SCRIPT_DIR/create_anchor_set.py" \
-            --shards  "$SHARDS_DIR" \
+            --shards  "${ANCHOR_SOURCES[@]}" \
             --output  "$ANCHOR_DIR" \
             --n       10000 &
         ANCHOR_PID=$!
