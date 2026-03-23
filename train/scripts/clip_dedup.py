@@ -152,7 +152,7 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     return keys, tensors
 
 
-def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
+def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 1024):
     """
     Embed all WebDataset images with CLIP ViT-L/14 using open_clip.
     Forward pass runs on MPS (Apple Silicon GPU).
@@ -171,7 +171,7 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
     model, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-L-14-quickgelu", pretrained="openai"
     )
-    model = model.to(device).eval()
+    model = model.to(device).half().eval()
 
     os.makedirs(embeddings_dir, exist_ok=True)
     tar_files = sorted(glob.glob(os.path.join(shards_dir, "*.tar")))
@@ -222,16 +222,17 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
             if keys is None or not tensors:
                 continue
 
-            # GPU inference — runs while the next shard is being decoded above
-            all_embs = []
+            # GPU inference — runs while the next shard is being decoded above.
+            # fp16 halves memory bandwidth; deferred CPU transfer avoids a GPU
+            # sync after every batch.
+            all_embs_gpu = []
             with torch.no_grad():
                 for i in range(0, len(tensors), batch_size):
-                    batch = torch.stack(tensors[i:i + batch_size]).to(device)
-                    embs  = model.encode_image(batch).float()
+                    batch = torch.stack(tensors[i:i + batch_size]).to(device, dtype=torch.float16)
+                    embs  = model.encode_image(batch)
                     embs  = embs / embs.norm(dim=-1, keepdim=True)
-                    all_embs.append(embs.cpu().numpy())
-
-            emb_arr = np.vstack(all_embs).astype(np.float32)
+                    all_embs_gpu.append(embs)
+            emb_arr = torch.cat(all_embs_gpu).float().cpu().numpy()
             np.save(out_emb, emb_arr)
             pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
 
@@ -516,7 +517,7 @@ def main():
     bi.add_argument("--shards",      required=True)
     bi.add_argument("--embeddings",  required=True)
     bi.add_argument("--index",       required=True)
-    bi.add_argument("--batch_size",  type=int, default=256)
+    bi.add_argument("--batch_size",  type=int, default=1024)
 
     # incremental
     inc = subparsers.add_parser(
