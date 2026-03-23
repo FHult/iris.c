@@ -31,6 +31,8 @@ import multiprocessing
 import os
 import sys
 import tarfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -175,7 +177,11 @@ def _encode_batch(vae, rec_ids: list, imgs_np: list, output_dir: str) -> int:
 def process_shard(args) -> dict:
     """
     Worker: encode all images in one shard through VAE and save quantised latents.
-    Images are processed in batches (batch_size) for better GPU utilisation.
+
+    Two-phase design within each shard:
+      Phase 1: sequential tar read → list of (rec_id, jpg_bytes)
+      Phase 2: 1-ahead prefetch — while GPU encodes batch N, P-core threads
+               decode+preprocess batch N+1 in parallel, hiding CPU latency.
     """
     shard_path, output_dir, model_path, image_size, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
@@ -201,29 +207,52 @@ def process_shard(args) -> dict:
     except ImportError:
         tj = None
 
+    # Phase 1: sequential tar read — collect pending (id, bytes) pairs
     written = 0
-    batch_ids: list = []
-    batch_imgs: list = []
-
+    raw_items = []
     for rec_id, jpg_bytes in iter_shard(shard_path):
-        out_path = os.path.join(output_dir, f"{rec_id}.npz")
-        if os.path.exists(out_path):
+        if os.path.exists(os.path.join(output_dir, f"{rec_id}.npz")):
             written += 1
-            continue
+        else:
+            raw_items.append((rec_id, jpg_bytes))
 
-        try:
-            batch_imgs.append(preprocess_vae(jpg_bytes, image_size, tj=tj))
-            batch_ids.append(rec_id)
-        except Exception as e:
-            print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+    if not raw_items:
+        return {"shard": shard_path, "written": written, "error": False}
 
-        if len(batch_imgs) >= batch_size:
-            written += _encode_batch(vae, batch_ids, batch_imgs, output_dir)
-            batch_ids.clear()
-            batch_imgs.clear()
+    # Split into batches upfront
+    batches = [raw_items[i:i + batch_size] for i in range(0, len(raw_items), batch_size)]
 
-    if batch_imgs:
-        written += _encode_batch(vae, batch_ids, batch_imgs, output_dir)
+    def _preprocess_batch(items):
+        """Decode+preprocess a list of (rec_id, jpg_bytes) in parallel."""
+        def _one(item):
+            rec_id, jpg_bytes = item
+            try:
+                return rec_id, preprocess_vae(jpg_bytes, image_size, tj=tj)
+            except Exception as e:
+                print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+                return rec_id, None
+        n = min(_PERF_CORES, len(items))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            return list(pool.map(_one, items))
+
+    # Phase 2: 1-ahead prefetch — decode next batch while GPU encodes current
+    prefetch_q: deque = deque()
+    with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+        if batches:
+            prefetch_q.append(prefetch_pool.submit(_preprocess_batch, batches[0]))
+
+        for batch_idx in range(len(batches)):
+            preprocessed = prefetch_q.popleft().result()
+
+            # Submit next batch decode immediately (runs during GPU encode below)
+            next_idx = batch_idx + 1
+            if next_idx < len(batches):
+                prefetch_q.append(prefetch_pool.submit(_preprocess_batch, batches[next_idx]))
+
+            batch_ids = [r for r, img in preprocessed if img is not None]
+            batch_imgs = [img for r, img in preprocessed if img is not None]
+            if batch_imgs:
+                written += _encode_batch(vae, batch_ids, batch_imgs, output_dir)
 
     return {"shard": shard_path, "written": written, "error": False}
 
@@ -257,8 +286,8 @@ def main():
         help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=8,
-        help="Images per VAE encode call (default 8; batching amortises GPU launch overhead)"
+        "--batch_size", type=int, default=16,
+        help="Images per VAE encode call (default 16; batching amortises GPU launch overhead)"
     )
     args = parser.parse_args()
 

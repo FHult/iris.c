@@ -196,13 +196,18 @@ def process_shard(args) -> dict:
             outputs = model(padded, output_hidden_states=True)
             h = outputs.hidden_states  # list of [B, max_len, 2560]
 
+            # Pull all three layers to NumPy in 3 GPU syncs (not 3×B)
+            h9_np  = np.array(h[9])   # [B, max_len, 2560]
+            h18_np = np.array(h[18])
+            h27_np = np.array(h[27])
+
             for j, (rec_id, _, _) in enumerate(batch):
                 sl = seq_lens[j]
                 emb_np = np.concatenate([
-                    np.array(h[9][j, :sl]),    # [sl, 2560]
-                    np.array(h[18][j, :sl]),   # [sl, 2560]
-                    np.array(h[27][j, :sl]),   # [sl, 2560]
-                ], axis=-1)                    # [sl, 7680]
+                    h9_np[j, :sl],    # [sl, 2560]
+                    h18_np[j, :sl],   # [sl, 2560]
+                    h27_np[j, :sl],   # [sl, 2560]
+                ], axis=-1)           # [sl, 7680]
                 q_packed, scale = quantize_4bit_seq(emb_np.astype(np.float32))
                 np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q_packed, scale=scale)
                 written += 1
@@ -241,8 +246,8 @@ def main():
         help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=4,
-        help="Captions per encoder forward pass (default 4; sequences are right-padded "
+        "--batch_size", type=int, default=8,
+        help="Captions per encoder forward pass (default 8; sequences are right-padded "
              "and sorted by length to minimise wasted compute)"
     )
     args = parser.parse_args()

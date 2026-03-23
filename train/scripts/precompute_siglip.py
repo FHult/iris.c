@@ -79,19 +79,24 @@ _SIGLIP_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 _SIGLIP_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
 
-def preprocess_siglip(jpg_bytes: bytes, image_size: int = 384) -> np.ndarray:
+def preprocess_siglip(jpg_bytes: bytes, image_size: int = 384, tj=None) -> np.ndarray:
     """
     Decode and resize to 384×384, normalise to SigLIP expected range.
+    Pass a TurboJPEG instance via `tj` to reuse across calls.
     Returns float32 [1, 3, 384, 384].
     """
-    try:
-        from turbojpeg import TurboJPEG, TJPF_RGB
-        img = TurboJPEG().decode(jpg_bytes, pixel_format=TJPF_RGB)  # HWC uint8 RGB
-    except ImportError:
-        from PIL import Image as PilImage
-        img = np.array(
-            PilImage.open(io.BytesIO(jpg_bytes)).convert("RGB"), dtype=np.uint8
-        )
+    if tj is not None:
+        from turbojpeg import TJPF_RGB
+        img = tj.decode(jpg_bytes, pixel_format=TJPF_RGB)
+    else:
+        try:
+            from turbojpeg import TurboJPEG, TJPF_RGB
+            img = TurboJPEG().decode(jpg_bytes, pixel_format=TJPF_RGB)
+        except ImportError:
+            from PIL import Image as PilImage
+            img = np.array(
+                PilImage.open(io.BytesIO(jpg_bytes)).convert("RGB"), dtype=np.uint8
+            )
 
     # Resize to 384×384
     if img.shape[0] != image_size or img.shape[1] != image_size:
@@ -138,66 +143,107 @@ def iter_shard(shard_path: str):
 # Worker
 # ---------------------------------------------------------------------------
 
+def _encode_batch_siglip(model_state, rec_ids, imgs_np, output_dir):
+    """
+    Encode a batch of pre-processed images through SigLIP in one GPU call.
+    model_state: (_use_mlx_vlm, model_or_hf_model)
+    Falls back to single-image on error.
+    Returns number of successfully saved files.
+    """
+    import mlx.core as mx
+    _use_mlx_vlm, model_obj = model_state
+    try:
+        stacked = np.concatenate(imgs_np, axis=0)  # [B, 3, 384, 384]
+        if _use_mlx_vlm:
+            feats = model_obj.vision_model(mx.array(stacked))  # [B, 729, 1152]
+            mx.eval(feats)
+            feats_np = np.array(feats)  # [B, 729, 1152]
+        else:
+            import torch
+            with torch.no_grad():
+                out = model_obj(pixel_values=torch.from_numpy(stacked))
+            feats_np = out.last_hidden_state.float().numpy()  # [B, 729, 1152]
+        for k, rec_id in enumerate(rec_ids):
+            q_packed, scale = quantize_4bit(feats_np[k].astype(np.float32))
+            np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q_packed, scale=scale)
+        return len(rec_ids)
+    except Exception as e:
+        print(f"  Batch encode failed ({e}), retrying single-image", file=sys.stderr)
+        saved = 0
+        for rec_id, img_np in zip(rec_ids, imgs_np):
+            try:
+                if _use_mlx_vlm:
+                    feats = model_obj.vision_model(mx.array(img_np))  # [1, 729, 1152]
+                    mx.eval(feats)
+                    feat_np = np.array(feats[0])
+                else:
+                    import torch
+                    with torch.no_grad():
+                        out = model_obj(pixel_values=torch.from_numpy(img_np))
+                    feat_np = out.last_hidden_state[0].float().numpy()
+                q_packed, scale = quantize_4bit(feat_np.astype(np.float32))
+                np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q_packed, scale=scale)
+                saved += 1
+            except Exception as e2:
+                print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
+        return saved
+
+
 def process_shard(args) -> dict:
     """
     Worker: encode all images in one shard with SigLIP and save quantised features.
+    Images are processed in batches for better GPU utilisation.
     """
-    shard_path, output_dir = args
+    shard_path, output_dir, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
     try:
         import mlx.core as mx
-        # Load SigLIP via mlx_vlm or transformers
-        # SigLIP SO400M: google/siglip-so400m-patch14-384
         try:
             from mlx_vlm import load as vlm_load
             model, processor = vlm_load("google/siglip-so400m-patch14-384")
             model.eval()
-            _use_mlx_vlm = True
+            model_state = (True, model)
         except Exception:
-            # Fallback: load via transformers + convert to MLX manually
             _use_mlx_vlm = False
             from transformers import AutoModel, AutoProcessor
             import torch
             hf_model = AutoModel.from_pretrained(
                 "google/siglip-so400m-patch14-384"
             ).vision_model.eval()
-            processor = AutoProcessor.from_pretrained(
-                "google/siglip-so400m-patch14-384"
-            )
+            model_state = (False, hf_model)
     except ImportError as e:
         print(f"Missing dependency: {e}", file=sys.stderr)
         print("Run: pip install mlx-vlm transformers", file=sys.stderr)
         return {"shard": shard_path, "written": 0, "error": True}
 
+    try:
+        from turbojpeg import TurboJPEG
+        tj = TurboJPEG()
+    except ImportError:
+        tj = None
+
     written = 0
+    batch_ids: list = []
+    batch_imgs: list = []
+
     for rec_id, jpg_bytes in iter_shard(shard_path):
         out_path = os.path.join(output_dir, f"{rec_id}.npz")
         if os.path.exists(out_path):
             written += 1
             continue
-
         try:
-            img_np = preprocess_siglip(jpg_bytes)  # [1, 3, 384, 384]
-
-            if _use_mlx_vlm:
-                img_mx = mx.array(img_np)
-                feats = model.vision_model(img_mx)  # [1, 729, 1152]
-                mx.eval(feats)
-                feats_np = np.array(feats[0])  # [729, 1152]
-            else:
-                import torch
-                img_t = torch.from_numpy(img_np)
-                with torch.no_grad():
-                    out = hf_model(pixel_values=img_t)
-                feats_np = out.last_hidden_state[0].float().numpy()  # [729, 1152]
-
-            q_packed, scale = quantize_4bit(feats_np.astype(np.float32))
-            np.savez_compressed(out_path, q=q_packed, scale=scale)
-            written += 1
-
+            batch_imgs.append(preprocess_siglip(jpg_bytes, tj=tj))
+            batch_ids.append(rec_id)
         except Exception as e:
             print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+        if len(batch_imgs) >= batch_size:
+            written += _encode_batch_siglip(model_state, batch_ids, batch_imgs, output_dir)
+            batch_ids.clear()
+            batch_imgs.clear()
+
+    if batch_imgs:
+        written += _encode_batch_siglip(model_state, batch_ids, batch_imgs, output_dir)
 
     return {"shard": shard_path, "written": written, "error": False}
 
@@ -222,6 +268,10 @@ def main():
         "--workers", type=int, default=2,
         help="Parallel processes (default 2; GPU shared so >2 contends)"
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=8,
+        help="Images per SigLIP forward pass (default 8)"
+    )
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
@@ -236,13 +286,14 @@ def main():
     total_gb = len(shards) * 5000 * bytes_per / 1e9
 
     print(f"Pre-computing SigLIP features for {len(shards)} shards")
-    print(f"  Output:  {args.output}")
-    print(f"  Workers: {args.workers}")
+    print(f"  Output:     {args.output}")
+    print(f"  Workers:    {args.workers}")
+    print(f"  Batch size: {args.batch_size}")
     print(f"  Storage estimate: ~{total_gb:.0f} GB")
     print(f"  NOTE: Only pre-compute if {total_gb:.0f} GB free after Qwen3+VAE storage.")
     print()
 
-    work_items = [(s, args.output) for s in shards]
+    work_items = [(s, args.output, args.batch_size) for s in shards]
 
     import time as _time
     results = []
