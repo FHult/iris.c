@@ -195,7 +195,7 @@ Chat template:
 
 ```
 
-Flux extraction: concatenate layers 8, 17, 26 (0-indexed):
+Flux extraction: concatenate layers 9, 18, 27 (0-indexed):
 - 4B: [seq, 7680]
 - 9B: [seq, 12288]
 
