@@ -48,11 +48,9 @@ import tarfile
 
 try:
     from turbojpeg import TurboJPEG
-    _JPEG = TurboJPEG()
     _HAS_TURBOJPEG = True
 except ImportError:
     _HAS_TURBOJPEG = False
-    from PIL import Image
 
 try:
     import subprocess
@@ -67,32 +65,6 @@ COMPUTE_WORKERS = max(1, _PERF_CORES - 2)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _decode_jpeg(raw: bytes):
-    """Decode JPEG bytes to RGB numpy array. turbojpeg if available."""
-    if _HAS_TURBOJPEG:
-        return TurboJPEG().decode(raw)  # per-process instance (not thread-safe)
-    else:
-        from PIL import Image
-        import numpy as np
-        import io as _io
-        img = Image.open(_io.BytesIO(raw)).convert("RGB")
-        return img
-
-
-def _encode_jpeg(img, quality: int = 85) -> bytes:
-    """Encode RGB image to JPEG bytes."""
-    if _HAS_TURBOJPEG:
-        tj = TurboJPEG()
-        return tj.encode(img, quality=quality)
-    else:
-        buf = io.BytesIO()
-        if not hasattr(img, "save"):
-            from PIL import Image
-            img = Image.fromarray(img)
-        img.save(buf, format="JPEG", quality=quality)
-        return buf.getvalue()
-
 
 def _tar_add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     """Add raw bytes as a named member to an open tar file."""

@@ -29,11 +29,10 @@ import tarfile
 import tempfile
 
 try:
-    from turbojpeg import TurboJPEG
+    from turbojpeg import TurboJPEG, TJPF_RGB
     _HAS_TURBOJPEG = True
 except ImportError:
     _HAS_TURBOJPEG = False
-    from PIL import Image
 
 try:
     import subprocess
@@ -104,12 +103,12 @@ def filter_shard(shard_path: str) -> dict:
                 jpg = tar.extractfile(members[jpg_key]).read()
                 try:
                     if _HAS_TURBOJPEG:
-                        img = tj.decode(jpg)
-                        h, w = img.shape[:2]
+                        # decode_header reads only the JPEG header (~0.01 ms vs ~5 ms
+                        # for a full decode) — sufficient to get dimensions.
+                        w, h, _, _ = tj.decode_header(jpg)
                     else:
                         from PIL import Image as PilImage
-                        img = PilImage.open(io.BytesIO(jpg))
-                        w, h = img.size
+                        w, h = PilImage.open(io.BytesIO(jpg)).size
                     if w < 256 or h < 256:
                         continue
                 except Exception:

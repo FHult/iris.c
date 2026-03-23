@@ -74,22 +74,26 @@ def load_vae_latent(npz_path: str) -> np.ndarray:
 # Image preprocessing for VAE
 # ---------------------------------------------------------------------------
 
-def preprocess_vae(jpg_bytes: bytes, image_size: int = 512) -> np.ndarray:
+def preprocess_vae(jpg_bytes: bytes, image_size: int = 512, tj=None) -> np.ndarray:
     """
     Decode JPEG and prepare for VAE encoder.
     Returns float32 [1, 3, H, W] in [-1, 1].
+    Pass a TurboJPEG instance via `tj` to reuse across calls (avoids per-image init cost).
     """
-    try:
-        from turbojpeg import TurboJPEG
-        tj = TurboJPEG()
-        img = tj.decode(jpg_bytes)  # HWC uint8 RGB
-    except ImportError:
-        from PIL import Image as PilImage
-        img = np.array(
-            PilImage.open(io.BytesIO(jpg_bytes)).convert("RGB")
-               .resize((image_size, image_size), PilImage.LANCZOS),
-            dtype=np.uint8
-        )
+    if tj is not None:
+        from turbojpeg import TJPF_RGB
+        img = tj.decode(jpg_bytes, pixel_format=TJPF_RGB)  # HWC uint8 RGB
+    else:
+        try:
+            from turbojpeg import TurboJPEG, TJPF_RGB
+            img = TurboJPEG().decode(jpg_bytes, pixel_format=TJPF_RGB)
+        except ImportError:
+            from PIL import Image as PilImage
+            img = np.array(
+                PilImage.open(io.BytesIO(jpg_bytes)).convert("RGB")
+                   .resize((image_size, image_size), PilImage.LANCZOS),
+                dtype=np.uint8
+            )
 
     if img.shape[0] != image_size or img.shape[1] != image_size:
         from PIL import Image as PilImage
@@ -130,25 +134,59 @@ def iter_shard(shard_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Batch encode helper
+# ---------------------------------------------------------------------------
+
+def _encode_batch(vae, rec_ids: list, imgs_np: list, output_dir: str) -> int:
+    """
+    Encode a list of pre-processed images through the VAE in one batched GPU call.
+    Falls back to single-image mode if the batch encode raises (e.g. OOM).
+    Returns the number of successfully saved images.
+    """
+    import mlx.core as mx
+    try:
+        stacked = np.concatenate(imgs_np, axis=0)       # [B, 3, H, W]
+        latents = vae.encode(mx.array(stacked))          # [B, 32, H/8, W/8]
+        mx.eval(latents)
+        latents_np = np.array(latents)                   # [B, 32, H/8, W/8]
+        for k, rec_id in enumerate(rec_ids):
+            q, scale = quantize_int8(latents_np[k].astype(np.float32))
+            np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q, scale=scale)
+        return len(rec_ids)
+    except Exception as e:
+        print(f"  Batch encode failed ({e}), retrying single-image", file=sys.stderr)
+        saved = 0
+        for rec_id, img_np in zip(rec_ids, imgs_np):
+            try:
+                latent = vae.encode(mx.array(img_np))
+                mx.eval(latent)
+                q, scale = quantize_int8(np.array(latent[0]).astype(np.float32))
+                np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                saved += 1
+            except Exception as e2:
+                print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
+        return saved
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
 def process_shard(args) -> dict:
     """
     Worker: encode all images in one shard through VAE and save quantised latents.
+    Images are processed in batches (batch_size) for better GPU utilisation.
     """
-    shard_path, output_dir, model_path, image_size = args
+    shard_path, output_dir, model_path, image_size, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
     try:
         import mlx.core as mx
-        import mlx.nn as nn
         from mflux.models.flux2 import Flux2Klein
     except ImportError:
         print("mflux not available. Run: pip install mflux", file=sys.stderr)
         return {"shard": shard_path, "written": 0, "error": True}
 
-    # Load only the VAE (not the full transformer)
     try:
         flux = Flux2Klein(model_path=model_path, quantize=None)
         vae = flux.vae
@@ -157,27 +195,35 @@ def process_shard(args) -> dict:
         print(f"Failed to load VAE from {model_path}: {e}", file=sys.stderr)
         return {"shard": shard_path, "written": 0, "error": True}
 
+    try:
+        from turbojpeg import TurboJPEG
+        tj = TurboJPEG()
+    except ImportError:
+        tj = None
+
     written = 0
+    batch_ids: list = []
+    batch_imgs: list = []
+
     for rec_id, jpg_bytes in iter_shard(shard_path):
         out_path = os.path.join(output_dir, f"{rec_id}.npz")
         if os.path.exists(out_path):
             written += 1
-            continue  # resume-safe
+            continue
 
         try:
-            img_np = preprocess_vae(jpg_bytes, image_size)
-            img_mx = mx.array(img_np)  # [1, 3, H, W]
-
-            latent = vae.encode(img_mx)  # [1, 32, H/8, W/8]
-            mx.eval(latent)
-            latent_np = np.array(latent[0])  # [32, H/8, W/8]
-
-            q, scale = quantize_int8(latent_np.astype(np.float32))
-            np.savez(out_path, q=q, scale=scale)
-            written += 1
-
+            batch_imgs.append(preprocess_vae(jpg_bytes, image_size, tj=tj))
+            batch_ids.append(rec_id)
         except Exception as e:
             print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+
+        if len(batch_imgs) >= batch_size:
+            written += _encode_batch(vae, batch_ids, batch_imgs, output_dir)
+            batch_ids.clear()
+            batch_imgs.clear()
+
+    if batch_imgs:
+        written += _encode_batch(vae, batch_ids, batch_imgs, output_dir)
 
     return {"shard": shard_path, "written": written, "error": False}
 
@@ -210,6 +256,10 @@ def main():
         "--workers", type=int, default=1,
         help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=8,
+        help="Images per VAE encode call (default 8; batching amortises GPU launch overhead)"
+    )
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
@@ -222,14 +272,15 @@ def main():
     print(f"Pre-computing VAE latents for {len(shards)} shards")
     print(f"  Model:   {args.model}")
     print(f"  Output:  {args.output}")
-    print(f"  Workers: {args.workers}")
+    print(f"  Workers:    {args.workers}")
+    print(f"  Batch size: {args.batch_size}")
     latent_h = args.image_size // 8
     bytes_per = 32 * latent_h * latent_h  # int8
     total_gb = len(shards) * 5000 * bytes_per / 1e9
     print(f"  Storage estimate: ~{total_gb:.0f} GB")
     print()
 
-    work_items = [(s, args.output, args.model, args.image_size) for s in shards]
+    work_items = [(s, args.output, args.model, args.image_size, args.batch_size) for s in shards]
 
     import time as _time
     results = []

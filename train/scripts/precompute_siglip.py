@@ -85,9 +85,8 @@ def preprocess_siglip(jpg_bytes: bytes, image_size: int = 384) -> np.ndarray:
     Returns float32 [1, 3, 384, 384].
     """
     try:
-        from turbojpeg import TurboJPEG
-        tj = TurboJPEG()
-        img = tj.decode(jpg_bytes)  # HWC uint8 RGB
+        from turbojpeg import TurboJPEG, TJPF_RGB
+        img = TurboJPEG().decode(jpg_bytes, pixel_format=TJPF_RGB)  # HWC uint8 RGB
     except ImportError:
         from PIL import Image as PilImage
         img = np.array(

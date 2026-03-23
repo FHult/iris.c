@@ -99,11 +99,10 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     """
     from PIL import Image as _PilImage
     try:
-        from turbojpeg import TurboJPEG as _TJ
+        from turbojpeg import TurboJPEG as _TJ, TJPF_RGB as _TJPF_RGB
         _tj = _TJ()
         def _decode_jpeg(data):
-            rgb = _tj.decode(data)          # HWC uint8 BGR
-            return _PilImage.fromarray(rgb[:, :, ::-1])  # BGR→RGB PIL
+            return _PilImage.fromarray(_tj.decode(data, pixel_format=_TJPF_RGB))
     except ImportError:
         def _decode_jpeg(data):
             return _PilImage.open(io.BytesIO(data)).convert("RGB")
@@ -180,22 +179,27 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
     t_last_hb = t_start
     interval_rates = []
 
-    # One background thread prefetches the next shard's images while the GPU
-    # processes the current shard — overlaps I/O+PIL decode with MPS inference.
-    with ThreadPoolExecutor(max_workers=1) as loader:
-        # Kick off the first shard immediately
-        next_future = loader.submit(_decode_shard, pending[0][1], preprocess) if pending else None
+    # Two background threads prefetch upcoming shards while the GPU processes the
+    # current one.  A 2-deep queue absorbs I/O variance (e.g. a slow tar read on
+    # one shard won't stall the GPU if the shard after it is already decoded).
+    with ThreadPoolExecutor(max_workers=2) as loader:
+        from collections import deque
+        prefetch_q: deque = deque()
+        # Seed the queue with the first two shards
+        for k in range(min(2, len(pending))):
+            prefetch_q.append(loader.submit(_decode_shard, pending[k][1], preprocess))
 
         for batch_idx, (shard_idx, tar_path) in enumerate(pending):
             out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
             out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
 
-            # Collect result for this shard (already loading in background)
-            keys, tensors = next_future.result()
+            # Collect the front-of-queue result (already decoded in background)
+            keys, tensors = prefetch_q.popleft().result()
 
-            # Immediately kick off decoding the next shard
-            if batch_idx + 1 < len(pending):
-                next_future = loader.submit(_decode_shard, pending[batch_idx + 1][1], preprocess)
+            # Enqueue the shard that is 2 positions ahead
+            next_k = batch_idx + 2
+            if next_k < len(pending):
+                prefetch_q.append(loader.submit(_decode_shard, pending[next_k][1], preprocess))
 
             if keys is None or not tensors:
                 continue

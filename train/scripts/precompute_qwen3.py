@@ -113,15 +113,36 @@ def iter_shard(shard_path: str):
 # Worker
 # ---------------------------------------------------------------------------
 
+def _encode_single(model, tokenizer, rec_id, caption, output_dir):
+    """Encode one caption. Returns True on success. Used as fallback from batch path."""
+    import mlx.core as mx
+    try:
+        chat = [{"role": "user", "content": caption}]
+        text = tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(text, return_tensors="mlx")
+        outputs = model(inputs["input_ids"], output_hidden_states=True)
+        h = outputs.hidden_states
+        emb = mx.concatenate([h[9], h[18], h[27]], axis=-1)  # [1, seq, 7680]
+        emb_np = np.array(emb[0])  # [seq, 7680]
+        q_packed, scale = quantize_4bit_seq(emb_np.astype(np.float32))
+        np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q_packed, scale=scale)
+        return True
+    except Exception as e:
+        print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+        return False
+
+
 def process_shard(args) -> dict:
     """
     Worker: encode all captions in one shard and save quantised embeddings.
     Loads text encoder once per worker process (not once per shard).
+    Captions are processed in batches (sorted by length to minimise padding waste).
     """
-    shard_path, output_dir, model_path = args
+    shard_path, output_dir, model_path, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
 
-    # Import MLX inside worker (each process initialises its own Metal context)
     try:
         import mlx.core as mx
         from mlx_lm import load as mlx_lm_load
@@ -130,38 +151,67 @@ def process_shard(args) -> dict:
         return {"shard": shard_path, "written": 0, "error": True}
 
     model, tokenizer = mlx_lm_load(model_path)
-    model.eval()  # no grad
+    model.eval()
 
+    # Collect all pending (id, caption) pairs, skipping already-done
     written = 0
+    pending = []
     for rec_id, caption in iter_shard(shard_path):
-        out_path = os.path.join(output_dir, f"{rec_id}.npz")
-        if os.path.exists(out_path):
+        if os.path.exists(os.path.join(output_dir, f"{rec_id}.npz")):
             written += 1
-            continue  # resume-safe: skip already computed
+            continue
+        pending.append((rec_id, caption))
 
+    if not pending:
+        return {"shard": shard_path, "written": written, "error": False}
+
+    # Tokenize all captions; sort by length to minimise padding within each batch
+    pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0)
+    tokenized = []
+    for rec_id, caption in pending:
         try:
-            # Tokenize using Qwen3 chat template (same as iris.c training)
             chat = [{"role": "user", "content": caption}]
             text = tokenizer.apply_chat_template(
                 chat, tokenize=False, add_generation_prompt=True
             )
-            inputs = tokenizer(text, return_tensors="mlx")
-            tokens = inputs["input_ids"]
+            ids = tokenizer.encode(text)
+            tokenized.append((rec_id, caption, ids))
+        except Exception as e:
+            print(f"  Skipping {rec_id} (tokenize): {e}", file=sys.stderr)
+    tokenized.sort(key=lambda x: len(x[2]))
 
-            # Run encoder; extract layers 9, 18, 27 (0-indexed) and concatenate
-            # to match Flux Klein 4B text_dim=7680 (3 × 2560)
-            # Indices must match train_ip_adapter.py hidden_state_layers=(9, 18, 27)
-            outputs = model(tokens, output_hidden_states=True)
-            h = outputs.hidden_states  # list of [1, seq, 2560]
-            emb = mx.concatenate([h[9], h[18], h[27]], axis=-1)  # [1, seq, 7680]
-            emb_np = np.array(emb[0])  # [seq, 7680]
+    # Process in batches with right-padding.
+    # Causal attention ensures padding at the end does not affect earlier positions,
+    # so hidden states at indices 0..seq_len-1 are identical to single-item inference.
+    for i in range(0, len(tokenized), batch_size):
+        batch = tokenized[i:i + batch_size]
+        seq_lens = [len(ids) for _, _, ids in batch]
+        max_len = max(seq_lens)
+        padded = mx.array(np.array([
+            ids + [pad_id] * (max_len - len(ids))
+            for _, _, ids in batch
+        ]))  # [B, max_len]
 
-            q_packed, scale = quantize_4bit_seq(emb_np.astype(np.float32))
-            np.savez(out_path, q=q_packed, scale=scale)
-            written += 1
+        try:
+            outputs = model(padded, output_hidden_states=True)
+            h = outputs.hidden_states  # list of [B, max_len, 2560]
+
+            for j, (rec_id, _, _) in enumerate(batch):
+                sl = seq_lens[j]
+                emb_np = np.concatenate([
+                    np.array(h[9][j, :sl]),    # [sl, 2560]
+                    np.array(h[18][j, :sl]),   # [sl, 2560]
+                    np.array(h[27][j, :sl]),   # [sl, 2560]
+                ], axis=-1)                    # [sl, 7680]
+                q_packed, scale = quantize_4bit_seq(emb_np.astype(np.float32))
+                np.savez(os.path.join(output_dir, f"{rec_id}.npz"), q=q_packed, scale=scale)
+                written += 1
 
         except Exception as e:
-            print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+            print(f"  Batch {i // batch_size} failed ({e}), retrying single-item", file=sys.stderr)
+            for rec_id, caption, _ in batch:
+                if _encode_single(model, tokenizer, rec_id, caption, output_dir):
+                    written += 1
 
     return {"shard": shard_path, "written": written, "error": False}
 
@@ -190,6 +240,11 @@ def main():
         "--workers", type=int, default=1,
         help="Parallel processes (default 1; GPU-bound — 2+ processes contend for Metal)"
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=4,
+        help="Captions per encoder forward pass (default 4; sequences are right-padded "
+             "and sorted by length to minimise wasted compute)"
+    )
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
@@ -202,11 +257,12 @@ def main():
     print(f"Pre-computing Qwen3 embeddings for {len(shards)} shards")
     print(f"  Model:   {args.model}")
     print(f"  Output:  {args.output}")
-    print(f"  Workers: {args.workers}")
+    print(f"  Workers:    {args.workers}")
+    print(f"  Batch size: {args.batch_size}")
     print(f"  Storage estimate: ~{len(shards) * 0.46:.0f} GB")
     print()
 
-    work_items = [(s, args.output, args.model) for s in shards]
+    work_items = [(s, args.output, args.model, args.batch_size) for s in shards]
 
     # Use Pool with 2 workers: GPU is shared, more workers causes contention
     import time as _time
