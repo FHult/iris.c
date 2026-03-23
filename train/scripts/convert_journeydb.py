@@ -23,6 +23,8 @@ import json
 import os
 import tarfile
 
+from PIL import Image as _Img
+
 
 def load_annotations(anno_tgz_path: str) -> dict:
     """
@@ -170,9 +172,7 @@ def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int,
 
                     if min_size > 0:
                         try:
-                            from PIL import Image as _Img
-                            import io as _io
-                            img = _Img.open(_io.BytesIO(jpg_bytes))
+                            img = _Img.open(io.BytesIO(jpg_bytes))
                             if img.width < min_size or img.height < min_size:
                                 total_skipped += 1
                                 continue

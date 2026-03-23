@@ -35,6 +35,7 @@ import io
 import os
 import sys
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import subprocess
@@ -102,17 +103,24 @@ def rewrite_shard(shard_path: str, records: list) -> None:
             os.remove(tmp_path)
 
 
-def process_shard(shard_path: str, model, tokenizer, min_words: int = 10) -> dict:
+def _load_shard_records(shard_path: str) -> list:
+    """Read all (stem, jpg, txt) records from a shard into memory (I/O only, no VLM)."""
+    return list(iter_shard_raw(shard_path))
+
+
+def process_shard(shard_path: str, model, tokenizer, min_words: int = 10,
+                  preloaded: list = None) -> dict:
     """
     Re-caption all records in one shard whose captions are under min_words words.
-    Rewrites the shard in place.
+    Rewrites the shard in place.  If preloaded is given (from prefetch thread), uses
+    that instead of reading the shard from disk.
     Returns counts.
     """
     records = []
     recaptioned = 0
     kept = 0
 
-    for stem, jpg, txt in iter_shard_raw(shard_path):
+    for stem, jpg, txt in (preloaded if preloaded is not None else iter_shard_raw(shard_path)):
         if _word_count(txt) < min_words:
             # Re-caption with style-focused prompt
             try:
@@ -192,15 +200,27 @@ def main():
     total_kept = 0
     total_recaptioned = 0
 
-    for i, shard_path in enumerate(shards):
-        result = process_shard(shard_path, model, tokenizer, args.min_caption_words)
-        total_kept += result["kept"]
-        total_recaptioned += result["recaptioned"]
-        if (i + 1) % 10 == 0 or i == len(shards) - 1:
-            print(
-                f"  [{i+1}/{len(shards)}] recaptioned={total_recaptioned:,} "
-                f"total={total_kept:,}"
-            )
+    # 1-ahead prefetch: read next shard from disk while VLM processes current shard.
+    # VLM inference is GPU-bound; shard I/O runs in a background thread at no cost.
+    with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+        prefetch_future = prefetch_pool.submit(_load_shard_records, shards[0]) if shards else None
+
+        for i, shard_path in enumerate(shards):
+            records = prefetch_future.result()
+
+            # Start loading the next shard immediately (overlaps with VLM inference below)
+            if i + 1 < len(shards):
+                prefetch_future = prefetch_pool.submit(_load_shard_records, shards[i + 1])
+
+            result = process_shard(shard_path, model, tokenizer, args.min_caption_words,
+                                   preloaded=records)
+            total_kept += result["kept"]
+            total_recaptioned += result["recaptioned"]
+            if (i + 1) % 10 == 0 or i == len(shards) - 1:
+                print(
+                    f"  [{i+1}/{len(shards)}] recaptioned={total_recaptioned:,} "
+                    f"total={total_kept:,}"
+                )
 
     print(f"\nDone. Re-captioned {total_recaptioned:,} / {total_kept:,} records.")
 

@@ -25,8 +25,8 @@ from PIL import Image
 
 
 def make_caption(row) -> str:
-    style = (row.get("style") or "").strip()
-    desc  = (row.get("description") or row.get("title") or "").strip()
+    style = (getattr(row, "style", None) or "").strip()
+    desc  = (getattr(row, "description", None) or getattr(row, "title", None) or "").strip()
     if style and desc:
         return f"{style} painting: {desc}"
     elif style:
@@ -77,16 +77,17 @@ def main():
         print(f"Reading {os.path.basename(pq_path)} ...", flush=True)
         df = pd.read_parquet(pq_path, columns=["image", "style", "description", "title"])
 
-        for _, row in df.iterrows():
-            img_data = row["image"]
+        for row in df.itertuples(index=False):
+            img_data = row.image
             raw_bytes = img_data["bytes"] if isinstance(img_data, dict) else img_data
 
-            # Validate and re-encode as JPEG
+            # Lazy open for size check (header only, no decode); convert only after passing
             try:
-                img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                img = Image.open(io.BytesIO(raw_bytes))
                 if img.width < args.min_size or img.height < args.min_size:
                     total_skipped += 1
                     continue
+                img = img.convert("RGB")
                 out = io.BytesIO()
                 img.save(out, format="JPEG", quality=90)
                 jpg_bytes = out.getvalue()
