@@ -152,7 +152,7 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     return keys, tensors
 
 
-def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 1024):
+def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
     """
     Embed all WebDataset images with CLIP ViT-L/14 using open_clip.
     Forward pass runs on MPS (Apple Silicon GPU).
@@ -517,7 +517,7 @@ def main():
     bi.add_argument("--shards",      required=True)
     bi.add_argument("--embeddings",  required=True)
     bi.add_argument("--index",       required=True)
-    bi.add_argument("--batch_size",  type=int, default=1024)
+    bi.add_argument("--batch_size",  type=int, default=512)
 
     # incremental
     inc = subparsers.add_parser(
