@@ -247,7 +247,7 @@ def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
                 t_last_hb = t_now
                 print(
                     f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
-                    f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                    f"  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
                     flush=True,
                 )
 

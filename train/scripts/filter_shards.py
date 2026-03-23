@@ -217,7 +217,7 @@ def main():
                 print(
                     f"  [{done}/{len(shards)}] kept={kept_so_far:,}"
                     f"  dropped={dropped_so_far:,}{err_str}"
-                    f"  {avg_rate:.1f} shards/s  ETA {eta/60:.0f}m",
+                    f"  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
                     flush=True,
                 )
 

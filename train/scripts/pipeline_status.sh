@@ -189,22 +189,22 @@ hb=$(last_match "${TRAIN_LOG:-}" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
 [[ -z "$hb" ]] && hb=$(last_match "$BUILD_LOG" '\[worker [0-9]+\] src [0-9]+/[0-9]+')
 [[ -n "$hb" ]] && BUILD_RUN_INFO="$hb"
 
-# Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm"
+# Step 5 — filter_shards: "[X/Y] kept=N  dropped=N  X.X s/shard  ETA Xm"
 FILTER_RUN_INFO="running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] kept=')
 [[ -n "$hb" ]] && FILTER_RUN_INFO="$hb"
 
-# Step 6 — clip_dedup build-index: "[X/Y] N,NNN images embedded  X.X shards/s  ETA Xm"
+# Step 6 — clip_dedup build-index: "[X/Y] N,NNN images embedded  X.X s/shard  ETA Xm"
 DEDUP_INDEX_RUN_INFO="building..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ images embedded')
 [[ -n "$hb" ]] && DEDUP_INDEX_RUN_INFO="$hb"
 
-# Step 8a — precompute_qwen3: "[X/Y] N,NNN embeddings  X.XX shards/s  ETA Xm"
+# Step 8a — precompute_qwen3: "[X/Y] N,NNN embeddings  X.X s/shard  ETA Xm"
 QWEN3_RUN_INFO="$QWEN3_COUNT/$SHARD_COUNT shards, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ embeddings')
 [[ -n "$hb" ]] && QWEN3_RUN_INFO="$hb"
 
-# Step 8b — precompute_vae: "[X/Y] N,NNN latents  X.XX shards/s  ETA Xm"
+# Step 8b — precompute_vae: "[X/Y] N,NNN latents  X.X s/shard  ETA Xm"
 VAE_RUN_INFO="$VAE_COUNT/$SHARD_COUNT shards, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
 [[ -n "$hb" ]] && VAE_RUN_INFO="$hb"

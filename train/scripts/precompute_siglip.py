@@ -317,7 +317,7 @@ def main():
             err_str = f"  errors={errs_so_far}" if errs_so_far else ""
             print(
                 f"  [{done}/{len(work_items)}] {written_so_far:,} features"
-                f"{err_str}  {avg_rate:.2f} shards/s  ETA {eta/60:.0f}m",
+                f"{err_str}  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
                 flush=True,
             )
 
