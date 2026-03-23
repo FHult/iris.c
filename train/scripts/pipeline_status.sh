@@ -163,11 +163,14 @@ BUILD_RUNNING=false;  pgrep -f build_shards     &>/dev/null && BUILD_RUNNING=tru
 # Match run_training_pipeline.sh logic: done if any shards exist and not running.
 BUILD_DONE=false
 if [[ $SHARD_COUNT -gt 0 && $BUILD_RUNNING == false ]]; then BUILD_DONE=true; fi
-FILTER_RUNNING=false; pgrep -f filter_shards    &>/dev/null && FILTER_RUNNING=true
-QWEN3_RUNNING=false;  pgrep -f precompute_qwen3 &>/dev/null && QWEN3_RUNNING=true
-VAE_RUNNING=false;    pgrep -f precompute_vae   &>/dev/null && VAE_RUNNING=true
+FILTER_RUNNING=false;     pgrep -f filter_shards    &>/dev/null && FILTER_RUNNING=true
+PRECOMPUTE_RUNNING=false; pgrep -f precompute_all  &>/dev/null && PRECOMPUTE_RUNNING=true
+TRAIN_RUNNING=false;      pgrep -f train_ip_adapter &>/dev/null && TRAIN_RUNNING=true
+# Legacy individual-script names (kept for backwards compat with old runs)
+QWEN3_RUNNING=false;  pgrep -f precompute_qwen3  &>/dev/null && QWEN3_RUNNING=true
+VAE_RUNNING=false;    pgrep -f precompute_vae    &>/dev/null && VAE_RUNNING=true
 SIGLIP_RUNNING=false; pgrep -f precompute_siglip &>/dev/null && SIGLIP_RUNNING=true
-TRAIN_RUNNING=false;  pgrep -f train_ip_adapter &>/dev/null && TRAIN_RUNNING=true
+[[ $QWEN3_RUNNING == true || $VAE_RUNNING == true || $SIGLIP_RUNNING == true ]] && PRECOMPUTE_RUNNING=true
 
 # ── Heartbeat progress lines (from logs) ──────────────────────────────────────
 # Each running step emits heartbeat lines we can parse for live progress.
@@ -199,13 +202,15 @@ DEDUP_INDEX_RUN_INFO="building..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ images embedded')
 [[ -n "$hb" ]] && DEDUP_INDEX_RUN_INFO="$hb"
 
-# Step 8a — precompute_qwen3: "[X/Y] N,NNN embeddings  X.X s/shard  ETA Xm"
-QWEN3_RUN_INFO="$QWEN3_COUNT/$SHARD_COUNT shards, running..."
+# Step 8 — precompute_all: "[X/Y]  qwen3=N,NNN  vae=N,NNN  X.X s/shard  ETA Xm"
+PRECOMPUTE_RUN_INFO="qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  ($SHARD_COUNT shards, running...)"
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\]  qwen3=[0-9,]+  vae=')
+[[ -n "$hb" ]] && PRECOMPUTE_RUN_INFO="$hb"
+# Legacy individual scripts (for old runs that used precompute_qwen3/vae separately)
+QWEN3_RUN_INFO="$QWEN3_COUNT embeddings, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ embeddings')
 [[ -n "$hb" ]] && QWEN3_RUN_INFO="$hb"
-
-# Step 8b — precompute_vae: "[X/Y] N,NNN latents  X.X s/shard  ETA Xm"
-VAE_RUN_INFO="$VAE_COUNT/$SHARD_COUNT shards, running..."
+VAE_RUN_INFO="$VAE_COUNT latents, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
 [[ -n "$hb" ]] && VAE_RUN_INFO="$hb"
 
@@ -255,7 +260,7 @@ step_status "[4/9] Build unified shards" \
     "$BUILD_RUN_INFO"
 
 step_status "[5/9] Filter shards" \
-    "[[ -f $SHARDS_DIR/.filtered_chunk1 ]]" \
+    "[[ -f $SHARDS_DIR/.filtered_chunk1 && $SHARD_COUNT -gt 0 ]]" \
     "$FILTER_RUNNING" \
     "($SHARD_COUNT shards)" "$FILTER_RUN_INFO"
 
@@ -268,17 +273,11 @@ step_status "[7/9] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
     "($ANCHOR_COUNT shards · built from raw sources, independent of steps 4-6)"
 
-step_status "[8a/9] Precompute Qwen3 embeddings" \
-    "[[ -f $PRECOMP_DIR/qwen3/.done || ($QWEN3_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0) ]]" \
-    "$QWEN3_RUNNING" \
-    "($QWEN3_COUNT/$SHARD_COUNT shards)" \
-    "$QWEN3_RUN_INFO"
-
-step_status "[8b/9] Precompute VAE latents" \
-    "[[ -f $PRECOMP_DIR/vae/.done || ($VAE_COUNT -ge $SHARD_COUNT && $SHARD_COUNT -gt 0) ]]" \
-    "$VAE_RUNNING" \
-    "($VAE_COUNT/$SHARD_COUNT shards)" \
-    "$VAE_RUN_INFO"
+step_status "[8/9] Precompute Qwen3 + VAE" \
+    "[[ -f $PRECOMP_DIR/.done ]]" \
+    "$PRECOMPUTE_RUNNING" \
+    "(qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  shards=$SHARD_COUNT)" \
+    "$PRECOMPUTE_RUN_INFO"
 
 step_status "[9/9] Train" \
     "[[ $CKPT_COUNT -gt 0 ]]" \
@@ -309,7 +308,7 @@ if [[ -n "$PIPELINE_ROOT" ]]; then
 fi
 
 # Step-level worker processes (exclude pipeline shell subprocesses)
-STEP_PROCS=$(pgrep -a -l -f "build_shards|clip_dedup\.py|filter_shards|precompute_qwen3|precompute_vae|precompute_siglip|train_ip_adapter" 2>/dev/null \
+STEP_PROCS=$(pgrep -a -l -f "build_shards|clip_dedup\.py|filter_shards|precompute_all|precompute_qwen3|precompute_vae|precompute_siglip|train_ip_adapter" 2>/dev/null \
     | grep -v "grep\|pipeline_status" || true)
 if [[ -n "$STEP_PROCS" ]]; then
     echo "$STEP_PROCS" | while read -r pid rest; do
@@ -342,7 +341,7 @@ if $BUILD_RUNNING; then
     # Prefer live pipeline log; fall back to /tmp/build_shards.log for heartbeat
     ACTIVE_LOG="${TRAIN_LOG:-}"
     [[ -z "$ACTIVE_LOG" && -f "$BUILD_LOG" ]] && ACTIVE_LOG="$BUILD_LOG"
-elif $FILTER_RUNNING || $QWEN3_RUNNING || $VAE_RUNNING || $SIGLIP_RUNNING; then
+elif $FILTER_RUNNING || $PRECOMPUTE_RUNNING; then
     ACTIVE_LOG="${PRECOMPUTE_LOG:-}"
     [[ -z "$ACTIVE_LOG" ]] && ACTIVE_LOG=$(ls -t "$DATA_ROOT/logs"/*.log 2>/dev/null | head -1 || true)
 elif $TRAIN_RUNNING; then

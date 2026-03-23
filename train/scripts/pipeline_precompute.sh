@@ -1,12 +1,14 @@
 #!/bin/bash
-# train/scripts/pipeline_precompute.sh — Run precompute steps only.
+# train/scripts/pipeline_precompute.sh — Run precompute step only (step 8).
 #
-# Runs steps 8a (Qwen3 embeddings, ~8h) and 8b (VAE latents, ~6h) in sequence.
+# Runs precompute_all.py (~14h total): reads each shard once and writes both
+# Qwen3 text embeddings (~143 GB, 4-bit quantised) and VAE latents (~198 GB,
+# int8 quantised) in a single pass — 2× faster than running them sequentially.
 # Use this after build_shards and filter_shards are complete if you want to run
 # precompute independently from the main pipeline.
 #
 # Guards against starting when a 'precompute' tmux session already exists.
-# Each step is idempotent: already-computed .npz files are skipped per-shard.
+# Idempotent: already-computed .npz files are skipped per-record on restart.
 #
 # Usage:
 #   bash train/scripts/pipeline_precompute.sh

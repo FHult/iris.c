@@ -212,8 +212,15 @@ def main():
     )
     args = parser.parse_args()
 
-    # Clean up any orphaned .tmp files left by a previously interrupted run
-    stale_tmps = glob.glob(os.path.join(args.shards, "*.tar.tmp"))
+    # Clean up orphaned .tmp files left by a previously interrupted run.
+    # Only remove files older than 5 minutes — younger files may be actively
+    # written by a concurrent build_shards.py run, and deleting them would
+    # unlink the directory entry while the fd stays open, causing build_shards
+    # to silently produce zero .tar files (os.path.exists returns False in finally).
+    import time as _time
+    stale_cutoff = _time.time() - 300  # 5 minutes
+    stale_tmps = [p for p in glob.glob(os.path.join(args.shards, "*.tar.tmp"))
+                  if os.path.getmtime(p) < stale_cutoff]
     if stale_tmps:
         print(f"Cleaning up {len(stale_tmps)} orphaned .tmp files from previous run...")
         for p in stale_tmps:

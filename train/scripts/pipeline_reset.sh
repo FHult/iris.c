@@ -11,6 +11,7 @@
 #                      LAION and COYO are never deleted — they are pre-existing and
 #                      not managed by this pipeline.
 #   --dry-run          Print what would be deleted; make no changes.
+#   --keep-journeydb   Keep raw/journeydb_wds* (converted JourneyDB WDS shards).
 #   --yes, -y          Skip the confirmation prompt.
 #
 # What is cleaned (standard reset):
@@ -41,15 +42,17 @@ TRAIN_DIR="$(dirname "$SCRIPT_DIR")"
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 DATA_ROOT=""
 FULL_RESET=false
+KEEP_JOURNEYDB=false
 DRY_RUN=false
 YES=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --data-root) DATA_ROOT="$2"; shift 2 ;;
-        --full)      FULL_RESET=true;  shift ;;
-        --dry-run)   DRY_RUN=true;     shift ;;
-        --yes|-y)    YES=true;         shift ;;
+        --data-root)       DATA_ROOT="$2"; shift 2 ;;
+        --full)            FULL_RESET=true;      shift ;;
+        --keep-journeydb)  KEEP_JOURNEYDB=true;  shift ;;
+        --dry-run)         DRY_RUN=true;         shift ;;
+        --yes|-y)          YES=true;             shift ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -104,14 +107,16 @@ _remove() {
 
 # ── Build target lists ────────────────────────────────────────────────────────
 
-# Converted WebDataset dirs (intermediate, always cleaned)
-WDS_DIRS=(
-    "$DATA_ROOT/raw/wikiart_wds"
-    "$DATA_ROOT/raw/journeydb_wds"
-    "$DATA_ROOT/raw/journeydb_wds_chunk2"
-    "$DATA_ROOT/raw/journeydb_wds_chunk3"
-    "$DATA_ROOT/raw/journeydb_wds_chunk4"
-)
+# Converted WebDataset dirs (intermediate, always cleaned unless --keep-journeydb)
+WDS_DIRS=("$DATA_ROOT/raw/wikiart_wds")
+if ! $KEEP_JOURNEYDB; then
+    WDS_DIRS+=(
+        "$DATA_ROOT/raw/journeydb_wds"
+        "$DATA_ROOT/raw/journeydb_wds_chunk2"
+        "$DATA_ROOT/raw/journeydb_wds_chunk3"
+        "$DATA_ROOT/raw/journeydb_wds_chunk4"
+    )
+fi
 
 # Pipeline output directories (always cleaned)
 OUTPUT_DIRS=(
@@ -188,6 +193,7 @@ echo ""
 echo "Will keep:"
 echo "  $DATA_ROOT/raw/laion           (pre-existing, not pipeline-managed)"
 echo "  $DATA_ROOT/raw/coyo            (pre-existing, not pipeline-managed)"
+$KEEP_JOURNEYDB && echo "  $DATA_ROOT/raw/journeydb_wds*  (--keep-journeydb)"
 if ! $FULL_RESET; then
     echo "  $DATA_ROOT/raw/wikiart         (downloaded dataset)"
     echo "  $DATA_ROOT/raw/journeydb       (downloaded dataset)"
