@@ -24,6 +24,8 @@ import multiprocessing
 import os
 import sys
 import tarfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -192,7 +194,11 @@ def _encode_batch_siglip(model_state, rec_ids, imgs_np, output_dir):
 def process_shard(args) -> dict:
     """
     Worker: encode all images in one shard with SigLIP and save quantised features.
-    Images are processed in batches for better GPU utilisation.
+
+    Two-phase design within each shard:
+      Phase 1: sequential tar read → list of (rec_id, jpg_bytes)
+      Phase 2: 1-ahead prefetch — while GPU encodes batch N, P-core threads
+               decode+preprocess batch N+1 in parallel, hiding CPU latency.
     """
     shard_path, output_dir, batch_size = args
     os.makedirs(output_dir, exist_ok=True)
@@ -223,27 +229,52 @@ def process_shard(args) -> dict:
     except ImportError:
         tj = None
 
+    # Phase 1: sequential tar read — collect pending (id, bytes) pairs
     written = 0
-    batch_ids: list = []
-    batch_imgs: list = []
-
+    raw_items = []
     for rec_id, jpg_bytes in iter_shard(shard_path):
-        out_path = os.path.join(output_dir, f"{rec_id}.npz")
-        if os.path.exists(out_path):
+        if os.path.exists(os.path.join(output_dir, f"{rec_id}.npz")):
             written += 1
-            continue
-        try:
-            batch_imgs.append(preprocess_siglip(jpg_bytes, tj=tj))
-            batch_ids.append(rec_id)
-        except Exception as e:
-            print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
-        if len(batch_imgs) >= batch_size:
-            written += _encode_batch_siglip(model_state, batch_ids, batch_imgs, output_dir)
-            batch_ids.clear()
-            batch_imgs.clear()
+        else:
+            raw_items.append((rec_id, jpg_bytes))
 
-    if batch_imgs:
-        written += _encode_batch_siglip(model_state, batch_ids, batch_imgs, output_dir)
+    if not raw_items:
+        return {"shard": shard_path, "written": written, "error": False}
+
+    # Split into batches upfront
+    batches = [raw_items[i:i + batch_size] for i in range(0, len(raw_items), batch_size)]
+
+    def _preprocess_batch(items):
+        """Decode+preprocess a list of (rec_id, jpg_bytes) in parallel."""
+        def _one(item):
+            rec_id, jpg_bytes = item
+            try:
+                return rec_id, preprocess_siglip(jpg_bytes, tj=tj)
+            except Exception as e:
+                print(f"  Skipping {rec_id}: {e}", file=sys.stderr)
+                return rec_id, None
+        n = min(_PERF_CORES, len(items))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            return list(pool.map(_one, items))
+
+    # Phase 2: 1-ahead prefetch — decode next batch while GPU encodes current
+    prefetch_q: deque = deque()
+    with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+        if batches:
+            prefetch_q.append(prefetch_pool.submit(_preprocess_batch, batches[0]))
+
+        for batch_idx in range(len(batches)):
+            preprocessed = prefetch_q.popleft().result()
+
+            # Submit next batch decode immediately (runs during GPU encode below)
+            next_idx = batch_idx + 1
+            if next_idx < len(batches):
+                prefetch_q.append(prefetch_pool.submit(_preprocess_batch, batches[next_idx]))
+
+            batch_ids = [r for r, img in preprocessed if img is not None]
+            batch_imgs = [img for r, img in preprocessed if img is not None]
+            if batch_imgs:
+                written += _encode_batch_siglip(model_state, batch_ids, batch_imgs, output_dir)
 
     return {"shard": shard_path, "written": written, "error": False}
 
