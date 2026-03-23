@@ -18,8 +18,8 @@
 #   1. CLIP deduplication (~1.5h embed + 20min FAISS)
 #   2. Merge + shuffle all sources into unified shards (COMPUTE_WORKERS=6)
 #   3. Filter pass — drop corrupt/small/bad-caption records (PERF_CORES=8)
-#   4. Precompute Qwen3 embeddings (~8h, ~143 GB)
-#   5. Precompute VAE latents (~6h, ~198 GB)
+#   4. Unified precompute: Qwen3 + VAE in one pass (~14h, ~341 GB)
+#      Each shard tar opened once instead of twice, saving ~2h of I/O.
 #
 # Recaption (step 2b) is optional and runs separately in two terminals.
 # SigLIP precompute is excluded by default (420 GB); add --siglip to enable.
@@ -66,9 +66,8 @@ fi
 DONE_DEDUP="$DATA_ROOT/.done_dedup"
 DONE_SHARDS="$DATA_ROOT/.done_shards"
 DONE_FILTER="$DATA_ROOT/.done_filter"
-DONE_QWEN3="$DATA_ROOT/.done_qwen3"
-DONE_VAE="$DATA_ROOT/.done_vae"
-DONE_SIGLIP="$DATA_ROOT/.done_siglip"
+DONE_PRECOMPUTE="$DATA_ROOT/.done_precompute"
+DONE_SIGLIP="$DATA_ROOT/.done_siglip"  # kept for back-compat checks
 
 # ── Step 1: CLIP deduplication ────────────────────────────────────────────────
 if [[ -f "$DONE_DEDUP" ]]; then
@@ -107,47 +106,28 @@ else
     touch "$DONE_FILTER"
 fi
 
-# ── Step 4: Precompute Qwen3 (~8h, ~143 GB) ──────────────────────────────────
-if [[ -f "$DONE_QWEN3" ]]; then
-    echo "[4/5] Qwen3 precompute — already done, skipping."
+# ── Steps 4+5: Unified precompute — Qwen3 + VAE [+ SigLIP] ──────────────────
+# Single pass: each shard tar opened once instead of twice or three times.
+if [[ -f "$DONE_PRECOMPUTE" ]]; then
+    echo "[4/4] Precompute — already done, skipping."
 else
-    echo "[4/5] Precomputing Qwen3 text embeddings (~8h)..."
-    python "$SCRIPT_DIR/precompute_qwen3.py" \
-        --shards "$DATA_ROOT/shards" \
-        --output "$DATA_ROOT/precomputed/qwen3"
-    touch "$DONE_QWEN3"
-fi
-
-# ── Step 5: Precompute VAE latents (~6h, ~198 GB) ────────────────────────────
-if [[ -f "$DONE_VAE" ]]; then
-    echo "[5/5] VAE precompute — already done, skipping."
-else
-    echo "[5/5] Precomputing VAE latents (~6h)..."
-    python "$SCRIPT_DIR/precompute_vae.py" \
-        --shards "$DATA_ROOT/shards" \
-        --output "$DATA_ROOT/precomputed/vae"
-    touch "$DONE_VAE"
-fi
-
-# ── Optional: SigLIP (~420 GB) ────────────────────────────────────────────────
-if $ENABLE_SIGLIP; then
-    if [[ -f "$DONE_SIGLIP" ]]; then
-        echo "[+] SigLIP precompute — already done, skipping."
-    else
-        echo "[+] Precomputing SigLIP features (~420 GB)..."
-        python "$SCRIPT_DIR/precompute_siglip.py" \
-            --shards "$DATA_ROOT/shards" \
-            --output "$DATA_ROOT/precomputed/siglip"
-        touch "$DONE_SIGLIP"
-    fi
+    echo "[4/4] Precomputing Qwen3 + VAE (~14h, ~341 GB)..."
+    PRECOMPUTE_ARGS=(
+        --shards       "$DATA_ROOT/shards"
+        --qwen3-output "$DATA_ROOT/precomputed/qwen3"
+        --vae-output   "$DATA_ROOT/precomputed/vae"
+    )
+    $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$DATA_ROOT/precomputed/siglip")
+    python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
+    touch "$DONE_PRECOMPUTE"
 fi
 
 echo ""
 echo "==================================================================="
 echo "  Preprocessing complete."
-echo "  Shards:      $DATA_ROOT/shards/"
-echo "  Qwen3 cache: $DATA_ROOT/precomputed/qwen3/"
-echo "  VAE cache:   $DATA_ROOT/precomputed/vae/"
+echo "  Shards:       $DATA_ROOT/shards/"
+echo "  Precomputed:  $DATA_ROOT/precomputed/"
+echo "    qwen3/  vae/  [siglip/]"
 echo ""
 echo "  NOTE: Recaptioning runs separately — see train/README.md Step 4."
 echo ""

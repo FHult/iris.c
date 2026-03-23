@@ -343,44 +343,26 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  Done: anchor set in $ANCHOR_DIR"
     fi
 
-    # ── 1h. Precompute text embeddings + VAE latents ──────────────────────────
+    # ── 1h. Unified precompute: Qwen3 + VAE [+ SigLIP] ───────────────────────
+    # Single pass over all shards — reads each tar once instead of 2-3 times.
     QWEN3_DIR="$DATA_ROOT/precomputed/qwen3"
     VAE_DIR="$DATA_ROOT/precomputed/vae"
+    SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
+    PRECOMPUTE_DONE="$DATA_ROOT/precomputed/.done"
 
-    if [[ -f "$QWEN3_DIR/.done" ]]; then
-        log "[8a/9] Qwen3 embeddings already precomputed — skipping"
+    if [[ -f "$PRECOMPUTE_DONE" ]]; then
+        log "[8/9] Precompute already done — skipping"
     else
-        log "[8a/9] Precomputing Qwen3 text embeddings (~8h, ~143 GB)..."
-        python "$SCRIPT_DIR/precompute_qwen3.py" \
-            --shards "$SHARDS_DIR" \
-            --output "$QWEN3_DIR"
-        touch "$QWEN3_DIR/.done"
-        log "  Done: $QWEN3_DIR"
-    fi
-
-    if [[ -f "$VAE_DIR/.done" ]]; then
-        log "[8b/9] VAE latents already precomputed — skipping"
-    else
-        log "[8b/9] Precomputing VAE latents (~6h, ~198 GB)..."
-        python "$SCRIPT_DIR/precompute_vae.py" \
-            --shards "$SHARDS_DIR" \
-            --output "$VAE_DIR"
-        touch "$VAE_DIR/.done"
-        log "  Done: $VAE_DIR"
-    fi
-
-    if $ENABLE_SIGLIP; then
-        SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
-        if [[ -f "$SIGLIP_DIR/.done" ]]; then
-            log "[8c/9] SigLIP features already precomputed — skipping"
-        else
-            log "[8c/9] Precomputing SigLIP features (~420 GB)..."
-            python "$SCRIPT_DIR/precompute_siglip.py" \
-                --shards "$SHARDS_DIR" \
-                --output "$SIGLIP_DIR"
-            touch "$SIGLIP_DIR/.done"
-            log "  Done: $SIGLIP_DIR"
-        fi
+        log "[8/9] Precomputing Qwen3 + VAE (~14h, ~341 GB)..."
+        PRECOMPUTE_ARGS=(
+            --shards        "$SHARDS_DIR"
+            --qwen3-output  "$QWEN3_DIR"
+            --vae-output    "$VAE_DIR"
+        )
+        $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
+        python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
+        touch "$PRECOMPUTE_DONE"
+        log "  Done: $DATA_ROOT/precomputed/"
     fi
 
     # ── 1i. Background-prefetch JDB chunk 2 (front-run next phase, GPU-bound window) ──
