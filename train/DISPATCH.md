@@ -14,21 +14,21 @@ Hardware: M1 Max (8 P-cores / 2 E-cores, 64 GB unified memory), 2 TB NVMe SSD.
 
 ## Pipeline Overview
 
-The pipeline has **9 sequential steps** across ~3 weeks of compute:
+The pipeline has **9 steps** (some parallel) across ~3 weeks of compute:
 
-| # | Step | Duration | Output |
-|---|------|----------|--------|
-| 1 | Verify downloads | 1 min | — |
-| 2a | WikiArt → WebDataset | 5 min | `raw/wikiart_wds/` (104 shards) |
-| 2b | JourneyDB → WebDataset | 30 min | `raw/journeydb_wds/` (210 shards) |
-| 3 | CLIP deduplication | 2 h | `dedup_ids/duplicate_ids.txt` |
-| 4 | Build unified shards | 2–4 h | `shards/*.tar` (5000 img/shard) |
-| 5 | Filter shards | 30 min | shards rewritten in place |
-| 6 | Cross-chunk dedup index | 1 h | `dedup_ids/dedup_index.faiss` |
-| 7 | Anchor set | 5 min | `anchor_shards/` |
-| 8a | Precompute Qwen3 embeddings | 8 h | `precomputed/qwen3/` (~143 GB) |
-| 8b | Precompute VAE latents | 6 h | `precomputed/vae/` (~198 GB) |
-| 9 | Train IP-Adapter | 3–7 days | `checkpoints/step_*.safetensors` |
+| # | Step | Duration | Output | Parallelism |
+|---|------|----------|--------|-------------|
+| 1 | Verify LAION/COYO on disk | 1 min | — | — |
+| 2a | WikiArt download + WDS convert | 2 min | `raw/wikiart_wds/` (80 shards) | ↕ parallel with 2b, 3 |
+| 2b | JourneyDB download + WDS convert | 5 min | `raw/journeydb_wds/` (210 shards) | ↕ parallel with 2a, 3 |
+| 3 | CLIP deduplication | 2 h | `dedup_ids/duplicate_ids.txt` | ↕ parallel with 2a, 2b |
+| 4 | Build unified shards | 2–4 h | `shards/*.tar` (5000 img/shard) | filter runs in background |
+| 5 | Filter shards (final pass) | 30 min | shards rewritten in place | background during step 4 |
+| 7 | Anchor set | 5 min | `anchor_shards/` (10K images) | after step 5 |
+| 8 | Precompute Qwen3 + VAE | 14 h | `precomputed/qwen3/` + `vae/` | single unified pass |
+| 9 | Train IP-Adapter | 3–7 days | `checkpoints/step_*.safetensors` | chunked across 4 phases |
+
+**Key topology**: Steps 2a, 2b, and 3 all launch simultaneously at the start. Step 4 runs a concurrent background filter loop so shards are validated as they are written. Step 8 reads each shard once and writes both Qwen3 embeddings and VAE latents in a single pass (2× faster than running them sequentially).
 
 Training is **chunked** across 4 JourneyDB data batches. Chunk 1 is the initial full run. Chunks 2–4 fine-tune on additional data with decaying LR.
 
@@ -43,18 +43,18 @@ Training is **chunked** across 4 JourneyDB data batches. Chunk 1 is the initial 
 
 ## Calls to Action
 
-All scripts work from any working directory. All long-running scripts launch in `tmux` automatically and survive shell disconnects.
+All scripts work from any working directory.
 
 ### `status` — Full pipeline snapshot
 ```bash
 bash train/scripts/pipeline_status.sh
 ```
-Shows all 9 steps (✅/⏳/⬜), active process names, tmux sessions, last 15 lines of the active log, and disk layout. **This is usually the first command to run.** Auto-detects `/Volumes/2TBSSD` so no flags needed.
+Shows all steps (✅/⏳/⬜), active process names, tmux sessions, last 15 lines of the active log, and disk layout. **This is always the first command to run.** Auto-detects `/Volumes/2TBSSD` so no flags needed.
 
-For running steps, each line shows the **most recent heartbeat** parsed from the step's log — no separate progress query needed:
+For running steps, each line shows the **most recent heartbeat** parsed from the step's log:
 - `build_shards`: `[worker N] src X/Y | written N records | shards A/B full`
-- `filter_shards`: `[X/Y] kept=N  dropped=N  X.X shards/s  ETA Xm`
-- `precompute_qwen3/vae/siglip`: `[X/Y] N,NNN embeddings/latents/features  X.XX shards/s  ETA Xm`
+- `filter_shards`: `[X/Y] kept=N  dropped=N  X.X s/shard  ETA Xm`
+- `precompute_all`: `[X/Y]  qwen3=N,NNN  vae=N,NNN  X.X s/shard  ETA Xm`
 - `clip_dedup`: `[X/N] N duplicates found`
 - `train_ip_adapter`: `step X,XXX/105,000  loss X.XXXX (avg X.XXXX)  lr X  X.XX steps/s  ETA Xh XXm`
 
@@ -72,7 +72,18 @@ bash train/scripts/pipeline_start.sh --data-root /Volumes/2TBSSD --siglip
 ```
 Guards against double-starting: exits if a `pipeline` tmux session already exists. Launches `run_training_pipeline.sh` under `caffeinate` in a tmux session named `pipeline`.
 
-Options: `--chunk 1–4`, `--data-root PATH`, `--resume CKPT`, `--config YAML`, `--steps N`, `--lr RATE`, `--siglip`, `--skip-dedup`, `--skip-train`
+Options: `--chunk 1–4`, `--data-root PATH`, `--resume CKPT`, `--config YAML`, `--steps N`, `--lr RATE`, `--siglip`, `--recaption`, `--skip-dedup`, `--skip-train`
+
+---
+
+### `reset` — Delete all pipeline outputs, keep downloads
+```bash
+bash train/scripts/pipeline_reset.sh              # standard: keeps raw/wikiart, raw/journeydb
+bash train/scripts/pipeline_reset.sh --full       # also deletes downloaded datasets
+bash train/scripts/pipeline_reset.sh --dry-run    # preview what would be deleted
+bash train/scripts/pipeline_reset.sh --yes        # skip confirmation prompt
+```
+Deletes all intermediate and final pipeline outputs: converted WDS dirs, unified shards, anchor set, dedup blocklist, precomputed caches, embeddings, and logs. Refuses to run if the pipeline lock is held by a live process — run `stop` first. `--full` additionally removes the downloaded raw datasets (wikiart, journeydb); LAION and COYO are never touched (pre-existing). Training checkpoints are never deleted.
 
 ---
 
@@ -109,9 +120,7 @@ bash train/scripts/pipeline_logs.sh --follow     # stream live (Ctrl-C to exit)
 bash train/scripts/pipeline_logs.sh --progress   # heartbeat lines only (best for dispatch)
 bash train/scripts/pipeline_logs.sh --all        # list all log files
 ```
-Auto-selects the most relevant log for what is currently running: build_shards → `/tmp/build_shards.log`, precompute → `DATA_ROOT/logs/precompute*.log`, training → `DATA_ROOT/logs/pipeline_chunk*.log`.
-
-`--progress` filters to only heartbeat lines (worker updates, shard counts, step/loss lines), removing startup noise and model output. This is the recommended mode for Claude CoWork Dispatch progress checks.
+Auto-selects the most relevant log for what is currently running. `--progress` filters to only heartbeat lines (worker updates, shard counts, step/loss lines), removing startup noise. This is the recommended mode for Claude CoWork Dispatch progress checks.
 
 ---
 
@@ -123,12 +132,12 @@ One-shot snapshot of: CPU utilisation by core class (P/E), memory pressure and s
 
 ---
 
-### `precompute` — Run precompute steps only
+### `precompute` — Run precompute step only
 ```bash
 bash train/scripts/pipeline_precompute.sh
-bash train/scripts/pipeline_precompute.sh --siglip   # include SigLIP (420 GB extra)
+bash train/scripts/pipeline_precompute.sh --siglip   # include SigLIP (~420 GB extra)
 ```
-Runs steps 8a (Qwen3, ~8 h) and 8b (VAE, ~6 h) in sequence. Use after `build_shards` and `filter_shards` complete if you want to decouple precompute from training. Launches in tmux session `precompute`.
+Runs step 8 (unified Qwen3 + VAE precompute, ~14 h) via `precompute_all.py`. Reads each shard once and writes both caches in a single pass. Use after build/filter complete if you want to decouple precompute from training. Launches in tmux session `precompute`. Each .npz file is idempotent — already-computed records are skipped on restart.
 
 ---
 
@@ -137,7 +146,7 @@ Runs steps 8a (Qwen3, ~8 h) and 8b (VAE, ~6 h) in sequence. Use after `build_sha
 bash train/scripts/pipeline_test.sh           # full suite (9 tests, < 5 min)
 bash train/scripts/pipeline_test.sh --fast    # skip dataset loader test
 ```
-Verifies every pipeline component is functional before committing to a long run: Python environment and packages, shard format and readability, filter logic, precompute cache validity, model importability, and checkpoint integrity. All tests are **read-only** — they do not modify data. Run this after setup or after any code change before starting a full pipeline run.
+Verifies every pipeline component is functional before committing to a long run: Python environment and packages, shard format and readability, filter logic, precompute cache validity, model importability, and checkpoint integrity. All tests are **read-only** — they do not modify data.
 
 Tests: T1 Python env · T2 Shard format · T3 Caption filter logic · T4 Metadata collection · T5 Qwen3 cache · T6 VAE cache · T7 Dataset loader · T8 Model import · T9 Checkpoint readability
 
@@ -148,7 +157,7 @@ Tests: T1 Python env · T2 Shard format · T3 Caption filter logic · T4 Metadat
 bash train/scripts/pipeline_doctor.sh           # warnings-only output
 bash train/scripts/pipeline_doctor.sh --verbose  # show passing checks too
 ```
-Reviews all completed outputs for correctness and integrity: source counts, dedup blocklist, shard content sampling, filter quality, precompute coverage and dtype consistency, ID alignment between shards and caches, and checkpoint step progression. **Use this when something looks wrong** — e.g. training loss is unexpectedly high, a step seemed to complete too fast, or after a crash recovery. Reports ⚠️ warnings (anomalies worth reviewing) and ❌ errors (things that need to be fixed before proceeding).
+Reviews all completed outputs for correctness and integrity: source counts, dedup blocklist, shard content sampling, filter quality, precompute coverage and dtype consistency, ID alignment between shards and caches, and checkpoint step progression. **Use this when something looks wrong** — e.g. training loss is unexpectedly high, a step seemed to complete too fast, or after a crash recovery.
 
 Checks: D1 Source completeness · D2 Dedup blocklist · D3 Shard content · D4 Filter quality · D5 Qwen3 integrity · D6 VAE integrity · D7 ID alignment · D8 Checkpoint progression
 
@@ -159,7 +168,7 @@ Checks: D1 Source completeness · D2 Dedup blocklist · D3 Shard content · D4 F
 These scripts do not exist yet but are well-defined and ready to build:
 
 ### `pipeline_validate.sh` — Check training quality
-Generate N sample images using the current checkpoint and the fixed eval prompts in `train/configs/eval_prompts.txt`. Saves to `/tmp/iris_eval/`. Useful to spot degradation or confirm a chunk improved quality.
+Generate N sample images using the current checkpoint and fixed eval prompts in `train/configs/eval_prompts.txt`. Saves to `/tmp/iris_eval/`. Useful to spot degradation or confirm a chunk improved quality.
 ```bash
 bash train/scripts/pipeline_validate.sh --steps 2 --n 4
 ```
@@ -190,19 +199,19 @@ bash train/scripts/pipeline_recaption.sh --data-root /Volumes/2TBSSD
 raw/
   laion/            LAION-Aesthetics-v2 (~150 shards, pre-downloaded WebDataset)
   coyo/             COYO-700M subset (~50 shards)
-  journeydb_wds/    JourneyDB converted to WDS (210 shards)
-  wikiart_wds/      WikiArt converted to WDS (104 shards)
-shards/             Merged unified shards (5000 images/shard)
-anchor_shards/      Fixed anchor set (~10K images, mixed in at training time)
+  journeydb_wds/    JourneyDB chunk 1 converted to WDS (210 shards)
+  wikiart_wds/      WikiArt converted to WDS (80 shards)
+shards/             Merged unified shards (~430+ shards, 5000 images each)
+anchor_shards/      Fixed anchor set (~10K images, LAION+WikiArt only)
 dedup_ids/
   duplicate_ids.txt Blocklist from CLIP dedup (124,340 IDs)
   dedup_index.faiss Cross-chunk FAISS index (chunk 2+ only)
-embeddings/         CLIP embeddings from dedup step (~3 GB)
 precomputed/
   qwen3/            Qwen3 text embeddings, 4-bit quantised (.npz, ~143 GB)
   vae/              VAE latents, int8 quantised (.npz, ~198 GB)
   siglip/           SigLIP features, 4-bit quantised (.npz, ~420 GB, optional)
-logs/               Pipeline run logs (pipeline_chunk*.log, precompute*.log)
+  .done             Sentinel: precompute step 8 complete
+logs/               Pipeline run logs (pipeline_chunk*.log)
 ```
 
 Checkpoints: `train/checkpoints/` (on the internal SSD, not the external).
@@ -214,12 +223,13 @@ Checkpoints: `train/checkpoints/` (on the internal SSD, not the external).
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `status` shows 0/N shards | Wrong DATA_ROOT detected | `pipeline_status.sh --data-root /Volumes/2TBSSD` |
-| build_shards exits with NameError | Old run with unfixed code | Pull latest, re-run `pipeline_start.sh` |
-| Kernel watchdog panic / system crash | Swap exhaustion in build_shards | Restart; code is now fixed (streaming I/O) |
+| `status` shows filter ✅ but 0 shards | Stale `.filtered_chunk1` sentinel from failed run | Safe to ignore — pipeline re-runs step 4 when count_tars=0 |
+| build_shards reports N shards but dir empty | Old bug: background filter deleted .tar.tmp files | Fixed in `filter_shards.py` (only deletes files >5 min old) |
 | Training hangs, no log output | sample_q timeout (dataset crash) | `pipeline_stop.sh`, check logs, `pipeline_resume.sh` |
 | SSD at >90% capacity | raw/ not cleaned up after conversion | Raw dirs safe to delete after shards are built |
 | FAISS SIGSEGV | OpenMP on Apple Silicon | Already fixed (`omp_set_num_threads(1)`) |
 | tmux session not found on `resume` | Previous run already finished or crashed | Check `pipeline_status.sh`, then `pipeline_start.sh` |
+| Pipeline killed when shell exits | Not using tmux | Use `pipeline_start.sh` (launches in tmux automatically) |
 
 ---
 
