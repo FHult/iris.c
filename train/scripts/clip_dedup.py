@@ -95,6 +95,11 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     Open one .tar shard and decode all JPEG images into preprocessed tensors.
     Runs in a background thread so I/O + CPU decode overlaps with GPU inference.
     Uses TurboJPEG when available (3-5x faster than PIL for JPEG decode).
+
+    Two-phase design:
+      Phase 1: sequential tar read (tarfile is not thread-safe)
+      Phase 2: parallel decode+preprocess across P-cores via ThreadPoolExecutor
+
     Returns (keys, tensors) or (None, None) on hard error.
     """
     from PIL import Image as _PilImage
@@ -107,8 +112,8 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
         def _decode_jpeg(data):
             return _PilImage.open(io.BytesIO(data)).convert("RGB")
 
-    keys: list[str] = []
-    tensors = []
+    # Phase 1: sequential tar read
+    raw_items = []
     try:
         with tarfile.open(tar_path) as tf:
             members = {m.name: m for m in tf.getmembers()}
@@ -122,15 +127,28 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
                 f = tf.extractfile(m)
                 if f is None:
                     continue
-                try:
-                    img = _decode_jpeg(f.read())
-                    tensors.append(preprocess(img))
-                    keys.append(key)
-                except Exception:
-                    continue
+                raw_items.append((key, f.read()))
     except Exception as e:
         print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
         return None, None
+
+    if not raw_items:
+        return [], []
+
+    # Phase 2: parallel decode + preprocess across P-cores
+    def _process_one(key_raw):
+        key, raw = key_raw
+        try:
+            return key, preprocess(_decode_jpeg(raw))
+        except Exception:
+            return None, None
+
+    n_threads = min(_PERF_CORES, len(raw_items))
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        results = list(pool.map(_process_one, raw_items))
+
+    keys = [k for k, t in results if k is not None]
+    tensors = [t for k, t in results if t is not None]
     return keys, tensors
 
 
