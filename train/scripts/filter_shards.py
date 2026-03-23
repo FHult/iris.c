@@ -41,12 +41,43 @@ try:
 except Exception:
     _PERF_CORES = os.cpu_count() or 4
 
+# Criteria used by the current run (set via Pool initializer from main args).
+# Stored as module-level so worker processes can read them without passing per-shard.
+_CRITERIA: dict = {"min_size": 256, "min_words": 5}
 
-def _is_valid_caption(caption: str) -> bool:
+# Sentinels written by older versions of this script are empty files.
+# Treat empty content as the historical defaults so existing filtered shards
+# are not re-processed unless the user actually changes the criteria.
+_LEGACY_FINGERPRINT = "min_size=256 min_words=5"
+
+
+def _criteria_fingerprint(min_size: int, min_words: int) -> str:
+    return f"min_size={min_size} min_words={min_words}"
+
+
+def _sentinel_valid(shard_path: str, fingerprint: str) -> bool:
+    """Return True iff shard_path + '.filtered' exists and matches fingerprint."""
+    p = shard_path + ".filtered"
+    if not os.path.exists(p):
+        return False
+    try:
+        content = open(p).read().strip()
+        stored = content if content else _LEGACY_FINGERPRINT
+        return stored == fingerprint
+    except OSError:
+        return False
+
+
+def _worker_init(min_size: int, min_words: int) -> None:
+    global _CRITERIA
+    _CRITERIA = {"min_size": min_size, "min_words": min_words}
+
+
+def _is_valid_caption(caption: str, min_words: int) -> bool:
     if not caption or not caption.strip():
         return False
     words = caption.strip().split()
-    if len(words) < 5:
+    if len(words) < min_words:
         return False
     low = caption.lower()
     if low.startswith("http") or low.startswith("www"):
@@ -61,6 +92,9 @@ def filter_shard(shard_path: str) -> dict:
     Validate all records in one shard; rewrite in place keeping only valid ones.
     Returns dict with kept/dropped counts.
     """
+    min_size = _CRITERIA["min_size"]
+    min_words = _CRITERIA["min_words"]
+    fingerprint = _criteria_fingerprint(min_size, min_words)
     if _HAS_TURBOJPEG:
         tj = TurboJPEG()
 
@@ -97,7 +131,7 @@ def filter_shard(shard_path: str) -> dict:
                 txt = tar.extractfile(members[txt_key]).read().decode(
                     "utf-8", errors="replace"
                 ).strip()
-                if not _is_valid_caption(txt):
+                if not _is_valid_caption(txt, min_words):
                     continue
 
                 jpg = tar.extractfile(members[jpg_key]).read()
@@ -109,7 +143,7 @@ def filter_shard(shard_path: str) -> dict:
                     else:
                         from PIL import Image as PilImage
                         w, h = PilImage.open(io.BytesIO(jpg)).size
-                    if w < 256 or h < 256:
+                    if w < min_size or h < min_size:
                         continue
                 except Exception:
                     continue
@@ -123,7 +157,7 @@ def filter_shard(shard_path: str) -> dict:
 
     # Fast path: nothing dropped — write sentinel without any I/O
     if len(kept_records) == original_count:
-        open(done_path, "w").close()
+        open(done_path, "w").write(fingerprint + "\n")
         return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False}
 
     # Rewrite shard in a temp file then atomically replace
@@ -137,7 +171,7 @@ def filter_shard(shard_path: str) -> dict:
                     info.size = len(data)
                     out_tar.addfile(info, io.BytesIO(data))
         os.replace(tmp_path, shard_path)
-        open(done_path, "w").close()  # mark as done after successful replace
+        open(done_path, "w").write(fingerprint + "\n")  # mark done after successful replace
     except Exception as e:
         print(f"Error rewriting {shard_path}: {e}", file=sys.stderr)
         if os.path.exists(tmp_path):
@@ -166,6 +200,16 @@ def main():
         help="Only filter shards whose numeric index >= this value (use to "
              "filter only newly appended shards without re-processing old ones)"
     )
+    parser.add_argument(
+        "--min-size", type=int, default=256,
+        help="Drop images smaller than this in either dimension (default 256). "
+             "Changing this value invalidates existing per-shard sentinels."
+    )
+    parser.add_argument(
+        "--min-words", type=int, default=5,
+        help="Drop captions with fewer than this many words (default 5). "
+             "Changing this value invalidates existing per-shard sentinels."
+    )
     args = parser.parse_args()
 
     # Clean up any orphaned .tmp files left by a previously interrupted run
@@ -184,8 +228,10 @@ def main():
                       if int(os.path.splitext(os.path.basename(s))[0]) >= args.start_idx]
         print(f"--start-idx {args.start_idx}: {len(all_shards)} shards in range")
 
-    # Skip shards already successfully filtered in a previous run
-    shards = [s for s in all_shards if not os.path.exists(s + ".filtered")]
+    fingerprint = _criteria_fingerprint(args.min_size, args.min_words)
+
+    # Skip shards whose sentinel matches current criteria fingerprint
+    shards = [s for s in all_shards if not _sentinel_valid(s, fingerprint)]
     already_done = len(all_shards) - len(shards)
     if already_done:
         print(f"Skipping {already_done} already-filtered shards (resume)")
@@ -194,7 +240,8 @@ def main():
         return
 
     print(f"Filtering {len(shards)} shards with {args.workers} workers...")
-    print(f"turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (slower fallback)'}")
+    print(f"  criteria: min_size={args.min_size}  min_words={args.min_words}")
+    print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (slower fallback)'}")
 
     import time as _time
     results = []
@@ -202,7 +249,11 @@ def main():
     t_last_hb = t_start
     interval_rates = []
     last_done = 0
-    with multiprocessing.Pool(processes=args.workers) as pool:
+    with multiprocessing.Pool(
+        processes=args.workers,
+        initializer=_worker_init,
+        initargs=(args.min_size, args.min_words),
+    ) as pool:
         for done, result in enumerate(
             pool.imap_unordered(filter_shard, shards, chunksize=1), 1
         ):

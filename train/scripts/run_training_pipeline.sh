@@ -151,6 +151,21 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*"; }
 die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
+# retry MAX_ATTEMPTS DELAY_SECS CMD [ARGS...]
+# Runs CMD up to MAX_ATTEMPTS times, sleeping DELAY_SECS between attempts.
+# Returns 0 on first success; returns 1 (triggering set -e exit) on exhaustion.
+retry() {
+    local max="$1" delay="$2"; shift 2
+    local attempt=1
+    while true; do
+        if "$@"; then return 0; fi
+        [[ "$attempt" -ge "$max" ]] && { log "ERROR: command failed after $max attempts: $*"; return 1; }
+        log "  Attempt $attempt/$max failed — retrying in ${delay}s..."
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 log "================================================================="
 log "  IP-Adapter training pipeline  chunk=$CHUNK"
 log "  DATA_ROOT: $DATA_ROOT"
@@ -388,7 +403,7 @@ if [[ "$CHUNK" -eq 1 ]]; then
             --vae-output    "$VAE_DIR"
         )
         $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
-        python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
+        retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
         touch "$PRECOMPUTE_DONE"
         log "  Done: $DATA_ROOT/precomputed/"
     fi
@@ -437,7 +452,7 @@ PYEOF
         [[ -n "$ANCHOR_DIR" && $(count_tars "$ANCHOR_DIR") -gt 0 ]] && \
             TRAIN_ARGS+=("--anchor-shards" "$ANCHOR_DIR")
 
-        python "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
+        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
         log "Stage 1 training complete."
 
         # Wait for prefetch if it's still running
@@ -449,14 +464,17 @@ PYEOF
     fi
 
     # ── 1k. Build cross-chunk dedup index (after training — not on critical path) ──
-    # Used by chunks 2–4 to flag images already seen. Building here saves ~1.5h
-    # from the precompute start time compared to building before precompute.
+    # DEPENDENCY: chunks 2–4 step 2b (cross-chunk dedup) requires this index.
+    # Building here (after training) is safe for chunk 1 because chunk 2 cannot
+    # start until chunk 1 training completes and this index exists.
+    # Do NOT skip this step if you plan to run chunk 2+.
     DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
     ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
     if [[ -f "$DEDUP_INDEX" ]]; then
         log "[6/9] Cross-chunk dedup index already built — skipping"
     else
-        log "[6/9] Building cross-chunk dedup index (~1.5h, needed before chunk 2)..."
+        log "[6/9] Building cross-chunk dedup index (~1.5h)..."
+        log "  (Required before starting --chunk 2; chunks 2-4 step 2b depends on this)"
         python "$SCRIPT_DIR/clip_dedup.py" build-index \
             --shards     "$SHARDS_DIR" \
             --embeddings "$ALL_EMBEDDINGS" \
@@ -597,23 +615,19 @@ PYEOF
         log "  Done"
     fi
 
-    # ── 4. Precompute embeddings for new shards (resume-safe) ─────────────────
-    log "[4a/6] Precomputing Qwen3 text embeddings (incremental, skips existing)..."
-    python "$SCRIPT_DIR/precompute_qwen3.py" \
-        --shards "$SHARDS_DIR" \
-        --output "$QWEN3_DIR"
-
-    log "[4b/6] Precomputing VAE latents (incremental, skips existing)..."
-    python "$SCRIPT_DIR/precompute_vae.py" \
-        --shards "$SHARDS_DIR" \
-        --output "$VAE_DIR"
-
-    if $ENABLE_SIGLIP; then
-        log "[4c/6] Precomputing SigLIP features (incremental)..."
-        python "$SCRIPT_DIR/precompute_siglip.py" \
-            --shards "$SHARDS_DIR" \
-            --output "$DATA_ROOT/precomputed/siglip"
-    fi
+    # ── 4. Precompute embeddings for new shards (single pass, resume-safe) ──────
+    # precompute_all.py reads each shard once and writes Qwen3 + VAE [+ SigLIP].
+    # Per-sample .npz skip logic means only new shards do real work on resume.
+    SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
+    log "[4/6] Precomputing Qwen3 + VAE embeddings for chunk $CHUNK shards..."
+    CHUNK_PRECOMPUTE_ARGS=(
+        --shards       "$SHARDS_DIR"
+        --qwen3-output "$QWEN3_DIR"
+        --vae-output   "$VAE_DIR"
+    )
+    $ENABLE_SIGLIP && CHUNK_PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
+    retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${CHUNK_PRECOMPUTE_ARGS[@]}"
+    log "  Done: embeddings in $QWEN3_DIR and $VAE_DIR"
 
     # ── 5. Resume training ────────────────────────────────────────────────────
     if $SKIP_TRAIN; then
@@ -630,7 +644,7 @@ PYEOF
         log "       Checkpoint: $RESUME"
         log "       Anchor shards: $ANCHOR_DIR"
 
-        python "$TRAIN_DIR/train_ip_adapter.py" \
+        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" \
             --config    "$CONFIG" \
             --resume    "$RESUME" \
             --lr        "$TRAIN_LR" \
