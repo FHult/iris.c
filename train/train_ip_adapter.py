@@ -429,8 +429,12 @@ def train(config: dict) -> None:
         images = augment_mlx(images, bH, bW)               # [B, C, bH, bW]
 
         # Null conditioning flags — decided OUTSIDE compiled region (§3.7)
-        use_null_image = mx.array(random.random() < tcfg["image_dropout_prob"])
-        use_null_text = mx.array(random.random() < tcfg["text_dropout_prob"])
+        # Keep as Python bools for use in Python conditionals (no GPU sync).
+        # Wrap in mx.array only for passing into the compiled loss fn (mx.where).
+        null_image = random.random() < tcfg["image_dropout_prob"]
+        null_text  = random.random() < tcfg["text_dropout_prob"]
+        use_null_image = mx.array(null_image)
+        use_null_text  = mx.array(null_text)
 
         # Encode frozen models — use pre-computed cache if available (§2.7)
         if vae_np is not None:
@@ -440,10 +444,10 @@ def train(config: dict) -> None:
 
         if text_np is not None:
             text_embeds = mx.array(text_np, dtype=mx.bfloat16)
-            if bool(use_null_text.item()):
+            if null_text:
                 text_embeds = mx.zeros_like(text_embeds)
         else:
-            captions_in = [""] * len(captions) if bool(use_null_text.item()) else captions
+            captions_in = [""] * len(captions) if null_text else captions
             text_embeds = _encode_text(text_encoder, captions_in)
 
         if siglip_np is not None:

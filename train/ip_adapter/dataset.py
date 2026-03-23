@@ -42,10 +42,11 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 
 try:
-    from turbojpeg import TurboJPEG as _TurboJPEG
+    from turbojpeg import TurboJPEG as _TurboJPEG, TJPF_RGB as _TJPF_RGB
     _HAS_TURBOJPEG = True
 except ImportError:
     _HAS_TURBOJPEG = False
+    _TJPF_RGB = None
 
 from .utils import PERF_CORES as _PERF_CORES
 
@@ -93,7 +94,7 @@ def _decode_jpeg(raw: bytes, tj=None) -> Optional[np.ndarray]:
     """
     try:
         if tj is not None:
-            return tj.decode(raw)
+            return tj.decode(raw, pixel_format=_TJPF_RGB)
         from PIL import Image
         return np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
     except Exception:
