@@ -202,104 +202,103 @@ if [[ "$CHUNK" -eq 1 ]]; then
     # COYO-700M subset (optional, also WebDataset):
     #   img2dataset --url_list coyo_urls.parquet ... --output_folder "$DATA_ROOT/raw/coyo"
 
-    # ── 1a. Ensure all source data is present; auto-download anything missing ──
-    # Rule: if the WDS conversion already exists, raw data is not needed.
-    # LAION is produced by img2dataset and has no single HuggingFace source —
-    # it must be present already; all other sources are auto-downloaded.
-    log "[1/9] Checking source data (auto-downloading if WDS not found)..."
+    # ── 1a–3. Parallel: (download if needed) → convert → dedup ──────────────
+    # Each source runs as an independent background job:
+    #   WikiArt:   download huggan/wikiart if absent → convert_wikiart.py
+    #   JourneyDB: download JourneyDB/JourneyDB if absent → convert_journeydb.py
+    #   CLIP dedup: runs immediately on LAION (already on disk)
+    # Jobs that find their WDS already present exit immediately.
+    # LAION must exist already (WebDataset output of img2dataset, no HF source).
+
     WIKIART_WDS="$DATA_ROOT/raw/wikiart_wds"
     JDB_WDS="$DATA_ROOT/raw/journeydb_wds"
     DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+    WIKIART_LOG="$DATA_ROOT/logs/wikiart.log"
+    JDB_LOG="$DATA_ROOT/logs/journeydb.log"
+    DEDUP_LOG="$DATA_ROOT/logs/clip_dedup.log"
 
-    # LAION — must be pre-downloaded via img2dataset (no single HF source)
     LAION_TARS=$(count_tars "$DATA_ROOT/raw/laion")
     [[ "$LAION_TARS" -gt 0 ]] || \
         die "LAION shards not found in $DATA_ROOT/raw/laion/ — run img2dataset first"
-    log "  LAION:     $LAION_TARS shards"
-
-    # COYO — optional
     COYO_TARS=$(count_tars "$DATA_ROOT/raw/coyo" || echo 0)
-    [[ "$COYO_TARS" -gt 0 ]] && log "  COYO:      $COYO_TARS shards"
+    log "[1/9] LAION: $LAION_TARS shards  COYO: $COYO_TARS shards"
+    log "      Launching WikiArt, JourneyDB, and CLIP dedup in parallel..."
 
-    # WikiArt — download from HuggingFace if neither raw nor WDS present
+    # ── WikiArt background job ────────────────────────────────────────────────
+    WIKIART_PID=""
     if [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
-        log "  WikiArt:   WDS $(count_tars "$WIKIART_WDS") shards (skip download)"
-    elif [[ -d "$DATA_ROOT/raw/wikiart/data" || -d "$DATA_ROOT/raw/wikiart" ]]; then
-        log "  WikiArt:   raw parquet found (will convert)"
+        log "  WikiArt:   WDS already present ($(count_tars "$WIKIART_WDS") shards) — skipping"
     else
-        log "  WikiArt:   not found — downloading huggan/wikiart from HuggingFace (~27 GB)..."
-        python3 -c "
+        log "  WikiArt:   launching → $WIKIART_LOG"
+        (
+            set -euo pipefail
+            if [[ ! -d "$DATA_ROOT/raw/wikiart/data" && ! -d "$DATA_ROOT/raw/wikiart" ]]; then
+                echo "[$(date '+%T')] Downloading huggan/wikiart (~27 GB)..."
+                python3 - <<PYEOF
 from huggingface_hub import snapshot_download
 snapshot_download('huggan/wikiart', repo_type='dataset',
-    local_dir='$DATA_ROOT/raw/wikiart')
-print('WikiArt download complete.')
-" || die "WikiArt download failed"
-        log "  WikiArt:   download complete"
+    local_dir='${DATA_ROOT}/raw/wikiart')
+print('Download complete.')
+PYEOF
+            fi
+            echo "[$(date '+%T')] Converting WikiArt to WebDataset..."
+            python "$SCRIPT_DIR/convert_wikiart.py" \
+                --input  "$DATA_ROOT/raw/wikiart/data" \
+                --output "$WIKIART_WDS" \
+                --shard-size 1000
+            echo "[$(date '+%T')] Done: $(count_tars "$WIKIART_WDS") shards."
+            [[ -d "$DATA_ROOT/raw/wikiart" ]] && \
+                { echo "Removing raw WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
+        ) > "$WIKIART_LOG" 2>&1 &
+        WIKIART_PID=$!
     fi
 
-    # JourneyDB chunk 1 — download from HuggingFace if neither tgz nor WDS present
-    shopt -s nullglob
-    JDB_TGZ_ARRAY=("$DATA_ROOT/raw/journeydb/data/train/imgs"/0[0-4][0-9].tgz)
-    shopt -u nullglob
-    JDB_TGZS=${#JDB_TGZ_ARRAY[@]}
+    # ── JourneyDB background job ──────────────────────────────────────────────
+    JDB_PID=""
     if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
-        log "  JourneyDB: WDS $(count_tars "$JDB_WDS") shards (skip download)"
-    elif [[ "$JDB_TGZS" -eq 50 ]]; then
-        log "  JourneyDB: $JDB_TGZS tgz files found (will convert)"
+        log "  JourneyDB: WDS already present ($(count_tars "$JDB_WDS") shards) — skipping"
     else
-        log "  JourneyDB: $JDB_TGZS/50 tgz files, no WDS — downloading chunk 1 from HuggingFace (~800 GB)..."
-        python3 -c "
+        log "  JourneyDB: launching → $JDB_LOG"
+        (
+            set -euo pipefail
+            shopt -s nullglob
+            _tgz=("$DATA_ROOT/raw/journeydb/data/train/imgs"/0[0-4][0-9].tgz)
+            shopt -u nullglob
+            if [[ ${#_tgz[@]} -lt 50 ]]; then
+                echo "[$(date '+%T')] ${#_tgz[@]}/50 tgz files — downloading JourneyDB chunk 1 (~800 GB)..."
+                python3 - <<PYEOF
 from huggingface_hub import snapshot_download
 snapshot_download(
     'JourneyDB/JourneyDB',
     repo_type='dataset',
-    local_dir='$DATA_ROOT/raw/journeydb',
+    local_dir='${DATA_ROOT}/raw/journeydb',
     allow_patterns=[
         'data/train/imgs/0[0-4][0-9].tgz',
         'data/train/train_anno_realease_repath.jsonl.tgz',
     ],
 )
-print('JourneyDB chunk 1 download complete.')
-" || die "JourneyDB chunk 1 download failed"
-        log "  JourneyDB: download complete"
-    fi
-
-    # ── 1b–1d. Parallel: convert WikiArt + JourneyDB chunk 1 + CLIP dedup ──────
-    # All three are fully independent — launch simultaneously, wait before build.
-    WIKIART_LOG="$DATA_ROOT/logs/convert_wikiart.log"
-    JDB_LOG="$DATA_ROOT/logs/convert_journeydb.log"
-    DEDUP_LOG="$DATA_ROOT/logs/clip_dedup.log"
-    WIKIART_PID=""
-    JDB_PID=""
-    DEDUP_PID=""
-
-    if [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
-        log "[2a/9] WikiArt already converted ($(count_tars "$WIKIART_WDS") shards) — skipping"
-    else
-        log "[2a/9] Converting WikiArt in background → $WIKIART_LOG"
-        python "$SCRIPT_DIR/convert_wikiart.py" \
-            --input  "$DATA_ROOT/raw/wikiart/data" \
-            --output "$WIKIART_WDS" \
-            --shard-size 1000 > "$WIKIART_LOG" 2>&1 &
-        WIKIART_PID=$!
-    fi
-
-    if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
-        log "[2b/9] JourneyDB chunk 1 already converted ($(count_tars "$JDB_WDS") shards) — skipping"
-    else
-        log "[2b/9] Converting JourneyDB chunk 1 in background → $JDB_LOG"
-        python "$SCRIPT_DIR/convert_journeydb.py" \
-            --input      "$DATA_ROOT/raw/journeydb" \
-            --output     "$JDB_WDS" \
-            --shard-size 5000 \
-            --start-tgz  0 --end-tgz 49 > "$JDB_LOG" 2>&1 &
+print('Download complete.')
+PYEOF
+            fi
+            echo "[$(date '+%T')] Converting JourneyDB chunk 1 to WebDataset..."
+            python "$SCRIPT_DIR/convert_journeydb.py" \
+                --input      "$DATA_ROOT/raw/journeydb" \
+                --output     "$JDB_WDS" \
+                --shard-size 5000 \
+                --start-tgz  0 --end-tgz 49
+            echo "[$(date '+%T')] Done: $(count_tars "$JDB_WDS") shards."
+            [[ -d "$DATA_ROOT/raw/journeydb" ]] && \
+                { echo "Removing original JourneyDB tgz (~730 GB)..."; rm -rf "$DATA_ROOT/raw/journeydb"; }
+        ) > "$JDB_LOG" 2>&1 &
         JDB_PID=$!
     fi
 
+    # ── CLIP dedup background job (LAION already on disk — starts immediately) ─
+    DEDUP_PID=""
     if [[ -f "$DEDUP_IDS" ]] || $SKIP_DEDUP; then
-        log "[3/9] CLIP deduplication already done (or --skip-dedup) — skipping"
+        log "  CLIP dedup: already done (or --skip-dedup) — skipping"
     else
-        log "[3/9] Running CLIP deduplication on LAION in background → $DEDUP_LOG"
+        log "  CLIP dedup: launching → $DEDUP_LOG"
         python "$SCRIPT_DIR/clip_dedup.py" all \
             --shards     "$DATA_ROOT/raw/laion" \
             --embeddings "$DATA_ROOT/embeddings" \
@@ -307,33 +306,32 @@ print('JourneyDB chunk 1 download complete.')
         DEDUP_PID=$!
     fi
 
-    # Wait for all three parallel steps
+    # ── Wait for all three ────────────────────────────────────────────────────
     PARALLEL_FAIL=0
     if [[ -n "$WIKIART_PID" ]]; then
         if wait "$WIKIART_PID"; then
-            log "  [2a] WikiArt done: $(count_tars "$WIKIART_WDS") shards"
-            [[ -d "$DATA_ROOT/raw/wikiart" ]] && { log "  Removing original WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
+            log "[2a/9] WikiArt done: $(count_tars "$WIKIART_WDS") shards"
         else
-            log "ERROR: convert_wikiart.py failed — see $WIKIART_LOG" >&2; PARALLEL_FAIL=1
+            log "ERROR: WikiArt job failed — see $WIKIART_LOG" >&2; PARALLEL_FAIL=1
         fi
     fi
     if [[ -n "$JDB_PID" ]]; then
         if wait "$JDB_PID"; then
-            log "  [2b] JourneyDB done: $(count_tars "$JDB_WDS") shards"
-            [[ -d "$DATA_ROOT/raw/journeydb" ]] && { log "  Removing original JourneyDB tgz (~730 GB)..."; rm -rf "$DATA_ROOT/raw/journeydb"; }
+            log "[2b/9] JourneyDB done: $(count_tars "$JDB_WDS") shards"
         else
-            log "ERROR: convert_journeydb.py failed — see $JDB_LOG" >&2; PARALLEL_FAIL=1
+            log "ERROR: JourneyDB job failed — see $JDB_LOG" >&2; PARALLEL_FAIL=1
         fi
     fi
     if [[ -n "$DEDUP_PID" ]]; then
         if wait "$DEDUP_PID"; then
-            log "  [3] CLIP dedup done: $DEDUP_IDS"
-            [[ -d "$DATA_ROOT/embeddings" ]] && { log "  Removing CLIP embeddings (~3 GB)..."; rm -rf "$DATA_ROOT/embeddings"; }
+            log "[3/9] CLIP dedup done: $DEDUP_IDS"
+            [[ -d "$DATA_ROOT/embeddings" ]] && \
+                { log "  Removing CLIP embeddings (~3 GB)..."; rm -rf "$DATA_ROOT/embeddings"; }
         else
-            log "ERROR: clip_dedup.py failed — see $DEDUP_LOG" >&2; PARALLEL_FAIL=1
+            log "ERROR: CLIP dedup failed — see $DEDUP_LOG" >&2; PARALLEL_FAIL=1
         fi
     fi
-    [[ "$PARALLEL_FAIL" -eq 0 ]] || die "One or more parallel conversion/dedup steps failed"
+    [[ "$PARALLEL_FAIL" -eq 0 ]] || die "One or more parallel steps failed"
 
     # ── 1e. Build unified shards (+ concurrent filter) ────────────────────────
     SHARDS_DIR="$DATA_ROOT/shards"
