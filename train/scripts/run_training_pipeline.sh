@@ -232,7 +232,8 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  WikiArt:   launching → $WIKIART_LOG"
         (
             set -euo pipefail
-            if [[ ! -d "$DATA_ROOT/raw/wikiart/data" && ! -d "$DATA_ROOT/raw/wikiart" ]]; then
+            _wa_sentinel="${DATA_ROOT}/raw/wikiart/.download_complete"
+            if [[ ! -f "$_wa_sentinel" ]]; then
                 echo "[$(date '+%T')] Downloading huggan/wikiart (~27 GB)..."
                 python3 - <<PYEOF
 from huggingface_hub import snapshot_download
@@ -240,6 +241,7 @@ snapshot_download('huggan/wikiart', repo_type='dataset',
     local_dir='${DATA_ROOT}/raw/wikiart')
 print('Download complete.')
 PYEOF
+                touch "$_wa_sentinel"
             fi
             echo "[$(date '+%T')] Converting WikiArt to WebDataset..."
             python "$SCRIPT_DIR/convert_wikiart.py" \
@@ -264,7 +266,8 @@ PYEOF
             shopt -s nullglob
             _tgz=("$DATA_ROOT/raw/journeydb/data/train/imgs"/0[0-4][0-9].tgz)
             shopt -u nullglob
-            if [[ ${#_tgz[@]} -lt 50 ]]; then
+            _jdb_sentinel="${DATA_ROOT}/raw/journeydb/.download_complete_chunk1"
+            if [[ ${#_tgz[@]} -lt 50 && ! -f "$_jdb_sentinel" ]]; then
                 echo "[$(date '+%T')] ${#_tgz[@]}/50 tgz files — downloading JourneyDB chunk 1 (~800 GB)..."
                 python3 - <<PYEOF
 from huggingface_hub import snapshot_download
@@ -279,6 +282,7 @@ snapshot_download(
 )
 print('Download complete.')
 PYEOF
+                touch "$_jdb_sentinel"
             fi
             echo "[$(date '+%T')] Converting JourneyDB chunk 1 to WebDataset..."
             python "$SCRIPT_DIR/convert_journeydb.py" \

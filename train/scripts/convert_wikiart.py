@@ -3,8 +3,10 @@
 train/scripts/convert_wikiart.py — Convert WikiArt HuggingFace parquet to
 WebDataset tar shards, ready for build_shards.py.
 
-Images are already embedded as bytes in the parquet — no downloading needed.
-Captions are generated as: "{style} painting: {description}"
+Supports the huggan/wikiart schema where style/artist/genre are integer
+ClassLabel IDs. Label names are loaded from the dataset's feature metadata
+and used to generate captions: "{style} painting" or
+"A {genre} painted in the {style} style".
 
 Usage:
     source train/.venv/bin/activate
@@ -16,7 +18,6 @@ Usage:
 
 import argparse
 import io
-import json
 import os
 import tarfile
 
@@ -24,25 +25,75 @@ import pandas as pd
 from PIL import Image
 
 
-def make_caption(row) -> str:
-    style = (getattr(row, "style", None) or "").strip()
-    desc  = (getattr(row, "description", None) or getattr(row, "title", None) or "").strip()
-    if style and desc:
-        return f"{style} painting: {desc}"
+def _load_label_maps(input_dir: str) -> tuple[list, list, list]:
+    """
+    Load style/artist/genre label name lists from HuggingFace dataset metadata.
+    Falls back to integer strings if metadata is unavailable.
+    Returns (style_names, artist_names, genre_names).
+    """
+    # Walk up one level from the data/ subdir to find dataset_infos.json or
+    # .huggingface/dataset_info.json written by snapshot_download.
+    for candidate in [
+        os.path.join(input_dir, "..", "dataset_infos.json"),
+        os.path.join(input_dir, "..", ".huggingface", "dataset_info.json"),
+    ]:
+        path = os.path.normpath(candidate)
+        if os.path.exists(path):
+            import json
+            with open(path) as f:
+                info = json.load(f)
+            # dataset_infos.json: {"default": {"features": {...}}}
+            # dataset_info.json:  {"features": {...}}
+            features = info.get("default", info).get("features", {})
+            def _names(key):
+                feat = features.get(key, {})
+                return feat.get("names", [])
+            return _names("style"), _names("artist"), _names("genre")
+
+    # Fallback: use HuggingFace datasets library if available
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("huggan/wikiart", split="train", streaming=True)
+        feat = ds.features
+        style_names  = feat["style"].names  if hasattr(feat.get("style",  None), "names") else []
+        artist_names = feat["artist"].names if hasattr(feat.get("artist", None), "names") else []
+        genre_names  = feat["genre"].names  if hasattr(feat.get("genre",  None), "names") else []
+        return style_names, artist_names, genre_names
+    except Exception:
+        pass
+
+    return [], [], []
+
+
+def _label(names: list, idx) -> str:
+    """Return human-readable label, replacing underscores with spaces."""
+    if idx is None:
+        return ""
+    try:
+        return names[int(idx)].replace("_", " ")
+    except (IndexError, TypeError, ValueError):
+        return str(idx)
+
+
+def make_caption(style: str, genre: str) -> str:
+    style = (style or "").strip()
+    genre = (genre or "").strip()
+    if style and genre and genre.lower() not in ("unknown genre", ""):
+        return f"A {genre} painted in the {style} style"
     elif style:
-        return f"An artwork painted in the {style} style"
-    return desc
+        return f"A painting in the {style} style"
+    elif genre:
+        return f"A {genre} painting"
+    return ""
 
 
 def write_shard(records: list, path: str):
     tmp_path = path + ".tmp"
     with tarfile.open(tmp_path, "w") as tf:
-        for i, (key, jpg_bytes, caption) in enumerate(records):
-            # jpg
+        for key, jpg_bytes, caption in records:
             jpg_info = tarfile.TarInfo(name=f"{key}.jpg")
             jpg_info.size = len(jpg_bytes)
             tf.addfile(jpg_info, io.BytesIO(jpg_bytes))
-            # txt
             txt_bytes = caption.encode("utf-8")
             txt_info = tarfile.TarInfo(name=f"{key}.txt")
             txt_info.size = len(txt_bytes)
@@ -61,6 +112,12 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
+    style_names, artist_names, genre_names = _load_label_maps(args.input)
+    if style_names:
+        print(f"Loaded {len(style_names)} style labels, {len(genre_names)} genre labels.")
+    else:
+        print("Warning: could not load label maps — captions will use integer IDs.")
+
     parquet_files = sorted(
         os.path.join(args.input, f)
         for f in os.listdir(args.input)
@@ -69,6 +126,12 @@ def main():
     if not parquet_files:
         print(f"No parquet files found in {args.input}")
         return
+    print(f"Found {len(parquet_files)} parquet files.")
+
+    # Read only the columns that exist in the huggan/wikiart schema.
+    # Legacy datasets with description/title will also work because
+    # we fall back gracefully when those columns are absent.
+    available_cols = None  # detect from first file
 
     shard_idx = 0
     buf = []
@@ -77,13 +140,23 @@ def main():
 
     for pq_path in parquet_files:
         print(f"Reading {os.path.basename(pq_path)} ...", flush=True)
-        df = pd.read_parquet(pq_path, columns=["image", "style", "description", "title"])
+
+        if available_cols is None:
+            import pyarrow.parquet as pq_mod
+            schema = pq_mod.read_schema(pq_path)
+            all_cols = schema.names
+            want = ["image", "style", "genre", "description", "title", "artist"]
+            available_cols = [c for c in want if c in all_cols]
+
+        df = pd.read_parquet(pq_path, columns=available_cols)
 
         for row in df.itertuples(index=False):
             img_data = row.image
             raw_bytes = img_data["bytes"] if isinstance(img_data, dict) else img_data
+            if not raw_bytes:
+                total_skipped += 1
+                continue
 
-            # Lazy open for size check (header only, no decode); convert only after passing
             try:
                 img = Image.open(io.BytesIO(raw_bytes))
                 if img.width < args.min_size or img.height < args.min_size:
@@ -97,7 +170,26 @@ def main():
                 total_skipped += 1
                 continue
 
-            caption = make_caption(row)
+            # Build caption: prefer text fields (legacy schema); fall back to labels
+            raw_style = getattr(row, "style", None)
+            raw_genre = getattr(row, "genre", None)
+            desc  = (getattr(row, "description", None) or "").strip() if hasattr(row, "description") else ""
+            title = (getattr(row, "title",       None) or "").strip() if hasattr(row, "title")       else ""
+
+            if style_names and isinstance(raw_style, (int, float)):
+                style_str = _label(style_names, raw_style)
+                genre_str = _label(genre_names, raw_genre)
+            else:
+                style_str = str(raw_style or "").strip()
+                genre_str = str(raw_genre or "").strip()
+
+            if desc or title:
+                # Legacy schema with free-text description
+                text = desc or title
+                caption = f"{style_str} painting: {text}" if style_str else text
+            else:
+                caption = make_caption(style_str, genre_str)
+
             if not caption:
                 total_skipped += 1
                 continue
@@ -109,7 +201,7 @@ def main():
             if len(buf) >= args.shard_size:
                 shard_path = os.path.join(args.output, f"{shard_idx:06d}.tar")
                 if os.path.exists(shard_path):
-                    print(f"  Shard {shard_idx:06d}.tar already exists — skipping ({len(buf)} records consumed)", flush=True)
+                    print(f"  Shard {shard_idx:06d}.tar already exists — skipping", flush=True)
                 else:
                     write_shard(buf, shard_path)
                     print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
@@ -117,11 +209,10 @@ def main():
                 shard_idx += 1
                 buf = []
 
-    # flush remainder
     if buf:
         shard_path = os.path.join(args.output, f"{shard_idx:06d}.tar")
         if os.path.exists(shard_path):
-            print(f"  Shard {shard_idx:06d}.tar already exists — skipping ({len(buf)} records consumed)", flush=True)
+            print(f"  Shard {shard_idx:06d}.tar already exists — skipping", flush=True)
         else:
             write_shard(buf, shard_path)
             print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
