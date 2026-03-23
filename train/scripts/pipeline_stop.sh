@@ -13,33 +13,55 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DIR="$(dirname "$SCRIPT_DIR")"
 
+if [[ -d "/Volumes/2TBSSD" ]]; then
+    DATA_ROOT="/Volumes/2TBSSD"
+else
+    DATA_ROOT="$TRAIN_DIR/data"
+fi
+
 echo "================================================================="
 echo "  Stopping training pipeline"
 echo "================================================================="
 echo ""
 
-# ── SIGTERM pipeline Python processes (graceful) ──────────────────────────────
-PIPELINE_PATTERNS="train_ip_adapter|build_shards|filter_shards|precompute_qwen3|precompute_vae|precompute_siglip|clip_dedup|recaption"
-PIDS=$(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true)
+# ── Collect PIDs to stop ──────────────────────────────────────────────────────
+# 1. Main pipeline bash process recorded in the lock file.
+LOCK_FILE="$DATA_ROOT/logs/pipeline.lock"
+LOCK_PID=""
+if [[ -f "$LOCK_FILE" ]]; then
+    LOCK_PID=$(grep '^pid=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2 || true)
+    kill -0 "$LOCK_PID" 2>/dev/null || LOCK_PID=""  # discard if not alive
+fi
 
-if [[ -n "$PIDS" ]]; then
+# 2. Python worker processes by name pattern.
+PIPELINE_PATTERNS="train_ip_adapter|build_shards|filter_shards|precompute_qwen3|precompute_vae|precompute_siglip|clip_dedup|recaption"
+WORKER_PIDS=$(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true)
+
+# Combine, deduplicate.
+ALL_PIDS=$(printf '%s\n' $LOCK_PID $WORKER_PIDS | sort -u | grep -v '^$' || true)
+
+if [[ -n "$ALL_PIDS" ]]; then
     echo "Sending SIGTERM to pipeline processes..."
     while IFS= read -r pid; do
         NAME=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "?")
         echo "  SIGTERM PID $pid ($NAME)"
         kill -TERM "$pid" 2>/dev/null || true
-    done <<< "$PIDS"
+    done <<< "$ALL_PIDS"
 
     # Wait up to 30s for graceful shutdown
     echo "Waiting up to 30s for processes to exit..."
     for i in $(seq 1 30); do
-        REMAINING=$(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true)
+        REMAINING=$(printf '%s\n' $LOCK_PID $(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true) \
+                    | sort -u | grep -v '^$' \
+                    | while IFS= read -r pid; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done || true)
         [[ -z "$REMAINING" ]] && break
         sleep 1
     done
 
     # Force-kill anything still running
-    REMAINING=$(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true)
+    REMAINING=$(printf '%s\n' $LOCK_PID $(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true) \
+                | sort -u | grep -v '^$' \
+                | while IFS= read -r pid; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done || true)
     if [[ -n "$REMAINING" ]]; then
         echo "Force-killing remaining processes..."
         while IFS= read -r pid; do
