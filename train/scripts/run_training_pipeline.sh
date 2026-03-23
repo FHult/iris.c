@@ -330,9 +330,24 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  Done"
     fi
 
-    # ── 1g. Launch anchor set in background (from filtered unified shards) ──────
-    # Samples from SHARDS_DIR so anchors are already filtered + possibly recaptioned.
-    # Launched before precompute; finishes well within the 14h precompute window.
+    # ── 1gr. Recaption (optional, must run BEFORE precompute AND anchor set) ──────
+    # Enforces correct ordering: recaption updates shard captions; both precompute
+    # and anchor set must see the final captions or they will silently diverge.
+    RECAPTION_DONE="$SHARDS_DIR/.recaption_done"
+    if $ENABLE_RECAPTION; then
+        if [[ -f "$RECAPTION_DONE" ]]; then
+            log "[8r/9] Recaption already done — skipping"
+        else
+            log "[8r/9] Re-captioning short captions (this takes ~2 days, resumable)..."
+            python "$SCRIPT_DIR/recaption.py" --shards "$SHARDS_DIR"
+            touch "$RECAPTION_DONE"
+            log "  Done: recaptioning complete"
+        fi
+    fi
+
+    # ── 1g. Launch anchor set in background (from filtered+recaptioned shards) ─
+    # Launched after recaption so anchors have final captions. Finishes well within
+    # the 14h precompute window.
     ANCHOR_DIR="$DATA_ROOT/anchor_shards"
     ANCHOR_PID=""
     if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
@@ -344,21 +359,6 @@ if [[ "$CHUNK" -eq 1 ]]; then
             --output  "$ANCHOR_DIR" \
             --n       10000 &
         ANCHOR_PID=$!
-    fi
-
-    # ── 1gr. Recaption (optional, must run BEFORE precompute) ─────────────────
-    # Enforces correct ordering: recaption updates shard captions; precompute must
-    # encode the final captions or embeddings and captions will silently diverge.
-    RECAPTION_DONE="$SHARDS_DIR/.recaption_done"
-    if $ENABLE_RECAPTION; then
-        if [[ -f "$RECAPTION_DONE" ]]; then
-            log "[8r/9] Recaption already done — skipping"
-        else
-            log "[8r/9] Re-captioning short captions (this takes ~2 days, resumable)..."
-            python "$SCRIPT_DIR/recaption.py" --shards "$SHARDS_DIR"
-            touch "$RECAPTION_DONE"
-            log "  Done: recaptioning complete"
-        fi
     fi
 
     # Wait for anchor set (should be done well before precompute finishes, but check)
