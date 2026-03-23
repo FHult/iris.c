@@ -202,33 +202,70 @@ if [[ "$CHUNK" -eq 1 ]]; then
     # COYO-700M subset (optional, also WebDataset):
     #   img2dataset --url_list coyo_urls.parquet ... --output_folder "$DATA_ROOT/raw/coyo"
 
-    # ── 1a. Verify downloads ──────────────────────────────────────────────────
-    log "[1/9] Verifying downloads..."
+    # ── 1a. Ensure all source data is present; auto-download anything missing ──
+    # Rule: if the WDS conversion already exists, raw data is not needed.
+    # LAION is produced by img2dataset and has no single HuggingFace source —
+    # it must be present already; all other sources are auto-downloaded.
+    log "[1/9] Checking source data (auto-downloading if WDS not found)..."
+    WIKIART_WDS="$DATA_ROOT/raw/wikiart_wds"
+    JDB_WDS="$DATA_ROOT/raw/journeydb_wds"
+    DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+
+    # LAION — must be pre-downloaded via img2dataset (no single HF source)
     LAION_TARS=$(count_tars "$DATA_ROOT/raw/laion")
+    [[ "$LAION_TARS" -gt 0 ]] || \
+        die "LAION shards not found in $DATA_ROOT/raw/laion/ — run img2dataset first"
+    log "  LAION:     $LAION_TARS shards"
+
+    # COYO — optional
     COYO_TARS=$(count_tars "$DATA_ROOT/raw/coyo" || echo 0)
+    [[ "$COYO_TARS" -gt 0 ]] && log "  COYO:      $COYO_TARS shards"
+
+    # WikiArt — download from HuggingFace if neither raw nor WDS present
+    if [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
+        log "  WikiArt:   WDS $(count_tars "$WIKIART_WDS") shards (skip download)"
+    elif [[ -d "$DATA_ROOT/raw/wikiart/data" || -d "$DATA_ROOT/raw/wikiart" ]]; then
+        log "  WikiArt:   raw parquet found (will convert)"
+    else
+        log "  WikiArt:   not found — downloading huggan/wikiart from HuggingFace (~27 GB)..."
+        python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('huggan/wikiart', repo_type='dataset',
+    local_dir='$DATA_ROOT/raw/wikiart')
+print('WikiArt download complete.')
+" || die "WikiArt download failed"
+        log "  WikiArt:   download complete"
+    fi
+
+    # JourneyDB chunk 1 — download from HuggingFace if neither tgz nor WDS present
     shopt -s nullglob
     JDB_TGZ_ARRAY=("$DATA_ROOT/raw/journeydb/data/train/imgs"/0[0-4][0-9].tgz)
     shopt -u nullglob
     JDB_TGZS=${#JDB_TGZ_ARRAY[@]}
-
-    log "  LAION shards:         $LAION_TARS (expect ~150)"
-    log "  COYO shards:          $COYO_TARS"
-    log "  JourneyDB tgz 0-49:   $JDB_TGZS (expect 50)"
-
-    [[ "$LAION_TARS" -gt 0 ]] || die "LAION shards not found in $DATA_ROOT/raw/laion/ — run img2dataset first"
-    [[ "$JDB_TGZS" -eq 50 || $(count_tars "$DATA_ROOT/raw/journeydb_wds") -gt 0 ]]  || {
-        log "  WARNING: JourneyDB chunk 1 has $JDB_TGZS/50 files and no WDS conversion found. Still downloading?"
-        log "  Continuing with what is available..."
-    }
-    [[ -d "$DATA_ROOT/raw/wikiart/data" || -d "$DATA_ROOT/raw/wikiart" || \
-       $(count_tars "$DATA_ROOT/raw/wikiart_wds") -gt 0 ]] || \
-        die "WikiArt not found — expected raw/wikiart/ or raw/wikiart_wds/"
+    if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
+        log "  JourneyDB: WDS $(count_tars "$JDB_WDS") shards (skip download)"
+    elif [[ "$JDB_TGZS" -eq 50 ]]; then
+        log "  JourneyDB: $JDB_TGZS tgz files found (will convert)"
+    else
+        log "  JourneyDB: $JDB_TGZS/50 tgz files, no WDS — downloading chunk 1 from HuggingFace (~800 GB)..."
+        python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'JourneyDB/JourneyDB',
+    repo_type='dataset',
+    local_dir='$DATA_ROOT/raw/journeydb',
+    allow_patterns=[
+        'data/train/imgs/0[0-4][0-9].tgz',
+        'data/train/train_anno_realease_repath.jsonl.tgz',
+    ],
+)
+print('JourneyDB chunk 1 download complete.')
+" || die "JourneyDB chunk 1 download failed"
+        log "  JourneyDB: download complete"
+    fi
 
     # ── 1b–1d. Parallel: convert WikiArt + JourneyDB chunk 1 + CLIP dedup ──────
     # All three are fully independent — launch simultaneously, wait before build.
-    WIKIART_WDS="$DATA_ROOT/raw/wikiart_wds"
-    JDB_WDS="$DATA_ROOT/raw/journeydb_wds"
-    DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
     WIKIART_LOG="$DATA_ROOT/logs/convert_wikiart.log"
     JDB_LOG="$DATA_ROOT/logs/convert_journeydb.log"
     DEDUP_LOG="$DATA_ROOT/logs/clip_dedup.log"
