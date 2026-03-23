@@ -132,14 +132,18 @@ def convert(input_dir: str, output_dir: str, shard_size: int, min_size: int,
     def flush_shard():
         nonlocal shard_idx, total_written
         path = os.path.join(output_dir, f"{shard_idx:06d}.tar")
-        with tarfile.open(path, "w") as tf:
-            for key, jpg_bytes, txt in buf:
-                for ext, data in [(".jpg", jpg_bytes), (".txt", txt.encode())]:
-                    info = tarfile.TarInfo(name=key + ext)
-                    info.size = len(data)
-                    tf.addfile(info, io.BytesIO(data))
-        print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
-        total_written += len(buf)
+        if os.path.exists(path):
+            # Shard already written by a previous run — consume records but skip write
+            print(f"  Shard {shard_idx:06d}.tar already exists — skipping ({len(buf)} records consumed)", flush=True)
+        else:
+            with tarfile.open(path, "w") as tf:
+                for key, jpg_bytes, txt in buf:
+                    for ext, data in [(".jpg", jpg_bytes), (".txt", txt.encode())]:
+                        info = tarfile.TarInfo(name=key + ext)
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
+            print(f"  Wrote shard {shard_idx:06d}.tar ({len(buf)} records)", flush=True)
+            total_written += len(buf)
         shard_idx += 1
         buf.clear()
 

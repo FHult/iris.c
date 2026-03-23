@@ -66,6 +66,10 @@ COMPUTE_WORKERS = max(1, _PERF_CORES - 2)
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _is_jpeg(data: bytes) -> bool:
+    return len(data) >= 3 and data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF
+
+
 def _tar_add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     """Add raw bytes as a named member to an open tar file."""
     info = tarfile.TarInfo(name=name)
@@ -257,22 +261,34 @@ def _write_shard_range(args) -> dict:
                     continue
                 try:
                     if _HAS_TURBOJPEG:
-                        img = tj.decode(raw)
-                        h, w = img.shape[:2]
-                        if w < 256 or h < 256:
-                            skipped += 1
-                            continue
-                        jpg_out = tj.encode(img, quality=quality)
+                        if _is_jpeg(raw):
+                            # Header-only size check — no decode, no re-encode
+                            w, h, _, _ = tj.decode_header(raw)
+                            if w < 256 or h < 256:
+                                skipped += 1
+                                continue
+                            jpg_out = raw  # pass through original JPEG bytes
+                        else:
+                            # PNG or other: full decode + JPEG re-encode
+                            img = tj.decode(raw)
+                            h, w = img.shape[:2]
+                            if w < 256 or h < 256:
+                                skipped += 1
+                                continue
+                            jpg_out = tj.encode(img, quality=quality)
                     else:
                         from PIL import Image as PilImage
-                        img = PilImage.open(io.BytesIO(raw)).convert("RGB")
-                        w, h = img.size
+                        pil_img = PilImage.open(io.BytesIO(raw))
+                        w, h = pil_img.size
                         if w < 256 or h < 256:
                             skipped += 1
                             continue
-                        buf = io.BytesIO()
-                        img.save(buf, format="JPEG", quality=quality)
-                        jpg_out = buf.getvalue()
+                        if _is_jpeg(raw):
+                            jpg_out = raw  # pass through JPEG as-is
+                        else:
+                            _buf = io.BytesIO()
+                            pil_img.convert("RGB").save(_buf, format="JPEG", quality=quality)
+                            jpg_out = _buf.getvalue()
 
                     if shard_id not in out_tars:
                         tmp_path = os.path.join(output_dir, f"{shard_id:06d}.tar.tmp")

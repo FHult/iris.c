@@ -138,6 +138,7 @@ def process_shard(shard_path: str, model, tokenizer, min_words: int = 10,
     if recaptioned > 0:
         rewrite_shard(shard_path, records)
 
+    open(shard_path + ".recaptioned", "w").close()
     return {"shard": shard_path, "kept": kept, "recaptioned": recaptioned}
 
 
@@ -183,7 +184,16 @@ def main():
         sys.exit(1)
 
     end = args.shard_end if args.shard_end is not None else len(all_shards) - 1
-    shards = all_shards[args.shard_start : end + 1]
+    shards_in_range = all_shards[args.shard_start : end + 1]
+
+    # Skip shards already processed in a previous run (per-shard sentinel)
+    shards = [s for s in shards_in_range if not os.path.exists(s + ".recaptioned")]
+    already_done = len(shards_in_range) - len(shards)
+    if already_done:
+        print(f"Skipping {already_done} already-recaptioned shards (resume)")
+    if not shards:
+        print("All shards already recaptioned.")
+        return
 
     print(f"Loading VLM: {args.model}")
     try:

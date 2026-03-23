@@ -35,6 +35,7 @@
 #   --steps N          Override num_steps for this chunk's training run
 #   --lr LR            Override learning rate for this chunk
 #   --siglip           Also precompute SigLIP features (~420 GB extra)
+#   --recaption        Re-caption short captions before precompute (enforces correct ordering)
 #   --skip-train       Run data prep only, stop before training
 #   --skip-dedup       Skip CLIP deduplication (safe if LAION not changed)
 #
@@ -64,6 +65,7 @@ CONFIG="$TRAIN_DIR/configs/stage1_512px.yaml"
 OVERRIDE_STEPS=""
 OVERRIDE_LR=""
 ENABLE_SIGLIP=false
+ENABLE_RECAPTION=false
 SKIP_TRAIN=false
 SKIP_DEDUP=false
 VENV="$TRAIN_DIR/.venv/bin/activate"
@@ -81,9 +83,10 @@ while [[ $# -gt 0 ]]; do
         --config)      CONFIG="$2";      shift 2 ;;
         --steps)       OVERRIDE_STEPS="$2"; shift 2 ;;
         --lr)          OVERRIDE_LR="$2"; shift 2 ;;
-        --siglip)      ENABLE_SIGLIP=true; shift ;;
-        --skip-train)  SKIP_TRAIN=true;  shift ;;
-        --skip-dedup)  SKIP_DEDUP=true;  shift ;;
+        --siglip)      ENABLE_SIGLIP=true;     shift ;;
+        --recaption)   ENABLE_RECAPTION=true;  shift ;;
+        --skip-train)  SKIP_TRAIN=true;        shift ;;
+        --skip-dedup)  SKIP_DEDUP=true;        shift ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -206,57 +209,79 @@ if [[ "$CHUNK" -eq 1 ]]; then
        $(count_tars "$DATA_ROOT/raw/wikiart_wds") -gt 0 ]] || \
         die "WikiArt not found — expected raw/wikiart/ or raw/wikiart_wds/"
 
-    # ── 1b. Convert WikiArt ───────────────────────────────────────────────────
+    # ── 1b–1d. Parallel: convert WikiArt + JourneyDB chunk 1 + CLIP dedup ──────
+    # All three are fully independent — launch simultaneously, wait before build.
     WIKIART_WDS="$DATA_ROOT/raw/wikiart_wds"
+    JDB_WDS="$DATA_ROOT/raw/journeydb_wds"
+    DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
+    WIKIART_LOG="$DATA_ROOT/logs/convert_wikiart.log"
+    JDB_LOG="$DATA_ROOT/logs/convert_journeydb.log"
+    DEDUP_LOG="$DATA_ROOT/logs/clip_dedup.log"
+    WIKIART_PID=""
+    JDB_PID=""
+    DEDUP_PID=""
+
     if [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
         log "[2a/9] WikiArt already converted ($(count_tars "$WIKIART_WDS") shards) — skipping"
     else
-        log "[2a/9] Converting WikiArt to WebDataset..."
+        log "[2a/9] Converting WikiArt in background → $WIKIART_LOG"
         python "$SCRIPT_DIR/convert_wikiart.py" \
             --input  "$DATA_ROOT/raw/wikiart/data" \
             --output "$WIKIART_WDS" \
-            --shard-size 1000
-        log "  Done: $(count_tars "$WIKIART_WDS") WikiArt shards"
-        if [[ -d "$DATA_ROOT/raw/wikiart" ]]; then
-            log "  Removing original WikiArt source (~1.6 GB)..."
-            rm -rf "$DATA_ROOT/raw/wikiart"
-        fi
+            --shard-size 1000 > "$WIKIART_LOG" 2>&1 &
+        WIKIART_PID=$!
     fi
 
-    # ── 1c. Convert JourneyDB chunk 1 ────────────────────────────────────────
-    JDB_WDS="$DATA_ROOT/raw/journeydb_wds"
     if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
         log "[2b/9] JourneyDB chunk 1 already converted ($(count_tars "$JDB_WDS") shards) — skipping"
     else
-        log "[2b/9] Converting JourneyDB chunk 1 (000–049) to WebDataset..."
+        log "[2b/9] Converting JourneyDB chunk 1 in background → $JDB_LOG"
         python "$SCRIPT_DIR/convert_journeydb.py" \
             --input      "$DATA_ROOT/raw/journeydb" \
             --output     "$JDB_WDS" \
             --shard-size 5000 \
-            --start-tgz  0 --end-tgz 49
-        log "  Done: $(count_tars "$JDB_WDS") JourneyDB shards"
-        if [[ -d "$DATA_ROOT/raw/journeydb" ]]; then
-            log "  Removing original JourneyDB tgz archives (~730 GB)..."
-            rm -rf "$DATA_ROOT/raw/journeydb"
-        fi
+            --start-tgz  0 --end-tgz 49 > "$JDB_LOG" 2>&1 &
+        JDB_PID=$!
     fi
 
-    # ── 1d. CLIP deduplication (LAION only) ───────────────────────────────────
-    DEDUP_IDS="$DATA_ROOT/dedup_ids/duplicate_ids.txt"
     if [[ -f "$DEDUP_IDS" ]] || $SKIP_DEDUP; then
         log "[3/9] CLIP deduplication already done (or --skip-dedup) — skipping"
     else
-        log "[3/9] Running CLIP deduplication on LAION (~2h)..."
+        log "[3/9] Running CLIP deduplication on LAION in background → $DEDUP_LOG"
         python "$SCRIPT_DIR/clip_dedup.py" all \
             --shards     "$DATA_ROOT/raw/laion" \
             --embeddings "$DATA_ROOT/embeddings" \
-            --output     "$DATA_ROOT/dedup_ids"
-        log "  Done: duplicate IDs in $DEDUP_IDS"
-        if [[ -d "$DATA_ROOT/embeddings" ]]; then
-            log "  Removing CLIP embeddings (~3 GB, no longer needed after dedup)..."
-            rm -rf "$DATA_ROOT/embeddings"
+            --output     "$DATA_ROOT/dedup_ids" > "$DEDUP_LOG" 2>&1 &
+        DEDUP_PID=$!
+    fi
+
+    # Wait for all three parallel steps
+    PARALLEL_FAIL=0
+    if [[ -n "$WIKIART_PID" ]]; then
+        if wait "$WIKIART_PID"; then
+            log "  [2a] WikiArt done: $(count_tars "$WIKIART_WDS") shards"
+            [[ -d "$DATA_ROOT/raw/wikiart" ]] && { log "  Removing original WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
+        else
+            log "ERROR: convert_wikiart.py failed — see $WIKIART_LOG" >&2; PARALLEL_FAIL=1
         fi
     fi
+    if [[ -n "$JDB_PID" ]]; then
+        if wait "$JDB_PID"; then
+            log "  [2b] JourneyDB done: $(count_tars "$JDB_WDS") shards"
+            [[ -d "$DATA_ROOT/raw/journeydb" ]] && { log "  Removing original JourneyDB tgz (~730 GB)..."; rm -rf "$DATA_ROOT/raw/journeydb"; }
+        else
+            log "ERROR: convert_journeydb.py failed — see $JDB_LOG" >&2; PARALLEL_FAIL=1
+        fi
+    fi
+    if [[ -n "$DEDUP_PID" ]]; then
+        if wait "$DEDUP_PID"; then
+            log "  [3] CLIP dedup done: $DEDUP_IDS"
+            [[ -d "$DATA_ROOT/embeddings" ]] && { log "  Removing CLIP embeddings (~3 GB)..."; rm -rf "$DATA_ROOT/embeddings"; }
+        else
+            log "ERROR: clip_dedup.py failed — see $DEDUP_LOG" >&2; PARALLEL_FAIL=1
+        fi
+    fi
+    [[ "$PARALLEL_FAIL" -eq 0 ]] || die "One or more parallel conversion/dedup steps failed"
 
     # ── 1e. Build unified shards (+ concurrent filter) ────────────────────────
     SHARDS_DIR="$DATA_ROOT/shards"
@@ -305,38 +330,38 @@ if [[ "$CHUNK" -eq 1 ]]; then
         log "  Done"
     fi
 
-    # ── 1g. Launch anchor set creation in background (runs during step 6) ─────
-    # Independent of the dedup index: samples directly from raw source dirs.
+    # ── 1g. Launch anchor set in background (from filtered unified shards) ──────
+    # Samples from SHARDS_DIR so anchors are already filtered + possibly recaptioned.
+    # Launched before precompute; finishes well within the 14h precompute window.
     ANCHOR_DIR="$DATA_ROOT/anchor_shards"
-    ANCHOR_SOURCES=("$DATA_ROOT/raw/laion" "$WIKIART_WDS")
-    [[ "${COYO_TARS:-0}" -gt 0 ]] && ANCHOR_SOURCES+=("$DATA_ROOT/raw/coyo")
     ANCHOR_PID=""
     if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
         log "[7/9] Anchor set already exists ($(count_tars "$ANCHOR_DIR") shards) — skipping"
     else
-        log "[7/9] Creating anchor set in background (runs concurrently with step 6)..."
+        log "[7/9] Creating anchor set in background (from $SHARDS_DIR)..."
         python "$SCRIPT_DIR/create_anchor_set.py" \
-            --shards  "${ANCHOR_SOURCES[@]}" \
+            --shards  "$SHARDS_DIR" \
             --output  "$ANCHOR_DIR" \
             --n       10000 &
         ANCHOR_PID=$!
     fi
 
-    # ── 1f2. Build persistent cross-chunk dedup index ─────────────────────────
-    DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
-    ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
-    if [[ -f "$DEDUP_INDEX" ]]; then
-        log "[6/9] Cross-chunk dedup index already built — skipping"
-    else
-        log "[6/9] Building cross-chunk dedup index from unified shards (~1.5h)..."
-        python "$SCRIPT_DIR/clip_dedup.py" build-index \
-            --shards     "$SHARDS_DIR" \
-            --embeddings "$ALL_EMBEDDINGS" \
-            --index      "$DEDUP_INDEX"
-        log "  Done: $DEDUP_INDEX"
+    # ── 1gr. Recaption (optional, must run BEFORE precompute) ─────────────────
+    # Enforces correct ordering: recaption updates shard captions; precompute must
+    # encode the final captions or embeddings and captions will silently diverge.
+    RECAPTION_DONE="$SHARDS_DIR/.recaption_done"
+    if $ENABLE_RECAPTION; then
+        if [[ -f "$RECAPTION_DONE" ]]; then
+            log "[8r/9] Recaption already done — skipping"
+        else
+            log "[8r/9] Re-captioning short captions (this takes ~2 days, resumable)..."
+            python "$SCRIPT_DIR/recaption.py" --shards "$SHARDS_DIR"
+            touch "$RECAPTION_DONE"
+            log "  Done: recaptioning complete"
+        fi
     fi
 
-    # Join anchor set background process (step 7)
+    # Wait for anchor set (should be done well before precompute finishes, but check)
     if [[ -n "$ANCHOR_PID" ]]; then
         log "[7/9] Waiting for anchor set creation..."
         wait "$ANCHOR_PID" || die "create_anchor_set.py failed"
@@ -418,6 +443,22 @@ PYEOF
             wait "$PREFETCH2_PID" || true
             log "Prefetch complete."
         fi
+    fi
+
+    # ── 1k. Build cross-chunk dedup index (after training — not on critical path) ──
+    # Used by chunks 2–4 to flag images already seen. Building here saves ~1.5h
+    # from the precompute start time compared to building before precompute.
+    DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
+    ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
+    if [[ -f "$DEDUP_INDEX" ]]; then
+        log "[6/9] Cross-chunk dedup index already built — skipping"
+    else
+        log "[6/9] Building cross-chunk dedup index (~1.5h, needed before chunk 2)..."
+        python "$SCRIPT_DIR/clip_dedup.py" build-index \
+            --shards     "$SHARDS_DIR" \
+            --embeddings "$ALL_EMBEDDINGS" \
+            --index      "$DEDUP_INDEX"
+        log "  Done: $DEDUP_INDEX"
     fi
 
 # ═════════════════════════════════════════════════════════════════════════════

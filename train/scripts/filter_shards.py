@@ -119,9 +119,15 @@ def filter_shard(shard_path: str) -> dict:
         print(f"Error reading {shard_path}: {e}", file=sys.stderr)
         return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True}
 
+    done_path = shard_path + ".filtered"
+
+    # Fast path: nothing dropped — write sentinel without any I/O
+    if len(kept_records) == original_count:
+        open(done_path, "w").close()
+        return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False}
+
     # Rewrite shard in a temp file then atomically replace
     tmp_path = shard_path + ".tmp"
-    done_path = shard_path + ".filtered"
     try:
         with tarfile.open(tmp_path, "w") as out_tar:
             for i, rec in enumerate(kept_records):
