@@ -205,6 +205,11 @@ def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
         h = layer(h, mask, c)
         if i in target_set:
             collected[i] = h
+    # Evaluate the full forward pass so MLX can free the unevaluated graph
+    # nodes for layers after the last collected layer (28-35). Without this,
+    # those pending nodes accumulate across batches and cause Metal buffer
+    # pressure that grows with each shard (~625 batches/shard × 36 layers).
+    mx.eval(h)
     return collected
 
 
@@ -470,6 +475,11 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
             _preprocess_siglip,
             _siglip_gpu_encode,
         )
+
+    # Release Metal buffer cache between shards to prevent fragmentation
+    # from accumulating over a 432-shard run.
+    import mlx.core as mx
+    mx.metal.clear_cache()
 
     return {
         "shard": shard_path,
