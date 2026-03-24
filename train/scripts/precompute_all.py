@@ -476,8 +476,19 @@ def main():
                         help="Also compute SigLIP features (~420 GB)")
     parser.add_argument("--qwen3-model", default="Qwen/Qwen3-4B",
                         help="Qwen3 model ID or local path")
-    parser.add_argument("--flux-model", default="flux-klein-4b",
-                        help="Flux model ID or path (VAE is extracted from it)")
+    # Auto-detect local Flux Klein model; fall back to HF ID if not found locally.
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _repo_dir   = os.path.dirname(os.path.dirname(_script_dir))
+    _flux_default = next(
+        (p for p in [
+            os.path.join(_repo_dir, "flux-klein-model"),
+            os.path.join(_repo_dir, "flux-klein-4b"),
+            os.path.join(_repo_dir, "flux-klein-4b-base"),
+        ] if os.path.isdir(os.path.join(p, "vae"))),
+        "black-forest-labs/FLUX.2-Klein",
+    )
+    parser.add_argument("--flux-model", default=_flux_default,
+                        help="Flux model local path or HF repo ID (VAE is extracted from it)")
     parser.add_argument("--image-size", type=int, default=512,
                         help="Image size for VAE (default 512; SigLIP always 384)")
     parser.add_argument("--workers", type=int, default=1,

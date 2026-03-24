@@ -442,6 +442,16 @@ PYEOF
 
     mkdir -p "$QWEN3_DIR" "$VAE_DIR"
     $ENABLE_SIGLIP && mkdir -p "$SIGLIP_DIR"
+
+    # Locate Flux Klein model for mflux VAE encoder.
+    # mflux requires a local directory with a vae/ subdirectory or an HF repo ID.
+    FLUX_MODEL=""
+    for _cand in "$REPO_DIR/flux-klein-model" "$REPO_DIR/flux-klein-4b" "$REPO_DIR/flux-klein-4b-base"; do
+        [[ -d "$_cand/vae" ]] && { FLUX_MODEL="$_cand"; break; }
+    done
+    [[ -n "$FLUX_MODEL" ]] || die "Flux Klein model not found — expected $REPO_DIR/flux-klein-model with a vae/ subdirectory"
+    log "  Flux model: $FLUX_MODEL"
+
     if [[ -f "$PRECOMPUTE_DONE" ]]; then
         log "[8/9] Precompute already done — skipping"
     else
@@ -450,6 +460,7 @@ PYEOF
             --shards        "$SHARDS_DIR"
             --qwen3-output  "$QWEN3_DIR"
             --vae-output    "$VAE_DIR"
+            --flux-model    "$FLUX_MODEL"
         )
         $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
         retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
