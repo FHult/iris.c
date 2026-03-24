@@ -141,6 +141,39 @@ def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
 _W: dict = {}
 
 
+def _load_flux_vae_only(flux_model_path: str):
+    """Load only the Flux2 VAE weights, skipping the 4B transformer and text encoder.
+
+    Flux2Klein.__init__ loads all three components (VAE + transformer + text_encoder),
+    consuming ~16 GB of Metal memory that is never used here. This function loads only
+    the ~500 MB VAE safetensors, freeing that memory for compute buffers.
+    """
+    import mlx.core as mx
+    from mflux.models.flux2.model.flux2_vae.vae import Flux2VAE
+    from mflux.models.flux2.weights.flux2_weight_definition import Flux2KleinWeightDefinition
+    from mflux.models.common.weights.loading.weight_loader import WeightLoader
+    from mflux.models.common.weights.loading.weight_applier import WeightApplier
+
+    vae_comp = next(c for c in Flux2KleinWeightDefinition.get_components() if c.name == "vae")
+
+    class _VaeOnly:
+        @staticmethod
+        def get_components():
+            return [vae_comp]
+        @staticmethod
+        def get_download_patterns():
+            return ["vae/*.safetensors", "vae/*.json"]
+
+    weights = WeightLoader.load(weight_definition=_VaeOnly, model_path=flux_model_path)
+    vae = Flux2VAE()
+    WeightApplier.apply_and_quantize_single(
+        weights=weights, model=vae, component=vae_comp, quantize_arg=None,
+    )
+    vae.eval()
+    mx.eval(vae.parameters())
+    return vae
+
+
 def _worker_init(qwen3_model_path: str, flux_model_path: str,
                  enable_siglip: bool, image_size: int) -> None:
     """Load all models once per worker process."""
@@ -153,10 +186,8 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
     _W["qwen3"] = model
     _W["tokenizer"] = tokenizer
 
-    from mflux.models.flux2 import Flux2Klein
-    flux = Flux2Klein(model_path=flux_model_path, quantize=None)
-    flux.vae.freeze()
-    _W["vae"] = flux.vae
+    vae = _load_flux_vae_only(flux_model_path)
+    _W["vae"] = vae
 
     if enable_siglip:
         try:
@@ -245,6 +276,11 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
         padded = mx.array(np.array([
             ids + [pad_id] * (max_len - len(ids)) for _, _, ids in batch
         ]))
+        # Attention masks vary in shape per batch (different seq_len); flush the
+        # Metal free-list every 64 batches to prevent buffer fragmentation build-up.
+        batch_idx = i // batch_size
+        if batch_idx > 0 and batch_idx % 64 == 0:
+            mx.clear_cache()
         try:
             h = _qwen3_hidden_states(model, padded)
             mx.eval(h[9], h[18], h[27])
@@ -324,6 +360,10 @@ def _encode_with_prefetch(records: list, out_dir: str, batch_size: int,
             batch_imgs = [img for r, img in preprocessed if img is not None]
             if batch_imgs:
                 written += gpu_encode_fn(batch_ids, batch_imgs, out_dir)
+            # Flush Metal buffer free-list every 32 batches to limit pool growth.
+            if idx > 0 and idx % 32 == 0:
+                import mlx.core as mx
+                mx.clear_cache()
 
     return written
 
@@ -476,9 +516,10 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
             _siglip_gpu_encode,
         )
 
-    # Release Metal buffer cache between shards to prevent fragmentation
-    # from accumulating over a 432-shard run.
+    # Release Python objects and Metal buffer cache between shards.
+    import gc
     import mlx.core as mx
+    gc.collect()
     mx.clear_cache()
 
     return {
@@ -566,9 +607,12 @@ def main():
     ]
 
     import time as _time
+    from collections import deque as _deque
     results = []
     t_start = t_last = _time.time()
-    interval_rates = []
+    # Keep recent shard times for windowed ETA (last 10 shards).
+    # Avoids the harmonic-mean trap where fast cache-hit shards mask growing compute time.
+    recent_dts: _deque = _deque(maxlen=10)
 
     with multiprocessing.Pool(
         processes=args.workers,
@@ -581,11 +625,11 @@ def main():
             results.append(result)
             t_now = _time.time()
             dt = t_now - t_last
-            if dt > 0:
-                interval_rates.append(1.0 / dt)
-            avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
-            eta = (len(work_items) - done) / avg_rate if avg_rate > 0 else 0
             t_last = t_now
+            if dt > 0:
+                recent_dts.append(dt)
+            avg_dt = sum(recent_dts) / len(recent_dts) if recent_dts else dt
+            eta = (len(work_items) - done) * avg_dt
 
             errs = sum(1 for r in results if r["error"])
             wq   = sum(r["wq"] for r in results)
@@ -596,7 +640,7 @@ def main():
             print(
                 f"  [{done}/{len(work_items)}]"
                 f"  qwen3={wq:,}  vae={wv:,}{siglip_str}"
-                f"{err_str}  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
+                f"{err_str}  {dt:.1f} s/shard  ETA {eta/60:.0f}m",
                 flush=True,
             )
 
