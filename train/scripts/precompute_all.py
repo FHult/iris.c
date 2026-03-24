@@ -308,9 +308,9 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
         stacked = np.concatenate(batch_imgs, axis=0)
         latents = vae.encode(mx.array(stacked))
         mx.eval(latents)
-        latents_np = np.array(latents)
+        latents_np = np.array(latents.astype(mx.float32))
         for k, rec_id in enumerate(batch_ids):
-            q, scale = _quantize_int8(latents_np[k].astype(np.float32))
+            q, scale = _quantize_int8(latents_np[k])
             np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
         return len(batch_ids)
     except Exception as e:
@@ -320,7 +320,7 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
             try:
                 latent = vae.encode(mx.array(img_np))
                 mx.eval(latent)
-                q, scale = _quantize_int8(np.array(latent[0]).astype(np.float32))
+                q, scale = _quantize_int8(np.array(latent[0].astype(mx.float32)))
                 np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 saved += 1
             except Exception as e2:
