@@ -264,11 +264,6 @@ step_status "[5/9] Filter shards" \
     "$FILTER_RUNNING" \
     "($SHARD_COUNT shards)" "$FILTER_RUN_INFO"
 
-step_status "[6/9] Cross-chunk dedup index" \
-    "[[ -f $DEDUP_INDEX ]]" \
-    "pgrep -f 'clip_dedup.*build-index'" \
-    "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
-
 step_status "[7/9] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
     "($ANCHOR_COUNT shards · built from raw sources, independent of steps 4-6)"
@@ -284,6 +279,11 @@ step_status "[9/9] Train" \
     "$TRAIN_RUNNING" \
     "${LATEST_STEP}($CKPT_COUNT checkpoints)" \
     "$TRAIN_RUN_INFO"
+
+step_status "[6/9] Cross-chunk dedup index  (runs after training)" \
+    "[[ -f $DEDUP_INDEX ]]" \
+    "pgrep -f 'clip_dedup.*build-index'" \
+    "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
 
 # ── Active processes ──────────────────────────────────────────────────────────
 # Show the pipeline as one entry (top-level PID only) plus individual step processes.
