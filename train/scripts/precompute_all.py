@@ -479,7 +479,7 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     # Release Metal buffer cache between shards to prevent fragmentation
     # from accumulating over a 432-shard run.
     import mlx.core as mx
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     return {
         "shard": shard_path,
