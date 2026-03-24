@@ -186,6 +186,28 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
 # Encode helpers (operate on records already filtered to missing-output only)
 # ---------------------------------------------------------------------------
 
+def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
+    """
+    Manual forward pass through Qwen3 that captures intermediate layer outputs.
+
+    mlx_lm 0.31+ does not expose output_hidden_states in Model.__call__.
+    We replicate the inner Qwen3Model forward pass (embed → layers → collect).
+    """
+    import mlx.core as mx
+    from mlx_lm.models.qwen3 import create_attention_mask
+    inner = model.model
+    h = inner.embed_tokens(tokens)
+    cache = [None] * len(inner.layers)
+    mask = create_attention_mask(h, cache[0])
+    collected = {}
+    target_set = set(target)
+    for i, (layer, c) in enumerate(zip(inner.layers, cache)):
+        h = layer(h, mask, c)
+        if i in target_set:
+            collected[i] = h
+    return collected
+
+
 def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
     """
     Encode captions through Qwen3, save 4-bit quantised embeddings.
@@ -219,17 +241,17 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
             ids + [pad_id] * (max_len - len(ids)) for _, _, ids in batch
         ]))
         try:
-            outputs = model(padded, output_hidden_states=True)
-            h = outputs.hidden_states
-            h9_np  = np.array(h[9])
-            h18_np = np.array(h[18])
-            h27_np = np.array(h[27])
+            h = _qwen3_hidden_states(model, padded)
+            mx.eval(h[9], h[18], h[27])
+            h9_np  = np.array(h[9].astype(mx.float32))
+            h18_np = np.array(h[18].astype(mx.float32))
+            h27_np = np.array(h[27].astype(mx.float32))
             for j, (rec_id, _, _) in enumerate(batch):
                 sl = seq_lens[j]
                 emb = np.concatenate(
                     [h9_np[j, :sl], h18_np[j, :sl], h27_np[j, :sl]], axis=-1
                 )
-                q, scale = _quantize_4bit(emb.astype(np.float32))
+                q, scale = _quantize_4bit(emb)
                 np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 written += 1
         except Exception as e:
@@ -238,14 +260,14 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
             for rec_id, caption, ids in batch:
                 try:
                     sl = len(ids)
-                    out = model(mx.array([ids]), output_hidden_states=True)
-                    h = out.hidden_states
+                    h = _qwen3_hidden_states(model, mx.array([ids]))
+                    mx.eval(h[9], h[18], h[27])
                     emb = np.concatenate([
-                        np.array(h[9][0, :sl]),
-                        np.array(h[18][0, :sl]),
-                        np.array(h[27][0, :sl]),
+                        np.array(h[9][0, :sl].astype(mx.float32)),
+                        np.array(h[18][0, :sl].astype(mx.float32)),
+                        np.array(h[27][0, :sl].astype(mx.float32)),
                     ], axis=-1)
-                    q, scale = _quantize_4bit(emb.astype(np.float32))
+                    q, scale = _quantize_4bit(emb)
                     np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                     written += 1
                 except Exception as e2:
