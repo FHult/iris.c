@@ -217,12 +217,19 @@ if [[ "$CHUNK" -eq 1 ]]; then
     JDB_LOG="$DATA_ROOT/logs/journeydb.log"
     DEDUP_LOG="$DATA_ROOT/logs/clip_dedup.log"
 
+    [[ -d "$DATA_ROOT/raw/laion" ]] || \
+        die "raw/laion not found or not accessible: $DATA_ROOT/raw/laion — run img2dataset first"
     LAION_TARS=$(count_tars "$DATA_ROOT/raw/laion")
     [[ "$LAION_TARS" -gt 0 ]] || \
         die "LAION shards not found in $DATA_ROOT/raw/laion/ — run img2dataset first"
     COYO_TARS=$(count_tars "$DATA_ROOT/raw/coyo" || echo 0)
     log "[1/9] LAION: $LAION_TARS shards  COYO: $COYO_TARS shards"
     log "      Launching WikiArt, JourneyDB, and CLIP dedup in parallel..."
+
+    # Pre-create output directories for all parallel background jobs so they
+    # never fail due to a missing parent directory.
+    mkdir -p "$WIKIART_WDS" "$JDB_WDS" \
+             "$DATA_ROOT/embeddings" "$DATA_ROOT/dedup_ids"
 
     # ── WikiArt background job ────────────────────────────────────────────────
     WIKIART_PID=""
@@ -406,6 +413,7 @@ PYEOF
     ANCHOR_DIR="$DATA_ROOT/anchor_shards"
     ANCHOR_SOURCES=("$DATA_ROOT/raw/laion" "$WIKIART_WDS")
     [[ "${COYO_TARS:-0}" -gt 0 ]] && ANCHOR_SOURCES+=("$DATA_ROOT/raw/coyo")
+    mkdir -p "$ANCHOR_DIR"
     ANCHOR_PID=""
     if [[ $(count_tars "$ANCHOR_DIR") -gt 0 ]]; then
         log "[7/9] Anchor set already exists ($(count_tars "$ANCHOR_DIR") shards) — skipping"
@@ -432,6 +440,8 @@ PYEOF
     SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
     PRECOMPUTE_DONE="$DATA_ROOT/precomputed/.done"
 
+    mkdir -p "$QWEN3_DIR" "$VAE_DIR"
+    $ENABLE_SIGLIP && mkdir -p "$SIGLIP_DIR"
     if [[ -f "$PRECOMPUTE_DONE" ]]; then
         log "[8/9] Precompute already done — skipping"
     else
@@ -509,6 +519,7 @@ PYEOF
     # Do NOT skip this step if you plan to run chunk 2+.
     DEDUP_INDEX="$DATA_ROOT/dedup_ids/dedup_index.faiss"
     ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
+    mkdir -p "$ALL_EMBEDDINGS"
     if [[ -f "$DEDUP_INDEX" ]]; then
         log "[6/9] Cross-chunk dedup index already built — skipping"
     else
@@ -624,6 +635,7 @@ PYEOF
         log "         Skipping cross-chunk dedup (run build-index on chunk 1 shards first)"
     else
         log "[2b/6] Running cross-chunk dedup (query $JDB_WDS against existing index)..."
+        mkdir -p "$CHUNK_EMBEDDINGS"
         python "$SCRIPT_DIR/clip_dedup.py" incremental \
             --shards     "$JDB_WDS" \
             --embeddings "$CHUNK_EMBEDDINGS" \
