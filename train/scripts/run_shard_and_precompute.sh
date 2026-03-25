@@ -40,8 +40,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Activate venv if not already active
-if [[ -z "$VIRTUAL_ENV" && -f "$VENV" ]]; then
+# Activate project venv (override any externally-set VIRTUAL_ENV)
+if [[ "$VIRTUAL_ENV" != "$TRAIN_DIR/.venv" && -f "$VENV" ]]; then
     source "$VENV"
 fi
 
@@ -116,6 +116,8 @@ else
         --shards       "$DATA_ROOT/shards"
         --qwen3-output "$DATA_ROOT/precomputed/qwen3"
         --vae-output   "$DATA_ROOT/precomputed/vae"
+        --qwen3-batch  32
+        --vae-batch    16
     )
     $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$DATA_ROOT/precomputed/siglip")
     python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"

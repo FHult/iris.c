@@ -268,25 +268,32 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
             print(f"  Skipping {rec_id} (tokenize): {e}", file=sys.stderr)
     tokenized.sort(key=lambda x: len(x[2]))
 
+    import time as _time
+    total_seq = 0
+    max_seq = 0
+    t_q_start = _time.time()
     written = 0
     for i in range(0, len(tokenized), batch_size):
         batch = tokenized[i:i + batch_size]
         seq_lens = [len(ids) for _, _, ids in batch]
         max_len = max(seq_lens)
+        total_seq += max_len
+        max_seq = max(max_seq, max_len)
         padded = mx.array(np.array([
             ids + [pad_id] * (max_len - len(ids)) for _, _, ids in batch
         ]))
-        # Attention masks vary in shape per batch (different seq_len); flush the
-        # Metal free-list every 64 batches to prevent buffer fragmentation build-up.
         batch_idx = i // batch_size
-        if batch_idx > 0 and batch_idx % 64 == 0:
-            mx.clear_cache()
+        t_b = _time.time()
         try:
             h = _qwen3_hidden_states(model, padded)
             mx.eval(h[9], h[18], h[27])
             h9_np  = np.array(h[9].astype(mx.float32))
             h18_np = np.array(h[18].astype(mx.float32))
             h27_np = np.array(h[27].astype(mx.float32))
+            t_b_end = _time.time()
+            if batch_idx < 3 or batch_idx % 100 == 0:
+                print(f"  [qwen3 batch {batch_idx}] seq={max_len} dt={t_b_end-t_b:.2f}s",
+                      file=sys.stderr, flush=True)
             for j, (rec_id, _, _) in enumerate(batch):
                 sl = seq_lens[j]
                 emb = np.concatenate(
@@ -313,6 +320,12 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
                     written += 1
                 except Exception as e2:
                     print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
+    n_batches = len(tokenized) // batch_size + 1
+    elapsed = _time.time() - t_q_start
+    avg_dt = elapsed / max(n_batches, 1)
+    avg_seq = total_seq // max(n_batches, 1)
+    print(f"  [qwen3 summary] {n_batches} batches  avg_seq={avg_seq}  max_seq={max_seq}"
+          f"  avg_dt={avg_dt:.2f}s/batch  total={elapsed:.1f}s", file=sys.stderr, flush=True)
     return written
 
 
@@ -370,11 +383,19 @@ def _encode_with_prefetch(records: list, out_dir: str, batch_size: int,
 
 def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
     import mlx.core as mx
+    import time as _time
     vae = _W["vae"]
+    _n = _W.get("_vae_batch_n", 0)
+    _W["_vae_batch_n"] = _n + 1
     try:
         stacked = np.concatenate(batch_imgs, axis=0)
+        _t0 = _time.time()
         latents = vae.encode(mx.array(stacked))
         mx.eval(latents)
+        _dt = _time.time() - _t0
+        if _n < 3 or _n % 50 == 0:
+            print(f"  [vae batch {_n}] n={len(batch_ids)} dt={_dt:.2f}s ({_dt/len(batch_ids):.3f}s/img)",
+                  file=sys.stderr, flush=True)
         latents_np = np.array(latents.astype(mx.float32))
         for k, rec_id in enumerate(batch_ids):
             q, scale = _quantize_int8(latents_np[k])
@@ -466,7 +487,10 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     for d in filter(None, [qwen3_out, vae_out, siglip_out]):
         os.makedirs(d, exist_ok=True)
 
+    import time as _time
+    import mlx.core as _mx_gc
     # Phase 1: read tar once — partition records by which outputs are still needed
+    t1 = _time.time()
     wq = wv = ws = 0          # already-written counts (resume)
     pending_q: list = []      # (rec_id, jpg_bytes, caption) needing Qwen3
     pending_v: list = []      # needing VAE
@@ -495,12 +519,23 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
         if need_s:
             pending_s.append(rec)
 
+    t2 = _time.time()
+    shard_name = os.path.basename(shard_path)
+    print(f"  [{shard_name}] phase1={t2-t1:.1f}s  pending_q={len(pending_q)}  pending_v={len(pending_v)}",
+          file=sys.stderr, flush=True)
+
     # Phase 2a: Qwen3
     if pending_q:
         wq += _encode_qwen3(pending_q, qwen3_out, qwen3_batch)
+    t3 = _time.time()
+    print(f"  [{shard_name}] qwen3={t3-t2:.1f}s", file=sys.stderr, flush=True)
+    # Clear Metal free-list between Qwen3 and VAE phases to avoid buffer
+    # fragmentation from Qwen3 attention masks interfering with large VAE convs.
+    _mx_gc.clear_cache()
 
     # Phase 2b: VAE (1-ahead prefetch)
     if pending_v:
+        _W["_vae_batch_n"] = 0
         image_size = _W["image_size"]
         wv += _encode_with_prefetch(
             pending_v, vae_out, vae_batch,
@@ -515,6 +550,9 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
             _preprocess_siglip,
             _siglip_gpu_encode,
         )
+
+    t4 = _time.time()
+    print(f"  [{shard_name}] vae={t4-t3:.1f}s  total={t4-t1:.1f}s", file=sys.stderr, flush=True)
 
     # Release Python objects and Metal buffer cache between shards.
     import gc
