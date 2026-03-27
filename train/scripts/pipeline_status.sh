@@ -208,7 +208,7 @@ hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ images embedded')
 
 # Step 8 — precompute_all: "[X/Y] PCT%  X.X s/shard  ETA Xm"
 PRECOMPUTE_RUN_INFO="running... ($SHARD_COUNT shards)"
-hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9]+%')
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9]+%.*ETA [0-9]+h')
 [[ -z "$hb" ]] && hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\]  qwen3=[0-9,]+  vae=')
 [[ -n "$hb" ]] && PRECOMPUTE_RUN_INFO="$hb"
 # Legacy individual scripts (for old runs that used precompute_qwen3/vae separately)

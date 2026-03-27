@@ -720,7 +720,7 @@ def main():
             siglip_str = f" +siglip" if siglip_out and ws > 0 else ""
             print(
                 f"  [{done}/{len(work_items)}] {pct}%{siglip_str}"
-                f"{err_str}  {dt:.1f} s/shard  ETA {eta/60:.0f}m",
+                f"{err_str}  {dt:.1f} s/shard  ETA {int(eta//3600)}h {int((eta%3600)//60)}m",
                 flush=True,
             )
 

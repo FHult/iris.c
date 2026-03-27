@@ -68,7 +68,7 @@ Shows all steps (✅/⏳/⬜), active process names, tmux sessions, last 15 line
 For running steps, each line shows the **most recent heartbeat** parsed from the step's log:
 - `build_shards`: `[worker N] src X/Y | written N records | shards A/B full`
 - `filter_shards`: `[X/Y] kept=N  dropped=N  X.X s/shard  ETA Xm`
-- `precompute_all`: `[X/Y] PCT%  X.X s/shard  ETA Xm`
+- `precompute_all`: `[X/Y] PCT%  X.X s/shard  ETA Xh Xm`
 - `clip_dedup`: `[X/N] N duplicates found`
 - `train_ip_adapter`: `step X,XXX/105,000  loss X.XXXX (avg X.XXXX)  lr X  X.XX steps/s  ETA Xh XXm`
 
