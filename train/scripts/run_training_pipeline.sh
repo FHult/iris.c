@@ -623,9 +623,9 @@ PYEOF
     ALL_EMBEDDINGS="$DATA_ROOT/embeddings/all"
     mkdir -p "$ALL_EMBEDDINGS"
     if [[ -f "$DEDUP_INDEX" ]]; then
-        log "[6/9] Cross-chunk dedup index already built — skipping"
+        log "[10/10] Cross-chunk dedup index already built — skipping"
     else
-        log "[6/9] Building cross-chunk dedup index (~1.5h)..."
+        log "[10/10] Building cross-chunk dedup index (~1.5h)..."
         log "  (Required before starting --chunk 2; chunks 2-4 step 2b depends on this)"
         python "$SCRIPT_DIR/clip_dedup.py" build-index \
             --shards     "$SHARDS_DIR" \

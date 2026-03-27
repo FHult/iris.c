@@ -298,7 +298,7 @@ step_status "[9b/10] Mine hard examples" \
     "$MINE_RUN_INFO" \
     "$(if $BEST_CKPT_EXISTS; then echo 'Pending (runs after training)'; else echo 'Pending (needs best.safetensors)'; fi)"
 
-step_status "[6/10] Cross-chunk dedup index  (runs after training)" \
+step_status "[10/10] Cross-chunk dedup index  (runs after training)" \
     "[[ -f $DEDUP_INDEX ]]" \
     "pgrep -f 'clip_dedup.*build-index'" \
     "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
