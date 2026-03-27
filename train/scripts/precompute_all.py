@@ -714,14 +714,12 @@ def main():
             eta = (len(work_items) - done) * avg_dt
 
             errs = sum(1 for r in results if r["error"])
-            wq   = sum(r["wq"] for r in results)
-            wv   = sum(r["wv"] for r in results)
             ws   = sum(r["ws"] for r in results)
-            err_str = f"  errors={errs}" if errs else ""
-            siglip_str = f"  siglip={ws:,}" if siglip_out else ""
+            pct  = 100 * done // len(work_items)
+            err_str    = f"  errors={errs}" if errs else ""
+            siglip_str = f" +siglip" if siglip_out and ws > 0 else ""
             print(
-                f"  [{done}/{len(work_items)}]"
-                f"  qwen3={wq:,}  vae={wv:,}{siglip_str}"
+                f"  [{done}/{len(work_items)}] {pct}%{siglip_str}"
                 f"{err_str}  {dt:.1f} s/shard  ETA {eta/60:.0f}m",
                 flush=True,
             )

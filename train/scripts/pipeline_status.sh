@@ -206,9 +206,9 @@ DEDUP_INDEX_RUN_INFO="building..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ images embedded')
 [[ -n "$hb" ]] && DEDUP_INDEX_RUN_INFO="$hb"
 
-# Step 8 — precompute_all: "[X/Y]  qwen3=N,NNN  vae=N,NNN  X.X s/shard  ETA Xm"
-PRECOMPUTE_RUN_INFO="qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  ($SHARD_COUNT shards, running...)"
-hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\]  qwen3=[0-9,]+  vae=')
+# Step 8 — precompute_all: "[X/Y] PCT%  X.X s/shard  ETA Xm"
+PRECOMPUTE_RUN_INFO="running... ($SHARD_COUNT shards)"
+hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9]+%')
 [[ -n "$hb" ]] && PRECOMPUTE_RUN_INFO="$hb"
 # Legacy individual scripts (for old runs that used precompute_qwen3/vae separately)
 QWEN3_RUN_INFO="$QWEN3_COUNT embeddings, running..."
