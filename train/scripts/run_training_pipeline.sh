@@ -563,7 +563,11 @@ PYEOF
     if [[ $(count_tars "$JDB_WDS_CHUNK2") -gt 0 || -f "$PREFETCH2_DONE" ]]; then
         log "[1i/9] JDB chunk 2 already downloaded or converted — no prefetch needed"
     else
-        log "[1i/9] Launching JDB chunk 2 background prefetch (~800 GB, resumable)..."
+        # Chunk 2 covers tgz 050–099 (50 files); scope to PRECOMPUTE_SHARDS like chunk 1.
+        _c2_max=50
+        _c2_want="${PRECOMPUTE_SHARDS:-$_c2_max}"
+        _c2_n=$(( _c2_want < _c2_max ? _c2_want : _c2_max ))
+        log "[1i/9] Launching JDB chunk 2 background prefetch ($_c2_n files, ~$(( _c2_n * 16 )) GB, resumable)..."
         mkdir -p "$JDB_RAW" "$DATA_ROOT/logs"
         (python3 - <<PYEOF
 from huggingface_hub import snapshot_download
@@ -571,10 +575,10 @@ snapshot_download(
     'JourneyDB/JourneyDB',
     repo_type='dataset',
     local_dir='${JDB_RAW}',
-    allow_patterns=[
-        'data/train/imgs/0[5-9][0-9].tgz',
-        'data/train/train_anno_realease_repath.jsonl.tgz',
-    ],
+    allow_patterns=(
+        [f'data/train/imgs/{i:03d}.tgz' for i in range(50, 50 + $_c2_n)]
+        + ['data/train/train_anno_realease_repath.jsonl.tgz']
+    ),
 )
 PYEOF
         touch "${PREFETCH2_DONE}"
