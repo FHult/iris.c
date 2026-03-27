@@ -324,6 +324,12 @@ PYEOF
     fi
 
     # ── JourneyDB background job ──────────────────────────────────────────────
+    # Scope download to precompute budget: each tgz ≈ 5000 images ≈ 1 shard,
+    # so downloading PRECOMPUTE_SHARDS files covers the training need without
+    # pulling the full ~800 GB when running at small/medium scale.
+    # all-in (PRECOMPUTE_SHARDS="") downloads all 50 chunk-1 files.
+    _jdb_want_c1="${PRECOMPUTE_SHARDS:-50}"
+    JDB_DOWNLOAD_N=$(( _jdb_want_c1 < 50 ? _jdb_want_c1 : 50 ))
     JDB_PID=""
     if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
         log "  JourneyDB: WDS already present ($(count_tars "$JDB_WDS") shards) — skipping"
@@ -335,29 +341,29 @@ PYEOF
             _tgz=("$DATA_ROOT/raw/journeydb/data/train/imgs"/0[0-4][0-9].tgz)
             shopt -u nullglob
             _jdb_sentinel="${DATA_ROOT}/raw/journeydb/.download_complete_chunk1"
-            if [[ ${#_tgz[@]} -lt 50 && ! -f "$_jdb_sentinel" ]]; then
-                echo "[$(date '+%T')] ${#_tgz[@]}/50 tgz files — downloading JourneyDB chunk 1 (~800 GB)..."
+            if [[ ${#_tgz[@]} -lt $JDB_DOWNLOAD_N && ! -f "$_jdb_sentinel" ]]; then
+                echo "[$(date '+%T')] ${#_tgz[@]}/$JDB_DOWNLOAD_N tgz files — downloading JourneyDB chunk 1 (~$((JDB_DOWNLOAD_N * 16)) GB)..."
                 python3 - <<PYEOF
 from huggingface_hub import snapshot_download
 snapshot_download(
     'JourneyDB/JourneyDB',
     repo_type='dataset',
     local_dir='${DATA_ROOT}/raw/journeydb',
-    allow_patterns=[
-        'data/train/imgs/0[0-4][0-9].tgz',
-        'data/train/train_anno_realease_repath.jsonl.tgz',
-    ],
+    allow_patterns=(
+        [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_DOWNLOAD_N)]
+        + ['data/train/train_anno_realease_repath.jsonl.tgz']
+    ),
 )
 print('Download complete.')
 PYEOF
                 touch "$_jdb_sentinel"
             fi
-            echo "[$(date '+%T')] Converting JourneyDB chunk 1 to WebDataset..."
+            echo "[$(date '+%T')] Converting JourneyDB chunk 1 to WebDataset (tgz 000–$(( JDB_DOWNLOAD_N - 1 )))..."
             python "$SCRIPT_DIR/convert_journeydb.py" \
                 --input      "$DATA_ROOT/raw/journeydb" \
                 --output     "$JDB_WDS" \
                 --shard-size 5000 \
-                --start-tgz  0 --end-tgz 49
+                --start-tgz  0 --end-tgz $(( JDB_DOWNLOAD_N - 1 ))
             echo "[$(date '+%T')] Done: $(count_tars "$JDB_WDS") shards."
             [[ -d "$DATA_ROOT/raw/journeydb" ]] && \
                 { echo "Removing original JourneyDB tgz (~730 GB)..."; rm -rf "$DATA_ROOT/raw/journeydb"; }
@@ -657,68 +663,54 @@ elif [[ "$CHUNK" -ge 2 && "$CHUNK" -le 4 ]]; then
     CHUNK_EMBEDDINGS="$DATA_ROOT/embeddings/chunk${CHUNK}"
 
     # ── 1. Download JourneyDB chunk N ─────────────────────────────────────────
-    # Count present files using nullglob-safe array expansion (avoids ls|wc pipefail)
-    EXPECTED_TGZ_COUNT=$((JDB_TGZ_END - JDB_TGZ_START + 1))
+    # Scope download to precompute budget: each tgz ≈ 5000 images ≈ 1 shard.
+    # PRECOMPUTE_SHARDS="" (all-in) downloads the full chunk range.
+    _jdb_max_cx=$((JDB_TGZ_END - JDB_TGZ_START + 1))
+    _jdb_want_cx="${PRECOMPUTE_SHARDS:-$_jdb_max_cx}"
+    JDB_DOWNLOAD_N=$(( _jdb_want_cx < _jdb_max_cx ? _jdb_want_cx : _jdb_max_cx ))
+    JDB_TGZ_END_ACTUAL=$(( JDB_TGZ_START + JDB_DOWNLOAD_N - 1 ))
 
-    shopt -s nullglob
     IMGS_DIR="$JDB_RAW/data/train/imgs"
-    case $CHUNK in
-        2) PRESENT_FILES=("$IMGS_DIR"/0[5-9][0-9].tgz) ;;
-        3) PRESENT_FILES=("$IMGS_DIR"/1[0-4][0-9].tgz) ;;
-        4) PRESENT_FILES=("$IMGS_DIR"/1[5-9][0-9].tgz)
-           [[ -f "$IMGS_DIR/200.tgz" ]] && PRESENT_FILES+=("$IMGS_DIR/200.tgz")
-           [[ -f "$IMGS_DIR/201.tgz" ]] && PRESENT_FILES+=("$IMGS_DIR/201.tgz") ;;
-    esac
+    shopt -s nullglob
+    PRESENT_FILES=()
+    for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
+        [[ -f "$IMGS_DIR/$(printf '%03d' $_i).tgz" ]] && \
+            PRESENT_FILES+=("$IMGS_DIR/$(printf '%03d' $_i).tgz")
+    done
     shopt -u nullglob
     PRESENT=${#PRESENT_FILES[@]}
 
-    if [[ "$PRESENT" -ge "$EXPECTED_TGZ_COUNT" ]]; then
-        log "[1/6] JourneyDB chunk $CHUNK already downloaded ($PRESENT files) — skipping"
+    if [[ "$PRESENT" -ge "$JDB_DOWNLOAD_N" ]]; then
+        log "[1/6] JourneyDB chunk $CHUNK already downloaded ($PRESENT/$JDB_DOWNLOAD_N files) — skipping"
     else
-        log "[1/6] Downloading JourneyDB chunk $CHUNK (${EXPECTED_TGZ_COUNT} files, ~$((EXPECTED_TGZ_COUNT * 16)) GB)..."
-
-        # Build Python allow_patterns list
-        PATTERNS_PY="["
-        for p in "${JDB_PATTERNS[@]}"; do
-            PATTERNS_PY+="'$p', "
-        done
-        # Always include annotation files (idempotent if already present)
-        PATTERNS_PY+="'data/train/train_anno_realease_repath.jsonl.tgz']"
-
+        log "[1/6] Downloading JourneyDB chunk $CHUNK ($JDB_DOWNLOAD_N/$_jdb_max_cx files, ~$((JDB_DOWNLOAD_N * 16)) GB)..."
         python3 - <<PYEOF
 from huggingface_hub import snapshot_download
 snapshot_download(
     'JourneyDB/JourneyDB',
     repo_type='dataset',
     local_dir='$JDB_RAW',
-    allow_patterns=$PATTERNS_PY,
+    allow_patterns=(
+        [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_TGZ_START, $JDB_TGZ_START + $JDB_DOWNLOAD_N)]
+        + ['data/train/train_anno_realease_repath.jsonl.tgz']
+    ),
 )
 print('Download complete.')
 PYEOF
         [[ $? -eq 0 ]] || die "HuggingFace snapshot_download failed for chunk $CHUNK"
-        # Recount after download
-        shopt -s nullglob
-        case $CHUNK in
-            2) PRESENT_FILES=("$IMGS_DIR"/0[5-9][0-9].tgz) ;;
-            3) PRESENT_FILES=("$IMGS_DIR"/1[0-4][0-9].tgz) ;;
-            4) PRESENT_FILES=("$IMGS_DIR"/1[5-9][0-9].tgz)
-               [[ -f "$IMGS_DIR/200.tgz" ]] && PRESENT_FILES+=("$IMGS_DIR/200.tgz")
-               [[ -f "$IMGS_DIR/201.tgz" ]] && PRESENT_FILES+=("$IMGS_DIR/201.tgz") ;;
-        esac
-        shopt -u nullglob
-        log "  Done: ${#PRESENT_FILES[@]} files in $IMGS_DIR"
+        log "  Done: $JDB_DOWNLOAD_N files in $IMGS_DIR"
     fi
 
     # ── 2. Convert chunk N to WebDataset ─────────────────────────────────────
     if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
         log "[2/6] Chunk $CHUNK WebDataset already exists ($(count_tars "$JDB_WDS") shards) — skipping"
     else
-        log "[2/6] Converting JourneyDB chunk $CHUNK to WebDataset (tgz $JDB_TGZ_START–$JDB_TGZ_END)..."
+        log "[2/6] Converting JourneyDB chunk $CHUNK to WebDataset (tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL of $JDB_TGZ_END)..."
         python "$SCRIPT_DIR/convert_journeydb.py" \
             --input      "$JDB_RAW" \
             --output     "$JDB_WDS" \
             --shard-size 5000 \
-            --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END"
+            --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END_ACTUAL"
         log "  Done: $(count_tars "$JDB_WDS") shards in $JDB_WDS"
     fi
 
@@ -836,16 +828,12 @@ PYEOF
     # ── 6. Clean up raw chunk files to free SSD space ─────────────────────────
     log "[6/6] Chunk $CHUNK complete."
     log ""
-    log "  Raw chunk files: $JDB_RAW/data/train/imgs/ ($((EXPECTED_TGZ_COUNT * 16)) GB approx)"
+    log "  Raw chunk files: $JDB_RAW/data/train/imgs/ ($((JDB_DOWNLOAD_N * 16)) GB, tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL)"
     log "  Chunk WDS shards: $JDB_WDS"
     log "  These can be deleted to free SSD space once training is verified:"
     log ""
-    log "  To free raw chunk data (~$((EXPECTED_TGZ_COUNT * 16)) GB):"
-    case $CHUNK in
-        2) log "    rm $JDB_RAW/data/train/imgs/0[5-9][0-9].tgz" ;;
-        3) log "    rm $JDB_RAW/data/train/imgs/1[0-4][0-9].tgz" ;;
-        4) log "    rm $JDB_RAW/data/train/imgs/1[5-9][0-9].tgz $JDB_RAW/data/train/imgs/200.tgz $JDB_RAW/data/train/imgs/201.tgz" ;;
-    esac
+    log "  To free raw chunk data (~$((JDB_DOWNLOAD_N * 16)) GB):"
+    log "    for i in \$(seq $JDB_TGZ_START $JDB_TGZ_END_ACTUAL); do rm -f $IMGS_DIR/\$(printf '%03d' \$i).tgz; done"
     log "  To free chunk WDS shards (after precompute verified):"
     log "    rm -rf $JDB_WDS"
     log ""
