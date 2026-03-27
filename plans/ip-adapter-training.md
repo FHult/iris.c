@@ -672,8 +672,11 @@ Expected loss: ~3–5% → ~1.55M usable unique images, 310 shards.
 ### 2.7 Pre-compute frozen forward passes
 
 Three encoders run during every training step with frozen weights: SigLIP, VAE, and Qwen3.
-Each image is visited ~78 times over 120K steps — computing these three passes from scratch
-on every visit wastes GPU time. Pre-compute and cache all three if storage permits.
+At 2.15M images across ~430 shards, 105K steps × batch=2 covers only ~10% of the dataset
+(~1 visit per image on the selected shards). Pre-computing and caching encoder outputs
+eliminates repeated frozen forward passes and is especially valuable since VAE dominates
+at ~0.28 s/image. Cache all three if storage permits. See `train/TRAINING.md` for full
+coverage analysis and per-chunk shard sizing guidance.
 
 **Combined savings if all three are pre-computed:**
 ```

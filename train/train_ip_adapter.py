@@ -405,6 +405,8 @@ def train(config: dict) -> None:
         siglip_cache_dir=dcfg.get("siglip_cache_dir"),
         anchor_shard_dir=dcfg.get("anchor_shard_dir"),
         anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
+        hard_example_dir=dcfg.get("hard_example_dir"),
+        hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -873,6 +875,9 @@ def main():
                         help="Override max_steps from config")
     parser.add_argument("--anchor-shards", default=None,
                         help="Path to anchor shard directory mixed into every chunk (20%% of batches)")
+    parser.add_argument("--hard-examples", default=None,
+                        help="Path to hard example shard directory (from mine_hard_examples.py); "
+                             "mixed at hard_mix_ratio (default 5%%)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate config without training")
     args = parser.parse_args()
@@ -888,6 +893,8 @@ def main():
         config["training"]["num_steps"] = args.max_steps
     if args.anchor_shards is not None:
         config["data"]["anchor_shard_dir"] = args.anchor_shards
+    if args.hard_examples is not None:
+        config["data"]["hard_example_dir"] = args.hard_examples
 
     if args.dry_run:
         print("Config OK:")

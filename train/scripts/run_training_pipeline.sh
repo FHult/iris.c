@@ -64,6 +64,7 @@ DATA_ROOT="${DATA_ROOT:-$TRAIN_DIR/data}"
 CONFIG="$TRAIN_DIR/configs/stage1_512px.yaml"
 OVERRIDE_STEPS=""
 OVERRIDE_LR=""
+SCALE=""
 ENABLE_SIGLIP=false
 ENABLE_RECAPTION=false
 SKIP_TRAIN=false
@@ -83,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --config)      CONFIG="$2";      shift 2 ;;
         --steps)       OVERRIDE_STEPS="$2"; shift 2 ;;
         --lr)          OVERRIDE_LR="$2"; shift 2 ;;
+        --scale)       SCALE="$2";       shift 2 ;;
         --siglip)      ENABLE_SIGLIP=true;     shift ;;
         --recaption)   ENABLE_RECAPTION=true;  shift ;;
         --skip-train)  SKIP_TRAIN=true;        shift ;;
@@ -95,8 +97,67 @@ done
 if [[ "$CHUNK" -lt 1 || "$CHUNK" -gt 4 ]]; then
     echo "ERROR: --chunk must be 1–4, got: $CHUNK" >&2; exit 1
 fi
+
+# ── Scale presets ─────────────────────────────────────────────────────────────
+# Maps preset or step count to (steps_chunk1, steps_chunkN, shards_chunk1, shards_chunkN).
+# Shard counts = ceil(steps * batch=2 / avg_records_per_shard=4970), sized for ~1 pass
+# through selected shards to maximise diversity over repetition.
+#
+#   small:     50K / 15K steps,  21 /  7 shards  — fast iteration / proof-of-concept
+#   medium:   105K / 40K steps,  43 / 17 shards  — default (current plan)
+#   large:    200K / 60K steps,  81 / 25 shards  — recommended for reference-class quality
+#   god-like: 400K /120K steps, 162 / 50 shards  — maximum quality on M1 Max (~12 days)
+#   all-in:   540K /200K steps,  ALL shards      — every downloaded image, ~18 days total
+#
+# all-in precomputes the entire shard pool (no --max-shards) and trains for ~0.5 passes
+# through all available data. Steps are fixed; actual coverage depends on total shards.
+#
+# Numeric --scale N sets steps directly; shards derived as ceil(N * 2 / 4970).
+# --steps always overrides --scale for step count; shard count still follows scale.
+SCALE_STEPS_C1=""
+SCALE_STEPS_CX=""
+SCALE_SHARDS_C1=""
+SCALE_SHARDS_CX=""
+if [[ -n "$SCALE" ]]; then
+    case "$SCALE" in
+        small)
+            SCALE_STEPS_C1=50000;  SCALE_STEPS_CX=15000
+            SCALE_SHARDS_C1=21;    SCALE_SHARDS_CX=7  ;;
+        medium)
+            SCALE_STEPS_C1=105000; SCALE_STEPS_CX=40000
+            SCALE_SHARDS_C1=43;    SCALE_SHARDS_CX=17 ;;
+        large)
+            SCALE_STEPS_C1=200000; SCALE_STEPS_CX=60000
+            SCALE_SHARDS_C1=81;    SCALE_SHARDS_CX=25 ;;
+        god-like)
+            SCALE_STEPS_C1=400000; SCALE_STEPS_CX=120000
+            SCALE_SHARDS_C1=162;   SCALE_SHARDS_CX=50 ;;
+        all-in)
+            # 540K ≈ 0.5 pass through 432 shards × 4970 records at batch=2.
+            # No shard limit — precomputes the entire downloaded pool.
+            SCALE_STEPS_C1=540000; SCALE_STEPS_CX=200000
+            SCALE_SHARDS_C1="";    SCALE_SHARDS_CX="" ;;
+        ''|*[!0-9]*)
+            echo "ERROR: --scale must be small|medium|large|god-like|all-in or a positive integer, got: $SCALE" >&2
+            exit 1 ;;
+        *)  # numeric steps
+            SCALE_STEPS_C1="$SCALE"; SCALE_STEPS_CX="$SCALE"
+            SCALE_SHARDS_C1=$(( (SCALE * 2 + 4969) / 4970 ))
+            SCALE_SHARDS_CX=$SCALE_SHARDS_C1 ;;
+    esac
+fi
+
+# --steps overrides scale for step count only; shard limit still follows scale
+[[ -n "$OVERRIDE_STEPS" ]] && SCALE_STEPS_C1="$OVERRIDE_STEPS" && SCALE_STEPS_CX="$OVERRIDE_STEPS"
+
+if [[ "$CHUNK" -eq 1 ]]; then
+    TRAIN_STEPS="${SCALE_STEPS_C1:-${CHUNK_STEPS[$CHUNK]}}"
+    PRECOMPUTE_SHARDS="${SCALE_SHARDS_C1:-}"
+else
+    TRAIN_STEPS="${SCALE_STEPS_CX:-${CHUNK_STEPS[$CHUNK]}}"
+    PRECOMPUTE_SHARDS="${SCALE_SHARDS_CX:-}"
+fi
 TRAIN_LR="${OVERRIDE_LR:-${CHUNK_LR[$CHUNK]}}"
-TRAIN_STEPS="${OVERRIDE_STEPS:-${CHUNK_STEPS[$CHUNK]}}"
 
 # ── Early checks (before logging so we can fail cleanly) ─────────────────────
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: data root not found: $DATA_ROOT — run setup_data_dir.sh first" >&2; exit 1; }
@@ -170,7 +231,7 @@ log "================================================================="
 log "  IP-Adapter training pipeline  chunk=$CHUNK"
 log "  DATA_ROOT: $DATA_ROOT"
 log "  CONFIG:    $CONFIG"
-log "  LR:        $TRAIN_LR    STEPS: $TRAIN_STEPS"
+log "  LR:        $TRAIN_LR    STEPS: $TRAIN_STEPS${SCALE:+    SCALE: $SCALE}${PRECOMPUTE_SHARDS:+    MAX-SHARDS: $PRECOMPUTE_SHARDS}"
 log "  Log:       $LOG"
 log "  Lock:      $LOCK_FILE  (PID $$)"
 log "================================================================="
@@ -455,13 +516,15 @@ PYEOF
     if [[ -f "$PRECOMPUTE_DONE" ]]; then
         log "[8/9] Precompute already done — skipping"
     else
-        log "[8/9] Precomputing Qwen3 + VAE (~14h, ~341 GB)..."
+        log "[8/9] Precomputing Qwen3 + VAE${PRECOMPUTE_SHARDS:+ (max $PRECOMPUTE_SHARDS shards, seed=$CHUNK)}..."
         PRECOMPUTE_ARGS=(
             --shards        "$SHARDS_DIR"
             --qwen3-output  "$QWEN3_DIR"
             --vae-output    "$VAE_DIR"
             --flux-model    "$FLUX_MODEL"
+            --seed          "$CHUNK"
         )
+        [[ -n "$PRECOMPUTE_SHARDS" ]] && PRECOMPUTE_ARGS+=(--max-shards "$PRECOMPUTE_SHARDS")
         $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
         retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
         touch "$PRECOMPUTE_DONE"
@@ -514,6 +577,28 @@ PYEOF
 
         retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
         log "Stage 1 training complete."
+
+        # ── Mine hard examples from chunk 1 ───────────────────────────────────
+        # Identifies the ~2000 highest-loss training samples using the EMA checkpoint.
+        # Writes to train/data/hard_examples/ — never deleted between chunks.
+        # Chunks 2-4 mix these in at 5% to focus gradient on difficult cases.
+        HARD_DIR="$DATA_ROOT/hard_examples"
+        # Resolve checkpoint_dir from config as absolute path so CWD doesn't matter.
+        _ckpt_rel=$(grep -m1 'checkpoint_dir:' "$CONFIG" 2>/dev/null | awk -F'"' '{print $2}')
+        CKPT_DIR="${REPO_DIR}/${_ckpt_rel:-checkpoints/stage1}"
+        BEST_CKPT="$CKPT_DIR/best.safetensors"
+        if [[ -f "$BEST_CKPT" ]]; then
+            log "[9b/9] Mining hard examples from chunk 1 (EMA checkpoint)..."
+            MINE_ARGS=(--checkpoint "$BEST_CKPT" --shards "$SHARDS_DIR"
+                        --qwen3-cache "$QWEN3_DIR" --vae-cache "$VAE_DIR"
+                        --output "$HARD_DIR")
+            $ENABLE_SIGLIP && MINE_ARGS+=(--siglip-cache "$DATA_ROOT/precomputed/siglip")
+            python "$SCRIPT_DIR/mine_hard_examples.py" "${MINE_ARGS[@]}" \
+                && log "  Done: hard examples in $HARD_DIR" \
+                || log "  WARNING: hard example mining failed — skipping (non-fatal)"
+        else
+            log "[9b/9] Skipping hard example mining (no checkpoint at $BEST_CKPT)"
+        fi
 
         # Wait for prefetch if it's still running
         if [[ -n "$PREFETCH2_PID" ]] && kill -0 "$PREFETCH2_PID" 2>/dev/null; then
@@ -681,12 +766,22 @@ PYEOF
     # precompute_all.py reads each shard once and writes Qwen3 + VAE [+ SigLIP].
     # Per-sample .npz skip logic means only new shards do real work on resume.
     SIGLIP_DIR="$DATA_ROOT/precomputed/siglip"
-    log "[4/6] Precomputing Qwen3 + VAE embeddings for chunk $CHUNK shards..."
+    # For chunks 2+: reserve 70% of the shard budget for new (not-yet-precomputed) shards,
+    # keeping 30% from the existing pool for continuity.  This ensures each chunk
+    # introduces meaningful new data rather than re-processing already-seen shards.
+    _new_first=0
+    if [[ -n "$PRECOMPUTE_SHARDS" && "$CHUNK" -gt 1 ]]; then
+        _new_first=$(( PRECOMPUTE_SHARDS * 70 / 100 ))
+    fi
+    log "[4/6] Precomputing Qwen3 + VAE embeddings for chunk $CHUNK${PRECOMPUTE_SHARDS:+ (max $PRECOMPUTE_SHARDS, seed=$CHUNK${_new_first:+, new-first=$_new_first})}..."
     CHUNK_PRECOMPUTE_ARGS=(
         --shards       "$SHARDS_DIR"
         --qwen3-output "$QWEN3_DIR"
         --vae-output   "$VAE_DIR"
+        --seed         "$CHUNK"
     )
+    [[ -n "$PRECOMPUTE_SHARDS" ]] && CHUNK_PRECOMPUTE_ARGS+=(--max-shards "$PRECOMPUTE_SHARDS")
+    [[ "$_new_first" -gt 0 ]]     && CHUNK_PRECOMPUTE_ARGS+=(--new-shards-first "$_new_first")
     $ENABLE_SIGLIP && CHUNK_PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
     retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${CHUNK_PRECOMPUTE_ARGS[@]}"
     log "  Done: embeddings in $QWEN3_DIR and $VAE_DIR"
@@ -702,18 +797,40 @@ PYEOF
             log "  Auto-detected checkpoint: $RESUME"
         fi
 
+        HARD_DIR="$DATA_ROOT/hard_examples"
         log "[5/6] Resuming training for chunk $CHUNK ($TRAIN_STEPS steps, lr=$TRAIN_LR)..."
-        log "       Checkpoint: $RESUME"
+        log "       Checkpoint:    $RESUME"
         log "       Anchor shards: $ANCHOR_DIR"
+        [[ -d "$HARD_DIR" && $(count_tars "$HARD_DIR") -gt 0 ]] && \
+            log "       Hard examples: $HARD_DIR ($(count_tars "$HARD_DIR") shards, 5% mix)"
 
-        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" \
-            --config    "$CONFIG" \
-            --resume    "$RESUME" \
-            --lr        "$TRAIN_LR" \
-            --max-steps "$TRAIN_STEPS" \
+        CHUNK_TRAIN_ARGS=(
+            --config    "$CONFIG"
+            --resume    "$RESUME"
+            --lr        "$TRAIN_LR"
+            --max-steps "$TRAIN_STEPS"
             --anchor-shards "$ANCHOR_DIR"
+        )
+        [[ -d "$HARD_DIR" && $(count_tars "$HARD_DIR") -gt 0 ]] && \
+            CHUNK_TRAIN_ARGS+=(--hard-examples "$HARD_DIR")
 
+        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" "${CHUNK_TRAIN_ARGS[@]}"
         log "Chunk $CHUNK training complete."
+
+        # Mine hard examples after each chunk, appending to the persistent store.
+        # CKPT_DIR is already set above from config; BEST_CKPT is absolute.
+        BEST_CKPT="$CKPT_DIR/best.safetensors"
+        if [[ -f "$BEST_CKPT" ]]; then
+            log "[5b/6] Mining hard examples for chunk $CHUNK (appending to $HARD_DIR)..."
+            python "$SCRIPT_DIR/mine_hard_examples.py" \
+                --checkpoint "$BEST_CKPT" \
+                --shards     "$SHARDS_DIR" \
+                --qwen3-cache "$QWEN3_DIR" \
+                --vae-cache   "$VAE_DIR" \
+                --output      "$HARD_DIR" \
+            && log "  Done: $(count_tars "$HARD_DIR") hard example shards total" \
+            || log "  WARNING: hard example mining failed — skipping (non-fatal)"
+        fi
     fi
 
     # ── 6. Clean up raw chunk files to free SSD space ─────────────────────────
@@ -733,6 +850,10 @@ PYEOF
     log "    rm -rf $JDB_WDS"
     log ""
     log "  !! Delete only after confirming embeddings are in $QWEN3_DIR and $VAE_DIR !!"
+    log ""
+    log "  NEVER delete:"
+    log "    $DATA_ROOT/anchor_shards/   — persistent anchor set (always mixed in)"
+    log "    $DATA_ROOT/hard_examples/   — persistent hard examples (always mixed in)"
 
 else
     die "Invalid --chunk $CHUNK (must be 1–4)"

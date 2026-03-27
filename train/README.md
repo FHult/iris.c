@@ -31,9 +31,16 @@ train/
     clip_dedup.py           CLIP-based deduplication via clip-retrieval + FAISS
                             --num_prepro_workers PERF_CORES; writes duplicate_ids.txt
     recaption.py            Moondream re-captioning (style-focused prompt, 2 parallel procs)
+    precompute_all.py       Unified Qwen3 + VAE precompute in a single shard pass
+                            --max-shards N  selective sampling (sized by --scale)
+                            --new-shards-first N  bias toward unprocessed shards (chunks 2-4)
+                            --seed INT  reproducible random shard selection per chunk
     precompute_qwen3.py     4-bit quantise Qwen3 text embeddings (~143 GB, saves 200ms/step)
     precompute_vae.py       int8 quantise VAE latents (~198 GB, saves 180ms/step)
     precompute_siglip.py    4-bit quantise SigLIP features (~420 GB, saves 50ms/step)
+    mine_hard_examples.py   Post-chunk eval: identify highest-loss records and extract as WDS tars
+                            Samples up to --eval-records 5000, extracts top-K=2000 by flow loss
+                            Output: hard_examples/*.tar — persistent across chunks, mixed at 5%
   configs/
     stage1_512px.yaml       Stage 1 training config (512px, ~105K steps)
     stage2_768px.yaml       Stage 2 training config (768px, ~20K steps)

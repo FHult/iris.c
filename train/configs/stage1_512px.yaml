@@ -23,6 +23,10 @@ data:
   qwen3_cache_dir: "train/data/precomputed/qwen3"    # ~143 GB, saves ~200ms/step
   vae_cache_dir: "train/data/precomputed/vae"        # ~198 GB, saves ~180ms/step
   siglip_cache_dir: null                                     # ~420 GB — skip if space tight
+  anchor_shard_dir: null                              # set by pipeline (10 anchor shards, always mixed)
+  anchor_mix_ratio: 0.20
+  hard_example_dir: null                              # set by pipeline after chunk 1 mining completes
+  hard_mix_ratio: 0.05                               # 5% of batches from hard examples
   batch_size: 2
   prefetch_batches: 6
   num_prefetch_threads: 2

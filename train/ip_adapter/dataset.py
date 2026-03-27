@@ -278,6 +278,8 @@ def make_prefetch_loader(
     siglip_cache_dir: Optional[str] = None,
     anchor_shard_dir: Optional[str] = None,
     anchor_mix_ratio: float = 0.20,
+    hard_example_dir: Optional[str] = None,
+    hard_mix_ratio: float = 0.05,
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -286,6 +288,10 @@ def make_prefetch_loader(
     anchor_shard_dir:     path to anchor shards mixed in at anchor_mix_ratio (default 20%).
                           Use during incremental/chunked training to prevent distribution shift.
     anchor_mix_ratio:     fraction of batches drawn from anchor set (default 0.20)
+    hard_example_dir:     path to hard example shards (from mine_hard_examples.py).
+                          Mixed in at hard_mix_ratio every epoch; focuses gradient signal
+                          on samples the model found difficult in the previous chunk.
+    hard_mix_ratio:       fraction of batches drawn from hard examples (default 0.05)
     batch_size:           images per batch (default 2)
     image_dropout_prob:   null image conditioning dropout rate (default 0.30)
     text_dropout_prob:    null text conditioning dropout rate (default 0.10)
@@ -313,6 +319,17 @@ def make_prefetch_loader(
             if f.endswith(".tar")
         )
 
+    hard_paths: List[str] = []
+    if hard_example_dir and os.path.isdir(hard_example_dir):
+        hard_paths = sorted(
+            os.path.join(hard_example_dir, f)
+            for f in os.listdir(hard_example_dir)
+            if f.endswith(".tar")
+        )
+        if hard_paths:
+            print(f"Hard examples: {len(hard_paths)} shards in {hard_example_dir} "
+                  f"(mix ratio {hard_mix_ratio:.0%})", flush=True)
+
     shard_q: queue.Queue = queue.Queue(maxsize=2)
     sample_q: queue.Queue = queue.Queue(maxsize=sample_buffer)
 
@@ -321,11 +338,17 @@ def make_prefetch_loader(
         rng = random.Random()
         consecutive_errors = 0
         while True:
-            # Build this epoch's shard list: mix anchor shards at anchor_mix_ratio
+            # Build this epoch's shard list:
+            #   - anchor shards at anchor_mix_ratio (forgetting prevention)
+            #   - hard example shards at hard_mix_ratio (focus on difficult cases)
             epoch_paths = list(paths)
+            remaining_ratio = 1.0 - anchor_mix_ratio - hard_mix_ratio
             if anchor_paths:
-                n_anchor = max(1, int(len(epoch_paths) * anchor_mix_ratio / (1 - anchor_mix_ratio)))
+                n_anchor = max(1, int(len(epoch_paths) * anchor_mix_ratio / max(remaining_ratio, 0.01)))
                 epoch_paths += rng.choices(anchor_paths, k=n_anchor)
+            if hard_paths:
+                n_hard = max(1, int(len(epoch_paths) * hard_mix_ratio / max(remaining_ratio, 0.01)))
+                epoch_paths += rng.choices(hard_paths, k=n_hard)
             rng.shuffle(epoch_paths)
             for path in epoch_paths:
                 try:

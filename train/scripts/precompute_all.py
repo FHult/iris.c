@@ -610,12 +610,56 @@ def main():
                         help="Images per VAE encode call (default 16)")
     parser.add_argument("--siglip-batch", type=int, default=8,
                         help="Images per SigLIP forward pass (default 8)")
+    parser.add_argument("--max-shards", type=int, default=None,
+                        help="Randomly select N shards from the pool instead of all "
+                             "(use with --scale to limit precompute to training budget)")
+    parser.add_argument("--new-shards-first", type=int, default=0,
+                        help="Reserve this many slots for shards not yet in any precomputed "
+                             "output dir, filling remaining slots from the full pool. "
+                             "Use for chunks 2+ to prioritise newly downloaded data. "
+                             "Set to 0 (default) for uniform random selection.")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="Random seed for shard selection (default 1; use chunk number "
+                             "for reproducible but distinct selections per chunk)")
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if not shards:
         print(f"No .tar files in {args.shards}", file=sys.stderr)
         sys.exit(1)
+
+    if args.max_shards is not None and args.max_shards < len(shards):
+        import random as _random
+        _rng = _random.Random(args.seed)
+        n_total = len(shards)
+
+        if args.new_shards_first > 0:
+            # Identify shards that have no precomputed output yet (new data).
+            # A shard is "new" if no .npz exists for it in any output directory.
+            out_dirs = [d for d in [args.qwen3_output, args.vae_output] if d]
+            def _has_output(shard_path: str) -> bool:
+                stem = os.path.splitext(os.path.basename(shard_path))[0]
+                return any(
+                    os.path.exists(os.path.join(d, f"{stem}.npz")) or
+                    # per-record npz files use record IDs not shard stem; check dir non-empty
+                    (os.path.isdir(d) and bool(os.listdir(d)))
+                    for d in out_dirs
+                )
+            new_shards = [s for s in shards if not _has_output(s)]
+            old_shards = [s for s in shards if _has_output(s)]
+            n_new = min(args.new_shards_first, len(new_shards), args.max_shards)
+            n_old = args.max_shards - n_new
+            selected  = _rng.sample(new_shards, n_new) if n_new > 0 else []
+            selected += _rng.sample(old_shards, min(n_old, len(old_shards))) if n_old > 0 else []
+            print(f"  --max-shards: {len(selected)} selected "
+                  f"({n_new} new + {len(selected)-n_new} old) of {n_total} available  "
+                  f"[seed={args.seed}]")
+        else:
+            selected = _rng.sample(shards, args.max_shards)
+            print(f"  --max-shards: selected {len(selected)} of {n_total} available shards  "
+                  f"[seed={args.seed}]")
+
+        shards = sorted(selected)  # stable order for reproducible ETA display
 
     siglip_out = args.siglip_output if args.siglip else None
 

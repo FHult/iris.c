@@ -14,7 +14,14 @@
 #   --data-root PATH   Override auto-detected data root
 #   --resume PATH      Checkpoint to resume from (required for chunks 2–4)
 #   --config PATH      Training config YAML (default: train/configs/stage1_512px.yaml)
-#   --steps N          Override step count for this chunk
+#   --scale PRESET     Training scale: small|medium|large|god-like or a step count N
+#                        small:     50K / 15K steps,  21 /  7 shards  (fast iteration)
+#                        medium:   105K / 40K steps,  43 / 17 shards  (default)
+#                        large:    200K / 60K steps,  81 / 25 shards  (recommended)
+#                        god-like: 400K /120K steps, 162 / 50 shards  (max quality)
+#                        all-in:   540K /200K steps,  ALL shards      (~18 days total)
+#                      Controls both step count and how many shards are precomputed.
+#   --steps N          Override step count only (shard count still follows --scale)
 #   --lr RATE          Override learning rate for this chunk
 #   --siglip           Include SigLIP precompute step
 #   --skip-dedup       Skip CLIP deduplication
@@ -39,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --data-root)  DATA_ROOT_EXPLICIT="$2"; PIPELINE_ARGS+=(--data-root "$2"); shift 2 ;;
         --resume)     PIPELINE_ARGS+=(--resume "$2"); shift 2 ;;
         --config)     PIPELINE_ARGS+=(--config "$2"); shift 2 ;;
+        --scale)      PIPELINE_ARGS+=(--scale "$2"); shift 2 ;;
         --steps)      PIPELINE_ARGS+=(--steps "$2"); shift 2 ;;
         --lr)         PIPELINE_ARGS+=(--lr "$2"); shift 2 ;;
         --siglip)     PIPELINE_ARGS+=(--siglip); shift ;;

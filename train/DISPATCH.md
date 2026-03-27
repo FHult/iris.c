@@ -14,7 +14,7 @@ Hardware: M1 Max (8 P-cores / 2 E-cores, 64 GB unified memory), 2 TB NVMe SSD.
 
 ## Pipeline Overview
 
-The pipeline has **9 steps** (some parallel) across ~3 weeks of compute:
+The pipeline has **10 steps** (some parallel) across ~3 weeks of compute (at `medium` scale):
 
 | # | Step | Duration | Output | Parallelism |
 |---|------|----------|--------|-------------|
@@ -25,19 +25,33 @@ The pipeline has **9 steps** (some parallel) across ~3 weeks of compute:
 | 4 | Build unified shards | 2–4 h | `shards/*.tar` (5000 img/shard) | filter runs in background |
 | 5 | Filter shards (final pass) | 30 min | shards rewritten in place | background during step 4 |
 | 7 | Anchor set | 5 min | `anchor_shards/` (10K images) | after step 5 |
-| 8 | Precompute Qwen3 + VAE | 14 h | `precomputed/qwen3/` + `vae/` | single unified pass |
-| 9 | Train IP-Adapter | 3–7 days | `checkpoints/step_*.safetensors` | chunked across 4 phases |
+| 8 | Precompute Qwen3 + VAE | 2–14 h | `precomputed/qwen3/` + `vae/` | selective per-chunk |
+| 9a | Train IP-Adapter (chunk N) | 1–7 days | `checkpoints/step_*.safetensors` | chunked across 4 phases |
+| 9b | Mine hard examples | 15–30 min | `hard_examples/*.tar` | after each chunk |
 
-**Key topology**: Steps 2a, 2b, and 3 all launch simultaneously at the start. Step 4 runs a concurrent background filter loop so shards are validated as they are written. Step 8 reads each shard once and writes both Qwen3 embeddings and VAE latents in a single pass (2× faster than running them sequentially).
+**Key topology**: Steps 2a, 2b, and 3 all launch simultaneously at the start. Step 4 runs a concurrent background filter loop so shards are validated as they are written. Step 8 reads each shard once and writes both Qwen3 embeddings and VAE latents in a single pass (2× faster than running them sequentially). The precompute step now uses **selective shard sampling** — only the shards needed for each chunk are precomputed (VAE dominates at ~0.28 s/image; see `train/TRAINING.md`).
 
-Training is **chunked** across 4 JourneyDB data batches. Chunk 1 is the initial full run. Chunks 2–4 fine-tune on additional data with decaying LR.
+Training is **chunked** across 4 JourneyDB data batches. Chunk 1 is the initial full run. Chunks 2–4 fine-tune on additional data with decaying LR. **Step counts and shard budget are controlled by `--scale`** (see `start` section). The table below shows `medium` defaults.
 
-| Chunk | JourneyDB range | LR | Steps |
-|-------|----------------|----|-------|
-| 1 | 000–049 | 1e-4 | 105,000 |
-| 2 | 050–099 | 3e-5 | 40,000 |
-| 3 | 100–149 | 1e-5 | 40,000 |
-| 4 | 150–201 | 1e-5 | 40,000 |
+| Chunk | JourneyDB range | LR | Steps (medium) | Hard-example mix |
+|-------|----------------|----|----------------|-----------------|
+| 1 | 000–049 | 1e-4 | 105,000 | — (mined after) |
+| 2 | 050–099 | 3e-5 | 40,000 | 5% |
+| 3 | 100–149 | 1e-5 | 40,000 | 5% |
+| 4 | 150–201 | 1e-5 | 40,000 | 5% |
+
+**Scale presets** (`--scale` option):
+
+| Preset | Chunk 1 steps | Chunks 2–4 steps | Chunk 1 shards | Chunks 2–4 shards | Wall clock |
+|--------|---------------|------------------|----------------|-------------------|------------|
+| `small` | 50,000 | 15,000 | 21 | 7 | ~3 days |
+| `medium` | 105,000 | 40,000 | 43 | 17 | ~7 days |
+| `large` | 200,000 | 60,000 | 81 | 25 | ~11 days |
+| `god-like` | 400,000 | 120,000 | 162 | 50 | ~18 days |
+| `all-in` | 540,000 | 200,000 | all | all | ~26 days |
+| `N` (numeric) | N | — | ceil(N×2/4970) | — | varies |
+
+Shard counts are sized for ~1 pass through each chunk's selected images. Each chunk uses a different random seed so the full 4-chunk pipeline samples ~4× as many unique images.
 
 ---
 
@@ -62,8 +76,16 @@ For running steps, each line shows the **most recent heartbeat** parsed from the
 
 ### `start` — Start the pipeline
 ```bash
-# Chunk 1 (initial full run):
+# Chunk 1 (initial full run, medium scale):
 bash train/scripts/pipeline_start.sh
+
+# Larger run:
+bash train/scripts/pipeline_start.sh --scale large
+bash train/scripts/pipeline_start.sh --scale god-like
+bash train/scripts/pipeline_start.sh --scale all-in   # uses every shard
+
+# Custom step count (shards sized automatically):
+bash train/scripts/pipeline_start.sh --scale 200000
 
 # Specific chunk with optional overrides:
 bash train/scripts/pipeline_start.sh --chunk 2 --resume /path/to/step_105000.safetensors
@@ -72,7 +94,9 @@ bash train/scripts/pipeline_start.sh --data-root /Volumes/2TBSSD --siglip
 ```
 Guards against double-starting: exits if a `pipeline` tmux session already exists. Launches `run_training_pipeline.sh` under `caffeinate` in a tmux session named `pipeline`.
 
-Options: `--chunk 1–4`, `--data-root PATH`, `--resume CKPT`, `--config YAML`, `--steps N`, `--lr RATE`, `--siglip`, `--recaption`, `--skip-dedup`, `--skip-train`
+Options: `--chunk 1–4`, `--scale PRESET_OR_N`, `--data-root PATH`, `--resume CKPT`, `--config YAML`, `--steps N`, `--lr RATE`, `--siglip`, `--recaption`, `--skip-dedup`, `--skip-train`
+
+The `--scale` preset controls both step count and how many shards to precompute for each chunk (see table in Pipeline Overview). When `--steps N` is also provided it overrides the step count from the preset while keeping the shard sizing.
 
 ---
 
@@ -83,7 +107,9 @@ bash train/scripts/pipeline_reset.sh --full       # also deletes downloaded data
 bash train/scripts/pipeline_reset.sh --dry-run    # preview what would be deleted
 bash train/scripts/pipeline_reset.sh --yes        # skip confirmation prompt
 ```
-Deletes all intermediate and final pipeline outputs: converted WDS dirs, unified shards, anchor set, dedup blocklist, precomputed caches, embeddings, and logs. Refuses to run if the pipeline lock is held by a live process — run `stop` first. `--full` additionally removes the downloaded raw datasets (wikiart, journeydb); LAION and COYO are never touched (pre-existing). Training checkpoints are never deleted.
+Deletes all intermediate and final pipeline outputs: converted WDS dirs, unified shards, dedup blocklist, precomputed caches, embeddings, and logs. Refuses to run if the pipeline lock is held by a live process — run `stop` first. `--full` additionally removes the downloaded raw datasets (wikiart, journeydb); LAION and COYO are never touched (pre-existing). Training checkpoints are never deleted.
+
+**NEVER delete `anchor_shards/` or `hard_examples/`.** These are persistent across all chunks — the anchor set is always mixed in, and the hard example store grows through all 4 chunks. Reset intentionally leaves them in place.
 
 ---
 
@@ -137,7 +163,9 @@ One-shot snapshot of: CPU utilisation by core class (P/E), memory pressure and s
 bash train/scripts/pipeline_precompute.sh
 bash train/scripts/pipeline_precompute.sh --siglip   # include SigLIP (~420 GB extra)
 ```
-Runs step 8 (unified Qwen3 + VAE precompute, ~14 h) via `precompute_all.py`. Reads each shard once and writes both caches in a single pass. Use after build/filter complete if you want to decouple precompute from training. Launches in tmux session `precompute`. Each .npz file is idempotent — already-computed records are skipped on restart.
+Runs step 8 (unified Qwen3 + VAE precompute) via `precompute_all.py`. Reads each shard once and writes both caches in a single pass. Use after build/filter complete if you want to decouple precompute from training. Launches in tmux session `precompute`. Each .npz file is idempotent — already-computed records are skipped on restart.
+
+**Selective precompute**: the full pipeline only precomputes the shards needed per chunk (sized by `--scale`). Subsequent chunks bias toward new/unprocessed shards via `--new-shards-first` (70% new, 30% existing) for data diversity. Pass `--max-shards N` to `precompute_all.py` directly for manual control. VAE is the dominant cost at ~0.28 s/image (~6.6 h per 43 shards); see `train/TRAINING.md` for full measurements.
 
 ---
 
@@ -202,7 +230,11 @@ raw/
   journeydb_wds/    JourneyDB chunk 1 converted to WDS (210 shards)
   wikiart_wds/      WikiArt converted to WDS (80 shards)
 shards/             Merged unified shards (~430+ shards, 5000 images each)
-anchor_shards/      Fixed anchor set (~10K images, LAION+WikiArt only)
+anchor_shards/      *** PERSISTENT *** Fixed anchor set (~10K images, LAION+WikiArt only)
+                    Always mixed into training (20% by default). Never delete.
+hard_examples/      *** PERSISTENT *** Highest-loss records extracted after each chunk
+                    WDS .tar files written by mine_hard_examples.py; grows across chunks
+                    Mixed at 5% into subsequent chunk training. Never delete.
 dedup_ids/
   duplicate_ids.txt Blocklist from CLIP dedup (124,340 IDs)
   dedup_index.faiss Cross-chunk FAISS index (chunk 2+ only)
@@ -215,6 +247,8 @@ logs/               Pipeline run logs (pipeline_chunk*.log)
 ```
 
 Checkpoints: `train/checkpoints/` (on the internal SSD, not the external).
+
+**Storage note**: Only the shards selected by `--scale` are precomputed per chunk — you do not need to precompute all ~430 shards upfront. At `medium` scale, chunk 1 uses ~43 shards (~341 GB of precomputed data), chunks 2–4 use ~17 each.
 
 ---
 
@@ -230,6 +264,10 @@ Checkpoints: `train/checkpoints/` (on the internal SSD, not the external).
 | FAISS SIGSEGV | OpenMP on Apple Silicon | Already fixed (`omp_set_num_threads(1)`) |
 | tmux session not found on `resume` | Previous run already finished or crashed | Check `pipeline_status.sh`, then `pipeline_start.sh` |
 | Pipeline killed when shell exits | Not using tmux | Use `pipeline_start.sh` (launches in tmux automatically) |
+| Chunk 2+ training loss spikes | hard_examples/ deleted between chunks | Restore from backup or skip `--hard-examples` for that chunk |
+| Mining step fails: no EMA checkpoint | Chunk 1 ended before first ema_update_every | Check checkpoints/; mining needs at least one EMA .safetensors |
+| Precompute much slower than expected | All shards already done (--new-shards-first had nothing new) | Normal — idempotent skip is fast; actual precompute only on new shards |
+| Training only sees anchor + hard data | remaining_ratio near zero (anchor + hard ratios sum to ≥1.0) | Reduce anchor_mix_ratio or hard_mix_ratio in stage config |
 
 ---
 
@@ -245,9 +283,11 @@ Checkpoints: `train/checkpoints/` (on the internal SSD, not the external).
 
 **"System seems slow / SSD is hot"** → `pipeline_sysmon.sh`
 
-**"Training finished chunk 1, start chunk 2"** → `pipeline_start.sh --chunk 2` (auto-detects latest checkpoint)
+**"Training finished chunk 1, start chunk 2"** → mining runs automatically; then `pipeline_start.sh --chunk 2` (auto-detects latest checkpoint, mixes hard examples in).
 
-**"I need to free up disk space"** → `pipeline_sysmon.sh` shows disk; raw/ dirs safe to delete once shards are built; embeddings/ safe to delete once dedup is done.
+**"I need to free up disk space"** → `pipeline_sysmon.sh` shows disk; raw/ dirs safe to delete once shards are built; embeddings/ safe to delete once dedup is done. Never delete `anchor_shards/` or `hard_examples/`.
+
+**"I want to increase the training budget"** → re-run with `--scale large` or `--scale god-like`; precompute is idempotent so only new shards are processed.
 
 **"Something looks wrong — training loss is high or a step finished suspiciously fast"** → `pipeline_doctor.sh` — audits all outputs for correctness.
 
