@@ -105,23 +105,24 @@ fi
 # Helper: per-source state string for step 1 detail lines
 _jdb_src_state() {
     local raw="$1" expected="$2" wds="$3" extra="${4:-pending}"
-    if [[ $raw -gt 0 ]]; then echo "${raw}/${expected} tgz · WDS ${wds} shards"
-    elif [[ $wds -gt 0 ]]; then echo "raw deleted · WDS ready (${wds} shards)"
+    if [[ $raw -gt 0 && $wds -gt 0 ]]; then echo "${raw}/${expected} tgz [retained] · WDS ${wds} shards [retained]"
+    elif [[ $raw -gt 0 ]]; then              echo "${raw}/${expected} tgz [retained] · WDS not yet converted"
+    elif [[ $wds -gt 0 ]]; then              echo "tgz deleted · WDS ${wds} shards [retained]"
     else echo "$extra"; fi
 }
 
-if [[ $LAION_TARS -gt 0 ]]; then         LAION_STATE="${LAION_TARS} tars"
-elif [[ $SHARD_COUNT -gt 0 ]]; then       LAION_STATE="raw deleted · used in step 4"
+if [[ $LAION_TARS -gt 0 ]]; then         LAION_STATE="${LAION_TARS} tars [retained]"
+elif [[ $SHARD_COUNT -gt 0 ]]; then       LAION_STATE="deleted · used in step 4"
 else                                       LAION_STATE="not downloaded"; fi
 
-if [[ $COYO_TARS -gt 0 ]]; then           COYO_STATE="${COYO_TARS} tars"
-elif [[ $SHARD_COUNT -gt 0 ]]; then       COYO_STATE="raw deleted · used in step 4"
+if [[ $COYO_TARS -gt 0 ]]; then           COYO_STATE="${COYO_TARS} tars [retained]"
+elif [[ $SHARD_COUNT -gt 0 ]]; then       COYO_STATE="deleted · used in step 4"
 else                                       COYO_STATE="not downloaded"; fi
 
 if $WIKIART_RAW_EXISTS; then
-    WIKIART_STATE="raw present"
+    WIKIART_STATE="raw retained"
     [[ $WIKIART_WDS_TARS -gt 0 ]] && WIKIART_STATE+=" · WDS ${WIKIART_WDS_TARS} shards"
-elif [[ $WIKIART_WDS_TARS -gt 0 ]]; then  WIKIART_STATE="raw deleted · WDS ready (${WIKIART_WDS_TARS} shards)"
+elif [[ $WIKIART_WDS_TARS -gt 0 ]]; then  WIKIART_STATE="raw deleted · WDS ${WIKIART_WDS_TARS} shards [retained]"
 else                                       WIKIART_STATE="not downloaded"; fi
 
 JDB1_STATE=$(_jdb_src_state $JDB_RAW1_TGZS 50 $JDB_WDS_TARS)
@@ -245,7 +246,8 @@ echo "── Steps ────────────────────�
 step_status "[1/10] Verify downloads" \
     "[[ $LAION_TARS -gt 0 || $SHARD_COUNT -gt 0 || $WIKIART_WDS_TARS -gt 0 || $JDB_WDS_TARS -gt 0 ]]" "" \
     ""
-printf "       LAION:   %-38s COYO: %s\n" "$LAION_STATE" "$COYO_STATE"
+printf "       LAION:   %s\n" "$LAION_STATE"
+printf "       COYO:    %s\n" "$COYO_STATE"
 printf "       WikiArt: %s\n" "$WIKIART_STATE"
 printf "       JDB 1 (000-049):  %s\n" "$JDB1_STATE"
 printf "       JDB 2 (050-099):  %s\n" "$JDB2_STATE"
