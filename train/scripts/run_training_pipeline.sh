@@ -289,12 +289,16 @@ if [[ "$CHUNK" -eq 1 ]]; then
 
     # Pre-create output directories for all parallel background jobs so they
     # never fail due to a missing parent directory.
+    SHARDS_DIR="$DATA_ROOT/shards"
+    FILTER_DONE="$SHARDS_DIR/.filtered_chunk1"
     mkdir -p "$WIKIART_WDS" "$JDB_WDS" \
              "$DATA_ROOT/embeddings" "$DATA_ROOT/dedup_ids"
 
     # ── WikiArt background job ────────────────────────────────────────────────
     WIKIART_PID=""
-    if [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
+    if [[ -f "$FILTER_DONE" ]]; then
+        log "  WikiArt:   shards already built — skipping WDS"
+    elif [[ $(count_tars "$WIKIART_WDS") -gt 0 ]]; then
         log "  WikiArt:   WDS already present ($(count_tars "$WIKIART_WDS") shards) — skipping"
     else
         log "  WikiArt:   launching → $WIKIART_LOG"
@@ -329,7 +333,9 @@ PYEOF
     _jdb_want_c1="${PRECOMPUTE_SHARDS:-50}"
     JDB_DOWNLOAD_N=$(( _jdb_want_c1 < 50 ? _jdb_want_c1 : 50 ))
     JDB_PID=""
-    if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
+    if [[ -f "$FILTER_DONE" ]]; then
+        log "  JourneyDB: shards already built — skipping WDS"
+    elif [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
         log "  JourneyDB: WDS already present ($(count_tars "$JDB_WDS") shards) — skipping"
     else
         log "  JourneyDB: launching → $JDB_LOG"
@@ -415,8 +421,6 @@ PYEOF
     [[ "$PARALLEL_FAIL" -eq 0 ]] || die "One or more parallel steps failed"
 
     # ── 1e. Build unified shards (+ concurrent filter) ────────────────────────
-    SHARDS_DIR="$DATA_ROOT/shards"
-    FILTER_DONE="$SHARDS_DIR/.filtered_chunk1"
     if [[ $(count_tars "$SHARDS_DIR") -gt 0 ]]; then
         log "[4/9] Unified shards already built ($(count_tars "$SHARDS_DIR") shards) — skipping"
     else

@@ -239,7 +239,7 @@ def train(config: dict) -> None:
     dcfg = config["data"]
     tcfg = config["training"]
     ocfg = config["output"]
-    lcfg = config.get("logging", {})
+    lcfg = config.get("logging") or {}
 
     # ── Optional W&B logging ──────────────────────────────────────────────────
     wandb_run = None

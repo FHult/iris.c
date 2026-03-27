@@ -51,5 +51,5 @@ output:
   log_every: 100
 
 logging:
-  wandb_project: "iris-ip-adapter"
-  wandb_run_name: "stage1-512px"
+  # wandb_project: "iris-ip-adapter"
+  # wandb_run_name: "stage1-512px"
