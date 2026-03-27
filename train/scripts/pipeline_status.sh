@@ -79,13 +79,13 @@ PRECOMP_DIR="$DATA_ROOT/precomputed"
 CKPT_DIR="$TRAIN_DIR/checkpoints"
 LOCK_FILE="$DATA_ROOT/logs/pipeline.lock"
 
-# JourneyDB per-phase summary for display (phase N: shard count or ⬜ if not yet downloaded)
+# JourneyDB per-phase WDS shard count for [2b/10] summary line
 _jdb_phase() {
-    local n="$1" tars="$2" label="$3"
-    if [[ $tars -gt 0 ]]; then printf "ph.%s:%s(%s)" "$n" "$tars" "$label"
-    else printf "ph.%s:⬜" "$n"; fi
+    local n="$1" tars="$2"
+    if [[ $tars -gt 0 ]]; then printf "ph.%s:%-5s" "$n" "$tars"
+    else printf "ph.%s:⬜    " "$n"; fi
 }
-JDB_PHASE_INFO="$(_jdb_phase 1 $JDB_WDS_TARS 000-049)  $(_jdb_phase 2 $JDB_WDS2_TARS 050-099)  $(_jdb_phase 3 $JDB_WDS3_TARS 100-149)  $(_jdb_phase 4 $JDB_WDS4_TARS 150-201)"
+JDB_PHASE_INFO="$(_jdb_phase 1 $JDB_WDS_TARS)  $(_jdb_phase 2 $JDB_WDS2_TARS)  $(_jdb_phase 3 $JDB_WDS3_TARS)  $(_jdb_phase 4 $JDB_WDS4_TARS)"
 
 # ── Per-source raw state for step 1 detail lines ──────────────────────────────
 WIKIART_RAW_EXISTS=false; [[ -d "$DATA_ROOT/raw/wikiart" ]] && WIKIART_RAW_EXISTS=true
@@ -245,10 +245,12 @@ echo "── Steps ────────────────────�
 step_status "[1/10] Verify downloads" \
     "[[ $LAION_TARS -gt 0 || $SHARD_COUNT -gt 0 || $WIKIART_WDS_TARS -gt 0 || $JDB_WDS_TARS -gt 0 ]]" "" \
     ""
-printf "       LAION:   %-40s COYO: %s\n" "$LAION_STATE" "$COYO_STATE"
+printf "       LAION:   %-38s COYO: %s\n" "$LAION_STATE" "$COYO_STATE"
 printf "       WikiArt: %s\n" "$WIKIART_STATE"
-printf "       JDB ph.1(000-049): %-36s ph.2(050-099): %s\n" "$JDB1_STATE" "$JDB2_STATE"
-printf "       JDB ph.3(100-149): %-36s ph.4(150-201): %s\n" "$JDB3_STATE" "$JDB4_STATE"
+printf "       JDB 1 (000-049):  %s\n" "$JDB1_STATE"
+printf "       JDB 2 (050-099):  %s\n" "$JDB2_STATE"
+printf "       JDB 3 (100-149):  %s\n" "$JDB3_STATE"
+printf "       JDB 4 (150-201):  %s\n" "$JDB4_STATE"
 
 step_status "[2a/10] WikiArt → WDS" \
     "[[ $WIKIART_WDS_TARS -gt 0 ]]" "" \
@@ -277,7 +279,7 @@ step_status "[5/10] Filter shards" \
 
 step_status "[7/10] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
-    "($ANCHOR_COUNT shards · built from raw sources, independent of steps 4-6)"
+    "($ANCHOR_COUNT shards · built from raw sources, not from unified shards)"
 
 step_status "[8/10] Precompute Qwen3 + VAE" \
     "[[ -f $PRECOMP_DIR/.done ]]" \
