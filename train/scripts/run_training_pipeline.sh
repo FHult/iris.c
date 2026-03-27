@@ -500,6 +500,15 @@ PYEOF
         log "  Done: anchor set in $ANCHOR_DIR"
     fi
 
+    # ── Free intermediate WDS dirs ────────────────────────────────────────────
+    # build_shards and anchor set are both complete — source WDS dirs are no
+    # longer needed. Delete to reclaim space before precompute fills the SSD.
+    for _wds_dir in "$WIKIART_WDS" "$JDB_WDS"; do
+        [[ -d "$_wds_dir" ]] || continue
+        log "  Freeing intermediate WDS: $_wds_dir"
+        rm -rf "$_wds_dir"
+    done
+
     # ── 1h. Unified precompute: Qwen3 + VAE [+ SigLIP] ───────────────────────
     # Single pass over all shards — reads each tar once instead of 2-3 times.
     QWEN3_DIR="$DATA_ROOT/precomputed/qwen3"
@@ -712,6 +721,12 @@ PYEOF
             --shard-size 5000 \
             --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END_ACTUAL"
         log "  Done: $(count_tars "$JDB_WDS") shards in $JDB_WDS"
+        # Raw tgz files are no longer needed — delete to free space.
+        log "  Freeing raw tgz files for chunk $CHUNK (~$((JDB_DOWNLOAD_N * 16)) GB)..."
+        for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
+            rm -f "$IMGS_DIR/$(printf '%03d' $_i).tgz"
+        done
+        log "  Done."
     fi
 
     # ── 2b. Cross-chunk dedup: flag images already seen in previous chunks ────
@@ -753,6 +768,11 @@ PYEOF
         touch "$FILTER_DONE"
         log "  Done"
     fi
+
+    # ── Free chunk WDS dir and dedup embeddings ───────────────────────────────
+    # build+filter complete — chunk WDS and embeddings are no longer needed.
+    [[ -d "$JDB_WDS" ]]          && { log "  Freeing chunk $CHUNK WDS: $JDB_WDS"; rm -rf "$JDB_WDS"; }
+    [[ -d "$CHUNK_EMBEDDINGS" ]] && { log "  Freeing chunk $CHUNK embeddings: $CHUNK_EMBEDDINGS"; rm -rf "$CHUNK_EMBEDDINGS"; }
 
     # ── 4. Precompute embeddings for new shards (single pass, resume-safe) ──────
     # precompute_all.py reads each shard once and writes Qwen3 + VAE [+ SigLIP].
@@ -825,19 +845,9 @@ PYEOF
         fi
     fi
 
-    # ── 6. Clean up raw chunk files to free SSD space ─────────────────────────
+    # ── 6. Done ───────────────────────────────────────────────────────────────
     log "[6/6] Chunk $CHUNK complete."
-    log ""
-    log "  Raw chunk files: $JDB_RAW/data/train/imgs/ ($((JDB_DOWNLOAD_N * 16)) GB, tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL)"
-    log "  Chunk WDS shards: $JDB_WDS"
-    log "  These can be deleted to free SSD space once training is verified:"
-    log ""
-    log "  To free raw chunk data (~$((JDB_DOWNLOAD_N * 16)) GB):"
-    log "    for i in \$(seq $JDB_TGZ_START $JDB_TGZ_END_ACTUAL); do rm -f $IMGS_DIR/\$(printf '%03d' \$i).tgz; done"
-    log "  To free chunk WDS shards (after precompute verified):"
-    log "    rm -rf $JDB_WDS"
-    log ""
-    log "  !! Delete only after confirming embeddings are in $QWEN3_DIR and $VAE_DIR !!"
+    log "  Intermediate files freed automatically (raw tgz, WDS dir, dedup embeddings)."
     log ""
     log "  NEVER delete:"
     log "    $DATA_ROOT/anchor_shards/   — persistent anchor set (always mixed in)"
