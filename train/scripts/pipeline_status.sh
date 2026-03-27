@@ -1,8 +1,9 @@
 #!/bin/bash
 # train/scripts/pipeline_status.sh — Training pipeline status report.
 #
-# Prints a full status snapshot: all 9 pipeline steps with live heartbeat
-# progress from each step's log, active log tail, disk usage.
+# Prints a full status snapshot: all pipeline steps (10 including hard-example
+# mining) with live heartbeat progress from each step's log, active log tail,
+# disk usage.
 # Auto-detects DATA_ROOT from common SSD mount points so a single call
 # gives a complete picture with no follow-up queries needed.
 #
@@ -134,6 +135,8 @@ JDB4_STATE=$(_jdb_src_state $JDB_RAW4_TGZS 52 $JDB_WDS4_TARS)
 QWEN3_COUNT=$(count_files "$PRECOMP_DIR/qwen3" "*.npz")
 VAE_COUNT=$(count_files "$PRECOMP_DIR/vae" "*.npz")
 ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
+HARD_DIR="$DATA_ROOT/hard_examples"
+HARD_COUNT=$(count_tars "$HARD_DIR")
 CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | tr -d ' ')
 
 # ── Log file discovery ────────────────────────────────────────────────────────
@@ -214,13 +217,21 @@ VAE_RUN_INFO="$VAE_COUNT latents, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
 [[ -n "$hb" ]] && VAE_RUN_INFO="$hb"
 
-# Step 9 — training: "step X,XXX/105,000  loss X.XXXX (avg X.XXXX)  lr ...  ETA Xh XXm"
+# Step 9a — training: "step X,XXX/N  loss X.XXXX (avg X.XXXX)  lr ...  ETA Xh XXm"
 LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors 2>/dev/null | grep -v ema | head -1)
 LATEST_STEP=""
 [[ -n "$LATEST_CKPT" ]] && LATEST_STEP="($(basename "$LATEST_CKPT" .safetensors)) "
 TRAIN_RUN_INFO="${LATEST_STEP}running..."
 hb=$(last_match "$TRAIN_LOG" 'steps/s.*ETA [0-9]+h')
 [[ -n "$hb" ]] && TRAIN_RUN_INFO="$hb"
+
+# Step 9b — hard example mining: runs after each chunk's training
+MINE_RUNNING=false; pgrep -f mine_hard_examples &>/dev/null && MINE_RUNNING=true
+MINE_RUN_INFO="running..."
+hb=$(last_match "$TRAIN_LOG" 'Mining hard\|hard examples.*Done\|top-[0-9]+ records')
+[[ -n "$hb" ]] && MINE_RUN_INFO="$hb"
+BEST_CKPT_EXISTS=false
+[[ -f "$CKPT_DIR/stage1/best.safetensors" || -f "$TRAIN_DIR/checkpoints/stage1/best.safetensors" ]] && BEST_CKPT_EXISTS=true
 
 # ── Header ────────────────────────────────────────────────────────────────────
 echo "================================================================="
@@ -231,7 +242,7 @@ echo ""
 
 # ── Steps ─────────────────────────────────────────────────────────────────────
 echo "── Steps ────────────────────────────────────────────────────────"
-step_status "[1/9] Verify downloads" \
+step_status "[1/10] Verify downloads" \
     "[[ $LAION_TARS -gt 0 || $SHARD_COUNT -gt 0 || $WIKIART_WDS_TARS -gt 0 || $JDB_WDS_TARS -gt 0 ]]" "" \
     ""
 printf "       LAION:   %-40s COYO: %s\n" "$LAION_STATE" "$COYO_STATE"
@@ -239,48 +250,55 @@ printf "       WikiArt: %s\n" "$WIKIART_STATE"
 printf "       JDB ph.1(000-049): %-36s ph.2(050-099): %s\n" "$JDB1_STATE" "$JDB2_STATE"
 printf "       JDB ph.3(100-149): %-36s ph.4(150-201): %s\n" "$JDB3_STATE" "$JDB4_STATE"
 
-step_status "[2a/9] WikiArt → WDS" \
+step_status "[2a/10] WikiArt → WDS" \
     "[[ $WIKIART_WDS_TARS -gt 0 ]]" "" \
     "($WIKIART_WDS_TARS shards)"
 
-step_status "[2b/9] JourneyDB → WDS" \
+step_status "[2b/10] JourneyDB → WDS" \
     "[[ $JDB_WDS_TARS -gt 0 ]]" "" \
     "($JDB_PHASE_INFO)"
 
-step_status "[3/9] CLIP deduplication" \
+step_status "[3/10] CLIP deduplication" \
     "[[ -f $DEDUP_IDS ]]" \
     "pgrep -f 'clip_dedup.py all'" \
     "($DEDUP_LINES IDs blocked)" \
     "$DEDUP_RUN_INFO"
 
-step_status "[4/9] Build unified shards" \
+step_status "[4/10] Build unified shards" \
     "$BUILD_DONE" \
     "$BUILD_RUNNING" \
     "($SHARD_COUNT shards)" \
     "$BUILD_RUN_INFO"
 
-step_status "[5/9] Filter shards" \
+step_status "[5/10] Filter shards" \
     "[[ -f $SHARDS_DIR/.filtered_chunk1 && $SHARD_COUNT -gt 0 ]]" \
     "$FILTER_RUNNING" \
     "($SHARD_COUNT shards)" "$FILTER_RUN_INFO"
 
-step_status "[7/9] Anchor set" \
+step_status "[7/10] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
     "($ANCHOR_COUNT shards · built from raw sources, independent of steps 4-6)"
 
-step_status "[8/9] Precompute Qwen3 + VAE" \
+step_status "[8/10] Precompute Qwen3 + VAE" \
     "[[ -f $PRECOMP_DIR/.done ]]" \
     "$PRECOMPUTE_RUNNING" \
     "(qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  shards=$SHARD_COUNT)" \
     "$PRECOMPUTE_RUN_INFO"
 
-step_status "[9/9] Train" \
-    "[[ $CKPT_COUNT -gt 0 ]]" \
+step_status "[9a/10] Train" \
+    "[[ $CKPT_COUNT -gt 0 && $TRAIN_RUNNING == false ]]" \
     "$TRAIN_RUNNING" \
     "${LATEST_STEP}($CKPT_COUNT checkpoints)" \
     "$TRAIN_RUN_INFO"
 
-step_status "[6/9] Cross-chunk dedup index  (runs after training)" \
+step_status "[9b/10] Mine hard examples" \
+    "$BEST_CKPT_EXISTS && [[ $HARD_COUNT -gt 0 && $MINE_RUNNING == false ]]" \
+    "$MINE_RUNNING" \
+    "($HARD_COUNT hard-example shards)" \
+    "$MINE_RUN_INFO" \
+    "$(if $BEST_CKPT_EXISTS; then echo 'Pending (runs after training)'; else echo 'Pending (needs best.safetensors)'; fi)"
+
+step_status "[6/10] Cross-chunk dedup index  (runs after training)" \
     "[[ -f $DEDUP_INDEX ]]" \
     "pgrep -f 'clip_dedup.*build-index'" \
     "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
@@ -303,8 +321,10 @@ done < <(pgrep -f "run_training_pipeline" 2>/dev/null | sort -n)
 
 if [[ -n "$PIPELINE_ROOT" ]]; then
     lock_chunk=$(grep '^chunk=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2)
-    printf "  PID %-8s run_training_pipeline.sh%s\n" "$PIPELINE_ROOT" \
-        "${lock_chunk:+  (chunk $lock_chunk)}"
+    lock_scale=$(grep '^cmdline=' "$LOCK_FILE" 2>/dev/null | grep -oE '\-\-scale [^ ]+' | awk '{print $2}')
+    printf "  PID %-8s run_training_pipeline.sh%s%s\n" "$PIPELINE_ROOT" \
+        "${lock_chunk:+  (chunk $lock_chunk)}" \
+        "${lock_scale:+  scale=$lock_scale}"
 fi
 
 # Step-level worker processes (exclude pipeline shell subprocesses)
@@ -373,6 +393,8 @@ df -h "$DATA_ROOT" 2>/dev/null | awk 'NR==2 {
 echo ""
 printf "  %-28s %s\n" "raw/"                "$(du_h "$DATA_ROOT/raw")"
 printf "  %-28s %s\n" "shards/"             "$(du_h "$SHARDS_DIR") ($SHARD_COUNT tars)"
+printf "  %-28s %s\n" "anchor_shards/ [keep]" "$(du_h "$ANCHOR_DIR") ($ANCHOR_COUNT tars)"
+printf "  %-28s %s\n" "hard_examples/ [keep]" "$(du_h "$HARD_DIR") ($HARD_COUNT tars)"
 printf "  %-28s %s\n" "precomputed/qwen3/"  "$(du_h "$PRECOMP_DIR/qwen3") ($QWEN3_COUNT files)"
 printf "  %-28s %s\n" "precomputed/vae/"    "$(du_h "$PRECOMP_DIR/vae") ($VAE_COUNT files)"
 printf "  %-28s %s\n" "embeddings/"         "$(du_h "$DATA_ROOT/embeddings")"
