@@ -317,8 +317,6 @@ PYEOF
                 --output "$WIKIART_WDS" \
                 --shard-size 1000
             echo "[$(date '+%T')] Done: $(count_tars "$WIKIART_WDS") shards."
-            [[ -d "$DATA_ROOT/raw/wikiart" ]] && \
-                { echo "Removing raw WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
         ) > "$WIKIART_LOG" 2>&1 &
         WIKIART_PID=$!
     fi
@@ -365,8 +363,6 @@ PYEOF
                 --shard-size 5000 \
                 --start-tgz  0 --end-tgz $(( JDB_DOWNLOAD_N - 1 ))
             echo "[$(date '+%T')] Done: $(count_tars "$JDB_WDS") shards."
-            [[ -d "$DATA_ROOT/raw/journeydb" ]] && \
-                { echo "Removing original JourneyDB tgz (~730 GB)..."; rm -rf "$DATA_ROOT/raw/journeydb"; }
         ) > "$JDB_LOG" 2>&1 &
         JDB_PID=$!
     fi
@@ -389,6 +385,8 @@ PYEOF
     if [[ -n "$WIKIART_PID" ]]; then
         if wait "$WIKIART_PID"; then
             log "[2a/9] WikiArt done: $(count_tars "$WIKIART_WDS") shards"
+            [[ -d "$DATA_ROOT/raw/wikiart" ]] && \
+                { log "  Freeing raw WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
         else
             log "ERROR: WikiArt job failed — see $WIKIART_LOG" >&2; PARALLEL_FAIL=1
         fi
@@ -396,6 +394,11 @@ PYEOF
     if [[ -n "$JDB_PID" ]]; then
         if wait "$JDB_PID"; then
             log "[2b/9] JourneyDB done: $(count_tars "$JDB_WDS") shards"
+            log "  Freeing raw JourneyDB chunk 1 tgz (~$((JDB_DOWNLOAD_N * 16)) GB)..."
+            for _i in $(seq 0 $(( JDB_DOWNLOAD_N - 1 ))); do
+                rm -f "$DATA_ROOT/raw/journeydb/data/train/imgs/$(printf '%03d' $_i).tgz"
+            done
+            log "  Done."
         else
             log "ERROR: JourneyDB job failed — see $JDB_LOG" >&2; PARALLEL_FAIL=1
         fi
