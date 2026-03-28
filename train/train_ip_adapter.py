@@ -262,9 +262,14 @@ def train(config: dict) -> None:
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
 
-    print("Loading SigLIP SO400M (frozen) ...")
-    siglip = _load_siglip(mcfg["siglip_model"])
-    siglip.freeze()
+    use_siglip_live = dcfg.get("siglip_cache_dir") is None
+    siglip = None
+    if use_siglip_live:
+        print("Loading SigLIP SO400M (frozen, live inference — consider precomputing) ...")
+        siglip = _load_siglip(mcfg["siglip_model"])
+        siglip.freeze()
+    else:
+        print("SigLIP: using precomputed cache — skipping model load.")
 
     print("Loading VAE (frozen) ...")
     vae = _load_vae(flux)
@@ -454,8 +459,10 @@ def train(config: dict) -> None:
 
         if siglip_np is not None:
             siglip_feats = mx.array(siglip_np, dtype=mx.bfloat16)
-        else:
+        elif siglip is not None:
             siglip_feats = siglip(images)
+        else:
+            raise RuntimeError("No SigLIP features available: set siglip_cache_dir or remove it to enable live inference")
 
         # Forward + backward (compiled)
         loss_val, grads = compiled_loss_and_grad(
