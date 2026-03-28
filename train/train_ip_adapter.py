@@ -475,7 +475,7 @@ def train(config: dict) -> None:
         )
 
         # Gradient clip then optimizer step (plans §3.6)
-        grads = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
+        grads, _ = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
 
         # async_eval: overlaps ~5–10ms Python overhead with Metal execution
