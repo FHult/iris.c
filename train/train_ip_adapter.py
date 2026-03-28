@@ -86,7 +86,7 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
         return optim.join_schedules(
             [
                 optim.linear_schedule(1e-8, lr_max, steps=warmup_steps),
-                optim.cosine_decay(lr_max, decay_steps=decay_steps, eta_min=eta_min),
+                optim.cosine_decay(lr_max, decay_steps=decay_steps, end=eta_min),
             ],
             [warmup_steps],
         )
@@ -98,7 +98,7 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
         return optim.join_schedules(
             [
                 optim.linear_schedule(current_lr, lr_max, steps=remaining_warmup),
-                optim.cosine_decay(lr_max, decay_steps=decay_steps, eta_min=eta_min),
+                optim.cosine_decay(lr_max, decay_steps=decay_steps, end=eta_min),
             ],
             [remaining_warmup],
         )
@@ -109,7 +109,7 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
         progress = min(1.0, decay_done / decay_total)
         current_lr = eta_min + 0.5 * (lr_max - eta_min) * (1.0 + math.cos(math.pi * progress))
         remaining_decay = max(1, decay_total - decay_done)
-        return optim.cosine_decay(current_lr, decay_steps=remaining_decay, eta_min=eta_min)
+        return optim.cosine_decay(current_lr, decay_steps=remaining_decay, end=eta_min)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
