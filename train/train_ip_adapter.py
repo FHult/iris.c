@@ -56,11 +56,6 @@ except ImportError:
     _HAS_MFLUX = False
     print("Warning: mflux not installed. Run: pip install mflux", file=sys.stderr)
 
-try:
-    from mlx_lm.tuner.trainer import grad_checkpoint
-    _HAS_GRAD_CHECKPOINT = True
-except ImportError:
-    _HAS_GRAD_CHECKPOINT = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,17 +283,19 @@ def train(config: dict) -> None:
     mx.eval(flux.transformer.parameters())
 
     # ── Apply gradient checkpointing to Flux transformer blocks ──────────────
-    # Saves ~600MB at 512px; enables batch_size=2.
-    # Uses grad_checkpoint from mlx_lm (plans/ip-adapter-training.md §3.2).
-    if _HAS_GRAD_CHECKPOINT:
-        try:
-            grad_checkpoint(flux.transformer.transformer_blocks[0])
-            grad_checkpoint(flux.transformer.single_transformer_blocks[0])
-            print("Gradient checkpointing applied to Flux transformer blocks")
-        except (AttributeError, TypeError) as e:
-            print(f"Warning: gradient checkpointing unavailable: {e}")
-    else:
-        print("Warning: mlx_lm not installed — gradient checkpointing disabled")
+    # mflux 0.17.4 has immutable types — mlx_lm's grad_checkpoint() which patches
+    # type.__call__ won't work. Use mlx.nn.checkpoint() instead, which wraps
+    # individual block instances and returns checkpointed callables.
+    # These are passed into _flux_forward_with_ip and called in place of blocks.
+    ckpt_double = None
+    ckpt_single = None
+    try:
+        from mlx.nn import checkpoint as nn_checkpoint
+        ckpt_double = [nn_checkpoint(b) for b in flux.transformer.transformer_blocks]
+        ckpt_single = [nn_checkpoint(b) for b in flux.transformer.single_transformer_blocks]
+        print("Gradient checkpointing applied to Flux transformer blocks")
+    except Exception as e:
+        print(f"Warning: gradient checkpointing unavailable: {e}")
 
     # ── Build IP-Adapter (trainable) ──────────────────────────────────────────
     print("Building IPAdapterKlein ...")
@@ -386,6 +383,8 @@ def train(config: dict) -> None:
             k_ip_all=k_ip_all,
             v_ip_all=v_ip_all,
             ip_scale=adapter.scale,
+            ckpt_double=ckpt_double,
+            ckpt_single=ckpt_single,
         )
 
         return mx.mean((pred - target) ** 2)
@@ -681,6 +680,8 @@ def _flux_forward_with_ip(
     k_ip_all: mx.array,
     v_ip_all: mx.array,
     ip_scale: mx.array,
+    ckpt_double=None,
+    ckpt_single=None,
 ) -> mx.array:
     """
     Flux Klein 4B forward pass with IP-Adapter injection.
@@ -778,7 +779,8 @@ def _flux_forward_with_ip(
     for i, block in enumerate(tr.transformer_blocks):
         h_before = hidden_states  # save pre-block state to recompute Q
 
-        encoder_hidden_states, hidden_states = block(
+        call_block = ckpt_double[i] if ckpt_double is not None else block
+        encoder_hidden_states, hidden_states = call_block(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb_mod_params_img=temb_mod_params_img,
@@ -825,7 +827,8 @@ def _flux_forward_with_ip(
     for j, block in enumerate(tr.single_transformer_blocks):
         h_before_s = hidden_states
 
-        hidden_states = block(
+        call_block_s = ckpt_single[j] if ckpt_single is not None else block
+        hidden_states = call_block_s(
             hidden_states=hidden_states,
             temb_mod_params=temb_mod_params_single,
             image_rotary_emb=concat_rotary_emb,
