@@ -20,6 +20,7 @@ Performance: plans/ip-adapter-training.md Metal Optimisations section
 import argparse
 import glob
 import math
+import json
 import os
 import random
 import sys
@@ -434,8 +435,10 @@ def train(config: dict) -> None:
 
     step = start_step
     t0 = time.time()
+    t_start = time.time()
     log_interval = ocfg["log_every"]
     loss_history: list[float] = []  # rolling window for smoothed loss
+    heartbeat_path = os.path.join(ocfg["checkpoint_dir"], "heartbeat.json")
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
@@ -525,6 +528,26 @@ def train(config: dict) -> None:
                      "lr": lr_now, "steps_per_sec": steps_per_sec},
                     step=step,
                 )
+            # Write machine-readable heartbeat for status scripts
+            total_elapsed = time.time() - t_start
+            _hb = {
+                "step": step,
+                "total_steps": tcfg["num_steps"],
+                "loss": round(loss_scalar, 6),
+                "loss_smooth": round(loss_smooth, 6),
+                "lr": lr_now,
+                "steps_per_sec": round(steps_per_sec, 4),
+                "eta_seconds": int(eta_s),
+                "elapsed_seconds": int(total_elapsed),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            try:
+                os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
+                with open(heartbeat_path + ".tmp", "w") as _f:
+                    json.dump(_hb, _f)
+                os.replace(heartbeat_path + ".tmp", heartbeat_path)
+            except OSError:
+                pass
             t0 = time.time()
 
         # Checkpoint (async background write; plans §3.12)
