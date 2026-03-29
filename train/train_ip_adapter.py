@@ -25,6 +25,7 @@ import random
 import sys
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -279,21 +280,22 @@ def train(config: dict) -> None:
     text_encoder = _load_text_encoder(flux)
     text_encoder.freeze()
 
+    # ── Force-evaluate all frozen model weights ───────────────────────────────
+    # Flux weights are mmap'd (lazy, loaded from disk via ParallelFileReader).
+    # mx.eval here pre-fetches all weights into Metal memory so the first
+    # training step doesn't stall on disk I/O.
+    print("Pre-evaluating frozen weights (flushing mmap → GPU) ...")
+    mx.eval(flux.transformer.parameters())
+
     # ── Apply gradient checkpointing to Flux transformer blocks ──────────────
     # Saves ~600MB at 512px; enables batch_size=2.
     # Uses grad_checkpoint from mlx_lm (plans/ip-adapter-training.md §3.2).
     if _HAS_GRAD_CHECKPOINT:
         try:
-            from mflux.models.flux2.model.flux2_transformer.transformer_block import (
-                Flux2TransformerBlock,
-            )
-            from mflux.models.flux2.model.flux2_transformer.single_transformer_block import (
-                Flux2SingleTransformerBlock,
-            )
-            grad_checkpoint(Flux2TransformerBlock)
-            grad_checkpoint(Flux2SingleTransformerBlock)
+            grad_checkpoint(flux.transformer.transformer_blocks[0])
+            grad_checkpoint(flux.transformer.single_transformer_blocks[0])
             print("Gradient checkpointing applied to Flux transformer blocks")
-        except (ImportError, TypeError) as e:
+        except (AttributeError, TypeError) as e:
             print(f"Warning: gradient checkpointing unavailable: {e}")
     else:
         print("Warning: mlx_lm not installed — gradient checkpointing disabled")
@@ -354,16 +356,13 @@ def train(config: dict) -> None:
     else:
         ema_params = adapter.parameters()
 
-    # ── Compiled loss + backward ──────────────────────────────────────────────
-    # state list must include mx.random.state so noise sampling isn't baked
-    # as a constant during graph compilation.
-    # (plans/ip-adapter-training.md §3.7)
-    state = [adapter.state, optimizer.state, mx.random.state]
+    # ── Pre-evaluate adapter parameters ───────────────────────────────────────
+    # Flush all lazy init arrays (mx.random.normal * scale) before training.
+    mx.eval(adapter.parameters())
+    mx.eval(ema_params)
 
-    def loss_fn(adapter_params, images, text_embeds, latents, siglip_feats,
+    def loss_fn(images, text_embeds, latents, siglip_feats,
                 use_null_image: mx.array, use_null_text: mx.array):
-        adapter.update(adapter_params)
-
         # Null conditioning dropout — decided outside compiled region,
         # passed as mx.array so mx.where works inside compiled graph.
         ip_embeds = adapter.get_image_embeds(siglip_feats)
@@ -392,7 +391,24 @@ def train(config: dict) -> None:
         return mx.mean((pred - target) ** 2)
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
-    compiled_loss_and_grad = mx.compile(loss_and_grad, inputs=state, outputs=state)
+
+    # Disable MLX auto-compilation for the entire training loop.
+    # MLX auto-fuses element-wise ops into Compiled kernels; mx.checkpoint also
+    # creates Compiled nodes for the recomputed backward pass. Both paths crash
+    # with SIGSEGV (null Metal buffer) when mmap'd Flux weights haven't been
+    # promoted to GPU yet. Disabling compile prevents kernel fusion SIGSEGV while
+    # still allowing mx.checkpoint to recompute activations (memory savings preserved).
+    mx.disable_compile()
+
+    def compiled_step(images, text_embeds, latents, siglip_feats,
+                      use_null_image, use_null_text):
+        loss_val, grads = loss_and_grad(
+            images, text_embeds, latents, siglip_feats,
+            use_null_image, use_null_text,
+        )
+        grads, _ = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
+        optimizer.update(adapter, grads)
+        return loss_val
 
     # ── Data loader ───────────────────────────────────────────────────────────
     shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
@@ -467,19 +483,14 @@ def train(config: dict) -> None:
             B = images.shape[0]
             siglip_feats = mx.zeros((B, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
 
-        # Forward + backward (compiled)
-        loss_val, grads = compiled_loss_and_grad(
-            adapter.trainable_parameters(),
+        # Forward + backward + optimizer update (compiled step)
+        loss_val = compiled_step(
             images, text_embeds, latents, siglip_feats,
             use_null_image, use_null_text,
         )
 
-        # Gradient clip then optimizer step (plans §3.6)
-        grads, _ = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
-        optimizer.update(adapter, grads)
-
         # async_eval: overlaps ~5–10ms Python overhead with Metal execution
-        mx.async_eval(adapter.parameters(), optimizer.state, loss_val)
+        mx.async_eval(loss_val, adapter.parameters())
 
         step += 1
 

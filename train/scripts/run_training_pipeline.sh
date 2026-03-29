@@ -601,7 +601,7 @@ PYEOF
         [[ -n "$ANCHOR_DIR" && $(count_tars "$ANCHOR_DIR") -gt 0 ]] && \
             TRAIN_ARGS+=("--anchor-shards" "$ANCHOR_DIR")
 
-        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
+        retry 2 30 caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
         log "Stage 1 training complete."
 
         # ── Mine hard examples from chunk 1 ───────────────────────────────────
@@ -837,7 +837,7 @@ PYEOF
         [[ -d "$HARD_DIR" && $(count_tars "$HARD_DIR") -gt 0 ]] && \
             CHUNK_TRAIN_ARGS+=(--hard-examples "$HARD_DIR")
 
-        retry 2 30 python "$TRAIN_DIR/train_ip_adapter.py" "${CHUNK_TRAIN_ARGS[@]}"
+        retry 2 30 caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${CHUNK_TRAIN_ARGS[@]}"
         log "Chunk $CHUNK training complete."
 
         # Mine hard examples after each chunk, appending to the persistent store.
