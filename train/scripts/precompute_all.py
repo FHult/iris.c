@@ -621,6 +621,11 @@ def main():
     parser.add_argument("--seed", type=int, default=1,
                         help="Random seed for shard selection (default 1; use chunk number "
                              "for reproducible but distinct selections per chunk)")
+    parser.add_argument("--match-dir", default=None,
+                        help="Run only on shards already covered by this precomputed output "
+                             "directory. Shard coverage is detected from npz filenames "
+                             "(format: SHARDID_RECID.npz). Use to align siglip with an "
+                             "existing qwen3 or vae run instead of a new random selection.")
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
@@ -628,7 +633,22 @@ def main():
         print(f"No .tar files in {args.shards}", file=sys.stderr)
         sys.exit(1)
 
-    if args.max_shards is not None and args.max_shards < len(shards):
+    if args.match_dir is not None:
+        # Select only shards that have at least one record in the reference dir.
+        # Record files are named SHARDID_RECID.npz — the prefix before the first
+        # underscore is the shard stem (e.g. "000014" → "000014.tar").
+        covered_ids: set[str] = set()
+        for fname in os.listdir(args.match_dir):
+            if fname.endswith(".npz"):
+                covered_ids.add(fname.split("_")[0])
+        before = len(shards)
+        shards = [s for s in shards if os.path.splitext(os.path.basename(s))[0] in covered_ids]
+        print(f"  --match-dir: {len(shards)} shards matched from {before} available  "
+              f"(reference: {args.match_dir})")
+        if not shards:
+            print("No shards matched — check that --match-dir contains npz files.", file=sys.stderr)
+            sys.exit(1)
+    elif args.max_shards is not None and args.max_shards < len(shards):
         import random as _random
         _rng = _random.Random(args.seed)
         n_total = len(shards)
