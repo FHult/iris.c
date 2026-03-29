@@ -284,16 +284,24 @@ def train(config: dict) -> None:
     mx.eval(flux.transformer.parameters())
 
     # ── Apply gradient checkpointing to Flux transformer blocks ──────────────
-    # mflux 0.17.4 has immutable types — mlx_lm's grad_checkpoint() which patches
-    # type.__call__ won't work. Use mlx.nn.checkpoint() instead, which wraps
-    # individual block instances and returns checkpointed callables.
-    # These are passed into _flux_forward_with_ip and called in place of blocks.
+    # mflux 0.17.4 has immutable types — grad_checkpoint() that patches
+    # type.__call__ won't work. Build per-instance checkpointed callables using
+    # mx.checkpoint(fn) which wraps a (params, *args, **kwargs) function.
+    # Pattern mirrors mlx.nn.checkpoint (added in later MLX; not yet in 0.31.1).
     ckpt_double = None
     ckpt_single = None
     try:
-        from mlx.nn import checkpoint as nn_checkpoint
-        ckpt_double = [nn_checkpoint(b) for b in flux.transformer.transformer_blocks]
-        ckpt_single = [nn_checkpoint(b) for b in flux.transformer.single_transformer_blocks]
+        def _make_ckpt(module):
+            def inner(params, *args, **kwargs):
+                module.update(params)
+                return module(*args, **kwargs)
+            checkpointed = mx.checkpoint(inner)
+            def call(*args, **kwargs):
+                return checkpointed(module.parameters(), *args, **kwargs)
+            return call
+
+        ckpt_double = [_make_ckpt(b) for b in flux.transformer.transformer_blocks]
+        ckpt_single = [_make_ckpt(b) for b in flux.transformer.single_transformer_blocks]
         print("Gradient checkpointing applied to Flux transformer blocks")
     except Exception as e:
         print(f"Warning: gradient checkpointing unavailable: {e}")
