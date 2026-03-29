@@ -139,6 +139,8 @@ ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
 HARD_DIR="$DATA_ROOT/hard_examples"
 HARD_COUNT=$(count_tars "$HARD_DIR")
 CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | tr -d ' ')
+# Heartbeat file written by train_ip_adapter.py every log_every steps
+HEARTBEAT_FILE=$(ls -t "$CKPT_DIR"/stage*/heartbeat.json "$CKPT_DIR"/heartbeat.json 2>/dev/null | head -1 || true)
 
 # ── Log file discovery ────────────────────────────────────────────────────────
 BUILD_LOG=/tmp/build_shards.log
@@ -219,13 +221,45 @@ VAE_RUN_INFO="$VAE_COUNT latents, running..."
 hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
 [[ -n "$hb" ]] && VAE_RUN_INFO="$hb"
 
-# Step 9a — training: "step X,XXX/N  loss X.XXXX (avg X.XXXX)  lr ...  ETA Xh XXm"
-LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors 2>/dev/null | grep -v ema | head -1)
+# Step 9a — training: read heartbeat.json for live progress
+LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors "$CKPT_DIR"/stage**/step_*.safetensors 2>/dev/null | grep -v ema | head -1 || true)
 LATEST_STEP=""
 [[ -n "$LATEST_CKPT" ]] && LATEST_STEP="($(basename "$LATEST_CKPT" .safetensors)) "
 TRAIN_RUN_INFO="${LATEST_STEP}running..."
-hb=$(last_match "$TRAIN_LOG" 'steps/s.*ETA [0-9]+h')
-[[ -n "$hb" ]] && TRAIN_RUN_INFO="$hb"
+HB_STALE=""
+if [[ -n "$HEARTBEAT_FILE" && -f "$HEARTBEAT_FILE" ]]; then
+    # Parse heartbeat.json with python3 (always available in venv context)
+    _hb_out=$(python3 - "$HEARTBEAT_FILE" 2>/dev/null <<'PYEOF'
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    step      = d.get("step", 0)
+    total     = d.get("total_steps", 0)
+    loss      = d.get("loss", 0)
+    loss_s    = d.get("loss_smooth", 0)
+    sps       = d.get("steps_per_sec", 0)
+    eta_s     = d.get("eta_seconds", 0)
+    ts        = d.get("timestamp", "")
+    pct       = step / total * 100 if total else 0
+    eta_h, rem = divmod(int(eta_s), 3600)
+    eta_m     = rem // 60
+    age_s     = int(time.time()) - int(time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))) if ts else -1
+    stale     = age_s > 300  # >5 min since last log = likely stuck/dead
+    print(f"step {step:,}/{total:,} ({pct:.1f}%)  loss {loss:.4f} (avg {loss_s:.4f})  {sps:.3f} steps/s  ETA {eta_h}h{eta_m:02d}m  [{ts}]")
+    if stale:
+        print(f"STALE:{age_s}")
+except Exception as e:
+    print(f"ERR:{e}")
+PYEOF
+    )
+    _stale_line=$(echo "$_hb_out" | grep "^STALE:")
+    _hb_main=$(echo "$_hb_out" | grep -v "^STALE:\|^ERR:")
+    [[ -n "$_hb_main" ]] && TRAIN_RUN_INFO="$_hb_main"
+    if [[ -n "$_stale_line" ]]; then
+        _age=$(echo "$_stale_line" | cut -d: -f2)
+        HB_STALE="  ⚠️  heartbeat stale (${_age}s ago — process may be stuck or dead)"
+    fi
+fi
 
 # Step 9b — hard example mining: runs after each chunk's training
 MINE_RUNNING=false; pgrep -f mine_hard_examples &>/dev/null && MINE_RUNNING=true
@@ -295,6 +329,7 @@ step_status "[9a/10] Train" \
     "$TRAIN_RUNNING" \
     "${LATEST_STEP}($CKPT_COUNT checkpoints)" \
     "$TRAIN_RUN_INFO"
+[[ -n "$HB_STALE" ]] && echo "$HB_STALE"
 
 step_status "[9b/10] Mine hard examples" \
     "$BEST_CKPT_EXISTS && [[ $HARD_COUNT -gt 0 && $MINE_RUNNING == false ]]" \
@@ -404,5 +439,6 @@ printf "  %-28s %s\n" "precomputed/qwen3/"  "$(du_h "$PRECOMP_DIR/qwen3") ($QWEN
 printf "  %-28s %s\n" "precomputed/vae/"    "$(du_h "$PRECOMP_DIR/vae") ($VAE_COUNT files)"
 printf "  %-28s %s\n" "embeddings/"         "$(du_h "$DATA_ROOT/embeddings")"
 printf "  %-28s %s\n" "checkpoints/"        "$(du_h "$CKPT_DIR") ($CKPT_COUNT checkpoints)"
+[[ -n "$HEARTBEAT_FILE" ]] && printf "  %-28s %s\n" "heartbeat:"  "$HEARTBEAT_FILE"
 echo ""
 echo "================================================================="
