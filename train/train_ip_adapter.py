@@ -255,6 +255,26 @@ def train(config: dict) -> None:
     if not _HAS_MFLUX:
         raise RuntimeError("pip install mflux")
 
+    # Guard against post-sleep/wake Metal GPU instability. On macOS, mflux
+    # loads weights lazily via mmap + ParallelFileReader and internally triggers
+    # fast::LayerNorm GPU ops during init. Within ~2 min of a sleep/wake event
+    # the Metal GPU server can be unstable, producing null MTLBuffer crashes.
+    # sysctl kern.waketime gives seconds-since-last-wake on macOS.
+    try:
+        import re
+        import subprocess
+        r = subprocess.run(["sysctl", "-n", "kern.waketime"],
+                           capture_output=True, text=True, timeout=2)
+        m = re.search(r"sec = (\d+)", r.stdout)
+        if m:
+            wake_secs = time.time() - int(m.group(1))
+            if wake_secs < 120:
+                print(f"WARNING: system woke from sleep {wake_secs:.0f}s ago. "
+                      "Metal GPU may be unstable. Waiting 30s for GPU to stabilise...")
+                time.sleep(30)
+    except Exception:
+        pass  # non-macOS or sysctl unavailable — skip check
+
     print("Loading Flux Klein 4B (frozen) ...")
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
@@ -268,43 +288,34 @@ def train(config: dict) -> None:
     else:
         print("SigLIP: using precomputed cache — skipping model load.")
 
-    print("Loading VAE (frozen) ...")
-    vae = _load_vae(flux)
-    vae.freeze()
+    vae_cache_available = bool(dcfg.get("vae_cache_dir"))
+    text_cache_available = bool(dcfg.get("qwen3_cache_dir"))
 
-    print("Loading Qwen3 text encoder (Q4, frozen) ...")
-    text_encoder = _load_text_encoder(flux)
-    text_encoder.freeze()
+    if vae_cache_available:
+        vae = None  # precomputed latents — VAE not needed during training
+        print("VAE: using precomputed cache — skipping model load.")
+    else:
+        print("Loading VAE (frozen) ...")
+        vae = _load_vae(flux)
+        vae.freeze()
 
-    # ── Force-evaluate all frozen model weights ───────────────────────────────
-    # Flux weights are mmap'd (lazy, loaded from disk via ParallelFileReader).
-    # mx.eval here pre-fetches all weights into Metal memory so the first
-    # training step doesn't stall on disk I/O.
-    print("Pre-evaluating frozen weights (flushing mmap → GPU) ...")
+    if text_cache_available:
+        text_encoder = None  # precomputed text embeddings — encoder not needed
+        print("Text encoder: using precomputed cache — skipping model load.")
+    else:
+        print("Loading Qwen3 text encoder (Q4, frozen) ...")
+        text_encoder = _load_text_encoder(flux)
+        text_encoder.freeze()
+
+    # Force-materialize mmap'd Flux transformer weights into GPU memory before
+    # training starts. Without this, the first training step lazily loads weights
+    # while also computing activations; the mmap backing pages can be freed while
+    # the GPU is still referencing them, causing a null-MTLBuffer SIGSEGV.
+    print("Pre-evaluating Flux transformer weights ...")
     mx.eval(flux.transformer.parameters())
 
-    # ── Apply gradient checkpointing to Flux transformer blocks ──────────────
-    # mflux 0.17.4 has immutable types — grad_checkpoint() that patches
-    # type.__call__ won't work. Build per-instance checkpointed callables using
-    # mx.checkpoint(fn) which wraps a (params, *args, **kwargs) function.
-    # Pattern mirrors mlx.nn.checkpoint (added in later MLX; not yet in 0.31.1).
     ckpt_double = None
     ckpt_single = None
-    try:
-        def _make_ckpt(module):
-            def inner(params, *args, **kwargs):
-                module.update(params)
-                return module(*args, **kwargs)
-            checkpointed = mx.checkpoint(inner)
-            def call(*args, **kwargs):
-                return checkpointed(module.parameters(), *args, **kwargs)
-            return call
-
-        ckpt_double = [_make_ckpt(b) for b in flux.transformer.transformer_blocks]
-        ckpt_single = [_make_ckpt(b) for b in flux.transformer.single_transformer_blocks]
-        print("Gradient checkpointing applied to Flux transformer blocks")
-    except Exception as e:
-        print(f"Warning: gradient checkpointing unavailable: {e}")
 
     # ── Build IP-Adapter (trainable) ──────────────────────────────────────────
     print("Building IPAdapterKlein ...")
@@ -400,14 +411,6 @@ def train(config: dict) -> None:
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
 
-    # Disable MLX auto-compilation for the entire training loop.
-    # MLX auto-fuses element-wise ops into Compiled kernels; mx.checkpoint also
-    # creates Compiled nodes for the recomputed backward pass. Both paths crash
-    # with SIGSEGV (null Metal buffer) when mmap'd Flux weights haven't been
-    # promoted to GPU yet. Disabling compile prevents kernel fusion SIGSEGV while
-    # still allowing mx.checkpoint to recompute activations (memory savings preserved).
-    mx.disable_compile()
-
     def compiled_step(images, text_embeds, latents, siglip_feats,
                       use_null_image, use_null_text):
         loss_val, grads = loss_and_grad(
@@ -499,8 +502,8 @@ def train(config: dict) -> None:
             use_null_image, use_null_text,
         )
 
-        # async_eval: overlaps ~5–10ms Python overhead with Metal execution
-        mx.async_eval(loss_val, adapter.parameters())
+        # Synchronous eval: prevents lazy-graph accumulation across steps.
+        mx.eval(loss_val, adapter.parameters(), optimizer.state)
 
         step += 1
 
@@ -935,6 +938,8 @@ def main():
                              "mixed at hard_mix_ratio (default 5%%)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate config without training")
+    parser.add_argument("--log-every", type=int, default=None,
+                        help="Override log_every from config")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -946,6 +951,8 @@ def main():
         config["training"]["learning_rate"] = args.lr
     if args.max_steps is not None:
         config["training"]["num_steps"] = args.max_steps
+    if args.log_every is not None:
+        config["output"]["log_every"] = args.log_every
     if args.anchor_shards is not None:
         config["data"]["anchor_shard_dir"] = args.anchor_shards
     if args.hard_examples is not None:
