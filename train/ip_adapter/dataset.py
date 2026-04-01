@@ -428,10 +428,23 @@ def make_prefetch_loader(
                 sfeat_buf.append(siglip_feat)
 
                 if len(imgs_buf) == batch_size:
-                    # Stack arrays; keep None for missing caches
-                    t_arr = np.stack(temb_buf) if temb_buf[0] is not None else None
-                    v_arr = np.stack(vlat_buf) if vlat_buf[0] is not None else None
-                    s_arr = np.stack(sfeat_buf) if sfeat_buf[0] is not None else None
+                    # Stack arrays; keep None for missing caches.
+                    # Pad text embeddings to a fixed global max so mx.compile
+                    # sees consistent input shapes and avoids re-tracing per batch.
+                    # 512 tokens covers all Qwen3 outputs at standard caption lengths.
+                    _TEXT_PAD = 512
+                    if temb_buf[0] is not None:
+                        max_seq = max(max(t.shape[0] for t in temb_buf), _TEXT_PAD)
+                        padded = [
+                            np.pad(t, ((0, max_seq - t.shape[0]), (0, 0)))
+                            if t.shape[0] < max_seq else t
+                            for t in temb_buf
+                        ]
+                        t_arr = np.stack(padded)
+                    else:
+                        t_arr = None
+                    v_arr = np.stack(vlat_buf) if all(v is not None for v in vlat_buf) else None
+                    s_arr = np.stack(sfeat_buf) if all(s is not None for s in sfeat_buf) else None
 
                     sample_q.put((
                         np.stack(imgs_buf),     # [B, C, H+32, W+32]

@@ -307,6 +307,27 @@ def train(config: dict) -> None:
         text_encoder = _load_text_encoder(flux)
         text_encoder.freeze()
 
+    # Start data loader threads now so they can prefill the batch queue during
+    # the Flux pre-eval below (which takes several minutes). By the time training
+    # starts the first several batches will already be decoded and waiting.
+    shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
+    if not shard_paths:
+        raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
+    loader = make_prefetch_loader(
+        shard_paths=shard_paths,
+        batch_size=dcfg["batch_size"],
+        image_dropout_prob=tcfg["image_dropout_prob"],
+        text_dropout_prob=tcfg["text_dropout_prob"],
+        sample_buffer=dcfg.get("prefetch_batches", 6),
+        qwen3_cache_dir=dcfg.get("qwen3_cache_dir"),
+        vae_cache_dir=dcfg.get("vae_cache_dir"),
+        siglip_cache_dir=dcfg.get("siglip_cache_dir"),
+        anchor_shard_dir=dcfg.get("anchor_shard_dir"),
+        anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
+        hard_example_dir=dcfg.get("hard_example_dir"),
+        hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
+    )
+
     # Force-materialize mmap'd Flux transformer weights into GPU memory before
     # training starts. Without this, the first training step lazily loads weights
     # while also computing activations; the mmap backing pages can be freed while
@@ -378,68 +399,80 @@ def train(config: dict) -> None:
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
-    def loss_fn(images, text_embeds, latents, siglip_feats,
-                use_null_image: mx.array, use_null_text: mx.array):
-        # Null conditioning dropout — decided outside compiled region,
-        # passed as mx.array so mx.where works inside compiled graph.
+    def loss_fn(siglip_feats, use_null_image: mx.array, use_null_text: mx.array,
+                flux_state: dict, target: mx.array):
+        """
+        Differentiable adapter-only loss. Flux forward has already been run
+        outside this function (no grad); only the tiny adapter graph is traced.
+
+        flux_state contains stop_gradient'd tensors from _flux_forward_no_ip:
+          qs:      list[num_blocks] of [B, H, seq_img, Hd] -- Q per injection point
+          h_final: [B, seq_img, d_inner] -- Flux hidden state pre norm_out
+          temb:    [B, d_inner] -- timestep embedding for norm_out
+          shape metadata: B, C, Lh, Lw, pH, pW
+
+        Gradient graph: adapter → k_ip/v_ip → ip_out → h_final+ip → norm_out → pred → loss
+        No Flux block ops appear in the backward pass.
+        """
         ip_embeds = adapter.get_image_embeds(siglip_feats)
         zero_embeds = mx.zeros_like(ip_embeds)
         ip_embeds = mx.where(use_null_image, zero_embeds, ip_embeds)
 
-        # Batched K/V: 2 Metal dispatches for all 25 blocks
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-        # Sample per-sample timestep in [0, 1000]; get alpha/sigma for v-prediction
-        B = latents.shape[0]
-        t_int = mx.random.randint(0, 1000, shape=(B,))
-        alpha_t, sigma_t = get_schedule_values(t_int)
+        qs      = flux_state["qs"]       # list[25] [B, H, seq_img, Hd], stop_gradient
+        h_final = flux_state["h_final"]  # [B, seq_img, d_inner], stop_gradient
+        temb    = flux_state["temb"]     # [B, d_inner], stop_gradient
+        B       = flux_state["B"]
+        C       = flux_state["C"]
+        Lh      = flux_state["Lh"]
+        Lw      = flux_state["Lw"]
+        pH      = flux_state["pH"]
+        pW      = flux_state["pW"]
+        seq_img = flux_state["seq_img"]
+        d_inner = h_final.shape[2]
 
-        noise = mx.random.normal(latents.shape, dtype=latents.dtype)
-        noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)
+        # Accumulate IP contributions from all injection points.
+        # Approximation: each contribution is added to the final hidden state
+        # rather than at its original position in the sequence. This matches
+        # the standard IP-Adapter training approach (no grad through base model).
+        ip_total = mx.zeros((B, seq_img, d_inner), dtype=h_final.dtype)
+        for i, q_i in enumerate(qs):
+            H_i  = q_i.shape[1]
+            Hd_i = q_i.shape[3]
+            k_i  = k_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
+            v_i  = v_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
+            ip_out = mx.fast.scaled_dot_product_attention(
+                q_i, k_i, v_i, scale=Hd_i ** -0.5,
+            )  # [B, H, seq_img, Hd]
+            ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, d_inner)
+            ip_total = ip_total + adapter.scale[i] * ip_out
 
-        # Forward through frozen Klein with IP injection (stub — see below)
-        pred = _flux_forward_with_ip(
-            flux, noisy, text_embeds, t_int,
-            k_ip_all=k_ip_all,
-            v_ip_all=v_ip_all,
-            ip_scale=adapter.scale,
-            ckpt_double=ckpt_double,
-            ckpt_single=ckpt_single,
-        )
+        h_with_ip = h_final + ip_total
+
+        # norm_out + proj_out: frozen Flux layers needed for correct gradient signal.
+        # Jacobian-vector products flow through these 2 ops (negligible trace cost).
+        tr = flux.transformer
+        h_with_ip = tr.norm_out(h_with_ip, temb)
+        pred_seq  = tr.proj_out(h_with_ip)  # [B, seq_img, 128]
+
+        # Unpatchify → [B, 32, H/8, W/8]
+        pred = pred_seq.transpose(0, 2, 1).reshape(B, C * 4, pH, pW)
+        pred = pred.reshape(B, C, 2, 2, pH, pW)
+        pred = pred.transpose(0, 1, 4, 2, 5, 3)
+        pred = pred.reshape(B, C, Lh, Lw)
 
         return mx.mean((pred - target) ** 2)
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
 
-    def compiled_step(images, text_embeds, latents, siglip_feats,
-                      use_null_image, use_null_text):
+    def compiled_step(siglip_feats, use_null_image, use_null_text, flux_state, target):
         loss_val, grads = loss_and_grad(
-            images, text_embeds, latents, siglip_feats,
-            use_null_image, use_null_text,
+            siglip_feats, use_null_image, use_null_text, flux_state, target,
         )
         grads, _ = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
         return loss_val
-
-    # ── Data loader ───────────────────────────────────────────────────────────
-    shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
-    if not shard_paths:
-        raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
-
-    loader = make_prefetch_loader(
-        shard_paths=shard_paths,
-        batch_size=dcfg["batch_size"],
-        image_dropout_prob=tcfg["image_dropout_prob"],
-        text_dropout_prob=tcfg["text_dropout_prob"],
-        sample_buffer=dcfg.get("prefetch_batches", 6),
-        qwen3_cache_dir=dcfg.get("qwen3_cache_dir"),
-        vae_cache_dir=dcfg.get("vae_cache_dir"),
-        siglip_cache_dir=dcfg.get("siglip_cache_dir"),
-        anchor_shard_dir=dcfg.get("anchor_shard_dir"),
-        anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
-        hard_example_dir=dcfg.get("hard_example_dir"),
-        hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
-    )
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
@@ -451,12 +484,25 @@ def train(config: dict) -> None:
     loss_history: list[float] = []  # rolling window for smoothed loss
     heartbeat_path = os.path.join(ocfg["checkpoint_dir"], "heartbeat.json")
 
+    # Per-phase timing accumulators (TP-005). Printed at each log interval.
+    # fwd = Flux forward + mx.eval(flux_state) (no grad, the heavy part)
+    # step = adapter-only compiled_step (backward, should be tiny)
+    _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
+    _t_eval_end = None  # end of last mx.eval; None on first iteration
+
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
             break
 
+        # How long the GPU was idle waiting for data (time from end of last eval
+        # to receiving this batch). Zero on first step (loader pre-filled).
+        _t_now = time.time()
+        if _t_eval_end is not None:
+            _t_data += _t_now - _t_eval_end
+
         bH, bW = bucket_hw
 
+        _t0 = time.time()
         # Convert to MLX — images are padded (H+32, W+32) for GPU crop augmentation
         images = mx.array(images_np, dtype=mx.bfloat16)   # [B, C, H+32, W+32]
 
@@ -475,16 +521,23 @@ def train(config: dict) -> None:
         # Encode frozen models — use pre-computed cache if available (§2.7)
         if vae_np is not None:
             latents = mx.array(vae_np, dtype=mx.bfloat16)
-        else:
+        elif vae is not None:
             latents = _vae_encode(vae, images)
+        else:
+            # VAE not loaded (cache-only mode) but this batch has no cached latents.
+            # Skip rather than crash — incomplete precompute coverage.
+            continue
 
         if text_np is not None:
             text_embeds = mx.array(text_np, dtype=mx.bfloat16)
             if null_text:
                 text_embeds = mx.zeros_like(text_embeds)
-        else:
+        elif text_encoder is not None:
             captions_in = [""] * len(captions) if null_text else captions
             text_embeds = _encode_text(text_encoder, captions_in)
+        else:
+            # Text encoder not loaded (cache-only mode) but no cached embeddings.
+            continue
 
         if siglip_np is not None:
             siglip_feats = mx.array(siglip_np, dtype=mx.bfloat16)
@@ -496,14 +549,39 @@ def train(config: dict) -> None:
             B = images.shape[0]
             siglip_feats = mx.zeros((B, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
 
-        # Forward + backward + optimizer update (compiled step)
+        _t_prep += time.time() - _t0
+
+        # ── Split-forward: Flux no-grad forward, then tiny adapter backward ──
+        # Sample timestep + noise outside grad scope. fused_flow_noise is a pure
+        # kernel; target needs no grad. Flux forward is run here (no grad), only
+        # the adapter graph is traced by nn.value_and_grad.
+        _t0 = time.time()
+        B_lat = latents.shape[0]
+        t_int  = mx.random.randint(0, 1000, shape=(B_lat,), dtype=mx.int32)
+        noise  = mx.random.normal(latents.shape, dtype=latents.dtype)
+        alpha_t, sigma_t = get_schedule_values(t_int)
+        noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)
+
+        flux_state = _flux_forward_no_ip(flux, noisy, text_embeds, t_int)
+        # Force-materialize all Flux tensors before entering autodiff graph.
+        # Without this, MLX defers Flux computation into the gradient trace,
+        # negating the entire split-forward optimization.
+        mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"])
+        mx.eval(target)
+        _t_fwd += time.time() - _t0
+
+        # Adapter-only backward + optimizer update (tiny graph, should be fast)
+        _t0 = time.time()
         loss_val = compiled_step(
-            images, text_embeds, latents, siglip_feats,
-            use_null_image, use_null_text,
+            siglip_feats, use_null_image, use_null_text, flux_state, target,
         )
+        _t_step += time.time() - _t0
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
+        _t0 = time.time()
         mx.eval(loss_val, adapter.parameters(), optimizer.state)
+        _t_eval_end = time.time()
+        _t_eval += _t_eval_end - _t0
 
         step += 1
 
@@ -533,6 +611,21 @@ def train(config: dict) -> None:
                 f"  ETA {eta_h}h{eta_m:02d}m",
                 flush=True,
             )
+            # TP-005: per-phase timing breakdown
+            # fwd = Flux forward + flux_state eval (no grad)
+            # step = adapter compiled_step (backward, should be small)
+            total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
+            if total_phase > 0:
+                print(
+                    f"  timing/{log_interval}steps:"
+                    f"  data={_t_data:.1f}s ({100*_t_data/total_phase:.0f}%)"
+                    f"  prep={_t_prep:.1f}s ({100*_t_prep/total_phase:.0f}%)"
+                    f"  fwd={_t_fwd:.1f}s ({100*_t_fwd/total_phase:.0f}%)"
+                    f"  step={_t_step:.1f}s ({100*_t_step/total_phase:.0f}%)"
+                    f"  eval={_t_eval:.1f}s ({100*_t_eval/total_phase:.0f}%)",
+                    flush=True,
+                )
+            _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
             if wandb_run:
                 wandb_run.log(
                     {"loss": loss_scalar, "loss_smooth": loss_smooth,
@@ -565,6 +658,7 @@ def train(config: dict) -> None:
         if step % ocfg["checkpoint_every"] == 0:
             save_checkpoint_async(adapter, ema_params, step,
                                   ocfg["checkpoint_dir"], ocfg["keep_last_n"])
+
 
     # Final checkpoint + EMA export
     save_checkpoint_async(adapter, ema_params, step,
@@ -706,6 +800,163 @@ def _encode_text(text_encoder: _TextEncoderBundle, captions: list) -> mx.array:
 # Flux forward pass with IP-Adapter injection
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _flux_forward_no_ip(
+    flux,
+    noisy_latents: mx.array,
+    text_embeds: mx.array,
+    t_int: mx.array,
+) -> dict:
+    """
+    Flux Klein 4B forward pass WITHOUT IP injection.
+
+    Runs all transformer blocks, collecting the Q vector at each injection
+    point (5 double + 20 single = 25 total). All collected tensors are
+    wrapped in mx.stop_gradient so they carry no gradient into the adapter's
+    backward pass.
+
+    Returns flux_state dict:
+      qs:      list[25] of [B, H, seq_img, Hd] per-block image Q
+      h_final: [B, seq_img, d_inner]  image hidden state before norm_out
+      temb:    [B, d_inner]           timestep embedding for norm_out
+      B, C, Lh, Lw, pH, pW, seq_img, seq_txt: shape metadata
+    """
+    tr = flux.transformer
+
+    # ── Step 1: patchify + pack noisy latents ─────────────────────────────────
+    B, C, Lh, Lw = noisy_latents.shape
+    pH, pW = Lh // 2, Lw // 2
+
+    h = noisy_latents.reshape(B, C, pH, 2, pW, 2)
+    h = h.transpose(0, 1, 3, 5, 2, 4)
+    h = h.reshape(B, C * 4, pH, pW)
+    hidden_states = h.reshape(B, 128, pH * pW).transpose(0, 2, 1)  # [B, seq_img, 128]
+    seq_img = pH * pW
+
+    # ── Step 2: position IDs ──────────────────────────────────────────────────
+    h_grid = mx.broadcast_to(
+        mx.arange(pH, dtype=mx.int32)[:, None], (pH, pW)
+    ).reshape(-1)
+    w_grid = mx.broadcast_to(
+        mx.arange(pW, dtype=mx.int32)[None, :], (pH, pW)
+    ).reshape(-1)
+    img_ids = mx.stack(
+        [mx.zeros(seq_img, dtype=mx.int32), h_grid, w_grid,
+         mx.zeros(seq_img, dtype=mx.int32)],
+        axis=1,
+    )
+
+    seq_txt = text_embeds.shape[1]
+    txt_ids = mx.stack(
+        [mx.zeros(seq_txt, dtype=mx.int32),
+         mx.zeros(seq_txt, dtype=mx.int32),
+         mx.zeros(seq_txt, dtype=mx.int32),
+         mx.arange(seq_txt, dtype=mx.int32)],
+        axis=1,
+    )
+
+    # ── Step 3: timestep embedding ────────────────────────────────────────────
+    if not isinstance(t_int, mx.array):
+        timestep = mx.array(t_int, dtype=hidden_states.dtype)
+    else:
+        timestep = t_int.astype(hidden_states.dtype)
+    if timestep.ndim == 0:
+        timestep = mx.full((B,), float(timestep.item()), dtype=hidden_states.dtype)
+    elif timestep.shape[0] == 1 and B > 1:
+        timestep = mx.broadcast_to(timestep, (B,))
+
+    temb = tr.time_guidance_embed(timestep, guidance=None)
+    temb = temb.astype(mx.bfloat16)
+
+    # ── Step 4: project inputs ────────────────────────────────────────────────
+    hidden_states = tr.x_embedder(hidden_states)
+    encoder_hidden_states = tr.context_embedder(text_embeds)
+
+    # ── Step 5: RoPE ──────────────────────────────────────────────────────────
+    image_rotary_emb = tr.pos_embed(img_ids)
+    text_rotary_emb  = tr.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        mx.concatenate([text_rotary_emb[0], image_rotary_emb[0]], axis=0),
+        mx.concatenate([text_rotary_emb[1], image_rotary_emb[1]], axis=0),
+    )
+
+    # ── Step 6: double-stream modulation (shared across all double blocks) ────
+    temb_mod_params_img = tr.double_stream_modulation_img(temb)
+    temb_mod_params_txt = tr.double_stream_modulation_txt(temb)
+    (shift_msa_img, scale_msa_img, _), _ = temb_mod_params_img
+
+    qs: list[mx.array] = []
+
+    # ── Step 7: double-stream blocks ──────────────────────────────────────────
+    for block in tr.transformer_blocks:
+        h_before = hidden_states
+
+        encoder_hidden_states, hidden_states = block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb_mod_params_img=temb_mod_params_img,
+            temb_mod_params_txt=temb_mod_params_txt,
+            image_rotary_emb=concat_rotary_emb,
+        )
+
+        # Collect Q for this injection point
+        norm_h = block.norm1(h_before)
+        norm_h = (1 + scale_msa_img) * norm_h + shift_msa_img
+        q_ip = block.attn.to_q(norm_h)
+        bsz, s_img, d_inner = q_ip.shape
+        H  = block.attn.heads
+        Hd = block.attn.dim_head
+        q_ip = q_ip.reshape(bsz, s_img, H, Hd)
+        q_ip = block.attn.norm_q(q_ip.astype(mx.float32)).astype(mx.bfloat16)
+        qs.append(mx.stop_gradient(q_ip.transpose(0, 2, 1, 3)))  # [B, H, seq_img, Hd]
+
+    # ── Step 8: merge streams ─────────────────────────────────────────────────
+    hidden_states = mx.concatenate([encoder_hidden_states, hidden_states], axis=1)
+
+    # ── Step 9: single-stream modulation ─────────────────────────────────────
+    temb_mod_params_single = tr.single_stream_modulation(temb)[0]
+    mod_shift_s, mod_scale_s, _ = temb_mod_params_single
+
+    # ── Step 10: single-stream blocks ─────────────────────────────────────────
+    for block in tr.single_transformer_blocks:
+        h_before_s = hidden_states
+
+        hidden_states = block(
+            hidden_states=hidden_states,
+            temb_mod_params=temb_mod_params_single,
+            image_rotary_emb=concat_rotary_emb,
+        )
+
+        # Collect Q (image portion only)
+        norm_h_full = block.norm(h_before_s)
+        norm_h_full = (1 + mod_scale_s) * norm_h_full + mod_shift_s
+        img_norm_h = norm_h_full[:, seq_txt:, :]  # [B, seq_img, d_inner]
+
+        proj_img = block.attn.to_qkv_mlp_proj(img_norm_h)
+        qkv_img, _ = mx.split(proj_img, [block.attn.inner_dim * 3], axis=-1)
+        q_ip_s, _, _ = mx.split(qkv_img, 3, axis=-1)
+
+        bsz2, s2, d2 = q_ip_s.shape
+        H_s  = block.attn.heads
+        Hd_s = block.attn.dim_head
+        q_ip_s = q_ip_s.reshape(bsz2, s2, H_s, Hd_s)
+        q_ip_s = block.attn.norm_q(q_ip_s.astype(mx.float32)).astype(mx.bfloat16)
+        qs.append(mx.stop_gradient(q_ip_s.transpose(0, 2, 1, 3)))  # [B, H, seq_img, Hd]
+
+    # ── Step 11: extract image tokens before norm_out/proj_out ───────────────
+    h_final = hidden_states[:, seq_txt:, :]  # [B, seq_img, d_inner]
+
+    return {
+        "qs":      qs,
+        "h_final": mx.stop_gradient(h_final),
+        "temb":    mx.stop_gradient(temb),
+        "B":  B,   "C":  C,
+        "Lh": Lh,  "Lw": Lw,
+        "pH": pH,  "pW": pW,
+        "seq_img": seq_img,
+        "seq_txt": seq_txt,
+    }
+
+
 def _flux_forward_with_ip(
     flux,
     noisy_latents: mx.array,
@@ -827,13 +1078,15 @@ def _flux_forward_with_ip(
         norm_h = (1 + scale_msa_img) * norm_h + shift_msa_img  # [B, seq_img, inner_dim]
 
         # Q projection + RMSNorm (matches double-block attention path)
+        # stop_gradient: Q is from frozen Flux weights — gradient through Q is useless.
+        # This removes Q from the backward graph without affecting k_ip/v_ip gradients.
         q_ip = block.attn.to_q(norm_h)
         bsz, s_img, d_inner = q_ip.shape
         H = block.attn.heads
         Hd = block.attn.dim_head
         q_ip = q_ip.reshape(bsz, s_img, H, Hd)
         q_ip = block.attn.norm_q(q_ip.astype(mx.float32)).astype(mx.bfloat16)
-        q_ip = q_ip.transpose(0, 2, 1, 3)  # [B, heads, seq_img, head_dim]
+        q_ip = mx.stop_gradient(q_ip.transpose(0, 2, 1, 3))  # [B, heads, seq_img, head_dim]
 
         # IP K/V for this block: k_ip_all[:, i] is [B, 128, inner_dim]
         k_i = k_ip_all[:, i, :, :]  # [B, 128, inner_dim]
@@ -885,7 +1138,8 @@ def _flux_forward_with_ip(
         Hd_s = block.attn.dim_head
         q_ip_s = q_ip_s.reshape(bsz2, s2, H_s, Hd_s)
         q_ip_s = block.attn.norm_q(q_ip_s.astype(mx.float32)).astype(mx.bfloat16)
-        q_ip_s = q_ip_s.transpose(0, 2, 1, 3)  # [B, heads, seq_img, head_dim]
+        # stop_gradient: Q from frozen Flux weights, gradient not needed
+        q_ip_s = mx.stop_gradient(q_ip_s.transpose(0, 2, 1, 3))  # [B, heads, seq_img, head_dim]
 
         k_i2 = k_ip_all[:, block_ip_idx, :, :]
         v_i2 = v_ip_all[:, block_ip_idx, :, :]
