@@ -87,14 +87,21 @@ def _make_jpeg():
     return None
 
 
-def _decode_jpeg(raw: bytes, tj=None) -> Optional[np.ndarray]:
+def _decode_jpeg(raw: bytes, tj=None, rec_id: Optional[str] = None) -> Optional[np.ndarray]:
     """
     Decode JPEG bytes → HWC uint8 RGB numpy array.
     Uses turbojpeg (2–4× faster) when available, falls back to Pillow.
+    rec_id: logged alongside any turbojpeg warning (e.g. truncated JPEG).
     """
+    import warnings
     try:
         if tj is not None:
-            return tj.decode(raw, pixel_format=_TJPF_RGB)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = tj.decode(raw, pixel_format=_TJPF_RGB)
+            for w in caught:
+                print(f"[dataset] JPEG warning rec={rec_id}: {w.message}", file=sys.stderr, flush=True)
+            return result
         from PIL import Image
         return np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
     except Exception:
@@ -394,7 +401,7 @@ def make_prefetch_loader(
 
             for rec in records:
                 # Decode image
-                img = _decode_jpeg(rec["jpg"], tj)
+                img = _decode_jpeg(rec["jpg"], tj, rec_id=rec["id"])
                 if img is None:
                     continue
 

@@ -46,7 +46,7 @@ training:
 
 output:
   checkpoint_dir: "checkpoints/stage1"
-  checkpoint_every: 2000                   # steps between checkpoints (TB4 safety)
+  checkpoint_every: 500                    # steps between checkpoints (~1h at 7s/step)
   keep_last_n: 5
   log_every: 100
 
