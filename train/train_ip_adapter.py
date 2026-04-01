@@ -313,6 +313,28 @@ def train(config: dict) -> None:
     shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
     if not shard_paths:
         raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
+
+    # Filter to only shards that have at least qwen3+vae precomputed.
+    # Without this, the loader reads every shard (1.9 GB each) but the training
+    # loop skips all their batches — 92% I/O waste and GPU data stalls.
+    # Shards missing siglip cache are kept (siglip falls back to zeros).
+    qwen3_dir = dcfg.get("qwen3_cache_dir")
+    vae_dir   = dcfg.get("vae_cache_dir")
+    if qwen3_dir and vae_dir:
+        def _has_cache(tar_path):
+            stem = os.path.splitext(os.path.basename(tar_path))[0]  # e.g. "000042"
+            return (os.path.exists(os.path.join(qwen3_dir, f"{stem}_0000.npz")) and
+                    os.path.exists(os.path.join(vae_dir,   f"{stem}_0000.npz")))
+        all_shards = shard_paths
+        shard_paths = [p for p in all_shards if _has_cache(p)]
+        print(f"Shard cache filter: {len(shard_paths)}/{len(all_shards)} shards "
+              f"have qwen3+vae precomputed — training on {len(shard_paths)} shards only.")
+        if not shard_paths:
+            raise RuntimeError(
+                "No shards with precomputed qwen3+vae cache found. "
+                "Run train/scripts/precompute_all.py first."
+            )
+
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -465,6 +487,12 @@ def train(config: dict) -> None:
         return mx.mean((pred - target) ** 2)
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
+
+    # TP-002 (infeasible): mx.compile requires all inputs to be explicit args or
+    # declared captured state. flux_state contains dynamically-created arrays passed
+    # via a dict — MLX cannot track these, raises "uncaptured inputs." Not worth
+    # working around since the adapter step is already ~0.0s (lazy graph tracing
+    # is negligible; all real work is in mx.eval dominated by Flux forward at 5-6s).
 
     def compiled_step(siglip_feats, use_null_image, use_null_text, flux_state, target):
         loss_val, grads = loss_and_grad(
