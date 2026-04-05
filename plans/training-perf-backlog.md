@@ -140,3 +140,24 @@ If jetsam fires again at bs=2, the failure will likely occur later (step 500+)
 as EMA is no longer the cause. New culprit would be activation peak during a
 large-bucket forward (896×512 has ~3500 image tokens vs ~1600 for 512×512).
 Mitigation: reduce to bs=1 for large buckets only (not yet implemented).
+
+### Outcome (2026-04-05) — REVERTED to batch_size=1
+
+Experiment ran to step 600 with no OOM — EMA fix confirmed effective.
+
+However batch_size=2 provided **zero throughput improvement**:
+- bs=1: fwd=416s/100steps → 0.19 steps/s
+- bs=2: fwd=720s/100steps → 0.12 steps/s (worse per-sample)
+
+Forward time scaled nearly linearly with batch size. The hypothesis that batching
+would amortise fixed overhead was wrong. On M1 Max at these sequence lengths, the
+Flux attention is **memory-bandwidth bound**, not compute bound. Doubling batch
+doubles memory traffic and time — no amortisation benefit.
+
+Additionally, bs=2 uses ~2× activation memory for no gain, reducing headroom for
+future optimisations and increasing jetsam risk unnecessarily.
+
+**Conclusion:** batch_size=1 is optimal for M1 Max at 512px. Reverted.
+Batch_size=2 is not worth pursuing unless the attention implementation changes
+(e.g. Flash Attention with fused BF16 kernels that could saturate compute rather
+than memory bandwidth).
