@@ -48,9 +48,11 @@ if [[ -n "$ALL_PIDS" ]]; then
         kill -TERM "$pid" 2>/dev/null || true
     done <<< "$ALL_PIDS"
 
-    # Wait up to 30s for graceful shutdown
-    echo "Waiting up to 30s for processes to exit..."
-    for i in $(seq 1 30); do
+    # Wait up to 120s for graceful shutdown.
+    # Training writes a 3.9 GB checkpoint on SIGTERM; mx.eval + safetensors write
+    # takes ~45-60s. 30s caused SIGKILL mid-write → corrupt checkpoint files.
+    echo "Waiting up to 120s for processes to exit (checkpoint save can take ~60s)..."
+    for i in $(seq 1 120); do
         REMAINING=$(printf '%s\n' $LOCK_PID $(pgrep -f "$PIPELINE_PATTERNS" 2>/dev/null || true) \
                     | sort -u | grep -v '^$' \
                     | while IFS= read -r pid; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done || true)

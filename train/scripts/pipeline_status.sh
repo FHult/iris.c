@@ -40,7 +40,34 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────────────
 count_files() { find -L "${1}" -maxdepth 1 -name "${2:-*}" 2>/dev/null | wc -l | tr -d ' '; }
 count_tars()  { count_files "${1}" "*.tar"; }
-du_h()        { du -sh "$1" 2>/dev/null | cut -f1; }
+# du_h <dir> — returns human-readable size, cached for 60s to avoid traversing
+# 350+ GB trees on every pipeline_status invocation.
+_DU_CACHE="${DATA_ROOT}/logs/.du_cache"
+du_h() {
+    local dir="$1" now size elapsed line ts cached
+    [[ -d "$dir" ]] || { echo "—"; return; }
+    now=$(date +%s)
+    if [[ -f "$_DU_CACHE" ]]; then
+        # Cache format: timestamp<TAB>path<TAB>size
+        line=$(grep -F "	${dir}	" "$_DU_CACHE" 2>/dev/null | tail -1)
+        if [[ -n "$line" ]]; then
+            ts=$(printf '%s' "$line" | cut -f1)
+            cached=$(printf '%s' "$line" | cut -f3)
+            elapsed=$(( now - ts ))
+            if [[ $elapsed -lt 60 ]]; then
+                echo "$cached"; return
+            fi
+        fi
+    fi
+    size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+    # Atomically update cache: remove stale entry, append fresh one
+    local tmp
+    tmp=$(mktemp "${DATA_ROOT}/logs/.du_cache.XXXXXX" 2>/dev/null) || { echo "$size"; return; }
+    { [[ -f "$_DU_CACHE" ]] && grep -vF "	${dir}	" "$_DU_CACHE" 2>/dev/null; true; } > "$tmp"
+    printf '%s\t%s\t%s\n' "$now" "$dir" "$size" >> "$tmp"
+    mv "$tmp" "$_DU_CACHE" 2>/dev/null || rm -f "$tmp"
+    echo "$size"
+}
 ts()          { date '+%Y-%m-%d %H:%M:%S'; }
 
 # last_match <file> <egrep-pattern>
@@ -135,6 +162,7 @@ JDB4_STATE=$(_jdb_src_state $JDB_RAW4_TGZS 52 $JDB_WDS4_TARS)
 
 QWEN3_COUNT=$(count_files "$PRECOMP_DIR/qwen3" "*.npz")
 VAE_COUNT=$(count_files "$PRECOMP_DIR/vae" "*.npz")
+SIGLIP_COUNT=$(count_files "$PRECOMP_DIR/siglip" "*.npz")
 ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
 HARD_DIR="$DATA_ROOT/hard_examples"
 HARD_COUNT=$(count_tars "$HARD_DIR")
@@ -143,7 +171,7 @@ CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | t
 HEARTBEAT_FILE=$(ls -t "$CKPT_DIR"/stage*/heartbeat.json "$CKPT_DIR"/heartbeat.json 2>/dev/null | head -1 || true)
 
 # ── Log file discovery ────────────────────────────────────────────────────────
-BUILD_LOG=/tmp/build_shards.log
+BUILD_LOG="$DATA_ROOT/logs/build_shards.log"
 TRAIN_LOG=$(ls -t "$DATA_ROOT/logs"/pipeline_chunk*.log "$TRAIN_DIR/data/logs"/pipeline_chunk*.log 2>/dev/null | head -1 || true)
 # Dedicated precompute log (legacy); fall back to the pipeline chunk log which
 # captures all step output via tee when no separate precompute log exists.
@@ -163,19 +191,19 @@ for _log in "$BUILD_LOG" "${TRAIN_LOG:-}"; do
 done
 
 # ── Process state ─────────────────────────────────────────────────────────────
-BUILD_RUNNING=false;  pgrep -f build_shards     &>/dev/null && BUILD_RUNNING=true
+BUILD_RUNNING=false;  pgrep -f "build_shards\.py"    &>/dev/null && BUILD_RUNNING=true
 
 # ── Build_shards done condition ───────────────────────────────────────────────
 # Match run_training_pipeline.sh logic: done if any shards exist and not running.
 BUILD_DONE=false
 if [[ $SHARD_COUNT -gt 0 && $BUILD_RUNNING == false ]]; then BUILD_DONE=true; fi
-FILTER_RUNNING=false;     pgrep -f filter_shards    &>/dev/null && FILTER_RUNNING=true
-PRECOMPUTE_RUNNING=false; pgrep -f precompute_all  &>/dev/null && PRECOMPUTE_RUNNING=true
-TRAIN_RUNNING=false;      pgrep -f train_ip_adapter &>/dev/null && TRAIN_RUNNING=true
+FILTER_RUNNING=false;     pgrep -f "filter_shards\.py"    &>/dev/null && FILTER_RUNNING=true
+PRECOMPUTE_RUNNING=false; pgrep -f "precompute_all\.py"   &>/dev/null && PRECOMPUTE_RUNNING=true
+TRAIN_RUNNING=false;      pgrep -f "train_ip_adapter\.py" &>/dev/null && TRAIN_RUNNING=true
 # Legacy individual-script names (kept for backwards compat with old runs)
-QWEN3_RUNNING=false;  pgrep -f precompute_qwen3  &>/dev/null && QWEN3_RUNNING=true
-VAE_RUNNING=false;    pgrep -f precompute_vae    &>/dev/null && VAE_RUNNING=true
-SIGLIP_RUNNING=false; pgrep -f precompute_siglip &>/dev/null && SIGLIP_RUNNING=true
+QWEN3_RUNNING=false;  pgrep -f "precompute_qwen3\.py"  &>/dev/null && QWEN3_RUNNING=true
+VAE_RUNNING=false;    pgrep -f "precompute_vae\.py"    &>/dev/null && VAE_RUNNING=true
+SIGLIP_RUNNING=false; pgrep -f "precompute_siglip\.py" &>/dev/null && SIGLIP_RUNNING=true
 [[ $QWEN3_RUNNING == true || $VAE_RUNNING == true || $SIGLIP_RUNNING == true ]] && PRECOMPUTE_RUNNING=true
 
 # ── Heartbeat progress lines (from logs) ──────────────────────────────────────
@@ -262,7 +290,7 @@ PYEOF
 fi
 
 # Step 9b — hard example mining: runs after each chunk's training
-MINE_RUNNING=false; pgrep -f mine_hard_examples &>/dev/null && MINE_RUNNING=true
+MINE_RUNNING=false; pgrep -f "mine_hard_examples\.py" &>/dev/null && MINE_RUNNING=true
 MINE_RUN_INFO="running..."
 hb=$(last_match "$TRAIN_LOG" 'Mining hard\|hard examples.*Done\|top-[0-9]+ records')
 [[ -n "$hb" ]] && MINE_RUN_INFO="$hb"
@@ -299,7 +327,7 @@ step_status "[2b/10] JourneyDB → WDS" \
 
 step_status "[3/10] CLIP deduplication" \
     "[[ -f $DEDUP_IDS ]]" \
-    "pgrep -f 'clip_dedup.py all'" \
+    "pgrep -f 'clip_dedup\.py all'" \
     "($DEDUP_LINES IDs blocked)" \
     "$DEDUP_RUN_INFO"
 
@@ -318,10 +346,10 @@ step_status "[7/10] Anchor set" \
     "[[ $ANCHOR_COUNT -gt 0 ]]" "" \
     "($ANCHOR_COUNT shards · built from raw sources, not from unified shards)"
 
-step_status "[8/10] Precompute Qwen3 + VAE" \
+step_status "[8/10] Precompute Qwen3 + VAE [+ SigLIP]" \
     "[[ -f $PRECOMP_DIR/.done ]]" \
     "$PRECOMPUTE_RUNNING" \
-    "(qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  shards=$SHARD_COUNT)" \
+    "(qwen3=$QWEN3_COUNT  vae=$VAE_COUNT  siglip=$SIGLIP_COUNT  shards=$SHARD_COUNT)" \
     "$PRECOMPUTE_RUN_INFO"
 
 step_status "[9a/10] Train" \
@@ -340,24 +368,22 @@ step_status "[9b/10] Mine hard examples" \
 
 step_status "[10/10] Cross-chunk dedup index  (runs after training)" \
     "[[ -f $DEDUP_INDEX ]]" \
-    "pgrep -f 'clip_dedup.*build-index'" \
+    "pgrep -f 'clip_dedup\.py.*build-index'" \
     "($(du_h "$DEDUP_INDEX"))" "$DEDUP_INDEX_RUN_INFO"
 
 # ── Active processes ──────────────────────────────────────────────────────────
 # Show the pipeline as one entry (top-level PID only) plus individual step processes.
 echo ""
 echo "── Active processes ─────────────────────────────────────────────"
-# Top-level pipeline shell: run_training_pipeline.sh whose parent is NOT also
-# run_training_pipeline.sh (i.e. the root of the process tree, not subshells).
+# Read the root pipeline PID from the lock file written by run_training_pipeline.sh.
+# This is more reliable than the ppid heuristic which breaks in containers/debuggers.
 PIPELINE_ROOT=""
-while IFS= read -r pid; do
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    parent_cmd=$(ps -o comm= -p "$ppid" 2>/dev/null || true)
-    if [[ "$parent_cmd" != "bash" ]] || ! ps -o args= -p "$ppid" 2>/dev/null | grep -q "run_training_pipeline"; then
-        PIPELINE_ROOT="$pid"
-        break
+if [[ -f "$LOCK_FILE" ]]; then
+    _lock_pid=$(grep '^pid=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2)
+    if [[ -n "$_lock_pid" ]] && kill -0 "$_lock_pid" 2>/dev/null; then
+        PIPELINE_ROOT="$_lock_pid"
     fi
-done < <(pgrep -f "run_training_pipeline" 2>/dev/null | sort -n)
+fi
 
 if [[ -n "$PIPELINE_ROOT" ]]; then
     lock_chunk=$(grep '^chunk=' "$LOCK_FILE" 2>/dev/null | cut -d= -f2)
@@ -368,7 +394,7 @@ if [[ -n "$PIPELINE_ROOT" ]]; then
 fi
 
 # Step-level worker processes (exclude pipeline shell subprocesses)
-STEP_PROCS=$(pgrep -a -l -f "build_shards|clip_dedup\.py|filter_shards|precompute_all|precompute_qwen3|precompute_vae|precompute_siglip|train_ip_adapter" 2>/dev/null \
+STEP_PROCS=$(pgrep -a -l -f "build_shards\.py|clip_dedup\.py|filter_shards\.py|precompute_all\.py|precompute_qwen3\.py|precompute_vae\.py|precompute_siglip\.py|train_ip_adapter\.py" 2>/dev/null \
     | grep -v "grep\|pipeline_status" || true)
 if [[ -n "$STEP_PROCS" ]]; then
     echo "$STEP_PROCS" | while read -r pid rest; do
@@ -437,6 +463,7 @@ printf "  %-28s %s\n" "anchor_shards/ [keep]" "$(du_h "$ANCHOR_DIR") ($ANCHOR_CO
 printf "  %-28s %s\n" "hard_examples/ [keep]" "$(du_h "$HARD_DIR") ($HARD_COUNT tars)"
 printf "  %-28s %s\n" "precomputed/qwen3/"  "$(du_h "$PRECOMP_DIR/qwen3") ($QWEN3_COUNT files)"
 printf "  %-28s %s\n" "precomputed/vae/"    "$(du_h "$PRECOMP_DIR/vae") ($VAE_COUNT files)"
+printf "  %-28s %s\n" "precomputed/siglip/" "$(du_h "$PRECOMP_DIR/siglip") ($SIGLIP_COUNT files)"
 printf "  %-28s %s\n" "embeddings/"         "$(du_h "$DATA_ROOT/embeddings")"
 printf "  %-28s %s\n" "checkpoints/"        "$(du_h "$CKPT_DIR") ($CKPT_COUNT checkpoints)"
 [[ -n "$HEARTBEAT_FILE" ]] && printf "  %-28s %s\n" "heartbeat:"  "$HEARTBEAT_FILE"

@@ -235,20 +235,28 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # ── Find which record IDs already exist in the output dir ─────────────────
+    # Use .existing_ids.txt manifest when present (fast); fall back to tar scan
+    # only on the first run (or if the manifest was deleted).
+    manifest_path = os.path.join(args.output, ".existing_ids.txt")
     existing_ids: set = set()
-    for fn in os.listdir(args.output):
-        if not fn.endswith(".tar"):
-            continue
-        try:
-            with tarfile.open(os.path.join(args.output, fn)) as t:
-                for m in t.getmembers():
-                    stem, _, ext = m.name.rpartition(".")
-                    if ext.lower() in ("jpg", "jpeg", "txt"):
-                        existing_ids.add(stem)
-        except Exception:
-            pass
-    if existing_ids:
-        print(f"  Resuming: {len(existing_ids)} records already extracted — skipping those")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as _mf:
+            existing_ids = {line.strip() for line in _mf if line.strip()}
+        print(f"  Resuming: {len(existing_ids)} records in manifest — skipping those")
+    else:
+        for fn in os.listdir(args.output):
+            if not fn.endswith(".tar"):
+                continue
+            try:
+                with tarfile.open(os.path.join(args.output, fn)) as t:
+                    for m in t.getmembers():
+                        stem, _, ext = m.name.rpartition(".")
+                        if ext.lower() in ("jpg", "jpeg", "txt"):
+                            existing_ids.add(stem)
+            except Exception:
+                pass
+        if existing_ids:
+            print(f"  Resuming: {len(existing_ids)} records already extracted — skipping those")
 
     # ── Collect candidate records (those with qwen3 + vae cache) ──────────────
     import glob as _glob
@@ -438,6 +446,12 @@ def main():
     print(f"\nDone: {total} hard examples in {args.output}/")
     print(f"  Mix into training with:  hard_example_dir: {args.output}")
     print(f"                           hard_mix_ratio: 0.05")
+
+    # Update manifest: append new IDs so future resumes skip re-scanning tars.
+    new_ids = sorted({rec_id for rec_id, _, _ in records_to_write})
+    if new_ids:
+        with open(manifest_path, "a") as _mf:
+            _mf.write("\n".join(new_ids) + "\n")
 
 
 if __name__ == "__main__":

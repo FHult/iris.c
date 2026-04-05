@@ -75,13 +75,12 @@ on shards 000000–000033 to fill this gap.
 
 ---
 
-## DQ-002: Truncated JPEG in dataset (LOW)
+## DQ-002: Truncated JPEG in dataset ✅ DONE
 
-Observed `UserWarning: Premature end of JPEG file` from turbojpeg. A corrupted
-JPEG made it through the pipeline. To investigate:
-- Log shard path + sample key when turbojpeg warning fires (add to `_decode_jpeg`)
-- Add validation pass to shard-builder or `precompute_all.py` that decodes every
-  JPEG and drops corrupt samples before they enter training.
+- `_decode_jpeg` in `dataset.py` already logs `rec={rec_id}` alongside any turbojpeg warning.
+- `build_shards.py` now does a full `tj.decode()` (was `decode_header` only) for JPEG
+  validation at shard-build time. Truncated files raise an exception, are logged with
+  `rec={id} src={src}`, and are skipped. Pillow path uses `.verify()` equivalently.
 
 ---
 

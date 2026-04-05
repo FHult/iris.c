@@ -155,14 +155,23 @@ def filter_shard(shard_path: str) -> dict:
 
     done_path = shard_path + ".filtered"
 
+    # Guard: treat 0-record shard as an error (truncated tar with no usable content).
+    if original_count == 0:
+        print(f"Error: {shard_path} has 0 records (truncated or empty tar)", file=sys.stderr)
+        return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True}
+
     # Fast path: nothing dropped — write sentinel without any I/O
     if len(kept_records) == original_count:
         open(done_path, "w").write(fingerprint + "\n")
         return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False}
 
-    # Rewrite shard in a temp file then atomically replace
-    tmp_path = shard_path + ".tmp"
+    # Rewrite shard in a temp file in the same directory then atomically replace.
+    # Using mkstemp (not shard_path + ".tmp") prevents concurrent build_shards.py
+    # from accidentally unlinking a temp file it is still writing to.
+    shard_dir = os.path.dirname(shard_path)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=shard_dir, suffix=".filter_tmp")
     try:
+        os.close(tmp_fd)
         with tarfile.open(tmp_path, "w") as out_tar:
             for i, rec in enumerate(kept_records):
                 key = f"{rec['key']}"
@@ -174,8 +183,10 @@ def filter_shard(shard_path: str) -> dict:
         open(done_path, "w").write(fingerprint + "\n")  # mark done after successful replace
     except Exception as e:
         print(f"Error rewriting {shard_path}: {e}", file=sys.stderr)
-        if os.path.exists(tmp_path):
+        try:
             os.remove(tmp_path)
+        except OSError:
+            pass
         return {"shard": shard_path, "kept": len(kept_records),
                 "dropped": original_count - len(kept_records), "error": True}
 
@@ -262,9 +273,20 @@ def main():
         initargs=(args.min_size, args.min_words),
     ) as pool:
         for done, result in enumerate(
-            pool.imap_unordered(filter_shard, shards, chunksize=1), 1
+            pool.imap_unordered(filter_shard, shards, chunksize=4), 1
         ):
             results.append(result)
+            # Warn on unusually high drop rate (>15%) — may indicate a data quality
+            # regression in the source.  Expected loss is 3–5%.
+            if not result.get("error"):
+                _total = result["kept"] + result["dropped"]
+                if _total > 0 and result["dropped"] / _total > 0.15:
+                    print(
+                        f"WARNING: {os.path.basename(result['shard'])} dropped "
+                        f"{result['dropped']}/{_total} records "
+                        f"({result['dropped']/_total:.0%}) — unusually high",
+                        file=sys.stderr, flush=True,
+                    )
             if done % 10 == 0 or done == len(shards):
                 kept_so_far = sum(r["kept"] for r in results)
                 dropped_so_far = sum(r["dropped"] for r in results)

@@ -305,6 +305,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
         except Exception as e:
             print(f"  Qwen3 batch {i // batch_size} failed ({e}), retrying single",
                   file=sys.stderr)
+            _batch_skipped = 0
             for rec_id, caption, ids in batch:
                 try:
                     sl = len(ids)
@@ -320,6 +321,10 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
                     written += 1
                 except Exception as e2:
                     print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
+                    _batch_skipped += 1
+            if _batch_skipped:
+                print(f"  Qwen3 batch {i // batch_size}: {_batch_skipped}/{len(batch)} records skipped after single-record retry",
+                      file=sys.stderr, flush=True)
     n_batches = len(tokenized) // batch_size + 1
     elapsed = _time.time() - t_q_start
     avg_dt = elapsed / max(n_batches, 1)
@@ -496,12 +501,19 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     pending_v: list = []      # needing VAE
     pending_s: list = []      # needing SigLIP
 
+    def _npz_valid(path: str) -> bool:
+        """Return True iff path exists and is non-empty (guards against partial writes)."""
+        try:
+            return os.path.getsize(path) > 0
+        except OSError:
+            return False
+
     for rec_id, jpg_bytes, caption in iter_shard(shard_path):
-        need_q = bool(qwen3_out) and not os.path.exists(
+        need_q = bool(qwen3_out) and not _npz_valid(
             os.path.join(qwen3_out, f"{rec_id}.npz"))
-        need_v = bool(vae_out)   and not os.path.exists(
+        need_v = bool(vae_out)   and not _npz_valid(
             os.path.join(vae_out, f"{rec_id}.npz"))
-        need_s = bool(siglip_out) and not os.path.exists(
+        need_s = bool(siglip_out) and not _npz_valid(
             os.path.join(siglip_out, f"{rec_id}.npz"))
 
         if not need_q and qwen3_out:
@@ -564,6 +576,8 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
         "shard": shard_path,
         "wq": wq, "wv": wv, "ws": ws,
         "error": False,
+        "skipped_q": len(pending_q) - wq,
+        "skipped_v": len(pending_v) - wv,
     }
 
 
@@ -747,15 +761,19 @@ def main():
     wq = sum(r["wq"] for r in results)
     wv = sum(r["wv"] for r in results)
     ws = sum(r["ws"] for r in results)
+    sq = sum(r.get("skipped_q", 0) for r in results)
+    sv = sum(r.get("skipped_v", 0) for r in results)
     errs = sum(1 for r in results if r["error"])
     elapsed = (_time.time() - t_start) / 3600
     print(f"\nDone in {elapsed:.1f}h.")
-    print(f"  Qwen3:  {wq:,} embeddings  → {args.qwen3_output}/")
-    print(f"  VAE:    {wv:,} latents      → {args.vae_output}/")
+    print(f"  Qwen3:  {wq:,} embeddings  → {args.qwen3_output}/" + (f"  ({sq:,} skipped after retry)" if sq else ""))
+    print(f"  VAE:    {wv:,} latents      → {args.vae_output}/" + (f"  ({sv:,} skipped after retry)" if sv else ""))
     if siglip_out:
         print(f"  SigLIP: {ws:,} features    → {siglip_out}/")
     if errs:
         print(f"  {errs} shards had errors (check stderr)")
+    if sq or sv:
+        print(f"  WARNING: {sq + sv:,} records were skipped after single-record retry — check stderr for details")
 
 
 if __name__ == "__main__":

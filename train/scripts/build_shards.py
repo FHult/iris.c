@@ -261,24 +261,23 @@ def _write_shard_range(args) -> dict:
                     continue
                 try:
                     if _HAS_TURBOJPEG:
+                        # Full decode validates the entire JPEG bitstream, catching
+                        # truncated files that pass a header-only check (DQ-002).
+                        img = tj.decode(raw)
+                        h, w = img.shape[:2]
+                        if w < 256 or h < 256:
+                            skipped += 1
+                            continue
                         if _is_jpeg(raw):
-                            # Header-only size check — no decode, no re-encode
-                            w, h, _, _ = tj.decode_header(raw)
-                            if w < 256 or h < 256:
-                                skipped += 1
-                                continue
-                            jpg_out = raw  # pass through original JPEG bytes
+                            jpg_out = raw  # pass through valid original bytes
                         else:
-                            # PNG or other: full decode + JPEG re-encode
-                            img = tj.decode(raw)
-                            h, w = img.shape[:2]
-                            if w < 256 or h < 256:
-                                skipped += 1
-                                continue
+                            # PNG or other format: re-encode to JPEG
                             jpg_out = tj.encode(img, quality=quality)
                     else:
                         from PIL import Image as PilImage
                         pil_img = PilImage.open(io.BytesIO(raw))
+                        pil_img.verify()  # catches truncated files
+                        pil_img = PilImage.open(io.BytesIO(raw))  # reopen after verify
                         w, h = pil_img.size
                         if w < 256 or h < 256:
                             skipped += 1
@@ -307,7 +306,12 @@ def _write_shard_range(args) -> dict:
                         final_path = os.path.join(output_dir, f"{shard_id:06d}.tar")
                         os.replace(tmp_path, final_path)
                         completed_count += 1
-                except Exception:
+                except Exception as _exc:
+                    print(
+                        f"[worker {worker_idx}] skipping corrupt image "
+                        f"rec={rec['id']} src={rec.get('src', '?')}: {_exc}",
+                        flush=True,
+                    )
                     skipped += 1
             # jpg_raw released here — GC reclaims before next shard is fetched
 

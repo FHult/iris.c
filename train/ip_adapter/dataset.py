@@ -359,6 +359,7 @@ def make_prefetch_loader(
             rng.shuffle(epoch_paths)
             for path in epoch_paths:
                 try:
+                    print(f"[dataset] shard {path}", flush=True)
                     with tarfile.open(path) as tar:
                         contents = {
                             m.name: tar.extractfile(m).read()
