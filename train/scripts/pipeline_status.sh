@@ -10,17 +10,21 @@
 # Usage:
 #   bash train/scripts/pipeline_status.sh
 #   bash train/scripts/pipeline_status.sh --data-root /Volumes/2TBSSD
+#   bash train/scripts/pipeline_status.sh --json        # machine-readable JSON
 #
 # Works from any working directory. Safe to run from Claude CoWork Dispatch.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_DIR="$(dirname "$TRAIN_DIR")"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 DATA_ROOT=""
+JSON_MODE=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --data-root) DATA_ROOT="$2"; shift 2 ;;
+        --json)      JSON_MODE=true; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -166,9 +170,35 @@ SIGLIP_COUNT=$(count_files "$PRECOMP_DIR/siglip" "*.npz")
 ANCHOR_COUNT=$(count_tars "$ANCHOR_DIR")
 HARD_DIR="$DATA_ROOT/hard_examples"
 HARD_COUNT=$(count_tars "$HARD_DIR")
+
+# ── Resolve checkpoint dir from config (may be on SSD) ───────────────────────
+# Read checkpoint_dir from the active training config so we always find
+# checkpoints regardless of whether they are on the local disk or SSD.
+# Uses grep+sed to avoid depending on PyYAML (not always in system python3).
+CONFIG="${TRAIN_DIR}/configs/stage1_512px.yaml"
+CKPT_DIR_FROM_CONFIG=$(grep -E '^\s*checkpoint_dir:' "$CONFIG" 2>/dev/null \
+    | head -1 | sed 's/.*checkpoint_dir:[[:space:]]*//' | tr -d '"'"'" | tr -d "'")
+# Resolve relative paths against repo root
+if [[ -n "$CKPT_DIR_FROM_CONFIG" && "$CKPT_DIR_FROM_CONFIG" != /* ]]; then
+    CKPT_DIR_FROM_CONFIG="$REPO_DIR/$CKPT_DIR_FROM_CONFIG"
+fi
+# Fallback cascade: config → DATA_ROOT/checkpoints/stage1 → REPO_DIR/checkpoints/stage1
+if [[ -n "$CKPT_DIR_FROM_CONFIG" ]]; then
+    CKPT_DIR="$CKPT_DIR_FROM_CONFIG"
+elif [[ -d "$DATA_ROOT/checkpoints/stage1" ]]; then
+    CKPT_DIR="$DATA_ROOT/checkpoints/stage1"
+elif [[ -d "$DATA_ROOT/checkpoints" ]]; then
+    CKPT_DIR="$DATA_ROOT/checkpoints"
+else
+    CKPT_DIR="$REPO_DIR/checkpoints/stage1"
+fi
+
 CKPT_COUNT=$(find "$CKPT_DIR" -name "step_*.safetensors" 2>/dev/null | wc -l | tr -d ' ')
 # Heartbeat file written by train_ip_adapter.py every log_every steps
-HEARTBEAT_FILE=$(ls -t "$CKPT_DIR"/stage*/heartbeat.json "$CKPT_DIR"/heartbeat.json 2>/dev/null | head -1 || true)
+HEARTBEAT_FILE=$(ls -t "$CKPT_DIR"/heartbeat.json "$CKPT_DIR"/stage*/heartbeat.json \
+    "$DATA_ROOT"/checkpoints/stage*/heartbeat.json \
+    "$REPO_DIR"/checkpoints/stage*/heartbeat.json \
+    2>/dev/null | head -1 || true)
 
 # ── Log file discovery ────────────────────────────────────────────────────────
 BUILD_LOG="$DATA_ROOT/logs/build_shards.log"
@@ -200,11 +230,6 @@ if [[ $SHARD_COUNT -gt 0 && $BUILD_RUNNING == false ]]; then BUILD_DONE=true; fi
 FILTER_RUNNING=false;     pgrep -f "filter_shards\.py"    &>/dev/null && FILTER_RUNNING=true
 PRECOMPUTE_RUNNING=false; pgrep -f "precompute_all\.py"   &>/dev/null && PRECOMPUTE_RUNNING=true
 TRAIN_RUNNING=false;      pgrep -f "train_ip_adapter\.py" &>/dev/null && TRAIN_RUNNING=true
-# Legacy individual-script names (kept for backwards compat with old runs)
-QWEN3_RUNNING=false;  pgrep -f "precompute_qwen3\.py"  &>/dev/null && QWEN3_RUNNING=true
-VAE_RUNNING=false;    pgrep -f "precompute_vae\.py"    &>/dev/null && VAE_RUNNING=true
-SIGLIP_RUNNING=false; pgrep -f "precompute_siglip\.py" &>/dev/null && SIGLIP_RUNNING=true
-[[ $QWEN3_RUNNING == true || $VAE_RUNNING == true || $SIGLIP_RUNNING == true ]] && PRECOMPUTE_RUNNING=true
 
 # ── Heartbeat progress lines (from logs) ──────────────────────────────────────
 # Each running step emits heartbeat lines we can parse for live progress.
@@ -250,7 +275,7 @@ hb=$(last_match "$PRECOMPUTE_LOG" '\[[0-9]+/[0-9]+\] [0-9,]+ latents')
 [[ -n "$hb" ]] && VAE_RUN_INFO="$hb"
 
 # Step 9a — training: read heartbeat.json for live progress
-LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors "$CKPT_DIR"/stage**/step_*.safetensors 2>/dev/null | grep -v ema | head -1 || true)
+LATEST_CKPT=$(ls -t "$CKPT_DIR"/step_*.safetensors 2>/dev/null | head -1 || true)
 LATEST_STEP=""
 [[ -n "$LATEST_CKPT" ]] && LATEST_STEP="($(basename "$LATEST_CKPT" .safetensors)) "
 TRAIN_RUN_INFO="${LATEST_STEP}running..."
@@ -265,8 +290,10 @@ try:
     total     = d.get("total_steps", 0)
     loss      = d.get("loss", 0)
     loss_s    = d.get("loss_smooth", 0)
+    lr        = d.get("lr", 0)
     sps       = d.get("steps_per_sec", 0)
     eta_s     = d.get("eta_seconds", 0)
+    elapsed_s = d.get("elapsed_seconds", 0)
     ts        = d.get("timestamp", "")
     pct       = step / total * 100 if total else 0
     eta_h, rem = divmod(int(eta_s), 3600)
@@ -276,15 +303,28 @@ try:
     print(f"step {step:,}/{total:,} ({pct:.1f}%)  loss {loss:.4f} (avg {loss_s:.4f})  {sps:.3f} steps/s  ETA {eta_h}h{eta_m:02d}m  [{ts}]")
     if stale:
         print(f"STALE:{age_s}")
+    # Emit structured data for --json mode
+    jd = {"step": step, "total_steps": total, "pct": round(pct, 2),
+          "loss": round(loss, 6), "loss_smooth": round(loss_s, 6),
+          "lr": lr, "steps_per_sec": round(sps, 4),
+          "eta_seconds": int(eta_s), "eta_hours": round(eta_s/3600, 2),
+          "elapsed_seconds": int(elapsed_s),
+          "heartbeat_age_s": age_s, "heartbeat_stale": stale,
+          "timestamp": ts}
+    print("JSON:" + json.dumps(jd))
 except Exception as e:
     print(f"ERR:{e}")
 PYEOF
     )
     _stale_line=$(echo "$_hb_out" | grep "^STALE:")
-    _hb_main=$(echo "$_hb_out" | grep -v "^STALE:\|^ERR:")
+    _hb_main=$(echo "$_hb_out" | grep -v "^STALE:\|^ERR:\|^JSON:")
+    _hb_json=$(echo "$_hb_out" | grep "^JSON:" | sed 's/^JSON://')
     [[ -n "$_hb_main" ]] && TRAIN_RUN_INFO="$_hb_main"
+    HB_JSON="${_hb_json:-}"
+    HB_AGE_S=""
     if [[ -n "$_stale_line" ]]; then
         _age=$(echo "$_stale_line" | cut -d: -f2)
+        HB_AGE_S="$_age"
         HB_STALE="  ⚠️  heartbeat stale (${_age}s ago — process may be stuck or dead)"
     fi
 fi
@@ -295,7 +335,11 @@ MINE_RUN_INFO="running..."
 hb=$(last_match "$TRAIN_LOG" 'Mining hard\|hard examples.*Done\|top-[0-9]+ records')
 [[ -n "$hb" ]] && MINE_RUN_INFO="$hb"
 BEST_CKPT_EXISTS=false
-[[ -f "$CKPT_DIR/stage1/best.safetensors" || -f "$TRAIN_DIR/checkpoints/stage1/best.safetensors" ]] && BEST_CKPT_EXISTS=true
+[[ -f "$CKPT_DIR/best.safetensors" || -f "$CKPT_DIR/stage1/best.safetensors" || \
+   -f "$DATA_ROOT/checkpoints/stage1/best.safetensors" ]] && BEST_CKPT_EXISTS=true
+
+# ── Suppress human-readable output in JSON mode ───────────────────────────────
+if $JSON_MODE; then exec 3>&1 1>/dev/null; fi
 
 # ── Header ────────────────────────────────────────────────────────────────────
 echo "================================================================="
@@ -469,3 +513,112 @@ printf "  %-28s %s\n" "checkpoints/"        "$(du_h "$CKPT_DIR") ($CKPT_COUNT ch
 [[ -n "$HEARTBEAT_FILE" ]] && printf "  %-28s %s\n" "heartbeat:"  "$HEARTBEAT_FILE"
 echo ""
 echo "================================================================="
+
+# ── JSON output (--json flag) ─────────────────────────────────────────────────
+# Emits a single JSON object summarising pipeline state for AI agent consumption.
+# All fields always present; unknown values use null. Human-readable output is
+# suppressed; only JSON is printed when --json is set.
+if $JSON_MODE; then
+    # Restore stdout before emitting JSON
+    exec 1>&3 3>&-
+
+    # Determine active step
+    _active_step="idle"
+    $BUILD_RUNNING      && _active_step="build_shards"
+    $FILTER_RUNNING     && _active_step="filter_shards"
+    $PRECOMPUTE_RUNNING && _active_step="precompute"
+    $TRAIN_RUNNING      && _active_step="train"
+    $MINE_RUNNING       && _active_step="mine_hard_examples"
+
+    # Pipeline metadata from lock file
+    _lock_chunk=$(grep '^chunk='   "$LOCK_FILE" 2>/dev/null | cut -d= -f2 || true)
+    _lock_scale=$(grep '^cmdline=' "$LOCK_FILE" 2>/dev/null | grep -oE '\-\-scale [^ ]+' | awk '{print $2}' || true)
+    _latest_ckpt_name=$(basename "${LATEST_CKPT:-}" .safetensors)
+
+    # Disk stats (raw values for JSON)
+    _disk_info=$(df -k "$DATA_ROOT" 2>/dev/null | awk 'NR==2 {print $1, $3, $4}')
+    _disk_dev=$(echo "$_disk_info"  | awk '{print $1}')
+    _disk_used=$(echo "$_disk_info" | awk '{printf "%.1f", $2/1048576}')   # GiB
+    _disk_avail=$(echo "$_disk_info"| awk '{printf "%.1f", $3/1048576}')   # GiB
+
+    # Step done/running/pending state as strings
+    _s_downloads="pending"; { [[ $LAION_TARS -gt 0 || $SHARD_COUNT -gt 0 ]]; } 2>/dev/null && _s_downloads="done"
+    _s_dedup="pending";     [[ -f "$DEDUP_IDS" ]] && _s_dedup="done";     $([[ "$DEDUP_RUN_INFO" != "running..." ]]) 2>/dev/null && [[ "$_s_dedup" != "done" ]] && _s_dedup="running"
+    _s_build="pending";     [[ "$BUILD_DONE" == true ]] && _s_build="done"; [[ "$BUILD_RUNNING" == true ]] && _s_build="running"
+    _s_filter="pending";    [[ -f "$SHARDS_DIR/.filtered_chunk1" ]] && _s_filter="done"; [[ "$FILTER_RUNNING" == true ]] && _s_filter="running"
+    _s_precompute="pending"; [[ -f "$PRECOMP_DIR/.done" ]] && _s_precompute="done"; [[ "$PRECOMPUTE_RUNNING" == true ]] && _s_precompute="running"
+    _s_train="pending";     [[ $CKPT_COUNT -gt 0 && "$TRAIN_RUNNING" == false ]] && _s_train="done"; [[ "$TRAIN_RUNNING" == true ]] && _s_train="running"
+    _s_mine="pending";      [[ $HARD_COUNT -gt 0 && "$MINE_RUNNING" == false ]] && _s_mine="done"; [[ "$MINE_RUNNING" == true ]] && _s_mine="running"
+
+    python3 - \
+        "$DATA_ROOT" "$CKPT_DIR" "${HEARTBEAT_FILE:-}" \
+        "${PIPELINE_ROOT:-}" "${_lock_chunk:-}" "${_lock_scale:-}" \
+        "$_active_step" \
+        "$SHARD_COUNT" "$QWEN3_COUNT" "$VAE_COUNT" "$SIGLIP_COUNT" \
+        "$ANCHOR_COUNT" "$HARD_COUNT" "$CKPT_COUNT" "${_latest_ckpt_name:-}" \
+        "${HB_JSON:-}" \
+        "$_disk_dev" "$_disk_used" "$_disk_avail" \
+        "$_s_downloads" "$_s_dedup" "$_s_build" "$_s_filter" \
+        "$_s_precompute" "$_s_train" "$_s_mine" \
+        "$TRAIN_RUNNING" \
+        <<'PYEOF'
+import json, sys, datetime
+a = sys.argv[1:]
+def s(v): return v if v else None
+
+out = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "data_root":      a[0],
+    "checkpoint_dir": a[1],
+    "heartbeat_file": s(a[2]),
+    "pipeline": {
+        "running": bool(a[3]),
+        "pid":     int(a[3]) if a[3] else None,
+        "chunk":   a[4] or None,
+        "scale":   a[5] or None,
+    },
+    "active_step": a[6],
+    "steps": {
+        "downloads":  a[19],
+        "dedup":      a[20],
+        "build_shards": a[21],
+        "filter":     a[22],
+        "precompute": a[23],
+        "train":      a[24],
+        "mine_hard":  a[25],
+    },
+    "training": None,
+    "data": {
+        "shard_count":          int(a[7]),
+        "qwen3_count":          int(a[8]),
+        "vae_count":            int(a[9]),
+        "siglip_count":         int(a[10]),
+        "anchor_shards":        int(a[11]),
+        "hard_example_shards":  int(a[12]),
+        "checkpoints":          int(a[13]),
+        "latest_checkpoint":    s(a[14]),
+    },
+    "disk": {
+        "device":    a[16],
+        "used_gib":  float(a[17]),
+        "avail_gib": float(a[18]),
+    },
+}
+
+# Parse heartbeat JSON if available
+hb_raw = a[15]
+if hb_raw:
+    try:
+        hb = json.loads(hb_raw)
+        hb["running"] = (a[26] == "true")
+        hb["checkpoints"] = int(a[13])
+        hb["latest_checkpoint"] = s(a[14])
+        out["training"] = hb
+    except Exception:
+        out["training"] = {"running": (a[26] == "true"), "checkpoints": int(a[13])}
+else:
+    out["training"] = {"running": (a[26] == "true"), "checkpoints": int(a[13])}
+
+print(json.dumps(out, indent=2))
+PYEOF
+fi
