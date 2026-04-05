@@ -93,6 +93,13 @@ fi
 
 mkdir -p "$DATA_ROOT_EXPLICIT/logs"
 
+# ── Pass auto-detected data root unless the user already provided --data-root ──
+# Without this, run_training_pipeline.sh defaults to train/data (local SSD).
+# Use ${#...} guard to avoid bash 3.2 nounset failure on empty arrays.
+if [[ ${#PIPELINE_ARGS[@]} -eq 0 || " ${PIPELINE_ARGS[*]} " != *"--data-root"* ]]; then
+    PIPELINE_ARGS+=(--data-root "$DATA_ROOT_EXPLICIT")
+fi
+
 # ── Launch ────────────────────────────────────────────────────────────────────
 CMD="caffeinate -i -d bash $PIPELINE_SCRIPT ${PIPELINE_ARGS[*]:-}"
 echo "Starting pipeline in tmux session '$SESSION' (chunk $CHUNK)..."

@@ -167,6 +167,20 @@ if [[ -z "${TMUX:-}" ]]; then
     echo "         Recommended: tmux new-session -d -s pipeline \"caffeinate -i -d bash $0 $*\"" >&2
 fi
 
+# ── Disk space pre-check ──────────────────────────────────────────────────────
+# Precompute ~350 GB + shards ~800 GB + checkpoints ~20 GB + logs + overhead.
+# Minimum 50 GB required to start; warn at 200 GB.
+_avail_kb=$(df -k "$DATA_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+_avail_gb=$(( ${_avail_kb:-0} / 1048576 ))
+if [[ "$_avail_gb" -lt 50 ]]; then
+    echo "ERROR: only ${_avail_gb} GB free on $DATA_ROOT — need at least 50 GB to start." >&2
+    echo "       Free space before launching the pipeline." >&2
+    exit 1
+elif [[ "$_avail_gb" -lt 200 ]]; then
+    echo "WARNING: only ${_avail_gb} GB free on $DATA_ROOT — precompute needs ~350 GB." >&2
+    echo "         Pipeline may run out of space mid-run." >&2
+fi
+
 # ── Pipeline lock — prevent concurrent runs against the same DATA_ROOT ────────
 mkdir -p "$DATA_ROOT/logs"
 LOCK_FILE="$DATA_ROOT/logs/pipeline.lock"
@@ -210,21 +224,68 @@ exec > >(tee -a "$LOG") 2>&1
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*"; }
-die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
+die() {
+    echo "[$(ts)] ERROR: $*" >&2
+    # Mark the current step as failed in the manifest so operators know which step died.
+    [[ -n "${_MANIFEST_STEP:-}" ]] && manifest_step "$_MANIFEST_STEP" failed "${_MANIFEST_LOG:-${LOG:-}}" 2>/dev/null || true
+    exit 1
+}
+_MANIFEST_STEP=""
+_MANIFEST_LOG=""
 
-# retry MAX_ATTEMPTS DELAY_SECS CMD [ARGS...]
+# retry MAX_ATTEMPTS DELAY_SECS MAX_ELAPSED CMD [ARGS...]
 # Runs CMD up to MAX_ATTEMPTS times, sleeping DELAY_SECS between attempts.
+# MAX_ELAPSED: abort if total wall time since first attempt exceeds this many
+#              seconds (0 = no limit). Prevents retrying a 20h job that fails.
 # Returns 0 on first success; returns 1 (triggering set -e exit) on exhaustion.
 retry() {
-    local max="$1" delay="$2"; shift 2
-    local attempt=1
+    local max="$1" delay="$2" max_elapsed="$3"; shift 3
+    local attempt=1 t_start
+    t_start=$(date +%s)
     while true; do
         if "$@"; then return 0; fi
+        local elapsed=$(( $(date +%s) - t_start ))
         [[ "$attempt" -ge "$max" ]] && { log "ERROR: command failed after $max attempts: $*"; return 1; }
-        log "  Attempt $attempt/$max failed — retrying in ${delay}s..."
+        if [[ "$max_elapsed" -gt 0 && "$elapsed" -ge "$max_elapsed" ]]; then
+            log "ERROR: command failed and total elapsed ${elapsed}s >= max ${max_elapsed}s — aborting: $*"
+            return 1
+        fi
+        log "  Attempt $attempt/$max failed (elapsed ${elapsed}s) — retrying in ${delay}s..."
         sleep "$delay"
         attempt=$((attempt + 1))
     done
+}
+
+# manifest_step STEP STATUS [LOG_FILE]
+# Updates $DATA_ROOT/logs/pipeline_manifest.json so operators always know
+# which log file is associated with the currently running step.
+# STATUS: running | done | failed
+manifest_step() {
+    local step="$1" status="${2:-running}" log_file="${3:-${LOG:-}}"
+    local manifest="$DATA_ROOT/logs/pipeline_manifest.json"
+    python3 - "$manifest" "$step" "$log_file" "$status" <<'PYEOF' 2>/dev/null || true
+import json, os, sys, time
+manifest, step, log_file, status = sys.argv[1:]
+try:
+    data = json.load(open(manifest)) if os.path.exists(manifest) else {}
+except Exception:
+    data = {}
+steps = data.get("steps", [])
+for s in steps:
+    if s.get("step") == step:
+        s.update({"log": log_file, "status": status})
+        if status == "running":
+            s["started"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        break
+else:
+    steps.append({"step": step, "log": log_file,
+                  "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": status})
+data["steps"] = steps
+tmp = manifest + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, manifest)
+PYEOF
 }
 
 log "================================================================="
@@ -308,6 +369,7 @@ if [[ "$CHUNK" -eq 1 ]]; then
             if [[ ! -f "$_wa_sentinel" ]]; then
                 echo "[$(date '+%T')] Downloading huggan/wikiart (~27 GB)..."
                 python3 - <<PYEOF
+import os; os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # hf_transfer buffers ~5 GB RAM; use standard downloader
 from huggingface_hub import snapshot_download
 snapshot_download('huggan/wikiart', repo_type='dataset',
     local_dir='${DATA_ROOT}/raw/wikiart')
@@ -348,17 +410,23 @@ PYEOF
             if [[ ${#_tgz[@]} -lt $JDB_DOWNLOAD_N && ! -f "$_jdb_sentinel" ]]; then
                 echo "[$(date '+%T')] ${#_tgz[@]}/$JDB_DOWNLOAD_N tgz files — downloading JourneyDB chunk 1 (~$((JDB_DOWNLOAD_N * 16)) GB)..."
                 python3 - <<PYEOF
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'JourneyDB/JourneyDB',
-    repo_type='dataset',
-    local_dir='${DATA_ROOT}/raw/journeydb',
-    allow_patterns=(
-        [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_DOWNLOAD_N)]
-        + ['data/train/train_anno_realease_repath.jsonl.tgz']
-    ),
-)
-print('Download complete.')
+import os, sys
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # hf_transfer buffers ~5 GB RAM; use standard downloader
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        'JourneyDB/JourneyDB',
+        repo_type='dataset',
+        local_dir='${DATA_ROOT}/raw/journeydb',
+        allow_patterns=(
+            [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_DOWNLOAD_N)]
+            + ['data/train/train_anno_realease_repath.jsonl.tgz']
+        ),
+    )
+    print('Download complete.')
+except Exception as e:
+    print(f'ERROR: snapshot_download failed: {e}', file=sys.stderr)
+    sys.exit(1)
 PYEOF
                 touch "$_jdb_sentinel"
             fi
@@ -391,6 +459,8 @@ PYEOF
     if [[ -n "$WIKIART_PID" ]]; then
         if wait "$WIKIART_PID"; then
             log "[2a/9] WikiArt done: $(count_tars "$WIKIART_WDS") shards"
+            # Safe to delete: WDS conversion is confirmed done (wait returned 0) and
+            # the anchor set job above uses WIKIART_WDS (the converted dir), not raw.
             [[ -d "$DATA_ROOT/raw/wikiart" ]] && \
                 { log "  Freeing raw WikiArt (~1.6 GB)..."; rm -rf "$DATA_ROOT/raw/wikiart"; }
         else
@@ -425,6 +495,8 @@ PYEOF
         log "[4/9] Unified shards already built ($(count_tars "$SHARDS_DIR") shards) — skipping"
     else
         log "[4/9] Building unified shards from all sources..."
+        _MANIFEST_STEP="4/9 build-shards"; _MANIFEST_LOG="$DATA_ROOT/logs/build_shards.log"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         SOURCES=("$DATA_ROOT/raw/laion" "$JDB_WDS" "$WIKIART_WDS")
         [[ "${COYO_TARS:-0}" -gt 0 ]] && SOURCES+=("$DATA_ROOT/raw/coyo")
 
@@ -443,15 +515,29 @@ PYEOF
         done) &
         FILTER_LOOP_PID=$!
 
-        python "$SCRIPT_DIR/build_shards.py" "${BUILD_ARGS[@]}" 2>&1 | tee /tmp/build_shards.log
-        log "  Done: $(count_tars "$SHARDS_DIR") unified shards"
+        python "$SCRIPT_DIR/build_shards.py" "${BUILD_ARGS[@]}" 2>&1 | tee "$DATA_ROOT/logs/build_shards.log"
+        _built=$(count_tars "$SHARDS_DIR")
+        [[ "$_built" -gt 0 ]] || die "build_shards.py exited 0 but produced no shards in $SHARDS_DIR — not proceeding"
+        log "  Done: $_built unified shards"
 
-        # Stop loop; final pass catches any shards written in the last 60s window
-        kill "$FILTER_LOOP_PID" 2>/dev/null || true
+        # Stop background loop. Give Python time to flush its current iteration
+        # before killing the subshell. 5s is plenty for filter_shards to finish
+        # writing its current shard; SIGKILL after that to avoid hanging.
+        kill -TERM "$FILTER_LOOP_PID" 2>/dev/null || true
+        for _i in 1 2 3 4 5; do
+            kill -0 "$FILTER_LOOP_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -KILL "$FILTER_LOOP_PID" 2>/dev/null || true
         wait "$FILTER_LOOP_PID" 2>/dev/null || true
-        log "[5/9] Final filter pass..."
+        log "[5/9] Final filter pass (catches any shards written in last 60s window)..."
+        _MANIFEST_STEP="5/9 filter-shards"; _MANIFEST_LOG="$DATA_ROOT/logs/filter_background.log"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR"
+        _filtered=$(count_tars "$SHARDS_DIR")
+        [[ "$_filtered" -gt 0 ]] || die "filter_shards.py left 0 shards in $SHARDS_DIR — not proceeding"
         touch "$FILTER_DONE"
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "  Done"
     fi
 
@@ -460,8 +546,11 @@ PYEOF
         log "[5/9] Shards already filtered — skipping"
     else
         log "[5/9] Filtering shards (drop corrupt/small/bad-caption)..."
+        _MANIFEST_STEP="5/9 filter-shards"; _MANIFEST_LOG="$DATA_ROOT/logs/filter_background.log"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         python "$SCRIPT_DIR/filter_shards.py" --shards "$SHARDS_DIR"
         touch "$FILTER_DONE"
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "  Done"
     fi
 
@@ -506,6 +595,11 @@ PYEOF
         wait "$ANCHOR_PID" || die "create_anchor_set.py failed"
         log "  Done: anchor set in $ANCHOR_DIR"
     fi
+    # Validate anchor dir regardless of whether it was newly created or pre-existing.
+    # Training silently skips anchor mixing if the dir is empty.
+    _anchor_n=$(count_tars "$ANCHOR_DIR")
+    [[ "$_anchor_n" -gt 0 ]] || die "Anchor set is empty at $ANCHOR_DIR — training would run without anchor mixing. Re-run create_anchor_set.py."
+    log "  Anchor set: $_anchor_n shards"
 
     # ── Free intermediate WDS dirs ────────────────────────────────────────────
     # build_shards and anchor set are both complete — source WDS dirs are no
@@ -539,6 +633,8 @@ PYEOF
         log "[8/9] Precompute already done — skipping"
     else
         log "[8/9] Precomputing Qwen3 + VAE${PRECOMPUTE_SHARDS:+ (max $PRECOMPUTE_SHARDS shards, seed=$CHUNK)}..."
+        _MANIFEST_STEP="8/9 precompute"; _MANIFEST_LOG="$LOG"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         PRECOMPUTE_ARGS=(
             --shards        "$SHARDS_DIR"
             --qwen3-output  "$QWEN3_DIR"
@@ -548,8 +644,25 @@ PYEOF
         )
         [[ -n "$PRECOMPUTE_SHARDS" ]] && PRECOMPUTE_ARGS+=(--max-shards "$PRECOMPUTE_SHARDS")
         $ENABLE_SIGLIP && PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
-        retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
+        retry 3 300 1800 python "$SCRIPT_DIR/precompute_all.py" "${PRECOMPUTE_ARGS[@]}"
+
+        # Validate output counts before writing .done sentinel (fix 5).
+        # A precompute that wrote 90% of embeddings would silently cause training
+        # to skip batches or crash.  Compare file counts against shard count.
+        _shard_n=$(count_tars "$SHARDS_DIR")
+        _qwen3_n=$(find "$QWEN3_DIR" -name "*.npz" 2>/dev/null | wc -l | tr -d ' ')
+        _vae_n=$(find "$VAE_DIR" -name "*.npz" 2>/dev/null | wc -l | tr -d ' ')
+        # Each shard has ~5000 records; accept ≥80% coverage per modality.
+        _min_expected=$(( _shard_n * 5000 * 80 / 100 ))
+        if [[ "$_qwen3_n" -lt "$_min_expected" ]]; then
+            die "Precompute validation failed: qwen3=$_qwen3_n files for $_shard_n shards (expected ≥$_min_expected). Check logs."
+        fi
+        if [[ "$_vae_n" -lt "$_min_expected" ]]; then
+            die "Precompute validation failed: vae=$_vae_n files for $_shard_n shards (expected ≥$_min_expected). Check logs."
+        fi
+        log "  Validation OK: qwen3=$_qwen3_n  vae=$_vae_n  shards=$_shard_n"
         touch "$PRECOMPUTE_DONE"
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "  Done: $DATA_ROOT/precomputed/"
     fi
 
@@ -570,16 +683,22 @@ PYEOF
         log "[1i/9] Launching JDB chunk 2 background prefetch ($_c2_n files, ~$(( _c2_n * 16 )) GB, resumable)..."
         mkdir -p "$JDB_RAW" "$DATA_ROOT/logs"
         (python3 - <<PYEOF
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'JourneyDB/JourneyDB',
-    repo_type='dataset',
-    local_dir='${JDB_RAW}',
-    allow_patterns=(
-        [f'data/train/imgs/{i:03d}.tgz' for i in range(50, 50 + $_c2_n)]
-        + ['data/train/train_anno_realease_repath.jsonl.tgz']
-    ),
-)
+import os, sys
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # hf_transfer buffers ~5 GB RAM; use standard downloader
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        'JourneyDB/JourneyDB',
+        repo_type='dataset',
+        local_dir='${JDB_RAW}',
+        allow_patterns=(
+            [f'data/train/imgs/{i:03d}.tgz' for i in range(50, 50 + $_c2_n)]
+            + ['data/train/train_anno_realease_repath.jsonl.tgz']
+        ),
+    )
+except Exception as e:
+    print(f'ERROR: snapshot_download failed: {e}', file=sys.stderr)
+    sys.exit(1)
 PYEOF
         touch "${PREFETCH2_DONE}"
         ) >> "$PREFETCH2_LOG" 2>&1 &
@@ -595,13 +714,38 @@ PYEOF
         log "                 --config $CONFIG"
     else
         log "[9/9] Starting Stage 1 training ($TRAIN_STEPS steps, lr=$TRAIN_LR)..."
-        TRAIN_ARGS=("--config" "$CONFIG")
+        _MANIFEST_STEP="9/9 training"; _MANIFEST_LOG="$LOG"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
+        TRAIN_ARGS=("--config" "$CONFIG" "--data-root" "$DATA_ROOT")
         [[ -n "$TRAIN_LR" ]]    && TRAIN_ARGS+=("--lr" "$TRAIN_LR")
         [[ -n "$TRAIN_STEPS" ]] && TRAIN_ARGS+=("--max-steps" "$TRAIN_STEPS")
         [[ -n "$ANCHOR_DIR" && $(count_tars "$ANCHOR_DIR") -gt 0 ]] && \
             TRAIN_ARGS+=("--anchor-shards" "$ANCHOR_DIR")
 
-        retry 2 30 caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}"
+        # Resolve checkpoint_dir before launching so watchdog gets the exact path.
+        _ckpt_rel=$(python3 -c "
+import yaml, sys
+try:
+    c = yaml.safe_load(open('$CONFIG'))
+    print(c.get('output', {}).get('checkpoint_dir', 'checkpoints/stage1'))
+except Exception as e:
+    print('checkpoints/stage1')
+" 2>/dev/null)
+        CKPT_DIR="${REPO_DIR}/${_ckpt_rel:-checkpoints/stage1}"
+
+        # No retry: training failure (OOM, crash, user stop) should halt the pipeline
+        # so the operator can inspect logs and resume with --resume. Auto-restart would
+        # silently overwrite checkpoint history and restart from scratch.
+        caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${TRAIN_ARGS[@]}" &
+        _TRAIN_PID=$!
+        bash "$SCRIPT_DIR/pipeline_watchdog.sh" \
+            --pid "$_TRAIN_PID" --data-root "$DATA_ROOT" \
+            --heartbeat "$CKPT_DIR/heartbeat.json" \
+            >> "$DATA_ROOT/logs/watchdog.log" 2>&1 &
+        _WATCHDOG_PID=$!
+        wait "$_TRAIN_PID"
+        kill "$_WATCHDOG_PID" 2>/dev/null || true
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "Stage 1 training complete."
 
         # ── Mine hard examples from chunk 1 ───────────────────────────────────
@@ -609,19 +753,26 @@ PYEOF
         # Writes to train/data/hard_examples/ — never deleted between chunks.
         # Chunks 2-4 mix these in at 5% to focus gradient on difficult cases.
         HARD_DIR="$DATA_ROOT/hard_examples"
-        # Resolve checkpoint_dir from config as absolute path so CWD doesn't matter.
-        _ckpt_rel=$(grep -m1 'checkpoint_dir:' "$CONFIG" 2>/dev/null | awk -F'"' '{print $2}')
-        CKPT_DIR="${REPO_DIR}/${_ckpt_rel:-checkpoints/stage1}"
         BEST_CKPT="$CKPT_DIR/best.safetensors"
         if [[ -f "$BEST_CKPT" ]]; then
             log "[9b/9] Mining hard examples from chunk 1 (EMA checkpoint)..."
+            _MANIFEST_STEP="9b/9 mine-hard"; _MANIFEST_LOG="$DATA_ROOT/logs/mine_hard_chunk1.log"
+            manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
             MINE_ARGS=(--checkpoint "$BEST_CKPT" --shards "$SHARDS_DIR"
                         --qwen3-cache "$QWEN3_DIR" --vae-cache "$VAE_DIR"
                         --output "$HARD_DIR")
             $ENABLE_SIGLIP && MINE_ARGS+=(--siglip-cache "$DATA_ROOT/precomputed/siglip")
-            python "$SCRIPT_DIR/mine_hard_examples.py" "${MINE_ARGS[@]}" \
-                && log "  Done: hard examples in $HARD_DIR" \
-                || log "  WARNING: hard example mining failed — skipping (non-fatal)"
+            MINE_LOG="$DATA_ROOT/logs/mine_hard_chunk1.log"
+            if python "$SCRIPT_DIR/mine_hard_examples.py" "${MINE_ARGS[@]}" 2>&1 | tee "$MINE_LOG"; then
+                manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
+                log "  Done: hard examples in $HARD_DIR"
+            else
+                manifest_step "$_MANIFEST_STEP" failed "$_MANIFEST_LOG"
+                log "  WARNING: hard example mining failed — chunks 2-4 will train without hard examples (quality degradation expected)." >&2
+                log "  Log: $MINE_LOG  Re-run: python $SCRIPT_DIR/mine_hard_examples.py ${MINE_ARGS[*]}" >&2
+                log "  Last 30 lines of mining log:" >&2
+                tail -30 "$MINE_LOG" | while IFS= read -r line; do log "    $line" >&2; done
+            fi
         else
             log "[9b/9] Skipping hard example mining (no checkpoint at $BEST_CKPT)"
         fi
@@ -629,8 +780,11 @@ PYEOF
         # Wait for prefetch if it's still running
         if [[ -n "$PREFETCH2_PID" ]] && kill -0 "$PREFETCH2_PID" 2>/dev/null; then
             log "Training done. Waiting for JDB chunk 2 prefetch (PID $PREFETCH2_PID)..."
-            wait "$PREFETCH2_PID" || true
-            log "Prefetch complete."
+            if wait "$PREFETCH2_PID"; then
+                log "Prefetch complete."
+            else
+                log "WARNING: JDB chunk 2 prefetch failed (PID $PREFETCH2_PID) — chunk 2 will need to re-download or run without JDB chunk 2 data." >&2
+            fi
         fi
     fi
 
@@ -647,10 +801,13 @@ PYEOF
     else
         log "[10/10] Building cross-chunk dedup index (~1.5h)..."
         log "  (Required before starting --chunk 2; chunks 2-4 step 2b depends on this)"
+        _MANIFEST_STEP="10/10 dedup-index"; _MANIFEST_LOG="$DATA_ROOT/logs/clip_dedup.log"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         python "$SCRIPT_DIR/clip_dedup.py" build-index \
             --shards     "$SHARDS_DIR" \
             --embeddings "$ALL_EMBEDDINGS" \
             --index      "$DEDUP_INDEX"
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "  Done: $DEDUP_INDEX"
     fi
 
@@ -705,24 +862,33 @@ elif [[ "$CHUNK" -ge 2 && "$CHUNK" -le 4 ]]; then
     else
         log "[1/6] Downloading JourneyDB chunk $CHUNK ($JDB_DOWNLOAD_N/$_jdb_max_cx files, ~$((JDB_DOWNLOAD_N * 16)) GB)..."
         python3 - <<PYEOF
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'JourneyDB/JourneyDB',
-    repo_type='dataset',
-    local_dir='$JDB_RAW',
-    allow_patterns=(
-        [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_TGZ_START, $JDB_TGZ_START + $JDB_DOWNLOAD_N)]
-        + ['data/train/train_anno_realease_repath.jsonl.tgz']
-    ),
-)
-print('Download complete.')
+import os, sys
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # hf_transfer buffers ~5 GB RAM; use standard downloader
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        'JourneyDB/JourneyDB',
+        repo_type='dataset',
+        local_dir='$JDB_RAW',
+        allow_patterns=(
+            [f'data/train/imgs/{i:03d}.tgz' for i in range($JDB_TGZ_START, $JDB_TGZ_START + $JDB_DOWNLOAD_N)]
+            + ['data/train/train_anno_realease_repath.jsonl.tgz']
+        ),
+    )
+    print('Download complete.')
+except Exception as e:
+    print(f'ERROR: snapshot_download failed: {e}', file=sys.stderr)
+    sys.exit(1)
 PYEOF
         [[ $? -eq 0 ]] || die "HuggingFace snapshot_download failed for chunk $CHUNK"
         log "  Done: $JDB_DOWNLOAD_N files in $IMGS_DIR"
     fi
 
     # ── 2. Convert chunk N to WebDataset ─────────────────────────────────────
-    if [[ $(count_tars "$JDB_WDS") -gt 0 ]]; then
+    # Validate that "already exists" means a plausible complete conversion:
+    # each tgz ≈ 1 shard, so expect ≥ JDB_DOWNLOAD_N/2 shards minimum.
+    _jdb_wds_min=$(( JDB_DOWNLOAD_N / 2 ))
+    if [[ $(count_tars "$JDB_WDS") -ge "$_jdb_wds_min" ]]; then
         log "[2/6] Chunk $CHUNK WebDataset already exists ($(count_tars "$JDB_WDS") shards) — skipping"
     else
         log "[2/6] Converting JourneyDB chunk $CHUNK to WebDataset (tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL of $JDB_TGZ_END)..."
@@ -731,8 +897,10 @@ PYEOF
             --output     "$JDB_WDS" \
             --shard-size 5000 \
             --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END_ACTUAL"
-        log "  Done: $(count_tars "$JDB_WDS") shards in $JDB_WDS"
-        # Raw tgz files are no longer needed — delete to free space.
+        _conv_shards=$(count_tars "$JDB_WDS")
+        [[ "$_conv_shards" -gt 0 ]] || die "convert_journeydb.py produced 0 shards in $JDB_WDS — raw tgz files preserved, not deleting"
+        log "  Done: $_conv_shards shards in $JDB_WDS"
+        # Raw tgz files are no longer needed — confirmed WDS output is non-empty above.
         log "  Freeing raw tgz files for chunk $CHUNK (~$((JDB_DOWNLOAD_N * 16)) GB)..."
         for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
             rm -f "$IMGS_DIR/$(printf '%03d' $_i).tgz"
@@ -767,6 +935,8 @@ PYEOF
         # Capture shard count before appending — needed for filter --start-idx
         EXISTING=$(count_tars "$SHARDS_DIR")
         log "[3/6] Building new shards for chunk $CHUNK (appending after shard $EXISTING)..."
+        _MANIFEST_STEP="3/6 build-shards-chunk${CHUNK}"; _MANIFEST_LOG="$DATA_ROOT/logs/build_shards.log"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         CHUNK_BUILD_ARGS=("--sources" "$JDB_WDS" "--output" "$SHARDS_DIR" "--start-idx" "$EXISTING")
         [[ -f "$DEDUP_IDS" ]] && CHUNK_BUILD_ARGS+=("--blocklist" "$DEDUP_IDS")
         python "$SCRIPT_DIR/build_shards.py" "${CHUNK_BUILD_ARGS[@]}"
@@ -777,6 +947,7 @@ PYEOF
             --shards    "$SHARDS_DIR" \
             --start-idx "$EXISTING"
         touch "$FILTER_DONE"
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "  Done"
     fi
 
@@ -797,6 +968,8 @@ PYEOF
         _new_first=$(( PRECOMPUTE_SHARDS * 70 / 100 ))
     fi
     log "[4/6] Precomputing Qwen3 + VAE embeddings for chunk $CHUNK${PRECOMPUTE_SHARDS:+ (max $PRECOMPUTE_SHARDS, seed=$CHUNK${_new_first:+, new-first=$_new_first})}..."
+    _MANIFEST_STEP="4/6 precompute-chunk${CHUNK}"; _MANIFEST_LOG="$LOG"
+    manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
     CHUNK_PRECOMPUTE_ARGS=(
         --shards       "$SHARDS_DIR"
         --qwen3-output "$QWEN3_DIR"
@@ -806,7 +979,8 @@ PYEOF
     [[ -n "$PRECOMPUTE_SHARDS" ]] && CHUNK_PRECOMPUTE_ARGS+=(--max-shards "$PRECOMPUTE_SHARDS")
     [[ "$_new_first" -gt 0 ]]     && CHUNK_PRECOMPUTE_ARGS+=(--new-shards-first "$_new_first")
     $ENABLE_SIGLIP && CHUNK_PRECOMPUTE_ARGS+=(--siglip --siglip-output "$SIGLIP_DIR")
-    retry 3 60 python "$SCRIPT_DIR/precompute_all.py" "${CHUNK_PRECOMPUTE_ARGS[@]}"
+    retry 3 300 1800 python "$SCRIPT_DIR/precompute_all.py" "${CHUNK_PRECOMPUTE_ARGS[@]}"
+    manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
     log "  Done: embeddings in $QWEN3_DIR and $VAE_DIR"
 
     # ── 5. Resume training ────────────────────────────────────────────────────
@@ -822,6 +996,8 @@ PYEOF
 
         HARD_DIR="$DATA_ROOT/hard_examples"
         log "[5/6] Resuming training for chunk $CHUNK ($TRAIN_STEPS steps, lr=$TRAIN_LR)..."
+        _MANIFEST_STEP="5/6 training-chunk${CHUNK}"; _MANIFEST_LOG="$LOG"
+        manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
         log "       Checkpoint:    $RESUME"
         log "       Anchor shards: $ANCHOR_DIR"
         [[ -d "$HARD_DIR" && $(count_tars "$HARD_DIR") -gt 0 ]] && \
@@ -829,6 +1005,7 @@ PYEOF
 
         CHUNK_TRAIN_ARGS=(
             --config    "$CONFIG"
+            --data-root "$DATA_ROOT"
             --resume    "$RESUME"
             --lr        "$TRAIN_LR"
             --max-steps "$TRAIN_STEPS"
@@ -837,7 +1014,17 @@ PYEOF
         [[ -d "$HARD_DIR" && $(count_tars "$HARD_DIR") -gt 0 ]] && \
             CHUNK_TRAIN_ARGS+=(--hard-examples "$HARD_DIR")
 
-        retry 2 30 caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${CHUNK_TRAIN_ARGS[@]}"
+        # No retry: same rationale as chunk 1 — let operator resume deliberately.
+        caffeinate -i -d python -u "$TRAIN_DIR/train_ip_adapter.py" "${CHUNK_TRAIN_ARGS[@]}" &
+        _TRAIN_PID=$!
+        bash "$SCRIPT_DIR/pipeline_watchdog.sh" \
+            --pid "$_TRAIN_PID" --data-root "$DATA_ROOT" \
+            --heartbeat "$CKPT_DIR/heartbeat.json" \
+            >> "$DATA_ROOT/logs/watchdog.log" 2>&1 &
+        _WATCHDOG_PID=$!
+        wait "$_TRAIN_PID"
+        kill "$_WATCHDOG_PID" 2>/dev/null || true
+        manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
         log "Chunk $CHUNK training complete."
 
         # Mine hard examples after each chunk, appending to the persistent store.
@@ -845,14 +1032,25 @@ PYEOF
         BEST_CKPT="$CKPT_DIR/best.safetensors"
         if [[ -f "$BEST_CKPT" ]]; then
             log "[5b/6] Mining hard examples for chunk $CHUNK (appending to $HARD_DIR)..."
-            python "$SCRIPT_DIR/mine_hard_examples.py" \
-                --checkpoint "$BEST_CKPT" \
-                --shards     "$SHARDS_DIR" \
-                --qwen3-cache "$QWEN3_DIR" \
-                --vae-cache   "$VAE_DIR" \
-                --output      "$HARD_DIR" \
-            && log "  Done: $(count_tars "$HARD_DIR") hard example shards total" \
-            || log "  WARNING: hard example mining failed — skipping (non-fatal)"
+            MINE_LOG="$DATA_ROOT/logs/mine_hard_chunk${CHUNK}.log"
+            _MANIFEST_STEP="5b/6 mine-hard-chunk${CHUNK}"; _MANIFEST_LOG="$MINE_LOG"
+            manifest_step "$_MANIFEST_STEP" running "$_MANIFEST_LOG"
+            if python "$SCRIPT_DIR/mine_hard_examples.py" \
+                    --checkpoint "$BEST_CKPT" \
+                    --shards     "$SHARDS_DIR" \
+                    --qwen3-cache "$QWEN3_DIR" \
+                    --vae-cache   "$VAE_DIR" \
+                    --output      "$HARD_DIR" \
+                    2>&1 | tee "$MINE_LOG"; then
+                manifest_step "$_MANIFEST_STEP" done "$_MANIFEST_LOG"
+                log "  Done: $(count_tars "$HARD_DIR") hard example shards total"
+            else
+                manifest_step "$_MANIFEST_STEP" failed "$_MANIFEST_LOG"
+                log "  WARNING: hard example mining failed for chunk $CHUNK — subsequent chunks will train without updated hard examples (quality degradation expected)." >&2
+                log "  Log: $MINE_LOG  Re-run: python $SCRIPT_DIR/mine_hard_examples.py --checkpoint $BEST_CKPT --shards $SHARDS_DIR ..." >&2
+                log "  Last 30 lines of mining log:" >&2
+                tail -30 "$MINE_LOG" | while IFS= read -r line; do log "    $line" >&2; done
+            fi
         fi
     fi
 

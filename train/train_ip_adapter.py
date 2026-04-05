@@ -117,17 +117,34 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
 _ckpt_lock = threading.Lock()
 
 
+def _git_sha() -> str:
+    """Return the current HEAD git SHA (short), or 'unknown' if unavailable."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def save_checkpoint_async(
     adapter: IPAdapterKlein,
     ema_params: dict,
     step: int,
     output_dir: str,
     keep_last_n: int = 5,
+    lineage: Optional[dict] = None,
 ) -> None:
     """
     Save adapter weights + EMA on a background thread so GPU continues training.
     mx.eval() completes pending async_eval ops before the numpy copy.
     Based on plans/ip-adapter-training.md §3.12.
+
+    lineage: if provided, written as a sidecar step_NNNNNNN.json recording the
+    config, git SHA, training args, and step/loss for reproducibility (MLX-10).
     """
     from safetensors.numpy import save_file
 
@@ -146,6 +163,13 @@ def save_checkpoint_async(
         save_file(payload, ckpt_path)
         size_mb = os.path.getsize(ckpt_path) / 1e6
         print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
+        if lineage is not None:
+            sidecar_path = os.path.join(output_dir, f"step_{step:07d}.json")
+            try:
+                with open(sidecar_path, "w") as _f:
+                    json.dump(lineage, _f, indent=2)
+            except OSError as e:
+                print(f"  WARNING: could not write lineage sidecar: {e}")
         # Serialise purge so two concurrent threads don't race on the file list
         with _ckpt_lock:
             _purge_old_checkpoints(output_dir, keep_last_n)
@@ -161,6 +185,12 @@ def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
             os.remove(f)
         except FileNotFoundError:
             pass  # already removed by a concurrent thread
+        # Remove sidecar lineage JSON if present
+        sidecar = f.replace(".safetensors", ".json")
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
 
 
 def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
@@ -238,6 +268,16 @@ def train(config: dict) -> None:
     ocfg = config["output"]
     lcfg = config.get("logging") or {}
 
+    # ── Lineage base dict (MLX-10) ────────────────────────────────────────────
+    # Written as a sidecar .json alongside each checkpoint for reproducibility.
+    # step/loss are filled in at save time; everything else is static.
+    _lineage_base = {
+        "git_sha": _git_sha(),
+        "argv": sys.argv[:],
+        "config": config,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
     # ── Optional W&B logging ──────────────────────────────────────────────────
     wandb_run = None
     if lcfg.get("wandb_project"):
@@ -250,6 +290,57 @@ def train(config: dict) -> None:
             )
         except ImportError:
             print("wandb not installed — logging to stdout only")
+
+    # ── Pre-flight checks (MLX-11) ────────────────────────────────────────────
+    _preflight_ok = True
+    def _check(label: str, ok: bool, detail: str = "") -> bool:
+        mark = "✅" if ok else "❌"
+        suffix = f"  ({detail})" if detail else ""
+        print(f"  {mark} {label}{suffix}")
+        return ok
+    print("Pre-flight checks:")
+    # MLX version
+    try:
+        import mlx.core as _mlx_core
+        _ver_str = _mlx_core.__version__
+        _mlx_ver = tuple(int(x) for x in _ver_str.split(".")[:2])
+        _preflight_ok &= _check("MLX >= 0.31.1", _mlx_ver >= (0, 31), _ver_str)
+    except Exception as e:
+        _preflight_ok &= _check("MLX version", False, str(e))
+    # Required packages
+    for _pkg in ["safetensors", "yaml", "turbojpeg"]:
+        try:
+            __import__(_pkg)
+            _preflight_ok &= _check(f"import {_pkg}", True)
+        except ImportError:
+            _preflight_ok &= _check(f"import {_pkg}", False, "pip install " + _pkg)
+    # Model weights directory
+    _flux_dir = mcfg["flux_model_dir"]
+    _flux_ok = os.path.isdir(_flux_dir)
+    _preflight_ok &= _check(f"model dir: {_flux_dir}", _flux_ok,
+                             "" if _flux_ok else "not found")
+    # Shard path
+    _shard_dir = dcfg["shard_path"]
+    _shard_count = len(glob.glob(os.path.join(_shard_dir, "*.tar")))
+    _preflight_ok &= _check(f"shards: {_shard_dir}", _shard_count > 0,
+                             f"{_shard_count} tars" if _shard_count else "no .tar files found")
+    # Checkpoint if resuming
+    _warmstart = mcfg.get("warmstart_path")
+    if _warmstart:
+        _ws_ok = os.path.isfile(_warmstart)
+        _preflight_ok &= _check(f"resume checkpoint: {_warmstart}", _ws_ok,
+                                 "" if _ws_ok else "file not found")
+    # Output dir writable
+    _out_dir = ocfg["checkpoint_dir"]
+    try:
+        os.makedirs(_out_dir, exist_ok=True)
+        _out_ok = os.access(_out_dir, os.W_OK)
+    except OSError:
+        _out_ok = False
+    _preflight_ok &= _check(f"output dir writable: {_out_dir}", _out_ok)
+    if not _preflight_ok:
+        raise RuntimeError("Pre-flight checks failed — see ❌ items above.")
+    print()
 
     # ── Load frozen base models ───────────────────────────────────────────────
     if not _HAS_MFLUX:
@@ -274,6 +365,18 @@ def train(config: dict) -> None:
                 time.sleep(30)
     except Exception:
         pass  # non-macOS or sysctl unavailable — skip check
+
+    # Cap MLX GPU allocation to 20 GB on 32 GB systems (leaves ~12 GB for OS +
+    # Metal driver + other processes).  Without this cap, jetsam kills the
+    # process during mx.compile's first backward-pass compilation (~step 250)
+    # when transient buffer peaks exceed the system's memory pressure threshold.
+    # set_cache_limit(0) prevents MLX from holding freed buffers in a cache —
+    # forces immediate return to the OS, reducing peak wired memory.
+    _ram_bytes = 32 * 1024 ** 3
+    mx.set_memory_limit(int(_ram_bytes * 0.44))   # 14 GB on 32 GB — leaves room for OS + concurrent processes
+    mx.set_cache_limit(int(_ram_bytes * 0.06))    # 2 GB cache headroom
+    print(f"MLX memory limit: {int(_ram_bytes * 0.44) // 1024**3} GB  "
+          f"cache limit: {int(_ram_bytes * 0.06) // 1024**2} MB")
 
     print("Loading Flux Klein 4B (frozen) ...")
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
@@ -335,6 +438,27 @@ def train(config: dict) -> None:
                 "Run train/scripts/precompute_all.py first."
             )
 
+    # SigLIP coverage check (MLX-15): if siglip_cache_dir is set but incomplete,
+    # batches silently use zero image features, degrading training signal.
+    siglip_dir = dcfg.get("siglip_cache_dir")
+    if siglip_dir and os.path.isdir(siglip_dir):
+        _siglip_npz = glob.glob(os.path.join(siglip_dir, "*.npz"))
+        # Each shard produces multiple .npz files; presence of at least one per
+        # shard stem is sufficient. Count covered shard stems.
+        _covered = {os.path.basename(f).split("_")[0] for f in _siglip_npz}
+        _shard_stems = {os.path.splitext(os.path.basename(p))[0] for p in shard_paths}
+        _missing = _shard_stems - _covered
+        _coverage = len(_covered & _shard_stems) / len(_shard_stems) if _shard_stems else 1.0
+        if _missing:
+            print(
+                f"WARNING: SigLIP cache coverage {_coverage*100:.0f}% "
+                f"({len(_covered & _shard_stems)}/{len(_shard_stems)} shards). "
+                f"Missing: {sorted(_missing)[:5]}{'...' if len(_missing) > 5 else ''}. "
+                f"Batches from uncovered shards will train with zero image features."
+            )
+        else:
+            print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_stems)} shards). OK.")
+
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -356,6 +480,28 @@ def train(config: dict) -> None:
     # the GPU is still referencing them, causing a null-MTLBuffer SIGSEGV.
     print("Pre-evaluating Flux transformer weights ...")
     mx.eval(flux.transformer.parameters())
+
+    # Pre-compile Metal graphs for all training bucket shapes.
+    # _flux_forward_no_ip is a different graph from inference (collects Q at every
+    # block), so MPSGraph must compile it separately. Without warmup the first real
+    # training step stalls 10-30 min per bucket shape. We warm up all 6 buckets
+    # now so no compilation happens mid-training.
+    _txt_warmup = mx.zeros((1, 64, flux.transformer.context_embedder.weight.shape[1]),
+                           dtype=mx.bfloat16)
+    _t_warmup   = mx.array([500], dtype=mx.int32)
+    print("Warming up Flux training graphs (all bucket shapes)...")
+    for _bH, _bW in BUCKETS:
+        _lat_H, _lat_W = _bH // 8, _bW // 8          # VAE latent spatial dims
+        _dummy_lat = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
+        print(f"  [{_bH}x{_bW}] compiling...", flush=True)
+        _t0_wu = time.time()
+        _fs = _flux_forward_no_ip(flux, _dummy_lat, _txt_warmup, _t_warmup)
+        mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"])
+        print(f"  [{_bH}x{_bW}] done ({time.time() - _t0_wu:.1f}s)", flush=True)
+        del _fs
+        mx.clear_cache()
+    del _dummy_lat, _txt_warmup, _t_warmup
+    print("Flux training graphs ready.")
 
     ckpt_double = None
     ckpt_single = None
@@ -510,6 +656,7 @@ def train(config: dict) -> None:
     t_start = time.time()
     log_interval = ocfg["log_every"]
     loss_history: list[float] = []  # rolling window for smoothed loss
+    loss_smooth = 0.0
     heartbeat_path = os.path.join(ocfg["checkpoint_dir"], "heartbeat.json")
 
     # Per-phase timing accumulators (TP-005). Printed at each log interval.
@@ -608,14 +755,21 @@ def train(config: dict) -> None:
         # Synchronous eval: prevents lazy-graph accumulation across steps.
         _t0 = time.time()
         mx.eval(loss_val, adapter.parameters(), optimizer.state)
+        # Return freed buffers to the OS immediately.  Without this, MLX holds
+        # them in a cache that inflates peak wired memory and triggers jetsam.
+        mx.clear_cache()
         _t_eval_end = time.time()
         _t_eval += _t_eval_end - _t0
 
         step += 1
 
         # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
+        # mx.eval immediately after update to break the lazy-graph chain.
+        # Without this, ema_params accumulates one unevaluated level per update:
+        # by step 200 that is 20 × ~950 MB of live intermediate arrays (~19 GB).
         if step % tcfg["ema_update_every"] == 0:
             ema_params = update_ema(ema_params, adapter, decay=tcfg["ema_decay"])
+            mx.eval(ema_params)
 
         # Logging
         if step % log_interval == 0:
@@ -684,13 +838,18 @@ def train(config: dict) -> None:
 
         # Checkpoint (async background write; plans §3.12)
         if step % ocfg["checkpoint_every"] == 0:
+            _lineage = {**_lineage_base, "step": step,
+                        "loss": round(loss_smooth, 6)}
             save_checkpoint_async(adapter, ema_params, step,
-                                  ocfg["checkpoint_dir"], ocfg["keep_last_n"])
+                                  ocfg["checkpoint_dir"], ocfg["keep_last_n"],
+                                  lineage=_lineage)
 
 
     # Final checkpoint + EMA export
+    _lineage = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6)}
     save_checkpoint_async(adapter, ema_params, step,
-                          ocfg["checkpoint_dir"], keep_last_n=999)
+                          ocfg["checkpoint_dir"], keep_last_n=999,
+                          lineage=_lineage)
 
     # Save best EMA as final export
     mx.eval(ema_params)
@@ -1218,6 +1377,10 @@ def main():
     parser.add_argument("--hard-examples", default=None,
                         help="Path to hard example shard directory (from mine_hard_examples.py); "
                              "mixed at hard_mix_ratio (default 5%%)")
+    parser.add_argument("--data-root", default=None,
+                        help="Root directory for shards and precomputed caches. "
+                             "Relative paths in the config YAML are prefixed with this value. "
+                             "Defaults to the current working directory.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate config without training")
     parser.add_argument("--log-every", type=int, default=None,
@@ -1226,6 +1389,27 @@ def main():
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    # Prefix relative data paths with --data-root so the pipeline can point the
+    # trainer at an external drive without editing the YAML.
+    # Convention: YAML paths are written as "train/data/<subpath>"; we strip the
+    # "train/data/" prefix and join the remainder onto data_root.
+    if args.data_root:
+        _dr = args.data_root
+        _data_path_keys = [
+            ("data", "shard_path"),
+            ("data", "qwen3_cache_dir"),
+            ("data", "vae_cache_dir"),
+            ("data", "siglip_cache_dir"),
+            ("data", "anchor_shard_dir"),
+            ("data", "hard_example_dir"),
+        ]
+        _strip_prefix = "train/data/"
+        for section, key in _data_path_keys:
+            val = config.get(section, {}).get(key)
+            if val and not os.path.isabs(val):
+                rel = val[len(_strip_prefix):] if val.startswith(_strip_prefix) else val
+                config[section][key] = os.path.join(_dr, rel)
 
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
