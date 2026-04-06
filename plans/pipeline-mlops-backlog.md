@@ -104,16 +104,17 @@ After chunk 1 training completes (~3 days), the pipeline must wait for chunk 2 J
 conversion before precompute and training can start. This is pure wall-clock waste —
 conversion is CPU+I/O only with no GPU or RAM conflict with training.
 
-**Observed:** Manually launching `convert_journeydb.py --workers 2` alongside chunk 1
+**Observed:** Manually launching `convert_journeydb.py --workers 1` alongside chunk 1
 training consumed ~200-300MB RAM (safe on 32GB) and ran without any impact on training
-throughput (0.19 steps/s unchanged).
+throughput (0.19 steps/s unchanged). Workers=1 preferred over 2 — training is the
+timeline constraint anyway, so extra workers just add SSD I/O contention for no benefit.
 
 **Fix:** After chunk 1 training is launched, automatically start the chunk 2 JDB
 conversion in the background if the chunk 2 tgz files are already downloaded:
 ```bash
 # After training starts, check if chunk 2 tgz are present
 if [[ $(count_files "$JDB_IMGS_DIR" "0[5-9][0-9].tgz") -gt 0 ]]; then
-    python convert_journeydb.py --start-tgz 50 --end-tgz 70 --workers 2 &
+    python convert_journeydb.py --start-tgz 50 --end-tgz 70 --workers 1 &
 fi
 ```
 Similarly, chunk 2 conversion could front-run chunk 3 precompute, etc.
