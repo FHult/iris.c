@@ -97,6 +97,33 @@ and suppress the "running" implication in background loop comments.
 
 ---
 
+## MLX-16 — Front-run next chunk's JDB conversion during training (LOW)
+
+**Problem:** Chunk N training and chunk N+1 data conversion are fully sequential.
+After chunk 1 training completes (~3 days), the pipeline must wait for chunk 2 JDB
+conversion before precompute and training can start. This is pure wall-clock waste —
+conversion is CPU+I/O only with no GPU or RAM conflict with training.
+
+**Observed:** Manually launching `convert_journeydb.py --workers 2` alongside chunk 1
+training consumed ~200-300MB RAM (safe on 32GB) and ran without any impact on training
+throughput (0.19 steps/s unchanged).
+
+**Fix:** After chunk 1 training is launched, automatically start the chunk 2 JDB
+conversion in the background if the chunk 2 tgz files are already downloaded:
+```bash
+# After training starts, check if chunk 2 tgz are present
+if [[ $(count_files "$JDB_IMGS_DIR" "0[5-9][0-9].tgz") -gt 0 ]]; then
+    python convert_journeydb.py --start-tgz 50 --end-tgz 70 --workers 2 &
+fi
+```
+Similarly, chunk 2 conversion could front-run chunk 3 precompute, etc.
+
+**Savings:** Removes ~2-4h of serial conversion time per chunk from total wall-clock.
+**Risk:** Low. Workers=2 cap keeps RAM impact negligible. Conversion is idempotent
+(output tars are atomically renamed); a crash leaves no partial state.
+
+---
+
 ## MLX-15 — Siglip precompute not in precompute_all done gate ✅ DONE
 
 **Problem:** `precompute_all.py` writes `$PRECOMP_DIR/.done` when qwen3+vae are complete.
