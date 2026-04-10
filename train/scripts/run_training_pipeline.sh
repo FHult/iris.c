@@ -847,21 +847,29 @@ elif [[ "$CHUNK" -ge 2 && "$CHUNK" -le 4 ]]; then
     JDB_DOWNLOAD_N=$(( _jdb_want_cx < _jdb_max_cx ? _jdb_want_cx : _jdb_max_cx ))
     JDB_TGZ_END_ACTUAL=$(( JDB_TGZ_START + JDB_DOWNLOAD_N - 1 ))
 
-    IMGS_DIR="$JDB_RAW/data/train/imgs"
-    shopt -s nullglob
-    PRESENT_FILES=()
-    for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
-        [[ -f "$IMGS_DIR/$(printf '%03d' $_i).tgz" ]] && \
-            PRESENT_FILES+=("$IMGS_DIR/$(printf '%03d' $_i).tgz")
-    done
-    shopt -u nullglob
-    PRESENT=${#PRESENT_FILES[@]}
+    # Sentinel written after successful conversion + raw-tgz cleanup.
+    # Survives cleanup so repeated runs skip re-download even after raw/WDS dirs are freed.
+    CONVERTED_SENTINEL="$JDB_RAW/.converted_chunk${CHUNK}"
 
-    if [[ "$PRESENT" -ge "$JDB_DOWNLOAD_N" ]]; then
-        log "[1/6] JourneyDB chunk $CHUNK already downloaded ($PRESENT/$JDB_DOWNLOAD_N files) — skipping"
+    IMGS_DIR="$JDB_RAW/data/train/imgs"
+
+    if [[ -f "$CONVERTED_SENTINEL" ]]; then
+        log "[1/6] JourneyDB chunk $CHUNK already downloaded and converted (sentinel present) — skipping"
     else
-        log "[1/6] Downloading JourneyDB chunk $CHUNK ($JDB_DOWNLOAD_N/$_jdb_max_cx files, ~$((JDB_DOWNLOAD_N * 16)) GB)..."
-        python3 - <<PYEOF
+        shopt -s nullglob
+        PRESENT_FILES=()
+        for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
+            [[ -f "$IMGS_DIR/$(printf '%03d' $_i).tgz" ]] && \
+                PRESENT_FILES+=("$IMGS_DIR/$(printf '%03d' $_i).tgz")
+        done
+        shopt -u nullglob
+        PRESENT=${#PRESENT_FILES[@]}
+
+        if [[ "$PRESENT" -ge "$JDB_DOWNLOAD_N" ]]; then
+            log "[1/6] JourneyDB chunk $CHUNK already downloaded ($PRESENT/$JDB_DOWNLOAD_N files) — skipping"
+        else
+            log "[1/6] Downloading JourneyDB chunk $CHUNK ($JDB_DOWNLOAD_N/$_jdb_max_cx files, ~$((JDB_DOWNLOAD_N * 16)) GB)..."
+            python3 - <<PYEOF
 import os, sys
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # hf_transfer buffers ~5 GB RAM; use standard downloader
 try:
@@ -880,32 +888,36 @@ except Exception as e:
     print(f'ERROR: snapshot_download failed: {e}', file=sys.stderr)
     sys.exit(1)
 PYEOF
-        [[ $? -eq 0 ]] || die "HuggingFace snapshot_download failed for chunk $CHUNK"
-        log "  Done: $JDB_DOWNLOAD_N files in $IMGS_DIR"
-    fi
+            [[ $? -eq 0 ]] || die "HuggingFace snapshot_download failed for chunk $CHUNK"
+            log "  Done: $JDB_DOWNLOAD_N files in $IMGS_DIR"
+        fi
 
-    # ── 2. Convert chunk N to WebDataset ─────────────────────────────────────
-    # Validate that "already exists" means a plausible complete conversion:
-    # each tgz ≈ 1 shard, so expect ≥ JDB_DOWNLOAD_N/2 shards minimum.
-    _jdb_wds_min=$(( JDB_DOWNLOAD_N / 2 ))
-    if [[ $(count_tars "$JDB_WDS") -ge "$_jdb_wds_min" ]]; then
-        log "[2/6] Chunk $CHUNK WebDataset already exists ($(count_tars "$JDB_WDS") shards) — skipping"
-    else
-        log "[2/6] Converting JourneyDB chunk $CHUNK to WebDataset (tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL of $JDB_TGZ_END)..."
-        python "$SCRIPT_DIR/convert_journeydb.py" \
-            --input      "$JDB_RAW" \
-            --output     "$JDB_WDS" \
-            --shard-size 5000 \
-            --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END_ACTUAL"
-        _conv_shards=$(count_tars "$JDB_WDS")
-        [[ "$_conv_shards" -gt 0 ]] || die "convert_journeydb.py produced 0 shards in $JDB_WDS — raw tgz files preserved, not deleting"
-        log "  Done: $_conv_shards shards in $JDB_WDS"
-        # Raw tgz files are no longer needed — confirmed WDS output is non-empty above.
-        log "  Freeing raw tgz files for chunk $CHUNK (~$((JDB_DOWNLOAD_N * 16)) GB)..."
-        for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
-            rm -f "$IMGS_DIR/$(printf '%03d' $_i).tgz"
-        done
-        log "  Done."
+        # ── 2. Convert chunk N to WebDataset ─────────────────────────────────────
+        # Validate that "already exists" means a plausible complete conversion:
+        # each tgz ≈ 1 shard, so expect ≥ JDB_DOWNLOAD_N/2 shards minimum.
+        _jdb_wds_min=$(( JDB_DOWNLOAD_N / 2 ))
+        if [[ $(count_tars "$JDB_WDS") -ge "$_jdb_wds_min" ]]; then
+            log "[2/6] Chunk $CHUNK WebDataset already exists ($(count_tars "$JDB_WDS") shards) — skipping"
+        else
+            log "[2/6] Converting JourneyDB chunk $CHUNK to WebDataset (tgz $JDB_TGZ_START–$JDB_TGZ_END_ACTUAL of $JDB_TGZ_END)..."
+            python "$SCRIPT_DIR/convert_journeydb.py" \
+                --input      "$JDB_RAW" \
+                --output     "$JDB_WDS" \
+                --shard-size 5000 \
+                --start-tgz  "$JDB_TGZ_START" --end-tgz "$JDB_TGZ_END_ACTUAL"
+            _conv_shards=$(count_tars "$JDB_WDS")
+            [[ "$_conv_shards" -gt 0 ]] || die "convert_journeydb.py produced 0 shards in $JDB_WDS — raw tgz files preserved, not deleting"
+            log "  Done: $_conv_shards shards in $JDB_WDS"
+            # Raw tgz files are no longer needed — confirmed WDS output is non-empty above.
+            log "  Freeing raw tgz files for chunk $CHUNK (~$((JDB_DOWNLOAD_N * 16)) GB)..."
+            for _i in $(seq "$JDB_TGZ_START" "$JDB_TGZ_END_ACTUAL"); do
+                rm -f "$IMGS_DIR/$(printf '%03d' $_i).tgz"
+            done
+            log "  Done."
+        fi
+
+        # Write sentinel so future runs skip download+conversion even after cleanup.
+        touch "$CONVERTED_SENTINEL"
     fi
 
     # ── 2b. Cross-chunk dedup: flag images already seen in previous chunks ────
