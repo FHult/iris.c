@@ -97,6 +97,259 @@ and suppress the "running" implication in background loop comments.
 
 ---
 
+## MLX-25 — Staging architecture: isolated per-chunk data prep with orchestrator promotion (HIGH)
+
+**Problem:** The current pipeline conflates data preparation and production state in the
+same directories. Chunks append shards directly into `shards/`, mix precomputed caches
+into shared `precomputed/`, and scatter sentinels across various levels with no consistent
+scheme. This makes parallel chunk prep risky (partial data pollutes production), rollback
+impossible, and the orchestrator (MLX-18) fragile because it can't distinguish staged data
+from live training data.
+
+**Core idea:** Every chunk's data preparation happens entirely within an isolated
+`staging/chunk{N}/` directory. The orchestrator promotes staging → production atomically
+only when all staging steps are verified complete and the training pipeline is ready.
+The production `shards/` directory only ever contains fully validated, deduplicated,
+precomputed data.
+
+This item supersedes MLX-17 (parallel data pipeline) as the architectural target. MLX-18
+(orchestrator) is the process that governs staging and promotion. MLX-19 (producer-consumer
+download) is the download mechanism used within the staging download step.
+
+---
+
+### Proposed directory structure
+
+```
+/Volumes/2TBSSD/
+  ├── pipeline/                     ← MLX-18 orchestrator state (MLX-20 state file lives here)
+  │   ├── state.json                   authoritative run state (MLX-20)
+  │   └── chunk{N}/                    per-chunk sentinel files
+  │       ├── download.done
+  │       ├── convert.done
+  │       ├── build_shards.done
+  │       ├── filter_shards.done
+  │       ├── clip_embed.done
+  │       ├── clip_index.done
+  │       ├── clip_dups.done
+  │       ├── precompute.done
+  │       ├── promoted.done            written after shards moved to production
+  │       ├── train.done
+  │       ├── train.ckpt               path to final checkpoint
+  │       └── {step}.error             written on any step failure
+  │
+  ├── staging/                      ← transient; safe to delete once promoted.done exists
+  │   └── chunk{N}/
+  │       ├── raw_wds/                 JDB convert output (journeydb_wds_chunk{N})
+  │       ├── shards/                  build_shards output — ISOLATED from production
+  │       │   └── .filtered            filter sentinel (local to staging)
+  │       ├── embeddings/              clip_dedup embed output
+  │       ├── dedup_ids.txt            chunk-local duplicate ID list
+  │       └── precomputed/
+  │           ├── qwen3/               Qwen3 embeddings for this chunk's shards only
+  │           └── vae/                 VAE latents for this chunk's shards only
+  │
+  ├── shards/                       ← PRODUCTION only — promoted shards from all chunks
+  │   ├── chunk1_NNNN.tar              chunk-tagged to enable per-chunk rollback
+  │   ├── chunk2_NNNN.tar
+  │   └── ...
+  │
+  ├── precomputed/                  ← PRODUCTION only — promoted caches
+  │   ├── qwen3/
+  │   ├── vae/
+  │   └── dedup/
+  │       ├── chunk1_duplicate_ids.txt
+  │       ├── chunk2_duplicate_ids.txt
+  │       └── combined_duplicate_ids.txt   merged union, rebuilt at each promotion
+  │
+  ├── anchor_shards/                ← unchanged, persistent, never touched by staging
+  ├── hard_examples/                ← unchanged, persistent
+  ├── checkpoints/                  ← unchanged
+  └── logs/                         ← unchanged
+```
+
+**Shard naming:** Production shards are prefixed `chunk{N}_` so the orchestrator can
+identify which chunk contributed each shard. This enables rollback: to undo chunk 3,
+delete all `chunk3_*.tar` files and their corresponding precomputed cache entries.
+
+---
+
+### Staging lifecycle (per chunk)
+
+All CPU/IO steps run in `staging/chunk{N}/` while the previous chunk trains:
+
+```
+[GPU FREE — can run alongside training]
+  download        → staging/chunk{N}/raw_wds/ (MLX-19 producer-consumer)
+  convert         → staging/chunk{N}/raw_wds/ shards
+  build_shards    → staging/chunk{N}/shards/
+  filter_shards   → staging/chunk{N}/shards/ (in-place)
+
+[GPU REQUIRED — must wait for training to finish]
+  clip_embed      → staging/chunk{N}/embeddings/
+  clip_index      → builds FAISS index from embeddings
+  clip_dups       → staging/chunk{N}/dedup_ids.txt
+  precompute      → staging/chunk{N}/precomputed/qwen3/ + vae/
+
+[ORCHESTRATOR PROMOTION — atomic, no GPU needed]
+  verify          → check all staging sentinels present, shard count sane
+  copy shards     → staging/chunk{N}/shards/*.tar → shards/chunk{N}_*.tar
+  merge precompute→ staging/chunk{N}/precomputed/ → precomputed/
+  merge dedup     → rebuild combined_duplicate_ids.txt
+  write promoted.done
+  start training  → pipeline_start.sh --chunk N --resume prev_ckpt
+```
+
+**Clip dedup is optional per chunk:** if `--skip-clip-dedup` is set for a chunk, the
+orchestrator touches `clip_embed.done`, `clip_index.done`, and `clip_dups.done` to skip
+those steps and proceeds directly to precompute.
+
+---
+
+### Promotion logic (orchestrator responsibility)
+
+The orchestrator promotes a chunk's staging when ALL of the following are true:
+1. `pipeline/chunk{N}/precompute.done` exists
+2. `pipeline/chunk{N-1}/train.done` exists (previous chunk finished)
+3. GPU is free (no `iris-train` tmux window)
+4. Shard count sanity: `staging/chunk{N}/shards/*.tar` count ≥ expected minimum for scale
+
+Promotion is a short atomic operation (~30s for 7 shards):
+```bash
+promote_chunk() {
+    local N=$1
+    local STAGING="$DATA_ROOT/staging/chunk${N}"
+    local PREFIX="chunk${N}_"
+
+    # 1. Rename and move shards with chunk prefix
+    idx=0
+    for tar in "$STAGING/shards"/*.tar; do
+        dest="$DATA_ROOT/shards/${PREFIX}$(printf '%04d' $idx).tar"
+        mv "$tar" "$dest"
+        ((idx++))
+    done
+
+    # 2. Merge precomputed caches (copy, not move — staging kept as backup until .done)
+    cp -r "$STAGING/precomputed/qwen3/"* "$DATA_ROOT/precomputed/qwen3/"
+    cp -r "$STAGING/precomputed/vae/"*   "$DATA_ROOT/precomputed/vae/"
+
+    # 3. Merge dedup IDs
+    cat "$DATA_ROOT/precomputed/dedup/chunk"*"_duplicate_ids.txt" \
+        | sort -u > "$DATA_ROOT/precomputed/dedup/combined_duplicate_ids.txt"
+    cp "$STAGING/dedup_ids.txt" "$DATA_ROOT/precomputed/dedup/chunk${N}_duplicate_ids.txt"
+
+    # 4. Write sentinel
+    touch "$DATA_ROOT/pipeline/chunk${N}/promoted.done"
+    log_orch "Chunk $N promoted: $idx shards added to production"
+}
+```
+
+---
+
+### LAION/WikiArt re-sampling at promotion (links to MLX-24)
+
+At promotion time for chunk 2+, the orchestrator can optionally inject a fresh sample
+of LAION/WikiArt shards from the existing `raw/laion/` and `raw/wikiart_wds/` into the
+staging shards before promotion. This maintains foundation diversity as the JourneyDB
+proportion grows. See MLX-24 for full spec.
+
+---
+
+### Sentinel refactor
+
+All per-step sentinels move to `pipeline/chunk{N}/{step}.done`. Existing sentinels that
+must be migrated:
+
+| Old sentinel | New sentinel |
+|-------------|-------------|
+| `$DATA_ROOT/raw/journeydb/.download_complete_chunk1` | `pipeline/chunk1/download.done` |
+| `$DATA_ROOT/.convert_done_chunk{N}` | `pipeline/chunk{N}/convert.done` |
+| `$DATA_ROOT/shards/.filtered_chunk{N}` | `pipeline/chunk{N}/filter_shards.done` |
+| `$DATA_ROOT/precomputed/.done` | `pipeline/chunk{N}/precompute.done` |
+| `$DATA_ROOT/embeddings/.embed_done` | `pipeline/chunk{N}/clip_embed.done` |
+
+A migration script should be provided that reads existing sentinels and creates the
+new ones, so the current chunk 2/3 runs can be adopted into the new scheme without
+re-running completed steps.
+
+---
+
+### Status reporting integration
+
+`pipeline_status.sh --json` should reflect the staging model:
+
+```json
+"chunks": {
+  "chunk2": { "state": "training",  "promoted": true,  "step": 60200 },
+  "chunk3": { "state": "staged",    "promoted": false,
+              "staging": {
+                "build_shards": true, "filter": true,
+                "clip_embed": false,  "precompute": false
+              }}
+}
+```
+
+---
+
+### Implementation order
+
+1. Create `pipeline/chunk{N}/` sentinel directory structure; write migration script for
+   existing sentinels.
+2. Refactor `run_training_pipeline.sh` to write sentinels to new paths (backward-compatible:
+   write both old and new until cutover).
+3. Implement `staging/chunk{N}/` directory creation in the pipeline start script.
+4. Refactor chunk 2+ build steps to write into `staging/chunk{N}/shards/` instead of
+   directly into `shards/`.
+5. Implement `promote_chunk()` in a shared `pipeline_lib.sh`.
+6. Wire promotion into the MLX-18 orchestrator as the trigger for training launch.
+7. Update `pipeline_status.sh --json` with chunk staging state.
+8. Update DISPATCH.md data layout section.
+9. Apply LAION/WikiArt re-sampling at promotion (MLX-24).
+
+---
+
+## MLX-24 — Re-sample LAION/WikiArt in chunks 2–4 to maintain foundation diversity (LOW)
+
+**Problem:** LAION (~150 shards) and WikiArt (~80 shards) are only built into the shard
+pool at chunk 1. For `--small` (21 chunk 1 shards), the LAION+WikiArt content is a thin
+sample of the full datasets. As chunks 2–4 add JourneyDB-only shards, the ratio of
+JourneyDB to foundational data grows. By chunk 4 at `--small`, ~50% of shards are
+JDB-only, risking a slow drift toward JourneyDB aesthetics at the cost of photographic
+and fine-art generalisation.
+
+The anchor set (10K images, 20% mix-in) partially compensates but represents zero
+stylistic diversity compared to the full LAION+WikiArt pool.
+
+**Fix:** At promotion time (MLX-25), inject a fresh random sample of LAION+WikiArt shards
+into each chunk's staging before the shards are merged into production. The sample size
+should maintain a fixed LAION/WikiArt ratio in the total shard pool.
+
+**Target ratio:** ~30% LAION+WikiArt in the total pool at all scales:
+```
+After chunk 1 (small, 21 shards):  inject 0 extra (already 21 mixed shards)
+After chunk 2 (small, +7 JDB):     inject 3 LAION/WikiArt shards → 24+3 = 27, ~30% new LAION/WikiArt
+After chunk 3 (small, +7 JDB):     inject 3 → 30+3 = 33, ratio maintained
+After chunk 4 (small, +7 JDB):     inject 3 → 36+3 = 39, ratio maintained
+```
+
+**Implementation:** Add `--laion-resample-ratio 0.30` flag to the orchestrator's promotion
+step. At promotion, compute how many LAION/WikiArt shards are needed to maintain the
+ratio, randomly sample that many from `raw/laion/` and `raw/wikiart_wds/`, run them
+through filter_shards and precompute (they may need qwen3+vae cache entries), then include
+them in the promotion batch.
+
+**Note:** The fresh LAION/WikiArt shards must be precomputed before promotion. This can
+run alongside training (if precompute is added to the staging pipeline) or after. The
+incremental precompute cost is small: 3 extra shards × ~6 min/shard = ~18 min.
+
+**GPU scheduling:** LAION/WikiArt re-sampling precompute is subject to the same GPU gate
+as the main staging precompute — runs after training frees the GPU.
+
+**Risk:** Low. The re-sampled shards are filtered and precomputed through the same pipeline.
+If the ratio flag is 0.0, behaviour is identical to current. Can be tuned or disabled per chunk.
+
+---
+
 ## MLX-22 — Post-training validation suite: `pipeline_validate.sh` (HIGH)
 
 **Problem:** There is no automated way to verify that trained IP-Adapter weights are fit
