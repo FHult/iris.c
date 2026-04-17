@@ -97,6 +97,182 @@ and suppress the "running" implication in background loop comments.
 
 ---
 
+## MLX-26 — A/B weight comparison tool for training run evaluation (MEDIUM)
+
+**Problem:** After each chunk, or when comparing two training runs with different
+hyperparameters (LR, scale, data mix), there is no structured way to determine which
+weights are objectively better. The current approach is subjective visual inspection of
+a handful of images. This does not scale and gives no quantitative signal to guide
+future training decisions.
+
+**Goal:** `pipeline_ab.sh` — a script that takes two checkpoint paths (A and B) and
+produces a structured comparison: quantitative CLIP scores, a side-by-side visual grid,
+and a verdict. Usable for chunk-over-chunk regression checks, hyperparameter search,
+and LR schedule evaluation.
+
+---
+
+### Comparison axes
+
+For a fair A/B test, both checkpoints are evaluated on identical inputs:
+- Same fixed random seeds per eval pair
+- Same number of denoising steps
+- Same eval prompt set (`train/configs/eval_prompts.txt`)
+- Same reference images
+
+| Axis | Metric | What it measures |
+|------|--------|-----------------|
+| Style transfer | CLIP-I: output vs. reference | How well style was transferred |
+| Prompt following | CLIP-T: output vs. prompt | Whether text conditioning is preserved |
+| Style delta | CLIP-I(with adapter) − CLIP-I(no adapter) | Net adapter contribution |
+| Diversity | std(CLIP-I across eval pairs) | Whether the model generalises across styles |
+| Stability | std(CLIP-I across seeds) | Variance in output quality |
+
+---
+
+### Script interface
+
+```bash
+# Compare two specific checkpoints:
+bash train/scripts/pipeline_ab.sh \
+    --a /Volumes/2TBSSD/checkpoints/stage1/step_0050000_ema.safetensors \
+    --b /Volumes/2TBSSD/checkpoints/stage1/step_0065000_ema.safetensors \
+    --label-a "chunk1_small" \
+    --label-b "chunk2_small"
+
+# Compare latest checkpoint against best.safetensors:
+bash train/scripts/pipeline_ab.sh --a best --b latest
+
+# Compare two named runs from different data root paths:
+bash train/scripts/pipeline_ab.sh \
+    --a /Volumes/2TBSSD/checkpoints/run_small/best.safetensors \
+    --b /Volumes/2TBSSD/checkpoints/run_medium/best.safetensors \
+    --label-a "small" --label-b "medium"
+
+# Batch: compare a directory of checkpoints against a baseline:
+bash train/scripts/pipeline_ab.sh \
+    --baseline best \
+    --candidates "/Volumes/2TBSSD/checkpoints/stage1/step_*.safetensors"
+```
+
+---
+
+### Output
+
+#### 1. JSON results — `$CKPT_DIR/ab_results/{timestamp}.json`
+
+```json
+{
+  "a": { "path": "step_0050000_ema.safetensors", "label": "chunk1_small" },
+  "b": { "path": "step_0065000_ema.safetensors", "label": "chunk2_small" },
+  "timestamp": "2026-04-17T20:00:00Z",
+  "pairs": [
+    {
+      "prompt": "a portrait of a woman",
+      "sref":   "eval_refs/watercolor_portrait.jpg",
+      "seed":   42,
+      "a": { "clip_i": 0.26, "clip_t": 0.22, "delta": 0.08 },
+      "b": { "clip_i": 0.31, "clip_t": 0.23, "delta": 0.13 },
+      "winner": "b"
+    }
+    ...
+  ],
+  "summary": {
+    "a": { "mean_clip_i": 0.25, "mean_clip_t": 0.22, "mean_delta": 0.09,
+           "clip_i_std": 0.03, "seed_stability": 0.02 },
+    "b": { "mean_clip_i": 0.30, "mean_clip_t": 0.23, "mean_delta": 0.12,
+           "clip_i_std": 0.02, "seed_stability": 0.01 },
+    "winner": "b",
+    "clip_i_improvement": +0.05,
+    "clip_t_delta":       +0.01,
+    "confidence": "high"
+  }
+}
+```
+
+**Confidence scoring:**
+- `high`: B wins on ≥4/5 eval pairs AND mean_clip_i delta > 0.04
+- `medium`: B wins on ≥3/5 pairs AND mean_clip_i delta > 0.02
+- `low`: split result or delta < 0.02 — models are comparable, no clear winner
+
+---
+
+#### 2. Visual grid — `$CKPT_DIR/ab_results/{timestamp}_grid.png`
+
+```
+┌──────────────┬────────────────────────┬────────────────────────┐
+│  Reference   │  A: chunk1_small       │  B: chunk2_small       │
+├──────────────┼────────────────────────┼────────────────────────┤
+│ [sref 1]     │ [A output 1]           │ [B output 1]           │
+│              │ CLIP-I: 0.26  T: 0.22  │ CLIP-I: 0.31  T: 0.23 │
+│              │                        │ ← WINNER               │
+├──────────────┼────────────────────────┼────────────────────────┤
+│ [sref 2]     │ [A output 2]           │ [B output 2]           │
+│              │ CLIP-I: 0.28  T: 0.21  │ CLIP-I: 0.27  T: 0.22 │
+│              │ ← WINNER               │                        │
+...
+├──────────────┴────────────────────────┴────────────────────────┤
+│ SUMMARY: B wins 4/5  |  ΔCLiP-I +0.05  |  Confidence: HIGH    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Batch mode: checkpoint evolution curve
+
+When `--candidates` is used with multiple checkpoints, the tool generates a CLIP-I
+score curve across training steps — showing whether the model improves monotonically
+or peaks at a specific step:
+
+```
+CLIP-I vs. step (5 eval pairs averaged):
+  step_20000:  0.21
+  step_40000:  0.25
+  step_50000:  0.27  ← chunk 1 best
+  step_58000:  0.29
+  step_65000:  0.30  ← chunk 2 best
+```
+
+This is the quantitative version of "which checkpoint should I deploy?" and directly
+informs when to stop training (diminishing returns detection).
+
+---
+
+### Seed stability test
+
+For each checkpoint, generate the same (prompt, reference) pair with N=5 different
+seeds. Compute `std(CLIP-I)` across seeds. High variance (~0.05+) indicates the model
+is sensitive to initialisation noise — useful for detecting under-trained or unstable
+weights. Lower variance is better.
+
+---
+
+### Integration points
+
+- **MLX-22 (`pipeline_validate.sh`):** After validation, auto-run A/B against previous
+  chunk's best checkpoint. Embed the result in `results.json` under `"ab_vs_prev_chunk"`.
+- **MLX-20 (`pipeline_state.json`):** Record the current champion checkpoint path in
+  `current_run.best_ab_checkpoint` so the orchestrator always knows which weights won.
+- **`pipeline_export.sh`:** Export the A/B winner automatically rather than defaulting
+  to latest step.
+- **Human workflow:** Run ad-hoc any time a hyperparameter experiment finishes to
+  decide whether to keep or discard the new weights before committing to the next chunk.
+
+---
+
+### Files to create
+
+| File | Purpose |
+|------|---------|
+| `train/scripts/pipeline_ab.sh` | Orchestrator shell script |
+| `train/scripts/ab_compare.py` | Core comparison logic: inference × 2, CLIP scoring, JSON output |
+| `train/scripts/render_ab_grid.py` | Side-by-side grid image with per-pair winner labels |
+
+`ab_compare.py` reuses `run_inference.py` (MLX-22) and `score_validation.py` (MLX-22)
+so the CLIP scoring logic is not duplicated.
+
+---
+
 ## MLX-25 — Staging architecture: isolated per-chunk data prep with orchestrator promotion (HIGH)
 
 **Problem:** The current pipeline conflates data preparation and production state in the
