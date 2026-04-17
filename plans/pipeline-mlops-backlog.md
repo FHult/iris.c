@@ -97,6 +97,459 @@ and suppress the "running" implication in background loop comments.
 
 ---
 
+## MLX-22 — Post-training validation suite: `pipeline_validate.sh` (HIGH)
+
+**Problem:** There is no automated way to verify that trained IP-Adapter weights are fit
+for purpose before deploying them to the image app. The only current check is visual
+inspection of training loss curves — which measures fitting, not style transfer quality.
+`pipeline_validate.sh` is listed in DISPATCH.md as proposed but was never built.
+
+**Goal:** A script that runs after each chunk completes and answers: "do these weights
+actually transfer style correctly, and are they better than the previous chunk?"
+
+---
+
+### Components
+
+#### V-01 — Weight integrity check (~10s)
+
+Load the checkpoint safetensors, verify structure and numerics:
+
+```python
+# train/scripts/validate_weights.py --checkpoint path/to/step_NNNNN_ema.safetensors
+import safetensors.numpy as st
+import numpy as np
+
+weights = st.load_file(checkpoint_path)
+errors = []
+
+# 1. Shape checks — compare against expected architecture from config
+expected_shapes = {
+    "image_proj.weight":    (hidden_dim, siglip_dim),   # Perceiver resampler
+    "ip_scale":             (25,),                       # per-block scales
+    # ... derive full list from train/ip_adapter/model.py IPAdapterKlein.__init__
+}
+for key, expected in expected_shapes.items():
+    if key not in weights:
+        errors.append(f"MISSING: {key}")
+    elif weights[key].shape != expected:
+        errors.append(f"SHAPE MISMATCH {key}: got {weights[key].shape}, expected {expected}")
+
+# 2. Numerical health
+for key, val in weights.items():
+    if np.any(np.isnan(val)):  errors.append(f"NaN in {key}")
+    if np.any(np.isinf(val)):  errors.append(f"Inf in {key}")
+
+# 3. ip_scale sanity — values should be in [0.0, 3.0] after training
+ip_scale = weights.get("ip_scale")
+if ip_scale is not None:
+    if ip_scale.min() < -0.5 or ip_scale.max() > 5.0:
+        errors.append(f"ip_scale out of expected range: min={ip_scale.min():.3f} max={ip_scale.max():.3f}")
+```
+
+Emit: `{"v01_weight_integrity": {"ok": true/false, "errors": [...]}}`
+
+---
+
+#### V-02 — Style transfer smoke test (~3 min)
+
+Run inference with each of the 5 (prompt, style_ref) pairs from
+`train/configs/eval_prompts.txt` using the EMA checkpoint. Uses Python MLX inference —
+does not require `--sref` to be implemented in iris.c.
+
+```python
+# train/scripts/run_inference.py  (new helper, called by validate script)
+# Loads Flux + IP-Adapter weights in MLX, runs denoising loop with siglip features
+# from the reference image, saves output PNG.
+
+def run_sref_inference(flux, adapter, siglip, prompt, ref_image_path, seed, steps=4):
+    siglip_feats = extract_siglip(siglip, ref_image_path)   # [1, 729, 1152]
+    ip_embeds    = adapter.get_image_embeds(siglip_feats)    # [1, 128, 3072]
+    k_ip, v_ip   = adapter.get_kv_all(ip_embeds)
+    # ... standard Flux denoising loop with ip cross-attention injected
+    return output_image
+```
+
+Output: `$CKPT_DIR/validation/step_NNNNN/` — one PNG per eval pair.
+If any generation crashes or produces a blank/black image → FAIL.
+
+---
+
+#### V-03 — CLIP style similarity scoring (~2 min)
+
+For each output image + its reference image, compute CLIP-I cosine similarity.
+Uses `open_clip` which is already in the training venv.
+
+```python
+import open_clip, torch
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
+model = model.to('mps').eval()
+
+def clip_image_similarity(img_a_path, img_b_path):
+    with torch.no_grad():
+        feat_a = model.encode_image(preprocess(Image.open(img_a_path)).unsqueeze(0).to('mps'))
+        feat_b = model.encode_image(preprocess(Image.open(img_b_path)).unsqueeze(0).to('mps'))
+        return float(torch.cosine_similarity(feat_a, feat_b).item())
+```
+
+Emit per eval pair: `clip_i_similarity` (expected range: 0.2–0.5 for good style transfer;
+<0.15 suggests the adapter is not transferring style at all).
+
+---
+
+#### V-04 — CLIP prompt alignment scoring (~1 min)
+
+For each output image + its text prompt, compute CLIP-T cosine similarity.
+Ensures the model still follows the prompt despite style conditioning.
+
+```python
+def clip_text_similarity(img_path, prompt):
+    tokens = open_clip.tokenize([prompt]).to('mps')
+    with torch.no_grad():
+        img_feat  = model.encode_image(preprocess(Image.open(img_path)).unsqueeze(0).to('mps'))
+        txt_feat  = model.encode_text(tokens)
+        return float(torch.cosine_similarity(img_feat, txt_feat).item())
+```
+
+Emit per eval pair: `clip_t_alignment` (expected range: 0.20–0.35; <0.15 suggests
+the style conditioning is overriding the prompt entirely).
+
+---
+
+#### V-05 — No-adapter baseline delta (~3 min)
+
+Generate the same 5 prompts without the IP-Adapter (ip_scale=0) to get a baseline.
+Compute delta: `clip_i_with_adapter - clip_i_without_adapter`.
+
+If delta ≤ 0 for all pairs, the adapter is not improving style transfer over the base
+model — this is a strong signal of training failure or incorrect weight loading.
+
+---
+
+#### V-06 — EMA vs online weight comparison (~3 min)
+
+Run inference with both `step_NNNNN_ema.safetensors` and `step_NNNNN.safetensors`
+on the same eval pairs. Compare CLIP-I scores.
+
+Expected: EMA scores ≥ online scores (EMA is the deployment weight; if online is
+consistently better, the EMA decay may be too high and averaging away too much signal).
+
+---
+
+#### V-07 — Visual grid output
+
+Save a structured grid image for human review:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Checkpoint: step_0065000_ema   Scale: small   Chunk: 2      │
+├───────────┬────────────────┬────────────────┬────────────────┤
+│ Reference │ With adapter   │ No adapter     │ Prev chunk     │
+├───────────┼────────────────┼────────────────┼────────────────┤
+│ [sref 1]  │ [output 1]     │ [base 1]       │ [prev 1]       │
+│           │ CLIP-I: 0.31   │ CLIP-I: 0.18   │ CLIP-I: 0.26   │
+├───────────┼────────────────┼────────────────┼────────────────┤
+│ [sref 2]  │ [output 2]     │ [base 2]       │ [prev 2]       │
+...
+```
+
+Saved to: `$CKPT_DIR/validation/step_NNNNN/grid.png`
+
+---
+
+#### V-08 — Regression check against previous chunk checkpoint
+
+Load the previous chunk's best EMA checkpoint, run the same eval pairs, compare
+CLIP-I and CLIP-T scores. Emit: `{"regression": {"clip_i_delta": +0.04, "clip_t_delta": -0.01}}`.
+
+Positive CLIP-I delta = style improved. Negative CLIP-T delta = some prompt following
+sacrificed for style (acceptable within ±0.02; concerning if >0.05).
+
+---
+
+### Output format
+
+All results written to `$CKPT_DIR/validation/step_NNNNN/results.json`:
+
+```json
+{
+  "checkpoint": "step_0065000_ema.safetensors",
+  "chunk": 2, "scale": "small",
+  "timestamp": "2026-04-17T18:00:00Z",
+  "v01_weight_integrity": { "ok": true, "errors": [] },
+  "v02_smoke": { "ok": true, "generated": 5, "failed": 0 },
+  "pairs": [
+    {
+      "prompt": "a portrait of a woman",
+      "sref":   "eval_refs/watercolor_portrait.jpg",
+      "output": "step_0065000/pair_0.png",
+      "clip_i_with_adapter":    0.31,
+      "clip_i_no_adapter":      0.17,
+      "clip_i_delta":           0.14,
+      "clip_t_alignment":       0.24,
+      "clip_i_prev_chunk":      0.26
+    }
+    ...
+  ],
+  "summary": {
+    "mean_clip_i":        0.29,
+    "mean_clip_t":        0.23,
+    "mean_adapter_delta": 0.11,
+    "mean_chunk_delta":   0.03,
+    "ema_vs_online_delta": 0.02,
+    "verdict": "PASS"
+  }
+}
+```
+
+**Verdict logic:**
+- `PASS`: mean_clip_i > 0.20 AND mean_adapter_delta > 0.05 AND no weight integrity errors
+- `WARN`: mean_clip_i > 0.15 AND mean_adapter_delta > 0.0 (marginal style transfer)
+- `FAIL`: any weight integrity error, OR mean_clip_i < 0.15, OR mean_adapter_delta ≤ 0
+
+---
+
+### Script interface
+
+```bash
+# Run full validation suite on latest EMA checkpoint:
+bash train/scripts/pipeline_validate.sh
+
+# Run on a specific checkpoint:
+bash train/scripts/pipeline_validate.sh --checkpoint /path/to/step_65000_ema.safetensors
+
+# Skip slow tiers (integrity + smoke only):
+bash train/scripts/pipeline_validate.sh --fast
+
+# Compare two specific checkpoints:
+bash train/scripts/pipeline_validate.sh --compare step_50000_ema step_65000_ema
+```
+
+### Files to create
+
+| File | Purpose |
+|------|---------|
+| `train/scripts/pipeline_validate.sh` | Orchestrator shell script |
+| `train/scripts/validate_weights.py` | V-01 weight integrity |
+| `train/scripts/run_inference.py` | V-02 Python MLX inference with IP-Adapter |
+| `train/scripts/score_validation.py` | V-03/04/05/06/08 CLIP scoring + regression |
+| `train/scripts/render_validation_grid.py` | V-07 grid image rendering |
+| `train/configs/eval_prompts.txt` | Already exists — add more pairs (aim for 10) |
+| `train/eval_refs/` | Reference images for eval pairs (populate manually, ~10 images) |
+
+**Note on `run_inference.py`:** This is the Python-side inference path that enables
+validation *before* `--sref` is implemented in iris.c (MLX-23). It reuses the forward
+pass from `train_ip_adapter.py` but in no-grad eval mode. The key difference from
+training: use `ip_scale` from the loaded weights unchanged (don't zero any blocks).
+
+---
+
+## MLX-23 — Implement `--sref` in iris.c binary (HIGH)
+
+**Problem:** `--sref` is stubbed in `main.c:1273` with "not yet implemented (v2.6 target)".
+The IP-Adapter weights are trained and the Python inference path works, but the shipped
+binary cannot perform style-reference inference. This is the final step before the image
+app can use the trained adapter.
+
+---
+
+### Architecture overview
+
+The IP-Adapter adds cross-attention to 25 blocks of the Flux transformer:
+- 5 double-stream blocks (indices controlled by `ip_scale[0:5]`)
+- 20 single-stream blocks (indices controlled by `ip_scale[5:25]`)
+
+At each injection point, the adapter injects additional K/V pairs derived from
+SigLIP image features. The transformer's self-attention `Q` attends to both its own
+`K/V` and the adapter `K/V` (weighted by `ip_scale[block_idx]`).
+
+Adapter weight structure (from `train/ip_adapter/model.py`):
+```
+ip_adapter/
+  image_proj.*          Perceiver resampler: siglip [B,729,1152] → ip_embeds [B,128,3072]
+  to_k_ip_stacked       [25, 3072, head_dim×heads] = [25, 3072, 3072]  K projections
+  to_v_ip_stacked       [25, 3072, head_dim×heads] = [25, 3072, 3072]  V projections
+  ip_scale              [25]  per-block attention scale (trained, ~0.5–1.5)
+```
+
+---
+
+### The SigLIP encoding problem
+
+SigLIP-SO400M (400M params) is needed to extract `[B, 729, 1152]` features from a
+reference image. Implementing a full ViT in C is disproportionate effort. The pragmatic
+solution: **lazy Python extraction with a sidecar feature file**.
+
+**User-facing API (unchanged):**
+```bash
+./iris -d flux-klein-4b --sref portrait.jpg --ip-adapter weights.safetensors -p "a cat" -o out.png
+```
+
+**Under the hood:**
+1. iris.c checks for `portrait.jpg.sref` (pre-extracted feature file, binary float16 array)
+2. If absent: executes `python3 train/scripts/extract_sref.py portrait.jpg portrait.jpg.sref`
+3. Reads `portrait.jpg.sref` → `float16[729, 1152]` → promotes to float32 internally
+
+`extract_sref.py` is a thin wrapper:
+```python
+# train/scripts/extract_sref.py  input.jpg  output.sref
+import sys, numpy as np
+from train.ip_adapter.utils import load_siglip, extract_features
+feats = extract_features(sys.argv[1])   # [729, 1152] float32
+feats.astype(np.float16).tofile(sys.argv[2])
+```
+
+**Caching:** `.sref` files are permanent sidecar files — computing SigLIP features once
+per reference image (takes ~2s on M1 Max) is the right trade-off vs. re-extracting every
+generation. Users can pre-extract with `--sref-precompute img1.jpg img2.jpg`.
+
+**Multiple --sref flags (up to 4):** features are averaged:
+```c
+// Average features from multiple reference images
+for (int i = 0; i < n_srefs; i++)
+    add features[i] to accumulator
+divide accumulator by n_srefs
+```
+
+---
+
+### C implementation plan
+
+#### Step 1 — New struct: `iris_ip_adapter_t` (in `iris.c` / new `iris_ip_adapter.c`)
+
+```c
+typedef struct {
+    int     n_blocks;       // 25
+    int     hidden;         // 3072 (4B) or 4096 (9B)
+    int     ip_seq;         // 128  (resampler output tokens)
+    int     siglip_seq;     // 729
+    int     siglip_dim;     // 1152
+    float  *ip_scale;       // [25]
+
+    // Perceiver resampler weights
+    float  *resampler_q;    // [ip_seq, hidden]
+    float  *resampler_k;    // [siglip_dim, hidden]  (cross-attn over siglip)
+    float  *resampler_v;    // [siglip_dim, hidden]
+    float  *resampler_out;  // [hidden, hidden]
+    float  *resampler_norm_q; // [hidden]
+    float  *resampler_norm_k; // [hidden]
+    float  *proj_w;         // [hidden, ip_seq×hidden] final projection
+
+    // IP cross-attention projections (stacked over 25 blocks)
+    float  *to_k_ip;        // [25, hidden, hidden]
+    float  *to_v_ip;        // [25, hidden, hidden]
+} iris_ip_adapter_t;
+```
+
+#### Step 2 — Weight loading: `iris_load_ip_adapter()`
+
+Load from a safetensors file. Key name mapping:
+```c
+// safetensors key → struct field
+"image_proj.latents"         → resampler_q (learned latent queries)
+"image_proj.proj_in.weight"  → resampler_k / resampler_v
+"image_proj.proj_out.weight" → proj_w
+"to_k_ip_stacked"            → to_k_ip
+"to_v_ip_stacked"            → to_v_ip
+"ip_scale"                   → ip_scale
+```
+
+Weights are bfloat16 in the checkpoint — convert to float32 (or float16 for Metal path)
+using the existing `iris_safetensors.c` loading infrastructure.
+
+#### Step 3 — Perceiver resampler forward pass
+
+The resampler maps `siglip_feats [729, 1152]` → `ip_embeds [128, 3072]`:
+
+```
+1. Linear project siglip_feats → K, V  (siglip_dim → hidden)
+2. Learned queries Q [ip_seq, hidden]
+3. RMSNorm Q and K separately
+4. Multi-head cross-attention: Q attends to K/V
+5. Linear output projection
+Result: [128, 3072]
+```
+
+This is a single MHA forward pass — reuse `flux_attention()` from `iris_transformer_flux.c`.
+
+#### Step 4 — IP K/V projection
+
+From `ip_embeds [128, 3072]`, project to per-block K and V:
+```c
+// For each block b in 0..24:
+// k_ip[b] = ip_embeds @ to_k_ip[b]   → [128, hidden]
+// v_ip[b] = ip_embeds @ to_v_ip[b]   → [128, hidden]
+```
+
+Compute all 25 pairs once before the denoising loop (ip_embeds is timestep-independent).
+
+#### Step 5 — Inject into transformer blocks
+
+In `iris_transformer_flux.c`, each double/single block needs a new optional parameter:
+`const float *k_ip, const float *v_ip, float ip_scale`.
+
+In the attention computation, after computing the standard `K_self, V_self`, concatenate:
+```c
+// Attention over [self_seq + ip_seq] keys and values
+K_full = concat(K_self [img_seq, hidden], K_ip [128, hidden])
+V_full = concat(V_self [img_seq, hidden], V_ip [128, hidden])
+// Q only attends over the first img_seq outputs (ip tokens are key/value only)
+attn = softmax(Q @ K_full.T / sqrt(head_dim)) @ V_full
+attn_ip_contribution = attn[:, img_seq:] @ V_ip  * ip_scale
+output = attn[:, :img_seq] + ip_scale * attn_ip_contribution
+```
+
+**Note:** The ip_scale from the trained weights is applied per block. The `--sref-scale`
+CLI flag (`0.0–1.0`) multiplies all ip_scale values as a global override:
+`effective_ip_scale[b] = ip_scale[b] * sref_scale_cli`
+
+#### Step 6 — CLI wiring (`main.c`)
+
+```c
+// Already stubbed:
+fprintf(stderr, "      --sref PATH       Style reference image (up to 4 --sref flags)\n");
+fprintf(stderr, "      --sref-scale N    Style influence 0.0-1.0 (default: 0.7)\n\n");
+
+// Remove the "not yet implemented" error at line 1273.
+// Add:
+//   --ip-adapter PATH   IP-Adapter weights .safetensors
+// Load order: after Flux model loads, call iris_load_ip_adapter(ctx, ip_adapter_path)
+// Before generation: call iris_extract_sref_features(sref_paths, n_srefs) → siglip_feats
+```
+
+#### Step 7 — Metal (GPU) path
+
+The IP cross-attention K/V projections and the resampler are small GEMMs (128×3072).
+Use `flux_metal_sgemm_cached()` for `to_k_ip` / `to_v_ip` (static weights).
+Use `flux_metal_sgemm()` for the resampler cross-attention (dynamic — siglip_feats change
+per image). The K/V concatenation and extended attention can reuse the existing
+`flux_gpu_attention_mpsgraph_f32()` path with extended sequence length.
+
+---
+
+### Implementation order
+
+1. `extract_sref.py` — SigLIP feature extraction + `.sref` file format
+2. `iris_ip_adapter.c/.h` — struct, weight loading, resampler forward
+3. IP K/V precompute (called once before denoising loop)
+4. Inject into double-stream blocks only first (5 blocks) — validate style transfer works
+5. Extend to single-stream blocks (20 blocks)
+6. Metal GPU path for resampler + K/V projections
+7. CLI: `--sref`, `--ip-adapter`, `--sref-scale`, `--sref-precompute`
+8. Integration with validation suite (MLX-22 V-07 binary path)
+
+---
+
+### Validation criteria (links to MLX-22)
+
+Before merging, run `pipeline_validate.sh` and confirm:
+- V-01: weight integrity PASS
+- V-03: mean CLIP-I with iris binary ≥ Python inference mean CLIP-I ± 0.02
+  (confirms C implementation matches Python reference)
+- V-07: visual grid shows matching style character between Python and C outputs
+
+---
+
 ## MLX-21 — Extended telemetry for performance and quality insights (MEDIUM)
 
 **Problem:** Current telemetry (step, loss, lr, steps/s, ETA, disk) is enough to monitor
