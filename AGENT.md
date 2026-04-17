@@ -385,3 +385,9 @@ Manual Z-Image sanity:
 1. **Unified RoPE kernel indexing**: GPU must use consecutive pairs `(d, d+1)`, not axis-half indexing.
 2. **GPU caching of timestep params**: step-dependent shift/scale/gate must not be cached as static weights.
 3. **CLI mode CFG routing**: base models in interactive mode must go through `flux_generate()` (CFG-aware), not distilled-only embedding path.
+
+## Project docs
+- `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
+- `BUGS.md` — known anomalies and observed issues (training, pipeline)
+- `train/DISPATCH.md` — pipeline operational reference; read this before any pipeline work
+- `plans/chunk2_execution_plan.md` — step-by-step plan for chunk 2 pipeline run and code improvements

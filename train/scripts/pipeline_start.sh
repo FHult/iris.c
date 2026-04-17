@@ -59,7 +59,7 @@ done
 SESSION="pipeline"
 
 # ── Guard: already running? ───────────────────────────────────────────────────
-if tmux has-session -t "$SESSION" 2>/dev/null; then
+if /opt/homebrew/bin/tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "ERROR: tmux session '$SESSION' already exists — pipeline may already be running." >&2
     echo "  Run 'bash train/scripts/pipeline_status.sh' to check what is active." >&2
     echo "  Run 'bash train/scripts/pipeline_stop.sh' to stop it first." >&2
@@ -111,7 +111,7 @@ echo "  tmux attach -t $SESSION"
 echo "  bash train/scripts/pipeline_logs.sh --follow"
 echo "  bash train/scripts/pipeline_status.sh"
 
-tmux new-session -d -s "$SESSION" "$CMD"
+/opt/homebrew/bin/tmux new-session -d -s "$SESSION" "$CMD"
 
 echo ""
 echo "Pipeline started. Session: $SESSION"

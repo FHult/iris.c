@@ -55,6 +55,33 @@ Shard counts are sized for ~1 pass through each chunk's selected images. Each ch
 
 ---
 
+## Session Start Protocol
+
+**Do this at the start of every new session, in order:**
+
+**Step 1 — Read the pipeline state file** (authoritative source of chunk, scale, config):
+```bash
+cat /Volumes/2TBSSD/pipeline_state.json
+```
+This file tells you: which chunk is running, at what scale, with what LR and config,
+where the checkpoints are, and what data prep has been done for the next chunk.
+Do **not** infer these values from logs, config files, or checkpoint directory names —
+the state file is always the primary source of truth.
+
+> **If `pipeline_state.json` is missing or stale** (>6h older than the heartbeat): fall
+> back to `pipeline_status.sh --json`, then read the training config and latest heartbeat
+> to reconstruct state. File absence means MLX-20 has not been implemented yet or the
+> run was launched manually without the script.
+
+**Step 2 — Get live telemetry:**
+```bash
+bash train/scripts/pipeline_status.sh --json
+```
+Returns step count, loss, ETA, heartbeat age, disk usage, and (once MLX-20 is done)
+the full state file embedded under `"state"`.
+
+---
+
 ## Calls to Action
 
 All scripts work from any working directory.
@@ -97,6 +124,12 @@ Guards against double-starting: exits if a `pipeline` tmux session already exist
 Options: `--chunk 1–4`, `--scale PRESET_OR_N`, `--data-root PATH`, `--resume CKPT`, `--config YAML`, `--steps N`, `--lr RATE`, `--siglip`, `--recaption`, `--skip-dedup`, `--skip-train`
 
 The `--scale` preset controls both step count and how many shards to precompute for each chunk (see table in Pipeline Overview). When `--steps N` is also provided it overrides the step count from the preset while keeping the shard sizing.
+
+> **Operational requirements before leaving a training run unattended:**
+> - Always launch training inside tmux: `tmux new-session -s training` (if `pipeline_start.sh` didn't already create a session).
+> - Never run pipeline jobs (WDS conversion, precompute) on 2TBSSD while training is active — competing I/O caused a 2.6h stall during chunk 1 (see BACKLOG PIPELINE-3).
+> - Check for `WARNING: SigLIP cache coverage` in training startup output. If present, some shards lack siglip features and image conditioning will silently degrade for those batches.
+> - For chunks 2–4: confirm `--anchor-shard-dir` is set in the launch command, otherwise the 20% anchor slot silently receives nothing (see BACKLOG PIPELINE-1).
 
 ---
 
