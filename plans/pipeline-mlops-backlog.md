@@ -1,6 +1,6 @@
 # Pipeline MLOps Backlog
 
-Updated 2026-04-18 after V2 architecture review.
+Updated 2026-04-19 after Phase 2 completion.
 Dispositions: ✅ DONE | ➡ ABSORBED INTO V2 | 🗑 RETIRED | ✳ INCLUDE
 
 See `plans/pipeline-v2-architecture.md` for the design that governs open items.
@@ -20,15 +20,15 @@ See `plans/pipeline-v2-architecture.md` for the design that governs open items.
 | MLX-16 | Front-run JDB conversion | 🗑 RETIRED — orchestrator does this for all sources |
 | MLX-17 | Full parallel data pipeline | 🗑 RETIRED — superseded by V2 resource model |
 | MLX-18 | Pipeline orchestrator | ➡ ABSORBED — V2 Section 4 (Python, not bash) |
-| MLX-19 | Producer-consumer download | ✳ INCLUDE — Phase 1 |
+| MLX-19 | Producer-consumer download | ✅ DONE — Phase 1 (download_convert.py) |
 | MLX-20 | Pipeline state file | ➡ ABSORBED — V2 Section 4.1 (extended schema) |
-| MLX-21 T-01/02/03 | Telemetry: grad norm, bucket, memory | ✳ INCLUDE — Phase 2 first pass |
-| MLX-21 T-04–T-10 | Telemetry: remaining 7 metrics | ✳ INCLUDE — Phase 2 second pass |
-| MLX-22 | Post-training validation suite | ✳ INCLUDE — Phase 2 |
-| MLX-23 | `--sref` in iris.c | ✳ INCLUDE — parallel track |
+| MLX-21 T-01/02/03 | Telemetry: grad norm, bucket, memory | ✅ DONE — Phase 2 |
+| MLX-21 T-04–T-10 | Telemetry: remaining 7 metrics | ✅ DONE — Phase 2 |
+| MLX-22 | Post-training validation suite | ✅ DONE — Phase 2 |
+| MLX-23 | `--sref` in iris.c | ✳ INCLUDE — Phase 3 |
 | MLX-24 | LAION/WikiArt resampling | 🗑 RETIRED — equal chunking in V2 solves root cause |
 | MLX-25 | Staging architecture | ➡ ABSORBED — V2 Section 9 (directory + promotion logic) |
-| MLX-26 | A/B weight comparison | ✳ INCLUDE — Phase 2, after MLX-22 |
+| MLX-26 | A/B weight comparison | ✳ INCLUDE — Phase 3 (deferred until after pipeline test run) |
 
 ---
 
@@ -53,17 +53,20 @@ Goal: working orchestrator + data pipeline for all 4 sources in chunked mode.
 8. Doctor check — V2 Section 10 checks run at orchestrator startup
 9. Storage lifecycle — orchestrator deletes raw/converted after build (V2 Section 6)
 
-### Phase 2 — Quality + observability
+### Phase 2 — Quality + observability ✅ COMPLETE
 Goal: autonomous quality gates and sufficient telemetry for error detection.
 
-1. MLX-21 T-01/02/03 — grad norm, per-bucket throughput, memory pressure (in trainer)
-2. MLX-22 — validation suite: weight integrity (V-01), CLIP style (V-03/04), adapter delta (V-05), visual grid (V-07), regression vs prev chunk (V-08)
-3. MLX-26 — A/B weight comparison (reuses MLX-22 scoring infrastructure)
-4. MLX-21 T-04–T-10 — remaining telemetry metrics
-5. Anomaly detection — orchestrator rules from V2 Section 5.1
+1. ✅ MLX-21 T-01/02/03 — grad norm (EMA + spike alert), per-bucket throughput, memory pressure
+2. ✅ MLX-22 — validation suite: weight integrity (V-01), CLIP-I/CLIP-T (V-03/04), visual grid (V-07)
+3. ✅ MLX-21 T-04–T-10 — per-source loss (T-04), val loss held-out (T-05), EMA drift (T-06),
+   loader wait % (T-07), filter rejection by source (T-08), caption length distribution (T-09),
+   SigLIP coverage per batch (T-10)
+4. ✅ Anomaly detection — orchestrator: heartbeat staleness→restart, loss NaN/high→pause,
+   grad spike→pause; SigLIP coverage warning
 
-### Phase 3 — End product
-1. MLX-23 — `--sref` in iris.c binary (can start in parallel with Phase 1/2)
+### Phase 3 — End product + post-test tools
+1. MLX-23 — `--sref` in iris.c binary
+2. MLX-26 — A/B weight comparison (deferred until after pipeline test run)
 
 ---
 

@@ -22,6 +22,7 @@ Reference: plans/ip-adapter-training.md §2.6
 import argparse
 import glob
 import io
+import json
 import multiprocessing
 import os
 import sys
@@ -53,6 +54,19 @@ _LEGACY_FINGERPRINT = "min_size=256 min_words=5"
 
 def _criteria_fingerprint(min_size: int, min_words: int) -> str:
     return f"min_size={min_size} min_words={min_words}"
+
+
+def _infer_source(shard_path: str) -> str:
+    """Infer dataset source from shard filename (T-08). Returns 'unknown' if not tagged."""
+    name = os.path.basename(shard_path).lower()
+    for src in ("laion", "coyo", "wikiart"):
+        if src in name:
+            return src
+    if "jdb" in name or "journey" in name:
+        return "jdb"
+    if "anchor" in name:
+        return "anchor"
+    return "unknown"
 
 
 def _sentinel_valid(shard_path: str, fingerprint: str) -> bool:
@@ -100,6 +114,12 @@ def filter_shard(shard_path: str) -> dict:
 
     kept_records = []
     original_count = 0
+    # T-08: track drop reasons per shard
+    drop_reasons: dict[str, int] = {"caption": 0, "size": 0, "decode": 0}
+    # T-09: sample caption word-count for length distribution (sample every ~10th kept)
+    caption_len_sample: list[int] = []
+    _sample_every = 10
+    _sample_counter = 0
 
     try:
         with tarfile.open(shard_path) as tar:
@@ -132,6 +152,7 @@ def filter_shard(shard_path: str) -> dict:
                     "utf-8", errors="replace"
                 ).strip()
                 if not _is_valid_caption(txt, min_words):
+                    drop_reasons["caption"] += 1
                     continue
 
                 jpg = tar.extractfile(members[jpg_key]).read()
@@ -144,26 +165,39 @@ def filter_shard(shard_path: str) -> dict:
                         from PIL import Image as PilImage
                         w, h = PilImage.open(io.BytesIO(jpg)).size
                     if w < min_size or h < min_size:
+                        drop_reasons["size"] += 1
                         continue
                 except Exception:
+                    drop_reasons["decode"] += 1
                     continue
 
                 kept_records.append({"key": stem, "jpg": jpg, "txt": txt})
+                # T-09: sample caption length ~10%
+                _sample_counter += 1
+                if _sample_counter % _sample_every == 0:
+                    caption_len_sample.append(len(txt.split()))
     except Exception as e:
         print(f"Error reading {shard_path}: {e}", file=sys.stderr)
-        return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True}
+        return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True,
+                "source": _infer_source(shard_path), "drop_reasons": drop_reasons,
+                "caption_len_sample": []}
 
     done_path = shard_path + ".filtered"
+
+    source = _infer_source(shard_path)
 
     # Guard: treat 0-record shard as an error (truncated tar with no usable content).
     if original_count == 0:
         print(f"Error: {shard_path} has 0 records (truncated or empty tar)", file=sys.stderr)
-        return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True}
+        return {"shard": shard_path, "kept": 0, "dropped": 0, "error": True,
+                "source": source, "drop_reasons": drop_reasons, "caption_len_sample": []}
 
     # Fast path: nothing dropped — write sentinel without any I/O
     if len(kept_records) == original_count:
         open(done_path, "w").write(fingerprint + "\n")
-        return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False}
+        return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False,
+                "source": source, "drop_reasons": drop_reasons,
+                "caption_len_sample": caption_len_sample}
 
     # Rewrite shard in a temp file in the same directory then atomically replace.
     # Using mkstemp (not shard_path + ".tmp") prevents concurrent build_shards.py
@@ -188,10 +222,14 @@ def filter_shard(shard_path: str) -> dict:
         except OSError:
             pass
         return {"shard": shard_path, "kept": len(kept_records),
-                "dropped": original_count - len(kept_records), "error": True}
+                "dropped": original_count - len(kept_records), "error": True,
+                "source": source, "drop_reasons": drop_reasons,
+                "caption_len_sample": caption_len_sample}
 
     return {"shard": shard_path, "kept": len(kept_records),
-            "dropped": original_count - len(kept_records), "error": False}
+            "dropped": original_count - len(kept_records), "error": False,
+            "source": source, "drop_reasons": drop_reasons,
+            "caption_len_sample": caption_len_sample}
 
 
 def main():
@@ -314,6 +352,60 @@ def main():
     print(f"  Shards: {len(shards)}")
     if errors:
         print(f"  Errors: {errors} shards had read/write errors", file=sys.stderr)
+
+    # T-08: per-source rejection stats
+    from collections import defaultdict as _dd
+    source_stats: dict = _dd(lambda: {"kept": 0, "dropped": 0,
+                                       "caption": 0, "size": 0, "decode": 0})
+    all_caption_lens: list[int] = []
+    for r in results:
+        src = r.get("source", "unknown")
+        source_stats[src]["kept"]    += r["kept"]
+        source_stats[src]["dropped"] += r["dropped"]
+        for reason, count in r.get("drop_reasons", {}).items():
+            source_stats[src][reason] += count
+        all_caption_lens.extend(r.get("caption_len_sample", []))
+
+    filter_stats = {
+        "total_kept": total_kept,
+        "total_dropped": sum(r["dropped"] for r in results),
+        "total_shards": len(shards),
+        "errors": errors,
+        "by_source": {
+            src: {
+                **v,
+                "rejection_pct": round(v["dropped"] / max(v["kept"] + v["dropped"], 1) * 100, 1),
+            }
+            for src, v in source_stats.items()
+        },
+    }
+    stats_path = os.path.join(args.shards, "filter_stats.json")
+    with open(stats_path, "w") as _f:
+        json.dump(filter_stats, _f, indent=2)
+    print(f"  Filter stats → {stats_path}")
+    for src, sv in sorted(filter_stats["by_source"].items()):
+        print(f"    [{src}] kept={sv['kept']:,}  dropped={sv['dropped']:,}"
+              f"  rejection={sv['rejection_pct']:.1f}%"
+              f"  (caption={sv['caption']} size={sv['size']} decode={sv['decode']})")
+
+    # T-09: caption length distribution
+    if all_caption_lens:
+        all_caption_lens.sort()
+        n = len(all_caption_lens)
+        def _pct(p): return all_caption_lens[int(p * n / 100)]
+        caption_stats = {
+            "sample_size": n,
+            "p10": _pct(10), "p25": _pct(25), "p50": _pct(50),
+            "p75": _pct(75), "p90": _pct(90),
+            "mean": round(sum(all_caption_lens) / n, 1),
+        }
+        cap_path = os.path.join(args.shards, "caption_stats.json")
+        with open(cap_path, "w") as _f:
+            json.dump(caption_stats, _f, indent=2)
+        print(f"  Caption length (words) p50={caption_stats['p50']}"
+              f"  p90={caption_stats['p90']}  → {cap_path}")
+
+    if errors:
         sys.exit(1)
 
 

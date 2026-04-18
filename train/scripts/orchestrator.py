@@ -153,6 +153,10 @@ class Orchestrator:
         # {"chunk": N, "step": "build_shards", "log": Path, "token": "DISK_WRITE_HIGH"|None}
         self._active_prep: Optional[dict] = None
 
+        # Anomaly detection counters: {chunk: count_of_consecutive_anomaly_polls}
+        self._loss_high_since: dict[int, Optional[int]] = {}  # chunk → first anomaly step
+        self._grad_spike_polls: dict[int, int] = {}           # chunk → consecutive high-grad polls
+
     # -----------------------------------------------------------------------
     # Main loop
     # -----------------------------------------------------------------------
@@ -594,14 +598,116 @@ class Orchestrator:
             return
         for chunk in range(1, self.total_chunks + 1):
             if derive_chunk_state(chunk) == ChunkState.TRAINING:
-                age = heartbeat_age_secs("trainer", chunk)
-                if age is not None and age > 120:
-                    log_orch(f"Chunk {chunk}: trainer heartbeat stale ({age:.0f}s)",
+                self._check_training_anomalies(chunk)
+
+    def _check_training_anomalies(self, chunk: int) -> None:
+        """Section 5.1 anomaly detection rules for a training chunk."""
+        import math
+
+        hb = read_heartbeat("trainer", chunk)
+        age = heartbeat_age_secs("trainer", chunk)
+
+        # ── Heartbeat staleness → crash detection + restart ──────────────────
+        if age is not None and age > 90:
+            log_orch(f"Chunk {chunk}: trainer heartbeat stale ({age:.0f}s) — restarting",
+                     level="error", chunk=chunk)
+            dispatch_issue(self._next_issue_id(), "error",
+                           f"Trainer heartbeat stale ({age:.0f}s) — restarting process",
+                           chunk=chunk, process="trainer",
+                           suggested_action="check_training_log")
+            self._restart_trainer(chunk)
+            return
+
+        if hb is None:
+            return
+
+        loss = hb.get("loss")
+        step = hb.get("step", 0)
+
+        # ── Loss NaN/Inf → immediate pause ───────────────────────────────────
+        if loss is not None and (math.isnan(loss) or math.isinf(loss)):
+            log_orch(f"Chunk {chunk}: loss NaN/Inf at step {step} — pausing",
+                     level="error", chunk=chunk)
+            dispatch_issue(self._next_issue_id(), "critical",
+                           f"Training loss NaN/Inf at step {step}",
+                           chunk=chunk, suggested_action="investigate_training")
+            self._write_pause()
+            return
+
+        # ── Loss persistently > 2.0 for 100 steps → pause ───────────────────
+        if loss is not None:
+            if loss > 2.0:
+                first = self._loss_high_since.get(chunk)
+                if first is None:
+                    self._loss_high_since[chunk] = step
+                elif step - first >= 100:
+                    log_orch(f"Chunk {chunk}: loss {loss:.3f} > 2.0 for {step-first} steps — pausing",
+                             level="error", chunk=chunk)
+                    dispatch_issue(self._next_issue_id(), "error",
+                                   f"Training loss {loss:.3f} persistently > 2.0 (since step {first})",
+                                   chunk=chunk, suggested_action="investigate_training")
+                    self._write_pause()
+                    self._loss_high_since[chunk] = None
+            else:
+                self._loss_high_since[chunk] = None
+
+        # ── Grad norm > 50.0 for 10 polls → pause; > 10.0 → warn ────────────
+        grad_norm = hb.get("grad_norm")
+        if grad_norm is not None:
+            if grad_norm > 50.0:
+                self._grad_spike_polls[chunk] = self._grad_spike_polls.get(chunk, 0) + 1
+                n_spikes = self._grad_spike_polls[chunk]
+                if n_spikes >= 10:
+                    log_orch(f"Chunk {chunk}: grad_norm {grad_norm:.1f} > 50 for {n_spikes} polls — pausing",
+                             level="error", chunk=chunk)
+                    dispatch_issue(self._next_issue_id(), "error",
+                                   f"Grad norm {grad_norm:.1f} sustained > 50 ({n_spikes} polls)",
+                                   chunk=chunk, suggested_action="investigate_training")
+                    self._write_pause()
+                    self._grad_spike_polls[chunk] = 0
+                elif grad_norm > 10.0:
+                    log_orch(f"Chunk {chunk}: grad_norm warning {grad_norm:.1f} > 10",
                              level="warning", chunk=chunk)
-                    dispatch_issue(self._next_issue_id(), "warning",
-                                   f"Trainer heartbeat stale ({age:.0f}s) — process may be hung",
-                                   chunk=chunk, process="trainer",
-                                   suggested_action="check_training_log")
+            else:
+                self._grad_spike_polls[chunk] = 0
+
+        # ── SigLIP coverage < 90% → log warning ──────────────────────────────
+        siglip_cov = hb.get("siglip_coverage_pct")
+        if siglip_cov is not None and siglip_cov < 90:
+            log_orch(f"Chunk {chunk}: SigLIP coverage {siglip_cov:.0f}% < 90%",
+                     level="warning", chunk=chunk)
+
+    def _restart_trainer(self, chunk: int) -> None:
+        """Kill and relaunch the training window for the given chunk."""
+        if self.dry_run:
+            log_orch(f"[dry-run] would restart trainer for chunk {chunk}")
+            return
+        import subprocess
+        key = ("restart_trainer", chunk)
+        count = self._restart_counts.get(key, 0) + 1
+        self._restart_counts[key] = count
+        if count > 3:
+            log_orch(f"Chunk {chunk}: trainer restart limit (3) exceeded — aborting",
+                     level="error", chunk=chunk)
+            dispatch_issue(self._next_issue_id(), "critical",
+                           f"Trainer restart limit exceeded for chunk {chunk}",
+                           chunk=chunk, suggested_action="manual_intervention")
+            return
+        log_orch(f"Chunk {chunk}: killing iris-train window (restart #{count})", chunk=chunk)
+        subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"],
+                       capture_output=True)
+        # Let orchestrator's normal _check_training path relaunch on next poll
+        # by clearing the train.done sentinel (training was not complete)
+        clear_error(chunk, "train")
+
+    def _write_pause(self) -> None:
+        """Write a pause control signal so the operator can investigate."""
+        try:
+            import json as _json
+            with open(CONTROL_FILE, "w") as _f:
+                _json.dump({"action": "pause"}, _f)
+        except OSError:
+            pass
 
     # -----------------------------------------------------------------------
     # Disk check

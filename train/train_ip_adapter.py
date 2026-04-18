@@ -663,6 +663,51 @@ def train(config: dict) -> None:
         optimizer.update(adapter, grads)
         return loss_val, grad_norm
 
+    # ── T-05: validation loss on held-out set ─────────────────────────────────
+    def _compute_val_loss() -> Optional[float]:
+        """Run a no-grad forward on up to 16 held-out records. Returns mean loss or None."""
+        if not _val_shards:
+            return None
+        from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed
+        losses = []
+        for _shard in _val_shards[:2]:
+            try:
+                import tarfile as _tf
+                with _tf.open(_shard) as _tar:
+                    _contents = {m.name: _tar.extractfile(m).read()
+                                 for m in _tar.getmembers() if m.isfile()}
+            except Exception:
+                continue
+            _keys: dict = {}
+            for _name in _contents:
+                _stem, _, _ext = _name.rpartition(".")
+                _keys.setdefault(_stem, {})[_ext.lower()] = _name
+            for _stem in list(_keys)[:8]:
+                _txt_key = _keys[_stem].get("txt") or _keys[_stem].get("caption")
+                if not _txt_key:
+                    continue
+                _vae_np  = _load_vae_latent(_stem, dcfg.get("vae_cache_dir"),
+                                             expected_hw=None)
+                _text_np = _load_qwen3_embed(_stem, dcfg.get("qwen3_cache_dir"))
+                if _vae_np is None or _text_np is None:
+                    continue
+                _lat = mx.array(_vae_np[None], dtype=mx.bfloat16)
+                _txt = mx.array(_text_np[None], dtype=mx.bfloat16)
+                _t   = mx.array([500], dtype=mx.int32)
+                _noise = mx.random.normal(_lat.shape, dtype=_lat.dtype)
+                _alpha, _sigma = get_schedule_values(_t)
+                _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
+                _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
+                mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
+                # No-grad forward: call loss_fn directly (not through value_and_grad)
+                _siglip_zero = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+                _loss = loss_fn(_siglip_zero, mx.array(True), mx.array(False), _fs, _target)
+                mx.eval(_loss)
+                losses.append(float(_loss.item()))
+                if len(losses) >= 16:
+                    break
+        return sum(losses) / len(losses) if losses else None
+
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
 
@@ -690,6 +735,33 @@ def train(config: dict) -> None:
     # T-03: memory snapshot (read at log intervals to avoid overhead)
     mem_used_gb: Optional[float] = None
     mem_available_gb: Optional[float] = None
+
+    # T-04: per-source loss (source inferred from shard name; "unknown" until shard naming
+    # includes source prefix e.g. chunk1_laion_0000.tar — requires build_shards tagging)
+    source_stats: dict = defaultdict(lambda: {"steps": 0, "loss_sum": 0.0})
+
+    # T-05: validation loss on held-out set
+    _val_shards: list[str] = []
+    val_loss_last: Optional[float] = None
+    val_loss_log_path = os.path.join(ocfg["checkpoint_dir"], "val_loss.jsonl")
+    _val_every = tcfg.get("val_every", 1000)
+    try:
+        from pathlib import Path as _P
+        import pipeline_lib as _plib
+        _held_out = _P(str(_plib.DATA_ROOT)) / "validation" / "held_out"
+        if _held_out.exists():
+            _val_shards = sorted(str(p) for p in _held_out.glob("*.tar"))
+            print(f"Validation held-out: {len(_val_shards)} shards in {_held_out}")
+        else:
+            print("Validation held-out: not found — T-05 disabled")
+    except Exception:
+        pass
+
+    # T-06: EMA vs online weight divergence
+    ema_drift: float = 0.0
+
+    # T-10: SigLIP coverage per batch window
+    _siglip_miss_steps = 0
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
@@ -749,6 +821,7 @@ def train(config: dict) -> None:
             # Happens when siglip precompute is partial; treated as null-image dropout.
             B = images.shape[0]
             siglip_feats = mx.zeros((B, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            _siglip_miss_steps += 1  # T-10
 
         _t_prep += time.time() - _t0
 
@@ -801,9 +874,45 @@ def train(config: dict) -> None:
 
         # T-02: per-bucket throughput
         _bk = f"{bH}x{bW}"
+        _step_loss_val = float(loss_val.item())
         bucket_stats[_bk]["steps"]    += 1
-        bucket_stats[_bk]["loss_sum"] += float(loss_val.item())
+        bucket_stats[_bk]["loss_sum"] += _step_loss_val
         bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_bucket_start
+
+        # T-04: per-source loss (source tag requires shard naming; "unknown" until then)
+        source_stats["unknown"]["steps"]    += 1
+        source_stats["unknown"]["loss_sum"] += _step_loss_val
+
+        # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
+        if step % 500 == 0:
+            try:
+                _flat_online = dict(_flatten(adapter.parameters()))
+                _flat_ema    = dict(_flatten(ema_params))
+                _drift_vals  = []
+                for _k in list(_flat_online)[:5]:
+                    if _k in _flat_ema:
+                        _a = _flat_online[_k].astype(mx.float32)
+                        _b = _flat_ema[_k].astype(mx.float32)
+                        if _a.shape == _b.shape:
+                            _drift_vals.append(float(mx.mean((_a - _b) ** 2).item() ** 0.5))
+                if _drift_vals:
+                    ema_drift = sum(_drift_vals) / len(_drift_vals)
+            except Exception:
+                pass
+
+        # T-05: validation loss on held-out set
+        if _val_shards and step % _val_every == 0:
+            val_loss_last = _compute_val_loss()
+            if val_loss_last is not None:
+                try:
+                    os.makedirs(os.path.dirname(val_loss_log_path), exist_ok=True)
+                    with open(val_loss_log_path, "a") as _vf:
+                        json.dump({"step": step, "val_loss": round(val_loss_last, 6),
+                                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}, _vf)
+                        _vf.write("\n")
+                except OSError:
+                    pass
+                print(f"  val_loss={val_loss_last:.4f} (step {step})", flush=True)
 
         # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
         # mx.eval immediately after update to break the lazy-graph chain.
@@ -882,11 +991,42 @@ def train(config: dict) -> None:
                     print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
                           flush=True)
 
+            # T-04: per-source loss summary
+            _src_summary = {
+                src: {"steps": v["steps"],
+                      "loss_avg": round(v["loss_sum"] / v["steps"], 4) if v["steps"] else 0}
+                for src, v in source_stats.items()
+            }
+
+            # T-06: EMA drift
+            if ema_drift > 0:
+                print(f"  ema_drift={ema_drift:.5f}", flush=True)
+
+            # T-07: loader wait fraction (derived from phase accumulators already printed)
+            _total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
+            _loader_pct = round(100 * _t_data / _total_phase, 1) if _total_phase > 0 else 0.0
+            _loader_wait_ms = round(_t_data * 1000 / log_interval, 1)
+            _compute_ms = round((_t_prep + _t_fwd + _t_step + _t_eval) * 1000 / log_interval, 1)
+            if _loader_pct > 20:
+                print(f"  WARNING: loader wait {_loader_pct:.0f}% — consider increasing prefetch_batches",
+                      flush=True)
+
+            # T-10: SigLIP coverage
+            _siglip_cov = round(100 * (1 - _siglip_miss_steps / log_interval), 1)
+            if _siglip_miss_steps > 0:
+                print(f"  siglip_coverage={_siglip_cov:.0f}% ({_siglip_miss_steps}/{log_interval} steps missing)",
+                      flush=True)
+                if _siglip_cov < 90:
+                    print(f"  WARNING: SigLIP coverage below 90%", flush=True)
+            _siglip_miss_steps = 0
+
             if wandb_run:
                 wandb_run.log(
                     {"loss": loss_scalar, "loss_smooth": loss_smooth,
                      "lr": lr_now, "steps_per_sec": steps_per_sec,
-                     "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth},
+                     "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth,
+                     "ema_drift": ema_drift, "siglip_coverage_pct": _siglip_cov,
+                     "loader_wait_pct": _loader_pct},
                     step=step,
                 )
             # Write machine-readable heartbeat for status scripts
@@ -902,6 +1042,12 @@ def train(config: dict) -> None:
                 "elapsed_seconds": int(total_elapsed),
                 "grad_norm": round(_gn, 4),
                 "grad_norm_smooth": round(grad_norm_smooth, 4),
+                "ema_drift": round(ema_drift, 5),
+                "val_loss": round(val_loss_last, 6) if val_loss_last is not None else None,
+                "siglip_coverage_pct": _siglip_cov,
+                "loader_wait_ms_avg": _loader_wait_ms,
+                "compute_ms_avg": _compute_ms,
+                "source_loss": _src_summary,
                 "buckets": _bkt_summary,
                 "mem_used_gb": mem_used_gb,
                 "mem_available_gb": mem_available_gb,
