@@ -26,6 +26,7 @@ import random
 import sys
 import threading
 import time
+from collections import defaultdict
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,12 @@ try:
 except ImportError:
     _HAS_MFLUX = False
     print("Warning: mflux not installed. Run: pip install mflux", file=sys.stderr)
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 
 
@@ -652,9 +659,9 @@ def train(config: dict) -> None:
         loss_val, grads = loss_and_grad(
             siglip_feats, use_null_image, use_null_text, flux_state, target,
         )
-        grads, _ = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
+        grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
-        return loss_val
+        return loss_val, grad_norm
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
@@ -673,6 +680,17 @@ def train(config: dict) -> None:
     _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
     _t_eval_end = None  # end of last mx.eval; None on first iteration
 
+    # T-01: grad norm EMA (decay=0.98 ≈ 50-step half-life)
+    grad_norm_smooth = 0.0
+    _grad_ema_decay = 0.98
+
+    # T-02: per-bucket throughput (steps, loss, wall time)
+    bucket_stats: dict = defaultdict(lambda: {"steps": 0, "loss_sum": 0.0, "time_sum": 0.0})
+
+    # T-03: memory snapshot (read at log intervals to avoid overhead)
+    mem_used_gb: Optional[float] = None
+    mem_available_gb: Optional[float] = None
+
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
             break
@@ -685,7 +703,7 @@ def train(config: dict) -> None:
 
         bH, bW = bucket_hw
 
-        _t0 = time.time()
+        _t_bucket_start = _t0 = time.time()
         # Convert to MLX — images are padded (H+32, W+32) for GPU crop augmentation
         images = mx.array(images_np, dtype=mx.bfloat16)   # [B, C, H+32, W+32]
 
@@ -755,14 +773,14 @@ def train(config: dict) -> None:
 
         # Adapter-only backward + optimizer update (tiny graph, should be fast)
         _t0 = time.time()
-        loss_val = compiled_step(
+        loss_val, grad_norm_val = compiled_step(
             siglip_feats, use_null_image, use_null_text, flux_state, target,
         )
         _t_step += time.time() - _t0
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
         _t0 = time.time()
-        mx.eval(loss_val, adapter.parameters(), optimizer.state)
+        mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
         # Return freed buffers to the OS immediately.  Without this, MLX holds
         # them in a cache that inflates peak wired memory and triggers jetsam.
         mx.clear_cache()
@@ -770,6 +788,22 @@ def train(config: dict) -> None:
         _t_eval += _t_eval_end - _t0
 
         step += 1
+
+        # T-01: grad norm EMA + spike alert
+        _gn = float(grad_norm_val.item())
+        if grad_norm_smooth == 0.0:
+            grad_norm_smooth = _gn
+        else:
+            grad_norm_smooth = _grad_ema_decay * grad_norm_smooth + (1 - _grad_ema_decay) * _gn
+        if grad_norm_smooth > 0 and _gn > 10 * grad_norm_smooth:
+            print(f"  WARNING: grad norm spike step {step}: "
+                  f"{_gn:.3f} vs smooth {grad_norm_smooth:.3f}", flush=True)
+
+        # T-02: per-bucket throughput
+        _bk = f"{bH}x{bW}"
+        bucket_stats[_bk]["steps"]    += 1
+        bucket_stats[_bk]["loss_sum"] += float(loss_val.item())
+        bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_bucket_start
 
         # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
         # mx.eval immediately after update to break the lazy-graph chain.
@@ -816,10 +850,43 @@ def train(config: dict) -> None:
                     flush=True,
                 )
             _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
+
+            # T-01: grad norm at log interval
+            print(f"  grad_norm {_gn:.3f}  (smooth {grad_norm_smooth:.3f})", flush=True)
+
+            # T-02: per-bucket summary at log interval
+            _bkt_summary = {}
+            for _bk, _bv in sorted(bucket_stats.items()):
+                _n = _bv["steps"]
+                if _n > 0:
+                    _bkt_summary[_bk] = {
+                        "steps": _n,
+                        "loss_avg": round(_bv["loss_sum"] / _n, 4),
+                        "secs_avg": round(_bv["time_sum"] / _n, 2),
+                    }
+            if _bkt_summary:
+                _bkt_str = "  ".join(
+                    f"{k}:{v['steps']}steps loss={v['loss_avg']:.4f} {v['secs_avg']:.1f}s/step"
+                    for k, v in _bkt_summary.items()
+                )
+                print(f"  buckets: {_bkt_str}", flush=True)
+
+            # T-03: memory pressure
+            if _HAS_PSUTIL:
+                _vm = _psutil.virtual_memory()
+                mem_used_gb = round(_vm.used / 1e9, 1)
+                mem_available_gb = round(_vm.available / 1e9, 1)
+                print(f"  mem: {mem_used_gb:.1f} GB used  {mem_available_gb:.1f} GB free",
+                      flush=True)
+                if mem_available_gb < 6.0:
+                    print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
+                          flush=True)
+
             if wandb_run:
                 wandb_run.log(
                     {"loss": loss_scalar, "loss_smooth": loss_smooth,
-                     "lr": lr_now, "steps_per_sec": steps_per_sec},
+                     "lr": lr_now, "steps_per_sec": steps_per_sec,
+                     "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth},
                     step=step,
                 )
             # Write machine-readable heartbeat for status scripts
@@ -833,6 +900,11 @@ def train(config: dict) -> None:
                 "steps_per_sec": round(steps_per_sec, 4),
                 "eta_seconds": int(eta_s),
                 "elapsed_seconds": int(total_elapsed),
+                "grad_norm": round(_gn, 4),
+                "grad_norm_smooth": round(grad_norm_smooth, 4),
+                "buckets": _bkt_summary,
+                "mem_used_gb": mem_used_gb,
+                "mem_available_gb": mem_available_gb,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             try:
