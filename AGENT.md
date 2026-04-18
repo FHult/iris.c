@@ -390,4 +390,5 @@ Manual Z-Image sanity:
 - `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
 - `BUGS.md` — known anomalies and observed issues (training, pipeline)
 - `train/DISPATCH.md` — pipeline operational reference; read this before any pipeline work
-- `plans/chunk2_execution_plan.md` — step-by-step plan for chunk 2 pipeline run and code improvements
+- `plans/pipeline-v2-architecture.md` — V2 pipeline architecture (active design, supersedes all V1 plan docs)
+- `plans/pipeline-mlops-backlog.md` — backlog with V2 dispositions and implementation phases

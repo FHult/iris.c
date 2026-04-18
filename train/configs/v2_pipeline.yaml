@@ -1,0 +1,55 @@
+# V2 pipeline configuration
+# Reference: plans/pipeline-v2-architecture.md
+
+recipe: ip_adapter_flux4b
+chunks: 4
+scale: small          # small | medium | large | all-in
+poll_interval: 60     # orchestrator poll cycle in seconds
+
+model:
+  flux_model: flux-klein-4b
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/stage1
+
+training_config: train/configs/stage1_512px.yaml
+
+# JourneyDB tgz ranges per chunk (0-indexed tgz numbers)
+jdb:
+  tgz_ranges:
+    1: [0, 49]
+    2: [50, 99]
+    3: [100, 149]
+    4: [150, 201]
+
+training:
+  hard_mix_ratio: 0.05
+  siglip: false       # true requires SigLIP precompute (~420 GB extra)
+
+  # Steps per chunk per scale
+  steps:
+    small:
+      1: 50000
+      2: 15000
+      3: 15000
+      4: 15000
+    medium:
+      1: 105000
+      2: 40000
+      3: 40000
+      4: 40000
+    large:
+      1: 200000
+      2: 60000
+      3: 60000
+      4: 60000
+    all-in:
+      1: 540000
+      2: 200000
+      3: 200000
+      4: 200000
+
+  # Learning rate per chunk
+  lr:
+    1: 1.0e-4
+    2: 3.0e-5
+    3: 1.0e-5
+    4: 1.0e-5

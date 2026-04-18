@@ -116,26 +116,66 @@ def _collect_records_from_shard(shard_path: str) -> list:
     return records
 
 
-def _collect_records(source_dirs: list, workers: int = 1) -> list:
+def _parse_source_arg(arg: str) -> tuple:
+    """
+    Parse a source argument into (directory_path, chunk_idx, total_chunks).
+
+    Plain path:      "/some/dir"            → ("/some/dir", None, None)
+    Sliced path:     "/some/dir:2/4"        → ("/some/dir", 2, 4)
+
+    Sliced sources use a deterministic shuffle (seed=42) and take the
+    records[start:end] slice corresponding to chunk_idx out of total_chunks.
+    This ensures LAION/COYO are split consistently across all 4 training runs.
+    Pre-staged sources (JDB, WikiArt) pass no slice spec — they already
+    contain only the chunk's data.
+    """
+    if ":" in arg:
+        path, spec = arg.rsplit(":", 1)
+        parts = spec.split("/")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return (path, int(parts[0]), int(parts[1]))
+    return (arg, None, None)
+
+
+def _collect_records(source_args: list, workers: int = 1) -> list:
     """
     Enumerate all records from all source shard directories.
     Returns list of {"shard": path, "id": stem, "txt": str} — NO jpg bytes.
     JPEG bytes are read on demand in workers, one source shard at a time,
     to avoid loading the entire dataset (~200 GB) into RAM at once.
+
+    source_args may include slice specs like "/path/to/laion:2/4" to take
+    the second quarter of records from that source (for V2 per-chunk sampling).
     """
-    all_shards = []
-    for src_dir in source_dirs:
-        all_shards.extend(sorted(glob.glob(os.path.join(src_dir, "*.tar"))))
+    all_records = []
+    for arg in source_args:
+        src_dir, chunk_idx, total_chunks = _parse_source_arg(arg)
+        shards = sorted(glob.glob(os.path.join(src_dir, "*.tar")))
 
-    if workers > 1:
-        with multiprocessing.Pool(processes=workers) as pool:
-            batches = pool.map(_collect_records_from_shard, all_shards)
-        return [r for batch in batches for r in batch]
+        if workers > 1:
+            with multiprocessing.Pool(processes=workers) as pool:
+                batches = pool.map(_collect_records_from_shard, shards)
+            src_records = [r for batch in batches for r in batch]
+        else:
+            src_records = []
+            for shard_path in shards:
+                src_records.extend(_collect_records_from_shard(shard_path))
 
-    records = []
-    for shard_path in all_shards:
-        records.extend(_collect_records_from_shard(shard_path))
-    return records
+        if chunk_idx is not None and total_chunks and total_chunks > 1:
+            # Deterministic slice: shuffle with fixed seed then take chunk's window.
+            src_records.sort(key=lambda r: r["id"])  # stable sort before shuffle
+            rng = random.Random(42)
+            rng.shuffle(src_records)
+            n = len(src_records)
+            start = (chunk_idx - 1) * n // total_chunks
+            end   = chunk_idx * n // total_chunks
+            src_records = src_records[start:end]
+            print(f"  Source slice {src_dir}: chunk {chunk_idx}/{total_chunks} "
+                  f"→ records {start:,}–{end:,} ({len(src_records):,} total)",
+                  flush=True)
+
+        all_records.extend(src_records)
+    return all_records
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +392,8 @@ def main():
     )
     parser.add_argument(
         "--sources", nargs="+", required=True,
-        help="Directories containing source .tar shards"
+        help="Directories containing source .tar shards. Append :chunk/total to "
+             "take a deterministic slice (e.g. /data/laion:2/4 = second quarter)"
     )
     parser.add_argument(
         "--output", required=True,
@@ -397,7 +438,7 @@ def main():
                 pass
 
     print(f"Collecting records from {len(args.sources)} source(s) using {args.workers} workers...")
-    records = _collect_records(args.sources, workers=args.workers)
+    records = _collect_records(args.sources, workers=args.workers)  # args.sources may contain :chunk/total slices
     print(f"  Found {len(records):,} total records")
 
     # Shuffle globally before splitting to workers

@@ -2,6 +2,13 @@
 
 **This is your primary reference file. Read it before taking any action on the training pipeline.**
 
+> **V2 TRANSITION IN PROGRESS (2026-04-18)**
+> All V1 pipeline data has been cleared. V2 architecture is being built from scratch.
+> See `plans/pipeline-v2-architecture.md` for design and `plans/pipeline-mlops-backlog.md`
+> for implementation plan and phase status.
+> V2 Phase 1 (orchestrator + all-source chunked pipeline) is the current work item.
+> This document describes V1 for historical reference; update it as V2 scripts are built.
+
 ---
 
 ## What This Is
@@ -59,26 +66,26 @@ Shard counts are sized for ~1 pass through each chunk's selected images. Each ch
 
 **Do this at the start of every new session, in order:**
 
-**Step 1 — Read the pipeline state file** (authoritative source of chunk, scale, config):
+**Step 1 — Check V2 build status** (if V2 Phase 1 is in progress):
 ```bash
 cat /Volumes/2TBSSD/pipeline_state.json
 ```
-This file tells you: which chunk is running, at what scale, with what LR and config,
-where the checkpoints are, and what data prep has been done for the next chunk.
-Do **not** infer these values from logs, config files, or checkpoint directory names —
-the state file is always the primary source of truth.
+This file is the authoritative source of chunk, scale, config, and per-chunk step state.
+Do **not** infer these values from logs, config files, or checkpoint directory names.
 
-> **If `pipeline_state.json` is missing or stale** (>6h older than the heartbeat): fall
-> back to `pipeline_status.sh --json`, then read the training config and latest heartbeat
-> to reconstruct state. File absence means MLX-20 has not been implemented yet or the
-> run was launched manually without the script.
+> **If `pipeline_state.json` is missing:** V2 orchestrator has not started yet.
+> Check `plans/pipeline-v2-architecture.md` Section 12 for current phase and next steps.
 
-**Step 2 — Get live telemetry:**
+**Step 2 — Get live telemetry** (once V2 orchestrator is running):
+```bash
+python train/scripts/pipeline_status.py --json
+```
+Returns step count, loss, ETA, heartbeat age, disk usage, and full state embedded under `"state"`.
+
+**Step 2 (V1 fallback, if V2 not yet running):**
 ```bash
 bash train/scripts/pipeline_status.sh --json
 ```
-Returns step count, loss, ETA, heartbeat age, disk usage, and (once MLX-20 is done)
-the full state file embedded under `"state"`.
 
 ---
 
