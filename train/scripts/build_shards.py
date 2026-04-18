@@ -418,14 +418,16 @@ def main():
     n_shards = math.ceil(len(records) / args.shard_size)
     workers = min(args.workers, n_shards)
     start_idx = args.start_idx
-    # Total shards across the full run (0 … start_idx + n_shards - 1).
-    # Workers always receive the full range from 0 so their record consumption
-    # matches a fresh run; write_from tells them to skip writing shards < start_idx.
     total_shards = start_idx + n_shards
     print(f"  Output: {n_shards} new shards × {args.shard_size} images (writing {start_idx:06d}–{start_idx+n_shards-1:06d} of {total_shards} total)")
     print(f"  Workers: {workers} processes (targeting P-cores on Apple Silicon)")
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
-    full_shard_ranges = [list(range(i, total_shards, workers)) for i in range(workers)]
+    # Each worker owns an interleaved subset of the NEW shards only (>= start_idx).
+    # Previously workers started from shard 0 and simulated consuming records for
+    # shards 0..start_idx-1 before writing — but each worker's record slice is too
+    # small to survive that simulation when start_idx is large (e.g. 84 for chunk 3),
+    # causing workers to exhaust their records before reaching writable shards → 0 output.
+    full_shard_ranges = [list(range(start_idx + i, total_shards, workers)) for i in range(workers)]
 
     # Give each worker a contiguous slice of the shuffled record list.
     chunk = math.ceil(len(records) / workers)
