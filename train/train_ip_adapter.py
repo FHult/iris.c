@@ -207,16 +207,24 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
 
 def load_ema_from_checkpoint(path: str) -> Optional[dict]:
     """
-    Load EMA parameters from a step_*.safetensors checkpoint.
+    Load EMA parameters from a checkpoint file. Handles two formats:
+      - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint_async)
+      - best.safetensors:   bare keys, no prefix (written by save_ema)
     Returns a nested dict matching adapter.parameters() structure, or None if
-    the file contains no ema.* keys (e.g. a best.safetensors EMA export).
+    the file contains no recognisable EMA or adapter keys.
     """
     from safetensors import safe_open
     flat: dict = {}
     with safe_open(path, framework="numpy") as f:
-        for k in f.keys():
-            if k.startswith("ema."):
-                flat[k[4:]] = mx.array(f.get_tensor(k))  # strip "ema." prefix
+        keys = list(f.keys())
+        has_ema_prefix = any(k.startswith("ema.") for k in keys)
+        for k in keys:
+            if has_ema_prefix:
+                if k.startswith("ema."):
+                    flat[k[4:]] = mx.array(f.get_tensor(k))
+            else:
+                # bare keys — save_ema() export (e.g. best.safetensors)
+                flat[k] = mx.array(f.get_tensor(k))
     if not flat:
         return None
     return _flat_to_nested(flat)

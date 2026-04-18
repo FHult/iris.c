@@ -335,7 +335,7 @@ def main():
     else:
         from train_ip_adapter import load_checkpoint
         load_checkpoint(adapter, args.checkpoint)
-        print("    Raw weights loaded (no EMA found)")
+        print("    WARNING: no EMA weights found — loaded raw adapter weights")
     adapter.freeze()
     mx.eval(adapter.parameters())
 
