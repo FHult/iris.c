@@ -75,7 +75,7 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
 
     log_orch(f"JDB chunk {chunk} scale={scale}: download+convert {total} tgzs ({start:03d}–{end:03d})")
 
-    ready_q: queue.Queue = queue.Queue(maxsize=2)
+    ready_q: queue.Queue = queue.Queue()
     error_event = threading.Event()
     done_event = threading.Event()
 
