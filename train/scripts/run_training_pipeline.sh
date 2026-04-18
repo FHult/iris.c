@@ -922,7 +922,10 @@ PYEOF
 
     # ── 2b. Cross-chunk dedup: flag images already seen in previous chunks ────
     DEDUP_DONE="$SHARDS_DIR/.deduped_chunk${CHUNK}"
-    if [[ -f "$DEDUP_DONE" ]]; then
+    if $SKIP_DEDUP; then
+        log "[2b/6] --skip-dedup set — skipping cross-chunk dedup for chunk $CHUNK"
+        touch "$DEDUP_DONE"
+    elif [[ -f "$DEDUP_DONE" ]]; then
         log "[2b/6] Cross-chunk dedup already done for chunk $CHUNK — skipping"
     elif [[ ! -f "$DEDUP_INDEX" ]]; then
         log "[2b/6] WARNING: no dedup index found at $DEDUP_INDEX"
