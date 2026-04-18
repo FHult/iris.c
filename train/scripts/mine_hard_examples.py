@@ -110,7 +110,7 @@ def _load_siglip(rec_id: str, cache_dir: str):
 # ---------------------------------------------------------------------------
 
 _siglip_model = None
-_NULL_SIGLIP = np.zeros((1, 729, 1152), dtype=np.float16)
+_NULL_SIGLIP = np.zeros((729, 1152), dtype=np.float16)
 
 def _ensure_siglip(model_name: str):
     global _siglip_model
@@ -155,7 +155,7 @@ def _encode_siglip_jpg(jpg_bytes: bytes, model_name: str) -> np.ndarray:
             out = model.encode_image(t, normalize=False)
             # encode_image returns pooled [1, dim]; for patch tokens use visual.forward
             out = model.visual.trunk.forward_features(t)  # [1, 729, 1152]
-        return out.cpu().numpy().astype(np.float16)
+        return out[0].cpu().numpy().astype(np.float16)    # strip batch → (729, 1152)
     else:
         img_np = np.array(img.resize((384, 384), Image.LANCZOS), dtype=np.float32)
         img_np = (img_np / 127.5 - 1.0).transpose(2, 0, 1)[None]
@@ -163,7 +163,7 @@ def _encode_siglip_jpg(jpg_bytes: bytes, model_name: str) -> np.ndarray:
         with torch.no_grad():
             t = torch.from_numpy(img_np)
             out = model(pixel_values=t).last_hidden_state  # [1, 729, 1152]
-        return out.numpy().astype(np.float16)
+        return out[0].numpy().astype(np.float16)           # strip batch → (729, 1152)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +378,10 @@ def main():
         try:
             loss = _eval_loss(adapter, flux, text_np, vae_np, siglip_np)
         except Exception as e:
+            import traceback
             print(f"  Warning: eval failed for {rec_id}: {e}", file=sys.stderr)
+            if done == 0 and skipped < 2:
+                traceback.print_exc(file=sys.stderr)
             skipped += 1
             continue
 
