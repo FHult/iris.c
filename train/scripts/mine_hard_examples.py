@@ -312,7 +312,7 @@ def main():
     adapter = IPAdapterKlein(
         num_blocks=25, hidden_dim=3072,
         num_image_tokens=128, siglip_dim=1152,
-        perceiver_depth=4, perceiver_heads=16,
+        perceiver_heads=16,
     )
     ema_params = load_ema_from_checkpoint(args.checkpoint)
     if ema_params:
