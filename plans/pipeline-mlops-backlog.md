@@ -422,6 +422,26 @@ promote_chunk() {
 
 ---
 
+### SigLIP precompute before mining (operational requirement)
+
+Mining computes per-sample loss rankings. If SigLIP features used during mining differ
+from those used during training (e.g. training used zeros, mining uses live inference),
+the rankings are computed under inconsistent conditions. Hard examples identified may not
+reflect what was actually difficult during training.
+
+**Rule:** The staging pipeline must run SigLIP precompute for a chunk's shards before
+mining that chunk's hard examples. Mining must always be launched with `--siglip-cache`
+pointing to the precomputed cache. If SigLIP was not precomputed for a chunk (e.g. chunk
+2 small run), launch mining with `--null-siglip` to use zero features matching training
+conditions exactly.
+
+**Live inference fallback (when `--siglip-cache` is absent and `--null-siglip` not set):**
+Uses `open_clip` on MPS (fastest available path — already in venv). Falls back to
+`transformers` torch/MPS if open_clip fails. Live inference is for development only;
+do not use in production mining runs.
+
+---
+
 ### LAION/WikiArt re-sampling at promotion (links to MLX-24)
 
 At promotion time for chunk 2+, the orchestrator can optionally inject a fresh sample

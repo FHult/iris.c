@@ -110,46 +110,55 @@ def _load_siglip(rec_id: str, cache_dir: str):
 # ---------------------------------------------------------------------------
 
 _siglip_model = None
+_NULL_SIGLIP = np.zeros((1, 729, 1152), dtype=np.float16)
 
 def _ensure_siglip(model_name: str):
     global _siglip_model
     if _siglip_model is not None:
         return
     print(f"  Loading SigLIP '{model_name}' for on-the-fly encoding...")
+    # Prefer open_clip (already in venv, MPS-accelerated) over transformers fallback.
     try:
-        from mlx_vlm import load as vlm_load
-        model, _ = vlm_load(model_name)
-        model.eval()
-        _siglip_model = ("mlx", model.vision_model if hasattr(model, "vision_model") else model)
+        import open_clip, torch
+        oc_model, _, oc_preprocess = open_clip.create_model_and_transforms(
+            'hf-hub:timm/ViT-SO400M-14-SigLIP-384', device='mps'
+        )
+        oc_model.eval()
+        _siglip_model = ("open_clip", oc_model, oc_preprocess)
         return
     except Exception:
         pass
     try:
         from transformers import AutoModel
         hf = AutoModel.from_pretrained(model_name).vision_model.eval()
-        _siglip_model = ("torch", hf)
+        _siglip_model = ("torch", hf, None)
         return
     except Exception as e:
         raise RuntimeError(f"Cannot load SigLIP '{model_name}': {e}") from e
 
 
 def _encode_siglip_jpg(jpg_bytes: bytes, model_name: str) -> np.ndarray:
-    """Decode JPEG, resize to 384×384, run SigLIP. Returns [1, 729, 1152] float16."""
+    """Decode JPEG, run SigLIP. Returns [1, 729, 1152] float16."""
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
-        img = img.resize((384, 384), Image.LANCZOS)
-        img_np = np.array(img, dtype=np.float32) / 127.5 - 1.0   # [-1, 1]
-        img_np = img_np.transpose(2, 0, 1)[None]                   # [1, 3, 384, 384]
     except Exception:
         return None
 
     _ensure_siglip(model_name)
-    backend, model = _siglip_model
-    if backend == "mlx":
-        out = model(mx.array(img_np, dtype=mx.bfloat16))
-        return np.array(out.astype(mx.float16))          # [1, 729, 1152]
+    backend, model, preprocess = _siglip_model
+
+    if backend == "open_clip":
+        import torch
+        t = preprocess(img).unsqueeze(0).to('mps')
+        with torch.no_grad():
+            out = model.encode_image(t, normalize=False)
+            # encode_image returns pooled [1, dim]; for patch tokens use visual.forward
+            out = model.visual.trunk.forward_features(t)  # [1, 729, 1152]
+        return out.cpu().numpy().astype(np.float16)
     else:
+        img_np = np.array(img.resize((384, 384), Image.LANCZOS), dtype=np.float32)
+        img_np = (img_np / 127.5 - 1.0).transpose(2, 0, 1)[None]
         import torch
         with torch.no_grad():
             t = torch.from_numpy(img_np)
@@ -220,6 +229,10 @@ def main():
     parser.add_argument("--siglip-model",  default="google/siglip-so400m-patch14-384")
     parser.add_argument("--siglip-cache",  default=None,
                         help="Precomputed SigLIP .npz cache dir (optional — fast path)")
+    parser.add_argument("--null-siglip",   action="store_true",
+                        help="Use zero SigLIP features instead of live inference. "
+                             "Use when training was run without SigLIP precompute "
+                             "so loss rankings match training conditions.")
     parser.add_argument("--output",        required=True,
                         help="Output dir for hard example .tar files")
     parser.add_argument("--eval-records",  type=int, default=5000,
@@ -339,11 +352,13 @@ def main():
         vae_np    = _load_vae(rec_id, args.vae_cache)
         siglip_np = None
 
-        if args.siglip_cache:
+        if getattr(args, 'null_siglip', False):
+            siglip_np = _NULL_SIGLIP
+        elif args.siglip_cache:
             siglip_np = _load_siglip(rec_id, args.siglip_cache)
 
         if siglip_np is None:
-            # Need to decode the JPEG and encode with SigLIP
+            # Need to decode the JPEG and encode with SigLIP via open_clip
             try:
                 with tarfile.open(shard_path) as t:
                     members = {m.name: m for m in t.getmembers() if m.isfile()}
