@@ -44,12 +44,17 @@ def jdb_tgz_filename(idx: int) -> str:
     return f"data/train/imgs/{idx:03d}.tgz"
 
 
-def jdb_tgz_ranges(config: dict) -> dict[int, tuple[int, int]]:
-    """Return {chunk: (start_tgz, end_tgz)} from config."""
-    ranges = config.get("jdb", {}).get("tgz_ranges", {
+def jdb_tgz_ranges(config: dict, scale: str = "all-in") -> dict[int, tuple[int, int]]:
+    """Return {chunk: (start_tgz, end_tgz)} for the given scale."""
+    raw = config.get("jdb", {}).get("tgz_ranges", {})
+    # New format: nested by scale
+    if scale in raw:
+        return {int(k): tuple(v) for k, v in raw[scale].items()}
+    # Legacy flat format or all-in fallback
+    fallback = raw if raw and not any(isinstance(v, dict) for v in raw.values()) else {
         1: [0, 49], 2: [50, 99], 3: [100, 149], 4: [150, 201]
-    })
-    return {int(k): tuple(v) for k, v in ranges.items()}
+    }
+    return {int(k): tuple(v) for k, v in fallback.items()}
 
 
 def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:
@@ -73,9 +78,9 @@ def download_jdb_annotation(raw_dir: Path) -> None:
     log_orch(f"Annotation downloaded → {anno_dest}")
 
 
-def run_jdb_download(chunk: int, config: dict) -> None:
+def run_jdb_download(chunk: int, config: dict, scale: str = "all-in") -> None:
     """Download JDB tgzs for the given chunk using producer-consumer pattern."""
-    ranges = jdb_tgz_ranges(config)
+    ranges = jdb_tgz_ranges(config, scale)
     start, end = ranges[chunk]
     tgz_range = range(start, end + 1)
 
@@ -208,6 +213,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="V2 download worker")
     ap.add_argument("--chunk",    type=int, required=True)
     ap.add_argument("--config",   default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
+    ap.add_argument("--scale",    default="all-in",
+                    choices=["small", "medium", "large", "all-in"])
     ap.add_argument("--jdb-only", action="store_true")
     ap.add_argument("--no-jdb",   action="store_true")
     args = ap.parse_args()
@@ -218,10 +225,11 @@ def main() -> None:
         config = {}
 
     chunk = args.chunk
-    log_orch(f"Downloader starting for chunk {chunk}")
+    scale = args.scale
+    log_orch(f"Downloader starting for chunk {chunk} scale={scale}")
 
     if not args.no_jdb:
-        run_jdb_download(chunk, config)
+        run_jdb_download(chunk, config, scale)
 
     if not args.jdb_only:
         run_wikiart_download(chunk, config)

@@ -57,9 +57,9 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
               elapsed_sec=round(elapsed, 1))
 
 
-def run_jdb_download_convert(chunk: int, config: dict) -> None:
+def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") -> None:
     """Producer-consumer: download one tgz, signal consumer, consumer converts and deletes."""
-    ranges = jdb_tgz_ranges(config)
+    ranges = jdb_tgz_ranges(config, scale)
     start, end = ranges[chunk]
     tgz_range = range(start, end + 1)
     total = len(tgz_range)
@@ -73,7 +73,7 @@ def run_jdb_download_convert(chunk: int, config: dict) -> None:
 
     download_jdb_annotation(raw_dir)
 
-    log_orch(f"JDB chunk {chunk}: download+convert {total} tgzs ({start:03d}–{end:03d})")
+    log_orch(f"JDB chunk {chunk} scale={scale}: download+convert {total} tgzs ({start:03d}–{end:03d})")
 
     ready_q: queue.Queue = queue.Queue(maxsize=2)
     error_event = threading.Event()
@@ -173,6 +173,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="V2 combined download+convert worker")
     ap.add_argument("--chunk",    type=int, required=True)
     ap.add_argument("--config",   default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
+    ap.add_argument("--scale",    default="all-in",
+                    choices=["small", "medium", "large", "all-in"])
     ap.add_argument("--jdb-only", action="store_true")
     ap.add_argument("--no-jdb",   action="store_true")
     args = ap.parse_args()
@@ -183,10 +185,11 @@ def main() -> None:
         config = {}
 
     chunk = args.chunk
-    log_orch(f"download_convert starting for chunk {chunk}")
+    scale = args.scale
+    log_orch(f"download_convert starting for chunk {chunk} scale={scale}")
 
     if not args.no_jdb:
-        run_jdb_download_convert(chunk, config)
+        run_jdb_download_convert(chunk, config, scale)
 
     if not args.jdb_only:
         run_wikiart_download(chunk, config)

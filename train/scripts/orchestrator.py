@@ -326,7 +326,7 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: starting download+convert", chunk=chunk)
         log_file = LOG_DIR / f"download_chunk{chunk}.log"
         cmd = self._python_cmd("download_convert.py",
-                               f"--chunk {chunk} --config '{self._config_path()}'")
+                               f"--chunk {chunk} --scale {self.scale} --config '{self._config_path()}'")
         # Marks both download.done AND convert.done on exit 0
         self._launch_prep(f"download+convert chunk {chunk}", cmd, log_file,
                           chunk, "download", also_mark=["convert"])
@@ -563,6 +563,14 @@ class Orchestrator:
     # Source specification for build_shards
     # -----------------------------------------------------------------------
 
+    def _effective_chunk_denom(self) -> int:
+        """Effective denominator for LAION/COYO slice based on scale data_volume fraction."""
+        fractions = self.cfg.get("data_volume", {
+            "small": 0.10, "medium": 0.25, "large": 0.50, "all-in": 1.00,
+        })
+        frac = fractions.get(self.scale, 1.0)
+        return max(self.total_chunks, round(self.total_chunks / frac))
+
     def _build_sources(self, chunk: int) -> str:
         """Space-separated source arguments, with :chunk/total slice for global sources."""
         parts = []
@@ -574,10 +582,11 @@ class Orchestrator:
             parts.append(f"'{wiki_wds}'")
         laion = DATA_ROOT / "raw" / "laion"
         coyo  = DATA_ROOT / "raw" / "coyo"
+        eff_denom = self._effective_chunk_denom()
         if laion.exists() and any(laion.glob("*.tar")):
-            parts.append(f"'{laion}:{chunk}/{self.total_chunks}'")
+            parts.append(f"'{laion}:{chunk}/{eff_denom}'")
         if coyo.exists() and any(coyo.glob("*.tar")):
-            parts.append(f"'{coyo}:{chunk}/{self.total_chunks}'")
+            parts.append(f"'{coyo}:{chunk}/{eff_denom}'")
         return " ".join(parts) if parts else "''"
 
     # -----------------------------------------------------------------------
