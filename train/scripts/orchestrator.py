@@ -270,7 +270,8 @@ class Orchestrator:
             log_orch(f"DRY RUN: would launch {description}")
             return
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}"
+        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+                     f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_PREP_WIN, activated, log_file)
         self._active_prep = {
             "chunk": chunk, "step": step, "log": log_file,
@@ -326,8 +327,10 @@ class Orchestrator:
             return
         log_orch(f"Chunk {chunk}: starting download+convert", chunk=chunk)
         log_file = LOG_DIR / f"download_chunk{chunk}.log"
+        jdb_only = self.cfg.get("download", {}).get("jdb_only", False)
+        extra = " --jdb-only" if jdb_only else ""
         cmd = self._python_cmd("download_convert.py",
-                               f"--chunk {chunk} --scale {self.scale} --config '{self._config_path()}'")
+                               f"--chunk {chunk} --scale {self.scale} --config '{self._config_path()}'{extra}")
         # Marks both download.done AND convert.done on exit 0
         self._launch_prep(f"download+convert chunk {chunk}", cmd, log_file,
                           chunk, "download", also_mark=["convert"])
@@ -478,7 +481,8 @@ class Orchestrator:
         log_file = LOG_DIR / f"train_chunk{chunk}.log"
 
         if not self.dry_run:
-            activated = f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}"
+            activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+                         f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
 

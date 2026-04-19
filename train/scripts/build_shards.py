@@ -456,6 +456,10 @@ def main():
             blocklist = [line.strip() for line in f if line.strip()]
         print(f"  Blocklist: {len(blocklist):,} duplicate IDs to skip")
 
+    if not records:
+        print("  No records found in source directories — nothing to shard.", flush=True)
+        sys.exit(0)
+
     n_shards = math.ceil(len(records) / args.shard_size)
     workers = min(args.workers, n_shards)
     start_idx = args.start_idx

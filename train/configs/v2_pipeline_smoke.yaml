@@ -18,6 +18,9 @@ model:
 
 training_config: train/configs/stage1_512px.yaml
 
+download:
+  jdb_only: true        # skip WikiArt (66 GB) and LAION/COYO checks in smoke
+
 jdb:
   tgz_ranges:
     smoke:

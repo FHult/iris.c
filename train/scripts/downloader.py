@@ -162,6 +162,10 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
         return
 
     log_orch(f"WikiArt chunk {chunk}: downloading from HuggingFace ({WIKIART_REPO})")
+    # Route HuggingFace intermediate cache to the SSD to avoid filling local disk.
+    hf_cache = str(STAGING_DIR / "hf_cache")
+    os.environ.setdefault("HF_DATASETS_CACHE", hf_cache)
+    os.environ.setdefault("HF_HOME", str(STAGING_DIR / "hf_home"))
     try:
         from datasets import load_dataset
         ds = load_dataset(WIKIART_REPO, split="train", streaming=False)
