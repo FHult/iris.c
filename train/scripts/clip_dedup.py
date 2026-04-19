@@ -1,47 +1,23 @@
 """
-train/scripts/clip_dedup.py — CLIP-based deduplication using open_clip + FAISS.
+train/scripts/clip_dedup.py — CLIP embedding + FAISS deduplication.
 
-Removes near-duplicate images (cosine similarity > 0.95) from the training dataset.
-Expected removal: 200–400K from LAION → ~1.6M unique images.
+Three subcommands called sequentially by the orchestrator per chunk:
 
-No clip-retrieval dependency. Uses open_clip (ViT-L-14-quickgelu, MPS on Apple Silicon)
-for embedding and faiss-cpu for index / search.
+  embed       — compute CLIP image embeddings for all shards in --shards,
+                write one {stem}.npz per shard into --embeddings
+  build-index — load .npz files from --embeddings, extend (or create) the
+                cumulative FAISS IndexFlatIP at --index; writes a
+                {index}.ids sidecar (one record ID per line, matching add order)
+  find-dups   — KNN search over the full index, write near-duplicate IDs
+                to --out (the build_shards blocklist); append-safe
 
-Steps (initial, chunk 1):
-  1. Embed LAION images with CLIP ViT-L/14 on MPS (~1.5h on M1 Max for 1.5M images)
-  2. Find near-duplicate pairs with FAISS batched k-NN (threshold=0.95)
-  3. Write duplicate_ids.txt blocklist → used by build_shards.py
-  4. After unified shards are built: build a persistent flat IP index over all shards
+The index is cumulative: each chunk's build-index call extends it so
+cross-chunk near-duplicates are caught when later chunks run find-dups.
 
-Steps (incremental, chunks 2–4):
-  1. Embed new WDS chunk images
-  2. Query against the persistent flat index → mark near-duplicates as blocked
-  3. Append new IDs to blocklist
-  4. Add new embeddings to the persistent index
-
-Usage:
-    source train/.venv/bin/activate
-
-    # ── Chunk 1: LAION intra-dedup ────────────────────────────────────────────
-    python train/scripts/clip_dedup.py all \\
-        --shards     train/data/raw/laion \\
-        --embeddings train/data/embeddings/laion \\
-        --output     train/data/dedup_ids
-
-    # ── Chunk 1: build persistent cross-chunk dedup index ────────────────────
-    python train/scripts/clip_dedup.py build-index \\
-        --shards     train/data/shards \\
-        --embeddings train/data/embeddings/all \\
-        --index      train/data/dedup_ids/dedup_index.faiss
-
-    # ── Chunks 2–4: incremental cross-chunk dedup ─────────────────────────────
-    python train/scripts/clip_dedup.py incremental \\
-        --shards    train/data/raw/journeydb_wds_chunk2 \\
-        --embeddings train/data/embeddings/chunk2 \\
-        --index     train/data/dedup_ids/dedup_index.faiss \\
-        --blocklist train/data/dedup_ids/duplicate_ids.txt
-
-Reference: plans/ip-adapter-training.md §2.3
+Usage (called by orchestrator):
+    clip_dedup.py embed       --shards <dir> --embeddings <dir>
+    clip_dedup.py build-index --embeddings <dir> --index <path.faiss>
+    clip_dedup.py find-dups   --index <path.faiss> --out <blocklist.txt>
 """
 
 import argparse
@@ -50,16 +26,21 @@ import io
 import os
 import sys
 import tarfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-# Must be set before numpy/FAISS import; libomp on Apple Silicon crashes under
-# multi-threaded barrier release (SIGSEGV in __kmp_hyper_barrier_release).
-# KMP_DUPLICATE_LIB_OK suppresses abort when torch and faiss each bring their
-# own libomp copy — safe here since we pin to 1 thread anyway.
+# Must be set before numpy/FAISS import on macOS to prevent libOMP crash.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline_lib import (
+    LOG_DIR, write_heartbeat, log_event, log_orch, now_iso,
+)
 
 try:
     import subprocess as _sp
@@ -68,13 +49,14 @@ try:
 except Exception:
     _PERF_CORES = os.cpu_count() or 4
 
+DUP_THRESHOLD = 0.95
+
 
 # ---------------------------------------------------------------------------
-# Device selection
+# Device + CLIP loading
 # ---------------------------------------------------------------------------
 
 def _clip_device() -> str:
-    """Return 'mps' on Apple Silicon, 'cuda' if available, else 'cpu'."""
     try:
         import torch
         if torch.backends.mps.is_available():
@@ -86,474 +68,371 @@ def _clip_device() -> str:
     return "cpu"
 
 
+_clip_model      = None
+_clip_preprocess = None
+_clip_backend    = None
+
+
+def _load_clip() -> None:
+    global _clip_model, _clip_preprocess, _clip_backend
+    if _clip_model is not None:
+        return
+    device = _clip_device()
+    try:
+        import torch, open_clip
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-L-14-quickgelu", pretrained="openai"
+        )
+        model = model.to(device).half().eval()
+        _clip_model, _clip_preprocess, _clip_backend = model, preprocess, "open_clip"
+        log_orch(f"CLIP: ViT-L-14 via open_clip on {device}")
+        return
+    except ImportError:
+        pass
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        model = model.to(device).eval()
+        proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        _clip_model, _clip_preprocess, _clip_backend = model, proc, "transformers"
+        log_orch(f"CLIP: ViT-B-32 via transformers on {device}")
+        return
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "CLIP requires open_clip or transformers+torch: "
+        "pip install open-clip-torch  OR  pip install transformers torch"
+    )
+
+
+def _embed_batch(images: list) -> np.ndarray:
+    """Embed PIL images; return L2-normalised float32 [N, D]."""
+    import torch
+    device = next(_clip_model.parameters()).device
+    if _clip_backend == "open_clip":
+        batch = torch.stack([_clip_preprocess(img) for img in images]).to(device)
+        with torch.no_grad():
+            feats = _clip_model.encode_image(batch.half()).float()
+    else:
+        inputs = _clip_preprocess(images=images, return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            feats = _clip_model.get_image_features(**inputs).float()
+    arr   = feats.cpu().numpy()
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-8, 1.0, norms)
+    return (arr / norms).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
-# Embedding
+# Shard decoding (parallelised, TurboJPEG when available)
 # ---------------------------------------------------------------------------
 
 def _decode_shard(tar_path: str, preprocess) -> tuple:
     """
-    Open one .tar shard and decode all JPEG images into preprocessed tensors.
-    Runs in a background thread so I/O + CPU decode overlaps with GPU inference.
-    Uses TurboJPEG when available (3-5x faster than PIL for JPEG decode).
-
-    Two-phase design:
-      Phase 1: sequential tar read (tarfile is not thread-safe)
-      Phase 2: parallel decode+preprocess across P-cores via ThreadPoolExecutor
-
-    Returns (keys, tensors) or (None, None) on hard error.
+    Open one WDS .tar shard, decode all images.
+    Returns (ids: list[str], tensors: list[Tensor]) or (None, None) on error.
+    Phase 1 is sequential (tarfile not thread-safe); phase 2 decodes in parallel.
     """
-    from PIL import Image as _PilImage
+    from PIL import Image as _PIL
     try:
-        from turbojpeg import TurboJPEG as _TJ, TJPF_RGB as _TJPF_RGB
+        from turbojpeg import TurboJPEG as _TJ, TJPF_RGB as _RGB
         _tj = _TJ()
-        def _decode_jpeg(data):
-            return _PilImage.fromarray(_tj.decode(data, pixel_format=_TJPF_RGB))
+        def _decode(data): return _PIL.fromarray(_tj.decode(data, pixel_format=_RGB))
     except ImportError:
-        def _decode_jpeg(data):
-            return _PilImage.open(io.BytesIO(data)).convert("RGB")
+        def _decode(data): return _PIL.open(io.BytesIO(data)).convert("RGB")
 
-    # Phase 1: sequential tar read
     raw_items = []
     try:
         with tarfile.open(tar_path) as tf:
-            members = {m.name: m for m in tf.getmembers()}
-            _img_exts = (".jpg", ".jpeg", ".png")
-            stem_to_name: dict = {}
-            for n in members:
-                stem, ext = os.path.splitext(n)
-                if ext.lower() in _img_exts:
-                    stem_to_name.setdefault(stem, n)  # first match wins
-            for key in sorted(stem_to_name.keys()):
-                m = members.get(stem_to_name[key])
-                if m is None:
-                    continue
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                raw_items.append((key, f.read()))
+            members = {m.name: m for m in tf.getmembers() if m.isfile()}
+            keys: dict = {}
+            for name in members:
+                stem, _, ext = name.rpartition(".")
+                if ext.lower() in ("jpg", "jpeg", "png"):
+                    keys.setdefault(stem, name)
+            for stem in sorted(keys):
+                f = tf.extractfile(members[keys[stem]])
+                if f:
+                    raw_items.append((stem, f.read()))
     except Exception as e:
-        print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
+        log_orch(f"embed: skipping {os.path.basename(tar_path)}: {e}", level="warning")
         return None, None
 
     if not raw_items:
         return [], []
 
-    # Phase 2: parallel decode + preprocess across P-cores
-    def _process_one(key_raw):
-        key, raw = key_raw
+    def _proc(item):
+        stem, raw = item
         try:
-            return key, preprocess(_decode_jpeg(raw))
+            return stem, preprocess(_decode(raw))
         except Exception:
             return None, None
 
     n_threads = min(_PERF_CORES, len(raw_items))
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        results = list(pool.map(_process_one, raw_items))
+        results = list(pool.map(_proc, raw_items))
 
-    keys = [k for k, t in results if k is not None]
+    ids     = [k for k, t in results if k is not None]
     tensors = [t for k, t in results if t is not None]
-    return keys, tensors
+    return ids, tensors
 
 
-def run_embed(shards_dir: str, embeddings_dir: str, batch_size: int = 512):
-    """
-    Embed all WebDataset images with CLIP ViT-L/14 using open_clip.
-    Forward pass runs on MPS (Apple Silicon GPU).
-    Uses a background thread to prefetch+decode the next shard while the GPU
-    processes the current one, overlapping CPU decode with GPU inference.
-    Output per shard: img_emb_NNNN.npy (float32 L2-normalised) + metadata_NNNN.parquet.
-    Resume-safe: skips shards whose .npy already exists.
-    """
+# ---------------------------------------------------------------------------
+# embed subcommand
+# ---------------------------------------------------------------------------
+
+def cmd_embed(args) -> int:
     import torch
-    import open_clip
-    import pandas as pd
-    import time as _time
+    shard_dir = Path(args.shards)
+    embed_dir = Path(args.embeddings)
+    embed_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(_clip_device())
-    print(f"Loading CLIP ViT-L/14 on device={device} ...")
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14-quickgelu", pretrained="openai"
-    )
-    model = model.to(device).half().eval()
+    shards = sorted(shard_dir.glob("*.tar"))
+    if not shards:
+        log_orch(f"embed: no .tar files in {shard_dir}")
+        return 0
 
-    os.makedirs(embeddings_dir, exist_ok=True)
-    tar_files = sorted(glob.glob(os.path.join(shards_dir, "*.tar")))
+    _load_clip()
+    batch_size = args.batch_size
 
-    # Pre-scan: accumulate counts for already-embedded shards; build pending list
-    # so rate/ETA are computed only over shards that actually need work.
-    total_embedded = 0
-    pending = []  # (original_shard_idx, tar_path)
-    for shard_idx, tar_path in enumerate(tar_files):
-        out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
-        out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
-        if os.path.exists(out_emb) and os.path.exists(out_meta):
-            total_embedded += np.load(out_emb, mmap_mode="r").shape[0]
-        else:
-            pending.append((shard_idx, tar_path))
+    total = len(shards)
+    done  = 0
+    done_event = threading.Event()
 
-    print(
-        f"Embedding {len(tar_files)} shards from {shards_dir}  "
-        f"({len(pending)} to process, {len(tar_files)-len(pending)} already done) ..."
-    )
+    def _heartbeat():
+        while not done_event.is_set():
+            write_heartbeat("clip_dedup", phase="embed",
+                            done=done, total=total,
+                            pct=round(done / total * 100, 1) if total else 100)
+            time.sleep(30)
 
-    t_start = _time.time()
-    t_last_hb = t_start
-    interval_rates = []
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
 
-    # Two background threads prefetch upcoming shards while the GPU processes the
-    # current one.  A 2-deep queue absorbs I/O variance (e.g. a slow tar read on
-    # one shard won't stall the GPU if the shard after it is already decoded).
-    with ThreadPoolExecutor(max_workers=2) as loader:
-        from collections import deque
-        prefetch_q: deque = deque()
-        # Seed the queue with the first two shards
-        for k in range(min(2, len(pending))):
-            prefetch_q.append(loader.submit(_decode_shard, pending[k][1], preprocess))
+    try:
+        # Prefetch next shard while GPU processes current one
+        pending = [(i, p) for i, p in enumerate(shards)
+                   if not (embed_dir / (p.stem + ".npz")).exists()]
 
-        for batch_idx, (shard_idx, tar_path) in enumerate(pending):
-            out_emb  = os.path.join(embeddings_dir, f"img_emb_{shard_idx:04d}.npy")
-            out_meta = os.path.join(embeddings_dir, f"metadata_{shard_idx:04d}.parquet")
+        log_orch(f"embed: {total} shards total, {len(pending)} to process")
 
-            # Collect the front-of-queue result (already decoded in background)
-            keys, tensors = prefetch_q.popleft().result()
+        with ThreadPoolExecutor(max_workers=2) as loader:
+            from collections import deque
+            q: deque = deque()
+            for k in range(min(2, len(pending))):
+                q.append(loader.submit(_decode_shard, str(pending[k][1]), _clip_preprocess))
 
-            # Enqueue the shard that is 2 positions ahead
-            next_k = batch_idx + 2
-            if next_k < len(pending):
-                prefetch_q.append(loader.submit(_decode_shard, pending[next_k][1], preprocess))
+            for batch_i, (shard_idx, shard_path) in enumerate(pending):
+                out_npz = embed_dir / (shard_path.stem + ".npz")
+                ids, tensors = q.popleft().result()
 
-            if keys is None or not tensors:
-                continue
+                # Enqueue shard 2 ahead
+                nxt = batch_i + 2
+                if nxt < len(pending):
+                    q.append(loader.submit(_decode_shard, str(pending[nxt][1]), _clip_preprocess))
 
-            # GPU inference — runs while the next shard is being decoded above.
-            # fp16 halves memory bandwidth; deferred CPU transfer avoids a GPU
-            # sync after every batch.
-            all_embs_gpu = []
-            with torch.no_grad():
-                for i in range(0, len(tensors), batch_size):
-                    batch = torch.stack(tensors[i:i + batch_size]).to(device, dtype=torch.float16)
-                    embs  = model.encode_image(batch)
-                    embs  = embs / embs.norm(dim=-1, keepdim=True)
-                    all_embs_gpu.append(embs)
-            emb_arr = torch.cat(all_embs_gpu).float().cpu().numpy()
-            np.save(out_emb, emb_arr)
-            pd.DataFrame({"key": keys}).to_parquet(out_meta, index=False)
+                if ids is None or not tensors:
+                    done += 1
+                    continue
 
-            total_embedded += len(keys)
-            if (batch_idx + 1) % 10 == 0 or batch_idx == len(pending) - 1:
-                t_now = _time.time()
-                interval_time = t_now - t_last_hb
-                if interval_time > 0:
-                    interval_rates.append((batch_idx % 10 + 1) / interval_time)
-                avg_rate = sum(interval_rates) / len(interval_rates) if interval_rates else 0
-                eta = (len(pending) - batch_idx - 1) / avg_rate if avg_rate > 0 else 0
-                t_last_hb = t_now
-                print(
-                    f"  [{batch_idx+1}/{len(pending)}] {total_embedded:,} images embedded"
-                    f"  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
-                    flush=True,
-                )
+                device = next(_clip_model.parameters()).device
+                all_embs = []
+                with torch.no_grad():
+                    for i in range(0, len(tensors), batch_size):
+                        b = torch.stack(tensors[i:i + batch_size]).to(device)
+                        if _clip_backend == "open_clip":
+                            e = _clip_model.encode_image(b.half()).float()
+                        else:
+                            e = _clip_model.get_image_features(pixel_values=b).float()
+                        e = e / e.norm(dim=-1, keepdim=True)
+                        all_embs.append(e.cpu().numpy())
 
-    print(f"Done. {total_embedded:,} embeddings in {embeddings_dir}")
+                emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
+                np.savez(out_npz, ids=np.array(ids), embeddings=emb_arr)
+
+                log_event("clip_dedup", "embed_shard",
+                          shard=shard_path.name, n=len(ids))
+                done += 1
+
+    finally:
+        done_event.set()
+
+    write_heartbeat("clip_dedup", phase="embed", done=total, total=total, pct=100)
+    log_orch(f"embed: complete — embeddings in {embed_dir}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# Intra-set deduplication (LAION chunk 1)
+# build-index subcommand
 # ---------------------------------------------------------------------------
 
-def run_dedup(embeddings_dir: str, output_dir: str, threshold: float = 0.95):
-    """
-    Find near-duplicate pairs within the embedded set using batched FAISS k-NN search.
-    Writes duplicate_ids.txt: one blocked ID per line (keep first occurrence, block rest).
-    Works in O(N * k) with IndexFlatIP — exact cosine similarity, no approximation.
-    """
-    import faiss
-    # OpenMP parallelism in FAISS is unstable on Apple Silicon (macOS) — crashes in
-    # __kmp_suspend_initialize_thread with near-null pointer dereference.
-    faiss.omp_set_num_threads(1)
+def cmd_build_index(args) -> int:
+    try:
+        import faiss
+        faiss.omp_set_num_threads(1)
+    except ImportError:
+        raise RuntimeError("build-index requires faiss-cpu: pip install faiss-cpu")
 
-    os.makedirs(output_dir, exist_ok=True)
-    ids, vecs = _load_embeddings_from_dir(embeddings_dir)
-    if len(ids) == 0:
-        print("No embeddings found — nothing to dedup", file=sys.stderr)
-        return
+    embed_dir  = Path(args.embeddings)
+    index_path = Path(args.index)
+    ids_path   = index_path.with_suffix(".ids")
 
-    N, D = vecs.shape
-    print(f"Building FAISS IndexFlatIP for {N:,} vectors (dim={D}) ...")
-    index = faiss.IndexFlatIP(D)
-    index.add(vecs)
+    npz_files = sorted(embed_dir.glob("*.npz"))
+    if not npz_files:
+        log_orch(f"build-index: no .npz files in {embed_dir}")
+        return 0
 
-    print(f"Searching k=2 nearest neighbours (threshold={threshold}) ...")
-    blocked: set[str] = set()
-    BATCH = 4096
-    n_batches = (N + BATCH - 1) // BATCH
-    for b_idx, start in enumerate(range(0, N, BATCH), 1):
-        batch = vecs[start:start + BATCH]
-        scores, idxs = index.search(batch, k=2)
-        for i, (score_row, idx_row) in enumerate(zip(scores, idxs)):
-            global_i = start + i
-            # k=0 is self-match; k=1 is nearest other
-            if len(score_row) > 1 and score_row[1] >= threshold:
-                j = idx_row[1]
-                if j != global_i and j >= 0:
-                    # Block the higher-index duplicate
-                    blocked.add(ids[max(global_i, j)])
-        if b_idx % 50 == 0 or b_idx == n_batches:
-            print(
-                f"  [{min(start + BATCH, N):,}/{N:,}] {len(blocked):,} duplicates found",
-                flush=True,
-            )
-
-    blocklist_path = os.path.join(output_dir, "duplicate_ids.txt")
-    with open(blocklist_path, "w") as f:
-        for rec_id in sorted(blocked):
-            f.write(rec_id + "\n")
-
-    print(f"  {len(blocked):,} duplicate IDs → {blocklist_path}")
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-def _load_embeddings_from_dir(embeddings_dir: str):
-    """
-    Load img_emb_*.npy + metadata_*.parquet pairs.
-    Returns (ids: list[str], vecs: np.ndarray[N, D] float32, L2-normalised).
-    """
-    emb_files = sorted(glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy")))
-    if not emb_files:
-        return [], np.zeros((0, 768), dtype=np.float32)
-
-    all_vecs = []
-    all_ids  = []
-
-    for emb_file in emb_files:
-        idx_str  = emb_file.rsplit("_", 1)[-1].replace(".npy", "")
-        meta_file = os.path.join(embeddings_dir, f"metadata_{idx_str}.parquet")
-
-        vecs = np.load(emb_file).astype(np.float32)
-        all_vecs.append(vecs)
-
-        if os.path.exists(meta_file):
-            import pandas as pd
-            df = pd.read_parquet(meta_file)
-            key_col = next((c for c in ("key", "image_path", "url") if c in df.columns), None)
-            if key_col:
-                all_ids.extend(df[key_col].astype(str).tolist())
-            else:
-                all_ids.extend([f"{idx_str}_{i}" for i in range(len(vecs))])
-        else:
-            all_ids.extend([f"{idx_str}_{i}" for i in range(len(vecs))])
-
-    vecs = np.vstack(all_vecs)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    vecs /= norms
-    return all_ids, vecs
-
-
-def _load_or_create_flat_index(index_path: str, dim: int = 768):
-    """Load existing IndexFlatIP or create an empty one."""
-    import faiss
-    if os.path.exists(index_path):
-        print(f"  Loading dedup index from {index_path} ...", flush=True)
-        index = faiss.read_index(index_path)
-        print(f"  Index contains {index.ntotal:,} vectors", flush=True)
+    # Load existing state — cumulative across chunks
+    if index_path.exists() and ids_path.exists():
+        log_orch(f"build-index: extending existing index ({index_path.name})")
+        index       = faiss.read_index(str(index_path))
+        indexed_ids = set(ids_path.read_text().splitlines())
     else:
-        print(f"  Creating new dedup index (dim={dim})", flush=True)
+        index       = None
+        indexed_ids = set()
+
+    new_vecs: list = []
+    new_ids:  list = []
+    for npz_path in npz_files:
+        data      = np.load(npz_path, allow_pickle=False)
+        file_ids  = data["ids"].tolist()
+        file_embs = data["embeddings"].astype(np.float32)
+        for i, fid in enumerate(file_ids):
+            if fid not in indexed_ids:
+                new_ids.append(fid)
+                new_vecs.append(file_embs[i])
+
+    if not new_ids:
+        log_orch("build-index: all embeddings already indexed")
+        return 0
+
+    vecs = np.stack(new_vecs, axis=0).astype(np.float32)
+    dim  = vecs.shape[1]
+    if index is None:
         index = faiss.IndexFlatIP(dim)
-    return index
 
-
-# ---------------------------------------------------------------------------
-# Cross-chunk dedup helpers
-# ---------------------------------------------------------------------------
-
-def run_build_index(shards_dir: str, embeddings_dir: str, index_path: str,
-                    batch_size: int = 256):
-    """
-    Embed all unified shards with CLIP and build the persistent flat IP index.
-    Resume-safe: skips embedding if .embed_done sentinel exists.
-    """
-    import faiss
-    faiss.omp_set_num_threads(1)
-
-    sentinel = os.path.join(embeddings_dir, ".embed_done")
-    if os.path.exists(sentinel):
-        existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
-        print(f"Embeddings already complete ({len(existing_embs)} files) — skipping CLIP inference")
-    else:
-        # run_embed is resume-safe (skips shards whose .npy already exists),
-        # so do NOT delete partial results here — let it pick up where it left off.
-        print("Embedding unified shards for cross-chunk dedup index...")
-        run_embed(shards_dir, embeddings_dir, batch_size)
-        open(sentinel, "w").close()
-
-    print("Loading embeddings...")
-    ids, vecs = _load_embeddings_from_dir(embeddings_dir)
-    if len(ids) == 0:
-        print("No embeddings found — nothing to index", file=sys.stderr)
-        return
-
-    print(f"  {len(ids):,} embeddings (dim={vecs.shape[1]})")
-    index = faiss.IndexFlatIP(vecs.shape[1])
     index.add(vecs)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(index_path))
 
-    os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
-    tmp_path = index_path + ".tmp"
-    faiss.write_index(index, tmp_path)
-    os.replace(tmp_path, index_path)
-    print(f"  Saved dedup index → {index_path} ({index.ntotal:,} vectors)")
+    with open(ids_path, "a") as f:
+        for fid in new_ids:
+            f.write(fid + "\n")
 
-
-def run_incremental(new_shards: str, embeddings_dir: str, index_path: str,
-                    blocklist_path: str, threshold: float = 0.95,
-                    batch_size: int = 256):
-    """
-    Incremental cross-chunk deduplication:
-      1. Embed new_shards (skip if embeddings already present)
-      2. Query every new embedding against the existing flat index
-      3. Append IDs of near-duplicates to blocklist
-      4. Add all new embeddings to the index
-      5. Save the updated index
-    """
-    import faiss
-    faiss.omp_set_num_threads(1)
-
-    existing_embs = glob.glob(os.path.join(embeddings_dir, "img_emb_*.npy"))
-    if existing_embs:
-        print(f"Embeddings already exist ({len(existing_embs)} files) — skipping CLIP inference")
-    else:
-        print(f"Embedding new shards from {new_shards} ...")
-        run_embed(new_shards, embeddings_dir, batch_size)
-
-    new_ids, new_vecs = _load_embeddings_from_dir(embeddings_dir)
-    if len(new_ids) == 0:
-        print("No embeddings found — nothing to dedup", file=sys.stderr)
-        return
-    print(f"  {len(new_ids):,} new embeddings (dim={new_vecs.shape[1]})", flush=True)
-
-    index = _load_or_create_flat_index(index_path, dim=new_vecs.shape[1])
-
-    duplicate_ids: set[str] = set()
-    if index.ntotal > 0:
-        print(f"  Querying {len(new_ids):,} images against {index.ntotal:,} existing ...",
-              flush=True)
-        BATCH = 4096
-        n_new = len(new_ids)
-        n_batches = (n_new + BATCH - 1) // BATCH
-        for b_idx, start in enumerate(range(0, n_new, BATCH), 1):
-            batch_vecs = new_vecs[start:start + BATCH]
-            scores, _  = index.search(batch_vecs, k=1)
-            for i, score_row in enumerate(scores):
-                if score_row[0] >= threshold:
-                    duplicate_ids.add(new_ids[start + i])
-            if b_idx % 50 == 0 or b_idx == n_batches:
-                print(
-                    f"  [{min(start + BATCH, n_new):,}/{n_new:,}]"
-                    f" {len(duplicate_ids):,} near-duplicates so far",
-                    flush=True,
-                )
-        print(f"  Found {len(duplicate_ids):,} near-duplicates (threshold={threshold})",
-              flush=True)
-    else:
-        print("  Index is empty — all new images treated as unique")
-
-    if duplicate_ids:
-        existing_blocked: set[str] = set()
-        if os.path.exists(blocklist_path):
-            with open(blocklist_path) as f:
-                existing_blocked = {line.strip() for line in f if line.strip()}
-        new_blocked = duplicate_ids - existing_blocked
-        if new_blocked:
-            os.makedirs(os.path.dirname(blocklist_path) or ".", exist_ok=True)
-            with open(blocklist_path, "a") as f:
-                for id_ in sorted(new_blocked):
-                    f.write(id_ + "\n")
-            print(f"  Added {len(new_blocked):,} IDs to blocklist ({blocklist_path})",
-                  flush=True)
-
-    index.add(new_vecs)
-    tmp_path = index_path + ".tmp"
-    faiss.write_index(index, tmp_path)
-    os.replace(tmp_path, index_path)
-    print(f"  Updated dedup index → {index_path} ({index.ntotal:,} total vectors)", flush=True)
+    log_event("clip_dedup", "index_built",
+              added=len(new_ids), total=index.ntotal, dim=dim)
+    log_orch(f"build-index: +{len(new_ids)} vectors; index total={index.ntotal}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# Main
+# find-dups subcommand
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="CLIP-based deduplication (open_clip + FAISS, no clip-retrieval)"
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def cmd_find_dups(args) -> int:
+    try:
+        import faiss
+        faiss.omp_set_num_threads(1)
+    except ImportError:
+        raise RuntimeError("find-dups requires faiss-cpu: pip install faiss-cpu")
 
-    # embed
-    emb = subparsers.add_parser("embed", help="Embed images with CLIP ViT-L/14")
-    emb.add_argument("--shards",      required=True)
-    emb.add_argument("--embeddings",  required=True)
-    emb.add_argument("--batch_size",  type=int, default=256)
+    index_path = Path(args.index)
+    ids_path   = index_path.with_suffix(".ids")
+    out_path   = Path(args.out)
+    threshold  = args.threshold
 
-    # dedup (intra-set, for initial LAION pass)
-    dd = subparsers.add_parser("dedup", help="Find intra-set duplicates from embeddings")
-    dd.add_argument("--embeddings",  required=True)
-    dd.add_argument("--output",      required=True,
-                    help="Directory for duplicate_ids.txt")
-    dd.add_argument("--threshold",   type=float, default=0.95)
+    if not index_path.exists():
+        log_orch(f"find-dups: index not found ({index_path}) — skipping", level="warning")
+        return 0
 
-    # all (embed + intra dedup in one go, for LAION)
-    al = subparsers.add_parser("all", help="Embed + dedup in sequence")
-    al.add_argument("--shards",      required=True)
-    al.add_argument("--embeddings",  required=True)
-    al.add_argument("--output",      required=True)
-    al.add_argument("--batch_size",  type=int, default=256)
-    al.add_argument("--threshold",   type=float, default=0.95)
+    index   = faiss.read_index(str(index_path))
+    all_ids = ids_path.read_text().splitlines()
+    n       = index.ntotal
 
-    # build-index
-    bi = subparsers.add_parser(
-        "build-index",
-        help="Embed unified shards and build persistent flat FAISS index"
-    )
-    bi.add_argument("--shards",      required=True)
-    bi.add_argument("--embeddings",  required=True)
-    bi.add_argument("--index",       required=True)
-    bi.add_argument("--batch_size",  type=int, default=512)
+    if n == 0:
+        log_orch("find-dups: empty index")
+        return 0
 
-    # incremental
-    inc = subparsers.add_parser(
-        "incremental",
-        help="Embed new chunk, find cross-chunk duplicates, update blocklist + index"
-    )
-    inc.add_argument("--shards",      required=True)
-    inc.add_argument("--embeddings",  required=True)
-    inc.add_argument("--index",       required=True)
-    inc.add_argument("--blocklist",   required=True)
-    inc.add_argument("--threshold",   type=float, default=0.95)
-    inc.add_argument("--batch_size",  type=int, default=256)
+    # Reconstruct stored vectors from the flat index
+    d   = index.d
+    xb  = faiss.vector_float_to_array(index.get_xb())
+    all_vecs = np.array(xb, dtype=np.float32).reshape(n, d)
 
-    args = parser.parse_args()
+    log_orch(f"find-dups: {n} vectors, threshold={threshold}")
 
-    if args.command == "embed":
-        run_embed(args.shards, args.embeddings, args.batch_size)
+    existing_dups: set = set()
+    if out_path.exists():
+        existing_dups = set(out_path.read_text().splitlines())
 
-    elif args.command == "dedup":
-        run_dedup(args.embeddings, args.output, args.threshold)
+    k         = min(5, n)
+    new_dups: list = []
+    kept_set: set  = set()
+    batch_size = 4096
 
-    elif args.command == "all":
-        run_embed(args.shards, args.embeddings, args.batch_size)
-        run_dedup(args.embeddings, args.output, args.threshold)
+    for start in range(0, n, batch_size):
+        end   = min(start + batch_size, n)
+        chunk = all_vecs[start:end]
+        D, I  = index.search(chunk, k)
 
-    elif args.command == "build-index":
-        run_build_index(args.shards, args.embeddings, args.index, args.batch_size)
+        for local_i in range(end - start):
+            global_i = start + local_i
+            fid = all_ids[global_i]
+            if fid in existing_dups:
+                continue
+            kept_set.add(global_i)
+            for rank in range(1, k):
+                neighbor = int(I[local_i, rank])
+                if neighbor < 0:
+                    break
+                if float(D[local_i, rank]) >= threshold:
+                    nid = all_ids[neighbor]
+                    if nid not in existing_dups and neighbor not in kept_set:
+                        existing_dups.add(nid)
+                        new_dups.append(nid)
 
-    elif args.command == "incremental":
-        run_incremental(
-            args.shards, args.embeddings, args.index,
-            args.blocklist, args.threshold, args.batch_size,
-        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_dups:
+        with open(out_path, "a") as f:
+            for fid in new_dups:
+                f.write(fid + "\n")
+
+    log_event("clip_dedup", "dups_found",
+              new_dups=len(new_dups), total_dups=len(existing_dups), index_size=n)
+    log_orch(f"find-dups: {len(new_dups)} new, {len(existing_dups)} total in blocklist")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap  = argparse.ArgumentParser(description="CLIP deduplication pipeline (V2)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_emb = sub.add_parser("embed", help="Compute CLIP embeddings per shard")
+    p_emb.add_argument("--shards",     required=True)
+    p_emb.add_argument("--embeddings", required=True)
+    p_emb.add_argument("--batch-size", dest="batch_size", type=int, default=512)
+
+    p_idx = sub.add_parser("build-index", help="Build/extend cumulative FAISS index")
+    p_idx.add_argument("--embeddings", required=True)
+    p_idx.add_argument("--index",      required=True)
+
+    p_dup = sub.add_parser("find-dups", help="Find near-duplicates, write blocklist")
+    p_dup.add_argument("--index",     required=True)
+    p_dup.add_argument("--out",       required=True)
+    p_dup.add_argument("--threshold", type=float, default=DUP_THRESHOLD)
+
+    args = ap.parse_args()
+    handlers = {
+        "embed":       cmd_embed,
+        "build-index": cmd_build_index,
+        "find-dups":   cmd_find_dups,
+    }
+    sys.exit(handlers[args.cmd](args))
 
 
 if __name__ == "__main__":

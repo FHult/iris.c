@@ -33,6 +33,8 @@ import os
 import random
 import sys
 import tarfile
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +42,10 @@ import numpy as np
 # ── Path setup ────────────────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).parent
 _TRAIN_DIR  = _SCRIPT_DIR.parent
+sys.path.insert(0, str(_SCRIPT_DIR))
 sys.path.insert(0, str(_TRAIN_DIR))
+
+from pipeline_lib import write_heartbeat, log_event, log_orch
 
 try:
     import mlx.core as mx
@@ -244,8 +249,19 @@ def main():
     parser.add_argument("--seed",          type=int, default=0)
     args = parser.parse_args()
 
+    # Resolve flux model: accept bare name or full path
+    fm = Path(args.flux_model)
+    if not fm.is_dir():
+        fm = _TRAIN_DIR.parent / args.flux_model
+    if not fm.is_dir():
+        print(f"Error: flux model not found: {args.flux_model}", file=sys.stderr)
+        sys.exit(1)
+    args.flux_model = str(fm)
+
     rng = random.Random(args.seed)
     os.makedirs(args.output, exist_ok=True)
+    log_event("mine_hard_examples", "start", output=args.output,
+              eval_records=args.eval_records, top_k=args.top_k)
 
     # ── Find which record IDs already exist in the output dir ─────────────────
     # Use .existing_ids.txt manifest when present (fast); fall back to tar scan
@@ -346,19 +362,29 @@ def main():
     heap = []   # (-loss, rec_id, shard_path)  — max-heap of top-K
     done = 0
     skipped = 0
+    eval_done_event = threading.Event()
+
+    def _heartbeat_loop():
+        while not eval_done_event.is_set():
+            write_heartbeat("mine_hard_examples",
+                            done=done, total=n_eval,
+                            pct=round(done / n_eval * 100, 1) if n_eval else 100)
+            time.sleep(30)
+
+    hb = threading.Thread(target=_heartbeat_loop, daemon=True)
+    hb.start()
 
     for rec_id, shard_path in sample:
         text_np   = _load_qwen3(rec_id, args.qwen3_cache)
         vae_np    = _load_vae(rec_id, args.vae_cache)
         siglip_np = None
 
-        if getattr(args, 'null_siglip', False):
+        if args.null_siglip:
             siglip_np = _NULL_SIGLIP
         elif args.siglip_cache:
             siglip_np = _load_siglip(rec_id, args.siglip_cache)
 
         if siglip_np is None:
-            # Need to decode the JPEG and encode with SigLIP via open_clip
             try:
                 with tarfile.open(shard_path) as t:
                     members = {m.name: m for m in t.getmembers() if m.isfile()}
@@ -397,8 +423,13 @@ def main():
             print(f"  [{done}/{n_eval}]  skipped={skipped}  "
                   f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
 
+    eval_done_event.set()
+    write_heartbeat("mine_hard_examples", done=done, total=n_eval, pct=100)
+
     print(f"\nEval complete: {done} evaluated, {skipped} skipped, "
           f"{len(heap)} hard examples selected")
+    log_event("mine_hard_examples", "eval_done",
+              evaluated=done, skipped=skipped, hard_count=len(heap))
     if not heap:
         print("No hard examples found — check that precomputed caches are populated.")
         return
@@ -464,6 +495,7 @@ def main():
     print(f"\nDone: {total} hard examples in {args.output}/")
     print(f"  Mix into training with:  hard_example_dir: {args.output}")
     print(f"                           hard_mix_ratio: 0.05")
+    log_event("mine_hard_examples", "done", total=total, output=args.output)
 
     # Update manifest: append new IDs so future resumes skip re-scanning tars.
     new_ids = sorted({rec_id for rec_id, _, _ in records_to_write})
