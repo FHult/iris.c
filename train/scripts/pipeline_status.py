@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR,
+    DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
     STATE_FILE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
     read_state, is_done, has_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
@@ -95,16 +95,36 @@ def _count_precomputed(directory: Path) -> int:
     return sum(1 for f in directory.rglob("*.npz"))
 
 
+def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool) -> str:
+    """Infer the active step within a chunk from sentinel state + window presence."""
+    steps = chunk_status["steps"]
+    state = str(chunk_status["state"])
+    if state in ("DONE", "IDLE", "ERROR"):
+        return ""
+    if train_running and state in ("TRAINING", "MINING", "VALIDATING"):
+        return state.lower()
+    if prep_running:
+        # First step that is not done
+        return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "") or ""
+    return ""
+
+
 def build_status_dict(total_chunks: int = 4) -> dict:
     state = read_state()
     tmux = _tmux_status()
     disk_gb = free_gb()
     shards = _count_shards(SHARDS_DIR)
+    staging_shards = sum(
+        _count_shards(STAGING_DIR / f"chunk{c}" / "shards")
+        for c in range(1, total_chunks + 1)
+    )
     precomp = _count_precomputed(PRECOMP_DIR)
 
     chunks = {}
     for c in range(1, total_chunks + 1):
-        chunks[c] = _chunk_status(c)
+        cs = _chunk_status(c)
+        cs["active_step"] = _active_step_for(cs, tmux["prep"], tmux["train"])
+        chunks[c] = cs
 
     # Find active training chunk and heartbeat
     trainer_hb = {}
@@ -121,6 +141,7 @@ def build_status_dict(total_chunks: int = 4) -> dict:
         "tmux": tmux,
         "disk_free_gb": round(disk_gb, 1),
         "shards_production": shards,
+        "shards_staging": staging_shards,
         "precomputed_records": precomp,
         "chunks": chunks,
         "active_chunk": active_chunk,
@@ -148,17 +169,23 @@ def print_human(status: dict) -> None:
     orch  = "🟢 iris-orch"  if tmux["orch"]  else "⬜ iris-orch"
     print(f"  tmux {sess}  {train}  {prep}  {orch}")
 
-    # Production data
-    print(f"  shards={status['shards_production']}  precomputed={status['precomputed_records']}")
+    # Production + staging data
+    shards = status["shards_production"]
+    staging = status["shards_staging"]
+    precomp = status["precomputed_records"]
+    shard_str = f"shards={shards}" + (f" (+{staging} staging)" if staging else "")
+    print(f"  {shard_str}  precomputed={precomp}")
 
     # Per-chunk status
     print()
     for c, cs in status["chunks"].items():
         state_str = cs["state"].split(".")[-1]  # strip ChunkState. prefix if present
         last = cs["last_done"] or "—"
+        active = cs.get("active_step", "")
         has_err = any(v == "error" for v in cs["steps"].values())
         err_mark = " ⚠️ ERROR" if has_err else ""
-        print(f"  Chunk {c}: {state_str:<16}  last done: {last}{err_mark}")
+        active_mark = f"  → {active}" if active else ""
+        print(f"  Chunk {c}: {state_str:<16}  last done: {last}{active_mark}{err_mark}")
 
     # Trainer heartbeat
     hb = status.get("trainer", {})
@@ -183,10 +210,24 @@ def print_human(status: dict) -> None:
     print(f"{'─'*60}\n")
 
 
+def _auto_chunk_count(default: int = 4) -> int:
+    """Infer total chunks from state file or sentinel dirs (fallback to default)."""
+    state = read_state()
+    if state.get("chunks"):
+        return max(int(k) for k in state["chunks"])
+    # Count sentinel dirs
+    if SENTINEL_DIR.exists():
+        n = sum(1 for d in SENTINEL_DIR.iterdir() if d.name.startswith("chunk"))
+        if n:
+            return n
+    return default
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json",        action="store_true")
-    ap.add_argument("--chunks",      type=int, default=4)
+    ap.add_argument("--chunks",      type=int, default=None,
+                    help="Total chunks (default: auto-detect from state file)")
     ap.add_argument("--watch",       action="store_true", help="Refresh every 30s")
     ap.add_argument("--data-root",   default=None)
     args = ap.parse_args()
@@ -195,8 +236,10 @@ def main() -> None:
         import pipeline_lib
         pipeline_lib.DATA_ROOT = Path(args.data_root)
 
+    total_chunks = args.chunks if args.chunks else _auto_chunk_count()
+
     def once():
-        status = build_status_dict(args.chunks)
+        status = build_status_dict(total_chunks)
         if args.json:
             print(json.dumps(status, indent=2, default=str))
         else:
