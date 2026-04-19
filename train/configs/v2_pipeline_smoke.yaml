@@ -29,6 +29,9 @@ jdb:
 data_volume:
   smoke: 0.005        # 0.5% — LAION/COYO absent in /tmp, downloader warns and skips
 
+precompute:
+  max_shards: 1     # limit to 1 shard (~5000 images) to keep smoke precompute fast
+
 training:
   hard_mix_ratio: 0.05
   siglip: false

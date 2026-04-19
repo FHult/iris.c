@@ -432,6 +432,8 @@ class Orchestrator:
         if not flux_model_path.is_absolute():
             flux_model_path = TRAIN_DIR.parent / flux_model_name
         flux_model_arg = f"--flux-model '{flux_model_path}'" if flux_model_path.exists() else ""
+        max_shards = self.cfg.get("precompute", {}).get("max_shards", None)
+        max_shards_arg = f"--max-shards {max_shards}" if max_shards else ""
         log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
         log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
         cmd = self._python_cmd("precompute_all.py",
@@ -440,6 +442,7 @@ class Orchestrator:
                                f"--vae-output '{vae_out}' "
                                f"--siglip-output '{siglip_out}' "
                                f"{flux_model_arg} "
+                               f"{max_shards_arg} "
                                f"{siglip_flag}")
         self._launch_prep(f"precompute chunk {chunk}", cmd, log_file,
                           chunk, "precompute", token="GPU_TOKEN")
