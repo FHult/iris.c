@@ -357,8 +357,8 @@ def cmd_find_dups(args) -> int:
 
     # Reconstruct stored vectors from the flat index
     d   = index.d
-    xb  = faiss.vector_float_to_array(index.get_xb())
-    all_vecs = np.array(xb, dtype=np.float32).reshape(n, d)
+    all_vecs = np.zeros((n, d), dtype=np.float32)
+    index.reconstruct_n(0, n, all_vecs)
 
     log_orch(f"find-dups: {n} vectors, threshold={threshold}")
 
