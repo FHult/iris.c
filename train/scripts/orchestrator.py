@@ -31,7 +31,8 @@ from pipeline_lib import (
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, DEDUP_DIR, CKPT_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
-    DISK_WARN_GB, DISK_ABORT_GB,
+    DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
+    STATE_FILE,
     read_state, write_state, update_state,
     is_done, mark_done, mark_error, has_error, read_error, clear_error,
     log_event, log_orch,
@@ -534,11 +535,25 @@ class Orchestrator:
                           chunk, "mine", token="GPU_TOKEN")
 
     def _start_validation(self, chunk: int) -> None:
-        if is_done(chunk, "validate"):
+        if is_done(chunk, "validate") or self._prep_busy():
             return
-        # Validation not yet implemented — auto-pass
-        log_orch(f"Chunk {chunk}: validation auto-pass (not yet implemented)", chunk=chunk)
-        mark_done(chunk, "validate")
+        best = CKPT_DIR / "best.safetensors"
+        if not best.exists():
+            log_orch(f"Chunk {chunk}: no checkpoint — skipping validation", chunk=chunk)
+            mark_done(chunk, "validate")
+            return
+        log_orch(f"Chunk {chunk}: starting validation", chunk=chunk)
+        prev_val_arg = ""
+        if chunk > 1:
+            prev_dir = LOG_DIR / f"val_chunk{chunk - 1}"
+            if prev_dir.exists():
+                prev_val_arg = f"--prev-val-dir '{prev_dir}'"
+        log_file = LOG_DIR / f"validate_chunk{chunk}.log"
+        cmd = self._python_cmd("validator.py",
+                               f"--chunk {chunk} --checkpoint '{best}' "
+                               f"--config '{self._config_path()}' {prev_val_arg}")
+        self._launch_prep(f"validate chunk {chunk}", cmd, log_file,
+                          chunk, "validate")
 
     def _handle_error(self, chunk: int) -> None:
         for step in CHUNK_STEPS:
@@ -574,12 +589,14 @@ class Orchestrator:
     def _build_sources(self, chunk: int) -> str:
         """Space-separated source arguments, with :chunk/total slice for global sources."""
         parts = []
-        jdb_wds  = STAGING_DIR / f"chunk{chunk}" / "raw" / "journeydb_wds"
-        wiki_wds = STAGING_DIR / f"chunk{chunk}" / "raw" / "wikiart_wds"
-        if jdb_wds.exists():
-            parts.append(f"'{jdb_wds}'")
-        if wiki_wds.exists():
-            parts.append(f"'{wiki_wds}'")
+        # download_convert outputs extracted JDB images here
+        jdb_dir  = STAGING_DIR / f"chunk{chunk}" / "converted" / "journeydb"
+        # WikiArt is saved as a HuggingFace dataset directory
+        wiki_dir = STAGING_DIR / f"chunk{chunk}" / "raw" / "wikiart"
+        if jdb_dir.exists():
+            parts.append(f"'{jdb_dir}'")
+        if wiki_dir.exists():
+            parts.append(f"'{wiki_dir}'")
         laion = DATA_ROOT / "raw" / "laion"
         coyo  = DATA_ROOT / "raw" / "coyo"
         eff_denom = self._effective_chunk_denom()
@@ -617,7 +634,7 @@ class Orchestrator:
         age = heartbeat_age_secs("trainer", chunk)
 
         # ── Heartbeat staleness → crash detection + restart ──────────────────
-        if age is not None and age > 90:
+        if age is not None and age > HEARTBEAT_STALE_SECS:
             log_orch(f"Chunk {chunk}: trainer heartbeat stale ({age:.0f}s) — restarting",
                      level="error", chunk=chunk)
             dispatch_issue(self._next_issue_id(), "error",

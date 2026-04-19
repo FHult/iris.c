@@ -237,9 +237,9 @@ def main() -> None:
     if verdict == "FAIL":
         mark_error(chunk, "validate")
         dispatch_issue(
-            id=f"val_fail_chunk{chunk}",
-            severity="error",
-            message=f"Chunk {chunk} validation FAILED: {reason}",
+            f"val_fail_chunk{chunk}",
+            "error",
+            f"Chunk {chunk} validation FAILED: {reason}",
             chunk=chunk,
         )
         sys.exit(1)
