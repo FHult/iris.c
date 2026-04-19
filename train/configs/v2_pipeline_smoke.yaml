@@ -13,7 +13,7 @@ scale: smoke
 poll_interval: 10     # fast polling — smoke run is short
 
 model:
-  flux_model: flux-klein-4b
+  flux_model: flux-klein-model
   checkpoint_dir: /tmp/iris_smoke/checkpoints/stage1
 
 training_config: train/configs/stage1_512px.yaml

@@ -427,7 +427,11 @@ class Orchestrator:
         siglip_out = staging / "precomputed" / "siglip"
         training_cfg = self.cfg.get("training", {})
         siglip_flag  = "--siglip" if training_cfg.get("siglip", False) else ""
-        flux_model   = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
+        flux_model_name = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
+        flux_model_path = Path(flux_model_name)
+        if not flux_model_path.is_absolute():
+            flux_model_path = TRAIN_DIR.parent / flux_model_name
+        flux_model_arg = f"--flux-model '{flux_model_path}'" if flux_model_path.exists() else ""
         log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
         log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
         cmd = self._python_cmd("precompute_all.py",
@@ -435,7 +439,7 @@ class Orchestrator:
                                f"--qwen3-output '{qwen3_out}' "
                                f"--vae-output '{vae_out}' "
                                f"--siglip-output '{siglip_out}' "
-                               f"--flux-model {flux_model} "
+                               f"{flux_model_arg} "
                                f"{siglip_flag}")
         self._launch_prep(f"precompute chunk {chunk}", cmd, log_file,
                           chunk, "precompute", token="GPU_TOKEN")
