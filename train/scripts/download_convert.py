@@ -15,6 +15,8 @@ Usage:
 """
 
 import argparse
+import io
+import json
 import queue
 import sys
 import tarfile
@@ -38,23 +40,62 @@ from downloader import (
 # JDB converter
 # ---------------------------------------------------------------------------
 
+def _load_annotation_index(anno_path: Path) -> dict:
+    """Load JDB annotation JSONL.tgz → {stem: caption} mapping."""
+    captions: dict = {}
+    with tarfile.open(anno_path, "r:gz") as atf:
+        for m in atf.getmembers():
+            if not m.name.endswith(".jsonl"):
+                continue
+            with atf.extractfile(m) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        stem = Path(rec["img_path"]).stem
+                        cap = (rec.get("Task2", {}) or {}).get("Caption") or rec.get("prompt", "")
+                        cap = cap.strip()
+                        if cap:
+                            captions[stem] = cap
+                    except Exception:
+                        pass
+            break
+    return captions
+
+
 def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx: int) -> None:
-    """Extract one JDB tgz and write per-image JSON records to out_dir."""
-    import json
-
-    # Load annotations lazily (only on first call — passed per-invocation for simplicity)
-    records_out = out_dir / "records"
-    records_out.mkdir(parents=True, exist_ok=True)
-
+    """Extract one JDB tgz and write a WebDataset tar with jpg+txt pairs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     log_event("download_convert", "convert_start", chunk=chunk, tgz=idx)
 
-    with tarfile.open(tgz_path, "r:gz") as tf:
-        tf.extractall(str(out_dir / "images"))
+    captions = _load_annotation_index(anno_path)
+
+    out_tar = out_dir / f"{idx:03d}.tar"
+    written = 0
+    with tarfile.open(tgz_path, "r:gz") as src, tarfile.open(out_tar, "w") as dst:
+        for member in src.getmembers():
+            if not member.isfile():
+                continue
+            if not member.name.lower().endswith((".jpg", ".jpeg")):
+                continue
+            stem = Path(member.name).stem
+            caption = captions.get(stem)
+            if not caption:
+                continue
+            img_data = src.extractfile(member).read()
+            info_jpg = tarfile.TarInfo(name=f"{stem}.jpg")
+            info_jpg.size = len(img_data)
+            dst.addfile(info_jpg, io.BytesIO(img_data))
+            txt_data = caption.encode()
+            info_txt = tarfile.TarInfo(name=f"{stem}.txt")
+            info_txt.size = len(txt_data)
+            dst.addfile(info_txt, io.BytesIO(txt_data))
+            written += 1
 
     elapsed = time.time() - t0
+    print(f"  JDB tgz {idx:03d}: {written} jpg+txt pairs → {out_tar}", flush=True)
     log_event("download_convert", "convert_done", chunk=chunk, tgz=idx,
-              elapsed_sec=round(elapsed, 1))
+              elapsed_sec=round(elapsed, 1), written=written)
 
 
 def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") -> None:
