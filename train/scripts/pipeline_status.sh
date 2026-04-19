@@ -369,7 +369,7 @@ if not JSON_MODE:
             elif active:
                 icon = "⏳"
             else:
-                icon = "  "   # blank — not done, not running
+                icon = "·"   # pending
 
             if done or active or error:
                 if detail:
