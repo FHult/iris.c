@@ -644,8 +644,8 @@ def main():
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if not shards:
-        print(f"No .tar files in {args.shards}", file=sys.stderr)
-        sys.exit(1)
+        print(f"No .tar files in {args.shards} — nothing to precompute.", flush=True)
+        sys.exit(0)
 
     if args.match_dir is not None:
         # Select only shards that have at least one record in the reference dir.

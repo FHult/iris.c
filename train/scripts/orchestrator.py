@@ -310,7 +310,7 @@ class Orchestrator:
             ChunkState.CLIP_EMBED:  self._start_clip_embed,
             ChunkState.CLIP_INDEX:  self._start_clip_index,
             ChunkState.CLIP_DUPS:   self._start_clip_dups,
-            ChunkState.PRECOMPUTING:self._noop,  # wait for prep window
+            ChunkState.PRECOMPUTING:self._start_precompute,
             ChunkState.READY:       self._check_ready,
             ChunkState.TRAINING:    self._check_training,
             ChunkState.MINING:      self._start_mining,
@@ -415,6 +415,31 @@ class Orchestrator:
                                f"find-dups --index '{index}' --out '{dups}'")
         self._launch_prep(f"clip_dups chunk {chunk}", cmd, log_file,
                           chunk, "clip_dups")
+
+    def _start_precompute(self, chunk: int) -> None:
+        if is_done(chunk, "precompute") or self._prep_busy():
+            return
+        if not self.res.request("GPU_TOKEN", f"precompute chunk {chunk}"):
+            return
+        staging    = STAGING_DIR / f"chunk{chunk}"
+        shard_dir  = staging / "shards"
+        qwen3_out  = staging / "precomputed" / "qwen3"
+        vae_out    = staging / "precomputed" / "vae"
+        siglip_out = staging / "precomputed" / "siglip"
+        training_cfg = self.cfg.get("training", {})
+        siglip_flag  = "--siglip" if training_cfg.get("siglip", False) else ""
+        flux_model   = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
+        log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
+        log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
+        cmd = self._python_cmd("precompute_all.py",
+                               f"--shards '{shard_dir}' "
+                               f"--qwen3-output '{qwen3_out}' "
+                               f"--vae-output '{vae_out}' "
+                               f"--siglip-output '{siglip_out}' "
+                               f"--flux-model {flux_model} "
+                               f"{siglip_flag}")
+        self._launch_prep(f"precompute chunk {chunk}", cmd, log_file,
+                          chunk, "precompute", token="GPU_TOKEN")
 
     def _check_ready(self, chunk: int) -> None:
         """Promote staging to production, then start training."""
