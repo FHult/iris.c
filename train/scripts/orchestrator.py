@@ -158,6 +158,9 @@ class Orchestrator:
         self._loss_high_since: dict[int, Optional[int]] = {}  # chunk → first anomaly step
         self._grad_spike_polls: dict[int, int] = {}           # chunk → consecutive high-grad polls
 
+        # Cache of last-written state per chunk — avoid redundant file writes
+        self._last_written_state: dict[int, str] = {}
+
     # -----------------------------------------------------------------------
     # Main loop
     # -----------------------------------------------------------------------
@@ -247,9 +250,7 @@ class Orchestrator:
             # Free staging raw data to reclaim disk space
             self._delete_staging_raw(chunk)
         if step in ("train", "mine"):
-            update_state(**{"chunks": {str(chunk): {"state": ChunkState.MINING
-                                                     if step == "train" else ChunkState.VALIDATING,
-                                                     "completed_at": now_iso()}}})
+            update_state(**{"chunks": {str(chunk): {"completed_at": now_iso()}}})
 
     def _delete_staging_raw(self, chunk: int) -> None:
         """Delete staging raw data once shards are built (V2 Section 6 lifecycle)."""
@@ -289,6 +290,12 @@ class Orchestrator:
 
     def _advance_chunk(self, chunk: int) -> None:
         state = derive_chunk_state(chunk)
+
+        # Sync sentinel-derived state into pipeline_state.json (authoritative source is
+        # the sentinel files; state file is a convenience mirror for tooling).
+        if self._last_written_state.get(chunk) != state:
+            update_state(**{"chunks": {str(chunk): {"state": state}}})
+            self._last_written_state[chunk] = state
 
         # Chunk N+1 doesn't start until chunk N is at least BUILDING
         if chunk > 1 and derive_chunk_state(chunk - 1) == ChunkState.IDLE:
