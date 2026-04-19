@@ -214,7 +214,7 @@ def main() -> None:
     ap.add_argument("--chunk",    type=int, required=True)
     ap.add_argument("--config",   default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
     ap.add_argument("--scale",    default="all-in",
-                    choices=["small", "medium", "large", "all-in"])
+                    choices=["smoke", "small", "medium", "large", "all-in"])
     ap.add_argument("--jdb-only", action="store_true")
     ap.add_argument("--no-jdb",   action="store_true")
     args = ap.parse_args()
