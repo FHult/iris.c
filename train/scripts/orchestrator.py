@@ -312,7 +312,6 @@ class Orchestrator:
             ChunkState.CLIP_DUPS:   self._start_clip_dups,
             ChunkState.PRECOMPUTING:self._start_precompute,
             ChunkState.READY:       self._check_ready,
-            ChunkState.TRAINING:    self._check_training,
             ChunkState.MINING:      self._start_mining,
             ChunkState.VALIDATING:  self._start_validation,
             ChunkState.DONE:        self._noop,
@@ -474,8 +473,27 @@ class Orchestrator:
                 f.rename(dst / f.name)
 
     def _start_training(self, chunk: int) -> None:
+        log_file = LOG_DIR / f"train_chunk{chunk}.log"
+
         if tmux_window_exists(TMUX_TRAIN_WIN):
-            return
+            return  # still running
+
+        # Window is gone — if a previous attempt left a log, check outcome.
+        if log_file.exists():
+            code = last_exit_code(log_file)
+            if code == 0:
+                log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
+                mark_done(chunk, "train")
+                self.res.release("GPU_TOKEN")
+                return
+            if code is not None:
+                msg = f"Training exited {code}; see {log_file}"
+                log_orch(f"Chunk {chunk}: training FAILED — {msg}", level="error", chunk=chunk)
+                mark_error(chunk, "train", msg)
+                self.res.release("GPU_TOKEN")
+                notify("iris pipeline ERROR", f"Training chunk {chunk} failed")
+                return
+
         if not self.res.request("GPU_TOKEN", f"train chunk {chunk}"):
             return
 
@@ -496,21 +514,17 @@ class Orchestrator:
         if chunk > 1:
             hard_chunk = HARD_EX_DIR / f"chunk{chunk-1}"
             if hard_chunk.exists() and any(hard_chunk.glob("*.tar")):
-                ratio = training_cfg.get("hard_mix_ratio", 0.05)
-                hard_arg = f"--hard-example-dir '{hard_chunk}' --hard-mix-ratio {ratio}"
+                hard_arg = f"--hard-examples '{hard_chunk}'"
 
         config_file = self.cfg.get("training_config",
                                    str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         cmd = (
             f"caffeinate -i python -u '{TRAIN_DIR}/train_ip_adapter.py' "
             f"--config '{config_file}' "
-            f"--steps {steps} --lr {lr} "
-            f"--shard-dir '{SHARDS_DIR}' "
-            f"--precomputed-dir '{PRECOMP_DIR}' "
-            f"--checkpoint-dir '{CKPT_DIR}' "
+            f"--max-steps {steps} --lr {lr} "
+            f"--data-root '{DATA_ROOT}' "
             f"{resume_arg} {hard_arg}"
         )
-        log_file = LOG_DIR / f"train_chunk{chunk}.log"
 
         if not self.dry_run:
             activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
@@ -522,21 +536,6 @@ class Orchestrator:
             "state": "TRAINING", "started_at": now_iso(),
             "steps": steps, "lr": lr,
         }}})
-
-    def _check_training(self, chunk: int) -> None:
-        if tmux_window_exists(TMUX_TRAIN_WIN):
-            return  # still running
-        self.res.release("GPU_TOKEN")
-        log_file = LOG_DIR / f"train_chunk{chunk}.log"
-        code = last_exit_code(log_file)
-        if code == 0:
-            log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
-            mark_done(chunk, "train")
-        else:
-            msg = f"Training exited {code}; see {log_file}"
-            log_orch(f"Chunk {chunk}: training FAILED — {msg}", level="error", chunk=chunk)
-            mark_error(chunk, "train", msg)
-            notify("iris pipeline ERROR", f"Training chunk {chunk} failed")
 
     def _start_mining(self, chunk: int) -> None:
         if is_done(chunk, "mine") or self._prep_busy():
