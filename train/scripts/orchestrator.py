@@ -463,10 +463,14 @@ class Orchestrator:
         precomp_src = staging / "precomputed"
 
         SHARDS_DIR.mkdir(parents=True, exist_ok=True)
+        # Build staging_stem → production_stem mapping so precomputed files
+        # can be renamed to match the new shard names.
+        stem_map: dict = {}
         count = 0
         for tar in sorted(shard_src.glob("*.tar")):
-            dest = SHARDS_DIR / f"chunk{chunk}_{count:04d}.tar"
-            tar.rename(dest)
+            prod_name = f"chunk{chunk}_{count:04d}.tar"
+            stem_map[tar.stem] = f"chunk{chunk}_{count:04d}"
+            tar.rename(SHARDS_DIR / prod_name)
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
 
@@ -477,7 +481,12 @@ class Orchestrator:
             dst = PRECOMP_DIR / subdir
             dst.mkdir(parents=True, exist_ok=True)
             for f in src.iterdir():
-                f.rename(dst / f.name)
+                # Rename: "000000_0012.npz" → "chunk1_0000_0012.npz"
+                parts = f.name.split("_", 1)
+                old_stem = parts[0]
+                new_stem = stem_map.get(old_stem, old_stem)
+                new_name = f"{new_stem}_{parts[1]}" if len(parts) == 2 else f"{new_stem}.npz"
+                f.rename(dst / new_name)
 
     def _start_training(self, chunk: int) -> None:
         log_file = LOG_DIR / f"train_chunk{chunk}.log"
