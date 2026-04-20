@@ -65,6 +65,12 @@ class ChunkState(str):
     ERROR        = "ERROR"
 
 
+# Shard ID space reserved per chunk.  Chunk N owns [N-1)*_SHARD_BLOCK, N*_SHARD_BLOCK).
+# Ceiling: 200000 shards × 5000 images = 1B images per chunk.
+# 4 chunks × 200000 = 800000 < 999999 (6-digit shard format limit).
+# _promote_chunk enforces this with a hard error if staging overflows.
+_SHARD_BLOCK = 200_000
+
 CHUNK_STEPS = [
     "download",
     "convert",
@@ -356,12 +362,12 @@ class Orchestrator:
             blocklist_arg = f"--blocklist '{blocklist}'"
         log_file = LOG_DIR / f"build_chunk{chunk}.log"
         # Reserve a non-overlapping shard ID space per chunk so that internal
-        # record IDs (embedded in shard member names, e.g. "250000_0003") are
+        # record IDs (embedded in shard member names, e.g. "200000_0003") are
         # globally unique across all chunks.  This prevents precomputed .npz
         # files from colliding when chunks are promoted to the shared production
-        # precomputed/ directory.  250000 shards × 5000 images = 1.25B images
-        # per chunk — well above realistic production volumes.
-        start_idx = (chunk - 1) * 250000
+        # precomputed/ directory.  200000 shards × 5000 images = 1B images per
+        # chunk.  _promote_chunk enforces this ceiling with a hard error.
+        start_idx = (chunk - 1) * _SHARD_BLOCK
         cmd = self._python_cmd("build_shards.py",
                                f"--sources {sources} --output '{out}' "
                                f"--start-idx {start_idx} "
@@ -472,12 +478,33 @@ class Orchestrator:
         shard_src   = staging / "shards"
         precomp_src = staging / "precomputed"
 
+        # Canary: verify no shard index overflows this chunk's reserved ID space.
+        ceiling = chunk * _SHARD_BLOCK
+        overflow = []
+        for tar in shard_src.glob("*.tar"):
+            try:
+                idx = int(tar.stem)
+            except ValueError:
+                continue
+            if idx >= ceiling:
+                overflow.append(tar.name)
+        if overflow:
+            msg = (
+                f"Chunk {chunk}: SHARD ID OVERFLOW — {len(overflow)} shard(s) exceed "
+                f"reserved ceiling {ceiling - 1} (block size {_SHARD_BLOCK}). "
+                f"First offenders: {sorted(overflow)[:5]}. "
+                f"Increase _SHARD_BLOCK or reduce data volume per chunk."
+            )
+            log_orch(msg, chunk=chunk)
+            mark_error(chunk, "promoted", msg)
+            return
+
         SHARDS_DIR.mkdir(parents=True, exist_ok=True)
         count = 0
         for tar in sorted(shard_src.glob("*.tar")):
             # Keep the original staging filename (e.g. "000000.tar" for chunk 1,
-            # "250000.tar" for chunk 2).  This preserves the match between shard
-            # member names like "250000_0003" and precomputed file "250000_0003.npz".
+            # "200000.tar" for chunk 2).  This preserves the match between shard
+            # member names like "200000_0003" and precomputed file "200000_0003.npz".
             tar.rename(SHARDS_DIR / tar.name)
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
