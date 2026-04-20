@@ -355,8 +355,16 @@ class Orchestrator:
         if blocklist.exists():
             blocklist_arg = f"--blocklist '{blocklist}'"
         log_file = LOG_DIR / f"build_chunk{chunk}.log"
+        # Reserve a non-overlapping shard ID space per chunk so that internal
+        # record IDs (embedded in shard member names, e.g. "250000_0003") are
+        # globally unique across all chunks.  This prevents precomputed .npz
+        # files from colliding when chunks are promoted to the shared production
+        # precomputed/ directory.  250000 shards × 5000 images = 1.25B images
+        # per chunk — well above realistic production volumes.
+        start_idx = (chunk - 1) * 250000
         cmd = self._python_cmd("build_shards.py",
                                f"--sources {sources} --output '{out}' "
+                               f"--start-idx {start_idx} "
                                f"--workers 1 {blocklist_arg}")
         self._launch_prep(f"build chunk {chunk}", cmd, log_file,
                           chunk, "build_shards", token="DISK_WRITE_HIGH")
@@ -467,7 +475,10 @@ class Orchestrator:
         SHARDS_DIR.mkdir(parents=True, exist_ok=True)
         count = 0
         for tar in sorted(shard_src.glob("*.tar")):
-            tar.rename(SHARDS_DIR / f"chunk{chunk}_{count:04d}.tar")
+            # Keep the original staging filename (e.g. "000000.tar" for chunk 1,
+            # "250000.tar" for chunk 2).  This preserves the match between shard
+            # member names like "250000_0003" and precomputed file "250000_0003.npz".
+            tar.rename(SHARDS_DIR / tar.name)
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
         mark_done(chunk, "promoted")

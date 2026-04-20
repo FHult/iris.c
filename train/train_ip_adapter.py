@@ -440,13 +440,9 @@ def train(config: dict) -> None:
     vae_dir   = dcfg.get("vae_cache_dir")
     if qwen3_dir and vae_dir:
         def _internal_prefix(tar_path):
-            # Precomputed files use the staging shard ID as prefix (e.g. "000042").
-            # Production shards are renamed to "chunk{N}_{idx:04d}.tar" during promotion,
-            # so we derive the internal prefix from the 4-digit suffix.
-            import re as _re
-            stem = os.path.splitext(os.path.basename(tar_path))[0]
-            m = _re.match(r"^chunk\d+_(\d+)$", stem)
-            return f"{int(m.group(1)):06d}" if m else stem
+            # Production shards keep their staging filename (e.g. "000000.tar" for
+            # chunk 1, "250000.tar" for chunk 2) so the stem IS the internal prefix.
+            return os.path.splitext(os.path.basename(tar_path))[0]
 
         def _has_cache(tar_path):
             pfx = _internal_prefix(tar_path)
@@ -468,7 +464,7 @@ def train(config: dict) -> None:
     siglip_dir = dcfg.get("siglip_cache_dir")
     if siglip_dir and os.path.isdir(siglip_dir):
         _siglip_npz = glob.glob(os.path.join(siglip_dir, "*.npz"))
-        # Precomputed files are keyed by internal prefix (staging shard ID, e.g. "000042").
+        # Precomputed files are keyed by shard stem (e.g. "000000" for chunk 1, "250000" for chunk 2).
         _covered = {os.path.basename(f).split("_")[0] for f in _siglip_npz}
         _shard_prefixes = {_internal_prefix(p) for p in shard_paths}
         _missing = _shard_prefixes - _covered
