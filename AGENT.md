@@ -392,3 +392,7 @@ Manual Z-Image sanity:
 - `train/DISPATCH.md` — pipeline operational reference; read this before any pipeline work
 - `plans/pipeline-v2-architecture.md` — V2 pipeline architecture (active design, supersedes all V1 plan docs)
 - `plans/pipeline-mlops-backlog.md` — backlog with V2 dispositions and implementation phases
+
+## Pipeline Script Layout
+- `train/scripts/` — V2 active scripts (orchestrator, pipeline_lib, pipeline_status, pipeline_ctl, and all step scripts)
+- `train/scripts/v1/` — V1 shell/python scripts, archived. Do not use for pipeline operations.

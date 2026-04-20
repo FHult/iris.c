@@ -291,7 +291,7 @@ def tmux_new_window(window_name: str, cmd: str, log_file: Path,
     import subprocess
     full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
     subprocess.run([
-        "tmux", "new-window", "-t", session, "-n", window_name,
+        "tmux", "new-window", "-t", f"{session}:", "-n", window_name,
         "bash", "-c", full_cmd
     ], check=True)
 
