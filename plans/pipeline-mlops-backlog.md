@@ -29,6 +29,7 @@ See `plans/pipeline-v2-architecture.md` for the design that governs open items.
 | MLX-24 | LAION/WikiArt resampling | 🗑 RETIRED — equal chunking in V2 solves root cause |
 | MLX-25 | Staging architecture | ➡ ABSORBED — V2 Section 9 (directory + promotion logic) |
 | MLX-26 | A/B weight comparison | ✳ INCLUDE — Phase 3 (deferred until after pipeline test run) |
+| MLX-27 | pipeline_status.py intelligence uplift | ✳ INCLUDE — Phase 3 |
 
 ---
 
@@ -357,6 +358,33 @@ python train/scripts/ab_compare.py --baseline best \
 |------|---------|
 | `train/scripts/ab_compare.py` | Core: inference × 2, CLIP scoring, JSON output |
 | `train/scripts/render_ab_grid.py` | Visual grid with per-pair winner labels |
+
+---
+
+### ✳ MLX-27 — pipeline_status.py intelligence uplift (Phase 3)
+
+**Problem:** The status script is too simplistic — it shows step names and sentinel flags but not what's actually happening. Claude can diagnose more from log files, heartbeats, and sentinel bodies than the script surfaces to the operator.
+
+**Goal:** Status output should tell the operator everything they need without having to grep logs manually.
+
+**Required improvements:**
+
+- **Error text from sentinels** — Read `.error` sentinel file body and print the message inline (not just a flag)
+- **Per-worker heartbeats** — Show heartbeat age and staleness for all workers (clip_dedup, precompute), not just trainer
+- **Active step log tail** — For the running step, show last 5 lines of its log file; helps spot Python tracebacks, hung processes, etc.
+- **clip_embed progress** — clip_dedup.py already writes a heartbeat with `done/total/pct`; surface it
+- **precompute progress** — If precompute_all.py writes a heartbeat, surface `done/total/pct`
+- **ETA estimates** — Where progress % and elapsed time are known, compute and show ETA
+- **Download/convert progress** — Count `.converted` sentinels vs total expected tgzs for the chunk
+- **Per-chunk staging detail** — Shard count and precomputed file count per staging chunk dir, not just aggregate
+- **Error recovery hint** — When in ERROR state, print the sentinel path the operator must delete to retry
+- **`--verbose` mode** — Longer log tail (20 lines), full heartbeat JSON dump, all sentinel ages
+
+**Implementation notes:**
+- `pipeline_lib.py` already has `read_heartbeat()` — extend to all worker names
+- Error sentinel body is written by `mark_error(chunk, step, msg)` in `pipeline_lib.py` — read it back
+- Log tail: use `pathlib.Path.read_text().splitlines()[-N:]` — no subprocess needed
+- Keep default output concise; gate verbosity behind `--verbose`
 
 ---
 

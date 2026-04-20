@@ -74,6 +74,7 @@ CHUNK_STEPS = [
     "clip_index",
     "clip_dups",
     "precompute",
+    "promoted",
     "train",
     "mine",
     "validate",
@@ -453,7 +454,8 @@ class Orchestrator:
             return  # wait for previous chunk's training
         if not gpu_is_free():
             return
-        self._promote_chunk(chunk)
+        if not is_done(chunk, "promoted"):
+            self._promote_chunk(chunk)
         self._start_training(chunk)
 
     def _promote_chunk(self, chunk: int) -> None:
@@ -473,6 +475,7 @@ class Orchestrator:
             tar.rename(SHARDS_DIR / prod_name)
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
+        mark_done(chunk, "promoted")
 
         for subdir in ["qwen3", "vae", "siglip"]:
             src = precomp_src / subdir

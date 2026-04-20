@@ -1629,6 +1629,7 @@ def main():
             ("data", "siglip_cache_dir"),
             ("data", "anchor_shard_dir"),
             ("data", "hard_example_dir"),
+            ("output", "checkpoint_dir"),
         ]
         _strip_prefix = "train/data/"
         for section, key in _data_path_keys:

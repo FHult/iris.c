@@ -45,7 +45,7 @@ training:
   text_dropout_prob: 0.10                  # 10%: use empty text prompt
 
 output:
-  checkpoint_dir: "/Volumes/2TBSSD/checkpoints/stage1"
+  checkpoint_dir: "train/data/checkpoints/stage1"
   checkpoint_every: 200                    # steps between checkpoints (~17min at 0.19 steps/s)
   keep_last_n: 5
   log_every: 100
