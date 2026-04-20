@@ -211,7 +211,7 @@ def main() -> None:
         print("mflux not installed — pip install mflux", file=sys.stderr)
         sys.exit(1)
 
-    flux = Flux2Klein(model_path=cfg["model"]["flux_model_dir"], quantize=None)
+    flux = Flux2Klein(model_path=cfg["model"].get("flux_model_dir") or cfg["model"]["flux_model"], quantize=None)
     flux.freeze()
     mx.eval(flux.transformer.parameters())
 
