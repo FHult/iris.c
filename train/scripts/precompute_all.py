@@ -180,6 +180,14 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
     global _W
     import mlx.core as mx  # noqa: F401 (ensures Metal context is initialised)
 
+    # Cap MLX GPU memory to 20 GB.  Qwen3-4B (~8 GB) + VAE (~0.5 GB) + SigLIP (~1.7 GB)
+    # fit comfortably.  Without a limit the Metal allocator can grow unboundedly and
+    # trigger jetsam on a 32 GB system under memory pressure from other processes.
+    try:
+        mx.metal.set_memory_limit(20 * 1024 ** 3)
+    except AttributeError:
+        pass  # MLX version does not expose set_memory_limit; safe to ignore
+
     from mlx_lm import load as mlx_lm_load
     model, tokenizer = mlx_lm_load(qwen3_model_path)
     model.eval()

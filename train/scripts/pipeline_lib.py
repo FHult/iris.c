@@ -42,7 +42,9 @@ TMUX_PREP_WIN  = "iris-prep"
 TMUX_ORCH_WIN  = "iris-orch"
 TMUX_WATCH_WIN = "iris-watchdog"
 
-HEARTBEAT_STALE_SECS = 120
+# Trainer heartbeat is written every log_every steps (~100 steps at ~0.19 steps/s ≈ 526s).
+# The threshold must exceed that interval with a safety margin.  900s = ~1.7× the interval.
+HEARTBEAT_STALE_SECS = 900
 DISK_WARN_GB  = 80
 DISK_ABORT_GB = 40
 
@@ -209,10 +211,17 @@ def heartbeat_age_secs(process: str, chunk: Optional[int] = None) -> Optional[fl
     hb = read_heartbeat(process, chunk)
     if hb is None:
         return None
+    # Accept both "ts" (UTC ISO, written by write_heartbeat) and "timestamp"
+    # (legacy local-time string written by older trainer versions).
+    raw = hb.get("ts") or hb.get("timestamp")
+    if not raw:
+        return None
     try:
-        ts = datetime.fromisoformat(hb["ts"])
+        ts = datetime.fromisoformat(raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - ts).total_seconds()
-    except (KeyError, ValueError):
+    except ValueError:
         return None
 
 

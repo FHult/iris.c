@@ -143,6 +143,34 @@ class ResourceManager:
 
 
 # ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+_REQUIRED_CONFIG_KEYS = [
+    ("recipe",),
+    ("chunks",),
+    ("training_config",),
+    ("training", "steps"),
+    ("training", "lr"),
+]
+
+
+def _validate_config(cfg: dict) -> None:
+    """Abort early if the pipeline config is missing required keys."""
+    missing = []
+    for path in _REQUIRED_CONFIG_KEYS:
+        node = cfg
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                missing.append(".".join(str(k) for k in path))
+                break
+            node = node[key]
+    if missing:
+        print(f"ERROR: pipeline config missing required keys: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -165,8 +193,13 @@ class Orchestrator:
         self._loss_high_since: dict[int, Optional[int]] = {}  # chunk → first anomaly step
         self._grad_spike_polls: dict[int, int] = {}           # chunk → consecutive high-grad polls
 
+        # Dispatch cooldown: {issue_key: last_dispatch_epoch_secs}
+        self._dispatch_last: dict[str, float] = {}
+
         # Cache of last-written state per chunk — avoid redundant file writes
         self._last_written_state: dict[int, str] = {}
+
+        _validate_config(config)
 
     # -----------------------------------------------------------------------
     # Main loop
@@ -249,6 +282,8 @@ class Orchestrator:
             msg = f"Exit code {code if code is not None else 'unknown'}; see {log}"
             log_orch(f"Chunk {chunk}: {step} FAILED — {msg}", level="error", chunk=chunk)
             mark_error(chunk, step, msg)
+            write_heartbeat(f"prep_{step}", chunk, status="failed", exit_code=code,
+                            step=step, log=str(log))
             notify("iris pipeline ERROR", f"{step} chunk {chunk} failed")
 
     def _post_step(self, chunk: int, step: str) -> None:
@@ -499,6 +534,32 @@ class Orchestrator:
             mark_error(chunk, "promoted", msg)
             return
 
+        # Coverage check: precomputed dirs must have >= 90% of expected records.
+        # This catches a partial precompute run that exited early, preventing the
+        # trainer from skipping most batches in that shard due to missing .npz files.
+        n_shards = sum(1 for _ in shard_src.glob("*.tar"))
+        if n_shards > 0:
+            shard_size = self.cfg.get("data", {}).get("shard_size", 5000)
+            expected = n_shards * shard_size
+            min_records = int(expected * 0.90)
+            for subdir in ("qwen3", "vae"):
+                src = precomp_src / subdir
+                if not src.exists():
+                    msg = (f"Chunk {chunk}: precomputed/{subdir} missing — "
+                           f"run precompute_all.py before promotion.")
+                    log_orch(msg, chunk=chunk, level="error")
+                    mark_error(chunk, "promoted", msg)
+                    return
+                actual = sum(1 for f in src.iterdir() if f.suffix == ".npz")
+                if actual < min_records:
+                    msg = (f"Chunk {chunk}: precomputed/{subdir} coverage too low — "
+                           f"{actual:,} records vs {min_records:,} required "
+                           f"(90% of {expected:,} expected). "
+                           f"Re-run precompute_all.py to complete the cache.")
+                    log_orch(msg, chunk=chunk, level="error")
+                    mark_error(chunk, "promoted", msg)
+                    return
+
         SHARDS_DIR.mkdir(parents=True, exist_ok=True)
         count = 0
         for tar in sorted(shard_src.glob("*.tar")):
@@ -572,6 +633,7 @@ class Orchestrator:
             f"--config '{config_file}' "
             f"--max-steps {steps} --lr {lr} "
             f"--data-root '{DATA_ROOT}' "
+            f"--chunk {chunk} "
             f"{resume_arg} {hard_arg}"
         )
 
@@ -710,6 +772,15 @@ class Orchestrator:
             if derive_chunk_state(chunk) == ChunkState.TRAINING:
                 self._check_training_anomalies(chunk)
 
+    def _dispatch_once(self, key: str, issue_id: str, severity: str, message: str,
+                       cooldown_secs: float = 3600.0, **kwargs) -> None:
+        """dispatch_issue with per-key cooldown to prevent alert floods."""
+        now = time.time()
+        if now - self._dispatch_last.get(key, 0.0) < cooldown_secs:
+            return
+        self._dispatch_last[key] = now
+        dispatch_issue(issue_id, severity, message, **kwargs)
+
     def _check_training_anomalies(self, chunk: int) -> None:
         """Section 5.1 anomaly detection rules for a training chunk."""
         import math
@@ -721,10 +792,10 @@ class Orchestrator:
         if age is not None and age > HEARTBEAT_STALE_SECS:
             log_orch(f"Chunk {chunk}: trainer heartbeat stale ({age:.0f}s) — restarting",
                      level="error", chunk=chunk)
-            dispatch_issue(self._next_issue_id(), "error",
-                           f"Trainer heartbeat stale ({age:.0f}s) — restarting process",
-                           chunk=chunk, process="trainer",
-                           suggested_action="check_training_log")
+            self._dispatch_once(f"stale_{chunk}", self._next_issue_id(), "error",
+                                f"Trainer heartbeat stale ({age:.0f}s) — restarting process",
+                                chunk=chunk, process="trainer",
+                                suggested_action="check_training_log")
             self._restart_trainer(chunk)
             return
 
@@ -738,9 +809,9 @@ class Orchestrator:
         if loss is not None and (math.isnan(loss) or math.isinf(loss)):
             log_orch(f"Chunk {chunk}: loss NaN/Inf at step {step} — pausing",
                      level="error", chunk=chunk)
-            dispatch_issue(self._next_issue_id(), "critical",
-                           f"Training loss NaN/Inf at step {step}",
-                           chunk=chunk, suggested_action="investigate_training")
+            self._dispatch_once(f"nan_{chunk}", self._next_issue_id(), "critical",
+                                f"Training loss NaN/Inf at step {step}",
+                                chunk=chunk, suggested_action="investigate_training")
             self._write_pause()
             return
 
@@ -753,9 +824,9 @@ class Orchestrator:
                 elif step - first >= 100:
                     log_orch(f"Chunk {chunk}: loss {loss:.3f} > 2.0 for {step-first} steps — pausing",
                              level="error", chunk=chunk)
-                    dispatch_issue(self._next_issue_id(), "error",
-                                   f"Training loss {loss:.3f} persistently > 2.0 (since step {first})",
-                                   chunk=chunk, suggested_action="investigate_training")
+                    self._dispatch_once(f"loss_high_{chunk}", self._next_issue_id(), "error",
+                                        f"Training loss {loss:.3f} persistently > 2.0 (since step {first})",
+                                        chunk=chunk, suggested_action="investigate_training")
                     self._write_pause()
                     self._loss_high_since[chunk] = None
             else:
@@ -770,9 +841,9 @@ class Orchestrator:
                 if n_spikes >= 10:
                     log_orch(f"Chunk {chunk}: grad_norm {grad_norm:.1f} > 50 for {n_spikes} polls — pausing",
                              level="error", chunk=chunk)
-                    dispatch_issue(self._next_issue_id(), "error",
-                                   f"Grad norm {grad_norm:.1f} sustained > 50 ({n_spikes} polls)",
-                                   chunk=chunk, suggested_action="investigate_training")
+                    self._dispatch_once(f"grad_{chunk}", self._next_issue_id(), "error",
+                                        f"Grad norm {grad_norm:.1f} sustained > 50 ({n_spikes} polls)",
+                                        chunk=chunk, suggested_action="investigate_training")
                     self._write_pause()
                     self._grad_spike_polls[chunk] = 0
                 elif grad_norm > 10.0:
@@ -806,6 +877,11 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: killing iris-train window (restart #{count})", chunk=chunk)
         subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"],
                        capture_output=True)
+        # Delete the stale heartbeat so the next poll doesn't immediately re-trigger
+        # another staleness alarm before the relaunched trainer has a chance to write one.
+        from pipeline_lib import heartbeat_path as _hb_path
+        _hbf = _hb_path("trainer", chunk)
+        _hbf.unlink(missing_ok=True)
         # Let orchestrator's normal _check_training path relaunch on next poll
         # by clearing the train.done sentinel (training was not complete)
         clear_error(chunk, "train")

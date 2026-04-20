@@ -446,8 +446,14 @@ def train(config: dict) -> None:
 
         def _has_cache(tar_path):
             pfx = _internal_prefix(tar_path)
-            return (os.path.exists(os.path.join(qwen3_dir, f"{pfx}_0000.npz")) and
-                    os.path.exists(os.path.join(vae_dir,   f"{pfx}_0000.npz")))
+            # Check first and 50th record: if both exist, the shard is substantially
+            # precomputed.  Checking only _0000 passes even if precompute crashed after
+            # the first write, causing 99%+ of that shard's batches to be skipped silently.
+            return all(
+                os.path.exists(os.path.join(d, f"{pfx}_{i:04d}.npz"))
+                for d in (qwen3_dir, vae_dir)
+                for i in (0, 49)
+            )
 
         all_shards = shard_paths
         shard_paths = [p for p in all_shards if _has_cache(p)]
@@ -722,7 +728,7 @@ def train(config: dict) -> None:
     log_interval = ocfg["log_every"]
     loss_history: list[float] = []  # rolling window for smoothed loss
     loss_smooth = 0.0
-    heartbeat_path = os.path.join(ocfg["checkpoint_dir"], "heartbeat.json")
+    _pipeline_chunk = config.get("_chunk")  # set by --chunk arg; None when run standalone
 
     # Per-phase timing accumulators (TP-005). Printed at each log interval.
     # fwd = Flux forward + mx.eval(flux_state) (no grad, the heavy part)
@@ -767,6 +773,10 @@ def train(config: dict) -> None:
 
     # T-10: SigLIP coverage per batch window
     _siglip_miss_steps = 0
+    _siglip_first_miss_logged = False
+
+    # T-11: gradient clipping events per log window
+    _grad_clip_steps = 0
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
@@ -824,6 +834,11 @@ def train(config: dict) -> None:
         else:
             # Cache miss — use zero features (neutral image conditioning).
             # Happens when siglip precompute is partial; treated as null-image dropout.
+            if not _siglip_first_miss_logged:
+                print(f"  WARNING: SigLIP cache miss at step {step} — "
+                      f"falling back to zero features. Check siglip precompute coverage.",
+                      flush=True)
+                _siglip_first_miss_logged = True
             B = images.shape[0]
             siglip_feats = mx.zeros((B, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
             _siglip_miss_steps += 1  # T-10
@@ -876,6 +891,9 @@ def train(config: dict) -> None:
         if grad_norm_smooth > 0 and _gn > 10 * grad_norm_smooth:
             print(f"  WARNING: grad norm spike step {step}: "
                   f"{_gn:.3f} vs smooth {grad_norm_smooth:.3f}", flush=True)
+        # T-11: count steps where clipping actually fired
+        if _gn > tcfg["grad_clip"]:
+            _grad_clip_steps += 1
 
         # T-02: per-bucket throughput
         _bk = f"{bH}x{bW}"
@@ -1025,6 +1043,13 @@ def train(config: dict) -> None:
                     print(f"  WARNING: SigLIP coverage below 90%", flush=True)
             _siglip_miss_steps = 0
 
+            # T-11: gradient clipping report
+            if _grad_clip_steps > 0:
+                _clip_pct = round(100 * _grad_clip_steps / log_interval, 1)
+                print(f"  grad_clipped={_clip_pct:.0f}% ({_grad_clip_steps}/{log_interval} steps "
+                      f"had norm > {tcfg['grad_clip']})", flush=True)
+            _grad_clip_steps = 0
+
             if wandb_run:
                 wandb_run.log(
                     {"loss": loss_scalar, "loss_smooth": loss_smooth,
@@ -1034,36 +1059,35 @@ def train(config: dict) -> None:
                      "loader_wait_pct": _loader_pct},
                     step=step,
                 )
-            # Write machine-readable heartbeat for status scripts
+            # Write machine-readable heartbeat to the pipeline location so the
+            # orchestrator and pipeline_status.py can monitor liveness and anomalies.
             total_elapsed = time.time() - t_start
-            _hb = {
-                "step": step,
-                "total_steps": tcfg["num_steps"],
-                "loss": round(loss_scalar, 6),
-                "loss_smooth": round(loss_smooth, 6),
-                "lr": lr_now,
-                "steps_per_sec": round(steps_per_sec, 4),
-                "eta_seconds": int(eta_s),
-                "elapsed_seconds": int(total_elapsed),
-                "grad_norm": round(_gn, 4),
-                "grad_norm_smooth": round(grad_norm_smooth, 4),
-                "ema_drift": round(ema_drift, 5),
-                "val_loss": round(val_loss_last, 6) if val_loss_last is not None else None,
-                "siglip_coverage_pct": _siglip_cov,
-                "loader_wait_ms_avg": _loader_wait_ms,
-                "compute_ms_avg": _compute_ms,
-                "source_loss": _src_summary,
-                "buckets": _bkt_summary,
-                "mem_used_gb": mem_used_gb,
-                "mem_available_gb": mem_available_gb,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
             try:
-                os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
-                with open(heartbeat_path + ".tmp", "w") as _f:
-                    json.dump(_hb, _f)
-                os.replace(heartbeat_path + ".tmp", heartbeat_path)
-            except OSError:
+                from pipeline_lib import write_heartbeat as _write_hb
+                _write_hb(
+                    "trainer", _pipeline_chunk,
+                    step=step,
+                    total_steps=tcfg["num_steps"],
+                    loss=round(loss_scalar, 6),
+                    loss_smooth=round(loss_smooth, 6),
+                    lr=lr_now,
+                    steps_per_sec=round(steps_per_sec, 4),
+                    eta_sec=int(eta_s),
+                    elapsed_seconds=int(total_elapsed),
+                    grad_norm=round(_gn, 4),
+                    grad_norm_smooth=round(grad_norm_smooth, 4),
+                    grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
+                    ema_drift=round(ema_drift, 5),
+                    val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
+                    siglip_coverage_pct=_siglip_cov,
+                    loader_wait_ms_avg=_loader_wait_ms,
+                    compute_ms_avg=_compute_ms,
+                    source_loss=_src_summary,
+                    buckets=_bkt_summary,
+                    mem_used_gb=mem_used_gb,
+                    mem_available_gb=mem_available_gb,
+                )
+            except Exception:
                 pass
             t0 = time.time()
 
@@ -1084,7 +1108,17 @@ def train(config: dict) -> None:
 
     # Save best EMA as final export
     mx.eval(ema_params)
-    save_ema(ema_params, os.path.join(ocfg["checkpoint_dir"], "best.safetensors"))
+    _best_path = os.path.join(ocfg["checkpoint_dir"], "best.safetensors")
+    save_ema(ema_params, _best_path)
+
+    # Write lineage sidecar so best.safetensors is self-documenting.
+    _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
+                  "chunk": _pipeline_chunk}
+    try:
+        with open(_best_path.replace(".safetensors", ".json"), "w") as _f:
+            json.dump(_best_meta, _f, indent=2)
+    except OSError:
+        pass
     print(f"\nTraining complete. EMA weights: {ocfg['checkpoint_dir']}/best.safetensors")
 
 
@@ -1608,6 +1642,10 @@ def main():
     parser.add_argument("--hard-examples", default=None,
                         help="Path to hard example shard directory (from mine_hard_examples.py); "
                              "mixed at hard_mix_ratio (default 5%%)")
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="Pipeline chunk number (1-4). Used to write the trainer "
+                             "heartbeat to the correct pipeline location so the orchestrator "
+                             "can monitor liveness and anomalies.")
     parser.add_argument("--data-root", default=None,
                         help="Root directory for shards and precomputed caches. "
                              "Relative paths in the config YAML are prefixed with this value. "
@@ -1655,6 +1693,9 @@ def main():
         config["data"]["anchor_shard_dir"] = args.anchor_shards
     if args.hard_examples is not None:
         config["data"]["hard_example_dir"] = args.hard_examples
+
+    if args.chunk is not None:
+        config["_chunk"] = args.chunk
 
     if args.dry_run:
         print("Config OK:")
