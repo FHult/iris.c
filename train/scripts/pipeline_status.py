@@ -167,6 +167,8 @@ def _active_heartbeat_for(step: str, chunk: int) -> dict:
         return _worker_heartbeat("clip_dedup", chunk)
     if step in ("train", "training"):
         return _trainer_heartbeat(chunk)
+    if step == "mine":
+        return _worker_heartbeat("mine_hard_examples", chunk)
     return {}
 
 
@@ -301,7 +303,7 @@ def print_human(status: dict, verbose: bool = False) -> None:
             print(f"      to retry: rm {sentinel}")
 
         # Active step progress from heartbeat
-        if active and active not in ("training", "mining", "validating"):
+        if active and active not in ("training", "validating"):
             hb = _active_heartbeat_for(active, c)
             if hb:
                 done = hb.get("done", 0)

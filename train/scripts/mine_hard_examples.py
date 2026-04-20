@@ -240,6 +240,8 @@ def main():
                              "so loss rankings match training conditions.")
     parser.add_argument("--output",        required=True,
                         help="Output dir for hard example .tar files")
+    parser.add_argument("--chunk",          type=int, default=None,
+                        help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--eval-records",  type=int, default=5000,
                         help="Max records to evaluate for loss (default 5000)")
     parser.add_argument("--top-k",         type=int, default=2000,
@@ -366,7 +368,7 @@ def main():
 
     def _heartbeat_loop():
         while not eval_done_event.is_set():
-            write_heartbeat("mine_hard_examples",
+            write_heartbeat("mine_hard_examples", args.chunk,
                             done=done, total=n_eval,
                             pct=round(done / n_eval * 100, 1) if n_eval else 100)
             time.sleep(30)
@@ -418,13 +420,13 @@ def main():
             heapq.heapreplace(heap, entry)
 
         done += 1
-        if done % 500 == 0 or done == n_eval:
+        if done % 100 == 0 or done == n_eval:
             threshold = -heap[0][0] if heap else 0.0
             print(f"  [{done}/{n_eval}]  skipped={skipped}  "
                   f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
 
     eval_done_event.set()
-    write_heartbeat("mine_hard_examples", done=done, total=n_eval, pct=100)
+    write_heartbeat("mine_hard_examples", args.chunk, done=done, total=n_eval, pct=100)
 
     print(f"\nEval complete: {done} evaluated, {skipped} skipped, "
           f"{len(heap)} hard examples selected")

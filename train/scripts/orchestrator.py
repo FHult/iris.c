@@ -683,6 +683,7 @@ class Orchestrator:
                                f"--qwen3-cache '{qwen3_cache}' "
                                f"--vae-cache '{vae_cache}' "
                                f"--flux-model {flux_model} --null-siglip "
+                               f"--chunk {chunk} "
                                f"--output '{out}'")
         self._launch_prep(f"mine chunk {chunk}", cmd, log_file,
                           chunk, "mine", token="GPU_TOKEN")
