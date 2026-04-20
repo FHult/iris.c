@@ -1,11 +1,11 @@
 # V2 pipeline smoke-test configuration
 # Exercises the full orchestrator state machine with minimal data and compute.
-# Run with: PIPELINE_DATA_ROOT=/tmp/iris_smoke python train/scripts/orchestrator.py \
+# Run with: PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke python train/scripts/orchestrator.py \
 #               --config train/configs/v2_pipeline_smoke.yaml
 #
-# Isolation: PIPELINE_DATA_ROOT=/tmp/iris_smoke keeps all output away from
-# the production /Volumes/2TBSSD tree. LAION/COYO will be absent and skipped
-# gracefully. JDB tgz 000 (~2-3 GB) is the only network download required.
+# Isolation: PIPELINE_DATA_ROOT keeps all output isolated from the production tree.
+# LAION/COYO will be absent and skipped gracefully.
+# JDB tgz 000 (~2-3 GB) is the only network download required.
 
 recipe: ip_adapter_flux4b
 chunks: 1
@@ -14,7 +14,6 @@ poll_interval: 10     # fast polling — smoke run is short
 
 model:
   flux_model: flux-klein-model
-  checkpoint_dir: /tmp/iris_smoke/checkpoints/stage1
 
 training_config: train/configs/stage1_512px.yaml
 

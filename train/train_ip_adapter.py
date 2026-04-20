@@ -439,10 +439,20 @@ def train(config: dict) -> None:
     qwen3_dir = dcfg.get("qwen3_cache_dir")
     vae_dir   = dcfg.get("vae_cache_dir")
     if qwen3_dir and vae_dir:
+        def _internal_prefix(tar_path):
+            # Precomputed files use the staging shard ID as prefix (e.g. "000042").
+            # Production shards are renamed to "chunk{N}_{idx:04d}.tar" during promotion,
+            # so we derive the internal prefix from the 4-digit suffix.
+            import re as _re
+            stem = os.path.splitext(os.path.basename(tar_path))[0]
+            m = _re.match(r"^chunk\d+_(\d+)$", stem)
+            return f"{int(m.group(1)):06d}" if m else stem
+
         def _has_cache(tar_path):
-            stem = os.path.splitext(os.path.basename(tar_path))[0]  # e.g. "000042"
-            return (os.path.exists(os.path.join(qwen3_dir, f"{stem}_0000.npz")) and
-                    os.path.exists(os.path.join(vae_dir,   f"{stem}_0000.npz")))
+            pfx = _internal_prefix(tar_path)
+            return (os.path.exists(os.path.join(qwen3_dir, f"{pfx}_0000.npz")) and
+                    os.path.exists(os.path.join(vae_dir,   f"{pfx}_0000.npz")))
+
         all_shards = shard_paths
         shard_paths = [p for p in all_shards if _has_cache(p)]
         print(f"Shard cache filter: {len(shard_paths)}/{len(all_shards)} shards "
@@ -458,21 +468,20 @@ def train(config: dict) -> None:
     siglip_dir = dcfg.get("siglip_cache_dir")
     if siglip_dir and os.path.isdir(siglip_dir):
         _siglip_npz = glob.glob(os.path.join(siglip_dir, "*.npz"))
-        # Each shard produces multiple .npz files; presence of at least one per
-        # shard stem is sufficient. Count covered shard stems.
+        # Precomputed files are keyed by internal prefix (staging shard ID, e.g. "000042").
         _covered = {os.path.basename(f).split("_")[0] for f in _siglip_npz}
-        _shard_stems = {os.path.splitext(os.path.basename(p))[0] for p in shard_paths}
-        _missing = _shard_stems - _covered
-        _coverage = len(_covered & _shard_stems) / len(_shard_stems) if _shard_stems else 1.0
+        _shard_prefixes = {_internal_prefix(p) for p in shard_paths}
+        _missing = _shard_prefixes - _covered
+        _coverage = len(_covered & _shard_prefixes) / len(_shard_prefixes) if _shard_prefixes else 1.0
         if _missing:
             print(
                 f"WARNING: SigLIP cache coverage {_coverage*100:.0f}% "
-                f"({len(_covered & _shard_stems)}/{len(_shard_stems)} shards). "
+                f"({len(_covered & _shard_prefixes)}/{len(_shard_prefixes)} shards). "
                 f"Missing: {sorted(_missing)[:5]}{'...' if len(_missing) > 5 else ''}. "
                 f"Batches from uncovered shards will train with zero image features."
             )
         else:
-            print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_stems)} shards). OK.")
+            print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_prefixes)} shards). OK.")
 
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
