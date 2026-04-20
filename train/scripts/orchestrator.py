@@ -36,7 +36,7 @@ from pipeline_lib import (
     read_state, write_state, update_state,
     is_done, mark_done, mark_error, has_error, read_error, clear_error,
     log_event, log_orch,
-    write_heartbeat, heartbeat_age_secs,
+    write_heartbeat, read_heartbeat, heartbeat_age_secs,
     dispatch_issue, gpu_is_free,
     tmux_session_exists, tmux_window_exists, tmux_new_window,
     last_exit_code, free_gb, notify, now_iso, load_config,
