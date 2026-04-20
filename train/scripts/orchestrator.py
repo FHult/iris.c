@@ -95,6 +95,7 @@ _STEP_TO_STATE = {
     "clip_index":   ChunkState.CLIP_DUPS,
     "clip_dups":    ChunkState.PRECOMPUTING,
     "precompute":   ChunkState.READY,
+    "promoted":     ChunkState.TRAINING,
     "train":        ChunkState.MINING,
     "mine":         ChunkState.VALIDATING,
     "validate":     ChunkState.DONE,
@@ -354,6 +355,7 @@ class Orchestrator:
             ChunkState.CLIP_DUPS:   self._start_clip_dups,
             ChunkState.PRECOMPUTING:self._start_precompute,
             ChunkState.READY:       self._check_ready,
+            ChunkState.TRAINING:    self._start_training,
             ChunkState.MINING:      self._start_mining,
             ChunkState.VALIDATING:  self._start_validation,
             ChunkState.DONE:        self._noop,
@@ -505,6 +507,8 @@ class Orchestrator:
             return
         if not is_done(chunk, "promoted"):
             self._promote_chunk(chunk)
+        if not is_done(chunk, "promoted"):
+            return  # promotion failed or incomplete; wait for next poll
         self._start_training(chunk)
 
     def _promote_chunk(self, chunk: int) -> None:
@@ -534,13 +538,16 @@ class Orchestrator:
             mark_error(chunk, "promoted", msg)
             return
 
-        # Coverage check: precomputed dirs must have >= 90% of expected records.
-        # This catches a partial precompute run that exited early, preventing the
-        # trainer from skipping most batches in that shard due to missing .npz files.
+        # Coverage check: precomputed dirs must have >= 90% of the records the
+        # trainer will actually see.  When precompute.max_shards is configured,
+        # only that many shards are precomputed intentionally; use that as the
+        # expected count so smoke/limited runs don't trip this check.
         n_shards = sum(1 for _ in shard_src.glob("*.tar"))
-        if n_shards > 0:
+        max_shards_cfg = self.cfg.get("precompute", {}).get("max_shards")
+        n_expected_shards = min(n_shards, max_shards_cfg) if max_shards_cfg else n_shards
+        if n_expected_shards > 0:
             shard_size = self.cfg.get("data", {}).get("shard_size", 5000)
-            expected = n_shards * shard_size
+            expected = n_expected_shards * shard_size
             min_records = int(expected * 0.90)
             for subdir in ("qwen3", "vae"):
                 src = precomp_src / subdir
@@ -711,6 +718,11 @@ class Orchestrator:
                     log_orch(f"Chunk {chunk}: auto-retrying {step}", chunk=chunk)
                     self._restart_counts[key] = restarts + 1
                     clear_error(chunk, step)
+                    # Delete the old step log so _start_training (and similar
+                    # detection loops) don't re-read a stale EXIT_CODE on next poll.
+                    old_log = LOG_DIR / f"{step}_chunk{chunk}.log"
+                    if old_log.exists():
+                        old_log.unlink()
                 else:
                     issue_id = self._next_issue_id()
                     log_orch(f"Chunk {chunk}: {step} failed twice — escalating", level="error")
