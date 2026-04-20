@@ -163,8 +163,14 @@ def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool
 def _active_heartbeat_for(step: str, chunk: int) -> dict:
     if step in ("download", "convert"):
         return _worker_heartbeat("download_convert", chunk)
+    if step == "build_shards":
+        return _worker_heartbeat("build_shards", chunk)
+    if step == "filter_shards":
+        return _worker_heartbeat("filter_shards", chunk)
     if step == "clip_embed":
         return _worker_heartbeat("clip_dedup", chunk)
+    if step == "precompute":
+        return _worker_heartbeat("precompute", chunk)
     if step in ("train", "training"):
         return _trainer_heartbeat(chunk)
     if step == "mine":

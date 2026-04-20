@@ -408,6 +408,7 @@ class Orchestrator:
         cmd = self._python_cmd("build_shards.py",
                                f"--sources {sources} --output '{out}' "
                                f"--start-idx {start_idx} "
+                               f"--chunk {chunk} "
                                f"--workers 1 {blocklist_arg}")
         self._launch_prep(f"build chunk {chunk}", cmd, log_file,
                           chunk, "build_shards", token="DISK_WRITE_HIGH")
@@ -419,7 +420,7 @@ class Orchestrator:
         shard_dir = STAGING_DIR / f"chunk{chunk}" / "shards"
         log_file  = LOG_DIR / f"filter_chunk{chunk}.log"
         cmd = self._python_cmd("filter_shards.py",
-                               f"--shards '{shard_dir}' --workers 1")
+                               f"--shards '{shard_dir}' --chunk {chunk} --workers 1")
         self._launch_prep(f"filter chunk {chunk}", cmd, log_file,
                           chunk, "filter_shards")
 
@@ -493,6 +494,7 @@ class Orchestrator:
                                f"--qwen3-output '{qwen3_out}' "
                                f"--vae-output '{vae_out}' "
                                f"--siglip-output '{siglip_out}' "
+                               f"--chunk {chunk} "
                                f"{flux_model_arg} "
                                f"{max_shards_arg} "
                                f"{siglip_flag}")

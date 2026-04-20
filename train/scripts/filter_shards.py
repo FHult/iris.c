@@ -28,6 +28,10 @@ import os
 import sys
 import tarfile
 import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline_lib import write_heartbeat
 
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
@@ -259,6 +263,8 @@ def main():
         help="Drop captions with fewer than this many words (default 5). "
              "Changing this value invalidates existing per-shard sentinels."
     )
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="Pipeline chunk number (for heartbeat naming)")
     args = parser.parse_args()
 
     # Clean up orphaned .tmp files left by a previously interrupted run.
@@ -338,12 +344,16 @@ def main():
                 t_last_hb = t_now
                 last_done = done
                 err_str = f"  errors={errs_so_far}" if errs_so_far else ""
+                pct = round(100 * done / len(shards))
                 print(
                     f"  [{done}/{len(shards)}] kept={kept_so_far:,}"
                     f"  dropped={dropped_so_far:,}{err_str}"
                     f"  {1/avg_rate:.1f} s/shard  ETA {eta/60:.0f}m",
                     flush=True,
                 )
+                write_heartbeat("filter_shards", args.chunk,
+                                done=done, total=len(shards), pct=pct,
+                                eta_sec=round(eta))
 
     total_kept = sum(r["kept"] for r in results)
     errors = sum(1 for r in results if r["error"])

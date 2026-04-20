@@ -45,6 +45,11 @@ import os
 import random
 import sys
 import tarfile
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline_lib import write_heartbeat
 
 try:
     from turbojpeg import TurboJPEG
@@ -423,6 +428,8 @@ def main():
         "--start-idx", type=int, default=0,
         help="Starting shard index (use to append to an existing output dir)"
     )
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="Pipeline chunk number (for heartbeat naming)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -492,8 +499,25 @@ def main():
     ]
 
     print(f"\nStarting {workers} parallel workers...")
+
+    # Heartbeat thread: counts completed .tar files in output dir as a progress
+    # proxy (pool.map blocks until all workers finish, so we can't get incremental
+    # results from the pool itself).
+    _hb_stop = threading.Event()
+    def _hb_loop():
+        while not _hb_stop.is_set():
+            done_tars = sum(1 for f in os.scandir(args.output)
+                            if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
+            write_heartbeat("build_shards", args.chunk,
+                            done=done_tars, total=n_shards, pct=round(100 * done_tars / max(n_shards, 1)))
+            _hb_stop.wait(30)
+    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    _hb_thread.start()
+
     with multiprocessing.Pool(processes=workers) as pool:
         results = pool.map(_write_shard_range, work_items)
+
+    _hb_stop.set()
 
     total_written = sum(r["written"] for r in results)
     total_skipped = sum(r["skipped"] for r in results)

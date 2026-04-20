@@ -30,6 +30,10 @@ import sys
 import tarfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline_lib import write_heartbeat
 
 import numpy as np
 
@@ -648,6 +652,8 @@ def main():
                              "directory. Shard coverage is detected from npz filenames "
                              "(format: SHARDID_RECID.npz). Use to align siglip with an "
                              "existing qwen3 or vae run instead of a new random selection.")
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="Pipeline chunk number (for heartbeat naming)")
     args = parser.parse_args()
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
@@ -765,6 +771,9 @@ def main():
                 f"{err_str}  {dt:.1f} s/shard  ETA {int(eta//3600)}h {int((eta%3600)//60)}m",
                 flush=True,
             )
+            write_heartbeat("precompute", args.chunk,
+                            done=done, total=len(work_items), pct=pct,
+                            eta_sec=round(eta))
 
     wq = sum(r["wq"] for r in results)
     wv = sum(r["wv"] for r in results)
