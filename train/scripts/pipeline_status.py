@@ -104,9 +104,11 @@ def _chunk_status(chunk: int) -> dict:
         else:
             steps[step] = "pending"
     last_done = next((s for s in reversed(CHUNK_STEPS) if steps[s] == "done"), None)
+    steps_done = sum(1 for s in steps.values() if s == "done")
     state = derive_chunk_state(chunk) if _HAS_ORCH else "UNKNOWN"
     return {"chunk": chunk, "state": str(state), "steps": steps,
-            "errors": errors, "last_done": last_done}
+            "errors": errors, "last_done": last_done,
+            "steps_done": steps_done, "steps_total": len(CHUNK_STEPS)}
 
 
 def _trainer_heartbeat(chunk: int) -> dict:
@@ -247,6 +249,23 @@ def print_human(status: dict, verbose: bool = False) -> None:
     shard_str = f"shards={shards}" + (f" (+{staging} staging)" if staging else "")
     print(f"  {shard_str}  precomputed={precomp}")
 
+    # Overall progress summary
+    total_chunks = len(status["chunks"])
+    active_c = next(
+        (c for c, cs in status["chunks"].items()
+         if cs["state"].split(".")[-1] not in ("DONE", "IDLE")),
+        max(status["chunks"].keys()) if status["chunks"] else 1,
+    )
+    active_cs = status["chunks"].get(active_c, {})
+    s_done  = active_cs.get("steps_done", 0)
+    s_total = active_cs.get("steps_total", len(CHUNK_STEPS))
+    done_chunks = sum(1 for cs in status["chunks"].values()
+                      if cs["state"].split(".")[-1] == "DONE")
+    active_step_name = active_cs.get("active_step") or active_cs.get("last_done") or "—"
+    print(f"  Progress: chunk {active_c}/{total_chunks}  "
+          f"step {s_done}/{s_total} ({active_step_name})  "
+          f"[{done_chunks} chunk(s) complete]")
+
     # Per-chunk status
     print()
     for c, cs in status["chunks"].items():
@@ -256,6 +275,8 @@ def print_human(status: dict, verbose: bool = False) -> None:
         staging_d = cs.get("staging", {})
         errors = cs.get("errors", {})
         has_err = bool(errors)
+        s_done_c  = cs.get("steps_done", 0)
+        s_total_c = cs.get("steps_total", len(CHUNK_STEPS))
 
         stg_parts = []
         if staging_d.get("shards"):
@@ -268,7 +289,8 @@ def print_human(status: dict, verbose: bool = False) -> None:
 
         err_mark = " ⚠️ ERROR" if has_err else ""
         active_mark = f"  → {active}" if active else ""
-        print(f"  Chunk {c}: {state_str:<16}  last: {last}{active_mark}{err_mark}{stg_str}")
+        step_prog = f"  step {s_done_c}/{s_total_c}"
+        print(f"  Chunk {c}: {state_str:<16}{step_prog}  last: {last}{active_mark}{err_mark}{stg_str}")
 
         # Error details with clear instructions
         for step, emsg in errors.items():
