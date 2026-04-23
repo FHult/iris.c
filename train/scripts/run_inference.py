@@ -202,6 +202,13 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    # Pipeline config has no `adapter` section — load from training config
+    if "adapter" not in cfg:
+        train_cfg_path = Path(args.config).parent / "stage1_512px.yaml"
+        with open(train_cfg_path) as f2:
+            train_cfg = yaml.safe_load(f2)
+        cfg = {**train_cfg, **cfg}
+
     os.makedirs(args.output, exist_ok=True)
 
     print("Loading Flux Klein 4B (frozen)...")

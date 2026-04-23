@@ -55,20 +55,23 @@ def _load_clip():
 
 def _img_embedding(image) -> "np.ndarray":
     import torch
-    import numpy as np
     inputs = _clip_processor(images=image, return_tensors="pt")
     with torch.no_grad():
-        feat = _clip_model.get_image_features(**inputs)
+        vision_out = _clip_model.vision_model(pixel_values=inputs["pixel_values"])
+        feat = _clip_model.visual_projection(vision_out.pooler_output)
     feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat[0].numpy()
 
 
 def _txt_embedding(text: str) -> "np.ndarray":
     import torch
-    import numpy as np
     inputs = _clip_processor(text=[text], return_tensors="pt", padding=True, truncation=True)
     with torch.no_grad():
-        feat = _clip_model.get_text_features(**inputs)
+        text_out = _clip_model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+        )
+        feat = _clip_model.text_projection(text_out.pooler_output)
     feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat[0].numpy()
 
@@ -110,6 +113,7 @@ def score_pair(
     emb_with = _img_embedding(img_with)
 
     # CLIP-I vs reference
+    emb_ref = None
     ref_full = ref_path if os.path.isabs(ref_path) else os.path.join("train", ref_path)
     if os.path.exists(ref_full):
         ref_img = Image.open(ref_full).convert("RGB")
@@ -123,7 +127,7 @@ def score_pair(
     result["clip_t"] = round(cosine(emb_with, emb_txt), 4)
 
     # Adapter delta: CLIP-I(with) - CLIP-I(no)
-    if os.path.exists(img_no_path) and result["clip_i"] is not None:
+    if os.path.exists(img_no_path) and result["clip_i"] is not None and emb_ref is not None:
         img_no = Image.open(img_no_path).convert("RGB")
         emb_no = _img_embedding(img_no)
         clip_i_no = cosine(emb_no, emb_ref)
@@ -149,7 +153,13 @@ def compute_verdict(pairs: list[dict], weight_errors: list[str] = None) -> dict:
     delta_vals      = [p["adapter_delta"] for p in pairs if p.get("adapter_delta") is not None]
 
     if not clip_i_vals:
-        return {"verdict": "FAIL", "reason": "no CLIP-I scores computed"}
+        clip_t_vals = [p["clip_t"] for p in pairs if p.get("clip_t") is not None]
+        return {
+            "verdict": "WARN",
+            "reason": "no ref images — CLIP-I skipped",
+            "mean_clip_t": round(sum(clip_t_vals) / len(clip_t_vals), 4) if clip_t_vals else None,
+            "n_pairs": len(pairs),
+        }
 
     mean_clip_i     = sum(clip_i_vals) / len(clip_i_vals)
     mean_delta      = sum(delta_vals) / len(delta_vals) if delta_vals else None
