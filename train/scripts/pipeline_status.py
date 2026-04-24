@@ -331,9 +331,12 @@ def print_human(status: dict, verbose: bool = False) -> None:
                 stale_mark = " ⚠️ STALE" if stale_flag else ""
                 extra = ""
                 if active == "download":
-                    gb = hb.get("in_flight_gb")
-                    if gb is not None and gb > 0:
-                        extra = f"  {gb:.1f} GB downloading"
+                    gb    = hb.get("in_flight_gb", 0)
+                    speed = hb.get("dl_speed_mbps", 0)
+                    tgz   = hb.get("current_tgz")
+                    if tgz is not None:
+                        speed_str = f"  {speed:.1f} MB/s" if speed > 0 else ""
+                        extra = f"  tgz {tgz:03d}: {gb:.1f} GB{speed_str}"
                 print(f"    {active}: {done}/{total_n} tgzs converted ({pct:.0f}%){extra}  hb {age_str} ago{stale_mark}")
 
         # Log tail for active or failed step
