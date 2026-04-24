@@ -143,6 +143,17 @@ def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 _W: dict = {}
+_progress_q = None  # set by main process before pool creation; worker receives via _worker_init
+
+
+def _report_progress(shard: str, phase: str, done: int, total: int) -> None:
+    """Non-blocking push to the inter-process progress queue (no-op if queue absent)."""
+    q = _progress_q
+    if q is not None:
+        try:
+            q.put_nowait({"shard": shard, "phase": phase, "done": done, "total": total})
+        except Exception:
+            pass
 
 
 def _load_flux_vae_only(flux_model_path: str):
@@ -179,9 +190,17 @@ def _load_flux_vae_only(flux_model_path: str):
 
 
 def _worker_init(qwen3_model_path: str, flux_model_path: str,
-                 enable_siglip: bool, image_size: int) -> None:
-    """Load all models once per worker process."""
-    global _W
+                 enable_siglip: bool, image_size: int, progress_q,
+                 load_qwen3: bool = True, load_vae: bool = True) -> None:
+    """Load all models once per worker process.
+
+    load_qwen3/load_vae: set False when the caller has confirmed all records
+    are already cached, avoiding loading 8+ GB of model weights that would be
+    immediately discarded.  This prevents jetsam killing the subsequent training
+    process when training starts shortly after a skip-only precompute run.
+    """
+    global _W, _progress_q
+    _progress_q = progress_q
     import mlx.core as mx  # noqa: F401 (ensures Metal context is initialised)
 
     # Cap MLX GPU memory to 20 GB.  Qwen3-4B (~8 GB) + VAE (~0.5 GB) + SigLIP (~1.7 GB)
@@ -192,14 +211,21 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
     except AttributeError:
         pass  # MLX version does not expose set_memory_limit; safe to ignore
 
-    from mlx_lm import load as mlx_lm_load
-    model, tokenizer = mlx_lm_load(qwen3_model_path)
-    model.eval()
-    _W["qwen3"] = model
-    _W["tokenizer"] = tokenizer
+    if load_qwen3:
+        from mlx_lm import load as mlx_lm_load
+        model, tokenizer = mlx_lm_load(qwen3_model_path)
+        model.eval()
+        _W["qwen3"] = model
+        _W["tokenizer"] = tokenizer
+    else:
+        _W["qwen3"] = None
+        _W["tokenizer"] = None
 
-    vae = _load_flux_vae_only(flux_model_path)
-    _W["vae"] = vae
+    if load_vae:
+        vae = _load_flux_vae_only(flux_model_path)
+        _W["vae"] = vae
+    else:
+        _W["vae"] = None
 
     if enable_siglip:
         try:
@@ -256,7 +282,7 @@ def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
     return collected
 
 
-def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
+def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str = "") -> int:
     """
     Encode captions through Qwen3, save 4-bit quantised embeddings.
     records: list of (rec_id, jpg_bytes, caption)
@@ -284,6 +310,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
     total_seq = 0
     max_seq = 0
     t_q_start = _time.time()
+    n_batches = (len(tokenized) + batch_size - 1) // batch_size
     written = 0
     for i in range(0, len(tokenized), batch_size):
         batch = tokenized[i:i + batch_size]
@@ -295,6 +322,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
             ids + [pad_id] * (max_len - len(ids)) for _, _, ids in batch
         ]))
         batch_idx = i // batch_size
+        _report_progress(shard_name, "qwen3", batch_idx, n_batches)
         t_b = _time.time()
         try:
             h = _qwen3_hidden_states(model, padded)
@@ -347,7 +375,8 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int) -> int:
 
 
 def _encode_with_prefetch(records: list, out_dir: str, batch_size: int,
-                          preprocess_fn, gpu_encode_fn) -> int:
+                          preprocess_fn, gpu_encode_fn,
+                          phase: str = "vae", shard_name: str = "") -> int:
     """
     Generic image encode with 1-ahead prefetch.
 
@@ -382,6 +411,7 @@ def _encode_with_prefetch(records: list, out_dir: str, batch_size: int,
             prefetch_q.append(prefetch_pool.submit(_decode_batch, batches[0]))
 
         for idx in range(len(batches)):
+            _report_progress(shard_name, phase, idx, len(batches))
             preprocessed = prefetch_q.popleft().result()
             if idx + 1 < len(batches):
                 prefetch_q.append(prefetch_pool.submit(_decode_batch, batches[idx + 1]))
@@ -550,7 +580,8 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
 
     # Phase 2a: Qwen3
     if pending_q:
-        wq += _encode_qwen3(pending_q, qwen3_out, qwen3_batch)
+        _report_progress(shard_name, "qwen3", 0, len(pending_q))
+        wq += _encode_qwen3(pending_q, qwen3_out, qwen3_batch, shard_name=shard_name)
     t3 = _time.time()
     print(f"  [{shard_name}] qwen3={t3-t2:.1f}s", file=sys.stderr, flush=True)
     # Clear Metal free-list between Qwen3 and VAE phases to avoid buffer
@@ -561,18 +592,22 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     if pending_v:
         _W["_vae_batch_n"] = 0
         image_size = _W["image_size"]
+        _report_progress(shard_name, "vae", 0, len(pending_v))
         wv += _encode_with_prefetch(
             pending_v, vae_out, vae_batch,
             lambda jpg, tj: _preprocess_vae(jpg, image_size, tj),
             _vae_gpu_encode,
+            phase="vae", shard_name=shard_name,
         )
 
     # Phase 2c: SigLIP (1-ahead prefetch, optional)
     if pending_s and _W.get("siglip") is not None:
+        _report_progress(shard_name, "siglip", 0, len(pending_s))
         ws += _encode_with_prefetch(
             pending_s, siglip_out, siglip_batch,
             _preprocess_siglip,
             _siglip_gpu_encode,
+            phase="siglip", shard_name=shard_name,
         )
 
     t4 = _time.time()
@@ -730,12 +765,45 @@ def main():
           + (f"   SigLIP batch: {args.siglip_batch}" if siglip_out else ""))
     print()
 
+    # Sample the first shard to check whether qwen3/vae are already fully cached.
+    # Avoids loading 8+ GB of model weights that would be immediately discarded —
+    # which caused jetsam to kill the subsequent training process on 32 GB systems
+    # when precompute and training started within seconds of each other.
+    _load_qwen3 = True
+    _load_vae   = True
+    if shards and args.qwen3_output and args.vae_output:
+        try:
+            import itertools as _itools
+            _sample = [(r, None, None) for r, _, _ in _itools.islice(iter_shard(shards[0]), 20)]
+            _load_qwen3 = any(
+                not (os.path.exists(_p := os.path.join(args.qwen3_output, f"{r}.npz"))
+                     and os.path.getsize(_p) > 0)
+                for r, _, _ in _sample
+            )
+            _load_vae = any(
+                not (os.path.exists(_p := os.path.join(args.vae_output, f"{r}.npz"))
+                     and os.path.getsize(_p) > 0)
+                for r, _, _ in _sample
+            )
+        except Exception:
+            pass  # can't sample → load both models to be safe
+    if not _load_qwen3:
+        print("  Qwen3: sample shard fully cached — skipping model load")
+    if not _load_vae:
+        print("  VAE:   sample shard fully cached — skipping model load")
+
+    # When a model is skipped, also omit its output path from work_items so
+    # _process_shard_inner doesn't attempt encoding with a None model.
+    _qwen3_work = args.qwen3_output if _load_qwen3 else None
+    _vae_work   = args.vae_output   if _load_vae   else None
+
     work_items = [
-        (s, args.qwen3_output, args.vae_output, siglip_out,
+        (s, _qwen3_work, _vae_work, siglip_out,
          args.qwen3_batch, args.vae_batch, args.siglip_batch)
         for s in shards
     ]
 
+    import threading as _threading
     import time as _time
     from collections import deque as _deque
     results = []
@@ -744,10 +812,45 @@ def main():
     # Avoids the harmonic-mean trap where fast cache-hit shards mask growing compute time.
     recent_dts: _deque = _deque(maxlen=10)
 
+    # Inter-process progress queue: worker pushes {shard, phase, done, total} messages.
+    progress_q = multiprocessing.Queue()
+
+    # Shared state updated by main loop and drained from progress_q; read by heartbeat thread.
+    _hb_state = {"done": 0, "total": len(work_items), "pct": 0, "eta_sec": 0,
+                 "shard": None, "phase": None, "phase_done": 0, "phase_total": 0}
+    _hb_stop  = _threading.Event()
+
+    def _drain_progress_q():
+        """Drain all pending worker progress messages into _hb_state (non-blocking)."""
+        while True:
+            try:
+                msg = progress_q.get_nowait()
+                _hb_state.update(
+                    shard=msg.get("shard"),
+                    phase=msg.get("phase"),
+                    phase_done=msg.get("done", 0),
+                    phase_total=msg.get("total", 0),
+                )
+            except Exception:
+                break
+
+    def _hb_thread():
+        while not _hb_stop.wait(60):
+            _drain_progress_q()
+            s = _hb_state
+            phase_str = f"{s['phase']} {s['phase_done']}/{s['phase_total']}" if s["phase"] else None
+            write_heartbeat("precompute", args.chunk,
+                            done=s["done"], total=s["total"],
+                            pct=s["pct"], eta_sec=s["eta_sec"],
+                            current_shard=s["shard"], current_phase=phase_str)
+
+    _threading.Thread(target=_hb_thread, daemon=True).start()
+
     with multiprocessing.Pool(
         processes=args.workers,
         initializer=_worker_init,
-        initargs=(args.qwen3_model, args.flux_model, args.siglip, args.image_size),
+        initargs=(args.qwen3_model, args.flux_model, args.siglip, args.image_size, progress_q,
+                  _load_qwen3, _load_vae),
     ) as pool:
         for done, result in enumerate(
             pool.imap_unordered(process_shard, work_items, chunksize=1), 1
@@ -761,9 +864,12 @@ def main():
             avg_dt = sum(recent_dts) / len(recent_dts) if recent_dts else dt
             eta = (len(work_items) - done) * avg_dt
 
+            _drain_progress_q()
             errs = sum(1 for r in results if r["error"])
             ws   = sum(r["ws"] for r in results)
             pct  = 100 * done // len(work_items)
+            _hb_state.update(done=done, pct=pct, eta_sec=round(eta),
+                             shard=None, phase=None, phase_done=0, phase_total=0)
             err_str    = f"  errors={errs}" if errs else ""
             siglip_str = f" +siglip" if siglip_out and ws > 0 else ""
             print(
@@ -774,6 +880,8 @@ def main():
             write_heartbeat("precompute", args.chunk,
                             done=done, total=len(work_items), pct=pct,
                             eta_sec=round(eta))
+
+    _hb_stop.set()
 
     wq = sum(r["wq"] for r in results)
     wv = sum(r["wv"] for r in results)
