@@ -45,7 +45,7 @@ data_volume:
 
 training:
   hard_mix_ratio: 0.05
-  siglip: false       # true requires SigLIP precompute (~420 GB extra)
+  siglip: true        # SigLIP precompute enabled (~420 GB extra)
 
   # Steps per chunk per scale
   steps:
