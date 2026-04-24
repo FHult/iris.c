@@ -176,14 +176,18 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
             done_event.set()
 
     def heartbeat_loop():
+        hf_cache = raw_dir / ".cache" / "huggingface" / "download"
         while not done_event.is_set():
             done_count = sum(
                 1 for i in tgz_range
                 if (sentinel_dir / f"{i:03d}.converted").exists()
             )
+            from downloader import _incomplete_bytes
+            in_flight_gb = round(_incomplete_bytes(hf_cache) / 1e9, 2)
             write_heartbeat("download_convert", chunk=chunk,
                             done=done_count, total=total,
-                            pct=round(done_count / total * 100, 1))
+                            pct=round(done_count / total * 100, 1),
+                            in_flight_gb=in_flight_gb)
             time.sleep(30)
 
     prod_thread = threading.Thread(target=producer, daemon=True)

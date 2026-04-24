@@ -151,7 +151,15 @@ def _staging_detail(chunk: int) -> dict:
 def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool) -> str:
     steps = chunk_status["steps"]
     state = str(chunk_status["state"])
-    if state in ("DONE", "IDLE", "ERROR"):
+    chunk = chunk_status["chunk"]
+    if state == "DONE" or state == "ERROR":
+        return ""
+    if state == "IDLE":
+        # IDLE + prep running + fresh heartbeat = download actively in progress
+        if prep_running:
+            hb = _worker_heartbeat("download_convert", chunk)
+            if hb and hb.get("age_secs", 9999) < 300:
+                return "download"
         return ""
     if train_running and state in ("TRAINING", "MINING", "VALIDATING"):
         return state.lower()
@@ -278,8 +286,10 @@ def print_human(status: dict, verbose: bool = False) -> None:
     print()
     for c, cs in status["chunks"].items():
         state_str = cs["state"].split(".")[-1]
-        last = cs["last_done"] or "—"
         active = cs.get("active_step", "")
+        if state_str == "IDLE" and active == "download":
+            state_str = "DOWNLOADING"
+        last = cs["last_done"] or "—"
         staging_d = cs.get("staging", {})
         errors = cs.get("errors", {})
         has_err = bool(errors)
@@ -319,7 +329,12 @@ def print_human(status: dict, verbose: bool = False) -> None:
                 stale_flag = hb.get("stale", False)
                 age_str = _age_str(age) if age is not None else "?"
                 stale_mark = " ⚠️ STALE" if stale_flag else ""
-                print(f"    {active}: {done}/{total_n} ({pct:.0f}%)  hb {age_str} ago{stale_mark}")
+                extra = ""
+                if active == "download":
+                    gb = hb.get("in_flight_gb")
+                    if gb is not None and gb > 0:
+                        extra = f"  {gb:.1f} GB downloading"
+                print(f"    {active}: {done}/{total_n} tgzs converted ({pct:.0f}%){extra}  hb {age_str} ago{stale_mark}")
 
         # Log tail for active or failed step
         show_step = active or (list(errors.keys())[0] if errors else None)
