@@ -216,10 +216,43 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
         return
 
     log_orch(f"WikiArt chunk {chunk}: downloading from HuggingFace ({WIKIART_REPO})")
-    # Route HuggingFace intermediate cache to the SSD to avoid filling local disk.
-    hf_cache = str(STAGING_DIR / "hf_cache")
-    os.environ.setdefault("HF_DATASETS_CACHE", hf_cache)
+    hf_cache_dir = STAGING_DIR / "hf_cache"
+    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_cache_dir))
     os.environ.setdefault("HF_HOME", str(STAGING_DIR / "hf_home"))
+
+    # Pre-count total parquet files for progress tracking
+    try:
+        from huggingface_hub import list_repo_files
+        total_parquets = sum(
+            1 for f in list_repo_files(WIKIART_REPO, repo_type="dataset")
+            if f.endswith(".parquet")
+        )
+    except Exception:
+        total_parquets = 0  # unknown — will show count without %
+
+    # Shared phase state: "download" → "save"
+    phase    = ["download"]
+    save_n   = [0]
+    save_tot = [0]
+    stop_ev  = threading.Event()
+
+    def _hb_loop():
+        while not stop_ev.wait(15):
+            if phase[0] == "download":
+                done_p = sum(1 for _ in hf_cache_dir.rglob("*.parquet")) if hf_cache_dir.exists() else 0
+                write_heartbeat("download_convert", chunk=chunk,
+                                phase="wikiart_download",
+                                done=done_p, total=total_parquets,
+                                pct=round(done_p / total_parquets * 100) if total_parquets else 0)
+            else:
+                write_heartbeat("download_convert", chunk=chunk,
+                                phase="wikiart_save",
+                                done=save_n[0], total=save_tot[0],
+                                pct=round(save_n[0] / save_tot[0] * 100) if save_tot[0] else 0)
+
+    hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    hb_thread.start()
+
     try:
         from datasets import load_dataset
         ds = load_dataset(WIKIART_REPO, split="train", streaming=False)
@@ -228,7 +261,23 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
         end   = chunk * total // total_chunks
         slice_ds = ds.select(range(start, end))
         log_orch(f"WikiArt chunk {chunk}: saving records {start}–{end} ({end-start} images)")
+        phase[0]    = "save"
+        save_tot[0] = end - start
+
+        # Wrap save_to_disk with row-count heartbeat via a monitoring thread
+        save_done_ev = threading.Event()
+        def _save_monitor():
+            while not save_done_ev.wait(15):
+                arrow_files = list(out_dir.rglob("*.arrow")) if out_dir.exists() else []
+                rows = sum(f.stat().st_size for f in arrow_files) // 4096  # rough estimate
+                save_n[0] = min(rows, save_tot[0])
+        mon = threading.Thread(target=_save_monitor, daemon=True)
+        mon.start()
+
         slice_ds.save_to_disk(str(out_dir))
+        save_done_ev.set()
+        save_n[0] = save_tot[0]
+
         done_sentinel.touch()
         log_event("downloader", "wikiart_done", chunk=chunk,
                   records=end - start, start=start, end=end)
@@ -237,6 +286,8 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
     except Exception as e:
         log_event("downloader", "wikiart_error", chunk=chunk, error=str(e))
         raise
+    finally:
+        stop_ev.set()
 
 
 # ---------------------------------------------------------------------------
