@@ -57,6 +57,23 @@ def jdb_tgz_ranges(config: dict, scale: str = "all-in") -> dict[int, tuple[int, 
     return {int(k): tuple(v) for k, v in fallback.items()}
 
 
+_STALL_SECS = 600  # 10 min with no byte progress → abort
+
+
+def _incomplete_bytes(cache_dir: Path) -> int:
+    """Sum of sizes of all .incomplete files in cache_dir (HF in-progress downloads)."""
+    total = 0
+    try:
+        for p in cache_dir.rglob("*.incomplete"):
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
 def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(
@@ -66,6 +83,43 @@ def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:
         local_dir=local_dir,
     )
     return Path(path)
+
+
+def _hf_download_file_guarded(repo_id: str, filename: str, local_dir: str) -> Path:
+    """Wraps _hf_download_file with a stall watchdog.
+
+    If the HF .incomplete file stops growing for _STALL_SECS, sends SIGTERM to
+    the current process so the orchestrator detects failure and retries.
+    HF resumes from the partial file on next attempt.
+    """
+    import os
+    import signal
+
+    cache_dir = Path(local_dir) / ".cache" / "huggingface" / "download"
+    stop_ev   = threading.Event()
+
+    def _watchdog():
+        last_size   = -1
+        last_change = time.time()
+        while not stop_ev.wait(60):
+            size = _incomplete_bytes(cache_dir)
+            if size != last_size:
+                last_size   = size
+                last_change = time.time()
+            elif size > 0 and time.time() - last_change > _STALL_SECS:
+                log_orch(
+                    f"Download stall: {size / 1e9:.1f} GB downloaded, "
+                    f"no progress for {_STALL_SECS}s — aborting for retry"
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+    t = threading.Thread(target=_watchdog, daemon=True)
+    t.start()
+    try:
+        return _hf_download_file(repo_id, filename, local_dir)
+    finally:
+        stop_ev.set()
 
 
 def download_jdb_annotation(raw_dir: Path) -> None:
@@ -109,7 +163,7 @@ def run_jdb_download(chunk: int, config: dict, scale: str = "all-in") -> None:
                 log_event("downloader", "download_start", chunk=chunk, tgz=i)
                 t0 = time.time()
                 try:
-                    _hf_download_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
+                    _hf_download_file_guarded(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
                     ready.touch()
                     elapsed = time.time() - t0
                     log_event("downloader", "download_done", chunk=chunk, tgz=i,

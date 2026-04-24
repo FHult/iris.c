@@ -32,7 +32,7 @@ from pipeline_lib import (
 from downloader import (
     jdb_tgz_ranges, jdb_tgz_filename, download_jdb_annotation,
     run_wikiart_download, check_laion, check_coyo,
-    JDB_REPO_ID, _hf_download_file,
+    JDB_REPO_ID, _hf_download_file_guarded as _hf_download_file,
 )
 
 
