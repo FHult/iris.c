@@ -208,6 +208,206 @@ logs/                       All pipeline logs (orchestrator.log, *_chunk*.log)
 
 ---
 
+## Telemetry Reference
+
+This section is the definitive map of every file the pipeline reads and writes for state, progress, and alerting. Understanding it prevents the recurring "why is status wrong?" and "what is the orchestrator actually doing?" confusion.
+
+### Source of Truth Hierarchy
+
+```
+Sentinel files (.done / .error)   ← authoritative; derive_chunk_state() reads only these
+Heartbeat files (.json)           ← live progress; written by workers, read by status + orchestrator
+Log files (*.log)                 ← human evidence; status shows tail; orchestrator reads EXIT_CODE only
+pipeline_state.json               ← convenience mirror of sentinel state; NOT authoritative
+dispatch_queue.jsonl              ← escalated alerts; NOT shown by status script (known gap — see below)
+```
+
+### Sentinel Files
+
+**Path**: `/Volumes/2TBSSD/pipeline/chunk{N}/{step}.done` and `{step}.error`
+
+**What writes them**: Orchestrator — writes `.done` when a step exits 0, `.error` when it fails. Coverage/overflow checks in `_promote_chunk()` can also write `promoted.error` directly.
+
+**What reads them**: `derive_chunk_state()` in `orchestrator.py` and `pipeline_status.py`. This function is stateless — it walks `CHUNK_STEPS` in order and returns the state implied by the last `.done` sentinel. Called on every orchestrator poll and every `pipeline_status.py` invocation.
+
+**Resilience**: Sentinel files survive orchestrator restarts, reboots, and process crashes. They are the only persistent state that the orchestrator trusts. If you need to re-run a step, delete its `.done` and any `.error` sentinels for that step.
+
+**Steps and their sentinel names** (in pipeline order):
+```
+download, convert, build_shards, filter_shards,
+clip_embed, clip_index, clip_dups, precompute,
+promoted, train, mine, validate
+```
+
+To list all sentinels for a chunk:
+```bash
+ls /Volumes/2TBSSD/pipeline/chunk1/
+```
+
+### Heartbeat Files
+
+**Path**: `/Volumes/2TBSSD/.heartbeat/{process}_chunk{N}.json`
+
+**Format**: JSON with at minimum `{"ts": "<ISO UTC>", "process": "<name>", "chunk": N, ...}`. Additional fields are process-specific (see below).
+
+**Written by**: Each worker process via a background thread calling `write_heartbeat()` from `pipeline_lib.py`. Written atomically (tmp + rename) every ~60s.
+
+**Read by**:
+- `pipeline_status.py` — reads all heartbeats to populate the progress line for the active step
+- `orchestrator.py` — reads **only** the `trainer_chunk{N}.json` heartbeat for anomaly detection (NaN loss, grad norm, staleness-triggered restart). Prep worker heartbeats are NOT read by the orchestrator.
+
+**Staleness thresholds**:
+- Status script marks trainer heartbeat stale at **120s** (custom threshold in `_trainer_heartbeat`)
+- Status script marks prep worker heartbeats stale at **300s** (`_worker_heartbeat`)
+- Orchestrator triggers trainer restart at **900s** (`HEARTBEAT_STALE_SECS`)
+
+**Heartbeats by process**:
+
+| File | Written by | Key fields |
+|------|-----------|------------|
+| `orchestrator.json` | orchestrator each poll | `step="poll"` |
+| `precompute_chunk{N}.json` | `precompute_all.py` | `done`, `total`, `pct`, `eta_sec`, `current_shard`, `current_phase` |
+| `prep_precompute_chunk{N}.json` | `precompute_all.py` | `status` (failed/running), `exit_code` |
+| `trainer_chunk{N}.json` | `train_ip_adapter.py` | `step`, `total_steps`, `loss`, `grad_norm`, `eta_sec`, `siglip_coverage_pct` |
+| `build_shards_chunk{N}.json` | `build_shards.py` | `done`, `total`, `pct` |
+| `download_convert_chunk{N}.json` | `download_convert.py` | `done`, `total`, `pct`, `phase`, `current_tgz`, `dl_speed_mbps` |
+| `filter_shards_chunk{N}.json` | `filter_shards.py` | `done`, `total`, `pct` |
+| `clip_dedup_chunk{N}.json` | `clip_dedup.py` | `done`, `total`, `pct` |
+| `mine_hard_examples_chunk{N}.json` | `mine_hard_examples.py` | `done`, `total`, `pct` |
+
+To inspect a heartbeat directly:
+```bash
+cat /Volumes/2TBSSD/.heartbeat/precompute_chunk1.json | python3 -m json.tool
+cat /Volumes/2TBSSD/.heartbeat/trainer_chunk1.json   | python3 -m json.tool
+```
+
+To check heartbeat age:
+```bash
+python3 -c "
+import json, datetime, pathlib
+p = pathlib.Path('/Volumes/2TBSSD/.heartbeat/precompute_chunk1.json')
+d = json.loads(p.read_text())
+ts = datetime.datetime.fromisoformat(d['ts'])
+age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+print(f'{age:.0f}s ago — {d}')
+"
+```
+
+### Log Files
+
+**Path**: `/Volumes/2TBSSD/logs/{step}_chunk{N}.log`
+
+**What writes them**: The bash wrapper in `tmux_new_window()`: `({cmd}) >> '{log}' 2>&1; echo EXIT_CODE=$? >> '{log}'`. Every line of stdout and stderr goes here, plus `EXIT_CODE=N` as the final line.
+
+**What reads them**:
+- `last_exit_code()` in `pipeline_lib.py` — scans the file in reverse for `EXIT_CODE=N`. This is how the orchestrator knows if a step succeeded.
+- `_log_tail()` in `pipeline_status.py` — shows the last 4–10 lines (excluding `EXIT_CODE=`).
+
+**Critical rule: log files are fixed-name and never automatically cleaned between sessions.** Old logs from a prior run will appear current to the status script. The orchestrator rotates prep step logs on error-auto-retry (renames to `{step}_chunk{N}.{timestamp}.log`) but does NOT rotate training logs. Manual cleaning is required after a pipeline reset.
+
+**Standard log names**:
+```
+orchestrator.log              orchestrator main output
+download_chunk{N}.log         download + convert step
+build_chunk{N}.log            build_shards step
+filter_chunk{N}.log           filter_shards step
+clip_embed_chunk{N}.log       clip_dedup embed step
+clip_index_chunk{N}.log       clip_dedup build-index step
+clip_dups_chunk{N}.log        clip_dedup find-dups step
+precompute_chunk{N}.log       precompute_all step (active log; old ones get .{ts}.log suffix)
+train_chunk{N}.log            training (never auto-rotated)
+mine_chunk{N}.log             hard example mining
+validate_chunk{N}.log         validation
+```
+
+**How to clean stale logs before a fresh run**:
+```bash
+# Remove ALL logs (do this when resetting pipeline state):
+rm -f /Volumes/2TBSSD/logs/*.log /Volumes/2TBSSD/logs/*.jsonl
+
+# Remove stale heartbeats (do this when resetting pipeline state):
+rm -f /Volumes/2TBSSD/.heartbeat/*.json
+
+# Keep only the orchestrator and active step log if pipeline is mid-run:
+# (identify current step from sentinels first, keep its log)
+```
+
+### `pipeline_state.json`
+
+**Path**: `/Volumes/2TBSSD/pipeline_state.json`
+
+**Written by**: Orchestrator — updated each poll whenever chunk state changes. Also updated at training start with `steps`, `lr`, `started_at`.
+
+**Read by**: `pipeline_status.py` for `run_id`, `scale`, and chunk state snapshots. Also contains an `issues` list that the status script displays — but see the Known Gaps section below.
+
+**NOT authoritative**: The orchestrator re-derives chunk state from sentinel files on every poll. `pipeline_state.json` is a snapshot for tooling; if it disagrees with sentinels, sentinels win.
+
+### `dispatch_queue.jsonl`
+
+**Path**: `/Volumes/2TBSSD/logs/dispatch_queue.jsonl`
+
+**Written by**: `dispatch_issue()` in `pipeline_lib.py` — called by the orchestrator for problems it cannot auto-resolve: step failed twice, trainer restart limit exceeded, loss NaN/Inf, sustained high grad norm, disk critical.
+
+**Read by**: Nothing currently reads this file automatically. **The status script reads `pipeline_state.json["issues"]`, not this file.** Escalated alerts are effectively invisible unless you manually inspect this file.
+
+```bash
+# Check for escalated alerts:
+cat /Volumes/2TBSSD/logs/dispatch_queue.jsonl | python3 -m json.tool
+```
+
+### `orchestrator.jsonl`
+
+**Path**: `/Volumes/2TBSSD/logs/orchestrator.jsonl`
+
+Written by `log_orch()` — a structured event log of every orchestrator decision. Useful for post-mortem debugging. Not read by any tooling currently.
+
+```bash
+# Recent orchestrator decisions:
+tail -20 /Volumes/2TBSSD/logs/orchestrator.jsonl | python3 -c "
+import sys, json
+for line in sys.stdin:
+    d = json.loads(line)
+    print(d['ts'], d.get('level','info').upper(), d.get('message',''))
+"
+```
+
+---
+
+## Known Telemetry Gaps
+
+These are confirmed bugs found in code review (2026-04-25). Document here so they are not rediscovered.
+
+**Gap 1 — Escalated alerts are invisible**
+`dispatch_issue()` writes to `logs/dispatch_queue.jsonl`. The status script reads `pipeline_state.json["issues"]`. These are different files and are not linked. If the orchestrator escalates (step failed twice, NaN loss, restart limit exceeded) you will not see it in `pipeline_status.py`. Always check dispatch_queue.jsonl after any anomaly:
+```bash
+cat /Volumes/2TBSSD/logs/dispatch_queue.jsonl
+```
+
+**Gap 2 — Orchestrator restart orphans any in-flight prep step**
+`_active_prep` is in-memory only. If the orchestrator is killed while iris-prep is running, on restart `_active_prep` is None. `_poll_prep_window()` returns immediately. When the prep window eventually finishes (or was already finished), the exit code is never read and the step is never marked done. The chunk is stuck indefinitely. **Workaround**: after orchestrator restart, check if iris-prep window exists. If it does, wait for it to finish then manually mark the step done or check its EXIT_CODE in the log. If the step log already contains `EXIT_CODE=0`, mark it done manually:
+```bash
+# Example: precompute completed but orchestrator missed it
+touch /Volumes/2TBSSD/pipeline/chunk1/precompute.done
+```
+
+**Gap 3 — Hung prep workers are never detected**
+The orchestrator only monitors the trainer heartbeat for staleness. Prep workers (precompute, clip_embed, build_shards, filter, mine) have no timeout in the orchestrator. If they hang (process alive but making no progress), the orchestrator waits forever. Detection requires manual inspection:
+```bash
+# Check if prep is alive and making progress:
+cat /Volumes/2TBSSD/.heartbeat/precompute_chunk1.json  # check ts field age
+tail -5 /Volumes/2TBSSD/logs/precompute_chunk1.log     # check for recent output
+```
+
+**Gap 4 — SigLIP coverage not enforced at promotion**
+`_promote_chunk()` checks that `qwen3/` and `vae/` have ≥90% of expected records. It does NOT check `siglip/`. A partial or empty siglip cache passes promotion silently and training starts with zero image conditioning for the missing records. Before manual promotion or after precompute completes, verify:
+```bash
+ls /Volumes/2TBSSD/staging/chunk1/precomputed/siglip/ | wc -l
+ls /Volumes/2TBSSD/staging/chunk1/precomputed/qwen3/  | wc -l
+# siglip count should be within a few % of qwen3 count
+```
+
+---
+
 ## Common Failure Modes
 
 | Symptom | Likely cause | Fix |
