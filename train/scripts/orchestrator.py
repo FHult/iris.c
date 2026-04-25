@@ -454,14 +454,14 @@ class Orchestrator:
                           chunk, "download", also_mark=["convert"])
 
     def _training_active(self) -> bool:
-        """True when training is in progress for any chunk.
+        """True when any chunk is in the training phase (window-close race-free).
 
-        Checks sentinel state first (window-close race-free), then falls back to
-        the tmux window.  Sentinel "promoted.done but train.done absent" means the
-        chunk is in the TRAINING phase even if the window is momentarily down.
+        Uses sentinel files directly: "promoted.done exists AND train.done absent"
+        means the chunk is assigned to training regardless of whether the window
+        is momentarily down or the step is in an error/retry state.
         """
         for c in range(1, self.total_chunks + 1):
-            if derive_chunk_state(c) == ChunkState.TRAINING:
+            if is_done(c, "promoted") and not is_done(c, "train"):
                 return True
         return tmux_window_exists(TMUX_TRAIN_WIN)
 
@@ -722,9 +722,15 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: starting training ({steps} steps, lr={lr})", chunk=chunk)
 
         resume_arg = ""
-        best = CKPT_DIR / "best.safetensors"
-        if chunk > 1 and best.exists():
-            resume_arg = f"--resume '{best}'"
+        # Resume from the latest intermediate checkpoint if one exists.
+        # This handles both mid-run restarts (any chunk) and chunk>1 warm-starts.
+        _ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        if _ckpts:
+            resume_arg = f"--resume '{_ckpts[-1]}'"
+        elif chunk > 1:
+            best = CKPT_DIR / "best.safetensors"
+            if best.exists():
+                resume_arg = f"--resume '{best}'"
 
         hard_arg = ""
         if chunk > 1:

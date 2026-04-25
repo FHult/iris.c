@@ -45,6 +45,7 @@ except ImportError:
 
 # ── Local imports ─────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import fused_flow_noise, get_schedule_values
 from ip_adapter.ema import update_ema, save_ema, _flatten
