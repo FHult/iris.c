@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
-    STATE_FILE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
+    STATE_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
     read_state, is_done, has_error, read_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
 )
@@ -86,6 +86,7 @@ def _log_for_step(chunk: int, step: str) -> Path:
         "clip_dups":    LOG_DIR / f"clip_dups_chunk{chunk}.log",
         "precompute":   LOG_DIR / f"precompute_chunk{chunk}.log",
         "train":        LOG_DIR / f"train_chunk{chunk}.log",
+        "training":     LOG_DIR / f"train_chunk{chunk}.log",
         "mine":         LOG_DIR / f"mine_chunk{chunk}.log",
         "validate":     LOG_DIR / f"validate_chunk{chunk}.log",
     }
@@ -125,6 +126,27 @@ def _worker_heartbeat(process: str, chunk: int) -> dict:
         return {}
     age = heartbeat_age_secs(process, chunk)
     return {**hb, "age_secs": age, "stale": age is not None and age > 300}
+
+
+def _read_dispatch_issues(resolved: bool = False) -> list:
+    """Read open (or all) issues from dispatch_queue.jsonl."""
+    if not DISPATCH_QUEUE.exists():
+        return []
+    issues = []
+    try:
+        for line in DISPATCH_QUEUE.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if resolved or not entry.get("resolved", False):
+                    issues.append(entry)
+            except json.JSONDecodeError:
+                pass
+    except OSError:
+        pass
+    return issues
 
 
 def _count_shards(directory: Path) -> int:
@@ -228,6 +250,7 @@ def build_status_dict(total_chunks: int = 4) -> dict:
         "trainer": trainer_hb,
         "orchestrator_hb": orch_hb,
         "orchestrator_age_secs": orch_age,
+        "dispatch_issues": _read_dispatch_issues(),
     }
 
 
@@ -319,34 +342,52 @@ def print_human(status: dict, verbose: bool = False) -> None:
             print(f"      to retry: rm {sentinel}")
 
         # Active step progress from heartbeat
-        if active and active not in ("training", "validating"):
+        if active:
             hb = _active_heartbeat_for(active, c)
+            if not hb and active in ("training", "validating"):
+                print(f"    {active}: loading... (no heartbeat yet)")
             if hb:
-                done = hb.get("done", 0)
-                total_n = hb.get("total", 0)
-                pct = hb.get("pct", 0)
                 age = hb.get("age_secs")
-                stale_flag = hb.get("stale", False)
                 age_str = _age_str(age) if age is not None else "?"
-                stale_mark = " ⚠️ STALE" if stale_flag else ""
-                if active == "download":
-                    phase = hb.get("phase", "jdb")
-                    if phase == "wikiart_download":
-                        label = f"wikiart: {done}/{total_n} parquets ({pct:.0f}%)"
-                    elif phase == "wikiart_save":
-                        label = f"wikiart: saving {done}/{total_n} records ({pct:.0f}%)"
-                    else:
-                        gb    = hb.get("in_flight_gb", 0)
-                        speed = hb.get("dl_speed_mbps", 0)
-                        tgz   = hb.get("current_tgz")
-                        extra = ""
-                        if tgz is not None:
-                            speed_str = f"  {speed:.1f} MB/s" if speed > 0 else ""
-                            extra = f"  tgz {tgz:03d}: {gb:.1f} GB{speed_str}"
-                        label = f"{done}/{total_n} tgzs converted ({pct:.0f}%){extra}"
-                    print(f"    {active}: {label}  hb {age_str} ago{stale_mark}")
+                stale_mark = " ⚠️ STALE" if hb.get("stale") else ""
+                if active in ("training", "validating"):
+                    step_n  = hb.get("step", "?")
+                    total_s = hb.get("total_steps", "?")
+                    loss    = hb.get("loss", "?")
+                    grad    = hb.get("grad_norm")
+                    eta     = hb.get("eta_sec")
+                    grad_str = f"  grad={grad:.2f}" if grad is not None else ""
+                    eta_str2 = f"  ETA {_age_str(eta)}" if eta else ""
+                    print(f"    {active}: step {step_n}/{total_s}  loss={loss}{grad_str}{eta_str2}  hb {age_str} ago{stale_mark}")
                 else:
-                    print(f"    {active}: {done}/{total_n} ({pct:.0f}%)  hb {age_str} ago{stale_mark}")
+                    done    = hb.get("done", 0)
+                    total_n = hb.get("total", 0)
+                    pct     = hb.get("pct", 0)
+                    if active == "download":
+                        phase = hb.get("phase", "jdb")
+                        if phase == "wikiart_download":
+                            label = f"wikiart: {done}/{total_n} parquets ({pct:.0f}%)"
+                        elif phase == "wikiart_save":
+                            label = f"wikiart: saving {done}/{total_n} records ({pct:.0f}%)"
+                        else:
+                            gb    = hb.get("in_flight_gb", 0)
+                            speed = hb.get("dl_speed_mbps", 0)
+                            tgz   = hb.get("current_tgz")
+                            extra = ""
+                            if tgz is not None:
+                                speed_str = f"  {speed:.1f} MB/s" if speed > 0 else ""
+                                extra = f"  tgz {tgz:03d}: {gb:.1f} GB{speed_str}"
+                            label = f"{done}/{total_n} tgzs converted ({pct:.0f}%){extra}"
+                        print(f"    {active}: {label}  hb {age_str} ago{stale_mark}")
+                    elif active == "precompute":
+                        shard   = hb.get("current_shard") or ""
+                        cphase  = hb.get("current_phase") or ""
+                        detail  = f"  [{shard} {cphase}]" if shard or cphase else ""
+                        eta_sec = hb.get("eta_sec", 0)
+                        eta_str2 = f"  ETA {int(eta_sec//3600)}h{int((eta_sec%3600)//60)}m" if eta_sec > 60 else ""
+                        print(f"    {active}: {done}/{total_n} shards ({pct:.0f}%){eta_str2}{detail}  hb {age_str} ago{stale_mark}")
+                    else:
+                        print(f"    {active}: {done}/{total_n} ({pct:.0f}%)  hb {age_str} ago{stale_mark}")
 
         # Log tail for active or failed step
         show_step = active or (list(errors.keys())[0] if errors else None)
@@ -359,33 +400,21 @@ def print_human(status: dict, verbose: bool = False) -> None:
                 for line in tail:
                     print(f"      {line}")
 
-    # Trainer heartbeat (always show when present)
-    hb = status.get("trainer", {})
-    if hb:
-        step = hb.get("step", "?")
-        total_s = hb.get("total_steps", "?")
-        loss  = hb.get("loss", "?")
-        eta   = hb.get("eta_sec")
-        age   = hb.get("age_secs")
-        grad  = hb.get("grad_norm")
-        eta_str = _age_str(eta) if eta else "?"
-        age_str = _age_str(age) if age is not None else "?"
-        stale_mark = " ⚠️ STALE" if hb.get("stale") else ""
-        grad_str = f"  grad={grad:.2f}" if grad is not None else ""
-        print(f"\n  Training: step {step}/{total_s}  loss={loss}{grad_str}  ETA {eta_str}"
-              f"  hb {age_str} ago{stale_mark}")
-        if verbose:
-            clean = {k: v for k, v in hb.items() if k not in ("stale",)}
-            print(f"  {json.dumps(clean)}")
 
-    # Open dispatch issues
-    dispatch = status["state_file"].get("issues", [])
-    open_issues = [i for i in dispatch if not i.get("resolved")]
+    # Open dispatch issues (from dispatch_queue.jsonl — the authoritative escalation log)
+    open_issues = status.get("dispatch_issues", [])
     if open_issues:
-        print(f"\n  ⚠️  {len(open_issues)} open issue(s):")
-        n_show = len(open_issues) if verbose else min(3, len(open_issues))
+        print(f"\n  *** {len(open_issues)} unresolved issue(s) in dispatch queue:")
+        n_show = len(open_issues) if verbose else min(5, len(open_issues))
         for i in open_issues[:n_show]:
-            print(f"    [{i.get('severity','?')}] {i.get('message','')}")
+            sev = i.get("severity", "?").upper()
+            ts  = i.get("ts", "")[:19]
+            msg = i.get("message", "")
+            act = i.get("suggested_action", "")
+            act_str = f"  → {act}" if act else ""
+            print(f"    [{sev}] {ts}  {msg}{act_str}")
+        if len(open_issues) > n_show:
+            print(f"    ... and {len(open_issues) - n_show} more (use --verbose)")
 
     print(f"{'─'*64}\n")
 

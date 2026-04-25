@@ -211,6 +211,8 @@ class Orchestrator:
         self._ensure_tmux_session()
         self._run_doctor()
         self._init_state()
+        self._rotate_stale_logs()
+        self._recover_prep_window()
 
         poll_interval = self.cfg.get("poll_interval", 60)
         while True:
@@ -327,6 +329,66 @@ class Orchestrator:
         """True when the prep window is occupied."""
         return self._active_prep is not None or tmux_window_exists(TMUX_PREP_WIN)
 
+    # Fix 2: recover _active_prep after orchestrator restart mid-step.
+    # _active_prep is in-memory; if orchestrator is killed while iris-prep runs,
+    # on restart _poll_prep_window() returns early and the step is never marked done.
+    # This method reconstructs _active_prep from sentinel state so the completion
+    # is detected on the next poll.
+    def _recover_prep_window(self) -> None:
+        if not tmux_window_exists(TMUX_PREP_WIN):
+            return
+        _state_to_step = {
+            ChunkState.IDLE:         "download",
+            ChunkState.CONVERTING:   "download",
+            ChunkState.BUILDING:     "build_shards",
+            ChunkState.FILTERING:    "filter_shards",
+            ChunkState.CLIP_EMBED:   "clip_embed",
+            ChunkState.CLIP_INDEX:   "clip_index",
+            ChunkState.CLIP_DUPS:    "clip_dups",
+            ChunkState.PRECOMPUTING: "precompute",
+            ChunkState.MINING:       "mine",
+            ChunkState.VALIDATING:   "validate",
+        }
+        _step_log = {
+            "download":     lambda c: LOG_DIR / f"download_chunk{c}.log",
+            "build_shards": lambda c: LOG_DIR / f"build_chunk{c}.log",
+            "filter_shards":lambda c: LOG_DIR / f"filter_chunk{c}.log",
+            "clip_embed":   lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
+            "clip_index":   lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
+            "clip_dups":    lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
+            "precompute":   lambda c: LOG_DIR / f"precompute_chunk{c}.log",
+            "mine":         lambda c: LOG_DIR / f"mine_chunk{c}.log",
+            "validate":     lambda c: LOG_DIR / f"validate_chunk{c}.log",
+        }
+        for chunk in range(1, self.total_chunks + 1):
+            state = derive_chunk_state(chunk)
+            step = _state_to_step.get(state)
+            if step:
+                log = _step_log.get(step, lambda c: LOG_DIR / f"{step}_chunk{c}.log")(chunk)
+                self._active_prep = {
+                    "chunk": chunk, "step": step, "log": log,
+                    "token": None, "also_mark": [],
+                }
+                log_orch(f"Startup: recovered iris-prep tracking ({step} chunk {chunk})",
+                         chunk=chunk)
+                return
+        log_orch("Startup: iris-prep window exists but no pending step found — monitoring only",
+                 level="warning")
+
+    # Fix 5: archive training logs from a previous session so stale EXIT_CODE values
+    # don't mislead _start_training() detection and don't pollute status log tails.
+    def _rotate_stale_logs(self) -> None:
+        for chunk in range(1, self.total_chunks + 1):
+            if is_done(chunk, "train"):
+                continue
+            log = LOG_DIR / f"train_chunk{chunk}.log"
+            if log.exists() and last_exit_code(log) is not None:
+                ts = now_iso().replace(":", "").replace("+", "").replace("-", "")[:15]
+                archived = log.with_suffix(f".{ts}.log")
+                log.rename(archived)
+                log_orch(f"Chunk {chunk}: archived stale training log → {archived.name}",
+                         chunk=chunk)
+
     # -----------------------------------------------------------------------
     # Per-chunk advancement
     # -----------------------------------------------------------------------
@@ -340,8 +402,12 @@ class Orchestrator:
             update_state(**{"chunks": {str(chunk): {"state": state}}})
             self._last_written_state[chunk] = state
 
-        # Chunk N+1 doesn't start until chunk N is at least BUILDING
-        if chunk > 1 and derive_chunk_state(chunk - 1) == ChunkState.IDLE:
+        # Chunk N+1 doesn't start until chunk N is at least BUILDING.
+        # Block on both IDLE and ERROR: an error means download/convert hasn't
+        # completed, so the next chunk must still wait.
+        if chunk > 1 and derive_chunk_state(chunk - 1) in (
+            ChunkState.IDLE, ChunkState.DOWNLOADING, ChunkState.CONVERTING, ChunkState.ERROR
+        ):
             return
 
         handlers = {
@@ -435,6 +501,8 @@ class Orchestrator:
             return
         if not gpu_is_free() or self._prep_busy():
             return
+        if not self.res.request("GPU_TOKEN", f"clip_embed chunk {chunk}"):
+            return
         log_orch(f"Chunk {chunk}: CLIP embedding", chunk=chunk)
         shard_dir = STAGING_DIR / f"chunk{chunk}" / "shards"
         embed_dir = STAGING_DIR / f"chunk{chunk}" / "embeddings"
@@ -442,7 +510,7 @@ class Orchestrator:
         cmd = self._python_cmd("clip_dedup.py",
                                f"embed --shards '{shard_dir}' --embeddings '{embed_dir}'")
         self._launch_prep(f"clip_embed chunk {chunk}", cmd, log_file,
-                          chunk, "clip_embed")
+                          chunk, "clip_embed", token="GPU_TOKEN")
 
     def _start_clip_index(self, chunk: int) -> None:
         if is_done(chunk, "clip_index") or self._prep_busy():
@@ -551,7 +619,13 @@ class Orchestrator:
             shard_size = self.cfg.get("data", {}).get("shard_size", 5000)
             expected = n_expected_shards * shard_size
             min_records = int(expected * 0.90)
-            for subdir in ("qwen3", "vae"):
+            subdirs_required = ["qwen3", "vae"]
+            # Fix 4: enforce siglip coverage when siglip is enabled in training config.
+            # Previously only qwen3/vae were checked, allowing a silent 0%-coverage
+            # siglip cache to pass promotion and corrupt image conditioning in training.
+            if self.cfg.get("training", {}).get("siglip", False):
+                subdirs_required.append("siglip")
+            for subdir in subdirs_required:
                 src = precomp_src / subdir
                 if not src.exists():
                     msg = (f"Chunk {chunk}: precomputed/{subdir} missing — "
@@ -561,10 +635,11 @@ class Orchestrator:
                     return
                 actual = sum(1 for f in src.iterdir() if f.suffix == ".npz")
                 if actual < min_records:
+                    flag = " --siglip" if subdir == "siglip" else ""
                     msg = (f"Chunk {chunk}: precomputed/{subdir} coverage too low — "
                            f"{actual:,} records vs {min_records:,} required "
                            f"(90% of {expected:,} expected). "
-                           f"Re-run precompute_all.py to complete the cache.")
+                           f"Re-run precompute_all.py{flag} to complete the cache.")
                     log_orch(msg, chunk=chunk, level="error")
                     mark_error(chunk, "promoted", msg)
                     return
@@ -721,11 +796,13 @@ class Orchestrator:
                     log_orch(f"Chunk {chunk}: auto-retrying {step}", chunk=chunk)
                     self._restart_counts[key] = restarts + 1
                     clear_error(chunk, step)
-                    # Delete the old step log so _start_training (and similar
-                    # detection loops) don't re-read a stale EXIT_CODE on next poll.
+                    # Rename the old step log with a timestamp so _start_training
+                    # (and similar detection loops) don't re-read a stale EXIT_CODE,
+                    # but the crash evidence is preserved for post-mortem debugging.
                     old_log = LOG_DIR / f"{step}_chunk{chunk}.log"
                     if old_log.exists():
-                        old_log.unlink()
+                        ts = now_iso().replace(":", "").replace("+", "").replace("-", "")[:15]
+                        old_log.rename(old_log.with_suffix(f".{ts}.log"))
                 else:
                     issue_id = self._next_issue_id()
                     log_orch(f"Chunk {chunk}: {step} failed twice — escalating", level="error")
@@ -781,11 +858,50 @@ class Orchestrator:
     # -----------------------------------------------------------------------
 
     def _check_heartbeats(self) -> None:
+        # Fix 3: check prep worker heartbeat for hung processes (no crash, no progress).
+        # Threshold is generous (1800s) to avoid false positives during slow operations
+        # like siglip precompute (~24 min/shard) where the heartbeat thread still writes
+        # every 60s; a 30-min stale gap means the process is truly hung or dead.
+        if self._active_prep is not None:
+            self._check_prep_heartbeat()
         if not tmux_window_exists(TMUX_TRAIN_WIN):
             return
         for chunk in range(1, self.total_chunks + 1):
             if derive_chunk_state(chunk) == ChunkState.TRAINING:
                 self._check_training_anomalies(chunk)
+
+    def _check_prep_heartbeat(self) -> None:
+        ap = self._active_prep
+        if ap is None:
+            return
+        chunk = ap["chunk"]
+        step  = ap["step"]
+        _step_process = {
+            "download":     "download_convert",
+            "build_shards": "build_shards",
+            "filter_shards":"filter_shards",
+            "clip_embed":   "clip_dedup",
+            "clip_index":   "clip_dedup",
+            "clip_dups":    "clip_dedup",
+            "precompute":   "precompute",
+            "mine":         "mine_hard_examples",
+            "validate":     "validator",
+        }
+        process = _step_process.get(step)
+        if not process:
+            return
+        age = heartbeat_age_secs(process, chunk)
+        if age is None or age < 1800:
+            return
+        log_orch(f"Chunk {chunk}: {step} heartbeat stale ({age:.0f}s) — may be hung",
+                 level="warning", chunk=chunk)
+        self._dispatch_once(
+            f"prep_stale_{chunk}_{step}", self._next_issue_id(), "warning",
+            f"{step} chunk {chunk} heartbeat stale for {age:.0f}s — may be hung. "
+            f"Check: tail -20 {ap['log']}",
+            chunk=chunk, process=step,
+            suggested_action="check_prep_log_and_kill_if_hung",
+        )
 
     def _dispatch_once(self, key: str, issue_id: str, severity: str, message: str,
                        cooldown_secs: float = 3600.0, **kwargs) -> None:
