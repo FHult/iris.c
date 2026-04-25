@@ -232,13 +232,16 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
             from mlx_vlm import load as vlm_load
             siglip_model, _ = vlm_load("google/siglip-so400m-patch14-384")
             siglip_model.eval()
-            _W["siglip"] = (True, siglip_model)
+            _W["siglip"] = (True, siglip_model, "mlx")
         except Exception:
+            import torch
             from transformers import AutoModel
             hf_model = AutoModel.from_pretrained(
                 "google/siglip-so400m-patch14-384"
             ).vision_model.eval()
-            _W["siglip"] = (False, hf_model)
+            _siglip_device = "mps" if torch.backends.mps.is_available() else "cpu"
+            hf_model = hf_model.to(_siglip_device)
+            _W["siglip"] = (False, hf_model, _siglip_device)
     else:
         _W["siglip"] = None
 
@@ -465,7 +468,10 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
 
 def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
     import mlx.core as mx
-    _use_mlx_vlm, model_obj = _W["siglip"]
+    siglip_entry = _W["siglip"]
+    _use_mlx_vlm = siglip_entry[0]
+    model_obj     = siglip_entry[1]
+    _dev          = siglip_entry[2] if len(siglip_entry) > 2 else "cpu"
     try:
         stacked = np.concatenate(batch_imgs, axis=0)
         if _use_mlx_vlm:
@@ -475,8 +481,9 @@ def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
         else:
             import torch
             with torch.no_grad():
-                out = model_obj(pixel_values=torch.from_numpy(stacked))
-            feats_np = out.last_hidden_state.float().numpy()
+                pv = torch.from_numpy(stacked).to(_dev)
+                out = model_obj(pixel_values=pv)
+            feats_np = out.last_hidden_state.float().cpu().numpy()
         for k, rec_id in enumerate(batch_ids):
             q, scale = _quantize_4bit(feats_np[k].astype(np.float32))
             np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
@@ -493,8 +500,9 @@ def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
                 else:
                     import torch
                     with torch.no_grad():
-                        out = model_obj(pixel_values=torch.from_numpy(img_np))
-                    feat_np = out.last_hidden_state[0].float().numpy()
+                        pv = torch.from_numpy(img_np).to(_dev)
+                        out = model_obj(pixel_values=pv)
+                    feat_np = out.last_hidden_state[0].float().cpu().numpy()
                 q, scale = _quantize_4bit(feat_np.astype(np.float32))
                 np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 saved += 1
