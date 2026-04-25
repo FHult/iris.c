@@ -441,6 +441,8 @@ class Orchestrator:
         """Download + convert all sources for this chunk (combined, MLX-19 pattern)."""
         if self._prep_busy():
             return
+        if self._training_active():
+            return
         log_orch(f"Chunk {chunk}: starting download+convert", chunk=chunk)
         log_file = LOG_DIR / f"download_chunk{chunk}.log"
         jdb_only = self.cfg.get("download", {}).get("jdb_only", False)
@@ -451,8 +453,18 @@ class Orchestrator:
         self._launch_prep(f"download+convert chunk {chunk}", cmd, log_file,
                           chunk, "download", also_mark=["convert"])
 
+    def _training_active(self) -> bool:
+        """True when iris-train window is running. Used to block disk-heavy prep."""
+        return tmux_window_exists(TMUX_TRAIN_WIN)
+
     def _start_build(self, chunk: int) -> None:
         if is_done(chunk, "build_shards") or self._prep_busy():
+            return
+        # PIPELINE-3: build_shards generates heavy SSD write pressure.  Running it
+        # concurrently with training on the same volume caused two kernel panics
+        # (WindowServer watchdog timeout from memory/IO exhaustion).  Wait until
+        # training is idle before launching any disk-intensive step.
+        if self._training_active():
             return
         if not self.res.request("DISK_WRITE_HIGH", f"build chunk {chunk}"):
             return
@@ -481,6 +493,8 @@ class Orchestrator:
 
     def _start_filter(self, chunk: int) -> None:
         if is_done(chunk, "filter_shards") or self._prep_busy():
+            return
+        if self._training_active():
             return
         log_orch(f"Chunk {chunk}: filtering shards", chunk=chunk)
         shard_dir = STAGING_DIR / f"chunk{chunk}" / "shards"
@@ -713,7 +727,7 @@ class Orchestrator:
         config_file = self.cfg.get("training_config",
                                    str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         cmd = (
-            f"caffeinate -i python -u '{TRAIN_DIR}/train_ip_adapter.py' "
+            f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
             f"--config '{config_file}' "
             f"--max-steps {steps} --lr {lr} "
             f"--data-root '{DATA_ROOT}' "
