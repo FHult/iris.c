@@ -622,10 +622,20 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     print(f"  [{shard_name}] vae={t4-t3:.1f}s  total={t4-t1:.1f}s", file=sys.stderr, flush=True)
 
     # Release Python objects and Metal buffer cache between shards.
+    # torch.mps.empty_cache() is required when siglip runs via PyTorch MPS:
+    # mx.clear_cache() only frees the MLX Metal allocator; PyTorch has a separate
+    # MPS cache that grows across shards and is never returned to the OS otherwise,
+    # eventually exhausting swap and causing a kernel panic.
     import gc
     import mlx.core as mx
     gc.collect()
     mx.clear_cache()
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
     return {
         "shard": shard_path,
