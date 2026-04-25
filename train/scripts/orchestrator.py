@@ -454,7 +454,15 @@ class Orchestrator:
                           chunk, "download", also_mark=["convert"])
 
     def _training_active(self) -> bool:
-        """True when iris-train window is running. Used to block disk-heavy prep."""
+        """True when training is in progress for any chunk.
+
+        Checks sentinel state first (window-close race-free), then falls back to
+        the tmux window.  Sentinel "promoted.done but train.done absent" means the
+        chunk is in the TRAINING phase even if the window is momentarily down.
+        """
+        for c in range(1, self.total_chunks + 1):
+            if derive_chunk_state(c) == ChunkState.TRAINING:
+                return True
         return tmux_window_exists(TMUX_TRAIN_WIN)
 
     def _start_build(self, chunk: int) -> None:
