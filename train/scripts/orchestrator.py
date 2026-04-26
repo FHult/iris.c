@@ -1108,6 +1108,18 @@ class Orchestrator:
                     key = (chunk, step)
                     self._restart_counts.pop(key, None)
                     clear_error(chunk, step)
+                    # Archive any stale log that still has EXIT_CODE at the end.
+                    # _start_training() reads the log to detect completion/failure;
+                    # without archiving, it would re-write the error sentinel and
+                    # never actually launch the new run.
+                    if step == "train":
+                        log_file = LOG_DIR / f"train_chunk{chunk}.log"
+                        if log_file.exists() and last_exit_code(log_file) is not None:
+                            ts = now_iso().replace(":", "").replace("+", "").replace("-", "")[:15]
+                            archived = log_file.with_suffix(f".{ts}.log")
+                            log_file.rename(archived)
+                            log_orch(f"Operator: archived stale train log → {archived.name}",
+                                     chunk=chunk)
                     log_orch(f"Operator: retry chunk {chunk} step {step} — counter reset", chunk=chunk)
             CONTROL_FILE.unlink(missing_ok=True)
         except Exception as e:
