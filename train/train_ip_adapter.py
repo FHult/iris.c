@@ -148,27 +148,30 @@ def save_checkpoint_async(
 ) -> None:
     """
     Save adapter weights + EMA on a background thread so GPU continues training.
-    mx.eval() completes pending async_eval ops before the numpy copy.
-    Based on plans/ip-adapter-training.md §3.12.
+    mx.eval() materialises all tensors; mx.save_safetensors writes directly from
+    Metal buffers without a numpy copy, eliminating the 4 GB CPU RAM spike.
 
     lineage: if provided, written as a sidecar step_NNNNNNN.json recording the
     config, git SHA, training args, and step/loss for reproducibility (MLX-10).
     """
-    from safetensors.numpy import save_file
-
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, f"step_{step:07d}.safetensors")
 
-    # mx.eval ensures all pending async_eval ops flush before numpy copy
+    # Flush all pending async_eval ops so tensors are fully materialised in
+    # Metal buffers before the background thread reads them.
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
-    flat_adapter = {k: np.array(v) for k, v in _flatten(adapter.parameters())}
-    flat_ema = {f"ema.{k}": np.array(v) for k, v in _flatten(ema_params)}
-    payload = {**flat_adapter, **flat_ema}
+    # Capture MLX array references (no numpy copy — avoids the 4 GB CPU spike).
+    # MLX is functional: training will create new arrays for updated params, so
+    # these references remain stable and can be safely read from another thread.
+    payload = {
+        **dict(_flatten(adapter.parameters())),
+        **{f"ema.{k}": v for k, v in _flatten(ema_params)},
+    }
 
     def _write():
-        save_file(payload, ckpt_path)
+        mx.save_safetensors(ckpt_path, payload)
         size_mb = os.path.getsize(ckpt_path) / 1e6
         print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
         if lineage is not None:
@@ -1094,6 +1097,7 @@ def train(config: dict) -> None:
             # MLX pools buffers internally; without periodic clearing, pool
             # growth can exhaust unified memory after ~1200 steps (~12 evals).
             mx.clear_cache()
+            import gc; gc.collect()
             t0 = time.time()
 
         # Checkpoint (async background write; plans §3.12)

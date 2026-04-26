@@ -360,14 +360,26 @@ class Orchestrator:
             "mine":         lambda c: LOG_DIR / f"mine_chunk{c}.log",
             "validate":     lambda c: LOG_DIR / f"validate_chunk{c}.log",
         }
+        _GPU_STEPS  = {"precompute", "clip_embed", "mine", "validate"}
+        _DISK_STEPS = {"build_shards"}
         for chunk in range(1, self.total_chunks + 1):
             state = derive_chunk_state(chunk)
             step = _state_to_step.get(state)
             if step:
                 log = _step_log.get(step, lambda c: LOG_DIR / f"{step}_chunk{c}.log")(chunk)
+                # Re-acquire the resource token so the ResourceManager correctly
+                # blocks other steps (e.g. training) from starting while this
+                # prep step is still running after an orchestrator restart.
+                token = None
+                if step in _GPU_STEPS:
+                    token = "GPU_TOKEN"
+                elif step in _DISK_STEPS:
+                    token = "DISK_WRITE_HIGH"
+                if token:
+                    self.res.request(token, f"recovered: {step} chunk {chunk}")
                 self._active_prep = {
                     "chunk": chunk, "step": step, "log": log,
-                    "token": None, "also_mark": [],
+                    "token": token, "also_mark": [],
                 }
                 log_orch(f"Startup: recovered iris-prep tracking ({step} chunk {chunk})",
                          chunk=chunk)
