@@ -719,6 +719,8 @@ def train(config: dict) -> None:
                 _loss = loss_fn(_siglip_zero, mx.array(True), mx.array(False), _fs, _target)
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
+                del _fs, _loss, _noisy, _target
+                mx.clear_cache()
                 if len(losses) >= 16:
                     break
         return sum(losses) / len(losses) if losses else None
@@ -873,6 +875,9 @@ def train(config: dict) -> None:
         loss_val, grad_norm_val = compiled_step(
             siglip_feats, use_null_image, use_null_text, flux_state, target,
         )
+        # flux_state (25 Q tensors, h_final, temb ≈ 300 MB) and target are no
+        # longer needed — release before eval so Metal reclaims them promptly.
+        del flux_state, target
         _t_step += time.time() - _t0
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
@@ -1093,6 +1098,10 @@ def train(config: dict) -> None:
                 )
             except Exception:
                 pass
+            # Reset rolling stats so per-interval averages don't drift over the
+            # entire run as loss improves and bucket distribution shifts.
+            bucket_stats.clear()
+            source_stats.clear()
             # Release unused Metal buffer pool entries every log interval.
             # MLX pools buffers internally; without periodic clearing, pool
             # growth can exhaust unified memory after ~1200 steps (~12 evals).

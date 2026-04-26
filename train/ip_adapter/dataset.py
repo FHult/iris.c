@@ -413,7 +413,7 @@ def make_prefetch_loader(
                 if rng.random() < image_dropout_prob:
                     style_ref = np.zeros_like(img)
                 else:
-                    style_ref = img.copy()
+                    style_ref = img  # _normalize() returns a fresh array; no copy needed
 
                 caption = rec["txt"]
                 if rng.random() < text_dropout_prob:
