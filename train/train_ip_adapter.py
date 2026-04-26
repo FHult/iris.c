@@ -54,9 +54,13 @@ from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 # ── mflux: Flux Klein 4B MLX inference ───────────────────────────────────────
 try:
     from mflux.models.flux2 import Flux2Klein
+    from mflux.models.flux.model.flux_transformer.common.attention_utils import (
+        AttentionUtils as _FluxAttentionUtils,
+    )
     _HAS_MFLUX = True
 except ImportError:
     _HAS_MFLUX = False
+    _FluxAttentionUtils = None
     print("Warning: mflux not installed. Run: pip install mflux", file=sys.stderr)
 
 try:
@@ -1388,33 +1392,51 @@ def _flux_forward_no_ip(
 
     # ── Step 9: single-stream modulation ─────────────────────────────────────
     temb_mod_params_single = tr.single_stream_modulation(temb)[0]
-    mod_shift_s, mod_scale_s, _ = temb_mod_params_single
+    mod_shift_s, mod_scale_s, mod_gate_s = temb_mod_params_single
 
-    # ── Step 10: single-stream blocks ─────────────────────────────────────────
+    # ── Step 10: single-stream blocks (inlined to eliminate redundant GEMM) ──
+    # Flux2SingleTransformerBlock.__call__ runs norm→modulate→to_qkv_mlp_proj→attn.
+    # Previously we'd call block() and then re-run norm+to_qkv_mlp_proj on image
+    # tokens to extract Q for IP injection — paying the big fused projection twice.
+    # Inlining shares the single GEMM, saving ~116 GFLOPs × 20 blocks per step.
     for block in tr.single_transformer_blocks:
-        h_before_s = hidden_states
-
-        hidden_states = block(
-            hidden_states=hidden_states,
-            temb_mod_params=temb_mod_params_single,
-            image_rotary_emb=concat_rotary_emb,
-        )
-
-        # Collect Q (image portion only)
-        norm_h_full = block.norm(h_before_s)
-        norm_h_full = (1 + mod_scale_s) * norm_h_full + mod_shift_s
-        img_norm_h = norm_h_full[:, seq_txt:, :]  # [B, seq_img, d_inner]
-
-        proj_img = block.attn.to_qkv_mlp_proj(img_norm_h)
-        qkv_img, _ = mx.split(proj_img, [block.attn.inner_dim * 3], axis=-1)
-        q_ip_s, _, _ = mx.split(qkv_img, 3, axis=-1)
-
-        bsz2, s2, d2 = q_ip_s.shape
+        bsz, seq_full, _ = hidden_states.shape
         H_s  = block.attn.heads
         Hd_s = block.attn.dim_head
-        q_ip_s = q_ip_s.reshape(bsz2, s2, H_s, Hd_s)
-        q_ip_s = block.attn.norm_q(q_ip_s.astype(mx.float32)).astype(mx.bfloat16)
-        qs.append(mx.stop_gradient(q_ip_s.transpose(0, 2, 1, 3)))  # [B, H, seq_img, Hd]
+
+        # Norm + modulation: block-specific LayerNorm, shared modulation params
+        norm_h = block.norm(hidden_states)
+        norm_h = (1 + mod_scale_s) * norm_h + mod_shift_s
+
+        # Single fused GEMM — used for both block forward and Q extraction
+        proj = block.attn.to_qkv_mlp_proj(norm_h)
+        qkv, mlp_hidden = mx.split(proj, [block.attn.inner_dim * 3], axis=-1)
+        q, k, v = mx.split(qkv, 3, axis=-1)
+
+        # [B, seq, H*Hd] → [B, H, seq, Hd]
+        q = q.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        k = k.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        v = v.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        q = block.attn.norm_q(q.astype(mx.float32)).astype(mx.bfloat16)
+        k = block.attn.norm_k(k.astype(mx.float32)).astype(mx.bfloat16)
+
+        # Q for IP-adapter: image tokens only, already norm_q'd; RMSNorm is per-token
+        # so slicing after norm_q is identical to norm_q on the slice alone
+        qs.append(mx.stop_gradient(q[:, :, seq_txt:, :]))  # [B, H, seq_img, Hd]
+
+        # Complete block forward: RoPE → attention → MLP → output proj → residual
+        if concat_rotary_emb is not None:
+            cos, sin = concat_rotary_emb
+            q, k = _FluxAttentionUtils.apply_rope_bshd(q, k, cos, sin)
+
+        attn_out = _FluxAttentionUtils.compute_attention(
+            query=q, key=k, value=v,
+            batch_size=bsz, num_heads=H_s, head_dim=Hd_s,
+        )
+        mlp_hidden = block.attn.mlp_act(mlp_hidden)
+        attn_out = mx.concatenate([attn_out, mlp_hidden], axis=-1)
+        attn_out = block.attn.to_out(attn_out)
+        hidden_states = hidden_states + mod_gate_s * attn_out
 
     # ── Step 11: extract image tokens before norm_out/proj_out ───────────────
     h_final = hidden_states[:, seq_txt:, :]  # [B, seq_img, d_inner]
