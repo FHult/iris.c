@@ -1089,6 +1089,14 @@ class Orchestrator:
                 if chunk:
                     log_orch(f"Operator: force-next-chunk {chunk}")
                     mark_done(chunk, "validate")
+            elif action == "retry":
+                chunk = ctrl.get("chunk")
+                step  = ctrl.get("step")
+                if chunk and step:
+                    key = (chunk, step)
+                    self._restart_counts.pop(key, None)
+                    clear_error(chunk, step)
+                    log_orch(f"Operator: retry chunk {chunk} step {step} — counter reset", chunk=chunk)
             CONTROL_FILE.unlink(missing_ok=True)
         except Exception as e:
             log_orch(f"Control file error: {e}", level="warning")

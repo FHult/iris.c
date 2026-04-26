@@ -78,6 +78,15 @@ def cmd_force_next_chunk(args) -> None:
     print(f"Force-advancing chunk {chunk} past validation")
 
 
+def cmd_retry(args) -> None:
+    """Clear error sentinel and tell the running orchestrator to reset its retry counter."""
+    chunk = args.chunk
+    step  = args.step
+    clear_error(chunk, step)
+    _write_control("retry", chunk=chunk, step=step)
+    print(f"Retry signal sent for chunk {chunk} step {step} — orchestrator will pick up on next poll")
+
+
 def cmd_clear_error(args) -> None:
     chunk = args.chunk
     step  = args.step
@@ -149,6 +158,10 @@ def main() -> None:
     p = sub.add_parser("force-next-chunk",help="Force-pass validation for a chunk")
     p.add_argument("chunk", type=int)
 
+    p = sub.add_parser("retry",          help="Reset retry counter and restart a failed step")
+    p.add_argument("chunk", type=int)
+    p.add_argument("step")
+
     p = sub.add_parser("clear-error",    help="Clear error sentinel for a step")
     p.add_argument("chunk", type=int)
     p.add_argument("step")
@@ -169,6 +182,7 @@ def main() -> None:
         "abort":                cmd_abort,
         "restart-orchestrator": cmd_restart_orchestrator,
         "force-next-chunk":     cmd_force_next_chunk,
+        "retry":                cmd_retry,
         "clear-error":          cmd_clear_error,
         "mark-done":            cmd_mark_done,
         "dispatch-read":        cmd_dispatch_read,
