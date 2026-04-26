@@ -32,13 +32,8 @@ def update_ema(
 
 def save_ema(ema_params: dict, path: str) -> None:
     """Save EMA parameter dict as safetensors."""
-    import numpy as np
-    from safetensors.numpy import save_file
-
     mx.eval(ema_params)
-    flat = _flatten(ema_params)
-    weights = {k: np.array(v) for k, v in flat}
-    save_file(weights, path)
+    mx.save_safetensors(path, dict(_flatten(ema_params)))
 
 
 def load_ema(path: str) -> dict:
