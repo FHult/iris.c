@@ -866,8 +866,9 @@ def train(config: dict) -> None:
         # Force-materialize all Flux tensors before entering autodiff graph.
         # Without this, MLX defers Flux computation into the gradient trace,
         # negating the entire split-forward optimization.
-        mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"])
-        mx.eval(target)
+        # target has no dependency on Flux; batching into one eval lets Metal
+        # schedule both concurrently rather than across two separate fences.
+        mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
         _t_fwd += time.time() - _t0
 
         # Adapter-only backward + optimizer update (tiny graph, should be fast)
@@ -880,9 +881,21 @@ def train(config: dict) -> None:
         del flux_state, target
         _t_step += time.time() - _t0
 
+        # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
+        # Computed here — before mx.eval — so the update graph is folded into
+        # the same Metal command submission as the optimizer step.  This avoids
+        # a second GPU fence (was: eval params, then separately eval ema_params).
+        # The lazy chain is broken by including ema_params in the eval below.
+        _do_ema = (step % tcfg["ema_update_every"] == 0)
+        if _do_ema:
+            ema_params = update_ema(ema_params, adapter, decay=tcfg["ema_decay"])
+
         # Synchronous eval: prevents lazy-graph accumulation across steps.
         _t0 = time.time()
-        mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
+        if _do_ema:
+            mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state, ema_params)
+        else:
+            mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
         # Return freed buffers to the OS immediately.  Without this, MLX holds
         # them in a cache that inflates peak wired memory and triggers jetsam.
         mx.clear_cache()
@@ -946,17 +959,8 @@ def train(config: dict) -> None:
                     pass
                 print(f"  val_loss={val_loss_last:.4f} (step {step})", flush=True)
 
-        # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
-        # mx.eval immediately after update to break the lazy-graph chain.
-        # Without this, ema_params accumulates one unevaluated level per update:
-        # by step 200 that is 20 × ~950 MB of live intermediate arrays (~19 GB).
-        if step % tcfg["ema_update_every"] == 0:
-            ema_params = update_ema(ema_params, adapter, decay=tcfg["ema_decay"])
-            mx.eval(ema_params)
-
         # Logging
         if step % log_interval == 0:
-            mx.eval(loss_val)  # materialise for logging
             elapsed = time.time() - t0
             steps_per_sec = log_interval / elapsed
             loss_scalar = float(loss_val.item())
