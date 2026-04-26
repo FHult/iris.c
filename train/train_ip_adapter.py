@@ -151,9 +151,16 @@ def save_checkpoint_async(
     lineage: Optional[dict] = None,
 ) -> None:
     """
-    Save adapter weights + EMA on a background thread so GPU continues training.
-    mx.eval() materialises all tensors; mx.save_safetensors writes directly from
-    Metal buffers without a numpy copy, eliminating the 4 GB CPU RAM spike.
+    Save adapter weights + EMA synchronously.
+
+    Background saving was tried but caused OOM: the background thread held
+    old adapter param tensors alive while the main thread created new ones
+    (after optimizer.update), temporarily doubling adapter memory footprint
+    and pushing unified memory over 32 GB. Synchronous saving adds ~1-2s
+    every 200 steps (<0.2% overhead) and avoids the memory overlap entirely.
+
+    mx.save_safetensors writes directly from Metal buffers without a numpy
+    copy, so the write itself is efficient.
 
     lineage: if provided, written as a sidecar step_NNNNNNN.json recording the
     config, git SHA, training args, and step/loss for reproducibility (MLX-10).
@@ -161,35 +168,31 @@ def save_checkpoint_async(
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, f"step_{step:07d}.safetensors")
 
-    # Flush all pending async_eval ops so tensors are fully materialised in
-    # Metal buffers before the background thread reads them.
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
-    # Capture MLX array references (no numpy copy — avoids the 4 GB CPU spike).
-    # MLX is functional: training will create new arrays for updated params, so
-    # these references remain stable and can be safely read from another thread.
     payload = {
         **dict(_flatten(adapter.parameters())),
         **{f"ema.{k}": v for k, v in _flatten(ema_params)},
     }
 
-    def _write():
-        mx.save_safetensors(ckpt_path, payload)
-        size_mb = os.path.getsize(ckpt_path) / 1e6
-        print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
-        if lineage is not None:
-            sidecar_path = os.path.join(output_dir, f"step_{step:07d}.json")
-            try:
-                with open(sidecar_path, "w") as _f:
-                    json.dump(lineage, _f, indent=2)
-            except OSError as e:
-                print(f"  WARNING: could not write lineage sidecar: {e}")
-        # Serialise purge so two concurrent threads don't race on the file list
-        with _ckpt_lock:
-            _purge_old_checkpoints(output_dir, keep_last_n)
+    mx.save_safetensors(ckpt_path, payload)
+    del payload
+    mx.clear_cache()
 
-    threading.Thread(target=_write, daemon=True).start()
+    size_mb = os.path.getsize(ckpt_path) / 1e6
+    print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
+
+    if lineage is not None:
+        sidecar_path = os.path.join(output_dir, f"step_{step:07d}.json")
+        try:
+            with open(sidecar_path, "w") as _f:
+                json.dump(lineage, _f, indent=2)
+        except OSError as e:
+            print(f"  WARNING: could not write lineage sidecar: {e}")
+
+    with _ckpt_lock:
+        _purge_old_checkpoints(output_dir, keep_last_n)
 
 
 def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
