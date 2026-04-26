@@ -1090,6 +1090,10 @@ def train(config: dict) -> None:
                 )
             except Exception:
                 pass
+            # Release unused Metal buffer pool entries every log interval.
+            # MLX pools buffers internally; without periodic clearing, pool
+            # growth can exhaust unified memory after ~1200 steps (~12 evals).
+            mx.clear_cache()
             t0 = time.time()
 
         # Checkpoint (async background write; plans §3.12)
