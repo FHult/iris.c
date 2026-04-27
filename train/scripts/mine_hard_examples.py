@@ -20,7 +20,7 @@ Usage:
         [--eval-records 5000] \\
         [--top-k 2000]
 
-Wall clock: ~30-40 min on M1 Max at eval-batch=4 (default).
+Wall clock: ~15-20 min on M1 Max at eval-batch=8 (default).
 
 Records that already exist in the output directory are not re-extracted.
 Re-running after a crash resumes safely.
@@ -60,22 +60,26 @@ except ImportError:
 # Embed loaders (same dequant as dataset.py)
 # ---------------------------------------------------------------------------
 
+def _dequant_4bit(d) -> np.ndarray:
+    """Unpack nibble-packed 4-bit quantised array → float16. d is a loaded npz dict."""
+    q, scale = d["q"], d["scale"]
+    lo = np.empty(q.shape, dtype=np.int8)
+    hi = np.empty(q.shape, dtype=np.int8)
+    np.bitwise_and(q, np.int8(0x0F), out=lo)
+    np.right_shift(q, 4, out=hi)
+    np.bitwise_and(hi, np.int8(0x0F), out=hi)
+    full = np.empty((*q.shape[:-1], q.shape[-1] * 2), dtype=np.int8)
+    full[..., 0::2] = lo
+    full[..., 1::2] = hi
+    return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+
+
 def _load_qwen3(rec_id: str, cache_dir: str):
     path = os.path.join(cache_dir, f"{rec_id}.npz")
     if not os.path.exists(path):
         return None
     try:
-        d = np.load(path)
-        q, scale = d["q"], d["scale"]
-        lo = np.empty(q.shape, dtype=np.int8)
-        hi = np.empty(q.shape, dtype=np.int8)
-        np.bitwise_and(q, np.int8(0x0F), out=lo)
-        np.right_shift(q, 4, out=hi)
-        np.bitwise_and(hi, np.int8(0x0F), out=hi)
-        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
-        full[:, 0::2] = lo
-        full[:, 1::2] = hi
-        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+        return _dequant_4bit(np.load(path))
     except Exception:
         return None
 
@@ -96,17 +100,7 @@ def _load_siglip(rec_id: str, cache_dir: str):
     if not os.path.exists(path):
         return None
     try:
-        d = np.load(path)
-        q, scale = d["q"], d["scale"]
-        lo = np.empty(q.shape, dtype=np.int8)
-        hi = np.empty(q.shape, dtype=np.int8)
-        np.bitwise_and(q, np.int8(0x0F), out=lo)
-        np.right_shift(q, 4, out=hi)
-        np.bitwise_and(hi, np.int8(0x0F), out=hi)
-        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
-        full[:, 0::2] = lo
-        full[:, 1::2] = hi
-        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+        return _dequant_4bit(np.load(path))
     except Exception:
         return None
 
@@ -300,8 +294,8 @@ def main():
                         help="Number of hard examples to extract (default 2000)")
     parser.add_argument("--shard-size",    type=int, default=500,
                         help="Max records per output .tar (default 500)")
-    parser.add_argument("--eval-batch",   type=int, default=4,
-                        help="Flux forward batch size during eval (default 4; use 1 if OOM)")
+    parser.add_argument("--eval-batch",   type=int, default=8,
+                        help="Flux forward batch size during eval (default 8; use 4 or 1 if OOM)")
     parser.add_argument("--seed",          type=int, default=0)
     args = parser.parse_args()
 
@@ -350,26 +344,23 @@ def main():
         print(f"No shards found in {args.shards}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Scanning {len(shard_paths)} shards for precomputed candidates...")
+    # Build shard path map: stem → full path ("000006" → ".../000006.tar")
+    shard_map = {Path(p).stem: p for p in shard_paths}
+
+    # Scan cache dirs once; intersect to find records with both embeddings present.
+    # Record IDs encode the shard stem as a prefix (e.g. "000006_0001"), so we can
+    # derive the shard path directly without opening any tar files.
+    # This replaces opening N tar files + N×5000×2 stat() calls with 2 directory scans.
+    print(f"Scanning cache dirs for precomputed candidates ({len(shard_paths)} shards)...")
+    cached_q = {f[:-4] for f in os.listdir(args.qwen3_cache) if f.endswith(".npz")}
+    cached_v = {f[:-4] for f in os.listdir(args.vae_cache)   if f.endswith(".npz")}
+    eligible  = (cached_q & cached_v) - existing_ids
+
     candidates = []   # [(rec_id, shard_path)]
-    for shard_path in shard_paths:
-        try:
-            with tarfile.open(shard_path) as t:
-                stems = set()
-                for m in t.getmembers():
-                    stem, _, ext = m.name.rpartition(".")
-                    if ext.lower() in ("jpg", "jpeg"):
-                        stems.add(stem)
-            # Only include records with both caches present and not already extracted
-            for stem in stems:
-                if stem in existing_ids:
-                    continue
-                q_ok = os.path.exists(os.path.join(args.qwen3_cache, f"{stem}.npz"))
-                v_ok = os.path.exists(os.path.join(args.vae_cache,   f"{stem}.npz"))
-                if q_ok and v_ok:
-                    candidates.append((stem, shard_path))
-        except Exception as e:
-            print(f"  Warning: failed to read {shard_path}: {e}", file=sys.stderr)
+    for rec_id in eligible:
+        shard_stem = rec_id.split("_")[0]
+        if shard_stem in shard_map:
+            candidates.append((rec_id, shard_map[shard_stem]))
 
     if not candidates:
         print("No precomputed candidates found — nothing to mine.", file=sys.stderr)
