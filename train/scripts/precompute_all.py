@@ -8,7 +8,7 @@ Reads each shard once and writes all requested outputs:
 
 Saves ~10-12h vs running the three scripts sequentially (~22h total):
 each shard's tar is opened once instead of twice or three times, and all
-models are loaded a single time at worker startup via Pool initializer.
+models are loaded a single time at startup.
 
 Within each shard:
   Phase 1  — sequential tar read → list of (rec_id, jpg_bytes, caption)
@@ -16,7 +16,10 @@ Within each shard:
   Phase 2b — VAE pass:   1-ahead image decode prefetch while GPU encodes
   Phase 2c — SigLIP pass (optional): same prefetch pattern as VAE
 
-Default workers=1 (GPU-bound; multiple workers contend for Metal).
+IO prefetch: the next shard's tar is read in a background thread while the
+GPU processes the current shard (Phase 2a/2b), hiding most of the tar I/O
+latency.  Output directories are scanned once per shard (set lookup O(1))
+rather than one stat() call per record per directory.
 
 Reference: plans/ip-adapter-training.md §2.7
 """
@@ -26,6 +29,7 @@ import glob
 import io
 import multiprocessing
 import os
+import queue as _queue_mod
 import sys
 import tarfile
 from collections import deque
@@ -72,6 +76,47 @@ def _quantize_4bit(arr: np.ndarray):
     q = np.clip(np.round(arr / scale), -8, 7).astype(np.int8)
     q_packed = ((q[..., 0::2] & 0x0F) | ((q[..., 1::2] & 0x0F) << 4)).astype(np.uint8)
     return q_packed, scale.astype(np.float16)
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+def _scan_existing(out_dir: str | None) -> set[str]:
+    """One-time directory scan; returns rec_id stems of all .npz files present.
+
+    Called once per shard at Phase 1 start.  Replaces per-record os.stat()
+    calls (which were ~15,000 syscalls/shard with 3 outputs) with a single
+    directory listing followed by O(1) set lookups.
+
+    Atomic writes (see _save_npz_atomic) ensure every listed file is complete,
+    so no size check is needed here.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return set()
+    try:
+        return {f[:-4] for f in os.listdir(out_dir) if f.endswith(".npz")}
+    except OSError:
+        return set()
+
+
+def _save_npz_atomic(path: str, **arrays) -> None:
+    """Write arrays to a .tmp file then atomically rename to path.
+
+    Prevents partial writes from being mistaken for valid outputs on resume —
+    a crash mid-write leaves a .tmp file (ignored by _scan_existing) rather
+    than a truncated .npz that would pass an existence check.
+    """
+    tmp = path + ".tmp"
+    try:
+        np.savez(tmp, **arrays)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -147,15 +192,15 @@ def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Per-worker model state (populated once via Pool initializer)
+# Per-process model state (populated once via _worker_init)
 # ---------------------------------------------------------------------------
 
 _W: dict = {}
-_progress_q = None  # set by main process before pool creation; worker receives via _worker_init
+_progress_q = None
 
 
 def _report_progress(shard: str, phase: str, done: int, total: int) -> None:
-    """Non-blocking push to the inter-process progress queue (no-op if queue absent)."""
+    """Non-blocking push to the progress queue (no-op if queue absent)."""
     q = _progress_q
     if q is not None:
         try:
@@ -200,7 +245,7 @@ def _load_flux_vae_only(flux_model_path: str):
 def _worker_init(qwen3_model_path: str, flux_model_path: str,
                  enable_siglip: bool, image_size: int, progress_q,
                  load_qwen3: bool = True, load_vae: bool = True) -> None:
-    """Load all models once per worker process.
+    """Load all models once.
 
     load_qwen3/load_vae: set False when the caller has confirmed all records
     are already cached, avoiding loading 8+ GB of model weights that would be
@@ -211,11 +256,12 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
     _progress_q = progress_q
     import mlx.core as mx  # noqa: F401 (ensures Metal context is initialised)
 
-    # Cap MLX GPU memory to 20 GB.  Qwen3-4B (~8 GB) + VAE (~0.5 GB) + SigLIP (~1.7 GB)
-    # fit comfortably.  Without a limit the Metal allocator can grow unboundedly and
-    # trigger jetsam on a 32 GB system under memory pressure from other processes.
+    # Cap MLX GPU memory to 14 GB.  Qwen3-4B (~8 GB) + VAE (~0.5 GB) + SigLIP (~1.7 GB)
+    # fit comfortably within this limit.  Keeping the cap lower (vs 20 GB) reduces
+    # memory pressure on 32 GB systems and leaves more headroom for the OS and other
+    # processes running concurrently with precompute.
     try:
-        mx.metal.set_memory_limit(20 * 1024 ** 3)
+        mx.metal.set_memory_limit(14 * 1024 ** 3)
     except AttributeError:
         pass  # MLX version does not expose set_memory_limit; safe to ignore
 
@@ -353,7 +399,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
                     [h9_np[j, :sl], h18_np[j, :sl], h27_np[j, :sl]], axis=-1
                 )
                 q, scale = _quantize_4bit(emb)
-                np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 written += 1
             if batch_idx % 32 == 31:
                 mx.clear_cache()
@@ -372,7 +418,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
                         np.array(h[27][0, :sl].astype(mx.float32)),
                     ], axis=-1)
                     q, scale = _quantize_4bit(emb)
-                    np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                    _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                     written += 1
                 except Exception as e2:
                     print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
@@ -461,7 +507,7 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
         latents_np = np.array(latents.astype(mx.float32))
         q_batch, scale_batch = _quantize_int8_batch(latents_np)
         for k, rec_id in enumerate(batch_ids):
-            np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q_batch[k], scale=scale_batch[k])
+            _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q_batch[k], scale=scale_batch[k])
         return len(batch_ids)
     except Exception as e:
         print(f"  VAE batch failed ({e}), retrying single", file=sys.stderr)
@@ -471,7 +517,7 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
                 latent = vae.encode(mx.array(img_np))
                 mx.eval(latent)
                 q, scale = _quantize_int8(np.array(latent[0].astype(mx.float32)))
-                np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 saved += 1
             except Exception as e2:
                 print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
@@ -498,7 +544,7 @@ def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
             feats_np = out.last_hidden_state.float().cpu().numpy()
         for k, rec_id in enumerate(batch_ids):
             q, scale = _quantize_4bit(feats_np[k].astype(np.float32))
-            np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+            _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
         return len(batch_ids)
     except Exception as e:
         print(f"  SigLIP batch failed ({e}), retrying single", file=sys.stderr)
@@ -516,7 +562,7 @@ def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
                         out = model_obj(pixel_values=pv)
                     feat_np = out.last_hidden_state[0].float().cpu().numpy()
                 q, scale = _quantize_4bit(feat_np.astype(np.float32))
-                np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 saved += 1
             except Exception as e2:
                 print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)
@@ -529,20 +575,21 @@ def _siglip_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
 
 def process_shard(args) -> dict:
     """
-    Worker: open each shard once and compute all requested outputs.
+    Process one shard: compute all requested outputs.
 
-    Phase 1  — sequential tar read → list of (rec_id, jpg_bytes, caption)
+    Phase 1  — partition records by which outputs are still needed
     Phase 2a — Qwen3:  tokenise+sort all pending captions, batched forward
     Phase 2b — VAE:    1-ahead image decode while GPU encodes
     Phase 2c — SigLIP: 1-ahead image decode while GPU encodes (optional)
     """
     shard_path, qwen3_out, vae_out, siglip_out, \
-        qwen3_batch, vae_batch, siglip_batch = args
+        qwen3_batch, vae_batch, siglip_batch, pre_records = args
 
     try:
         return _process_shard_inner(
             shard_path, qwen3_out, vae_out, siglip_out,
             qwen3_batch, vae_batch, siglip_batch,
+            pre_records=pre_records,
         )
     except Exception as e:
         print(f"Error processing {os.path.basename(shard_path)}: {e}", file=sys.stderr)
@@ -550,33 +597,32 @@ def process_shard(args) -> dict:
 
 
 def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
-                          qwen3_batch, vae_batch, siglip_batch) -> dict:
+                          qwen3_batch, vae_batch, siglip_batch,
+                          pre_records=None) -> dict:
     for d in filter(None, [qwen3_out, vae_out, siglip_out]):
         os.makedirs(d, exist_ok=True)
 
     import time as _time
     import mlx.core as _mx_gc
-    # Phase 1: read tar once — partition records by which outputs are still needed
+
+    # Phase 1: scan output dirs once (O(1) set lookup per record vs per-record stat).
+    # pre_records is a list pre-read by the IO prefetch thread during the previous
+    # shard's GPU phases; falls back to reading from disk if not provided.
     t1 = _time.time()
-    wq = wv = ws = 0          # already-written counts (resume)
-    pending_q: list = []      # (rec_id, caption) needing Qwen3
-    pending_v: list = []      # (rec_id, jpg_bytes, caption) needing VAE
-    pending_s: list = []      # needing SigLIP
+    existing_q = _scan_existing(qwen3_out)
+    existing_v = _scan_existing(vae_out)
+    existing_s = _scan_existing(siglip_out)
 
-    def _npz_valid(path: str) -> bool:
-        """Return True iff path exists and is non-empty (guards against partial writes)."""
-        try:
-            return os.path.getsize(path) > 0
-        except OSError:
-            return False
+    wq = wv = ws = 0
+    pending_q: list = []
+    pending_v: list = []
+    pending_s: list = []
 
-    for rec_id, jpg_bytes, caption in iter_shard(shard_path):
-        need_q = bool(qwen3_out) and not _npz_valid(
-            os.path.join(qwen3_out, f"{rec_id}.npz"))
-        need_v = bool(vae_out)   and not _npz_valid(
-            os.path.join(vae_out, f"{rec_id}.npz"))
-        need_s = bool(siglip_out) and not _npz_valid(
-            os.path.join(siglip_out, f"{rec_id}.npz"))
+    records_iter = pre_records if pre_records is not None else iter_shard(shard_path)
+    for rec_id, jpg_bytes, caption in records_iter:
+        need_q = bool(qwen3_out)   and rec_id not in existing_q
+        need_v = bool(vae_out)     and rec_id not in existing_v
+        need_s = bool(siglip_out)  and rec_id not in existing_s
 
         if not need_q and qwen3_out:
             wq += 1
@@ -699,11 +745,11 @@ def main():
     parser.add_argument("--image-size", type=int, default=512,
                         help="Image size for VAE (default 512; SigLIP always 384)")
     parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel processes (default 1; GPU-bound)")
-    parser.add_argument("--qwen3-batch", type=int, default=8,
-                        help="Captions per Qwen3 forward pass (default 8)")
-    parser.add_argument("--vae-batch", type=int, default=16,
-                        help="Images per VAE encode call (default 16)")
+                        help="Ignored (GPU precompute is single-threaded); kept for CLI compat")
+    parser.add_argument("--qwen3-batch", type=int, default=16,
+                        help="Captions per Qwen3 forward pass (default 16)")
+    parser.add_argument("--vae-batch", type=int, default=32,
+                        help="Images per VAE encode call (default 32)")
     parser.add_argument("--siglip-batch", type=int, default=8,
                         help="Images per SigLIP forward pass (default 8)")
     parser.add_argument("--max-shards", type=int, default=None,
@@ -725,6 +771,9 @@ def main():
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
     args = parser.parse_args()
+
+    if args.workers > 1:
+        print(f"  Note: --workers={args.workers} ignored; GPU precompute is single-threaded.")
 
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if not shards:
@@ -794,8 +843,7 @@ def main():
     print(f"  Flux model:   {args.flux_model}  → {args.vae_output}  (~{vae_gb:.0f} GB)")
     if siglip_out:
         print(f"  SigLIP:       google/siglip-so400m-patch14-384  → {siglip_out}  (~{siglip_gb:.0f} GB)")
-    print(f"  Workers: {args.workers}   "
-          f"Qwen3 batch: {args.qwen3_batch}   "
+    print(f"  Workers: 1   Qwen3 batch: {args.qwen3_batch}   "
           f"VAE batch: {args.vae_batch}"
           + (f"   SigLIP batch: {args.siglip_batch}" if siglip_out else ""))
     print()
@@ -810,16 +858,10 @@ def main():
         try:
             import itertools as _itools
             _sample = [(r, None, None) for r, _, _ in _itools.islice(iter_shard(shards[0]), 20)]
-            _load_qwen3 = any(
-                not (os.path.exists(_p := os.path.join(args.qwen3_output, f"{r}.npz"))
-                     and os.path.getsize(_p) > 0)
-                for r, _, _ in _sample
-            )
-            _load_vae = any(
-                not (os.path.exists(_p := os.path.join(args.vae_output, f"{r}.npz"))
-                     and os.path.getsize(_p) > 0)
-                for r, _, _ in _sample
-            )
+            _existing_q_sample = _scan_existing(args.qwen3_output)
+            _existing_v_sample = _scan_existing(args.vae_output)
+            _load_qwen3 = any(r not in _existing_q_sample for r, _, _ in _sample)
+            _load_vae   = any(r not in _existing_v_sample for r, _, _ in _sample)
         except Exception:
             pass  # can't sample → load both models to be safe
     if not _load_qwen3:
@@ -834,7 +876,7 @@ def main():
 
     work_items = [
         (s, _qwen3_work, _vae_work, siglip_out,
-         args.qwen3_batch, args.vae_batch, args.siglip_batch)
+         args.qwen3_batch, args.vae_batch, args.siglip_batch, None)
         for s in shards
     ]
 
@@ -847,8 +889,8 @@ def main():
     # Avoids the harmonic-mean trap where fast cache-hit shards mask growing compute time.
     recent_dts: _deque = _deque(maxlen=10)
 
-    # Inter-process progress queue: worker pushes {shard, phase, done, total} messages.
-    progress_q = multiprocessing.Queue()
+    # Thread-safe progress queue (no inter-process serialisation needed).
+    progress_q = _queue_mod.Queue()
 
     # Shared state updated by main loop and drained from progress_q; read by heartbeat thread.
     _hb_state = {"done": 0, "total": len(work_items), "pct": 0, "eta_sec": 0,
@@ -881,15 +923,29 @@ def main():
 
     _threading.Thread(target=_hb_thread, daemon=True).start()
 
-    with multiprocessing.Pool(
-        processes=args.workers,
-        initializer=_worker_init,
-        initargs=(args.qwen3_model, args.flux_model, args.siglip, args.image_size, progress_q,
-                  _load_qwen3, _load_vae),
-    ) as pool:
-        for done, result in enumerate(
-            pool.imap_unordered(process_shard, work_items, chunksize=1), 1
-        ):
+    # Load models once in the main process (no subprocess fork / pickle overhead).
+    _worker_init(args.qwen3_model, args.flux_model, args.siglip, args.image_size, progress_q,
+                 _load_qwen3, _load_vae)
+
+    def _read_shard_records(shard_path: str) -> list:
+        """Read all shard records into memory for IO prefetch."""
+        return list(iter_shard(shard_path))
+
+    # IO prefetch: submit next shard's tar read to a background thread so it
+    # overlaps with the current shard's GPU phases (Qwen3 ~5-10 min, VAE ~5-10 min).
+    # Peak extra RAM: one shard's raw JPEGs (~500 MB) held while the current shard
+    # processes — well within budget on a 32 GB system.
+    with ThreadPoolExecutor(max_workers=1) as io_exec:
+        prefetch = io_exec.submit(_read_shard_records, work_items[0][0]) if work_items else None
+
+        for seq_idx, base_item in enumerate(work_items):
+            pre_records = prefetch.result() if prefetch is not None else []
+            prefetch = None
+            if seq_idx + 1 < len(work_items):
+                prefetch = io_exec.submit(_read_shard_records, work_items[seq_idx + 1][0])
+
+            result = process_shard(base_item[:7] + (pre_records,))
+            done = seq_idx + 1
             results.append(result)
             t_now = _time.time()
             dt = t_now - t_last
