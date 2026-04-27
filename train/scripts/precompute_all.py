@@ -57,6 +57,14 @@ def _quantize_int8(arr: np.ndarray):
     return q, scale.astype(np.float16)
 
 
+def _quantize_int8_batch(arr: np.ndarray):
+    """Batch per-channel absmax int8 quantisation for VAE latents [B, 32, H, W]."""
+    scale = np.abs(arr).max(axis=(2, 3), keepdims=True) / 127.0
+    scale = np.where(scale == 0, 1e-8, scale)
+    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
+    return q, scale.astype(np.float16)
+
+
 def _quantize_4bit(arr: np.ndarray):
     """Per-token absmax 4-bit quantisation (nibble-packed) for [..., dim] arrays."""
     scale = np.abs(arr).max(axis=-1, keepdims=True) / 7.0
@@ -288,7 +296,7 @@ def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
 def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str = "") -> int:
     """
     Encode captions through Qwen3, save 4-bit quantised embeddings.
-    records: list of (rec_id, jpg_bytes, caption)
+    records: list of (rec_id, caption)
     Returns number successfully saved.
     """
     import mlx.core as mx
@@ -297,7 +305,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
     pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0)
 
     tokenized = []
-    for rec_id, _, caption in records:
+    for rec_id, caption in records:
         try:
             chat = [{"role": "user", "content": caption}]
             text = tokenizer.apply_chat_template(
@@ -345,11 +353,13 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
                 q, scale = _quantize_4bit(emb)
                 np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
                 written += 1
+            if batch_idx % 32 == 31:
+                mx.clear_cache()
         except Exception as e:
             print(f"  Qwen3 batch {i // batch_size} failed ({e}), retrying single",
                   file=sys.stderr)
             _batch_skipped = 0
-            for rec_id, caption, ids in batch:
+            for rec_id, _, ids in batch:
                 try:
                     sl = len(ids)
                     h = _qwen3_hidden_states(model, mx.array([ids]))
@@ -447,9 +457,9 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
             print(f"  [vae batch {_n}] n={len(batch_ids)} dt={_dt:.2f}s ({_dt/len(batch_ids):.3f}s/img)",
                   file=sys.stderr, flush=True)
         latents_np = np.array(latents.astype(mx.float32))
+        q_batch, scale_batch = _quantize_int8_batch(latents_np)
         for k, rec_id in enumerate(batch_ids):
-            q, scale = _quantize_int8(latents_np[k])
-            np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+            np.savez(os.path.join(out_dir, f"{rec_id}.npz"), q=q_batch[k], scale=scale_batch[k])
         return len(batch_ids)
     except Exception as e:
         print(f"  VAE batch failed ({e}), retrying single", file=sys.stderr)
@@ -547,8 +557,8 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     # Phase 1: read tar once — partition records by which outputs are still needed
     t1 = _time.time()
     wq = wv = ws = 0          # already-written counts (resume)
-    pending_q: list = []      # (rec_id, jpg_bytes, caption) needing Qwen3
-    pending_v: list = []      # needing VAE
+    pending_q: list = []      # (rec_id, caption) needing Qwen3
+    pending_v: list = []      # (rec_id, jpg_bytes, caption) needing VAE
     pending_s: list = []      # needing SigLIP
 
     def _npz_valid(path: str) -> bool:
@@ -573,13 +583,12 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
         if not need_s and siglip_out:
             ws += 1
 
-        rec = (rec_id, jpg_bytes, caption)
         if need_q:
-            pending_q.append(rec)
+            pending_q.append((rec_id, caption))
         if need_v:
-            pending_v.append(rec)
+            pending_v.append((rec_id, jpg_bytes, caption))
         if need_s:
-            pending_s.append(rec)
+            pending_s.append((rec_id, jpg_bytes, caption))
 
     t2 = _time.time()
     shard_name = os.path.basename(shard_path)
@@ -587,9 +596,12 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
           file=sys.stderr, flush=True)
 
     # Phase 2a: Qwen3
+    n_pending_q = len(pending_q)
+    wq_before = wq
     if pending_q:
-        _report_progress(shard_name, "qwen3", 0, len(pending_q))
+        _report_progress(shard_name, "qwen3", 0, n_pending_q)
         wq += _encode_qwen3(pending_q, qwen3_out, qwen3_batch, shard_name=shard_name)
+    pending_q.clear()
     t3 = _time.time()
     print(f"  [{shard_name}] qwen3={t3-t2:.1f}s", file=sys.stderr, flush=True)
     # Clear Metal free-list between Qwen3 and VAE phases to avoid buffer
@@ -597,16 +609,19 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     _mx_gc.clear_cache()
 
     # Phase 2b: VAE (1-ahead prefetch)
+    n_pending_v = len(pending_v)
+    wv_before = wv
     if pending_v:
         _W["_vae_batch_n"] = 0
         image_size = _W["image_size"]
-        _report_progress(shard_name, "vae", 0, len(pending_v))
+        _report_progress(shard_name, "vae", 0, n_pending_v)
         wv += _encode_with_prefetch(
             pending_v, vae_out, vae_batch,
             lambda jpg, tj: _preprocess_vae(jpg, image_size, tj),
             _vae_gpu_encode,
             phase="vae", shard_name=shard_name,
         )
+    pending_v.clear()
 
     # Phase 2c: SigLIP (1-ahead prefetch, optional)
     if pending_s and _W.get("siglip") is not None:
@@ -641,8 +656,8 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
         "shard": shard_path,
         "wq": wq, "wv": wv, "ws": ws,
         "error": False,
-        "skipped_q": len(pending_q) - wq,
-        "skipped_v": len(pending_v) - wv,
+        "skipped_q": n_pending_q - (wq - wq_before),
+        "skipped_v": n_pending_v - (wv - wv_before),
     }
 
 
