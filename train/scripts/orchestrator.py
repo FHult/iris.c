@@ -861,6 +861,11 @@ class Orchestrator:
                          f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
+            # Reset the trainer heartbeat timestamp so _check_heartbeats doesn't
+            # immediately flag the just-launched process as stale (old heartbeat
+            # from a previous crashed session can be hours old, triggering a kill
+            # within 60s before the new process has a chance to write its own).
+            write_heartbeat("trainer", chunk, status="booting", step=0)
 
         update_state(**{"chunks": {str(chunk): {
             "state": "TRAINING", "started_at": now_iso(),
