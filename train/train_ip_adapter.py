@@ -613,6 +613,17 @@ def train(config: dict) -> None:
         )
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
+    # Purge ALL checkpoint files from the OS page cache before loading anything.
+    # Checkpoints written in previous sessions (before msync eviction was added,
+    # or that were never loaded/purged) accumulate ~4 GB each in the unified
+    # buffer cache. With keep_last_n=5, that's up to 20 GB of inactive pages
+    # that psutil counts as "available" but Metal cannot use. Each crash-restart
+    # cycle adds more. Evicting the whole directory at startup clears the slate.
+    _ckpt_dir_for_purge = ocfg.get("checkpoint_dir", "")
+    if _ckpt_dir_for_purge:
+        for _cf in glob.glob(os.path.join(_ckpt_dir_for_purge, "*.safetensors")):
+            _purge_file_page_cache(_cf)
+
     start_step = 0
     loaded_ema: Optional[dict] = None
     if warmstart and os.path.isfile(warmstart):
