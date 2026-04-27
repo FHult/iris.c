@@ -62,7 +62,8 @@ def _parse_exit_code_from_msg(msg: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def _diagnose_crash(log_file: Path, exit_code: int) -> tuple[str, str]:
+def _diagnose_crash(log_file: Path, exit_code: int,
+                    mem_log: Optional[Path] = None) -> tuple[str, str]:
     """
     Return (reason, detail) describing why a training run crashed.
 
@@ -71,10 +72,20 @@ def _diagnose_crash(log_file: Path, exit_code: int) -> tuple[str, str]:
     Checks:
       1. Exit code — 137 (SIGKILL) almost always means jetsam on macOS.
       2. macOS system log — confirms whether a jetsam/memorystatus event fired.
-      3. Last memory reading from the training log — shows memory state at crash.
+      3. Last memory reading from the training log — memory state at crash.
+      4. memory_pressure.log tail — rolling vm_stat log from the watchdog thread.
     """
     last_mem = _parse_last_mem_from_log(log_file)
-    mem_str = f", last_mem={last_mem}" if last_mem else ""
+    mem_str = f", training_mem={last_mem}" if last_mem else ""
+
+    # Append the last two watchdog readings for context.
+    if mem_log and mem_log.exists():
+        try:
+            recent = mem_log.read_text().splitlines()[-2:]
+            if recent:
+                mem_str += "  watchdog=[" + " | ".join(ln.split("  ", 1)[-1] for ln in recent) + "]"
+        except OSError:
+            pass
 
     if exit_code != JETSAM_EXIT_CODE:
         return "code_error", f"exit {exit_code} (Python/logic error){mem_str}"
@@ -271,6 +282,12 @@ class Orchestrator:
 
         # Cache of last-written state per chunk — avoid redundant file writes
         self._last_written_state: dict[int, str] = {}
+
+        # Memory watchdog: background thread polls vm_stat every 30s and writes
+        # a rolling log so we have pre-crash memory state when training is killed.
+        self._mem_log = LOG_DIR / "memory_pressure.log"
+        self._mem_watchdog_stop = False
+        self._start_memory_watchdog()
 
         _validate_config(config)
 
@@ -914,7 +931,7 @@ class Orchestrator:
                 # Diagnose crash reason to decide retry policy.
                 exit_code = _parse_exit_code_from_msg(msg)
                 log_file = LOG_DIR / f"{step}_chunk{chunk}.log"
-                reason, detail = _diagnose_crash(log_file, exit_code)
+                reason, detail = _diagnose_crash(log_file, exit_code, self._mem_log)
                 is_jetsam = reason == "jetsam_oom"
                 max_retries = JETSAM_MAX_RETRIES if is_jetsam else 1
                 retry_delay = JETSAM_RETRY_DELAY_S if is_jetsam else 0
@@ -1176,6 +1193,76 @@ class Orchestrator:
                 _json.dump({"action": "pause"}, _f)
         except OSError:
             pass
+
+    # -----------------------------------------------------------------------
+    # Memory watchdog
+    # -----------------------------------------------------------------------
+
+    def _start_memory_watchdog(self) -> None:
+        """
+        Launch a daemon thread that polls vm_stat every 30 seconds and appends
+        a timestamped one-liner to memory_pressure.log.  On macOS, SIGKILL from
+        jetsam may not produce a JetsamEvent report for every kill.  This rolling
+        log gives us a pre-crash memory time-series so we can confirm memory
+        pressure after the fact.
+
+        Kept at 30-second granularity: low overhead, fine enough to bracket a
+        crash within one poll interval.
+        """
+        import threading
+
+        def _poll() -> None:
+            import subprocess as _sp
+            KEEP_LINES = 2880  # 24 h at 30 s per sample
+            while not self._mem_watchdog_stop:
+                try:
+                    vm = _sp.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+                    lines = vm.stdout.splitlines()
+                    # Extract the three most useful numbers: free, inactive, compressor
+                    stats: dict[str, int] = {}
+                    for ln in lines:
+                        for key, label in [
+                            ("Pages free", "free"),
+                            ("Pages inactive", "inactive"),
+                            ("Pages stored in compressor", "compressor"),
+                            ("Pages active", "active"),
+                            ("Pages wired down", "wired"),
+                        ]:
+                            if ln.startswith(key):
+                                try:
+                                    stats[label] = int(ln.split(":")[1].strip().rstrip("."))
+                                except ValueError:
+                                    pass
+                    page_kb = 16  # 16 KB pages on Apple Silicon
+                    def gb(pages: int) -> float:
+                        return pages * page_kb / 1e6
+                    entry = (
+                        f"{now_iso()}  "
+                        f"free={gb(stats.get('free', 0)):.2f}GB  "
+                        f"active={gb(stats.get('active', 0)):.2f}GB  "
+                        f"inactive={gb(stats.get('inactive', 0)):.2f}GB  "
+                        f"wired={gb(stats.get('wired', 0)):.2f}GB  "
+                        f"compressor={gb(stats.get('compressor', 0)):.2f}GB"
+                    )
+                    with open(self._mem_log, "a") as fh:
+                        fh.write(entry + "\n")
+                    # Trim to last KEEP_LINES to prevent unbounded growth.
+                    try:
+                        existing = self._mem_log.read_text().splitlines()
+                        if len(existing) > KEEP_LINES:
+                            self._mem_log.write_text("\n".join(existing[-KEEP_LINES:]) + "\n")
+                    except OSError:
+                        pass
+                except Exception:
+                    pass
+                # Sleep in short increments so _mem_watchdog_stop is checked promptly.
+                for _ in range(30):
+                    if self._mem_watchdog_stop:
+                        return
+                    time.sleep(1)
+
+        t = threading.Thread(target=_poll, name="mem-watchdog", daemon=True)
+        t.start()
 
     # -----------------------------------------------------------------------
     # Disk check
