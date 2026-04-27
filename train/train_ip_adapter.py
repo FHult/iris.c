@@ -144,16 +144,24 @@ def _git_sha() -> str:
 
 def _purge_file_page_cache(path: str) -> None:
     """
-    Evict a file from the macOS page cache to reclaim physical RAM.
+    Evict a file from the macOS unified buffer cache (page cache).
 
     mx.save_safetensors (and safetensors safe_open reads) leave file data in the
     kernel page cache. With ~4 GB checkpoint files, two consecutive reads or
     writes fill ~8 GB of page cache silently, reducing psutil 'available' memory
     and triggering jetsam even when MLX's own buffers fit within the 14 GB limit.
-    madvise(MADV_FREE) marks file-backed pages as immediately reclaimable.
+
+    madvise(MADV_FREE) is insufficient: on macOS it marks pages as reclaimable
+    but does not evict them immediately, so pages remain in physical RAM until
+    the kernel decides to free them — which may be after jetsam has already fired.
+
+    msync(MS_INVALIDATE=2) is synchronous: it flushes any dirty pages to the
+    backing store and then immediately evicts the pages from the UBC, reclaiming
+    physical RAM before the next Flux forward pass allocation.
     """
     try:
-        import mmap as _mmap
+        import ctypes as _ctypes, mmap as _mmap, numpy as _np
+        _libc = _ctypes.CDLL("libc.dylib", use_errno=True)
         _fd = os.open(path, os.O_RDONLY)
         try:
             _sz = os.fstat(_fd).st_size
@@ -161,7 +169,15 @@ def _purge_file_page_cache(path: str) -> None:
                 return
             _mm = _mmap.mmap(_fd, _sz, access=_mmap.ACCESS_READ)
             try:
-                _mm.madvise(_mmap.MADV_FREE)
+                # np.frombuffer is a zero-copy view; .ctypes.data gives the
+                # mmap base address without copying the 4 GB checkpoint data.
+                _arr = _np.frombuffer(_mm, dtype=_np.uint8)
+                _addr = _ctypes.c_void_p(_arr.ctypes.data)
+                # MS_INVALIDATE = 2: synchronously evict pages from the UBC.
+                # For a read-only file-backed mmap the flush is a no-op (no
+                # dirty pages), so only the eviction step runs.
+                _libc.msync(_addr, _ctypes.c_size_t(_sz), _ctypes.c_int(2))
+                del _arr  # release exported buffer ref before closing mmap
             finally:
                 _mm.close()
         finally:
