@@ -281,15 +281,17 @@ def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
     mask = create_attention_mask(h, cache[0])
     collected = {}
     target_set = set(target)
+    last_target = max(target_set)
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
         h = layer(h, mask, c)
         if i in target_set:
             collected[i] = h
-    # Evaluate the full forward pass so MLX can free the unevaluated graph
-    # nodes for layers after the last collected layer (28-35). Without this,
-    # those pending nodes accumulate across batches and cause Metal buffer
-    # pressure that grows with each shard (~625 batches/shard × 36 layers).
-    mx.eval(h)
+        if i == last_target:
+            break
+    # Evaluate only the layers we actually ran (0..last_target).
+    # Breaking early means layers after last_target are never added to the MLX
+    # computation graph, so there are no pending nodes to accumulate.
+    mx.eval(*collected.values())
     return collected
 
 
