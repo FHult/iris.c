@@ -142,6 +142,34 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _purge_file_page_cache(path: str) -> None:
+    """
+    Evict a file from the macOS page cache to reclaim physical RAM.
+
+    mx.save_safetensors (and safetensors safe_open reads) leave file data in the
+    kernel page cache. With ~4 GB checkpoint files, two consecutive reads or
+    writes fill ~8 GB of page cache silently, reducing psutil 'available' memory
+    and triggering jetsam even when MLX's own buffers fit within the 14 GB limit.
+    madvise(MADV_FREE) marks file-backed pages as immediately reclaimable.
+    """
+    try:
+        import mmap as _mmap
+        _fd = os.open(path, os.O_RDONLY)
+        try:
+            _sz = os.fstat(_fd).st_size
+            if _sz == 0:
+                return
+            _mm = _mmap.mmap(_fd, _sz, access=_mmap.ACCESS_READ)
+            try:
+                _mm.madvise(_mmap.MADV_FREE)
+            finally:
+                _mm.close()
+        finally:
+            os.close(_fd)
+    except Exception:
+        pass  # non-critical; pages reclaim naturally under pressure
+
+
 def save_checkpoint_async(
     adapter: IPAdapterKlein,
     ema_params: dict,
@@ -178,6 +206,7 @@ def save_checkpoint_async(
 
     mx.save_safetensors(ckpt_path, payload)
     del payload
+    _purge_file_page_cache(ckpt_path)  # reclaim ~4 GB OS page cache from the write
     mx.clear_cache()
 
     size_mb = os.path.getsize(ckpt_path) / 1e6
@@ -220,6 +249,7 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
             if not k.startswith("ema."):
                 params[k] = mx.array(f.get_tensor(k))
     _nested_update(adapter, params)
+    _purge_file_page_cache(path)  # reclaim ~4 GB OS page cache from the read
     print(f"Loaded checkpoint: {path}")
 
 
@@ -245,6 +275,7 @@ def load_ema_from_checkpoint(path: str) -> Optional[dict]:
                 flat[k] = mx.array(f.get_tensor(k))
     if not flat:
         return None
+    _purge_file_page_cache(path)  # reclaim ~4 GB OS page cache from the read
     return _flat_to_nested(flat)
 
 
