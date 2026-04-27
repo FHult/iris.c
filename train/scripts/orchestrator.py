@@ -709,16 +709,22 @@ class Orchestrator:
         # Window is gone — if a previous attempt left a log, check outcome.
         if log_file.exists():
             code = last_exit_code(log_file)
+            _train_token = f"train chunk {chunk}"
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
-                self.res.release("GPU_TOKEN")
+                if self.res.holder("GPU_TOKEN") == _train_token:
+                    self.res.release("GPU_TOKEN")
                 return
             if code is not None:
                 msg = f"Training exited {code}; see {log_file}"
                 log_orch(f"Chunk {chunk}: training FAILED — {msg}", level="error", chunk=chunk)
                 mark_error(chunk, "train", msg)
-                self.res.release("GPU_TOKEN")
+                # Only release if training holds the token — do NOT release a token
+                # held by another step (e.g. precompute on another chunk), which would
+                # let training start concurrently with that step on the same GPU.
+                if self.res.holder("GPU_TOKEN") == _train_token:
+                    self.res.release("GPU_TOKEN")
                 notify("iris pipeline ERROR", f"Training chunk {chunk} failed")
                 return
 
