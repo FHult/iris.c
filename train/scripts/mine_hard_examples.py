@@ -20,7 +20,7 @@ Usage:
         [--eval-records 5000] \\
         [--top-k 2000]
 
-Wall clock: ~15-20 min on M1 Max (Flux forward × 2500 steps).
+Wall clock: ~30-40 min on M1 Max at eval-batch=4 (default).
 
 Records that already exist in the output directory are not re-extracted.
 Re-running after a crash resumes safely.
@@ -29,6 +29,7 @@ Re-running after a crash resumes safely.
 import argparse
 import heapq
 import io
+import math
 import os
 import random
 import sys
@@ -205,6 +206,57 @@ def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
     return loss
 
 
+def _eval_loss_batch(adapter, flux, text_list, vae_list, siglip_list, null_kv=None) -> list:
+    """
+    Batch eval: compute flow-matching loss for N samples in one Flux forward pass.
+
+    All VAE latents must be the same spatial shape (standard: all 512×512 → [32,64,64]).
+    Text embeddings are zero-padded to max_seq within the batch; this slightly biases
+    absolute loss values but preserves relative ranking, which is all mining needs.
+
+    null_kv: precomputed (k_ip [1,B,128,3072], v_ip [1,B,128,3072]) for null-siglip
+             mode. Pass None when siglip_list carries real per-sample features.
+
+    Returns a list of N float losses (same order as inputs).
+    """
+    from ip_adapter.loss import fused_flow_noise, get_schedule_values
+    from train_ip_adapter import _flux_forward_with_ip
+
+    B = len(text_list)
+    latents = mx.array(np.stack(vae_list, axis=0), dtype=mx.bfloat16)  # [B, 32, H, W]
+
+    max_seq = max(t.shape[0] for t in text_list)
+    txt_dim = text_list[0].shape[1]
+    text_pad = np.zeros((B, max_seq, txt_dim), dtype=np.float16)
+    for i, t in enumerate(text_list):
+        text_pad[i, :t.shape[0]] = t
+    text_embeds = mx.array(text_pad, dtype=mx.bfloat16)  # [B, max_seq, txt_dim]
+
+    if null_kv is not None:
+        k_ip_all = mx.repeat(null_kv[0], B, axis=0)
+        v_ip_all = mx.repeat(null_kv[1], B, axis=0)
+    else:
+        siglip_feats = mx.array(np.stack(siglip_list, axis=0), dtype=mx.bfloat16)
+        ip_embeds = adapter.get_image_embeds(siglip_feats)
+        k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
+
+    t_int = mx.array([500] * B, dtype=mx.int32)
+    alpha_t, sigma_t = get_schedule_values(t_int)
+    noise = mx.random.normal(latents.shape, dtype=latents.dtype)
+    noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)
+
+    pred = _flux_forward_with_ip(
+        flux, noisy, text_embeds, t_int,
+        k_ip_all=k_ip_all,
+        v_ip_all=v_ip_all,
+        ip_scale=adapter.scale,
+    )
+    # Per-sample MSE: flatten spatial dims, mean over [C*H*W]
+    losses = mx.mean(((pred - target) ** 2).reshape(B, -1), axis=1).tolist()
+    mx.clear_cache()
+    return losses
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -248,6 +300,8 @@ def main():
                         help="Number of hard examples to extract (default 2000)")
     parser.add_argument("--shard-size",    type=int, default=500,
                         help="Max records per output .tar (default 500)")
+    parser.add_argument("--eval-batch",   type=int, default=4,
+                        help="Flux forward batch size during eval (default 4; use 1 if OOM)")
     parser.add_argument("--seed",          type=int, default=0)
     args = parser.parse_args()
 
@@ -357,10 +411,18 @@ def main():
     adapter.freeze()
     mx.eval(adapter.parameters())
 
+    # ── Precompute null IP KV once (null-siglip: same zeros for every sample) ───
+    null_kv = None
+    if args.null_siglip and args.eval_batch > 1:
+        _sg = mx.zeros((1, 729, 1152), dtype=mx.bfloat16)
+        _ip = adapter.get_image_embeds(_sg)
+        _nk, _nv = adapter.get_kv_all(_ip)
+        mx.eval(_nk, _nv)
+        null_kv = (_nk, _nv)
+        print(f"  Null IP KV precomputed — reused for all batches (eval_batch={args.eval_batch}).")
+
     # ── Eval pass — pass 1: compute loss per record ───────────────────────────
     print(f"\nPass 1: computing loss for {n_eval:,} records...")
-    # Min-heap of size top_k: (loss, rec_id, shard_path)
-    # We keep a MAX-heap via negation so we can efficiently drop the lowest.
     heap = []   # (-loss, rec_id, shard_path)  — max-heap of top-K
     done = 0
     skipped = 0
@@ -375,6 +437,45 @@ def main():
 
     hb = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb.start()
+
+    _buf_text: list = []
+    _buf_vae:  list = []
+    _buf_sg:   list = []
+    _buf_meta: list = []
+
+    def _flush():
+        nonlocal done, skipped
+        if not _buf_text:
+            return
+        try:
+            losses = _eval_loss_batch(adapter, flux, _buf_text, _buf_vae, _buf_sg, null_kv)
+        except Exception as e:
+            import traceback
+            print(f"  Batch ({len(_buf_text)}) failed ({e}), retrying serial", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            losses = []
+            for t, v, s in zip(_buf_text, _buf_vae, _buf_sg):
+                try:
+                    losses.append(_eval_loss(adapter, flux, t, v, s))
+                except Exception:
+                    losses.append(math.nan)
+
+        for loss, (r_id, s_path) in zip(losses, _buf_meta):
+            if math.isnan(loss):
+                skipped += 1
+                continue
+            entry = (-loss, r_id, s_path)
+            if len(heap) < args.top_k:
+                heapq.heappush(heap, entry)
+            elif entry > heap[0]:
+                heapq.heapreplace(heap, entry)
+            done += 1
+            if done % 100 == 0:
+                threshold = -heap[0][0] if heap else 0.0
+                print(f"  [{done}/{n_eval}]  skipped={skipped}  "
+                      f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
+
+        _buf_text.clear(); _buf_vae.clear(); _buf_sg.clear(); _buf_meta.clear()
 
     for rec_id, shard_path in sample:
         text_np   = _load_qwen3(rec_id, args.qwen3_cache)
@@ -403,29 +504,21 @@ def main():
             skipped += 1
             continue
 
-        try:
-            loss = _eval_loss(adapter, flux, text_np, vae_np, siglip_np)
-        except Exception as e:
-            import traceback
-            print(f"  Warning: eval failed for {rec_id}: {e}", file=sys.stderr)
-            if done == 0 and skipped < 2:
-                traceback.print_exc(file=sys.stderr)
-            skipped += 1
-            continue
+        _buf_text.append(text_np)
+        _buf_vae.append(vae_np)
+        _buf_sg.append(siglip_np)
+        _buf_meta.append((rec_id, shard_path))
 
-        entry = (-loss, rec_id, shard_path)
-        if len(heap) < args.top_k:
-            heapq.heappush(heap, entry)
-        elif entry > heap[0]:   # loss > current min in heap
-            heapq.heapreplace(heap, entry)
+        if len(_buf_text) >= args.eval_batch:
+            _flush()
 
-        done += 1
-        if done % 100 == 0 or done == n_eval:
-            threshold = -heap[0][0] if heap else 0.0
-            print(f"  [{done}/{n_eval}]  skipped={skipped}  "
-                  f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
+    _flush()  # drain any remaining partial batch
 
     eval_done_event.set()
+    if done % 100 != 0 and done > 0:
+        threshold = -heap[0][0] if heap else 0.0
+        print(f"  [{done}/{n_eval}]  skipped={skipped}  "
+              f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
     write_heartbeat("mine_hard_examples", args.chunk, done=done, total=n_eval, pct=100)
 
     print(f"\nEval complete: {done} evaluated, {skipped} skipped, "
