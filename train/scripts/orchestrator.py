@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,75 @@ from pipeline_lib import (
     tmux_session_exists, tmux_window_exists, tmux_new_window,
     last_exit_code, free_gb, notify, now_iso, load_config,
 )
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery policy
+# ---------------------------------------------------------------------------
+
+# macOS jetsam (OOM) sends SIGKILL → EXIT_CODE 137. Jetsam kills are transient:
+# the system had a memory spike, but training itself is not broken. Retry more
+# aggressively than for real code errors, with a backoff to let pressure settle.
+JETSAM_EXIT_CODE      = 137
+JETSAM_MAX_RETRIES    = 5   # up to 5 retries for transient OS kills
+JETSAM_RETRY_DELAY_S  = 90  # seconds to wait before relaunching
+
+
+def _parse_exit_code_from_msg(msg: str) -> int:
+    """Extract numeric exit code from 'Training exited 137; ...' error message."""
+    m = re.search(r"exited (\d+)", msg or "")
+    return int(m.group(1)) if m else -1
+
+
+def _diagnose_crash(log_file: Path, exit_code: int) -> tuple[str, str]:
+    """
+    Return (reason, detail) describing why a training run crashed.
+
+    reason is one of: "jetsam_oom" | "code_error" | "unknown"
+
+    Checks:
+      1. Exit code — 137 (SIGKILL) almost always means jetsam on macOS.
+      2. macOS system log — confirms whether a jetsam/memorystatus event fired.
+      3. Last memory reading from the training log — shows memory state at crash.
+    """
+    last_mem = _parse_last_mem_from_log(log_file)
+    mem_str = f", last_mem={last_mem}" if last_mem else ""
+
+    if exit_code != JETSAM_EXIT_CODE:
+        return "code_error", f"exit {exit_code} (Python/logic error){mem_str}"
+
+    # exit 137 = SIGKILL. Query system log to confirm jetsam.
+    jetsam_confirmed = _query_macos_jetsam_log()
+    if jetsam_confirmed:
+        return "jetsam_oom", f"exit 137, jetsam confirmed in system log{mem_str}"
+    # SIGKILL without a logged jetsam event: still treat as jetsam (system log
+    # can be delayed or filtered); the exit code is sufficient evidence on macOS.
+    return "jetsam_oom", f"exit 137, assumed jetsam (SIGKILL){mem_str}"
+
+
+def _parse_last_mem_from_log(log_file: Path) -> str:
+    """Return the last 'X GB used  Y GB free' string from the training log."""
+    try:
+        text = log_file.read_text(errors="replace")
+        matches = re.findall(r"mem:\s+([\d.]+ GB used\s+[\d.]+ GB free)", text)
+        return matches[-1] if matches else ""
+    except OSError:
+        return ""
+
+
+def _query_macos_jetsam_log(lookback_secs: int = 600) -> bool:
+    """Return True if a jetsam/memorystatus kill event appears in the system log."""
+    try:
+        r = subprocess.run(
+            ["log", "show",
+             "--predicate", "eventMessage contains \"jetsam\" OR "
+                            "eventMessage contains \"memorystatus\"",
+             "--last", f"{lookback_secs}s"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +255,8 @@ class Orchestrator:
         self.scale        = config.get("scale", "small")
         self.issue_counter = 0
         self._restart_counts: dict[tuple, int] = {}
+        # Retry backoff: {(chunk, step) → earliest epoch_sec to retry}
+        self._retry_after: dict[tuple, float] = {}
 
         # Track what is currently running in the prep window:
         # {"chunk": N, "step": "build_shards", "log": Path, "token": "DISK_WRITE_HIGH"|None}
@@ -838,9 +910,35 @@ class Orchestrator:
                 msg = read_error(chunk, step)
                 key = (chunk, step)
                 restarts = self._restart_counts.get(key, 0)
-                if restarts < 1:
-                    log_orch(f"Chunk {chunk}: auto-retrying {step}", chunk=chunk)
+
+                # Diagnose crash reason to decide retry policy.
+                exit_code = _parse_exit_code_from_msg(msg)
+                log_file = LOG_DIR / f"{step}_chunk{chunk}.log"
+                reason, detail = _diagnose_crash(log_file, exit_code)
+                is_jetsam = reason == "jetsam_oom"
+                max_retries = JETSAM_MAX_RETRIES if is_jetsam else 1
+                retry_delay = JETSAM_RETRY_DELAY_S if is_jetsam else 0
+
+                if restarts < max_retries:
+                    # Honour backoff window: don't relaunch until pressure settles.
+                    retry_at = self._retry_after.get(key, 0.0)
+                    if time.time() < retry_at:
+                        remaining = int(retry_at - time.time())
+                        log_orch(
+                            f"Chunk {chunk}: {step} retry #{restarts + 1}/{max_retries} "
+                            f"pending — {remaining}s backoff remaining ({reason})",
+                            chunk=chunk,
+                        )
+                        break
+
+                    log_orch(
+                        f"Chunk {chunk}: auto-retrying {step} "
+                        f"({detail}, attempt {restarts + 1}/{max_retries})",
+                        chunk=chunk,
+                    )
                     self._restart_counts[key] = restarts + 1
+                    if retry_delay > 0:
+                        self._retry_after[key] = time.time() + retry_delay
                     clear_error(chunk, step)
                     # Rename the old step log with a timestamp so _start_training
                     # (and similar detection loops) don't re-read a stale EXIT_CODE,
@@ -851,11 +949,18 @@ class Orchestrator:
                         old_log.rename(old_log.with_suffix(f".{ts}.log"))
                 else:
                     issue_id = self._next_issue_id()
-                    log_orch(f"Chunk {chunk}: {step} failed twice — escalating", level="error")
-                    dispatch_issue(issue_id, "error",
-                                   f"{step} chunk {chunk} failed twice — manual intervention needed",
-                                   chunk=chunk, process=step, context={"error": msg},
-                                   suggested_action="investigate_logs_and_clear_error")
+                    log_orch(
+                        f"Chunk {chunk}: {step} failed {restarts + 1} times "
+                        f"({reason}) — escalating",
+                        level="error", chunk=chunk,
+                    )
+                    dispatch_issue(
+                        issue_id, "error",
+                        f"{step} chunk {chunk} failed {restarts + 1} times "
+                        f"({reason}: {detail}) — manual intervention needed",
+                        chunk=chunk, process=step, context={"error": msg},
+                        suggested_action="investigate_logs_and_clear_error",
+                    )
                 break
 
     # -----------------------------------------------------------------------
@@ -1044,8 +1149,8 @@ class Orchestrator:
         key = ("restart_trainer", chunk)
         count = self._restart_counts.get(key, 0) + 1
         self._restart_counts[key] = count
-        if count > 3:
-            log_orch(f"Chunk {chunk}: trainer restart limit (3) exceeded — aborting",
+        if count > JETSAM_MAX_RETRIES:
+            log_orch(f"Chunk {chunk}: trainer restart limit ({JETSAM_MAX_RETRIES}) exceeded — aborting",
                      level="error", chunk=chunk)
             dispatch_issue(self._next_issue_id(), "critical",
                            f"Trainer restart limit exceeded for chunk {chunk}",
