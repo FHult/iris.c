@@ -101,19 +101,22 @@ PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke \
 ---
 
 ### `start` — Start or resume the orchestrator
-```bash
-# Production run (starts or resumes):
-tmux new-session -d -s iris -n iris-orch
-tmux send-keys -t iris:iris-orch \
-  "PIPELINE_DATA_ROOT=/Volumes/2TBSSD train/.venv/bin/python train/scripts/orchestrator.py \
-   --config train/configs/v2_pipeline.yaml 2>&1 | tee /Volumes/2TBSSD/logs/orchestrator.log" \
-  Enter
 
-# Smoke test (full pipeline at tiny scale):
-tmux new-session -d -s iris -n iris-orch
+**Preferred — use `pipeline_ctl.py` (wraps with `caffeinate -dim`, manages the tmux window):**
+```bash
+# Create the tmux session if it doesn't exist yet, then start:
+tmux new-session -d -s iris -n iris-orch 2>/dev/null || true
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator
+```
+
+**Smoke test (full pipeline at tiny scale):**
+```bash
+tmux new-session -d -s iris -n iris-orch 2>/dev/null || true
 tmux send-keys -t iris:iris-orch \
-  "PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke train/.venv/bin/python train/scripts/orchestrator.py \
-   --config train/configs/v2_pipeline_smoke.yaml 2>&1 | tee /Volumes/2TBSSD/smoke/logs/orchestrator.log" \
+  "PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke caffeinate -dim \
+   train/.venv/bin/python train/scripts/orchestrator.py --resume \
+   --config train/configs/v2_pipeline_smoke.yaml" \
   Enter
 ```
 
@@ -133,9 +136,10 @@ PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
   train/.venv/bin/python train/scripts/pipeline_ctl.py pause
 ```
 
-Resume (simply restart the orchestrator — it picks up from state):
+Resume (restart the orchestrator — it picks up from state):
 ```bash
-# Same as start above
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator
 ```
 
 ---

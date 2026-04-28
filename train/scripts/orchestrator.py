@@ -1114,6 +1114,19 @@ class Orchestrator:
 
         # ── Heartbeat staleness → crash detection + restart ──────────────────
         if age is not None and age > HEARTBEAT_STALE_SECS:
+            hb_step = (hb or {}).get("step", 0)
+            hb_status = (hb or {}).get("status", "")
+            # Boot-phase grace: model load + graph compile can take 20–30 min.
+            # If the training window is still alive and the heartbeat shows step=0
+            # (or status="booting"), the process is loading — do not restart it.
+            # A genuine hang during load would require manual intervention anyway.
+            if (hb_step == 0 or hb_status == "booting") and tmux_window_exists(TMUX_TRAIN_WIN):
+                log_orch(
+                    f"Chunk {chunk}: heartbeat stale ({age:.0f}s) but training still "
+                    f"in boot phase (step=0, window alive) — waiting",
+                    level="warning", chunk=chunk,
+                )
+                return
             log_orch(f"Chunk {chunk}: trainer heartbeat stale ({age:.0f}s) — restarting",
                      level="error", chunk=chunk)
             self._dispatch_once(f"stale_{chunk}", self._next_issue_id(), "error",
@@ -1128,6 +1141,12 @@ class Orchestrator:
 
         loss = hb.get("loss")
         step = hb.get("step", 0)
+
+        # Reset stale-restart counter once the training loop is running.
+        # Successful boot means any previous restart budget from boot-phase kills
+        # is no longer relevant; fresh budget for real mid-training hangs.
+        if step > 0:
+            self._restart_counts.pop(("restart_trainer", chunk), None)
 
         # ── Loss NaN/Inf → immediate pause ───────────────────────────────────
         if loss is not None and (math.isnan(loss) or math.isinf(loss)):
@@ -1330,6 +1349,10 @@ class Orchestrator:
                 if chunk and step:
                     key = (chunk, step)
                     self._restart_counts.pop(key, None)
+                    # Also reset the stale-restart counter so a retry after manual
+                    # intervention doesn't immediately hit the inherited limit.
+                    if step == "train":
+                        self._restart_counts.pop(("restart_trainer", chunk), None)
                     clear_error(chunk, step)
                     # Archive any stale log that still has EXIT_CODE at the end.
                     # _start_training() reads the log to detect completion/failure;
