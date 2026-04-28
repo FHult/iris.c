@@ -359,6 +359,16 @@ def print_human(status: dict, verbose: bool = False) -> None:
                     grad_str = f"  grad={grad:.2f}" if grad is not None else ""
                     eta_str2 = f"  ETA {_age_str(eta)}" if eta else ""
                     print(f"    {active}: step {step_n}/{total_s}  loss={loss}{grad_str}{eta_str2}  hb {age_str} ago{stale_mark}")
+                    mlx_act = hb.get("mlx_active_gb")
+                    mlx_pk  = hb.get("mlx_peak_gb")
+                    sys_avail = hb.get("mem_available_gb")
+                    mem_parts = []
+                    if mlx_act is not None:
+                        mem_parts.append(f"mlx={mlx_act:.1f}GB active/{mlx_pk:.1f}GB peak" if mlx_pk is not None else f"mlx={mlx_act:.1f}GB")
+                    if sys_avail is not None:
+                        mem_parts.append(f"sys_free={sys_avail:.1f}GB")
+                    if mem_parts:
+                        print(f"           mem: {' | '.join(mem_parts)}")
                 else:
                     done    = hb.get("done", 0)
                     total_n = hb.get("total", 0)
