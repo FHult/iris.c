@@ -46,21 +46,21 @@
 
 ## Training Quality Improvements
 
-- **PERF-1: Reduce eval frequency** — Change `log_every: 100` to `log_every: 500` in `train/configs/stage1_512px.yaml` (and any other config files). Eval consumes 20% of compute time (104s per 100 steps vs 416s forward). At log_every=500 this saves ~16–17% wall-clock time — roughly 8h on a full 105K-step run, or ~1 full day across the 4-chunk pipeline.
+- ~~**PERF-1: Reduce eval frequency**~~ ✅ DONE — `log_every` changed 100 → 500 in `train/configs/stage1_512px.yaml`. Saves ~16–17% wall-clock. Takes effect on next training restart.
 
-- **PERF-2: Logit-normal timestep sampling** — Currently using uniform timestep sampling. High-noise timesteps (t→1) produce inherently large flow-matching loss, causing raw loss to swing 0.30–2.84 with no readable trend. Logit-normal weighting (standard in Flux-family training) concentrates samples at middle timesteps where the model learns structure, reducing variance ~40% and making loss curves interpretable. One-line change to the timestep sampler in `ip_adapter/loss.py`.
+- **PERF-2: Logit-normal timestep sampling** — Currently using uniform timestep sampling. High-noise timesteps (t→1) produce inherently large flow-matching loss, causing raw loss to swing 0.30–2.84 with no readable trend. Logit-normal weighting (standard in Flux-family training) concentrates samples at middle timesteps where the model learns structure, reducing variance ~40% and making loss curves interpretable. One-line change to the timestep sampler in `train_ip_adapter.py` (line 939: `mx.random.randint(0, 1000, ...)` → logit-normal inverse CDF).
 
-- **PIPELINE-1: Verify anchor_shard_dir is set for chunks 2–4** — Config has `anchor_mix_ratio: 0.20` but `anchor_shard_dir: null` for chunk 1. For chunks 2–4, the pipeline script must pass the anchor shard directory when launching training, otherwise the 20% anchor slot silently falls through to nothing. Verify `run_training_pipeline.sh` passes `--anchor-shard-dir` correctly for subsequent chunks.
+- **PIPELINE-1: Fix anchor_shard_dir for chunks 2–4** — `stage1_512px.yaml` has `anchor_mix_ratio: 0.20` but `anchor_shard_dir: null`. The orchestrator's `_start_training()` never passes `--anchor-shards`. Anchor mixing is silently disabled for ALL chunks. Fix: add `anchor_shards` config section to `v2_pipeline.yaml` specifying which shard dir to use (likely the chunk 1 promoted shards), and pass `--anchor-shards` in `_start_training()` for chunk ≥ 2. Must be done before chunk 2 training begins.
 
-- **PIPELINE-2: Check SigLIP coverage before each chunk** — Training script prints `WARNING: SigLIP cache coverage X%` at startup if any shards are missing siglip precompute. Shards missing siglip fall back to zero image features, silently degrading image conditioning for those batches. Before starting each chunk's precompute, grep the startup log for this warning. Add a coverage check to the pipeline script (fail loudly if coverage < 100%).
-
-- **PIPELINE-4: Investigate MLX CLIP for clip_embed step** — `clip_dedup.py` currently uses `open_clip` ViT-L-14 via PyTorch MPS (fp16). MLX is installed in the venv (`mlx==0.31.1`) but `mlx_clip` is not. MLX runs natively on Apple Silicon without PyTorch overhead and may offer meaningfully higher throughput for the embedding step. Measure actual img/s on a real chunk before implementing; only worthwhile if clip_embed is a bottleneck. Implementation: `pip install mlx-clip`, add MLX branch to `_load_clip()` / `_embed_batch()` in `clip_dedup.py`.
-
-- **PIPELINE-5: Enforce single GPU token across ALL GPU-bound steps** — The current `GPU_TOKEN` resource in `orchestrator.py` is checked before starting training, precompute, clip_embed, mine, and validate — but only within the orchestrator. External manual runs (e.g. a manual `precompute_all.py` fill run) bypass the token entirely. Additionally, `GPU_TOKEN` does not prevent the orchestrator from starting a second GPU step if the first step completes while a manual job is still running. Fix: (1) write a lock file to a known path (e.g. `/Volumes/2TBSSD/.gpu_lock`) at the start of every GPU job and delete it on exit; (2) all GPU step launchers (orchestrator + manual scripts) must acquire this lock before starting. Alternative: run all GPU jobs via a lightweight job queue (a single tmux window that serialises GPU work).
+- ~~**PIPELINE-2: Check SigLIP coverage before each chunk**~~ ✅ DONE — `_promote_chunk()` in `orchestrator.py` enforces ≥90% siglip coverage when `training.siglip: true` in the pipeline config; fails promotion with a hard error if coverage is insufficient.
 
 - **PIPELINE-3: Never run pipeline jobs while training is active on 2TBSSD** — Two epoch-boundary stalls during chunk 1 training (at steps ~19,900 and ~24,900) were extended by competing I/O from the JDB chunk 2 conversion running in parallel. The step ~24,900 stall lasted 2.6h instead of the typical ~15–20min. Rule: fully complete all pipeline work (WDS conversion, precompute) before starting training, or ensure pipeline and training use separate storage volumes.
 
-- **RESILIENCE-1: Wrap training in tmux** — Training runs in a foreground terminal under `caffeinate`. If the terminal closes, the run dies silently. All multi-day training runs must be launched inside a tmux session. Add to DISPATCH.md launch instructions.
+- **PIPELINE-4: Investigate MLX CLIP for clip_embed step** — `clip_dedup.py` currently uses `open_clip` ViT-L-14 via PyTorch MPS (fp16). MLX is installed in the venv (`mlx==0.31.1`) but `mlx_clip` is not. MLX runs natively on Apple Silicon without PyTorch overhead and may offer meaningfully higher throughput for the embedding step. Measure actual img/s on a real chunk before implementing; only worthwhile if clip_embed is a bottleneck. Implementation: `pip install mlx-clip`, add MLX branch to `_load_clip()` / `_embed_batch()` in `clip_dedup.py`.
+
+- **PIPELINE-5: Enforce single GPU token across ALL GPU-bound steps** — The current `GPU_TOKEN` resource in `orchestrator.py` is checked before starting training, precompute, clip_embed, mine, and validate — but only within the orchestrator. External manual runs (e.g. a manual `precompute_all.py` fill run) bypass the token entirely. Fix: (1) write a lock file to `/Volumes/2TBSSD/.gpu_lock` at the start of every GPU job and delete it on exit; (2) all GPU step launchers (orchestrator + manual scripts) must acquire this lock before starting.
+
+- ~~**RESILIENCE-1: Wrap training in tmux**~~ ✅ DONE — Orchestrator launches training in a dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator itself runs in `iris-orch` window via `pipeline_ctl.py restart-orchestrator`, also wrapped in `caffeinate -dim` (commit 6f9e7e6). DISPATCH.md already shows tmux launch commands.
 
 ---
 
@@ -90,14 +90,11 @@
 
 ## Metal / GPU Performance
 <!-- Items from memory/perf_backlog.md. BL-004 and BL-005 are M3+ only — skip on M1/M2.
-     BL-002 and BL-003 apply to all Apple Silicon and are the highest-value open items.
-     Already completed: BL-001 (Float32 SDPA), BL-006 (MTLResidencySet), BL-007 (graph cache sizes), VAE-GPU-ATTN. -->
+     Already completed: BL-001 (Float32 SDPA), BL-002 (SIMD reductions), BL-003 (bias fusion),
+     BL-006 (MTLResidencySet), BL-007 (graph cache sizes), BL-008 (Qwen3 causal SDPA), VAE-GPU-ATTN. -->
 
-- **BL-002: SIMD Group Reductions** — all Apple Silicon
-- **BL-003: GPU Bias Fusion** — all Apple Silicon
 - **BL-004: simdgroup_matrix for Custom GEMM Tiles** — M3+ only
 - **BL-005: Native bfloat MSL Type** — M3+ only
-- **BL-008: Qwen3 Causal Attention MPSGraph fallback** — all Apple Silicon
 
 ---
 

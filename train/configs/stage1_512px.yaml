@@ -48,7 +48,7 @@ output:
   checkpoint_dir: "train/data/checkpoints/stage1"
   checkpoint_every: 200                    # steps between checkpoints (~17min at 0.19 steps/s)
   keep_last_n: 5
-  log_every: 100
+  log_every: 500
 
 logging:
   # wandb_project: "iris-ip-adapter"
