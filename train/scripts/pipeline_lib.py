@@ -44,8 +44,10 @@ TMUX_PREP_WIN  = "iris-prep"
 TMUX_ORCH_WIN  = "iris-orch"
 TMUX_WATCH_WIN = "iris-watchdog"
 
-# Trainer heartbeat is written every log_every steps (~100 steps at ~0.19 steps/s ≈ 526s).
-# The threshold must exceed that interval with a safety margin.  900s = ~1.7× the interval.
+# Trainer heartbeat is written every min(log_every, 100) steps.
+# At 0.19 steps/s: 100 steps ≈ 526s.  900s = ~1.7× that interval.
+# NOTE: heartbeat is decoupled from log_every in train_ip_adapter.py so that
+# large log intervals (e.g. 500 steps ≈ 44 min) do not exceed this threshold.
 HEARTBEAT_STALE_SECS = 900
 DISK_WARN_GB  = 80
 DISK_ABORT_GB = 40

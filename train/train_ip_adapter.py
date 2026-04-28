@@ -863,6 +863,16 @@ def train(config: dict) -> None:
 
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
+    # Heartbeat is written every _heartbeat_every steps, independent of log_every.
+    # When log_every is large (e.g. 500 steps × 0.19 sps ≈ 44 min) the log block
+    # fires too infrequently to keep the orchestrator's 900 s stale threshold happy.
+    _heartbeat_every = min(log_interval, 100)
+    _hb_t0 = time.time()
+    _hb_loss = 0.0
+    _hb_loss_smooth = 0.0
+    _hb_siglip_cov = 100.0   # last known from log block; 100% until first log fires
+    _hb_loader_pct = 0.0     # last known from log block
+
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
             break
@@ -1134,6 +1144,9 @@ def train(config: dict) -> None:
                 if _siglip_cov < 90:
                     print(f"  WARNING: SigLIP coverage below 90%", flush=True)
             _siglip_miss_steps = 0
+            # Keep inter-log heartbeats up-to-date with latest quality metrics.
+            _hb_siglip_cov = _siglip_cov
+            _hb_loader_pct = _loader_pct
 
             # T-11: gradient clipping report
             if _grad_clip_steps > 0:
@@ -1191,6 +1204,37 @@ def train(config: dict) -> None:
             mx.clear_cache()
             import gc; gc.collect()
             t0 = time.time()
+
+        # Heartbeat — decoupled from log_every so the orchestrator always sees
+        # liveness even when log_every is large.  The full rich heartbeat is
+        # written by the log block above at log_interval steps; this lightweight
+        # one fires at _heartbeat_every (≤100) steps for the intervals between.
+        if step % _heartbeat_every == 0 and step > 0:
+            _hb_elapsed = time.time() - _hb_t0
+            _hb_t0 = time.time()
+            _hb_sps = _heartbeat_every / _hb_elapsed if _hb_elapsed > 0 else 0.0
+            _hb_loss = float(loss_val.item())
+            _hb_loss_smooth = 0.98 * _hb_loss_smooth + 0.02 * _hb_loss
+            if step % log_interval != 0:
+                try:
+                    from pipeline_lib import write_heartbeat as _write_hb
+                    _write_hb(
+                        "trainer", _pipeline_chunk,
+                        step=step,
+                        total_steps=tcfg["num_steps"],
+                        loss=round(_hb_loss, 6),
+                        loss_smooth=round(_hb_loss_smooth, 6),
+                        lr=float(optimizer.learning_rate),
+                        steps_per_sec=round(_hb_sps, 4),
+                        eta_sec=int((tcfg["num_steps"] - step) / _hb_sps) if _hb_sps > 0 else 0,
+                        elapsed_seconds=int(time.time() - t_start),
+                        grad_norm=round(_gn, 4),
+                        grad_norm_smooth=round(grad_norm_smooth, 4),
+                        siglip_coverage_pct=_hb_siglip_cov,
+                        loader_wait_pct=_hb_loader_pct,
+                    )
+                except Exception:
+                    pass
 
         # Checkpoint (async background write; plans §3.12)
         if step % ocfg["checkpoint_every"] == 0:
