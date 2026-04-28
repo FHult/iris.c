@@ -261,9 +261,8 @@ def _write_shard_range(args) -> dict:
     # Output tars are opened lazily on first write so that a crash mid-run
     # does not leave empty stub files that would be mistaken for completed shards.
     # Each shard is written to a .tar.tmp temp file and atomically renamed to .tar
-    # only when it reaches shard_size records.  A re-run will skip any .tar that
-    # already exists on disk (from a previous complete run) even if shard_id >=
-    # write_from, preventing a restart from truncating finished shards.
+    # only when it reaches shard_size records.  A re-run skips any .tar that
+    # already exists on disk, preventing a restart from truncating finished shards.
     shard_plan = {sid: recs for sid, recs in shard_plan.items()
                   if not os.path.exists(os.path.join(output_dir, f"{sid:06d}.tar"))}
     if not shard_plan:
