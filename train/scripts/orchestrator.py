@@ -54,6 +54,7 @@ from pipeline_lib import (
 # aggressively than for real code errors, with a backoff to let pressure settle.
 JETSAM_EXIT_CODE      = 137
 JETSAM_MAX_RETRIES    = 5   # up to 5 retries for transient OS kills
+PREP_HUNG_HOURS       = 6   # dispatch alert if a prep step runs longer than this
 JETSAM_RETRY_DELAY_S  = 90  # seconds to wait before relaunching
 
 
@@ -357,6 +358,19 @@ class Orchestrator:
         if self._active_prep is None:
             return
         if tmux_window_exists(TMUX_PREP_WIN):
+            # Alert if the prep window has been alive far longer than expected.
+            elapsed_h = (time.time() - self._active_prep.get("started_at", time.time())) / 3600
+            if elapsed_h > PREP_HUNG_HOURS:
+                ap = self._active_prep
+                self._dispatch_once(
+                    f"hung_prep_{ap['chunk']}_{ap['step']}",
+                    self._next_issue_id(), "warning",
+                    f"{ap['step']} chunk {ap['chunk']} has been running {elapsed_h:.1f}h "
+                    f"(threshold {PREP_HUNG_HOURS}h) — may be hung",
+                    chunk=ap["chunk"], process=ap["step"],
+                    suggested_action="check_prep_log_and_kill_if_stuck",
+                    cooldown_secs=3600,
+                )
             return  # still running
 
         # Window is gone — read exit code and mark done/error
@@ -420,6 +434,7 @@ class Orchestrator:
         self._active_prep = {
             "chunk": chunk, "step": step, "log": log_file,
             "token": token, "also_mark": also_mark or [],
+            "started_at": time.time(),
         }
         log_orch(f"Launched: {description} → {log_file}")
 

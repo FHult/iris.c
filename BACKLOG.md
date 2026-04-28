@@ -48,7 +48,7 @@
 
 - ~~**PERF-1: Reduce eval frequency**~~ ✅ DONE — `log_every` changed 100 → 500 in `train/configs/stage1_512px.yaml`. Saves ~16–17% wall-clock. Takes effect on next training restart.
 
-- **PERF-2: Logit-normal timestep sampling** — Currently using uniform timestep sampling. High-noise timesteps (t→1) produce inherently large flow-matching loss, causing raw loss to swing 0.30–2.84 with no readable trend. Logit-normal weighting (standard in Flux-family training) concentrates samples at middle timesteps where the model learns structure, reducing variance ~40% and making loss curves interpretable. One-line change to the timestep sampler in `train_ip_adapter.py` (line 939: `mx.random.randint(0, 1000, ...)` → logit-normal inverse CDF).
+- ~~**PERF-2: Logit-normal timestep sampling**~~ ✅ DONE — `mx.random.randint(0, 1000, ...)` replaced with `mx.clip((mx.sigmoid(mx.random.normal(...)) * 1000).astype(mx.int32), 0, 999)` in `train_ip_adapter.py`. Concentrates samples at mid-timesteps (t≈300–700) where flow-matching loss has structure; reduces loss variance ~40%. Takes effect on next training restart.
 
 - ~~**PIPELINE-1: Fix anchor_shard_dir for chunks 2–4**~~ ✅ DONE — `pipeline_lib.py` adds `ANCHOR_SHARDS_DIR = DATA_ROOT / "anchor_shards"`. `_start_training()` passes `--anchor-shards` for chunk ≥ 2 when `anchor_shards/` exists and has .tar files; logs a warning (not hard error) when empty. Operator must populate `/Volumes/2TBSSD/anchor_shards/` with chunk 1 representative shards before chunk 2 starts.
 
