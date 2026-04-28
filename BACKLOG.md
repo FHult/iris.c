@@ -60,7 +60,7 @@
 
 - ~~**PIPELINE-5: Enforce single GPU token across ALL GPU-bound steps**~~ ✅ DONE — `pipeline_lib.py` adds `GPU_LOCK_FILE` (PID JSON record, `/Volumes/2TBSSD/.gpu_lock`) with `acquire_gpu_lock()` / `release_gpu_lock()` / `gpu_lock_holder()`. `ResourceManager.request("GPU_TOKEN")` checks for external holders before acquiring. `precompute_all.py` and `mine_hard_examples.py` refuse to start if iris-train/iris-prep is running or another process holds the lock; orchestrated runs skip the check via `PIPELINE_ORCHESTRATED=1`.
 
-- ~~**RESILIENCE-1: Wrap training in tmux**~~ ✅ DONE — Orchestrator launches training in a dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator itself runs in `iris-orch` window via `pipeline_ctl.py restart-orchestrator`, also wrapped in `caffeinate -dim` (commit 6f9e7e6). DISPATCH.md already shows tmux launch commands.
+- ~~**RESILIENCE-1: Wrap training in tmux**~~ ✅ DONE — Orchestrator launches training in a dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator itself runs in `iris-orch` window via `pipeline_ctl.py restart-orchestrator`, also wrapped in `caffeinate -dim` (commit 6f9e7e6). Boot-grace fix added (commit ff87603): stale detection skips restart when training window is alive and heartbeat shows step=0 (model loading phase). DISPATCH.md updated to use pipeline_ctl.py as the canonical start method.
 
 ---
 
