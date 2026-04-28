@@ -386,6 +386,39 @@ Manual Z-Image sanity:
 2. **GPU caching of timestep params**: step-dependent shift/scale/gate must not be cached as static weights.
 3. **CLI mode CFG routing**: base models in interactive mode must go through `flux_generate()` (CFG-aware), not distilled-only embedding path.
 
+## Pipeline Telemetry — Quick Reference
+
+Full documentation is in `train/DISPATCH.md` → "Telemetry Reference" section. Summary of what to read and when:
+
+**Source of truth (always authoritative)**:
+- Sentinel files: `/Volumes/2TBSSD/pipeline/chunk{N}/{step}.done|.error` — never infer step state from logs or heartbeats; always read sentinels. `derive_chunk_state(chunk)` in orchestrator.py is the canonical function.
+
+**Live progress**:
+- Heartbeat files: `/Volumes/2TBSSD/.heartbeat/{process}_chunk{N}.json` — written every ~60s by each worker. Contains `done`, `total`, `pct`, `eta_sec`, `current_shard`, and for trainer: `step`, `loss`, `grad_norm`, `siglip_coverage_pct`.
+- Status script: `train/.venv/bin/python train/scripts/pipeline_status.py` — reads sentinels + heartbeats + log tails.
+
+**Logs**:
+- Log files: `/Volumes/2TBSSD/logs/{step}_chunk{N}.log` — stdout/stderr of each tmux window, with `EXIT_CODE=N` as the final line. Fixed-name — old logs from prior runs persist and pollute status until manually deleted.
+- Orchestrator decisions: `/Volumes/2TBSSD/logs/orchestrator.jsonl` — structured JSON, one event per line.
+
+**Escalated alerts (check after any anomaly)**:
+- `/Volumes/2TBSSD/logs/dispatch_queue.jsonl` — written by orchestrator for unresolvable problems (step failed twice, NaN loss, restart limit exceeded). **NOT shown by pipeline_status.py** (known gap).
+
+**Stale state cleanup** — run this before any pipeline reset:
+```bash
+rm -f /Volumes/2TBSSD/logs/*.log /Volumes/2TBSSD/logs/*.jsonl
+rm -f /Volumes/2TBSSD/.heartbeat/*.json
+```
+
+### Known Telemetry Gaps (do not rediscover these)
+
+1. **Orchestrator restart orphans in-flight prep**: `_active_prep` is in-memory only. If orchestrator is killed while iris-prep is running, on restart the prep window completion is never detected and the step never marked done. After orchestrator restart, verify no iris-prep window is running, or manually mark done if the log shows `EXIT_CODE=0`.
+
+Previously documented gaps now resolved:
+- ~~Dispatch queue not surfaced~~ — `pipeline_status.py` reads `dispatch_queue.jsonl` directly via `_read_dispatch_issues()` and shows open issues in the status output.
+- ~~Hung prep workers undetected~~ — orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of continuous prep window activity.
+- ~~SigLIP coverage not checked at promotion~~ — `_promote_chunk()` enforces ≥90% siglip coverage when `training.siglip: true`.
+
 ## Project docs
 - `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
 - `BUGS.md` — known anomalies and observed issues (training, pipeline)

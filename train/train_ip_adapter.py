@@ -419,6 +419,18 @@ def train(config: dict) -> None:
         raise RuntimeError("Pre-flight checks failed — see ❌ items above.")
     print()
 
+    # ── Seed RNGs ─────────────────────────────────────────────────────────────
+    _seed = tcfg.get("seed")
+    if _seed is not None:
+        random.seed(_seed)
+        mx.random.seed(_seed)
+        try:
+            import numpy as _np_seed
+            _np_seed.random.seed(_seed)
+        except ImportError:
+            pass
+        print(f"RNG seed: {_seed}")
+
     # ── Load frozen base models ───────────────────────────────────────────────
     if not _HAS_MFLUX:
         raise RuntimeError("pip install mflux")
@@ -683,7 +695,7 @@ def train(config: dict) -> None:
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
-    def loss_fn(siglip_feats, use_null_image: mx.array, use_null_text: mx.array,
+    def loss_fn(siglip_feats, use_null_image: mx.array,
                 flux_state: dict, target: mx.array):
         """
         Differentiable adapter-only loss. Flux forward has already been run
@@ -756,9 +768,9 @@ def train(config: dict) -> None:
     # working around since the adapter step is already ~0.0s (lazy graph tracing
     # is negligible; all real work is in mx.eval dominated by Flux forward at 5-6s).
 
-    def compiled_step(siglip_feats, use_null_image, use_null_text, flux_state, target):
+    def compiled_step(siglip_feats, use_null_image, flux_state, target):
         loss_val, grads = loss_and_grad(
-            siglip_feats, use_null_image, use_null_text, flux_state, target,
+            siglip_feats, use_null_image, flux_state, target,
         )
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
@@ -775,12 +787,11 @@ def train(config: dict) -> None:
             try:
                 import tarfile as _tf
                 with _tf.open(_shard) as _tar:
-                    _contents = {m.name: _tar.extractfile(m).read()
-                                 for m in _tar.getmembers() if m.isfile()}
+                    _member_names = [m.name for m in _tar.getmembers() if m.isfile()]
             except Exception:
                 continue
             _keys: dict = {}
-            for _name in _contents:
+            for _name in _member_names:
                 _stem, _, _ext = _name.rpartition(".")
                 _keys.setdefault(_stem, {})[_ext.lower()] = _name
             for _stem in list(_keys)[:8]:
@@ -794,7 +805,8 @@ def train(config: dict) -> None:
                     continue
                 _lat = mx.array(_vae_np[None], dtype=mx.bfloat16)
                 _txt = mx.array(_text_np[None], dtype=mx.bfloat16)
-                _t   = mx.array([500], dtype=mx.int32)
+                # Sample a random timestep so val loss reflects the full noise distribution.
+                _t   = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
                 _noise = mx.random.normal(_lat.shape, dtype=_lat.dtype)
                 _alpha, _sigma = get_schedule_values(_t)
                 _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
@@ -802,7 +814,7 @@ def train(config: dict) -> None:
                 mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
                 # No-grad forward: call loss_fn directly (not through value_and_grad)
                 _siglip_zero = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
-                _loss = loss_fn(_siglip_zero, mx.array(True), mx.array(False), _fs, _target)
+                _loss = loss_fn(_siglip_zero, mx.array(True), _fs, _target)
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
                 del _fs, _loss, _noisy, _target
@@ -839,9 +851,7 @@ def train(config: dict) -> None:
     mem_used_gb: Optional[float] = None
     mem_available_gb: Optional[float] = None
 
-    # T-04: per-source loss (source inferred from shard name; "unknown" until shard naming
-    # includes source prefix e.g. chunk1_laion_0000.tar — requires build_shards tagging)
-    source_stats: dict = defaultdict(lambda: {"steps": 0, "loss_sum": 0.0})
+
 
     # T-05: validation loss on held-out set
     _val_shards: list[str] = []
@@ -908,7 +918,6 @@ def train(config: dict) -> None:
         null_image = random.random() < tcfg["image_dropout_prob"]
         null_text  = random.random() < tcfg["text_dropout_prob"]
         use_null_image = mx.array(null_image)
-        use_null_text  = mx.array(null_text)
 
         # Encode frozen models — use pre-computed cache if available (§2.7)
         if vae_np is not None:
@@ -974,7 +983,7 @@ def train(config: dict) -> None:
         # Adapter-only backward + optimizer update (tiny graph, should be fast)
         _t0 = time.time()
         loss_val, grad_norm_val = compiled_step(
-            siglip_feats, use_null_image, use_null_text, flux_state, target,
+            siglip_feats, use_null_image, flux_state, target,
         )
         # flux_state (25 Q tensors, h_final, temb ≈ 300 MB) and target are no
         # longer needed — release before eval so Metal reclaims them promptly.
@@ -988,7 +997,8 @@ def train(config: dict) -> None:
         # The lazy chain is broken by including ema_params in the eval below.
         _do_ema = (step % tcfg["ema_update_every"] == 0)
         if _do_ema:
-            ema_params = update_ema(ema_params, adapter, decay=tcfg["ema_decay"])
+            ema_params = update_ema(ema_params, adapter,
+                                   decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
         _t0 = time.time()
@@ -1023,10 +1033,6 @@ def train(config: dict) -> None:
         bucket_stats[_bk]["steps"]    += 1
         bucket_stats[_bk]["loss_sum"] += _step_loss_val
         bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_bucket_start
-
-        # T-04: per-source loss (source tag requires shard naming; "unknown" until then)
-        source_stats["unknown"]["steps"]    += 1
-        source_stats["unknown"]["loss_sum"] += _step_loss_val
 
         # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
         if step % 500 == 0:
@@ -1094,6 +1100,13 @@ def train(config: dict) -> None:
                     f"  eval={_t_eval:.1f}s ({100*_t_eval/total_phase:.0f}%)",
                     flush=True,
                 )
+            # T-07: loader wait fraction — computed before zeroing accumulators
+            _loader_pct = round(100 * _t_data / total_phase, 1) if total_phase > 0 else 0.0
+            _loader_wait_ms = round(_t_data * 1000 / log_interval, 1)
+            _compute_ms = round((_t_prep + _t_fwd + _t_step + _t_eval) * 1000 / log_interval, 1)
+            if _loader_pct > 20:
+                print(f"  WARNING: loader wait {_loader_pct:.0f}% — consider increasing prefetch_batches",
+                      flush=True)
             _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
 
             # T-01: grad norm at log interval
@@ -1127,25 +1140,9 @@ def train(config: dict) -> None:
                     print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
                           flush=True)
 
-            # T-04: per-source loss summary
-            _src_summary = {
-                src: {"steps": v["steps"],
-                      "loss_avg": round(v["loss_sum"] / v["steps"], 4) if v["steps"] else 0}
-                for src, v in source_stats.items()
-            }
-
             # T-06: EMA drift
             if ema_drift > 0:
                 print(f"  ema_drift={ema_drift:.5f}", flush=True)
-
-            # T-07: loader wait fraction (derived from phase accumulators already printed)
-            _total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
-            _loader_pct = round(100 * _t_data / _total_phase, 1) if _total_phase > 0 else 0.0
-            _loader_wait_ms = round(_t_data * 1000 / log_interval, 1)
-            _compute_ms = round((_t_prep + _t_fwd + _t_step + _t_eval) * 1000 / log_interval, 1)
-            if _loader_pct > 20:
-                print(f"  WARNING: loader wait {_loader_pct:.0f}% — consider increasing prefetch_batches",
-                      flush=True)
 
             # T-10: SigLIP coverage
             _siglip_cov = round(100 * (1 - _siglip_miss_steps / log_interval), 1)
@@ -1198,7 +1195,6 @@ def train(config: dict) -> None:
                     siglip_coverage_pct=_siglip_cov,
                     loader_wait_ms_avg=_loader_wait_ms,
                     compute_ms_avg=_compute_ms,
-                    source_loss=_src_summary,
                     buckets=_bkt_summary,
                     mem_used_gb=mem_used_gb,
                     mem_available_gb=mem_available_gb,
@@ -1208,7 +1204,6 @@ def train(config: dict) -> None:
             # Reset rolling stats so per-interval averages don't drift over the
             # entire run as loss improves and bucket distribution shifts.
             bucket_stats.clear()
-            source_stats.clear()
             # Release unused Metal buffer pool entries every log interval.
             # MLX pools buffers internally; without periodic clearing, pool
             # growth can exhaust unified memory after ~1200 steps (~12 evals).

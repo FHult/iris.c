@@ -171,7 +171,7 @@ def _encode_siglip_jpg(jpg_bytes: bytes, model_name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
-    """Compute flow-matching loss for one sample. Fixed t=500 for stable ranking."""
+    """Compute flow-matching loss for one sample. Random t for unbiased ranking."""
     from ip_adapter.loss import fused_flow_noise, get_schedule_values
     from train_ip_adapter import _flux_forward_with_ip
 
@@ -182,7 +182,7 @@ def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
     ip_embeds = adapter.get_image_embeds(siglip_feats)
     k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-    t_int = mx.array([500], dtype=mx.int32)
+    t_int = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
     alpha_t, sigma_t = get_schedule_values(t_int)
 
     noise = mx.random.normal(latents.shape, dtype=latents.dtype)

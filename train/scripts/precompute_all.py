@@ -835,9 +835,7 @@ def main():
             def _has_output(shard_path: str) -> bool:
                 stem = os.path.splitext(os.path.basename(shard_path))[0]
                 return any(
-                    os.path.exists(os.path.join(d, f"{stem}.npz")) or
-                    # per-record npz files use record IDs not shard stem; check dir non-empty
-                    (os.path.isdir(d) and bool(os.listdir(d)))
+                    os.path.exists(os.path.join(d, f"{stem}.npz"))
                     for d in out_dirs
                 )
             new_shards = [s for s in shards if not _has_output(s)]

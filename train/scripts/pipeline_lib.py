@@ -312,7 +312,12 @@ def last_exit_code(log_file: Path) -> Optional[int]:
     if not log_file.exists():
         return None
     try:
-        for line in reversed(log_file.read_text().splitlines()):
+        with open(log_file, "rb") as _f:
+            _f.seek(0, 2)
+            _tail = min(512, _f.tell())
+            _f.seek(-_tail, 2)
+            _chunk = _f.read(_tail).decode("utf-8", errors="replace")
+        for line in reversed(_chunk.splitlines()):
             if line.startswith("EXIT_CODE="):
                 return int(line.split("=", 1)[1])
     except (ValueError, OSError):
@@ -353,19 +358,26 @@ def acquire_gpu_lock(label: str) -> bool:
     Acquire the cross-process GPU exclusive lock file.
     Returns True if acquired, False if a live process already holds it.
     Stale locks from dead processes are silently stolen.
+    Uses O_EXCL (open mode 'x') for atomic acquisition — no TOCTOU window.
     """
-    if gpu_lock_holder() is not None:
-        return False
-    try:
-        GPU_LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-    GPU_LOCK_FILE.write_text(json.dumps({
+    record = json.dumps({
         "pid": os.getpid(),
         "label": label,
         "started": now_iso(),
-    }))
-    return True
+    })
+    for _ in range(2):
+        try:
+            with open(GPU_LOCK_FILE, "x") as _f:
+                _f.write(record)
+            return True
+        except FileExistsError:
+            if gpu_lock_holder() is not None:
+                return False
+            try:
+                GPU_LOCK_FILE.unlink()
+            except OSError:
+                pass
+    return False
 
 
 def release_gpu_lock() -> None:

@@ -1173,47 +1173,55 @@ class Orchestrator:
             self._write_pause()
             return
 
-        # ── Loss persistently > 2.0 for 100 steps → pause ───────────────────
+        _a = self.cfg.get("anomaly", {})
+        _loss_thresh   = _a.get("loss_threshold",    2.0)
+        _loss_steps    = _a.get("loss_high_steps",   100)
+        _grad_pause    = _a.get("grad_norm_pause",   50.0)
+        _grad_warn     = _a.get("grad_norm_warn",    10.0)
+        _grad_polls    = _a.get("grad_spike_polls",  10)
+        _siglip_min    = _a.get("siglip_min_coverage", 90)
+
+        # ── Loss persistently high for loss_high_steps → pause ───────────────
         if loss is not None:
-            if loss > 2.0:
+            if loss > _loss_thresh:
                 first = self._loss_high_since.get(chunk)
                 if first is None:
                     self._loss_high_since[chunk] = step
-                elif step - first >= 100:
-                    log_orch(f"Chunk {chunk}: loss {loss:.3f} > 2.0 for {step-first} steps — pausing",
+                elif step - first >= _loss_steps:
+                    log_orch(f"Chunk {chunk}: loss {loss:.3f} > {_loss_thresh} for {step-first} steps — pausing",
                              level="error", chunk=chunk)
                     self._dispatch_once(f"loss_high_{chunk}", self._next_issue_id(), "error",
-                                        f"Training loss {loss:.3f} persistently > 2.0 (since step {first})",
+                                        f"Training loss {loss:.3f} persistently > {_loss_thresh} (since step {first})",
                                         chunk=chunk, suggested_action="investigate_training")
                     self._write_pause()
                     self._loss_high_since[chunk] = None
             else:
                 self._loss_high_since[chunk] = None
 
-        # ── Grad norm > 50.0 for 10 polls → pause; > 10.0 → warn ────────────
+        # ── Grad norm sustained high → pause; mildly high → warn ────────────
         grad_norm = hb.get("grad_norm")
         if grad_norm is not None:
-            if grad_norm > 50.0:
+            if grad_norm > _grad_pause:
                 self._grad_spike_polls[chunk] = self._grad_spike_polls.get(chunk, 0) + 1
                 n_spikes = self._grad_spike_polls[chunk]
-                if n_spikes >= 10:
-                    log_orch(f"Chunk {chunk}: grad_norm {grad_norm:.1f} > 50 for {n_spikes} polls — pausing",
+                if n_spikes >= _grad_polls:
+                    log_orch(f"Chunk {chunk}: grad_norm {grad_norm:.1f} > {_grad_pause} for {n_spikes} polls — pausing",
                              level="error", chunk=chunk)
                     self._dispatch_once(f"grad_{chunk}", self._next_issue_id(), "error",
-                                        f"Grad norm {grad_norm:.1f} sustained > 50 ({n_spikes} polls)",
+                                        f"Grad norm {grad_norm:.1f} sustained > {_grad_pause} ({n_spikes} polls)",
                                         chunk=chunk, suggested_action="investigate_training")
                     self._write_pause()
                     self._grad_spike_polls[chunk] = 0
-                elif grad_norm > 10.0:
-                    log_orch(f"Chunk {chunk}: grad_norm warning {grad_norm:.1f} > 10",
+                elif grad_norm > _grad_warn:
+                    log_orch(f"Chunk {chunk}: grad_norm warning {grad_norm:.1f} > {_grad_warn}",
                              level="warning", chunk=chunk)
             else:
                 self._grad_spike_polls[chunk] = 0
 
-        # ── SigLIP coverage < 90% → log warning ──────────────────────────────
+        # ── SigLIP coverage below minimum → log warning ───────────────────────
         siglip_cov = hb.get("siglip_coverage_pct")
-        if siglip_cov is not None and siglip_cov < 90:
-            log_orch(f"Chunk {chunk}: SigLIP coverage {siglip_cov:.0f}% < 90%",
+        if siglip_cov is not None and siglip_cov < _siglip_min:
+            log_orch(f"Chunk {chunk}: SigLIP coverage {siglip_cov:.0f}% < {_siglip_min}%",
                      level="warning", chunk=chunk)
 
     def _restart_trainer(self, chunk: int) -> None:

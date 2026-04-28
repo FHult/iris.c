@@ -218,17 +218,14 @@ def _write_shard_range(args) -> dict:
     Workers are staggered so they access different source shards simultaneously,
     keeping SSD throughput high.
     """
-    shard_ids, records, output_dir, shard_size, blocklist, quality, worker_idx, n_workers, write_from = args
+    shard_ids, records, output_dir, shard_size, blocklist, quality, worker_idx, n_workers = args
     blocklist_set = set(blocklist)
 
     if _HAS_TURBOJPEG:
         tj = TurboJPEG()
 
     # Phase 1: filter by blocklist + caption (no I/O), assign to output shards.
-    # shard_ids covers the FULL range from 0 so that record consumption matches
-    # a fresh run exactly. Shards before write_from are consumed but not written,
-    # which ensures resumed workers pick up at the correct record position.
-    shard_plan = {}   # shard_id -> [rec, ...]  (only shard_id >= write_from)
+    shard_plan = {}   # shard_id -> [rec, ...]
     rec_idx = 0
     skipped = 0
     for shard_id in shard_ids:
@@ -240,7 +237,7 @@ def _write_shard_range(args) -> dict:
                 skipped += 1
                 continue
             shard_recs.append(rec)
-        if shard_recs and shard_id >= write_from:
+        if shard_recs:
             shard_plan[shard_id] = shard_recs
 
     if not shard_plan:
@@ -493,7 +490,6 @@ def main():
             args.quality,
             w,          # worker_idx — used to stagger source-shard read order
             workers,    # n_workers
-            start_idx,  # write_from — skip writing shards already on disk
         )
         for w in range(workers)
     ]

@@ -211,6 +211,7 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
     prod_thread.join()
     cons_thread.join()
     done_event.set()
+    hb_thread.join(timeout=5)  # ensure heartbeat loop exits before final write
 
     if error_event.is_set():
         raise RuntimeError(f"JDB download+convert failed for chunk {chunk}")

@@ -6,6 +6,14 @@ chunks: 4
 scale: small          # small | medium | large | all-in
 poll_interval: 60     # orchestrator poll cycle in seconds
 
+anomaly:
+  loss_threshold: 2.0       # pause when loss exceeds this for loss_high_steps consecutive steps
+  loss_high_steps: 100      # steps of sustained high loss before pausing
+  grad_norm_pause: 50.0     # grad norm above this for grad_spike_polls polls → pause
+  grad_norm_warn: 10.0      # grad norm above this → log warning
+  grad_spike_polls: 10      # number of consecutive high-grad-norm polls before pausing
+  siglip_min_coverage: 90   # warn when SigLIP coverage drops below this %
+
 model:
   flux_model: flux-klein-4b
   checkpoint_dir: /Volumes/2TBSSD/checkpoints/stage1
