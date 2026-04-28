@@ -30,7 +30,7 @@ from typing import Optional
 from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, VENV_PYTHON,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
-    SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, DEDUP_DIR, CKPT_DIR,
+    SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
     STATE_FILE,
@@ -41,6 +41,7 @@ from pipeline_lib import (
     dispatch_issue, gpu_is_free,
     tmux_session_exists, tmux_window_exists, tmux_new_window,
     last_exit_code, free_gb, notify, now_iso, load_config,
+    acquire_gpu_lock, release_gpu_lock, gpu_lock_holder,
 )
 
 
@@ -214,10 +215,18 @@ class ResourceManager:
     def request(self, token: str, holder: str) -> bool:
         if token in self._holders:
             return False
+        if token == "GPU_TOKEN":
+            lock_info = gpu_lock_holder()
+            if lock_info is not None:
+                # External manual process holds the file lock — wait.
+                return False
+            acquire_gpu_lock(holder)
         self._holders[token] = holder
         return True
 
     def release(self, token: str) -> None:
+        if token == "GPU_TOKEN":
+            release_gpu_lock()
         self._holders.pop(token, None)
 
     def holder(self, token: str) -> Optional[str]:
@@ -405,7 +414,7 @@ class Orchestrator:
             log_orch(f"DRY RUN: would launch {description}")
             return
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
                      f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_PREP_WIN, activated, log_file)
         self._active_prep = {
@@ -845,6 +854,17 @@ class Orchestrator:
             if hard_chunk.exists() and any(hard_chunk.glob("*.tar")):
                 hard_arg = f"--hard-examples '{hard_chunk}'"
 
+        anchor_arg = ""
+        if chunk > 1:
+            if ANCHOR_SHARDS_DIR.exists() and any(ANCHOR_SHARDS_DIR.glob("*.tar")):
+                anchor_arg = f"--anchor-shards '{ANCHOR_SHARDS_DIR}'"
+            else:
+                log_orch(
+                    f"Chunk {chunk}: {ANCHOR_SHARDS_DIR} missing or empty — "
+                    "starting without anchor mixing (populate dir to enable)",
+                    chunk=chunk,
+                )
+
         config_file = self.cfg.get("training_config",
                                    str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         cmd = (
@@ -853,7 +873,7 @@ class Orchestrator:
             f"--max-steps {steps} --lr {lr} "
             f"--data-root '{DATA_ROOT}' "
             f"--chunk {chunk} "
-            f"{resume_arg} {hard_arg}"
+            f"{resume_arg} {hard_arg} {anchor_arg}"
         )
 
         if not self.dry_run:

@@ -299,6 +299,34 @@ def main():
     parser.add_argument("--seed",          type=int, default=0)
     args = parser.parse_args()
 
+    # Block manual runs when GPU is already in use by training or the pipeline.
+    # Orchestrated runs (PIPELINE_ORCHESTRATED=1) skip this — the orchestrator
+    # manages GPU serialisation via GPU_TOKEN and the file lock itself.
+    if not os.environ.get("PIPELINE_ORCHESTRATED"):
+        import atexit
+        from pipeline_lib import (
+            gpu_is_free, tmux_window_exists, TMUX_PREP_WIN,
+            acquire_gpu_lock, release_gpu_lock, gpu_lock_holder,
+        )
+        if not gpu_is_free():
+            print("ERROR: iris-train is running. GPU is in use by training.", file=sys.stderr)
+            sys.exit(1)
+        if tmux_window_exists(TMUX_PREP_WIN):
+            print("ERROR: iris-prep is running. GPU is in use by the pipeline.", file=sys.stderr)
+            sys.exit(1)
+        _lock_info = gpu_lock_holder()
+        if _lock_info is not None:
+            print(
+                f"ERROR: GPU lock held by '{_lock_info.get('label', '?')}' "
+                f"(PID {_lock_info.get('pid', '?')}). Exiting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not acquire_gpu_lock("mine (manual)"):
+            print("ERROR: GPU lock acquire race — try again.", file=sys.stderr)
+            sys.exit(1)
+        atexit.register(release_gpu_lock)
+
     # Resolve flux model: accept bare name or full path
     fm = Path(args.flux_model)
     if not fm.is_dir():

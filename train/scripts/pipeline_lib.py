@@ -30,11 +30,13 @@ DISPATCH_RESP  = DATA_ROOT / "dispatch_responses.jsonl"
 SENTINEL_DIR   = DATA_ROOT / "pipeline"
 LOG_DIR        = DATA_ROOT / "logs"
 STAGING_DIR    = DATA_ROOT / "staging"
-SHARDS_DIR     = DATA_ROOT / "shards"
-PRECOMP_DIR    = DATA_ROOT / "precomputed"
-HARD_EX_DIR    = DATA_ROOT / "hard_examples"
-DEDUP_DIR      = DATA_ROOT / "dedup_ids"
-CKPT_DIR       = DATA_ROOT / "checkpoints" / "stage1"
+SHARDS_DIR        = DATA_ROOT / "shards"
+PRECOMP_DIR       = DATA_ROOT / "precomputed"
+HARD_EX_DIR       = DATA_ROOT / "hard_examples"
+ANCHOR_SHARDS_DIR = DATA_ROOT / "anchor_shards"
+DEDUP_DIR         = DATA_ROOT / "dedup_ids"
+CKPT_DIR          = DATA_ROOT / "checkpoints" / "stage1"
+GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 
 TMUX_SESSION   = "iris"
 TMUX_TRAIN_WIN = "iris-train"
@@ -314,6 +316,64 @@ def last_exit_code(log_file: Path) -> Optional[int]:
     except (ValueError, OSError):
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# GPU file lock — cross-process mutex for all GPU-bound steps
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists but we can't signal it
+
+
+def gpu_lock_holder() -> Optional[dict]:
+    """Return the lock info dict if a live process holds the GPU lock, else None."""
+    if not GPU_LOCK_FILE.exists():
+        return None
+    try:
+        info = json.loads(GPU_LOCK_FILE.read_text())
+        if _pid_alive(info.get("pid", 0)):
+            return info
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def acquire_gpu_lock(label: str) -> bool:
+    """
+    Acquire the cross-process GPU exclusive lock file.
+    Returns True if acquired, False if a live process already holds it.
+    Stale locks from dead processes are silently stolen.
+    """
+    if gpu_lock_holder() is not None:
+        return False
+    try:
+        GPU_LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    GPU_LOCK_FILE.write_text(json.dumps({
+        "pid": os.getpid(),
+        "label": label,
+        "started": now_iso(),
+    }))
+    return True
+
+
+def release_gpu_lock() -> None:
+    """Release the GPU lock if held by the current process. Safe to call on exit."""
+    try:
+        info = json.loads(GPU_LOCK_FILE.read_text())
+        if info.get("pid") == os.getpid():
+            GPU_LOCK_FILE.unlink()
+    except (ValueError, OSError):
+        pass
 
 
 # ---------------------------------------------------------------------------
