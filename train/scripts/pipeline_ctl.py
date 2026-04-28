@@ -67,7 +67,7 @@ def cmd_restart_orchestrator(_args) -> None:
     log_file = LOG_DIR / "orchestrator.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = (f"source '{TRAIN_DIR}/.venv/bin/activate' && "
-           f"python -u '{SCRIPTS_DIR}/orchestrator.py' --resume --config '{config}'")
+           f"caffeinate -dim python -u '{SCRIPTS_DIR}/orchestrator.py' --resume --config '{config}'")
     tmux_new_window(TMUX_ORCH_WIN, cmd, log_file)
     print(f"Orchestrator restarted → {log_file}")
 

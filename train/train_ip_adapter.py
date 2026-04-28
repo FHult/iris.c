@@ -451,6 +451,18 @@ def train(config: dict) -> None:
     print(f"MLX memory limit: {int(_ram_bytes * 0.44) // 1024**3} GB  "
           f"cache limit: {int(_ram_bytes * 0.06) // 1024**2} MB")
 
+    # Write loading heartbeats every 60s while models initialise.
+    # Without this, the orchestrator's 900s stale threshold kills the process
+    # before model loading + graph compilation finish (~10-12 min total).
+    _boot_chunk   = config.get("_chunk")
+    _boot_hb_stop = __import__("threading").Event()
+    def _boot_hb_thread():
+        import time as _t
+        from pipeline_lib import write_heartbeat as _wh
+        while not _boot_hb_stop.wait(60):
+            _wh("trainer", _boot_chunk, status="loading", step=0)
+    __import__("threading").Thread(target=_boot_hb_thread, daemon=True).start()
+
     print("Loading Flux Klein 4B (frozen) ...")
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
@@ -848,6 +860,8 @@ def train(config: dict) -> None:
 
     # T-11: gradient clipping events per log window
     _grad_clip_steps = 0
+
+    _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= tcfg["num_steps"]:
