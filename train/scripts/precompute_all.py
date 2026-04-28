@@ -261,7 +261,7 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
     # memory pressure on 32 GB systems and leaves more headroom for the OS and other
     # processes running concurrently with precompute.
     try:
-        mx.metal.set_memory_limit(14 * 1024 ** 3)
+        mx.set_memory_limit(14 * 1024 ** 3)
     except AttributeError:
         pass  # MLX version does not expose set_memory_limit; safe to ignore
 

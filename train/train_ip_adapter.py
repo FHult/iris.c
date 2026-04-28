@@ -1130,11 +1130,15 @@ def train(config: dict) -> None:
                 print(f"  buckets: {_bkt_str}", flush=True)
 
             # T-03: memory pressure
+            mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
+            mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
+            print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
+                  flush=True)
             if _HAS_PSUTIL:
                 _vm = _psutil.virtual_memory()
                 mem_used_gb = round(_vm.used / 1e9, 1)
                 mem_available_gb = round(_vm.available / 1e9, 1)
-                print(f"  mem: {mem_used_gb:.1f} GB used  {mem_available_gb:.1f} GB free",
+                print(f"  sys_mem: {mem_used_gb:.1f} GB used  {mem_available_gb:.1f} GB free",
                       flush=True)
                 if mem_available_gb < 6.0:
                     print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
@@ -1198,6 +1202,8 @@ def train(config: dict) -> None:
                     buckets=_bkt_summary,
                     mem_used_gb=mem_used_gb,
                     mem_available_gb=mem_available_gb,
+                    mlx_active_gb=mlx_active_gb,
+                    mlx_peak_gb=mlx_peak_gb,
                 )
             except Exception:
                 pass
