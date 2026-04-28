@@ -146,38 +146,34 @@ def _purge_file_page_cache(path: str) -> None:
     """
     Evict a file from the macOS unified buffer cache (page cache).
 
-    mx.save_safetensors (and safetensors safe_open reads) leave file data in the
-    kernel page cache. With ~4 GB checkpoint files, two consecutive reads or
-    writes fill ~8 GB of page cache silently, reducing psutil 'available' memory
-    and triggering jetsam even when MLX's own buffers fit within the 14 GB limit.
+    mx.save_safetensors leaves ~4 GB of dirty pages in the kernel UBC after
+    each checkpoint write. Two consecutive saves accumulate ~8 GB of page cache
+    that jetsam does not evict before killing the training process.
 
-    madvise(MADV_FREE) is insufficient: on macOS it marks pages as reclaimable
-    but does not evict them immediately, so pages remain in physical RAM until
-    the kernel decides to free them — which may be after jetsam has already fired.
-
-    msync(MS_INVALIDATE=2) is synchronous: it flushes any dirty pages to the
-    backing store and then immediately evicts the pages from the UBC, reclaiming
-    physical RAM before the next Flux forward pass allocation.
+    Approach: open the file read-write, mmap it, then call
+    msync(MS_SYNC|MS_INVALIDATE). MS_SYNC flushes any dirty pages to the
+    backing store; MS_INVALIDATE immediately evicts all pages from the UBC.
+    A read-only mapping cannot issue MS_SYNC for dirty pages written by another
+    fd — the read-write mapping is required so the kernel allows the flush.
     """
     try:
-        import ctypes as _ctypes, mmap as _mmap, numpy as _np
+        import ctypes as _ctypes, mmap as _mmap
         _libc = _ctypes.CDLL("libc.dylib", use_errno=True)
-        _fd = os.open(path, os.O_RDONLY)
+        _fd = os.open(path, os.O_RDWR)
         try:
             _sz = os.fstat(_fd).st_size
             if _sz == 0:
                 return
-            _mm = _mmap.mmap(_fd, _sz, access=_mmap.ACCESS_READ)
+            _mm = _mmap.mmap(_fd, _sz)  # read-write mapping
             try:
-                # np.frombuffer is a zero-copy view; .ctypes.data gives the
-                # mmap base address without copying the 4 GB checkpoint data.
-                _arr = _np.frombuffer(_mm, dtype=_np.uint8)
-                _addr = _ctypes.c_void_p(_arr.ctypes.data)
-                # MS_INVALIDATE = 2: synchronously evict pages from the UBC.
-                # For a read-only file-backed mmap the flush is a no-op (no
-                # dirty pages), so only the eviction step runs.
-                _libc.msync(_addr, _ctypes.c_size_t(_sz), _ctypes.c_int(2))
-                del _arr  # release exported buffer ref before closing mmap
+                # 1-byte from_buffer gives the mmap base address via addressof();
+                # must stay alive during msync so the buffer isn't unlocked.
+                _anchor = (_ctypes.c_char * 1).from_buffer(_mm)
+                _addr = _ctypes.c_void_p(_ctypes.addressof(_anchor))
+                # MS_SYNC=1 | MS_INVALIDATE=2 = 3: flush dirty pages to disk,
+                # then evict all pages from the UBC immediately.
+                _libc.msync(_addr, _ctypes.c_size_t(_sz), _ctypes.c_int(3))
+                del _anchor
             finally:
                 _mm.close()
         finally:
