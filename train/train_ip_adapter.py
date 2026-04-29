@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -879,9 +878,10 @@ def train(config: dict) -> None:
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
-    # When log_every is large (e.g. 500 steps × 0.19 sps ≈ 44 min) the log block
+    # When log_every is large (e.g. 500 steps × 0.22 sps ≈ 37 min) the log block
     # fires too infrequently to keep the orchestrator's 900 s stale threshold happy.
-    _heartbeat_every = min(log_interval, 100)
+    # 200 steps ≈ 880 s at 0.226 sps — safely below the 900 s stale threshold.
+    _heartbeat_every = min(log_interval, 200)
     _hb_t0 = time.time()
     _hb_loss = 0.0
     _hb_loss_smooth = 0.0

@@ -129,10 +129,15 @@ def _worker_heartbeat(process: str, chunk: int) -> dict:
 
 
 def _read_dispatch_issues(resolved: bool = False) -> list:
-    """Read open (or all) issues from dispatch_queue.jsonl."""
+    """Read open (or all) issues from dispatch_queue.jsonl.
+
+    The file is append-only: dispatch_issue() appends new issues and
+    cmd_dispatch_resolve() appends a resolve marker.  Last entry per ID wins,
+    so we collect all entries and keep only the final state for each ID.
+    """
     if not DISPATCH_QUEUE.exists():
         return []
-    issues = []
+    by_id: dict = {}
     try:
         for line in DISPATCH_QUEUE.read_text().splitlines():
             line = line.strip()
@@ -140,19 +145,31 @@ def _read_dispatch_issues(resolved: bool = False) -> list:
                 continue
             try:
                 entry = json.loads(line)
-                if resolved or not entry.get("resolved", False):
-                    issues.append(entry)
+                iid = entry.get("id")
+                if iid:
+                    by_id[iid] = entry  # last write wins
             except json.JSONDecodeError:
                 pass
     except OSError:
         pass
-    return issues
+    return [e for e in by_id.values() if resolved or not e.get("resolved", False)]
 
+
+_shard_count_cache: dict[Path, tuple] = {}  # path → (mtime, count)
 
 def _count_shards(directory: Path) -> int:
     if not directory.exists():
         return 0
-    return sum(1 for f in directory.iterdir() if f.suffix == ".tar")
+    try:
+        mtime = directory.stat().st_mtime
+    except OSError:
+        return 0
+    cached = _shard_count_cache.get(directory)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    count = sum(1 for f in directory.iterdir() if f.suffix == ".tar")
+    _shard_count_cache[directory] = (mtime, count)
+    return count
 
 
 def _count_precomputed(directory: Path) -> int:
@@ -186,7 +203,7 @@ def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool
     if train_running and state in ("TRAINING", "MINING", "VALIDATING"):
         return state.lower()
     if prep_running:
-        return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "") or ""
+        return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "")
     return ""
 
 
@@ -292,14 +309,14 @@ def print_human(status: dict, verbose: bool = False) -> None:
     total_chunks = len(status["chunks"])
     active_c = next(
         (c for c, cs in status["chunks"].items()
-         if cs["state"].split(".")[-1] not in ("DONE", "IDLE")),
+         if cs["state"] not in ("DONE", "IDLE")),
         max(status["chunks"].keys()) if status["chunks"] else 1,
     )
     active_cs = status["chunks"].get(active_c, {})
     s_done  = active_cs.get("steps_done", 0)
     s_total = active_cs.get("steps_total", len(CHUNK_STEPS))
     done_chunks = sum(1 for cs in status["chunks"].values()
-                      if cs["state"].split(".")[-1] == "DONE")
+                      if cs["state"] == "DONE")
     active_step_name = active_cs.get("active_step") or active_cs.get("last_done") or "—"
     print(f"  Progress: chunk {active_c}/{total_chunks}  "
           f"step {s_done}/{s_total} ({active_step_name})  "
@@ -308,7 +325,7 @@ def print_human(status: dict, verbose: bool = False) -> None:
     # Per-chunk status
     print()
     for c, cs in status["chunks"].items():
-        state_str = cs["state"].split(".")[-1]
+        state_str = cs["state"]
         active = cs.get("active_step", "")
         if state_str == "IDLE" and active == "download":
             state_str = "DOWNLOADING"

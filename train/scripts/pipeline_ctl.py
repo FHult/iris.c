@@ -131,18 +131,16 @@ def cmd_dispatch_resolve(args) -> None:
     if not DISPATCH_QUEUE.exists():
         print("No dispatch queue")
         return
+    # Verify the issue exists before appending a resolve marker.
     lines = DISPATCH_QUEUE.read_text().strip().splitlines()
-    issues = [json.loads(l) for l in lines if l.strip()]
-    found = False
-    for issue in issues:
-        if issue.get("id") == issue_id:
-            issue["resolved"] = True
-            issue["resolved_at"] = now_iso()
-            found = True
-    if not found:
+    ids = {json.loads(l).get("id") for l in lines if l.strip()}
+    if issue_id not in ids:
         print(f"Issue {issue_id} not found")
         return
-    DISPATCH_QUEUE.write_text("\n".join(json.dumps(i) for i in issues) + "\n")
+    # Append a resolve marker — the queue is append-only; last entry per ID wins.
+    marker = json.dumps({"id": issue_id, "resolved": True, "resolved_at": now_iso()})
+    with open(DISPATCH_QUEUE, "a") as f:
+        f.write(marker + "\n")
     print(f"Marked {issue_id} as resolved")
 
 

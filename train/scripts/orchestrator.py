@@ -31,7 +31,7 @@ from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, VENV_PYTHON,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
-    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
+    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
     STATE_FILE,
     read_state, write_state, update_state,
@@ -198,6 +198,9 @@ def derive_chunk_state(chunk: int) -> str:
         return ChunkState.IDLE
     return _STEP_TO_STATE.get(last_done, ChunkState.DONE)
 
+assert set(_STEP_TO_STATE) == set(CHUNK_STEPS), \
+    f"CHUNK_STEPS/_STEP_TO_STATE out of sync: {set(CHUNK_STEPS) ^ set(_STEP_TO_STATE)}"
+
 
 # ---------------------------------------------------------------------------
 # Resource token manager
@@ -285,7 +288,13 @@ class Orchestrator:
 
         # Anomaly detection counters: {chunk: count_of_consecutive_anomaly_polls}
         self._loss_high_since: dict[int, Optional[int]] = {}  # chunk → first anomaly step
+        # Consecutive polls with grad_norm above the warn threshold.  Resets to 0
+        # after a pause is triggered so a new episode can be detected on resume.
         self._grad_spike_polls: dict[int, int] = {}           # chunk → consecutive high-grad polls
+
+        # Crash diagnosis cache: avoid re-running `log show` (15 s subprocess) on
+        # every poll while a step is in error state.  Keyed by (chunk, step, exit_code).
+        self._crash_diag: dict[tuple, tuple] = {}             # → (reason, detail)
 
         # Dispatch cooldown: {issue_key: last_dispatch_epoch_secs}
         self._dispatch_last: dict[str, float] = {}
@@ -968,10 +977,15 @@ class Orchestrator:
                 key = (chunk, step)
                 restarts = self._restart_counts.get(key, 0)
 
-                # Diagnose crash reason to decide retry policy.
+                # Diagnose crash reason to decide retry policy.  Cache the result
+                # so _query_macos_jetsam_log() (15 s subprocess) only runs once per
+                # error episode rather than on every orchestrator poll.
                 exit_code = _parse_exit_code_from_msg(msg)
                 log_file = LOG_DIR / f"{step}_chunk{chunk}.log"
-                reason, detail = _diagnose_crash(log_file, exit_code, self._mem_log)
+                _diag_key = (chunk, step, exit_code)
+                if _diag_key not in self._crash_diag:
+                    self._crash_diag[_diag_key] = _diagnose_crash(log_file, exit_code, self._mem_log)
+                reason, detail = self._crash_diag[_diag_key]
                 is_jetsam = reason == "jetsam_oom"
                 max_retries = JETSAM_MAX_RETRIES if is_jetsam else 1
                 retry_delay = JETSAM_RETRY_DELAY_S if is_jetsam else 0
@@ -997,6 +1011,7 @@ class Orchestrator:
                     if retry_delay > 0:
                         self._retry_after[key] = time.time() + retry_delay
                     clear_error(chunk, step)
+                    self._crash_diag.pop(_diag_key, None)  # invalidate for next episode
                     # Rename the old step log with a timestamp so _start_training
                     # (and similar detection loops) don't re-read a stale EXIT_CODE,
                     # but the crash evidence is preserved for post-mortem debugging.
@@ -1376,6 +1391,10 @@ class Orchestrator:
                     # intervention doesn't immediately hit the inherited limit.
                     if step == "train":
                         self._restart_counts.pop(("restart_trainer", chunk), None)
+                    # Clear cached crash diagnosis so next episode gets a fresh read.
+                    for k in list(self._crash_diag):
+                        if k[:2] == (chunk, step):
+                            del self._crash_diag[k]
                     clear_error(chunk, step)
                     # Archive any stale log that still has EXIT_CODE at the end.
                     # _start_training() reads the log to detect completion/failure;
