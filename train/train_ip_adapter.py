@@ -141,6 +141,100 @@ def _git_sha() -> str:
         return "unknown"
 
 
+_SAFETENSORS_DTYPE = {
+    mx.float32:  "F32",
+    mx.float16:  "F16",
+    mx.bfloat16: "BF16",
+    mx.int8:     "I8",
+    mx.uint8:    "U8",
+    mx.int32:    "I32",
+    mx.int64:    "I64",
+}
+
+
+def _save_safetensors_streaming(
+    path: str,
+    tensor_pairs: list,
+) -> None:
+    """
+    Write safetensors without staging all tensors in memory at once, then
+    validate the written file by re-reading it sequentially.
+
+    Standard mx.save_safetensors serialises the full payload (e.g. 4 GB) into
+    a single contiguous buffer before writing, doubling peak Metal usage.  This
+    function writes one tensor at a time: the numpy chunk for each tensor is
+    created, written to disk, and deleted before the next tensor is processed.
+
+    On Apple Silicon (unified memory) np.array(mlx_arr) is often zero-copy —
+    numpy receives a view into the same physical memory the Metal buffer uses.
+    Even if a copy is made, at most one tensor (~50–200 MB) is held in CPU
+    memory at a time, keeping peak overhead near zero.
+
+    After writing, a streaming validation pass re-reads the data section
+    sequentially, comparing CRC32 of each written chunk against the CRC32
+    computed during the write.  Both passes stay within a single tensor's
+    footprint at any moment.  Raises RuntimeError on mismatch.
+
+    tensor_pairs: list of (name: str, array: mx.array) in write order.
+    """
+    import struct as _struct, zlib as _zlib
+
+    # Pass 1: build header from tensor metadata only — no data movement.
+    offset = 0
+    header = {}
+    for name, arr in tensor_pairs:
+        n = arr.nbytes
+        header[name] = {
+            "dtype":        _SAFETENSORS_DTYPE[arr.dtype],
+            "shape":        list(arr.shape),
+            "data_offsets": [offset, offset + n],
+        }
+        offset += n
+
+    header_json = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    # Safetensors spec: header length must be a multiple of 8 (pad with spaces).
+    pad = (8 - len(header_json) % 8) % 8
+    header_json += b' ' * pad
+    header_len = len(header_json)
+
+    # Pass 2: write header then tensors one at a time; accumulate CRC32 per tensor.
+    crcs: list = []
+    with open(path, 'wb') as _f:
+        _f.write(_struct.pack('<Q', header_len))
+        _f.write(header_json)
+        for _name, arr in tensor_pairs:
+            mx.eval(arr)  # no-op for concrete tensors; safety net
+            if arr.dtype == mx.bfloat16:
+                # numpy has no native bf16 — reinterpret as uint16 (same bytes)
+                chunk = np.array(arr.view(mx.uint16))
+            else:
+                chunk = np.array(arr)
+            raw = chunk.tobytes()
+            crcs.append(_zlib.crc32(raw))
+            _f.write(raw)
+            del chunk, raw
+
+    # Pass 3: validate — re-read the data section sequentially, one tensor at a
+    # time.  The page cache is warm from the write so this is purely CPU-bound.
+    with open(path, 'rb') as _f:
+        _f.seek(8 + header_len)  # skip fixed header (8 bytes length + JSON)
+        for i, (name, arr) in enumerate(tensor_pairs):
+            n = arr.nbytes
+            data = _f.read(n)
+            if len(data) != n:
+                raise RuntimeError(
+                    f"Checkpoint validation: truncated data for '{name}' "
+                    f"(expected {n} bytes, got {len(data)})"
+                )
+            actual = _zlib.crc32(data)
+            if actual != crcs[i]:
+                raise RuntimeError(
+                    f"Checkpoint validation: CRC32 mismatch for '{name}' "
+                    f"(written {crcs[i]:#010x}, read back {actual:#010x})"
+                )
+            del data
+
+
 def _purge_file_page_cache(path: str) -> None:
     """
     Evict a file from the macOS unified buffer cache (page cache).
@@ -190,49 +284,37 @@ def save_checkpoint_async(
     lineage: Optional[dict] = None,
 ) -> None:
     """
-    Save adapter weights + EMA synchronously in two separate files.
+    Save adapter weights + EMA synchronously using streaming write + validation.
 
     Background saving was tried but caused OOM: the background thread held
     old adapter param tensors alive while the main thread created new ones
     (after optimizer.update), temporarily doubling adapter memory footprint
-    and pushing unified memory over 32 GB. Synchronous saving adds ~1-2s
-    every 500 steps (<0.1% overhead) and avoids the memory overlap entirely.
+    and pushing unified memory over 32 GB. Synchronous saving adds ~2-4s
+    every 500 steps (<0.2% overhead) and avoids the memory overlap entirely.
 
-    Two-file format (introduced to halve the per-save Metal buffer spike):
-      step_NNNNNNN.safetensors     — adapter params only (~2 GB)
-      step_NNNNNNN.ema.safetensors — EMA params, bare keys, no prefix (~2 GB)
+    Checkpoint format (single combined file):
+      step_NNNNNNN.safetensors — adapter keys + ema.* keys
 
-    Writing both in a single mx.save_safetensors call required ~8 GB of
-    transient Metal buffers (2× the 4 GB combined payload), pushing unified
-    memory to ~25.6 GB peak and triggering jetsam kills on 32 GB systems.
-    Splitting into two sequential saves caps the per-save peak at ~2 GB each.
+    _save_safetensors_streaming() writes one tensor at a time and validates
+    each written chunk via CRC32 before returning, keeping peak Metal buffer
+    overhead at ~one tensor (50–200 MB) rather than 2–8 GB for a bulk save.
 
     lineage: if provided, written as a sidecar step_NNNNNNN.json.
     """
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, f"step_{step:07d}.safetensors")
-    ema_path  = ckpt_path.replace(".safetensors", ".ema.safetensors")
 
-    # Save adapter params (~2 GB).  mx.eval() is a no-op here — params are
-    # always concrete (evaluated every training step), but kept as a safety net.
+    tensor_pairs = (
+        list(_flatten(adapter.parameters()))
+        + [(f"ema.{k}", v) for k, v in _flatten(ema_params)]
+    )
+
     mx.clear_cache()
-    mx.eval(adapter.parameters())
-    adapter_payload = dict(_flatten(adapter.parameters()))
-    mx.save_safetensors(ckpt_path, adapter_payload)
-    del adapter_payload
+    _save_safetensors_streaming(ckpt_path, tensor_pairs)
     _purge_file_page_cache(ckpt_path)
     mx.clear_cache()
 
-    # Save EMA params (~2 GB) separately.  Bare keys (no "ema." prefix) so
-    # load_ema_from_checkpoint can load them without key remapping.
-    mx.eval(ema_params)
-    ema_payload = dict(_flatten(ema_params))
-    mx.save_safetensors(ema_path, ema_payload)
-    del ema_payload
-    _purge_file_page_cache(ema_path)
-    mx.clear_cache()
-
-    size_mb = (os.path.getsize(ckpt_path) + os.path.getsize(ema_path)) / 1e6
+    size_mb = os.path.getsize(ckpt_path) / 1e6
     print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
 
     if lineage is not None:
@@ -255,13 +337,12 @@ def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
             os.remove(f)
         except FileNotFoundError:
             pass  # already removed by a concurrent thread
-        # Remove EMA sidecar (new two-file format)
-        for sidecar in (f.replace(".safetensors", ".ema.safetensors"),
-                        f.replace(".safetensors", ".json")):
-            try:
-                os.remove(sidecar)
-            except FileNotFoundError:
-                pass
+        # Remove lineage JSON sidecar if present
+        sidecar = f.replace(".safetensors", ".json")
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
 
 
 def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
@@ -279,28 +360,14 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
 
 def load_ema_from_checkpoint(path: str) -> Optional[dict]:
     """
-    Load EMA parameters from a checkpoint. Handles three formats:
-      - step_NNNNNNN.ema.safetensors: bare keys, no prefix (new two-file format)
-      - step_*.safetensors:           keys prefixed with "ema." (old combined format)
-      - best.safetensors:             bare keys, no prefix (written by save_ema)
+    Load EMA parameters from a checkpoint file. Handles two formats:
+      - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint_async)
+      - best.safetensors:   bare keys, no prefix (written by save_ema)
     Returns a nested dict matching adapter.parameters() structure, or None if
-    the file contains no recognisable EMA keys.
+    the file contains no recognisable EMA or adapter keys.
     """
     from safetensors import safe_open
     flat: dict = {}
-
-    # New two-file format: separate .ema.safetensors sidecar with bare keys.
-    ema_path = path.replace(".safetensors", ".ema.safetensors")
-    if os.path.exists(ema_path):
-        with safe_open(ema_path, framework="numpy") as f:
-            for k in f.keys():
-                flat[k] = mx.array(f.get_tensor(k))
-        if flat:
-            _purge_file_page_cache(ema_path)
-            return _flat_to_nested(flat)
-
-    # Old combined format: ema.* keys inside the main checkpoint file,
-    # or bare keys (best.safetensors written by save_ema).
     with safe_open(path, framework="numpy") as f:
         keys = list(f.keys())
         has_ema_prefix = any(k.startswith("ema.") for k in keys)
@@ -309,10 +376,11 @@ def load_ema_from_checkpoint(path: str) -> Optional[dict]:
                 if k.startswith("ema."):
                     flat[k[4:]] = mx.array(f.get_tensor(k))
             else:
+                # bare keys — save_ema() export (e.g. best.safetensors)
                 flat[k] = mx.array(f.get_tensor(k))
     if not flat:
         return None
-    _purge_file_page_cache(path)
+    _purge_file_page_cache(path)  # reclaim ~4 GB OS page cache from the read
     return _flat_to_nested(flat)
 
 
