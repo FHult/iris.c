@@ -34,7 +34,7 @@ Active scripts (all in `train/scripts/`):
 | `validator.py` | Post-chunk validation checks |
 | `pipeline_lib.py` | Shared primitives: state I/O, sentinels, heartbeats, tmux helpers |
 | `pipeline_status.py` | Live pipeline status (reads state file + heartbeats) |
-| `pipeline_ctl.py` | Control interface: pause / resume / abort |
+| `pipeline_ctl.py` | Control interface: pause / resume / abort / retry |
 
 **V1 scripts** (archived, not for active use): `train/scripts/v1/`
 
@@ -154,6 +154,23 @@ tmux kill-session -t iris
 
 ---
 
+### `retry` — Unblock training after hitting retry limit
+
+Use this when `pipeline_status.py` shows `Chunk N: ERROR` with "Training exited 137" and `pipeline_ctl.py clear-error` alone has not worked. The orchestrator allows up to 5 auto-retries for jetsam kills; after that it sets `train.error` and stops. The `retry` command resets the in-memory counter, clears the sentinel, and **archives the stale log** — all three are required. Simply deleting `train.error` manually does not work because the orchestrator immediately re-creates it by reading `EXIT_CODE=137` from the stale log.
+
+```bash
+train/.venv/bin/python train/scripts/pipeline_ctl.py retry 1 train
+```
+
+The orchestrator picks this up on the next poll (~60 s) and re-launches training. To watch recovery:
+```bash
+train/.venv/bin/python train/scripts/pipeline_status.py
+```
+
+For other steps, substitute the step name: `retry 1 precompute`, `retry 2 train`, etc.
+
+---
+
 ### `logs` — View active logs
 ```bash
 # Orchestrator:
@@ -223,7 +240,7 @@ Sentinel files (.done / .error)   ← authoritative; derive_chunk_state() reads 
 Heartbeat files (.json)           ← live progress; written by workers, read by status + orchestrator
 Log files (*.log)                 ← human evidence; status shows tail; orchestrator reads EXIT_CODE only
 pipeline_state.json               ← convenience mirror of sentinel state; NOT authoritative
-dispatch_queue.jsonl              ← escalated alerts; NOT shown by status script (known gap — see below)
+dispatch_queue.jsonl              ← escalated alerts; shown at the bottom of pipeline_status.py output
 ```
 
 ### Sentinel Files
@@ -342,7 +359,7 @@ rm -f /Volumes/2TBSSD/.heartbeat/*.json
 
 **Written by**: Orchestrator — updated each poll whenever chunk state changes. Also updated at training start with `steps`, `lr`, `started_at`.
 
-**Read by**: `pipeline_status.py` for `run_id`, `scale`, and chunk state snapshots. Also contains an `issues` list that the status script displays — but see the Known Gaps section below.
+**Read by**: `pipeline_status.py` for `run_id`, `scale`, and chunk state snapshots.
 
 **NOT authoritative**: The orchestrator re-derives chunk state from sentinel files on every poll. `pipeline_state.json` is a snapshot for tooling; if it disagrees with sentinels, sentinels win.
 
@@ -350,13 +367,18 @@ rm -f /Volumes/2TBSSD/.heartbeat/*.json
 
 **Path**: `/Volumes/2TBSSD/logs/dispatch_queue.jsonl`
 
-**Written by**: `dispatch_issue()` in `pipeline_lib.py` — called by the orchestrator for problems it cannot auto-resolve: step failed twice, trainer restart limit exceeded, loss NaN/Inf, sustained high grad norm, disk critical.
+**Written by**: `dispatch_issue()` in `pipeline_lib.py` — called by the orchestrator for problems it cannot auto-resolve: step failed too many times, trainer restart limit exceeded, loss NaN/Inf, sustained high grad norm, disk critical.
 
-**Read by**: Nothing currently reads this file automatically. **The status script reads `pipeline_state.json["issues"]`, not this file.** Escalated alerts are effectively invisible unless you manually inspect this file.
+**Read by**: `pipeline_status.py` via `_read_dispatch_issues()` — open (unresolved) issues appear at the bottom of status output. The status script filters by `resolved: false`.
 
+To inspect directly:
 ```bash
-# Check for escalated alerts:
 cat /Volumes/2TBSSD/logs/dispatch_queue.jsonl | python3 -m json.tool
+```
+
+To resolve an issue after intervention (removes it from status output):
+```bash
+train/.venv/bin/python train/scripts/pipeline_ctl.py dispatch-resolve <issue_id>
 ```
 
 ### `orchestrator.jsonl`
@@ -379,36 +401,23 @@ for line in sys.stdin:
 
 ## Known Telemetry Gaps
 
-These are confirmed bugs found in code review (2026-04-25). Document here so they are not rediscovered.
+Confirmed issues found in code review. Document here so they are not rediscovered. Resolved items are kept for historical context.
 
-**Gap 1 — Escalated alerts are invisible**
-`dispatch_issue()` writes to `logs/dispatch_queue.jsonl`. The status script reads `pipeline_state.json["issues"]`. These are different files and are not linked. If the orchestrator escalates (step failed twice, NaN loss, restart limit exceeded) you will not see it in `pipeline_status.py`. Always check dispatch_queue.jsonl after any anomaly:
-```bash
-cat /Volumes/2TBSSD/logs/dispatch_queue.jsonl
-```
+**Gap 1 — ~~Escalated alerts are invisible~~ RESOLVED (2026-04-25)**
+`pipeline_status.py` now reads `dispatch_queue.jsonl` directly via `_read_dispatch_issues()` and shows open issues at the bottom of status output. Escalated alerts (retry limit exceeded, NaN loss, disk critical) are visible in normal `pipeline_status.py` output.
 
-**Gap 2 — Orchestrator restart orphans any in-flight prep step**
+**Gap 2 — Orchestrator restart orphans any in-flight prep step** *(still open)*
 `_active_prep` is in-memory only. If the orchestrator is killed while iris-prep is running, on restart `_active_prep` is None. `_poll_prep_window()` returns immediately. When the prep window eventually finishes (or was already finished), the exit code is never read and the step is never marked done. The chunk is stuck indefinitely. **Workaround**: after orchestrator restart, check if iris-prep window exists. If it does, wait for it to finish then manually mark the step done or check its EXIT_CODE in the log. If the step log already contains `EXIT_CODE=0`, mark it done manually:
 ```bash
 # Example: precompute completed but orchestrator missed it
 touch /Volumes/2TBSSD/pipeline/chunk1/precompute.done
 ```
 
-**Gap 3 — Hung prep workers are never detected**
-The orchestrator only monitors the trainer heartbeat for staleness. Prep workers (precompute, clip_embed, build_shards, filter, mine) have no timeout in the orchestrator. If they hang (process alive but making no progress), the orchestrator waits forever. Detection requires manual inspection:
-```bash
-# Check if prep is alive and making progress:
-cat /Volumes/2TBSSD/.heartbeat/precompute_chunk1.json  # check ts field age
-tail -5 /Volumes/2TBSSD/logs/precompute_chunk1.log     # check for recent output
-```
+**Gap 3 — ~~Hung prep workers undetected~~ RESOLVED (2026-04-25)**
+The orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of continuous prep window activity. It also monitors prep worker heartbeats: if a worker's heartbeat goes stale for >30 min, the orchestrator dispatches an alert (visible in `pipeline_status.py`). If you see a prep-hung alert, check the log and kill the window manually if confirmed stuck.
 
-**Gap 4 — SigLIP coverage not enforced at promotion**
-`_promote_chunk()` checks that `qwen3/` and `vae/` have ≥90% of expected records. It does NOT check `siglip/`. A partial or empty siglip cache passes promotion silently and training starts with zero image conditioning for the missing records. Before manual promotion or after precompute completes, verify:
-```bash
-ls /Volumes/2TBSSD/staging/chunk1/precomputed/siglip/ | wc -l
-ls /Volumes/2TBSSD/staging/chunk1/precomputed/qwen3/  | wc -l
-# siglip count should be within a few % of qwen3 count
-```
+**Gap 4 — ~~SigLIP coverage not enforced at promotion~~ RESOLVED (2026-04-25)**
+`_promote_chunk()` now enforces ≥90% siglip coverage when `training.siglip: true` in the pipeline config. A partial siglip cache is rejected at promotion with a `promoted.error` sentinel.
 
 ---
 
@@ -416,6 +425,7 @@ ls /Volumes/2TBSSD/staging/chunk1/precomputed/qwen3/  | wc -l
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
+| `Chunk N: ERROR` — "Training exited 137" — retry limit exceeded | macOS jetsam OOM kill (unified memory pressure) | `pipeline_ctl.py retry N train` — resets counter, clears sentinel, archives stale log. Do NOT just delete `train.error`; orchestrator immediately recreates it from stale log EXIT_CODE |
 | Orchestrator exits immediately | Doctor check failed | Read startup output; fix the flagged issue |
 | Prep window creation fails with "index N in use" | tmux session/window index conflict | Fixed in pipeline_lib.py — update if you see this again |
 | Training never starts (READY state loops) | Precompute coverage < 90% | Check precompute log; re-run precompute_all.py manually if stuck |
