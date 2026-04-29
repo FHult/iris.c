@@ -190,41 +190,49 @@ def save_checkpoint_async(
     lineage: Optional[dict] = None,
 ) -> None:
     """
-    Save adapter weights + EMA synchronously.
+    Save adapter weights + EMA synchronously in two separate files.
 
     Background saving was tried but caused OOM: the background thread held
     old adapter param tensors alive while the main thread created new ones
     (after optimizer.update), temporarily doubling adapter memory footprint
     and pushing unified memory over 32 GB. Synchronous saving adds ~1-2s
-    every 200 steps (<0.2% overhead) and avoids the memory overlap entirely.
+    every 500 steps (<0.1% overhead) and avoids the memory overlap entirely.
 
-    mx.save_safetensors writes directly from Metal buffers without a numpy
-    copy, so the write itself is efficient.
+    Two-file format (introduced to halve the per-save Metal buffer spike):
+      step_NNNNNNN.safetensors     — adapter params only (~2 GB)
+      step_NNNNNNN.ema.safetensors — EMA params, bare keys, no prefix (~2 GB)
 
-    lineage: if provided, written as a sidecar step_NNNNNNN.json recording the
-    config, git SHA, training args, and step/loss for reproducibility (MLX-10).
+    Writing both in a single mx.save_safetensors call required ~8 GB of
+    transient Metal buffers (2× the 4 GB combined payload), pushing unified
+    memory to ~25.6 GB peak and triggering jetsam kills on 32 GB systems.
+    Splitting into two sequential saves caps the per-save peak at ~2 GB each.
+
+    lineage: if provided, written as a sidecar step_NNNNNNN.json.
     """
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, f"step_{step:07d}.safetensors")
+    ema_path  = ckpt_path.replace(".safetensors", ".ema.safetensors")
 
-    # Free any cached MLX buffers before forcing eval of checkpoint tensors.
-    # Reduces peak unified memory during the eval + serialize window, which
-    # is the most likely trigger for jetsam kills on 32 GB systems.
+    # Save adapter params (~2 GB).  mx.eval() is a no-op here — params are
+    # always concrete (evaluated every training step), but kept as a safety net.
     mx.clear_cache()
     mx.eval(adapter.parameters())
-    mx.eval(ema_params)
-
-    payload = {
-        **dict(_flatten(adapter.parameters())),
-        **{f"ema.{k}": v for k, v in _flatten(ema_params)},
-    }
-
-    mx.save_safetensors(ckpt_path, payload)
-    del payload
-    _purge_file_page_cache(ckpt_path)  # reclaim ~4 GB OS page cache from the write
+    adapter_payload = dict(_flatten(adapter.parameters()))
+    mx.save_safetensors(ckpt_path, adapter_payload)
+    del adapter_payload
+    _purge_file_page_cache(ckpt_path)
     mx.clear_cache()
 
-    size_mb = os.path.getsize(ckpt_path) / 1e6
+    # Save EMA params (~2 GB) separately.  Bare keys (no "ema." prefix) so
+    # load_ema_from_checkpoint can load them without key remapping.
+    mx.eval(ema_params)
+    ema_payload = dict(_flatten(ema_params))
+    mx.save_safetensors(ema_path, ema_payload)
+    del ema_payload
+    _purge_file_page_cache(ema_path)
+    mx.clear_cache()
+
+    size_mb = (os.path.getsize(ckpt_path) + os.path.getsize(ema_path)) / 1e6
     print(f"  checkpoint saved: step_{step:07d}.safetensors ({size_mb:.0f} MB)")
 
     if lineage is not None:
@@ -247,12 +255,13 @@ def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
             os.remove(f)
         except FileNotFoundError:
             pass  # already removed by a concurrent thread
-        # Remove sidecar lineage JSON if present
-        sidecar = f.replace(".safetensors", ".json")
-        try:
-            os.remove(sidecar)
-        except FileNotFoundError:
-            pass
+        # Remove EMA sidecar (new two-file format)
+        for sidecar in (f.replace(".safetensors", ".ema.safetensors"),
+                        f.replace(".safetensors", ".json")):
+            try:
+                os.remove(sidecar)
+            except FileNotFoundError:
+                pass
 
 
 def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
@@ -270,14 +279,28 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
 
 def load_ema_from_checkpoint(path: str) -> Optional[dict]:
     """
-    Load EMA parameters from a checkpoint file. Handles two formats:
-      - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint_async)
-      - best.safetensors:   bare keys, no prefix (written by save_ema)
+    Load EMA parameters from a checkpoint. Handles three formats:
+      - step_NNNNNNN.ema.safetensors: bare keys, no prefix (new two-file format)
+      - step_*.safetensors:           keys prefixed with "ema." (old combined format)
+      - best.safetensors:             bare keys, no prefix (written by save_ema)
     Returns a nested dict matching adapter.parameters() structure, or None if
-    the file contains no recognisable EMA or adapter keys.
+    the file contains no recognisable EMA keys.
     """
     from safetensors import safe_open
     flat: dict = {}
+
+    # New two-file format: separate .ema.safetensors sidecar with bare keys.
+    ema_path = path.replace(".safetensors", ".ema.safetensors")
+    if os.path.exists(ema_path):
+        with safe_open(ema_path, framework="numpy") as f:
+            for k in f.keys():
+                flat[k] = mx.array(f.get_tensor(k))
+        if flat:
+            _purge_file_page_cache(ema_path)
+            return _flat_to_nested(flat)
+
+    # Old combined format: ema.* keys inside the main checkpoint file,
+    # or bare keys (best.safetensors written by save_ema).
     with safe_open(path, framework="numpy") as f:
         keys = list(f.keys())
         has_ema_prefix = any(k.startswith("ema.") for k in keys)
@@ -286,11 +309,10 @@ def load_ema_from_checkpoint(path: str) -> Optional[dict]:
                 if k.startswith("ema."):
                     flat[k[4:]] = mx.array(f.get_tensor(k))
             else:
-                # bare keys — save_ema() export (e.g. best.safetensors)
                 flat[k] = mx.array(f.get_tensor(k))
     if not flat:
         return None
-    _purge_file_page_cache(path)  # reclaim ~4 GB OS page cache from the read
+    _purge_file_page_cache(path)
     return _flat_to_nested(flat)
 
 
@@ -1129,10 +1151,11 @@ def train(config: dict) -> None:
                 )
                 print(f"  buckets: {_bkt_str}", flush=True)
 
-            # T-03: memory pressure (peak is per-interval; reset after reading)
+            # T-03: memory pressure (peak read here; reset deferred until after
+            # the checkpoint save so the interval peak captures both training
+            # AND checkpoint serialization spikes in the same window)
             mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
             mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
-            mx.reset_peak_memory()
             print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
                   flush=True)
             if _HAS_PSUTIL:
@@ -1256,6 +1279,11 @@ def train(config: dict) -> None:
             save_checkpoint_async(adapter, ema_params, step,
                                   ocfg["checkpoint_dir"], ocfg["keep_last_n"],
                                   lineage=_lineage)
+
+        # Peak reset deferred until after checkpoint so the reported peak
+        # covers the full interval (training + serialization spike).
+        if step % log_interval == 0:
+            mx.reset_peak_memory()
 
 
     # Final checkpoint + EMA export
