@@ -317,6 +317,27 @@ and use 2K-step checkpoint intervals. Full mitigation details in
 
 ---
 
+## Pipeline V3 / V4 Roadmap
+
+See [`plans/pipeline-v3-architecture.md`](pipeline-v3-architecture.md) for the full design.
+
+**V3 — Container-native, multi-node (Apple Silicon cluster)**
+Containerise the V2 pipeline, replace sentinel-file state with Redis, replace tmux
+process management with Kubernetes Jobs, add a web GUI with a REST API. Target hardware:
+a small cluster of Apple Silicon Macs (Mac Mini M4 / Mac Studio). CPU-only steps
+(download, convert, build_shards, filter) can run on Linux nodes. GPU steps (precompute,
+train) require Apple Silicon nodes due to the MLX/Metal dependency.
+
+**V4 — PyTorch/CUDA backend enabling cloud GPU training**
+Port the training backend to PyTorch alongside MLX (both produce identical safetensors
+checkpoints). Introduces `--backend mlx` / `--backend torch` flag. Once validated, the
+`iris-train` container gains a CUDA variant runnable on cloud GPU nodes (A100/H100 spot
+instances). A 22h training run costs ~$44 on spot A100 vs ~10 days of M1 Max wall-clock.
+
+V4 is scoped after V3 is stable and a complete 4-chunk run has been validated on V2.
+
+---
+
 ## Deferred / Later Consideration
 
 Items not in the current roadmap but identified as valuable:

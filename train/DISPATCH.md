@@ -6,6 +6,10 @@
 > V1 scripts have been archived to `train/scripts/v1/` — do not use them.
 > See `plans/pipeline-v2-architecture.md` for design and `plans/pipeline-mlops-backlog.md`
 > for implementation plan and phase status.
+>
+> **Future:** V3 (container-native, Kubernetes, web GUI) and V4 (PyTorch/CUDA + cloud GPU)
+> are documented in `plans/pipeline-v3-architecture.md`. V3/V4 are pre-design; V2 is the
+> active pipeline.
 
 ---
 
