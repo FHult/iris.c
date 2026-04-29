@@ -997,14 +997,18 @@ def train(config: dict) -> None:
                                    decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
+        # Split into two fences so the EMA allocation does not coincide with
+        # the backward-pass peak.  Including ema_params in the same eval as
+        # the backward pass adds ~4 GB to peak unified memory (old_ema +
+        # new_ema simultaneously alongside gradients + optimizer state), which
+        # causes jetsam kills on 32 GB systems.  Evaluating them separately
+        # lets the backward-pass temporaries free before EMA materialises.
         _t0 = time.time()
-        if _do_ema:
-            mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state, ema_params)
-        else:
-            mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
-        # Return freed buffers to the OS immediately.  Without this, MLX holds
-        # them in a cache that inflates peak wired memory and triggers jetsam.
+        mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
         mx.clear_cache()
+        if _do_ema:
+            mx.eval(ema_params)
+            mx.clear_cache()
         _t_eval_end = time.time()
         _t_eval += _t_eval_end - _t0
 
@@ -1125,9 +1129,10 @@ def train(config: dict) -> None:
                 )
                 print(f"  buckets: {_bkt_str}", flush=True)
 
-            # T-03: memory pressure
+            # T-03: memory pressure (peak is per-interval; reset after reading)
             mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
             mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
+            mx.reset_peak_memory()
             print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
                   flush=True)
             if _HAS_PSUTIL:
