@@ -2,7 +2,7 @@
 
 **Status:** Research / Pre-design  
 **Scope:** IP-Adapter training pipeline, generalisable to other training recipes  
-**Target hardware:** Apple Silicon cluster (M-series Mac Minis / Mac Studios) + optional Linux nodes for CPU-only steps  
+**Target hardware:** Apple Silicon cluster (M4 Pro Mac Mini / M4 Max Mac Studio) + optional Linux nodes for CPU-only steps  
 **Date:** 2026-04-29  
 **Prerequisite:** V2 pipeline fully operational (see `plans/pipeline-v2-architecture.md`)
 
@@ -28,7 +28,80 @@ replacing file-based state with a shared store, and adding a web control plane.
 
 ---
 
-## 2. Design Goals
+## 2. Hardware Profile
+
+### 2.1 Reference node: M1 Max (current V2)
+
+| Spec | Value |
+|------|-------|
+| GPU cores | 32 |
+| Memory bandwidth | 400 GB/s |
+| Unified memory | 64 GB |
+| Training throughput | ~0.226 steps/s (IP-Adapter, 512px) |
+| Step time breakdown | fwd 75% (~3.35s) + eval 25% (~1.10s) |
+
+### 2.2 V3 candidate nodes
+
+| Node | GPU cores | Bandwidth | Max memory | Est. price |
+|------|-----------|-----------|------------|------------|
+| M4 Pro Mac Mini (20-core) | 20 | 273 GB/s | 64 GB | ~$1,999 |
+| M4 Max Mac Studio (32-core) | 32 | 410 GB/s | 128 GB | ~$2,599+ |
+| M4 Max Mac Studio (40-core) | 40 | 546 GB/s | 128 GB | ~$3,999+ |
+
+The M4 GPU architecture is approximately 2–2.5× more efficient per core than M1 due to
+generational improvements across M2→M3→M4. A 20-core M4 Pro therefore delivers roughly
+comparable single-threaded GPU throughput to the M1 Max's 32 cores, at lower memory
+bandwidth (273 vs 400 GB/s) but significantly lower cost.
+
+### 2.3 Cluster throughput model
+
+For data-parallel training, each node trains on an independent batch and gradients are
+averaged via MLX's `mx.distributed.all_sum()` (MPI Ring backend, TCP transport). The
+IP-Adapter adapter weights are ~522 M params × 2 bytes (BF16) = ~1.04 GB per gradient
+sync. Over 10 GbE or Thunderbolt Bridge between Mac Minis (~1.25 GB/s effective), a
+3-node ring allreduce takes approximately:
+
+```
+2 × (N-1)/N × 1.04 GB / 1.25 GB/s ≈ 1.1 s for N=3
+```
+
+With a baseline step time of ~4.45s, communication overhead is ~25% per step. Net
+throughput for 3 data-parallel nodes: **3× compute / 1.25× overhead ≈ 2.4× speedup**.
+
+| Configuration | Nodes | Est. step time | Est. steps/s | Full-run ETA (225K steps) | Approx. cost |
+|---|---|---|---|---|---|
+| M1 Max (current) | 1 | 4.45s | 0.226 | 11 days | existing |
+| 1× M4 Pro Mac Mini | 1 | ~2.5s | ~0.40 | ~6.5 days | ~$2k |
+| 2× M4 Pro Mac Mini | 2 | ~1.9s (with comms) | ~0.53 | ~4.9 days | ~$4k |
+| 3× M4 Pro Mac Mini | 3 | ~1.6s (with comms) | ~0.63 | ~4.1 days | ~$6k |
+| M4 Max Mac Studio (40-core) | 1 | ~1.8s | ~0.56 | ~4.6 days | ~$4k+ |
+
+The step-time estimates assume the M4 Pro's per-core improvement roughly compensates for
+its lower core count vs M1 Max, and that the forward-pass bottleneck scales with memory
+bandwidth. These are order-of-magnitude estimates; real benchmarking is required.
+
+**Key observation:** For precompute and shard-building (embarrassingly parallel), multiple
+M4 Pro Mac Minis scale linearly with node count — no communication overhead. 3 nodes
+running precompute in parallel reduces the 14h precompute time to ~5h regardless of
+inter-node bandwidth. This is arguably the most immediate benefit of a small cluster.
+
+### 2.4 Single-node vs cluster recommendation
+
+For **pure training throughput**: an M4 Max Mac Studio (40-core, 128 GB) is the best
+single-node option — higher bandwidth than M1 Max, no communication overhead, 128 GB
+memory for larger batch sizes or multi-resolution training. Cost is similar to 2-3 Mac Minis.
+
+For **mixed pipeline workloads** (precompute + train simultaneously): a cluster of M4 Pro
+Mac Minis offers better total pipeline throughput since precompute and training can run on
+separate nodes in parallel rather than competing for the same GPU.
+
+For **cost-effective scaling**: 2–3 M4 Pro Mac Minis at ~$2k each is a compelling cluster
+that significantly outperforms the M1 Max on total throughput while keeping flexibility to
+run independent workloads per node.
+
+---
+
+## 3. Design Goals
 
 | Goal | Constraint |
 |------|-----------|
@@ -41,7 +114,7 @@ replacing file-based state with a shared store, and adding a web control plane.
 
 ---
 
-## 3. The Critical Decision: MLX Constraint
+## 4. The Critical Decision: MLX Constraint
 
 MLX only runs on Apple Silicon. This is the single biggest architectural constraint in V3.
 
@@ -57,8 +130,8 @@ MLX only runs on Apple Silicon. This is the single biggest architectural constra
 | mine / validate | Light CPU | Any node |
 | orchestrator / web GUI | CPU only | Any node |
 
-A V3 cluster could be heterogeneous:
-- 1–3 Apple Silicon nodes (M4 Mac Mini or Mac Studio) for GPU work
+A V3 cluster is heterogeneous:
+- 2–3 Apple Silicon nodes (M4 Pro Mac Mini or M4 Max Mac Studio) for GPU work
 - Optional Linux x86 nodes for bulk data download and shard building
 
 The Apple Silicon nodes run Darwin. Kubernetes on Darwin requires either:
@@ -70,9 +143,40 @@ The practical answer for a small home cluster: **k3s on each Mac, containers are
 images built for arm64-darwin, shared NFS or object storage for artefacts.** This is less
 "pure Kubernetes" than a cloud deployment but fully functional and keeps Metal access.
 
+### MLX Distributed Training
+
+MLX 0.31+ ships `mlx.core.distributed` with MPI Ring backend:
+
+```python
+import mlx.core.distributed as dist
+
+dist.init()          # reads MPI_WORLD from environment
+world = dist.Group() # all nodes
+
+# After backward pass — average gradients across nodes:
+averaged_grads = {k: dist.all_sum(g) / world.size()
+                  for k, g in grads.items()}
+```
+
+Available primitives: `all_sum`, `all_gather`, `all_max`, `all_min`, `sum_scatter`,
+`send`, `recv`. This covers standard data-parallel training (AllReduce gradient averaging).
+
+**Transport:** TCP sockets by default; no dedicated RDMA or Thunderbolt ML fabric. For
+~1 GB gradient tensors over 10 GbE, allreduce takes ~1.1s per step on 3 nodes (see
+Section 2.3). Thunderbolt Bridge between Mac Minis operates at 10 Gbit/s, same effective
+bandwidth as 10 GbE.
+
+**Launch:** `mpirun -n 3 --host mac1,mac2,mac3 python train_ip_adapter.py`
+Each node runs an independent forward/backward pass on its own batch; gradients are
+averaged before the optimizer step. Checkpoint saving is done only on rank 0.
+
+The training script requires one new code path: wrap the optimizer step with allreduce
+when `dist.is_available()` and world size > 1. Everything else (data loading, checkpointing,
+EMA, heartbeat) stays single-node per rank.
+
 ---
 
-## 4. Container Architecture
+## 5. Container Architecture
 
 ### 4.1 Container Inventory
 
@@ -173,7 +277,7 @@ pre-cache the relevant shard's precomputed files to a local emptyDir volume at s
 
 ---
 
-## 5. Orchestrator Refactor
+## 6. Orchestrator Refactor
 
 The current `orchestrator.py` is a monolithic polling loop. V3 splits it into two concerns:
 
@@ -200,7 +304,7 @@ GET  /api/v1/metrics         → Prometheus text format
 
 ---
 
-## 6. Web GUI
+## 7. Web GUI
 
 Single-page app (or server-rendered HTMX) consuming the orchestrator REST API.
 
@@ -221,7 +325,7 @@ No native app required.
 
 ---
 
-## 7. Kubernetes Specifics
+## 8. Kubernetes Specifics
 
 ### 7.1 Node labelling
 
@@ -277,7 +381,7 @@ is alive. This replaces `write_heartbeat()` entirely.
 
 ---
 
-## 8. Migration Path from V2
+## 9. Migration Path from V2
 
 V3 is a non-trivial refactor. Suggested phasing:
 
@@ -305,7 +409,7 @@ V3 is a non-trivial refactor. Suggested phasing:
 
 ---
 
-## 9. Open Questions
+## 10. Open Questions
 
 1. **Darwin containers on K8s**: OrbStack's K8s support is the most mature path for running
    OCI containers that access Metal on macOS. Needs evaluation for the MLX use case specifically.
@@ -326,7 +430,7 @@ V3 is a non-trivial refactor. Suggested phasing:
 
 ---
 
-## 10. V4 Roadmap Item: PyTorch/CUDA Backend
+## 11. V4 Roadmap Item: PyTorch/CUDA Backend
 
 Tracked separately in `plans/pipeline-v4-roadmap.md` when that document is created.
 
