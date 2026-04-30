@@ -859,6 +859,18 @@ def train(config: dict) -> None:
         )
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
+        # Materialize optimizer m/v inside this function before returning.
+        # optimizer.state shares the same lazy nodes as adapter.parameters():
+        # new_param = old_param - lr * new_m / sqrt(new_v), and new_m/new_v
+        # are also stored in state["m"]/state["v"].  Without this eval, the
+        # outer Fence 1 (adapter.parameters()) runs the full backward + m/v +
+        # param-update chain simultaneously, peaking at ~25.7 GB.
+        # By evaluating m/v here, adapter.parameters() lazy exprs reference
+        # only concrete values, so outer Fence 1 allocates just new_params
+        # (~2 GB), cutting the per-step peak to ~19–21 GB.
+        # grads are freed when this function returns (local var goes out of scope).
+        mx.eval(optimizer.state)
+        mx.clear_cache()
         return loss_val, grad_norm
 
     # ── T-05: validation loss on held-out set ─────────────────────────────────
@@ -1067,7 +1079,7 @@ def train(config: dict) -> None:
         mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
         _t_fwd += time.time() - _t0
 
-        # Adapter-only backward + optimizer update (tiny graph, should be fast)
+        # Adapter-only backward + optimizer update + optimizer state eval (bulk of GPU work)
         _t0 = time.time()
         loss_val, grad_norm_val = compiled_step(
             siglip_feats, use_null_image, flux_state, target,
@@ -1078,26 +1090,22 @@ def train(config: dict) -> None:
         _t_step += time.time() - _t0
 
         # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
-        # Computed here — before mx.eval — so the update graph is folded into
-        # the same Metal command submission as the optimizer step.  This avoids
-        # a second GPU fence (was: eval params, then separately eval ema_params).
-        # The lazy chain is broken by including ema_params in the eval below.
+        # Computed before mx.eval so ema_params references the same lazy
+        # adapter.parameters() that Fence 1 will evaluate — no extra fence needed.
         _do_ema = (step % tcfg["ema_update_every"] == 0)
         if _do_ema:
             ema_params = update_ema(ema_params, adapter,
                                    decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
-        # Split into three fences to keep each transient peak below ~22 GB:
-        # Fence 1 (adapter.parameters()): backward pass + weight update only.
-        # Fence 2 (optimizer.state): old_m + new_m + old_v + new_v — no
-        #   backward temporaries since they were freed by clear_cache above.
-        # Fence 3 (ema_params): old_ema + new_ema — isolated for same reason.
-        # Combining any two fences adds ~4 GB and causes jetsam kills on 32 GB.
+        # Fence 1 (adapter.parameters()): param update only — grads and
+        #   optimizer m/v are already concrete from compiled_step's internal
+        #   mx.eval(optimizer.state), so this fence allocates only new_params
+        #   (~2 GB), keeping the per-step peak at ~19–21 GB.
+        # Fence 2 (ema_params): old_ema + new_ema — isolated so EMA update
+        #   does not overlap with the param-update allocation.
         _t0 = time.time()
         mx.eval(loss_val, grad_norm_val, adapter.parameters())
-        mx.clear_cache()
-        mx.eval(optimizer.state)
         mx.clear_cache()
         if _do_ema:
             mx.eval(ema_params)
@@ -1181,7 +1189,8 @@ def train(config: dict) -> None:
             )
             # TP-005: per-phase timing breakdown
             # fwd = Flux forward + flux_state eval (no grad)
-            # step = adapter compiled_step (backward, should be small)
+            # step = compiled_step: backward + optimizer m/v eval (now includes bulk of eval time)
+            # eval = outer Fence 1: just new_params (~2 GB), should be small
             total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
             if total_phase > 0:
                 print(
