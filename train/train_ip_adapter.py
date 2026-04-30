@@ -1087,14 +1087,16 @@ def train(config: dict) -> None:
                                    decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
         # Synchronous eval: prevents lazy-graph accumulation across steps.
-        # Split into two fences so the EMA allocation does not coincide with
-        # the backward-pass peak.  Including ema_params in the same eval as
-        # the backward pass adds ~4 GB to peak unified memory (old_ema +
-        # new_ema simultaneously alongside gradients + optimizer state), which
-        # causes jetsam kills on 32 GB systems.  Evaluating them separately
-        # lets the backward-pass temporaries free before EMA materialises.
+        # Split into three fences to keep each transient peak below ~22 GB:
+        # Fence 1 (adapter.parameters()): backward pass + weight update only.
+        # Fence 2 (optimizer.state): old_m + new_m + old_v + new_v — no
+        #   backward temporaries since they were freed by clear_cache above.
+        # Fence 3 (ema_params): old_ema + new_ema — isolated for same reason.
+        # Combining any two fences adds ~4 GB and causes jetsam kills on 32 GB.
         _t0 = time.time()
-        mx.eval(loss_val, grad_norm_val, adapter.parameters(), optimizer.state)
+        mx.eval(loss_val, grad_norm_val, adapter.parameters())
+        mx.clear_cache()
+        mx.eval(optimizer.state)
         mx.clear_cache()
         if _do_ema:
             mx.eval(ema_params)
