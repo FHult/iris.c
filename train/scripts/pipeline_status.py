@@ -63,12 +63,18 @@ def _tmux_status() -> dict:
 
 
 def _log_tail(log_file: Path, n: int = 5) -> list:
-    """Return last n non-empty, non-EXIT_CODE lines of a log file."""
+    """Return last n non-empty, non-noise lines of a log file."""
     if not log_file or not log_file.exists():
         return []
     try:
         lines = log_file.read_text(errors="replace").splitlines()
-        tail = [l for l in lines if l.strip() and not l.startswith("EXIT_CODE=")]
+        tail = [
+            l for l in lines
+            if l.strip()
+            and not l.startswith("EXIT_CODE=")
+            and "Terminated:" not in l
+            and "Killed:" not in l
+        ]
         return tail[-n:]
     except OSError:
         return []
@@ -117,7 +123,10 @@ def _trainer_heartbeat(chunk: int) -> dict:
     if hb is None:
         return {}
     age = heartbeat_age_secs("trainer", chunk)
-    return {**hb, "age_secs": age, "stale": age is not None and age > 120}
+    # Trainer heartbeat fires every min(log_interval, 50) steps.  At current
+    # throughput (~0.20 steps/s) that is ~250 s; use 300 s stale threshold to
+    # give a single interval of slack before alarming.
+    return {**hb, "age_secs": age, "stale": age is not None and age > 300}
 
 
 def _worker_heartbeat(process: str, chunk: int) -> dict:
@@ -431,8 +440,9 @@ def print_human(status: dict, verbose: bool = False) -> None:
     # Open dispatch issues (from dispatch_queue.jsonl — the authoritative escalation log)
     open_issues = status.get("dispatch_issues", [])
     if open_issues:
-        print(f"\n  *** {len(open_issues)} unresolved issue(s) in dispatch queue:")
-        n_show = len(open_issues) if verbose else min(5, len(open_issues))
+        n = len(open_issues)
+        print(f"\n  *** {n} unresolved issue(s) in dispatch queue:")
+        n_show = n if verbose else min(5, n)
         for i in open_issues[:n_show]:
             sev = i.get("severity", "?").upper()
             ts  = i.get("ts", "")[:19]
@@ -440,8 +450,10 @@ def print_human(status: dict, verbose: bool = False) -> None:
             act = i.get("suggested_action", "")
             act_str = f"  → {act}" if act else ""
             print(f"    [{sev}] {ts}  {msg}{act_str}")
-        if len(open_issues) > n_show:
-            print(f"    ... and {len(open_issues) - n_show} more (use --verbose)")
+        if n > n_show:
+            print(f"    ... and {n - n_show} more (use --verbose)")
+        if n > 1:
+            print(f"    to clear all: pipeline_ctl.py dispatch-resolve-all")
 
     print(f"{'─'*64}\n")
 

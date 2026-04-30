@@ -144,6 +144,38 @@ def cmd_dispatch_resolve(args) -> None:
     print(f"Marked {issue_id} as resolved")
 
 
+def cmd_dispatch_resolve_all(args) -> None:
+    """Resolve all open dispatch issues, optionally filtered by chunk or severity."""
+    if not DISPATCH_QUEUE.exists():
+        print("No dispatch queue")
+        return
+    lines = DISPATCH_QUEUE.read_text().strip().splitlines()
+    by_id: dict = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            iid = entry.get("id")
+            if iid:
+                by_id[iid] = entry
+        except json.JSONDecodeError:
+            pass
+    open_issues = [e for e in by_id.values() if not e.get("resolved", False)]
+    if args.chunk:
+        open_issues = [e for e in open_issues if e.get("chunk") == args.chunk]
+    if not open_issues:
+        print("No matching open issues")
+        return
+    ts = now_iso()
+    with open(DISPATCH_QUEUE, "a") as f:
+        for issue in open_issues:
+            marker = json.dumps({"id": issue["id"], "resolved": True, "resolved_at": ts})
+            f.write(marker + "\n")
+    print(f"Resolved {len(open_issues)} issue(s)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Pipeline V2 control")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -170,21 +202,25 @@ def main() -> None:
 
     sub.add_parser("dispatch-read",      help="Show open dispatch issues")
 
-    p = sub.add_parser("dispatch-resolve",help="Mark a dispatch issue resolved")
+    p = sub.add_parser("dispatch-resolve",    help="Mark a single dispatch issue resolved")
     p.add_argument("issue_id")
+
+    p = sub.add_parser("dispatch-resolve-all", help="Resolve all open dispatch issues")
+    p.add_argument("--chunk", type=int, default=None, help="Limit to a specific chunk")
 
     args = ap.parse_args()
     handlers = {
-        "pause":                cmd_pause,
-        "resume":               cmd_resume,
-        "abort":                cmd_abort,
-        "restart-orchestrator": cmd_restart_orchestrator,
-        "force-next-chunk":     cmd_force_next_chunk,
-        "retry":                cmd_retry,
-        "clear-error":          cmd_clear_error,
-        "mark-done":            cmd_mark_done,
-        "dispatch-read":        cmd_dispatch_read,
-        "dispatch-resolve":     cmd_dispatch_resolve,
+        "pause":                   cmd_pause,
+        "resume":                  cmd_resume,
+        "abort":                   cmd_abort,
+        "restart-orchestrator":    cmd_restart_orchestrator,
+        "force-next-chunk":        cmd_force_next_chunk,
+        "retry":                   cmd_retry,
+        "clear-error":             cmd_clear_error,
+        "mark-done":               cmd_mark_done,
+        "dispatch-read":           cmd_dispatch_read,
+        "dispatch-resolve":        cmd_dispatch_resolve,
+        "dispatch-resolve-all":    cmd_dispatch_resolve_all,
     }
     handlers[args.command](args)
 
