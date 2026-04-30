@@ -968,13 +968,14 @@ def train(config: dict) -> None:
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
-    # When log_every is large (e.g. 500 steps × 0.22 sps ≈ 37 min) the log block
-    # fires too infrequently to keep the orchestrator's 900 s stale threshold happy.
-    # 200 steps ≈ 880 s at 0.226 sps — safely below the 900 s stale threshold.
-    _heartbeat_every = min(log_interval, 200)
+    # Capped at 50: at 0.22 steps/s that is ~227 s, well inside the 900 s stale
+    # threshold.  The old cap of 200 (≈909 s) was right at the limit — any small
+    # slowdown triggered a spurious orchestrator restart.
+    _heartbeat_every = min(log_interval, 50)
     _hb_t0 = time.time()
     _hb_loss = 0.0
     _hb_loss_smooth = 0.0
+    _hb_sps = 0.0
     _hb_siglip_cov = 100.0   # last known from log block; 100% until first log fires
     _hb_loader_pct = 0.0     # last known from log block
 
@@ -1314,7 +1315,7 @@ def train(config: dict) -> None:
         # Heartbeat — decoupled from log_every so the orchestrator always sees
         # liveness even when log_every is large.  The full rich heartbeat is
         # written by the log block above at log_interval steps; this lightweight
-        # one fires at _heartbeat_every (≤100) steps for the intervals between.
+        # one fires at _heartbeat_every (≤50) steps for the intervals between.
         if step % _heartbeat_every == 0 and step > 0:
             _hb_elapsed = time.time() - _hb_t0
             _hb_t0 = time.time()
@@ -1349,6 +1350,17 @@ def train(config: dict) -> None:
             save_checkpoint_async(adapter, ema_params, step,
                                   ocfg["checkpoint_dir"], ocfg["keep_last_n"],
                                   lineage=_lineage)
+            # Write a heartbeat after the potentially slow checkpoint save so
+            # the orchestrator doesn't see a stale heartbeat and restart us.
+            try:
+                from pipeline_lib import write_heartbeat as _write_hb
+                _write_hb("trainer", _pipeline_chunk, step=step,
+                           total_steps=tcfg["num_steps"],
+                           loss=round(_hb_loss, 6),
+                           steps_per_sec=round(_hb_sps, 4),
+                           eta_sec=int((tcfg["num_steps"] - step) / _hb_sps) if _hb_sps > 0 else 0)
+            except Exception:
+                pass
 
         # Peak reset deferred until after checkpoint so the reported peak
         # covers the full interval (training + serialization spike).
