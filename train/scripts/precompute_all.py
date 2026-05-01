@@ -106,14 +106,18 @@ def _save_npz_atomic(path: str, **arrays) -> None:
     Prevents partial writes from being mistaken for valid outputs on resume —
     a crash mid-write leaves a .tmp file (ignored by _scan_existing) rather
     than a truncated .npz that would pass an existence check.
+
+    np.savez appends ".npz" to the filename if it doesn't already end with it,
+    so the actual file created is path + ".tmp.npz", not path + ".tmp".
     """
-    tmp = path + ".tmp"
+    tmp_stem = path + ".tmp"
+    tmp_actual = tmp_stem + ".npz"  # what np.savez actually creates
     try:
-        np.savez(tmp, **arrays)
-        os.replace(tmp, path)
+        np.savez(tmp_stem, **arrays)
+        os.replace(tmp_actual, path)
     except Exception:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp_actual)
         except OSError:
             pass
         raise
@@ -874,16 +878,22 @@ def main():
           + (f"   SigLIP batch: {args.siglip_batch}" if siglip_out else ""))
     print()
 
-    # Sample the first shard to check whether qwen3/vae are already fully cached.
+    # Sample the LAST shard to check whether qwen3/vae are already fully cached.
     # Avoids loading 8+ GB of model weights that would be immediately discarded —
     # which caused jetsam to kill the subsequent training process on 32 GB systems
     # when precompute and training started within seconds of each other.
+    #
+    # We sample the last shard (not the first) because precompute processes shards
+    # in sorted order; after a partial run the first N shards are cached but later
+    # shards are not.  Sampling shards[0] incorrectly concludes "all done" when only
+    # a prefix is cached, causing all remaining shards to be silently skipped.
     _load_qwen3 = True
     _load_vae   = True
     if shards and args.qwen3_output and args.vae_output:
         try:
             import itertools as _itools
-            _sample = [(r, None, None) for r, _, _ in _itools.islice(iter_shard(shards[0]), 20)]
+            _sample_shard = shards[-1]  # last shard = least likely cached in a partial run
+            _sample = [(r, None, None) for r, _, _ in _itools.islice(iter_shard(_sample_shard), 20)]
             _existing_q_sample = _scan_existing(args.qwen3_output)
             _existing_v_sample = _scan_existing(args.vae_output)
             _load_qwen3 = any(r not in _existing_q_sample for r, _, _ in _sample)
