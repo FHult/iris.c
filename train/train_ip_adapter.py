@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import fused_flow_noise, get_schedule_values
-from ip_adapter.ema import update_ema, save_ema, _flatten
+from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 
 # ── mflux: Flux Klein 4B MLX inference ───────────────────────────────────────
@@ -917,7 +917,7 @@ def train(config: dict) -> None:
                 _loss = loss_fn(_siglip_zero, mx.array(True), _fs, _target)
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
-                del _fs, _loss, _noisy, _target
+                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip_zero, _fs, _loss, _noisy, _target
                 mx.clear_cache()
                 if len(losses) >= 16:
                     break
@@ -1386,10 +1386,12 @@ def train(config: dict) -> None:
                           ocfg["checkpoint_dir"], keep_last_n=999,
                           lineage=_lineage)
 
-    # Save best EMA as final export
+    # Save best EMA as final export using the streaming writer so the bulk
+    # mx.save_safetensors staging buffer (~2 GB) is avoided.
     mx.eval(ema_params)
     _best_path = os.path.join(ocfg["checkpoint_dir"], "best.safetensors")
-    save_ema(ema_params, _best_path)
+    _save_safetensors_streaming(_best_path, list(_flatten(ema_params)))
+    _purge_file_page_cache(_best_path)
 
     # Write lineage sidecar so best.safetensors is self-documenting.
     _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
