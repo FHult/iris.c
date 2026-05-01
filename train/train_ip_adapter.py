@@ -859,21 +859,8 @@ def train(config: dict) -> None:
         )
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
-        # Materialize all grad-dependent outputs inside this function so grads
-        # can be freed before the outer eval fence.
-        #
-        # Without this: outer Fence 1 evaluates backward + new_m + new_v +
-        # new_params + grad_norm simultaneously → peak ~25.7 GB.
-        #
-        # With this: optimizer.state (new_m, new_v) and grad_norm are concrete
-        # before we return.  grads have no remaining references → freed by
-        # mx.clear_cache().  loss_val is materialized as a side effect of the
-        # same forward+backward graph.
-        #
-        # Outer Fence 1 then only allocates new_params (~2 GB) on top of the
-        # 17.73 GB steady-state → peak ~19–22 GB, well below jetsam threshold.
-        mx.eval(optimizer.state, grad_norm, loss_val)
-        mx.clear_cache()
+        # Return all lazy. Eval is split into two fences in the caller AFTER
+        # del flux_state — this keeps flux_state out of the peak window.
         return loss_val, grad_norm
 
     # ── T-05: validation loss on held-out set ─────────────────────────────────
@@ -1093,22 +1080,27 @@ def train(config: dict) -> None:
         _t_step += time.time() - _t0
 
         # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
-        # Computed before mx.eval so ema_params references the same lazy
-        # adapter.parameters() that Fence 1 will evaluate — no extra fence needed.
+        # Built lazily here so it references the same lazy adapter.parameters()
+        # that Fence 2 will concretize — Fence 3 then evaluates only the new EMA.
         _do_ema = (step % tcfg["ema_update_every"] == 0)
         if _do_ema:
             ema_params = update_ema(ema_params, adapter,
                                    decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
-        # Synchronous eval: prevents lazy-graph accumulation across steps.
-        # Fence 1 (adapter.parameters()): param update only — grads and
-        #   optimizer m/v are already concrete from compiled_step's internal
-        #   mx.eval(optimizer.state), so this fence allocates only new_params
-        #   (~2 GB), keeping the per-step peak at ~19–21 GB.
-        # Fence 2 (ema_params): old_ema + new_ema — isolated so EMA update
-        #   does not overlap with the param-update allocation.
+        # Synchronous eval split into three fences to bound peak Metal allocation.
+        #
+        # Fence 1 — backward + optimizer state (m, v):
+        #   Peak = steady_state(17.73 GB) + grads(~2 GB) + new_m(~2 GB) + new_v(~2 GB)
+        #        ≈ 23.7 GB.  After this fence grads are freed (no remaining refs).
+        #
+        # Fence 2 — new params from concrete m/v (no backward re-run):
+        #   Peak = steady_state(17.73 GB) + new_params(~2 GB) ≈ 19.7 GB.
+        #
+        # Fence 3 — EMA (if due): old_ema + new_ema, isolated from param update.
         _t0 = time.time()
-        mx.eval(loss_val, grad_norm_val, adapter.parameters())
+        mx.eval(optimizer.state, loss_val, grad_norm_val)
+        mx.clear_cache()
+        mx.eval(adapter.parameters())
         mx.clear_cache()
         if _do_ema:
             mx.eval(ema_params)
