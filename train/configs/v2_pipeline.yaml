@@ -15,7 +15,7 @@ anomaly:
   siglip_min_coverage: 90   # warn when SigLIP coverage drops below this %
 
 model:
-  flux_model: flux-klein-4b
+  flux_model: flux-klein-model
   checkpoint_dir: /Volumes/2TBSSD/checkpoints/stage1
 
 training_config: train/configs/stage1_512px.yaml
