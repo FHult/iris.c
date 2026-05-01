@@ -484,30 +484,36 @@ class Orchestrator:
         }
         _GPU_STEPS  = {"precompute", "clip_embed", "mine", "validate"}
         _DISK_STEPS = {"build_shards"}
+        # Collect all chunks in a pending state, then pick the one whose log
+        # file was most recently written — that is the step actually running.
+        candidates = []
         for chunk in range(1, self.total_chunks + 1):
             state = derive_chunk_state(chunk)
             step = _state_to_step.get(state)
             if step:
                 log = _step_log.get(step, lambda c: LOG_DIR / f"{step}_chunk{c}.log")(chunk)
-                # Re-acquire the resource token so the ResourceManager correctly
-                # blocks other steps (e.g. training) from starting while this
-                # prep step is still running after an orchestrator restart.
-                token = None
-                if step in _GPU_STEPS:
-                    token = "GPU_TOKEN"
-                elif step in _DISK_STEPS:
-                    token = "DISK_WRITE_HIGH"
-                if token:
-                    self.res.request(token, f"recovered: {step} chunk {chunk}")
-                self._active_prep = {
-                    "chunk": chunk, "step": step, "log": log,
-                    "token": token, "also_mark": [],
-                }
-                log_orch(f"Startup: recovered iris-prep tracking ({step} chunk {chunk})",
-                         chunk=chunk)
-                return
-        log_orch("Startup: iris-prep window exists but no pending step found — monitoring only",
-                 level="warning")
+                mtime = log.stat().st_mtime if log.exists() else 0.0
+                candidates.append((mtime, chunk, step, log))
+        if not candidates:
+            log_orch("Startup: iris-prep window exists but no pending step found — monitoring only",
+                     level="warning")
+            return
+        # Most-recently-written log wins.
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, chunk, step, log = candidates[0]
+        token = None
+        if step in _GPU_STEPS:
+            token = "GPU_TOKEN"
+        elif step in _DISK_STEPS:
+            token = "DISK_WRITE_HIGH"
+        if token:
+            self.res.request(token, f"recovered: {step} chunk {chunk}")
+        self._active_prep = {
+            "chunk": chunk, "step": step, "log": log,
+            "token": token, "also_mark": [],
+        }
+        log_orch(f"Startup: recovered iris-prep tracking ({step} chunk {chunk})",
+                 chunk=chunk)
 
     # Fix 5: archive training logs from a previous session so stale EXIT_CODE values
     # don't mislead _start_training() detection and don't pollute status log tails.
