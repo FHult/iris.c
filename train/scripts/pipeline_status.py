@@ -197,23 +197,37 @@ def _staging_detail(chunk: int) -> dict:
 
 
 def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool) -> str:
+    """Return the step the chunk is currently at, regardless of whether it's executing."""
     steps = chunk_status["steps"]
     state = str(chunk_status["state"])
     chunk = chunk_status["chunk"]
-    if state == "DONE" or state == "ERROR":
+    if state in ("DONE", "ERROR"):
         return ""
     if state == "IDLE":
-        # IDLE + prep running + fresh heartbeat = download actively in progress
+        # Only show download if it's actually happening (fresh heartbeat)
         if prep_running:
             hb = _worker_heartbeat("download_convert", chunk)
             if hb and hb.get("age_secs", 9999) < 300:
                 return "download"
         return ""
-    if train_running and state in ("TRAINING", "MINING", "VALIDATING"):
+    if state in ("TRAINING", "MINING", "VALIDATING"):
         return state.lower()
-    if prep_running:
-        return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "")
-    return ""
+    # Prep pipeline states: return first pending step — where the chunk currently sits
+    return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "")
+
+
+def _step_is_executing(step: str, chunk: int, train_running: bool) -> bool:
+    """Return True only if the step has a fresh heartbeat confirming active execution."""
+    if not step:
+        return False
+    hb = _active_heartbeat_for(step, chunk)
+    if step in ("training", "mining", "validating"):
+        # No heartbeat yet but train window is up → loading
+        if not hb and train_running:
+            return True
+        return bool(hb and not hb.get("stale", True))
+    # Prep steps require a fresh heartbeat
+    return bool(hb and not hb.get("stale", True))
 
 
 def _active_heartbeat_for(step: str, chunk: int) -> dict:
@@ -336,6 +350,8 @@ def print_human(status: dict, verbose: bool = False) -> None:
     for c, cs in status["chunks"].items():
         state_str = cs["state"]
         active = cs.get("active_step", "")
+        executing = _step_is_executing(active, c, tmux["train"]) if active else False
+
         if state_str == "IDLE" and active == "download":
             state_str = "DOWNLOADING"
         last = cs["last_done"] or "—"
@@ -355,7 +371,12 @@ def print_human(status: dict, verbose: bool = False) -> None:
         stg_str = f"  [staging: {', '.join(stg_parts)}]" if stg_parts else ""
 
         err_mark = " ⚠️ ERROR" if has_err else ""
-        active_mark = f"  → {active}" if active else ""
+        if active and executing:
+            active_mark = f"  → {active}"
+        elif active:
+            active_mark = f"  → {active} [queued]"
+        else:
+            active_mark = ""
         step_prog = f"  step {s_done_c}/{s_total_c}"
         print(f"  Chunk {c}: {state_str:<16}{step_prog}  last: {last}{active_mark}{err_mark}{stg_str}")
 
@@ -367,8 +388,8 @@ def print_human(status: dict, verbose: bool = False) -> None:
             print(f"    ✗ {step}: {detail}")
             print(f"      to retry: rm {sentinel}")
 
-        # Active step progress from heartbeat
-        if active:
+        # Active step progress from heartbeat — only when actually executing
+        if active and executing:
             hb = _active_heartbeat_for(active, c)
             if not hb and active in ("training", "validating"):
                 print(f"    {active}: loading... (no heartbeat yet)")
@@ -425,8 +446,13 @@ def print_human(status: dict, verbose: bool = False) -> None:
                     else:
                         print(f"    {active}: {done}/{total_n} ({pct:.0f}%)  hb {age_str} ago{stale_mark}")
 
-        # Log tail for active or failed step
-        show_step = active or (list(errors.keys())[0] if errors else None)
+        # Log tail: only for executing steps or failed steps
+        if executing and active:
+            show_step = active
+        elif errors:
+            show_step = list(errors.keys())[0]
+        else:
+            show_step = None
         if show_step:
             log = _log_for_step(c, show_step)
             n_lines = 10 if verbose else 4
