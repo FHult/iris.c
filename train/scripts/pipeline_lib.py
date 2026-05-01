@@ -370,7 +370,12 @@ def acquire_gpu_lock(label: str) -> bool:
             with open(GPU_LOCK_FILE, "x") as _f:
                 _f.write(record)
             return True
-        except FileExistsError:
+        except (FileExistsError, PermissionError) as exc:
+            # Some Apple filesystems return EPERM instead of EEXIST for O_EXCL
+            # on an existing file.  Re-raise only if the file genuinely doesn't
+            # exist (real permission problem, not a collision).
+            if isinstance(exc, PermissionError) and not GPU_LOCK_FILE.exists():
+                raise
             if gpu_lock_holder() is not None:
                 return False
             try:

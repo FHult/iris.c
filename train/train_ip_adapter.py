@@ -859,17 +859,20 @@ def train(config: dict) -> None:
         )
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
-        # Materialize optimizer m/v inside this function before returning.
-        # optimizer.state shares the same lazy nodes as adapter.parameters():
-        # new_param = old_param - lr * new_m / sqrt(new_v), and new_m/new_v
-        # are also stored in state["m"]/state["v"].  Without this eval, the
-        # outer Fence 1 (adapter.parameters()) runs the full backward + m/v +
-        # param-update chain simultaneously, peaking at ~25.7 GB.
-        # By evaluating m/v here, adapter.parameters() lazy exprs reference
-        # only concrete values, so outer Fence 1 allocates just new_params
-        # (~2 GB), cutting the per-step peak to ~19–21 GB.
-        # grads are freed when this function returns (local var goes out of scope).
-        mx.eval(optimizer.state)
+        # Materialize all grad-dependent outputs inside this function so grads
+        # can be freed before the outer eval fence.
+        #
+        # Without this: outer Fence 1 evaluates backward + new_m + new_v +
+        # new_params + grad_norm simultaneously → peak ~25.7 GB.
+        #
+        # With this: optimizer.state (new_m, new_v) and grad_norm are concrete
+        # before we return.  grads have no remaining references → freed by
+        # mx.clear_cache().  loss_val is materialized as a side effect of the
+        # same forward+backward graph.
+        #
+        # Outer Fence 1 then only allocates new_params (~2 GB) on top of the
+        # 17.73 GB steady-state → peak ~19–22 GB, well below jetsam threshold.
+        mx.eval(optimizer.state, grad_norm, loss_val)
         mx.clear_cache()
         return loss_val, grad_norm
 
