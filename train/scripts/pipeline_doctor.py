@@ -59,22 +59,26 @@ _SHARD_BLOCK = 200_000
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Issue:
-    __slots__ = ("severity", "category", "chunk", "title", "detail", "fix")
+    __slots__ = ("severity", "category", "chunk", "title", "detail", "fix", "ctx")
 
     def __init__(self, severity: str, category: str, title: str,
-                 detail: str = "", fix: str = "", chunk: Optional[int] = None):
+                 detail: str = "", fix: str = "", chunk: Optional[int] = None,
+                 ctx: Optional[dict] = None):
         self.severity = severity   # CRITICAL | WARNING | INFO
         self.category = category
         self.chunk    = chunk
         self.title    = title
         self.detail   = detail
         self.fix      = fix        # shell command the user can run to remediate
+        self.ctx      = ctx or {}  # machine-readable key-value context for --ai mode
 
     def to_dict(self) -> dict:
         d = {"severity": self.severity, "category": self.category,
              "title": self.title, "detail": self.detail, "fix": self.fix}
         if self.chunk is not None:
             d["chunk"] = self.chunk
+        if self.ctx:
+            d["context"] = self.ctx
         return d
 
 
@@ -82,8 +86,9 @@ _issues: list[Issue] = []
 
 
 def _add(severity: str, category: str, title: str,
-         detail: str = "", fix: str = "", chunk: Optional[int] = None) -> None:
-    _issues.append(Issue(severity, category, title, detail, fix, chunk))
+         detail: str = "", fix: str = "", chunk: Optional[int] = None,
+         ctx: Optional[dict] = None) -> None:
+    _issues.append(Issue(severity, category, title, detail, fix, chunk, ctx))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,7 +230,8 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                 _add("CRITICAL", "phantom", f"Chunk {chunk} promoted.done but NO shards in production",
                      detail=f"Expected .tar files with IDs {lo:06d}-{hi-1:06d} in {SHARDS_DIR}",
                      fix=f"rm {SENTINEL_DIR}/chunk{chunk}/promoted.done",
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"shard_count": 0, "shard_id_lo": lo, "shard_id_hi": hi - 1})
 
             # Verify precomputed coverage
             if is_done(chunk, "precompute"):
@@ -234,7 +240,8 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                     _add("CRITICAL", "phantom", f"Chunk {chunk} precompute.done but 0 NPZ files in production",
                          detail=f"Expected NPZ files with chunk-{chunk} shard IDs in {PRECOMP_DIR}/qwen3/",
                          fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done"),
-                         chunk=chunk)
+                         chunk=chunk,
+                         ctx={"clean_npz": 0, "tmp_npz": tmp})
                 elif tmp > 0:
                     _add("WARNING", "phantom", f"Chunk {chunk} has {tmp} leftover .tmp.npz files in precomputed",
                          detail="Crash artifacts from a broken atomic-write run",
@@ -260,7 +267,9 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                      f"Chunk {chunk} train.done but no checkpoint near step {expected_end:,}",
                      detail=f"Expected end: {expected_end:,}, latest checkpoint: {latest}",
                      fix=f"rm {SENTINEL_DIR}/chunk{chunk}/train.done",
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"expected_end_step": expected_end, "latest_ckpt_step": latest,
+                          "available_ckpt_steps": ckpt_steps})
 
         # ── mine.done ─────────────────────────────────────────────────────
         if is_done(chunk, "mine"):
@@ -270,7 +279,8 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                 _add("CRITICAL", "phantom", f"Chunk {chunk} mine.done but 0 hard-example files",
                      detail=f"Expected .tar files in {hard_dir}",
                      fix=f"rm {SENTINEL_DIR}/chunk{chunk}/mine.done",
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"hard_ex_count": 0})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,7 +312,9 @@ def _check_training_integrity(cfg: dict, chunks: list[int]) -> None:
                              f"chunk_base={chunk_base:,}, num_steps={expected_steps:,}. "
                              f"Likely missing --chunk-base-step or wrong base."),
                      fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/train.done"),
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"resume_step": resume_step, "expected_end": expected_end,
+                          "chunk_base": chunk_base, "num_steps": expected_steps})
 
         # ── very short log + marked done ──────────────────────────────────
         if len(lines) < 20 and is_done(chunk, "train"):
@@ -340,7 +352,10 @@ def _check_training_integrity(cfg: dict, chunks: list[int]) -> None:
                      f"Chunk {chunk} training exited with code {exit_code}",
                      detail=f"Log tail: {lines[-5:]}",
                      fix=f"python train/scripts/pipeline_ctl.py reset --chunk {chunk} --step train",
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"exit_code": exit_code,
+                          "is_jetsam": exit_code == 137,
+                          "log_tail": lines[-3:] if lines else []})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,7 +377,9 @@ def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
                  detail=(f"Expected roughly ≥1 NPZ per shard. Leftover .tmp files: {tmp}. "
                          f"A partial run or sample-shard optimization bug could cause this."),
                  fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done"),
-                 chunk=chunk)
+                 chunk=chunk,
+                 ctx={"clean_npz": clean, "n_shards": n_shards,
+                      "coverage_pct": round(pct, 1), "tmp_npz": tmp})
 
         if tmp > 0:
             _add("WARNING", "precompute",
@@ -475,24 +492,26 @@ def _check_process_liveness(chunks: list[int]) -> None:
                           + (f"Window is serving chunk {active_training_chunk}."
                              if step == "train" and active_training_chunk not in (None, chunk)
                              else ""))
+                liveness_ctx = {"hb_age_s": round(age), "stale_threshold_s": HEARTBEAT_STALE_SECS,
+                                "win_alive": win_running}
                 if win_running and window_is_this_chunk:
                     _add("CRITICAL", "liveness",
                          f"Chunk {chunk} {step}: stale heartbeat but tmux window alive (zombie?)",
                          detail=detail,
                          fix=f"tmux kill-window -t {TMUX_SESSION}:{win}",
-                         chunk=chunk)
+                         chunk=chunk, ctx=liveness_ctx)
                 elif win_running and not window_is_this_chunk:
-                    # Stale hb + window alive but serving another chunk — just informational
                     _add("INFO", "liveness",
                          f"Chunk {chunk} {step}: stale heartbeat from prior run "
                          f"(window currently serving chunk {active_training_chunk})",
                          detail=detail,
-                         chunk=chunk)
+                         chunk=chunk,
+                         ctx={**liveness_ctx, "active_training_chunk": active_training_chunk})
                 elif not win_running and age < HEARTBEAT_STALE_SECS * 5:
                     _add("WARNING", "liveness",
                          f"Chunk {chunk} {step}: stale heartbeat, no active tmux window",
                          detail=detail,
-                         chunk=chunk)
+                         chunk=chunk, ctx=liveness_ctx)
 
             elif hb is None and win_running and (step != "train" or active_training_chunk == chunk):
                 _add("WARNING", "liveness",
@@ -646,6 +665,8 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
         if best_ckpt_mtime is not None and hard_mtime is not None:
             if hard_mtime < best_ckpt_mtime - 60:  # 60s grace
                 age_diff = best_ckpt_mtime - hard_mtime
+                hard_age_h = round((time.time() - hard_mtime) / 3600, 1)
+                ckpt_age_h = round((time.time() - best_ckpt_mtime) / 3600, 1)
                 _add("CRITICAL", "ordering",
                      f"Chunk {chunk} hard examples are OLDER than the training checkpoint",
                      detail=(f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
@@ -653,7 +674,9 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
                              f"Diff: {age_diff/3600:.1f}h. Hard examples mined from a stale model."),
                      fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/mine.done && "
                           f"rm -rf {hard_dir}  # orchestrator will re-run mine step"),
-                     chunk=chunk)
+                     chunk=chunk,
+                     ctx={"hard_ex_age_h": hard_age_h, "ckpt_step": best_step,
+                          "ckpt_age_h": ckpt_age_h, "diff_h": round(age_diff / 3600, 1)})
 
     # ── next chunk's hard examples must postdate current chunk's training ──
     for chunk in chunks:
@@ -708,7 +731,8 @@ def _check_error_sentinels(chunks: list[int]) -> None:
                  f"Chunk {chunk} step '{step}' has .error sentinel (no .done)",
                  detail=content[:300] if content else "(empty)",
                  fix=(f"cat {err_file}  # then: rm {err_file} to clear and retry"),
-                 chunk=chunk)
+                 chunk=chunk,
+                 ctx={"step": step, "error_content": content[:200] if content else ""})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -766,6 +790,97 @@ def _check_environment() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _build_summary(cfg: dict, chunks: list[int]) -> dict:
+    """Build compact machine-readable pipeline health summary for --ai mode."""
+    scale = cfg.get("scale", "small")
+    steps_map = cfg["training"]["steps"][scale]
+
+    # Disk
+    try:
+        disk_gb = round(free_gb(DATA_ROOT), 1)
+    except OSError:
+        disk_gb = None
+
+    # Chunks done
+    chunks_done = sum(1 for c in chunks if is_done(c, "train"))
+
+    # Active training chunk: find the one with the freshest trainer heartbeat
+    active_chunk: Optional[int] = None
+    active_hb: Optional[dict] = None
+    best_age = float("inf")
+    for c in chunks:
+        hb = read_heartbeat("trainer", c)
+        age = heartbeat_age_secs("trainer", c)
+        if hb is not None and age is not None and age < best_age:
+            best_age = age
+            active_chunk = c
+            active_hb = hb
+
+    train_info: dict = {}
+    if active_chunk is not None and active_hb is not None:
+        chunk_base, expected_end = _chunk_base_and_end(active_chunk, steps_map)
+        train_info = {
+            "chunk": active_chunk,
+            "step": active_hb.get("step"),
+            "total_steps": active_hb.get("total_steps") or expected_end,
+            "loss": active_hb.get("loss"),
+            "loss_smooth": active_hb.get("loss_smooth"),
+            "lr": active_hb.get("lr"),
+            "grad_norm": active_hb.get("grad_norm"),
+            "eta_h": round(active_hb["eta_sec"] / 3600, 2) if active_hb.get("eta_sec") else None,
+            "steps_per_sec": active_hb.get("steps_per_sec"),
+            "siglip_coverage_pct": active_hb.get("siglip_coverage_pct"),
+            "hb_age_s": round(best_age) if best_age < float("inf") else None,
+        }
+
+    # Active prep step: check precompute/mine/validate heartbeats
+    active_prep: Optional[dict] = None
+    for c in chunks:
+        for step, process in [("precompute", "precompute"), ("mine", "mining"), ("validate", "validate")]:
+            if is_done(c, step) or has_error(c, step):
+                continue
+            hb = read_heartbeat(process, c)
+            age = heartbeat_age_secs(process, c)
+            if hb is not None and age is not None and age <= HEARTBEAT_STALE_SECS:
+                active_prep = {
+                    "chunk": c, "step": step,
+                    "done": hb.get("done"), "total": hb.get("total"),
+                    "pct": hb.get("pct"),
+                    "eta_h": round(hb["eta_sec"] / 3600, 2) if hb.get("eta_sec") else None,
+                    "hb_age_s": round(age),
+                }
+                break
+        if active_prep:
+            break
+
+    # Orchestrator last poll
+    orch_age: Optional[int] = None
+    try:
+        state = read_state()
+        updated = state.get("last_updated", "")
+        if updated:
+            ts = datetime.fromisoformat(updated)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            orch_age = round((datetime.now(timezone.utc) - ts).total_seconds())
+    except Exception:
+        pass
+
+    summary: dict = {
+        "disk_gb": disk_gb,
+        "chunks_done": chunks_done,
+        "total_chunks": len(chunks),
+    }
+    if orch_age is not None:
+        summary["orch_last_poll_s"] = orch_age
+    if train_info:
+        summary["training"] = train_info
+    if active_prep:
+        summary["prep"] = active_prep
+
+    return summary
+
 
 def _current_pipeline_state() -> str:
     if not tmux_session_exists():
@@ -833,6 +948,52 @@ def print_json_output(args_chunk: Optional[int]) -> None:
     print(json.dumps([i.to_dict() for i in issues], indent=2))
 
 
+def print_ai_output(summary: dict, args_chunk: Optional[int]) -> None:
+    """Compact JSON for AI consumption: summary block + structured issues, no prose noise."""
+    issues = _issues
+    if args_chunk is not None:
+        issues = [i for i in issues if i.chunk is None or i.chunk == args_chunk]
+
+    criticals = [i for i in issues if i.severity == "CRITICAL"]
+    warnings   = [i for i in issues if i.severity == "WARNING"]
+
+    # top_action: highest-priority item in one sentence
+    if criticals:
+        top_action = criticals[0].title
+    elif warnings:
+        top_action = warnings[0].title
+    else:
+        top_action = "pipeline healthy"
+
+    ai_issues = []
+    for i in issues:
+        entry: dict = {
+            "severity": i.severity,
+            "category": i.category,
+            "title": i.title,
+            "fix": i.fix,
+        }
+        if i.chunk is not None:
+            entry["chunk"] = i.chunk
+        if i.ctx:
+            entry["context"] = i.ctx
+        # Omit prose detail from --ai output — context dict replaces it
+        ai_issues.append(entry)
+
+    output = {
+        "ts": now_iso(),
+        "summary": summary,
+        "top_action": top_action,
+        "issue_counts": {
+            "critical": len(criticals),
+            "warning": len(warnings),
+            "info": len([i for i in issues if i.severity == "INFO"]),
+        },
+        "issues": ai_issues,
+    }
+    print(json.dumps(output, separators=(",", ":")))
+
+
 def run_fix_mode(args_chunk: Optional[int]) -> None:
     issues = _issues
     if args_chunk is not None:
@@ -879,6 +1040,8 @@ def main() -> None:
                         help="Restrict diagnosis to a single chunk")
     parser.add_argument("--json", action="store_true",
                         help="Output issues as JSON array")
+    parser.add_argument("--ai", action="store_true",
+                        help="Compact JSON for AI consumption: structured context, no prose/ANSI")
     parser.add_argument("--fix", action="store_true",
                         help="Interactively offer to run remediation commands")
     parser.add_argument("--config", default=None, metavar="PATH",
@@ -891,7 +1054,7 @@ def main() -> None:
     if args.chunk is not None:
         chunks = [args.chunk]
 
-    if not args.json:
+    if not args.json and not args.ai:
         print(f"Diagnosing chunks: {chunks}")
 
     # ── run all checks ────────────────────────────────────────────────────
@@ -910,7 +1073,10 @@ def main() -> None:
     _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
     # ── output ────────────────────────────────────────────────────────────
-    if args.json:
+    if args.ai:
+        summary = _build_summary(cfg, chunks)
+        print_ai_output(summary, args.chunk)
+    elif args.json:
         print_json_output(args.chunk)
     elif args.fix:
         print_report(args.chunk)
