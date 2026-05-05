@@ -390,12 +390,18 @@ Manual Z-Image sanity:
 
 Full documentation is in `train/DISPATCH.md` → "Telemetry Reference" section. Summary of what to read and when:
 
+**ALWAYS START WITH THE DOCTOR. Run this before reading any individual file:**
+```
+train/.venv/bin/python train/scripts/pipeline_doctor.py --ai
+```
+Returns one compact JSON blob: `summary` (disk, active training step/loss/ETA, prep progress, orch poll age), `top_action` (single most important action), `issue_counts`, and `issues` with machine-readable `context` dicts and remediation commands. Replaces reading pipeline_status + multiple heartbeat files + sentinel dirs + log tails. Only reach for individual files when the doctor output is insufficient for the specific question.
+
 **Source of truth (always authoritative)**:
 - Sentinel files: `/Volumes/2TBSSD/pipeline/chunk{N}/{step}.done|.error` — never infer step state from logs or heartbeats; always read sentinels. `derive_chunk_state(chunk)` in orchestrator.py is the canonical function.
 
 **Live progress**:
 - Heartbeat files: `/Volumes/2TBSSD/.heartbeat/{process}_chunk{N}.json` — written every ~60s by each worker. Contains `done`, `total`, `pct`, `eta_sec`, `current_shard`, and for trainer: `step`, `loss`, `grad_norm`, `siglip_coverage_pct`.
-- Status script: `train/.venv/bin/python train/scripts/pipeline_status.py` — reads sentinels + heartbeats + log tails.
+- Status script: `train/.venv/bin/python train/scripts/pipeline_status.py` — reads sentinels + heartbeats + log tails. Use for live progress view; use the doctor for anomaly investigation.
 
 **Logs**:
 - Log files: `/Volumes/2TBSSD/logs/{step}_chunk{N}.log` — stdout/stderr of each tmux window, with `EXIT_CODE=N` as the final line. Fixed-name — old logs from prior runs persist and pollute status until manually deleted.
@@ -427,5 +433,5 @@ Previously documented gaps now resolved:
 - `plans/pipeline-mlops-backlog.md` — backlog with V2 dispositions and implementation phases
 
 ## Pipeline Script Layout
-- `train/scripts/` — V2 active scripts (orchestrator, pipeline_lib, pipeline_status, pipeline_ctl, and all step scripts)
+- `train/scripts/` — V2 active scripts (orchestrator, pipeline_lib, pipeline_status, pipeline_ctl, pipeline_doctor, and all step scripts)
 - `train/scripts/v1/` — V1 shell/python scripts, archived. Do not use for pipeline operations.
