@@ -10,7 +10,9 @@ Usage:
     python train/scripts/pipeline_doctor.py
     python train/scripts/pipeline_doctor.py --chunk 2
     python train/scripts/pipeline_doctor.py --json
+    python train/scripts/pipeline_doctor.py --ai        # compact JSON for AI
     python train/scripts/pipeline_doctor.py --fix       # interactive remediation
+    python train/scripts/pipeline_doctor.py --watch     # re-run every 60s on change
 """
 
 import argparse
@@ -694,6 +696,17 @@ def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
                       f"python train/scripts/pipeline_ctl.py clear-error {chunk} precompute"),
                  chunk=chunk,
                  ctx={"step": step, "siglip_pct": siglip_pct, "min_pct": siglip_min})
+
+        loader_wait = hb.get("loader_wait_pct")
+        if loader_wait is not None and loader_wait > 20.0:
+            sev = "WARNING" if loader_wait > 40.0 else "INFO"
+            _add(sev, "anomaly",
+                 f"Chunk {chunk}: loader_wait_pct {loader_wait:.1f}% — training I/O bound",
+                 detail=(f"Step {step:,}. Training is spending {loader_wait:.1f}% of wall-clock "
+                         f"time waiting for the data loader. Causes: precomputed cache read "
+                         f"contention, slow 2TBSSD, or pipeline steps competing for disk I/O."),
+                 chunk=chunk,
+                 ctx={"step": step, "loader_wait_pct": loader_wait})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1399,6 +1412,10 @@ def main() -> None:
                         ))
     parser.add_argument("--config", default=None, metavar="PATH",
                         help="Path to v2_pipeline.yaml (auto-detected if omitted)")
+    parser.add_argument("--watch", action="store_true",
+                        help="Re-run every --watch-interval seconds; only print when issue set changes")
+    parser.add_argument("--watch-interval", type=int, default=60, metavar="SECS",
+                        help="Seconds between re-runs in --watch mode (default: 60)")
     args = parser.parse_args()
 
     global _quality_mode
@@ -1410,26 +1427,50 @@ def main() -> None:
     if args.chunk is not None:
         chunks = [args.chunk]
 
-    if not args.json and not args.ai:
+    if not args.json and not args.ai and not args.watch:
         print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
 
-    # ── run all checks ────────────────────────────────────────────────────
-    _check_environment()
-    _check_error_sentinels(chunks)
-    _check_phantom_completions(cfg, chunks)
-    _check_training_integrity(cfg, chunks)
-    _check_precompute_forensics(cfg, chunks)
-    _check_checkpoint_continuity(cfg, chunks)
-    _check_process_liveness(chunks)
-    _check_code_consistency(cfg, chunks)
-    _check_training_anomalies(cfg, chunks)
-    _check_orchestrator_log()
-    _check_dispatch_queue()
-    _check_ordering_sanity(cfg, chunks)
-    _check_stale_logs(chunks)
+    def _run_checks() -> None:
+        global _issues
+        _issues = []
+        _check_environment()
+        _check_error_sentinels(chunks)
+        _check_phantom_completions(cfg, chunks)
+        _check_training_integrity(cfg, chunks)
+        _check_precompute_forensics(cfg, chunks)
+        _check_checkpoint_continuity(cfg, chunks)
+        _check_process_liveness(chunks)
+        _check_code_consistency(cfg, chunks)
+        _check_training_anomalies(cfg, chunks)
+        _check_orchestrator_log()
+        _check_dispatch_queue()
+        _check_ordering_sanity(cfg, chunks)
+        _check_stale_logs(chunks)
+        _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
-    # Sort: CRITICAL first, then WARNING, INFO; within each group by chunk
-    _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
+    def _issue_fingerprint() -> frozenset:
+        return frozenset((i.severity, i.category, i.title, i.chunk) for i in _issues)
+
+    if args.watch:
+        interval = args.watch_interval
+        last_fp: Optional[frozenset] = None
+        print(f"Watching pipeline — refreshing every {interval}s (Ctrl-C to stop)")
+        try:
+            while True:
+                _run_checks()
+                fp = _issue_fingerprint()
+                if fp != last_fp:
+                    os.system("clear")
+                    print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
+                    print_report(args.chunk)
+                    last_fp = fp
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # ── single run ────────────────────────────────────────────────────────
+    _run_checks()
 
     # ── output ────────────────────────────────────────────────────────────
     if args.ai:

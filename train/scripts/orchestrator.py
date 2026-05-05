@@ -415,6 +415,8 @@ class Orchestrator:
         if step == "build_shards":
             # Free staging raw data to reclaim disk space
             self._delete_staging_raw(chunk)
+        if step == "mine":
+            notify("iris pipeline", f"Chunk {chunk} hard example mining complete")
         if step in ("train", "mine"):
             update_state(**{"chunks": {str(chunk): {"completed_at": now_iso()}}})
 
@@ -425,6 +427,33 @@ class Orchestrator:
             log_orch(f"Chunk {chunk}: freeing staging raw data ({raw})", chunk=chunk)
             if not self.dry_run:
                 shutil.rmtree(raw, ignore_errors=True)
+
+    _PREP_LOG_PATTERNS = [
+        "download_chunk{c}.log",
+        "build_chunk{c}.log",
+        "filter_chunk{c}.log",
+        "clip_embed_chunk{c}.log",
+        "clip_index_chunk{c}.log",
+        "clip_dups_chunk{c}.log",
+        "precompute_chunk{c}.log",
+    ]
+
+    def _cleanup_prep_logs(self, chunk: int) -> None:
+        """Delete step logs for prep steps now that the chunk is promoted to production."""
+        if self.dry_run:
+            return
+        deleted = []
+        for pattern in self._PREP_LOG_PATTERNS:
+            log = LOG_DIR / pattern.format(c=chunk)
+            if log.exists():
+                try:
+                    log.unlink()
+                    deleted.append(log.name)
+                except OSError:
+                    pass
+        if deleted:
+            log_orch(f"Chunk {chunk}: deleted {len(deleted)} prep log(s) after promotion",
+                     chunk=chunk)
 
     def _launch_prep(self, description: str, cmd: str, log_file: Path,
                      chunk: int, step: str,
@@ -816,6 +845,7 @@ class Orchestrator:
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
         mark_done(chunk, "promoted")
+        self._cleanup_prep_logs(chunk)
 
         for subdir in ["qwen3", "vae", "siglip"]:
             src = precomp_src / subdir
@@ -841,6 +871,7 @@ class Orchestrator:
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
+                notify("iris pipeline", f"Chunk {chunk} training complete")
                 if self.res.holder("GPU_TOKEN") == _train_token:
                     self.res.release("GPU_TOKEN")
                 return
@@ -920,6 +951,7 @@ class Orchestrator:
                          f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
+            notify("iris pipeline", f"Chunk {chunk} training started ({steps} steps, lr={lr:.0e})")
             # Reset the trainer heartbeat timestamp so _check_heartbeats doesn't
             # immediately flag the just-launched process as stale (old heartbeat
             # from a previous crashed session can be hours old, triggering a kill
@@ -1048,6 +1080,8 @@ class Orchestrator:
                         chunk=chunk, process=step, context={"error": msg},
                         suggested_action="investigate_logs_and_clear_error",
                     )
+                    notify("iris pipeline ERROR",
+                           f"{step} chunk {chunk} needs manual intervention ({reason})")
                 break
 
     # -----------------------------------------------------------------------
@@ -1290,6 +1324,7 @@ class Orchestrator:
                 _json.dump({"action": "pause"}, _f)
         except OSError:
             pass
+        notify("iris pipeline WARNING", "Training paused by anomaly — check dispatch queue")
 
     # -----------------------------------------------------------------------
     # Memory watchdog

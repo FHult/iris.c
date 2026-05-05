@@ -64,6 +64,32 @@
 
 - ~~**RESILIENCE-1: Wrap training in tmux**~~ ✅ DONE — Orchestrator launches training in a dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator itself runs in `iris-orch` window via `pipeline_ctl.py restart-orchestrator`, also wrapped in `caffeinate -dim` (commit 6f9e7e6). Boot-grace fix added (commit ff87603): stale detection skips restart when training window is alive and heartbeat shows step=0 (model loading phase). DISPATCH.md updated to use pipeline_ctl.py as the canonical start method.
 
+- **PIPELINE-7: Checkpoint archive on chunk promotion** — When `train.done` is marked, copy (or hard-link) the final checkpoint pair plus `.ema.safetensors` into `/Volumes/2TBSSD/checkpoints/stage1/archive/chunk{N}_final.*`. Excluded from `keep_last_n` rotation. `pipeline_ctl.py restart-from-chunk N` should look here first. See also PIPELINE-6 for motivation.
+
+- **PIPELINE-8: Shard integrity scan before training** — After `promoted.done`, run a fast tarfile header-only scan across all newly promoted shards (no decompression). Flag any truncated or zero-byte members. This catches JPEG corruption and partial writes before they silently produce NaN gradients mid-training. Implement as a short `validate_shards.py` step inserted between `promoted` and `train`.
+
+- **PIPELINE-9: Disk space reservation check before each step** — Before launching any GPU or prep step, verify that disk free space on 2TBSSD exceeds a configurable minimum (e.g. 50 GB). If not, pause and dispatch an alert. Prevents silent OOM-on-disk that stalls steps mid-run. Add `min_free_gb` to `v2_pipeline.yaml`.
+
+- **PIPELINE-10: Pipeline run summary report on completion** — When the orchestrator writes "All chunks complete", generate a human-readable summary: total wall-clock per chunk, steps/hour per chunk, final loss, checkpoint path, hard example counts. Save to `/Volumes/2TBSSD/logs/run_summary.txt` and notify. Simplest implementation: parse `orchestrator.jsonl` timestamps for events.
+
+- **PIPELINE-11: `restart-from-chunk N` subcommand** — `pipeline_ctl.py restart-from-chunk N` should: (a) kill iris-train if running, (b) clear all sentinels for chunks N..total, (c) restore chunk N-1 final checkpoint from archive (see PIPELINE-7), (d) restart orchestrator. Provides a safe, one-command way to re-run from any chunk boundary without manual sentinel surgery.
+
+- **PIPELINE-12: Per-chunk data quality report** — After `clip_dups` finishes for each chunk, log: total images, deduplication rate (% removed), mean CLIP score, and dataset size breakdown by source (JDB / WikiArt / LAION / COYO). Helps catch bad data ratios before precompute runs. Implement by adding a `report_chunk.py` step or extending `clip_dedup.py` to emit a JSON summary.
+
+- **PIPELINE-13: Precompute progress saved across restarts** — `precompute_all.py` currently re-scans from scratch if interrupted. Add a resume-state file (list of completed shard IDs) so a restart skips already-done shards. Saves hours when precompute is interrupted at 80%.
+
+- **PIPELINE-14: Configurable hard_mix_ratio per chunk** — Current `hard_mix_ratio: 0.05` is global. Chunk 2+ may benefit from a higher ratio (0.10–0.15) since the hard example set is built from chunk N-1's model. Add per-chunk override in `v2_pipeline.yaml` under `training.hard_mix_ratio_by_chunk`.
+
+- **PIPELINE-15: EMA checkpoint auto-select for mining** — `mine_hard_examples.py` always uses `best.safetensors`. The EMA-smoothed weights (`best.ema.safetensors`) often generalise better and produce cleaner hard-example scores. Add `--use-ema` flag to `mine_hard_examples.py` and expose it via orchestrator config.
+
+- **PIPELINE-16: Validation FID/CLIP score tracking across chunks** — `validator.py` produces per-chunk images. Add CLIP score (text-image alignment) and a lightweight FID proxy metric. Store as JSON in `/Volumes/2TBSSD/logs/val_chunk{N}/metrics.json`. Orchestrator reads these to confirm chunk-over-chunk improvement at promotion time.
+
+- **PIPELINE-17: Auto-populate anchor_shards after chunk 1** — After chunk 1 `train.done`, automatically copy a representative sample of chunk 1 shards (e.g. every Nth shard) to `ANCHOR_SHARDS_DIR`. This removes the current manual step. Add `anchor_sample_rate: 10` to `v2_pipeline.yaml`.
+
+- **PIPELINE-18: Graceful pipeline pause on low disk** — Currently the disk-low alert is advisory only. Add a hard pause (write CONTROL_FILE) when free space drops below `disk_critical_gb` (e.g. 20 GB). Resume automatically when space recovers (e.g. after staging cleanup). Prevents silent partial writes that corrupt shards.
+
+- **PIPELINE-20: Structured run metadata for each pipeline execution** — Write a `run_metadata.json` to `DATA_ROOT` at orchestrator start (run_id, scale, start_time, total_chunks, config snapshot). Append completion_time and final_checkpoint at the end. Makes it easy to trace which training run produced which checkpoint, especially after multiple re-runs.
+
 ---
 
 ## C Binary / CLI

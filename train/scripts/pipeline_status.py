@@ -5,6 +5,7 @@ train/scripts/pipeline_status.py — V2 pipeline status viewer.
 Usage:
     python train/scripts/pipeline_status.py           # human-readable
     python train/scripts/pipeline_status.py --json    # machine-readable JSON
+    python train/scripts/pipeline_status.py --brief   # single-line summary
     python train/scripts/pipeline_status.py --watch   # refresh every 30s
     python train/scripts/pipeline_status.py --verbose # extended log tails + full heartbeats
 """
@@ -20,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
-    STATE_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
+    STATE_FILE, CONTROL_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
     read_state, is_done, has_error, read_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
 )
@@ -484,6 +485,80 @@ def print_human(status: dict, verbose: bool = False) -> None:
     print(f"{'─'*64}\n")
 
 
+def print_brief(status: dict) -> None:
+    """Print a single-line summary for quick status checks or monitoring."""
+    # Determine overall health label
+    dispatch_issues = status.get("dispatch_issues", [])
+    all_errors: list[str] = []
+    for c, cs in status["chunks"].items():
+        for step, _msg in cs.get("errors", {}).items():
+            all_errors.append(f"chunk {c} {step} failed")
+
+    # Check for pause/abort control signal
+    ctl_action = None
+    if CONTROL_FILE.exists():
+        try:
+            ctl = json.loads(CONTROL_FILE.read_text())
+            ctl_action = ctl.get("action")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if dispatch_issues or all_errors:
+        label = "ACTION NEEDED"
+        parts: list[str] = []
+        for i in dispatch_issues[:2]:
+            parts.append(i.get("message", "dispatch issue"))
+        parts.extend(all_errors[:2])
+        extra = f" | {' | '.join(parts)}"
+    elif ctl_action in ("pause", "abort"):
+        label = "PAUSED" if ctl_action == "pause" else "ABORTED"
+        extra = ""
+    else:
+        label = "HEALTHY"
+        extra = ""
+
+    # Build progress detail from active chunk
+    active_c = status.get("active_chunk")
+    detail_parts: list[str] = []
+
+    if active_c:
+        cs = status["chunks"].get(active_c, {})
+        state = str(cs.get("state", ""))
+        trainer = status.get("trainer", {})
+
+        if state == "TRAINING" and trainer:
+            step_n = trainer.get("step")
+            total_s = trainer.get("total_steps")
+            eta_sec = trainer.get("eta_sec")
+            if step_n is not None and total_s:
+                pct = int(step_n / total_s * 100)
+                detail_parts.append(f"chunk {active_c} training {pct}%")
+            else:
+                detail_parts.append(f"chunk {active_c} training")
+            if eta_sec:
+                detail_parts.append(f"ETA {_age_str(eta_sec)}")
+        elif state == "MINING":
+            hb = read_heartbeat("mine_hard_examples", active_c) or {}
+            pct = hb.get("pct", 0)
+            detail_parts.append(f"chunk {active_c} mining {pct:.0f}%")
+        elif state not in ("DONE", "IDLE", ""):
+            active_step = cs.get("active_step") or state.lower()
+            detail_parts.append(f"chunk {active_c} {active_step}")
+    else:
+        done_chunks = sum(1 for cs in status["chunks"].values() if cs["state"] == "DONE")
+        total_chunks = len(status["chunks"])
+        if done_chunks == total_chunks:
+            detail_parts.append("all chunks complete")
+        elif done_chunks:
+            detail_parts.append(f"{done_chunks}/{total_chunks} chunks complete — idle")
+        else:
+            detail_parts.append("idle")
+
+    detail = " | ".join(detail_parts)
+    line = f"{label} | {detail}{extra}" if detail else f"{label}{extra}"
+    print(line)
+
+
 def _auto_chunk_count(default: int = 4) -> int:
     state = read_state()
     if state.get("chunks"):
@@ -498,6 +573,7 @@ def _auto_chunk_count(default: int = 4) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json",      action="store_true")
+    ap.add_argument("--brief",     action="store_true", help="Single-line summary output")
     ap.add_argument("--chunks",    type=int, default=None,
                     help="Total chunks (default: auto-detect)")
     ap.add_argument("--watch",     action="store_true", help="Refresh every 30s")
@@ -515,6 +591,8 @@ def main() -> None:
         status = build_status_dict(total_chunks)
         if args.json:
             print(json.dumps(status, indent=2, default=str))
+        elif args.brief:
+            print_brief(status)
         else:
             print_human(status, verbose=args.verbose)
 

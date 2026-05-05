@@ -3,6 +3,8 @@
 train/scripts/pipeline_ctl.py — V2 pipeline control interface.
 
 Usage:
+    python train/scripts/pipeline_ctl.py status            # status + doctor summary
+    python train/scripts/pipeline_ctl.py status --brief    # one-line summary
     python train/scripts/pipeline_ctl.py pause
     python train/scripts/pipeline_ctl.py resume
     python train/scripts/pipeline_ctl.py abort
@@ -148,6 +150,21 @@ def cmd_dispatch_resolve(args) -> None:
     print(f"Marked {issue_id} as resolved")
 
 
+def cmd_status(args) -> None:
+    """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
+    import subprocess
+    venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    status_script = str(SCRIPTS_DIR / "pipeline_status.py")
+    doctor_script = str(SCRIPTS_DIR / "pipeline_doctor.py")
+
+    if args.brief:
+        subprocess.run([venv_python, status_script, "--brief"], check=False)
+    else:
+        subprocess.run([venv_python, status_script], check=False)
+        print()
+        subprocess.run([venv_python, doctor_script, "--ai"], check=False)
+
+
 def cmd_dispatch_resolve_all(args) -> None:
     """Resolve all open dispatch issues, optionally filtered by chunk or severity."""
     if not DISPATCH_QUEUE.exists():
@@ -184,6 +201,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Pipeline V2 control")
     sub = ap.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("status",           help="Show pipeline status + doctor summary")
+    p.add_argument("--brief", action="store_true", help="One-line summary only")
+
     sub.add_parser("pause",               help="Pause orchestrator")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
@@ -214,6 +234,7 @@ def main() -> None:
 
     args = ap.parse_args()
     handlers = {
+        "status":                  cmd_status,
         "pause":                   cmd_pause,
         "resume":                  cmd_resume,
         "abort":                   cmd_abort,
