@@ -32,7 +32,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from pipeline_lib import (
-    DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, CKPT_DIR,
+    DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, CKPT_DIR, CKPT_ARCHIVE_DIR,
     SENTINEL_DIR, LOG_DIR, SHARDS_DIR, PRECOMP_DIR,
     HARD_EX_DIR, STAGING_DIR, DEDUP_DIR, DISPATCH_QUEUE,
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE,
@@ -463,6 +463,47 @@ def _check_checkpoint_continuity(cfg: dict, chunks: list[int]) -> None:
                 _add("WARNING", "checkpoint",
                      f"Chunk {chunk}: no checkpoint near expected end step {expected_end:,}",
                      detail=f"Available steps: {all_steps}",
+                     chunk=chunk)
+
+    # ── checkpoint archive check ──────────────────────────────────────────
+    # After each chunk's training completes, the orchestrator archives the final
+    # checkpoint to CKPT_ARCHIVE_DIR/chunk{N}_final.{safetensors,json}.
+    # If train.done exists but the archive is absent, recovery via
+    # restart-from-chunk is impossible without re-training.
+    for chunk in chunks:
+        if not is_done(chunk, "train"):
+            continue
+        arch_st  = CKPT_ARCHIVE_DIR / f"chunk{chunk}_final.safetensors"
+        arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk}_final.json"
+        arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk}_final.ema.safetensors"
+        missing = [f.name for f in [arch_st, arch_js] if not f.exists()]
+        if missing:
+            # Distinguish: archive never created (old run pre-PIPELINE-7) vs partial write
+            if not arch_st.exists() and not arch_js.exists():
+                _add("WARNING", "checkpoint",
+                     f"Chunk {chunk}: no archive checkpoint (chunk{chunk}_final.*) in {CKPT_ARCHIVE_DIR.relative_to(DATA_ROOT)}",
+                     detail="Orchestrator archives on train.done since PIPELINE-7. "
+                            "This chunk pre-dates that change or the archive was deleted. "
+                            "Recovery via restart-from-chunk requires manual checkpoint copy.",
+                     fix=(f"# To archive manually (if step_{{}}_final checkpoint is still in CKPT_DIR):\n"
+                          f"cp {CKPT_DIR}/step_*.safetensors {CKPT_ARCHIVE_DIR}/chunk{chunk}_final.safetensors\n"
+                          f"cp {CKPT_DIR}/step_*.json        {CKPT_ARCHIVE_DIR}/chunk{chunk}_final.json"),
+                     chunk=chunk,
+                     ctx={"archive_dir": str(CKPT_ARCHIVE_DIR), "chunk": chunk})
+            else:
+                # Partial archive — one file present, one missing
+                _add("WARNING", "checkpoint",
+                     f"Chunk {chunk}: archive incomplete — missing {', '.join(missing)}",
+                     detail="A partial write may have left an unusable archive. "
+                            "Re-copy from CKPT_DIR or from a prior run.",
+                     chunk=chunk,
+                     ctx={"missing": missing})
+        else:
+            # Both required files present; optionally note if EMA is absent
+            if not arch_ema.exists():
+                _add("INFO", "checkpoint",
+                     f"Chunk {chunk}: archive present but no EMA file (chunk{chunk}_final.ema.safetensors)",
+                     detail="EMA weights improve mining quality. Absent if training didn't produce one.",
                      chunk=chunk)
 
     # ── orphaned checkpoints past max done step ───────────────────────────
