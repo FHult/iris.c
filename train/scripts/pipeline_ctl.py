@@ -56,19 +56,23 @@ def cmd_abort(_args) -> None:
 
 
 def cmd_restart_orchestrator(_args) -> None:
+    # Create the session if it doesn't exist yet.
     if not tmux_session_exists():
-        print(f"tmux session '{TMUX_SESSION}' not found — create it first", file=sys.stderr)
-        sys.exit(1)
-    # Kill existing orch window if any
-    if tmux_window_exists(TMUX_ORCH_WIN):
-        subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_ORCH_WIN}"])
-        print("Killed existing iris-orch window")
+        subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_ORCH_WIN],
+                       check=True)
     config = TRAIN_DIR / "configs" / "v2_pipeline.yaml"
     log_file = LOG_DIR / "orchestrator.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = (f"source '{TRAIN_DIR}/.venv/bin/activate' && "
            f"caffeinate -dim python -u '{SCRIPTS_DIR}/orchestrator.py' --resume --config '{config}'")
+    # If an old orch window exists, rename it so the session stays alive while we
+    # create the replacement, then kill it after.
+    if tmux_window_exists(TMUX_ORCH_WIN):
+        subprocess.run(["tmux", "rename-window", "-t", f"{TMUX_SESSION}:{TMUX_ORCH_WIN}", "_old-orch"],
+                       check=True)
     tmux_new_window(TMUX_ORCH_WIN, cmd, log_file)
+    if tmux_window_exists("_old-orch"):
+        subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:_old-orch"])
     print(f"Orchestrator restarted → {log_file}")
 
 
