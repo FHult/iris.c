@@ -464,17 +464,25 @@ def _check_checkpoint_continuity(cfg: dict, chunks: list[int]) -> None:
                      chunk=chunk)
 
     # ── orphaned checkpoints past max done step ───────────────────────────
-    max_done_step = 0
-    for chunk in chunks:
-        if is_done(chunk, "train"):
-            _, end = _chunk_base_and_end(chunk, steps_map)
-            max_done_step = max(max_done_step, end)
+    # Skip when any chunk is actively training — checkpoints beyond train.done
+    # are just live snapshots from the running chunk, not orphans.
+    any_training = any(
+        heartbeat_age_secs("trainer", c) is not None
+        and (heartbeat_age_secs("trainer", c) or float("inf")) <= HEARTBEAT_STALE_SECS
+        for c in chunks
+    )
+    if not any_training:
+        max_done_step = 0
+        for chunk in chunks:
+            if is_done(chunk, "train"):
+                _, end = _chunk_base_and_end(chunk, steps_map)
+                max_done_step = max(max_done_step, end)
 
-    for s in all_steps:
-        if s > max_done_step + 1000:
-            _add("INFO", "checkpoint",
-                 f"Checkpoint at step {s:,} has no matching train.done",
-                 detail="In-progress run or leftover from a reset.")
+        for s in all_steps:
+            if s > max_done_step + 1000:
+                _add("INFO", "checkpoint",
+                     f"Checkpoint at step {s:,} has no matching train.done",
+                     detail="Leftover from a reset or aborted run.")
 
     # ── checkpoint pair completeness (.json + .safetensors must both exist) ──
     # Build a map: step → extensions present (excluding EMA files)
