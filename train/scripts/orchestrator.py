@@ -31,6 +31,7 @@ from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, VENV_PYTHON,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
+    CKPT_ARCHIVE_DIR, RUN_METADATA_FILE,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
     STATE_FILE,
@@ -319,6 +320,7 @@ class Orchestrator:
         self._ensure_tmux_session()
         self._run_doctor()
         self._init_state()
+        self._write_run_metadata_start()
         self._rotate_stale_logs()
         self._recover_prep_window()
 
@@ -337,6 +339,8 @@ class Orchestrator:
                 write_heartbeat("orchestrator", step="poll")
                 if self._all_done():
                     log_orch("All chunks complete — pipeline finished")
+                    summary_path = self._write_run_summary()
+                    self._write_run_metadata_done(summary_path)
                     notify("iris pipeline", "All chunks complete")
                     break
             except KeyboardInterrupt:
@@ -455,6 +459,184 @@ class Orchestrator:
             log_orch(f"Chunk {chunk}: deleted {len(deleted)} prep log(s) after promotion",
                      chunk=chunk)
 
+    # -----------------------------------------------------------------------
+    # PIPELINE-6/7: Checkpoint archive on chunk completion
+    # -----------------------------------------------------------------------
+
+    def _archive_chunk_checkpoint(self, chunk: int) -> None:
+        """Copy the latest checkpoint pair + EMA to archive/chunk{N}_final.* ."""
+        if self.dry_run:
+            return
+        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        if not ckpts:
+            log_orch(f"Chunk {chunk}: no checkpoint to archive", chunk=chunk)
+            return
+        latest_st = ckpts[-1]
+        step_stem = latest_st.stem  # e.g. "step_0050000"
+        CKPT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for suffix in [".safetensors", ".json", ".ema.safetensors"]:
+            src = CKPT_DIR / f"{step_stem}{suffix}"
+            if not src.exists():
+                continue
+            dst = CKPT_ARCHIVE_DIR / f"chunk{chunk}_final{suffix}"
+            try:
+                shutil.copy2(src, dst)
+                copied.append(dst.name)
+            except OSError as e:
+                log_orch(f"Chunk {chunk}: archive copy failed for {src.name}: {e}",
+                         level="warning", chunk=chunk)
+        if copied:
+            log_orch(f"Chunk {chunk}: archived checkpoint {step_stem} → "
+                     f"{CKPT_ARCHIVE_DIR.relative_to(DATA_ROOT)} ({len(copied)} files)",
+                     chunk=chunk)
+
+    # -----------------------------------------------------------------------
+    # PIPELINE-17: Auto-populate anchor_shards after chunk 1
+    # -----------------------------------------------------------------------
+
+    def _auto_populate_anchor_shards(self, chunk: int) -> None:
+        """After chunk 1 training, copy every Nth shard to ANCHOR_SHARDS_DIR."""
+        if self.dry_run or chunk != 1:
+            return
+        if ANCHOR_SHARDS_DIR.exists() and any(ANCHOR_SHARDS_DIR.glob("*.tar")):
+            log_orch("Anchor shards already populated — skipping auto-populate", chunk=chunk)
+            return
+        sample_rate = self.cfg.get("training", {}).get("anchor_sample_rate", 10)
+        shards = sorted(SHARDS_DIR.glob("*.tar"))
+        if not shards:
+            log_orch("No shards found for anchor sampling", level="warning", chunk=chunk)
+            return
+        ANCHOR_SHARDS_DIR.mkdir(parents=True, exist_ok=True)
+        selected = shards[::sample_rate]
+        copied = 0
+        for shard in selected:
+            try:
+                shutil.copy2(shard, ANCHOR_SHARDS_DIR / shard.name)
+                copied += 1
+            except OSError as e:
+                log_orch(f"Anchor shard copy failed {shard.name}: {e}",
+                         level="warning", chunk=chunk)
+        log_orch(f"Chunk {chunk}: auto-populated {copied} anchor shards "
+                 f"(1/{sample_rate} sample rate) → {ANCHOR_SHARDS_DIR}", chunk=chunk)
+
+    # -----------------------------------------------------------------------
+    # PIPELINE-20: Run metadata
+    # -----------------------------------------------------------------------
+
+    def _write_run_metadata_start(self) -> None:
+        """Write run_metadata.json at orchestrator start."""
+        state = read_state()
+        run_id = state.get("run_id", f"run_{now_iso()[:10].replace('-', '')}")
+        meta = {
+            "run_id":       run_id,
+            "scale":        self.scale,
+            "total_chunks": self.total_chunks,
+            "started_at":   now_iso(),
+            "config":       {k: v for k, v in self.cfg.items() if k != "_config_path"},
+        }
+        try:
+            RUN_METADATA_FILE.write_text(json.dumps(meta, indent=2))
+        except OSError as e:
+            log_orch(f"Could not write run metadata: {e}", level="warning")
+
+    def _write_run_metadata_done(self, summary_path: Optional[Path] = None) -> None:
+        """Append completion info to run_metadata.json."""
+        try:
+            meta = json.loads(RUN_METADATA_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        meta["completed_at"] = now_iso()
+        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        if ckpts:
+            meta["final_checkpoint"] = str(ckpts[-1])
+        if summary_path and summary_path.exists():
+            meta["run_summary"] = str(summary_path)
+        try:
+            RUN_METADATA_FILE.write_text(json.dumps(meta, indent=2))
+        except OSError as e:
+            log_orch(f"Could not update run metadata: {e}", level="warning")
+
+    # -----------------------------------------------------------------------
+    # PIPELINE-10: Run summary report
+    # -----------------------------------------------------------------------
+
+    def _write_run_summary(self) -> Optional[Path]:
+        """Parse orchestrator logs to produce a human-readable run summary."""
+        summary_path = LOG_DIR / "run_summary.txt"
+        try:
+            lines: list[str] = []
+            for log_file in sorted(LOG_DIR.glob("orchestrator*.jsonl"),
+                                   key=lambda p: p.name):
+                if log_file.exists():
+                    lines.extend(log_file.read_text(errors="replace").splitlines())
+
+            events_by_chunk: dict[int, list[dict]] = {}
+            training_events: dict[int, dict] = {}
+            for line in lines:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = ev.get("chunk")
+                msg   = ev.get("msg", "")
+                ts    = ev.get("ts", "")
+                if chunk and ("training started" in msg or "training complete" in msg
+                              or "hard example mining complete" in msg):
+                    events_by_chunk.setdefault(chunk, []).append(ev)
+                if chunk and "training started" in msg:
+                    training_events.setdefault(chunk, {})["start"] = ts
+                if chunk and "training complete" in msg:
+                    training_events.setdefault(chunk, {})["end"] = ts
+
+            out: list[str] = ["=== Pipeline Run Summary ===", f"Generated: {now_iso()}", ""]
+            for chunk in range(1, self.total_chunks + 1):
+                ev = training_events.get(chunk, {})
+                start_ts = ev.get("start")
+                end_ts   = ev.get("end")
+                if start_ts and end_ts:
+                    from datetime import datetime, timezone
+                    fmt = "%Y-%m-%dT%H:%M:%S+00:00"
+                    try:
+                        t0 = datetime.fromisoformat(start_ts)
+                        t1 = datetime.fromisoformat(end_ts)
+                        elapsed_h = (t1 - t0).total_seconds() / 3600
+                        out.append(f"Chunk {chunk}: {elapsed_h:.1f}h training")
+                    except ValueError:
+                        out.append(f"Chunk {chunk}: training timestamps unparseable")
+                else:
+                    out.append(f"Chunk {chunk}: incomplete")
+
+            out.append("")
+            ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+            if ckpts:
+                out.append(f"Final checkpoint: {ckpts[-1].name}")
+            hard_counts = {}
+            if HARD_EX_DIR.exists():
+                for d in HARD_EX_DIR.iterdir():
+                    if d.is_dir() and d.name.startswith("chunk"):
+                        hard_counts[d.name] = sum(1 for f in d.glob("*.tar"))
+            if hard_counts:
+                out.append("Hard examples: " + "  ".join(
+                    f"{k}={v} tars" for k, v in sorted(hard_counts.items())))
+
+            summary_path.write_text("\n".join(out) + "\n")
+            log_orch(f"Run summary written → {summary_path}")
+            return summary_path
+        except Exception as e:
+            log_orch(f"Could not write run summary: {e}", level="warning")
+            return None
+
+    def _disk_guard(self, step_description: str) -> bool:
+        """Return False and pause if disk is below the critical threshold."""
+        min_gb = self.cfg.get("min_free_gb", DISK_ABORT_GB)
+        gb = free_gb()
+        if gb < min_gb:
+            log_orch(f"Disk guard: {gb:.1f} GB free < {min_gb} GB — skipping {step_description}",
+                     level="warning")
+            return False
+        return True
+
     def _launch_prep(self, description: str, cmd: str, log_file: Path,
                      chunk: int, step: str,
                      token: Optional[str] = None,
@@ -462,6 +644,8 @@ class Orchestrator:
         """Launch cmd in the iris-prep tmux window and record the active step."""
         if self._active_prep is not None:
             return  # already something running
+        if not self._disk_guard(description):
+            return
         if self.dry_run:
             log_orch(f"DRY RUN: would launch {description}")
             return
@@ -871,6 +1055,8 @@ class Orchestrator:
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
+                self._archive_chunk_checkpoint(chunk)
+                self._auto_populate_anchor_shards(chunk)
                 notify("iris pipeline", f"Chunk {chunk} training complete")
                 if self.res.holder("GPU_TOKEN") == _train_token:
                     self.res.release("GPU_TOKEN")
@@ -888,6 +1074,10 @@ class Orchestrator:
                 return
 
         if not self.res.request("GPU_TOKEN", f"train chunk {chunk}"):
+            return
+
+        if not self._disk_guard(f"train chunk {chunk}"):
+            self.res.release("GPU_TOKEN")
             return
 
         training_cfg = self.cfg.get("training", {})
@@ -1403,9 +1593,16 @@ class Orchestrator:
     def _check_disk(self) -> None:
         gb = free_gb()
         if gb < DISK_ABORT_GB:
-            log_orch(f"CRITICAL: {gb:.1f} GB free — pausing", level="error")
-            dispatch_issue(self._next_issue_id(), "error",
-                           f"Disk critically low: {gb:.1f} GB", suggested_action="free_disk")
+            log_orch(f"CRITICAL: {gb:.1f} GB free — pausing pipeline", level="error")
+            self._dispatch_once(
+                "disk_critical", self._next_issue_id(), "error",
+                f"Disk critically low: {gb:.1f} GB free (threshold {DISK_ABORT_GB} GB). "
+                f"Pipeline paused until disk is freed.",
+                suggested_action="free_disk_then_resume",
+                cooldown_secs=300,
+            )
+            notify("iris pipeline WARNING", f"Disk critically low: {gb:.1f} GB — pipeline paused")
+            self._write_pause()
         elif gb < DISK_WARN_GB:
             log_orch(f"WARNING: {gb:.1f} GB free", level="warning")
 

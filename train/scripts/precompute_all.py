@@ -27,6 +27,7 @@ Reference: plans/ip-adapter-training.md §2.7
 import argparse
 import glob
 import io
+import json
 import multiprocessing
 import os
 import queue as _queue_mod
@@ -910,6 +911,36 @@ def main():
     _qwen3_work = args.qwen3_output if _load_qwen3 else None
     _vae_work   = args.vae_output   if _load_vae   else None
 
+    # ── Resume state (PIPELINE-13) ─────────────────────────────────────────
+    # A JSON file lists shard basenames that completed with no errors in a
+    # previous run.  On restart those shards are skipped entirely, avoiding
+    # the tar-open and IO prefetch for already-done work.
+    _resume_state_path = None
+    _done_shards: set[str] = set()
+    if args.qwen3_output:
+        _resume_state_path = os.path.join(args.qwen3_output, ".precompute_done.json")
+        try:
+            with open(_resume_state_path) as _rf:
+                _done_shards = set(json.load(_rf))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+    if _done_shards:
+        shards_before = len(shards)
+        shards = [s for s in shards if os.path.basename(s) not in _done_shards]
+        print(f"  Resume: skipping {shards_before - len(shards)} fully-done shards "
+              f"({len(shards)} remaining)", flush=True)
+
+    def _append_done_shard(shard_path: str) -> None:
+        if _resume_state_path is None:
+            return
+        _done_shards.add(os.path.basename(shard_path))
+        try:
+            with open(_resume_state_path, "w") as _wf:
+                json.dump(sorted(_done_shards), _wf)
+        except OSError:
+            pass
+    # ── end resume state ───────────────────────────────────────────────────
+
     work_items = [
         (s, _qwen3_work, _vae_work, siglip_out,
          args.qwen3_batch, args.vae_batch, args.siglip_batch, None)
@@ -981,6 +1012,8 @@ def main():
                 prefetch = io_exec.submit(_read_shard_records, work_items[seq_idx + 1][0])
 
             result = process_shard(base_item[:7] + (pre_records,))
+            if not result.get("error"):
+                _append_done_shard(base_item[0])
             done = seq_idx + 1
             results.append(result)
             t_now = _time.time()

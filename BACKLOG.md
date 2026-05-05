@@ -54,7 +54,7 @@
 
 - ~~**PIPELINE-2: Check SigLIP coverage before each chunk**~~ ✅ DONE — `_promote_chunk()` in `orchestrator.py` enforces ≥90% siglip coverage when `training.siglip: true` in the pipeline config; fails promotion with a hard error if coverage is insufficient.
 
-- **PIPELINE-6: Preserve each chunk's final checkpoint for pipeline recovery** — The orchestrator currently relies on `keep_last_n` to manage checkpoint disk usage, which rotates out a chunk's final checkpoint once the next chunk starts training. If chunk N+1 training develops a bug or must be restarted from scratch, there is no way to recover without retraining chunk N from zero. Fix: when the orchestrator marks a chunk `train.done`, copy (or hard-link) the final checkpoint pair (`step_NNNNNNN.json` + `step_NNNNNNN.safetensors`) to a dedicated archive path e.g. `/Volumes/2TBSSD/checkpoints/stage1/archive/chunk{N}_final.*`. These archive files are excluded from `keep_last_n` rotation. The `pipeline_ctl.py restart-from-chunk N` operation should look in this archive first. EMA files (`.ema.safetensors`) should also be archived. Disk cost: ~2× the size of one checkpoint per chunk boundary; at small scale negligible.
+- ~~**PIPELINE-6: Preserve each chunk's final checkpoint for pipeline recovery**~~ ✅ DONE — Superseded by PIPELINE-7 (implemented). See PIPELINE-7 entry above.
 
 - **PIPELINE-3: Never run pipeline jobs while training is active on 2TBSSD** — Two epoch-boundary stalls during chunk 1 training (at steps ~19,900 and ~24,900) were extended by competing I/O from the JDB chunk 2 conversion running in parallel. The step ~24,900 stall lasted 2.6h instead of the typical ~15–20min. Rule: fully complete all pipeline work (WDS conversion, precompute) before starting training, or ensure pipeline and training use separate storage volumes.
 
@@ -64,19 +64,19 @@
 
 - ~~**RESILIENCE-1: Wrap training in tmux**~~ ✅ DONE — Orchestrator launches training in a dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator itself runs in `iris-orch` window via `pipeline_ctl.py restart-orchestrator`, also wrapped in `caffeinate -dim` (commit 6f9e7e6). Boot-grace fix added (commit ff87603): stale detection skips restart when training window is alive and heartbeat shows step=0 (model loading phase). DISPATCH.md updated to use pipeline_ctl.py as the canonical start method.
 
-- **PIPELINE-7: Checkpoint archive on chunk promotion** — When `train.done` is marked, copy (or hard-link) the final checkpoint pair plus `.ema.safetensors` into `/Volumes/2TBSSD/checkpoints/stage1/archive/chunk{N}_final.*`. Excluded from `keep_last_n` rotation. `pipeline_ctl.py restart-from-chunk N` should look here first. See also PIPELINE-6 for motivation.
+- ~~**PIPELINE-7: Checkpoint archive on chunk promotion**~~ ✅ DONE — Orchestrator calls `_archive_chunk_checkpoint(chunk)` after `train.done`; copies `step_NNNNNNN.{safetensors,json,.ema.safetensors}` to `checkpoints/stage1/archive/chunk{N}_final.*`. `pipeline_ctl.py restart-from-chunk N` restores from there.
 
-- **PIPELINE-8: Shard integrity scan before training** — After `promoted.done`, run a fast tarfile header-only scan across all newly promoted shards (no decompression). Flag any truncated or zero-byte members. This catches JPEG corruption and partial writes before they silently produce NaN gradients mid-training. Implement as a short `validate_shards.py` step inserted between `promoted` and `train`.
+- **PIPELINE-8: Shard integrity scan before training** (still pending) — After `promoted.done`, run a fast tarfile header-only scan across all newly promoted shards (no decompression). Flag any truncated or zero-byte members. This catches JPEG corruption and partial writes before they silently produce NaN gradients mid-training. Implement as a short `validate_shards.py` step inserted between `promoted` and `train`.
 
-- **PIPELINE-9: Disk space reservation check before each step** — Before launching any GPU or prep step, verify that disk free space on 2TBSSD exceeds a configurable minimum (e.g. 50 GB). If not, pause and dispatch an alert. Prevents silent OOM-on-disk that stalls steps mid-run. Add `min_free_gb` to `v2_pipeline.yaml`.
+- ~~**PIPELINE-9: Disk space reservation check before each step**~~ ✅ DONE — `_disk_guard()` in orchestrator checks `min_free_gb` (config key, defaults to `DISK_ABORT_GB`) before `_launch_prep()` and `_start_training()`. Returns False and logs if below threshold.
 
-- **PIPELINE-10: Pipeline run summary report on completion** — When the orchestrator writes "All chunks complete", generate a human-readable summary: total wall-clock per chunk, steps/hour per chunk, final loss, checkpoint path, hard example counts. Save to `/Volumes/2TBSSD/logs/run_summary.txt` and notify. Simplest implementation: parse `orchestrator.jsonl` timestamps for events.
+- ~~**PIPELINE-10: Pipeline run summary report on completion**~~ ✅ DONE — `_write_run_summary()` parses all `orchestrator*.jsonl` files on completion and writes `logs/run_summary.txt` with per-chunk wall-clock, final checkpoint, hard example counts. Called from `_all_done()` block.
 
-- **PIPELINE-11: `restart-from-chunk N` subcommand** — `pipeline_ctl.py restart-from-chunk N` should: (a) kill iris-train if running, (b) clear all sentinels for chunks N..total, (c) restore chunk N-1 final checkpoint from archive (see PIPELINE-7), (d) restart orchestrator. Provides a safe, one-command way to re-run from any chunk boundary without manual sentinel surgery.
+- ~~**PIPELINE-11: `restart-from-chunk N` subcommand**~~ ✅ DONE — `pipeline_ctl.py restart-from-chunk N`: kills iris-train, clears sentinels for chunks N..total, restores chunk N-1 final checkpoint from archive, restarts orchestrator. Requires confirmation before destructive operations.
 
 - **PIPELINE-12: Per-chunk data quality report** — After `clip_dups` finishes for each chunk, log: total images, deduplication rate (% removed), mean CLIP score, and dataset size breakdown by source (JDB / WikiArt / LAION / COYO). Helps catch bad data ratios before precompute runs. Implement by adding a `report_chunk.py` step or extending `clip_dedup.py` to emit a JSON summary.
 
-- **PIPELINE-13: Precompute progress saved across restarts** — `precompute_all.py` currently re-scans from scratch if interrupted. Add a resume-state file (list of completed shard IDs) so a restart skips already-done shards. Saves hours when precompute is interrupted at 80%.
+- ~~**PIPELINE-13: Precompute progress saved across restarts**~~ ✅ DONE — `precompute_all.py` maintains `qwen3_output/.precompute_done.json` (list of fully-done shard basenames). On restart, done shards are skipped before `work_items` is built, avoiding tar-open and IO prefetch for already-complete shards.
 
 - **PIPELINE-14: Configurable hard_mix_ratio per chunk** — Current `hard_mix_ratio: 0.05` is global. Chunk 2+ may benefit from a higher ratio (0.10–0.15) since the hard example set is built from chunk N-1's model. Add per-chunk override in `v2_pipeline.yaml` under `training.hard_mix_ratio_by_chunk`.
 
@@ -84,11 +84,11 @@
 
 - **PIPELINE-16: Validation FID/CLIP score tracking across chunks** — `validator.py` produces per-chunk images. Add CLIP score (text-image alignment) and a lightweight FID proxy metric. Store as JSON in `/Volumes/2TBSSD/logs/val_chunk{N}/metrics.json`. Orchestrator reads these to confirm chunk-over-chunk improvement at promotion time.
 
-- **PIPELINE-17: Auto-populate anchor_shards after chunk 1** — After chunk 1 `train.done`, automatically copy a representative sample of chunk 1 shards (e.g. every Nth shard) to `ANCHOR_SHARDS_DIR`. This removes the current manual step. Add `anchor_sample_rate: 10` to `v2_pipeline.yaml`.
+- ~~**PIPELINE-17: Auto-populate anchor_shards after chunk 1**~~ ✅ DONE — `_auto_populate_anchor_shards()` copies every Nth production shard to `ANCHOR_SHARDS_DIR` after chunk 1 `train.done`. Rate controlled by `training.anchor_sample_rate` in config (default 10). Skips if anchor dir already populated.
 
-- **PIPELINE-18: Graceful pipeline pause on low disk** — Currently the disk-low alert is advisory only. Add a hard pause (write CONTROL_FILE) when free space drops below `disk_critical_gb` (e.g. 20 GB). Resume automatically when space recovers (e.g. after staging cleanup). Prevents silent partial writes that corrupt shards.
+- ~~**PIPELINE-18: Graceful pipeline pause on low disk**~~ ✅ DONE — `_check_disk()` now calls `_write_pause()` + `notify()` + dispatches a cooldown alert when free GB drops below `DISK_ABORT_GB`. Operator can free disk and then run `pipeline_ctl.py resume`.
 
-- **PIPELINE-20: Structured run metadata for each pipeline execution** — Write a `run_metadata.json` to `DATA_ROOT` at orchestrator start (run_id, scale, start_time, total_chunks, config snapshot). Append completion_time and final_checkpoint at the end. Makes it easy to trace which training run produced which checkpoint, especially after multiple re-runs.
+- ~~**PIPELINE-20: Structured run metadata for each pipeline execution**~~ ✅ DONE — Orchestrator writes `run_metadata.json` at start (run_id, scale, total_chunks, config snapshot) and appends `completed_at` + `final_checkpoint` + `run_summary` path on pipeline completion.
 
 ---
 

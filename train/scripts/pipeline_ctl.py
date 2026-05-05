@@ -13,6 +13,7 @@ Usage:
     python train/scripts/pipeline_ctl.py clear-error 2 build_shards
     python train/scripts/pipeline_ctl.py dispatch-read       # show open issues
     python train/scripts/pipeline_ctl.py dispatch-resolve I-001
+    python train/scripts/pipeline_ctl.py restart-from-chunk 2  # restart from chunk 2
 """
 
 import argparse
@@ -23,8 +24,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, TMUX_SESSION,
-    TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, SCRIPTS_DIR, TRAIN_DIR,
+    DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, SENTINEL_DIR,
+    TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, SCRIPTS_DIR, TRAIN_DIR,
+    CKPT_ARCHIVE_DIR, CKPT_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso,
 )
@@ -150,6 +152,81 @@ def cmd_dispatch_resolve(args) -> None:
     print(f"Marked {issue_id} as resolved")
 
 
+def cmd_restart_from_chunk(args) -> None:
+    """
+    Safely restart the pipeline from chunk N:
+      1. Kill iris-train window if running (with confirmation)
+      2. Clear all sentinels for chunks N..total_chunks
+      3. Restore chunk N-1 final checkpoint from archive if available
+      4. Restart orchestrator
+    """
+    chunk = args.chunk
+
+    # Detect total_chunks from sentinel dirs
+    if SENTINEL_DIR.exists():
+        total = sum(1 for d in SENTINEL_DIR.iterdir() if d.name.startswith("chunk"))
+    else:
+        total = 4  # fallback
+
+    print(f"Restarting pipeline from chunk {chunk} (total={total})")
+    print(f"This will:")
+    print(f"  - Kill iris-train if running")
+    print(f"  - Delete sentinels for chunks {chunk}..{total}")
+    if chunk > 1:
+        arch = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
+        if arch.exists():
+            print(f"  - Restore chunk {chunk - 1} final checkpoint from archive")
+        else:
+            print(f"  - WARNING: no archived checkpoint for chunk {chunk - 1} — training will resume from whatever is in {CKPT_DIR}")
+    confirm = input("Continue? (y/N): ").strip()
+    if confirm.lower() != "y":
+        print("Aborted.")
+        return
+
+    # Kill training window
+    if tmux_window_exists(TMUX_TRAIN_WIN):
+        subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"])
+        print("Killed iris-train window")
+
+    # Clear sentinels for chunks N..total
+    for c in range(chunk, total + 1):
+        chunk_dir = SENTINEL_DIR / f"chunk{c}"
+        if chunk_dir.exists():
+            import shutil
+            shutil.rmtree(chunk_dir)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  Cleared sentinels for chunk {c}")
+
+    # Restore archived checkpoint if available
+    if chunk > 1:
+        arch_st  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
+        arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.json"
+        arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.ema.safetensors"
+        if arch_st.exists():
+            import shutil
+            # Find or infer the step number from the archive json
+            step_name = "restored"
+            if arch_js.exists():
+                try:
+                    meta = json.loads(arch_js.read_text())
+                    step_name = f"step_{meta.get('step', 'restored'):07d}"
+                except Exception:
+                    pass
+            CKPT_DIR.mkdir(parents=True, exist_ok=True)
+            dst_st  = CKPT_DIR / f"{step_name}.safetensors"
+            dst_js  = CKPT_DIR / f"{step_name}.json"
+            dst_ema = CKPT_DIR / f"{step_name}.ema.safetensors"
+            shutil.copy2(arch_st, dst_st)
+            if arch_js.exists():
+                shutil.copy2(arch_js, dst_js)
+            if arch_ema.exists():
+                shutil.copy2(arch_ema, dst_ema)
+            print(f"  Restored checkpoint → {dst_st.name}")
+
+    # Restart orchestrator
+    cmd_restart_orchestrator(args)
+
+
 def cmd_status(args) -> None:
     """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
     import subprocess
@@ -204,6 +281,10 @@ def main() -> None:
     p = sub.add_parser("status",           help="Show pipeline status + doctor summary")
     p.add_argument("--brief", action="store_true", help="One-line summary only")
 
+    p = sub.add_parser("restart-from-chunk",
+                       help="Safely restart pipeline from chunk N (clears sentinels, restores checkpoint)")
+    p.add_argument("chunk", type=int)
+
     sub.add_parser("pause",               help="Pause orchestrator")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
@@ -235,6 +316,7 @@ def main() -> None:
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
+        "restart-from-chunk":      cmd_restart_from_chunk,
         "pause":                   cmd_pause,
         "resume":                  cmd_resume,
         "abort":                   cmd_abort,
