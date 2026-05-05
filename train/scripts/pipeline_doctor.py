@@ -1117,7 +1117,7 @@ def _check_stale_logs(chunks: list[int]) -> None:
                 sent_mtime = sent.stat().st_mtime
             except OSError:
                 continue
-            if log_mtime < sent_mtime - 30:  # 30s grace for filesystem clock skew
+            if log_mtime < sent_mtime - 300:  # 5 min: accounts for orchestrator poll delay (60s) + buffer
                 age_diff_s = sent_mtime - log_mtime
                 age_diff_h = age_diff_s / 3600
                 age_str = (f"{age_diff_s/60:.0f}m" if age_diff_s < 3600
