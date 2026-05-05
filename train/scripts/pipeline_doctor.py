@@ -615,9 +615,21 @@ def _check_dispatch_queue() -> None:
 # 8. Data pipeline ordering sanity
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _next_chunk_training_active(chunk: int) -> bool:
+    """Return True if the chunk immediately after `chunk` is currently training."""
+    age = heartbeat_age_secs("trainer", chunk + 1)
+    return age is not None and age <= HEARTBEAT_STALE_SECS
+
+
+# Quality mode set by --quality flag; controls ordering-issue severity and fix strategy.
+_quality_mode: str = "strict"  # "strict" | "fast"
+
+
 def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
     scale = cfg.get("scale", "small")
     steps_map = cfg["training"]["steps"][scale]
+
+    ckpt_steps = _find_checkpoint_steps()
 
     for chunk in chunks:
         if not is_done(chunk, "train") or not is_done(chunk, "mine"):
@@ -626,7 +638,6 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
         chunk_base, expected_end = _chunk_base_and_end(chunk, steps_map)
 
         # Find the checkpoint file closest to expected_end
-        ckpt_steps = _find_checkpoint_steps()
         best_step: Optional[int] = None
         best_delta = 10**9
         for s in ckpt_steps:
@@ -644,7 +655,6 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
             try:
                 best_ckpt_mtime = ckpt_json.stat().st_mtime
             except OSError:
-                # Try any file matching the step
                 for f in CKPT_DIR.iterdir():
                     if f"step_{best_step}" in f.name:
                         try:
@@ -667,16 +677,70 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
                 age_diff = best_ckpt_mtime - hard_mtime
                 hard_age_h = round((time.time() - hard_mtime) / 3600, 1)
                 ckpt_age_h = round((time.time() - best_ckpt_mtime) / 3600, 1)
-                _add("CRITICAL", "ordering",
+                next_chunk = chunk + 1
+                next_training_active = _next_chunk_training_active(chunk)
+
+                if next_training_active:
+                    next_chunk_base, _ = _chunk_base_and_end(next_chunk, steps_map)
+                    # Read current training progress for contamination estimate
+                    next_hb = read_heartbeat("trainer", next_chunk) or {}
+                    current_step = next_hb.get("step", next_chunk_base)
+                    contaminated_steps = current_step - next_chunk_base
+                    contaminated_hard = max(0, round(contaminated_steps * 0.05))
+
+                    fix_strict = (
+                        f"# STRICT: stop training, re-mine with correct model, restart clean\n"
+                        f"tmux kill-window -t {TMUX_SESSION}:{TMUX_TRAIN_WIN}\n"
+                        f"rm -f {SENTINEL_DIR}/chunk{next_chunk}/train.done\n"
+                        f"rm -f {LOG_DIR}/train_chunk{next_chunk}.log\n"
+                        f"rm -f {SENTINEL_DIR}/chunk{chunk}/mine.done\n"
+                        f"rm -f {SENTINEL_DIR}/chunk{chunk}/validate.done\n"
+                        f"rm -rf {hard_dir}\n"
+                        f"# Orchestrator will: mine chunk {chunk} → validate → train chunk {next_chunk} from step {next_chunk_base:,}"
+                    )
+                    fix_fast = (
+                        f"# FAST: let training finish, re-mine after — stale examples affect only {contaminated_steps} steps ({contaminated_hard} hard-example samples)\n"
+                        f"rm -f {SENTINEL_DIR}/chunk{chunk}/mine.done\n"
+                        f"rm -f {SENTINEL_DIR}/chunk{chunk}/validate.done\n"
+                        f"rm -rf {hard_dir}\n"
+                        f"# Orchestrator will re-mine chunk {chunk} after chunk {next_chunk} training completes and GPU is free"
+                    )
+                    fix = fix_strict if _quality_mode == "strict" else fix_fast
+                    sev = "CRITICAL" if _quality_mode == "strict" else "WARNING"
+                    detail = (
+                        f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
+                        f"Checkpoint (step_{best_step}) mtime: {_fmt_age(time.time() - best_ckpt_mtime)} old. "
+                        f"Diff: {age_diff/3600:.1f}h. "
+                        f"Chunk {next_chunk} is mid-training ({contaminated_steps} steps, ~{contaminated_hard} hard-example samples affected). "
+                        f"{'STRICT: stop and restart. ' if _quality_mode == 'strict' else 'FAST: let training finish, re-mine after.'}"
+                    )
+                    ctx_extra = {"next_chunk_training_active": True, "next_chunk": next_chunk,
+                                 "next_chunk_base_step": next_chunk_base,
+                                 "contaminated_steps": contaminated_steps,
+                                 "contaminated_hard_samples": contaminated_hard,
+                                 "quality_mode": _quality_mode,
+                                 "fix_strict": fix_strict, "fix_fast": fix_fast}
+                else:
+                    sev = "CRITICAL"
+                    fix = (
+                        f"rm -f {SENTINEL_DIR}/chunk{chunk}/mine.done "
+                        f"{SENTINEL_DIR}/chunk{chunk}/validate.done && "
+                        f"rm -rf {hard_dir}  "
+                        f"# orchestrator will re-mine then re-validate chunk {chunk}"
+                    )
+                    detail = (
+                        f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
+                        f"Checkpoint (step_{best_step}) mtime: {_fmt_age(time.time() - best_ckpt_mtime)} old. "
+                        f"Diff: {age_diff/3600:.1f}h. Hard examples mined from a stale model."
+                    )
+                    ctx_extra = {"next_chunk_training_active": False, "quality_mode": _quality_mode}
+
+                _add(sev, "ordering",
                      f"Chunk {chunk} hard examples are OLDER than the training checkpoint",
-                     detail=(f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
-                             f"Checkpoint (step_{best_step}) mtime: {_fmt_age(time.time() - best_ckpt_mtime)} old. "
-                             f"Diff: {age_diff/3600:.1f}h. Hard examples mined from a stale model."),
-                     fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/mine.done && "
-                          f"rm -rf {hard_dir}  # orchestrator will re-run mine step"),
-                     chunk=chunk,
+                     detail=detail, fix=fix, chunk=chunk,
                      ctx={"hard_ex_age_h": hard_age_h, "ckpt_step": best_step,
-                          "ckpt_age_h": ckpt_age_h, "diff_h": round(age_diff / 3600, 1)})
+                          "ckpt_age_h": ckpt_age_h, "diff_h": round(age_diff / 3600, 1),
+                          **ctx_extra})
 
     # ── next chunk's hard examples must postdate current chunk's training ──
     for chunk in chunks:
@@ -1044,9 +1108,17 @@ def main() -> None:
                         help="Compact JSON for AI consumption: structured context, no prose/ANSI")
     parser.add_argument("--fix", action="store_true",
                         help="Interactively offer to run remediation commands")
+    parser.add_argument("--quality", choices=["strict", "fast"], default="strict",
+                        help=(
+                            "strict (default): stale hard examples mid-training → stop, re-mine, restart. "
+                            "fast: let current training finish, re-mine before next chunk uses them."
+                        ))
     parser.add_argument("--config", default=None, metavar="PATH",
                         help="Path to v2_pipeline.yaml (auto-detected if omitted)")
     args = parser.parse_args()
+
+    global _quality_mode
+    _quality_mode = args.quality
 
     cfg = load_config(args.config)
     total_chunks = cfg.get("chunks", 4)
@@ -1055,7 +1127,7 @@ def main() -> None:
         chunks = [args.chunk]
 
     if not args.json and not args.ai:
-        print(f"Diagnosing chunks: {chunks}")
+        print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
 
     # ── run all checks ────────────────────────────────────────────────────
     _check_environment()

@@ -39,6 +39,7 @@ Active scripts (all in `train/scripts/`):
 | `pipeline_lib.py` | Shared primitives: state I/O, sentinels, heartbeats, tmux helpers |
 | `pipeline_status.py` | Live pipeline status (reads state file + heartbeats) |
 | `pipeline_ctl.py` | Control interface: pause / resume / abort / retry |
+| `pipeline_doctor.py` | Deep diagnostic tool — cross-checks sentinel claims against actual artifacts, logs, and heartbeats; produces remediation commands |
 
 **V1 scripts** (archived, not for active use): `train/scripts/v1/`
 
@@ -192,14 +193,59 @@ ls /Volumes/2TBSSD/logs/
 
 ---
 
-### `doctor` — Startup health check
+### `doctor` — Deep pipeline diagnostic
 
-The orchestrator runs a doctor check at startup and refuses to proceed if any check fails. To run it manually or inspect results:
+`pipeline_doctor.py` actively investigates the pipeline state rather than passively reading it. Unlike `pipeline_status.py` (which reports what sentinels say), the doctor cross-checks each sentinel claim against actual artifacts, log content, heartbeat freshness, and ordering invariants.
+
+**Default (human report):**
+```bash
+train/.venv/bin/python train/scripts/pipeline_doctor.py
+train/.venv/bin/python train/scripts/pipeline_doctor.py --chunk 2   # single chunk
+```
+
+**AI-optimised compact JSON** (replaces multiple file reads with one structured report):
+```bash
+train/.venv/bin/python train/scripts/pipeline_doctor.py --ai
+```
+Output includes: `summary` (disk, active training step/loss/ETA, prep progress, orch poll age), `top_action` (highest-priority action in one sentence), `issue_counts`, and `issues` with machine-readable `context` dicts.
+
+**Interactive fix mode:**
+```bash
+train/.venv/bin/python train/scripts/pipeline_doctor.py --fix
+```
+Prints each issue with its remediation command and prompts `[y/N]` before running it.
+
+**Quality mode** (controls how stale-hard-examples issues are handled mid-training):
+```bash
+# strict (default): stop training, re-mine, restart chunk from clean checkpoint
+train/.venv/bin/python train/scripts/pipeline_doctor.py --quality strict
+
+# fast: let current training finish; re-mine before next chunk starts
+train/.venv/bin/python train/scripts/pipeline_doctor.py --quality fast
+```
+
+**Exit code**: 0 if no CRITICALs, 1 if any CRITICALs found. Useful in shell scripts.
+
+**What it checks:**
+
+| Category | What it detects |
+|----------|----------------|
+| `phantom` | `.done` sentinel exists but underlying artifacts are missing or empty (no shards, no NPZ files, no checkpoint at expected step, no hard-example tars) |
+| `training` | 0-step exit (resumed past end step), NaN loss in logs, very short log for a completed run, non-zero exit code |
+| `precompute` | Low NPZ coverage vs shard count, orphaned `.tmp.npz` crash artifacts, `.npz.tmp.npz` double-extension artifacts from pre-fix atomic write bug |
+| `checkpoint` | No checkpoint file near expected end step, orphaned future checkpoints |
+| `liveness` | Stale heartbeat with tmux window alive (zombie process); distinguishes window-serving-other-chunk from true zombie |
+| `code` | Missing `--chunk-base-step` arg in training log (0-step exit risk on cross-chunk warmstarts) |
+| `ordering` | Hard examples are older than the training checkpoint they should have been mined from; detects whether dependent chunk is mid-training and adjusts fix severity/commands accordingly |
+| `dispatch` | Open issues in `dispatch_queue.jsonl` not yet resolved |
+| `error_sentinel` | `.error` sentinels without a corresponding `.done` |
+| `environment` | Disk < 80/40 GB, venv missing, `pipeline_state.json` stale or corrupt |
+
+**Orchestrator startup check** (separate, lightweight):
 ```bash
 PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
   train/.venv/bin/python train/scripts/orchestrator.py --dry-run
 ```
-
 Checks: tmux available · DATA_ROOT exists and writable · venv python · disk ≥ 40 GB · numpy · yaml
 
 ---
