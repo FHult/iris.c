@@ -692,28 +692,55 @@ def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
 # 8. Orchestrator log analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ORCH_LOG = LOG_DIR / "orchestrator.jsonl"
 _ORCH_TAIL = 60  # events to scan for stuck-loop detection
 
 
+def _orch_log_files() -> list[Path]:
+    """Return all orchestrator JSONL log files (main + per-chunk), newest-mtime first."""
+    files = list(LOG_DIR.glob("orchestrator*.jsonl"))
+    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return files
+
+
 def _check_orchestrator_log() -> None:
-    if not _ORCH_LOG.exists():
-        return
-    try:
-        raw_lines = _ORCH_LOG.read_text(errors="replace").splitlines()
-    except OSError:
+    log_files = _orch_log_files()
+    if not log_files:
         return
 
-    # Parse last _ORCH_TAIL non-empty events
+    # Collect up to _ORCH_TAIL events across all orchestrator log files,
+    # reading from the most recently modified file first so that chunk-specific
+    # events (orchestrator_chunkN.jsonl) are included in staleness detection.
+    raw_lines: list[str] = []
+    for lf in log_files:
+        try:
+            raw_lines.extend(lf.read_text(errors="replace").splitlines())
+        except OSError:
+            pass
+
+    # Parse last _ORCH_TAIL non-empty events, restricted to the last 24 hours.
+    # Reading all files means stale per-chunk logs from prior runs would surface
+    # ancient errors as if they were current — timestamp filtering prevents this.
+    cutoff = time.time() - 86400  # 24h
     tail: list[dict] = []
     for line in reversed(raw_lines):
         line = line.strip()
         if not line:
             continue
         try:
-            tail.append(json.loads(line))
+            entry = json.loads(line)
         except json.JSONDecodeError:
-            pass
+            continue
+        ts_str = entry.get("ts", "")
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts.timestamp() < cutoff:
+                    continue  # older than 24h — skip
+            except ValueError:
+                pass
+        tail.append(entry)
         if len(tail) >= _ORCH_TAIL:
             break
     tail.reverse()
@@ -721,12 +748,17 @@ def _check_orchestrator_log() -> None:
     if not tail:
         return
 
-    # ── error events ──────────────────────────────────────────────────────
+    # ── error events (deduplicated by message text) ───────────────────────
+    seen_errors: set[str] = set()
     for entry in tail:
         if entry.get("event") == "error":
+            msg = entry.get("message", "")[:100]
+            if msg in seen_errors:
+                continue
+            seen_errors.add(msg)
             chunk = entry.get("chunk")
             _add("WARNING", "orchestrator",
-                 f"Orchestrator error: {entry.get('message', '')[:100]}",
+                 f"Orchestrator error: {msg}",
                  detail=f"ts={entry.get('ts', '')}",
                  chunk=chunk,
                  ctx={"ts": entry.get("ts", ""), "message": entry.get("message", "")[:200],
@@ -741,30 +773,27 @@ def _check_orchestrator_log() -> None:
         if key:
             msg_counts[key] = msg_counts.get(key, 0) + 1
     for msg, count in msg_counts.items():
-        if count >= 5:
+        if count >= 15:
             _add("WARNING", "orchestrator",
                  f"Orchestrator repeating same message {count}× in last {len(tail)} events (stuck loop?)",
                  detail=f"Repeated: '{msg}'",
                  ctx={"repeated_message": msg, "count": count, "tail_size": len(tail)})
             break  # one report is enough
 
-    # ── last-event age ────────────────────────────────────────────────────
-    last = tail[-1]
-    ts_str = last.get("ts", "")
-    if ts_str:
-        try:
-            ts = datetime.fromisoformat(ts_str)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            if age > 600:
-                _add("WARNING", "orchestrator",
-                     f"Orchestrator log last event {_fmt_age(age)} (orchestrator may be down)",
-                     detail=f"Last event: {last.get('message', '')[:100]}",
-                     ctx={"last_event_age_s": round(age),
-                          "last_message": last.get("message", "")[:100]})
-        except ValueError:
-            pass
+    # ── last-event age: use the most recently modified log file's mtime ───
+    # Parsing timestamps from combined lines is unreliable when old per-chunk
+    # logs are included — use filesystem mtime of the newest log file instead.
+    newest_log = log_files[0]  # already sorted by mtime desc
+    try:
+        newest_mtime = newest_log.stat().st_mtime
+        age = time.time() - newest_mtime
+        if age > 600:
+            _add("WARNING", "orchestrator",
+                 f"Orchestrator log last written {_fmt_age(age)} (orchestrator may be down)",
+                 detail=f"Most recent log file: {newest_log.name}",
+                 ctx={"last_write_age_s": round(age), "log_file": newest_log.name})
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
