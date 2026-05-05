@@ -233,20 +233,26 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                      chunk=chunk,
                      ctx={"shard_count": 0, "shard_id_lo": lo, "shard_id_hi": hi - 1})
 
-            # Verify precomputed coverage
+            # Verify precomputed coverage for all required subdirs
             if is_done(chunk, "precompute"):
-                clean, tmp = _count_precomp_for_chunk(chunk)
-                if clean == 0:
-                    _add("CRITICAL", "phantom", f"Chunk {chunk} precompute.done but 0 NPZ files in production",
-                         detail=f"Expected NPZ files with chunk-{chunk} shard IDs in {PRECOMP_DIR}/qwen3/",
-                         fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done"),
-                         chunk=chunk,
-                         ctx={"clean_npz": 0, "tmp_npz": tmp})
-                elif tmp > 0:
-                    _add("WARNING", "phantom", f"Chunk {chunk} has {tmp} leftover .tmp.npz files in precomputed",
-                         detail="Crash artifacts from a broken atomic-write run",
-                         fix=f"python -c \"import os; [os.unlink(f'{PRECOMP_DIR}/qwen3/'+f) for f in os.listdir('{PRECOMP_DIR}/qwen3/') if f.endswith('.tmp.npz')]\"",
-                         chunk=chunk)
+                siglip_on = cfg.get("training", {}).get("siglip", False)
+                subdirs = ["qwen3", "vae"] + (["siglip"] if siglip_on else [])
+                for subdir in subdirs:
+                    clean, tmp = _count_precomp_for_chunk(chunk, subdir)
+                    if clean == 0:
+                        _add("CRITICAL", "phantom",
+                             f"Chunk {chunk} precompute.done but 0 {subdir} NPZ files in production",
+                             detail=f"Expected NPZ files with chunk-{chunk} shard IDs in {PRECOMP_DIR}/{subdir}/",
+                             fix=f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done",
+                             chunk=chunk,
+                             ctx={"subdir": subdir, "clean_npz": 0, "tmp_npz": tmp})
+                    elif tmp > 0:
+                        _add("WARNING", "phantom",
+                             f"Chunk {chunk} has {tmp} leftover .tmp.npz in precomputed/{subdir}",
+                             detail="Crash artifacts from a broken atomic-write run.",
+                             fix=f"find {PRECOMP_DIR}/{subdir} -name '*.tmp.npz' -delete",
+                             chunk=chunk,
+                             ctx={"subdir": subdir, "tmp_npz": tmp})
 
             # Check for promoted error residue
             promoted_err = SENTINEL_DIR / f"chunk{chunk}" / "promoted.error"
@@ -263,13 +269,27 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
             near_end = [s for s in ckpt_steps if abs(s - expected_end) <= 1000]
             if not near_end:
                 latest = _latest_ckpt_step()
-                _add("CRITICAL", "phantom",
-                     f"Chunk {chunk} train.done but no checkpoint near step {expected_end:,}",
-                     detail=f"Expected end: {expected_end:,}, latest checkpoint: {latest}",
-                     fix=f"rm {SENTINEL_DIR}/chunk{chunk}/train.done",
-                     chunk=chunk,
-                     ctx={"expected_end_step": expected_end, "latest_ckpt_step": latest,
-                          "available_ckpt_steps": ckpt_steps})
+                next_chunk = chunk + 1
+                # If the next chunk is already training/done, the transition checkpoint
+                # was consumed successfully and may have been rotated by keep_last_n.
+                # That is expected — don't raise CRITICAL.
+                next_already_started = (is_done(next_chunk, "train") or
+                                        heartbeat_age_secs("trainer", next_chunk) is not None)
+                if next_already_started:
+                    _add("INFO", "phantom",
+                         f"Chunk {chunk} final checkpoint (step {expected_end:,}) rotated by keep_last_n",
+                         detail=(f"Chunk {next_chunk} already started training, confirming the "
+                                 f"transition was successful. Latest checkpoint: {latest:,}."),
+                         chunk=chunk,
+                         ctx={"expected_end_step": expected_end, "latest_ckpt_step": latest})
+                else:
+                    _add("CRITICAL", "phantom",
+                         f"Chunk {chunk} train.done but no checkpoint near step {expected_end:,}",
+                         detail=f"Expected end: {expected_end:,}, latest checkpoint: {latest}",
+                         fix=f"rm {SENTINEL_DIR}/chunk{chunk}/train.done",
+                         chunk=chunk,
+                         ctx={"expected_end_step": expected_end, "latest_ckpt_step": latest,
+                              "available_ckpt_steps": ckpt_steps})
 
         # ── mine.done ─────────────────────────────────────────────────────
         if is_done(chunk, "mine"):
@@ -363,54 +383,58 @@ def _check_training_integrity(cfg: dict, chunks: list[int]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
+    siglip_on = cfg.get("training", {}).get("siglip", False)
+    subdirs = ["qwen3", "vae"] + (["siglip"] if siglip_on else [])
+
     for chunk in chunks:
         n_shards = _count_shards_for_chunk(chunk)
         if n_shards == 0:
             continue  # no shards yet, nothing to check
 
-        clean, tmp = _count_precomp_for_chunk(chunk)
-
-        if is_done(chunk, "precompute") and clean < n_shards * 0.5:
-            pct = 100 * clean / n_shards if n_shards else 0
-            _add("WARNING", "precompute",
-                 f"Chunk {chunk} precompute coverage low: {clean} NPZ / {n_shards} shards ({pct:.0f}%)",
-                 detail=(f"Expected roughly ≥1 NPZ per shard. Leftover .tmp files: {tmp}. "
-                         f"A partial run or sample-shard optimization bug could cause this."),
-                 fix=(f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done"),
-                 chunk=chunk,
-                 ctx={"clean_npz": clean, "n_shards": n_shards,
-                      "coverage_pct": round(pct, 1), "tmp_npz": tmp})
-
-        if tmp > 0:
-            _add("WARNING", "precompute",
-                 f"Chunk {chunk}: {tmp} orphaned .tmp.npz files (broken atomic write)",
-                 detail=(f"Created by np.savez during a crash. "
-                         f"Training ignores them (wrong extension) but they add noise."),
-                 fix=(f"python -c \"import os, re; "
-                      f"[os.unlink(p) for p in __import__('glob').glob('{PRECOMP_DIR}/qwen3/*.tmp.npz')]\""),
-                 chunk=chunk)
-
-        # ── double-extension crash artifacts (pre-fix atomic write) ───────
         lo, hi = _chunk_shard_range(chunk)
-        double_tmp = []
-        try:
-            for f in os.listdir(PRECOMP_DIR / "qwen3"):
-                if f.endswith(".npz.tmp.npz"):
-                    try:
-                        shard_id = int(f.split("_")[0])
-                        if lo <= shard_id < hi:
-                            double_tmp.append(f)
-                    except (ValueError, IndexError):
-                        pass
-        except OSError:
-            pass
-        if double_tmp:
-            _add("CRITICAL", "precompute",
-                 f"Chunk {chunk}: {len(double_tmp)} .npz.tmp.npz files (pre-fix atomic write bug)",
-                 detail=(f"From broken _save_npz_atomic before fix. "
-                         f"The real .npz files were never written. Examples: {double_tmp[:3]}"),
-                 fix=f"find {PRECOMP_DIR}/qwen3 -name '*.npz.tmp.npz' -delete",
-                 chunk=chunk)
+
+        for subdir in subdirs:
+            clean, tmp = _count_precomp_for_chunk(chunk, subdir)
+
+            if is_done(chunk, "precompute") and clean < n_shards * 0.5:
+                pct = 100 * clean / n_shards if n_shards else 0
+                _add("WARNING", "precompute",
+                     f"Chunk {chunk} {subdir} precompute coverage low: {clean} NPZ / {n_shards} shards ({pct:.0f}%)",
+                     detail=(f"Expected roughly ≥1 NPZ per shard. Leftover .tmp files: {tmp}. "
+                             f"A partial run or sample-shard optimization bug could cause this."),
+                     fix=f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done",
+                     chunk=chunk,
+                     ctx={"subdir": subdir, "clean_npz": clean, "n_shards": n_shards,
+                          "coverage_pct": round(pct, 1), "tmp_npz": tmp})
+
+            if tmp > 0:
+                _add("WARNING", "precompute",
+                     f"Chunk {chunk}: {tmp} orphaned .tmp.npz files in {subdir} (broken atomic write)",
+                     detail="Created by np.savez during a crash. Training ignores them but they add noise.",
+                     fix=f"find {PRECOMP_DIR}/{subdir} -name '*.tmp.npz' -delete",
+                     chunk=chunk,
+                     ctx={"subdir": subdir, "tmp_npz": tmp})
+
+            # ── double-extension crash artifacts (pre-fix atomic write) ──
+            double_tmp = []
+            try:
+                for f in os.listdir(PRECOMP_DIR / subdir):
+                    if f.endswith(".npz.tmp.npz"):
+                        try:
+                            shard_id = int(f.split("_")[0])
+                            if lo <= shard_id < hi:
+                                double_tmp.append(f)
+                        except (ValueError, IndexError):
+                            pass
+            except OSError:
+                pass
+            if double_tmp:
+                _add("CRITICAL", "precompute",
+                     f"Chunk {chunk}: {len(double_tmp)} .npz.tmp.npz files in {subdir} (pre-fix atomic write bug)",
+                     detail=(f"From broken _save_npz_atomic before fix. "
+                             f"The real .npz files were never written. Examples: {double_tmp[:3]}"),
+                     fix=f"find {PRECOMP_DIR}/{subdir} -name '*.npz.tmp.npz' -delete",
+                     chunk=chunk)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,10 +454,14 @@ def _check_checkpoint_continuity(cfg: dict, chunks: list[int]) -> None:
         chunk_base, expected_end = _chunk_base_and_end(chunk, steps_map)
         near = [s for s in all_steps if abs(s - expected_end) <= 500]
         if not near:
-            _add("WARNING", "checkpoint",
-                 f"Chunk {chunk}: no checkpoint near expected end step {expected_end:,}",
-                 detail=f"Available steps: {all_steps}",
-                 chunk=chunk)
+            next_chunk = chunk + 1
+            next_already_started = (is_done(next_chunk, "train") or
+                                    heartbeat_age_secs("trainer", next_chunk) is not None)
+            if not next_already_started:
+                _add("WARNING", "checkpoint",
+                     f"Chunk {chunk}: no checkpoint near expected end step {expected_end:,}",
+                     detail=f"Available steps: {all_steps}",
+                     chunk=chunk)
 
     # ── orphaned checkpoints past max done step ───────────────────────────
     max_done_step = 0
@@ -447,6 +475,34 @@ def _check_checkpoint_continuity(cfg: dict, chunks: list[int]) -> None:
             _add("INFO", "checkpoint",
                  f"Checkpoint at step {s:,} has no matching train.done",
                  detail="In-progress run or leftover from a reset.")
+
+    # ── checkpoint pair completeness (.json + .safetensors must both exist) ──
+    # Build a map: step → extensions present (excluding EMA files)
+    pair_map: dict[int, set[str]] = {}
+    if CKPT_DIR.exists():
+        for f in CKPT_DIR.iterdir():
+            m = re.match(r"^step[_-](\d+)\.", f.name)
+            if not m or ".ema." in f.name:
+                continue
+            step = int(m.group(1))
+            ext = f.suffix  # ".json" or ".safetensors"
+            pair_map.setdefault(step, set()).add(ext)
+
+    for step, exts in pair_map.items():
+        has_json = ".json" in exts
+        has_st   = ".safetensors" in exts
+        if has_json and not has_st:
+            _add("WARNING", "checkpoint",
+                 f"Checkpoint step {step:,}: .json present but .safetensors missing (incomplete write?)",
+                 detail="Resume from this step will fail. Delete or let the next checkpoint overwrite it.",
+                 fix=f"rm {CKPT_DIR}/step_{step:07d}.json",
+                 ctx={"step": step, "has_json": True, "has_safetensors": False})
+        elif has_st and not has_json:
+            _add("WARNING", "checkpoint",
+                 f"Checkpoint step {step:,}: .safetensors present but .json metadata missing",
+                 detail="Step metadata required for resume. Delete the orphaned weights file.",
+                 fix=f"rm {CKPT_DIR}/step_{step:07d}.safetensors",
+                 ctx={"step": step, "has_json": False, "has_safetensors": True})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,7 +630,145 @@ def _check_code_consistency(cfg: dict, chunks: list[int]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Dispatch queue analysis
+# 7. Training anomaly detection (live heartbeat vs config thresholds)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
+    anomaly    = cfg.get("anomaly", {})
+    loss_thr   = float(anomaly.get("loss_threshold",   2.0))
+    gn_pause   = float(anomaly.get("grad_norm_pause",  50.0))
+    gn_warn    = float(anomaly.get("grad_norm_warn",   10.0))
+    siglip_min = float(anomaly.get("siglip_min_coverage", 90))
+    siglip_on  = cfg.get("training", {}).get("siglip", False)
+
+    for chunk in chunks:
+        if is_done(chunk, "train"):
+            continue
+        hb  = read_heartbeat("trainer", chunk)
+        age = heartbeat_age_secs("trainer", chunk)
+        if hb is None or age is None or age > HEARTBEAT_STALE_SECS:
+            continue
+
+        step         = hb.get("step", 0)
+        loss         = hb.get("loss")
+        loss_smooth  = hb.get("loss_smooth")
+        gn_smooth    = hb.get("grad_norm_smooth")
+        siglip_pct   = hb.get("siglip_coverage_pct")
+
+        if loss is not None and loss > loss_thr:
+            _add("WARNING", "anomaly",
+                 f"Chunk {chunk}: loss {loss:.4f} exceeds threshold {loss_thr} at step {step:,}",
+                 detail=(f"loss_smooth={loss_smooth}. Orchestrator pauses after "
+                         f"{anomaly.get('loss_high_steps', 100)} sustained steps above threshold."),
+                 chunk=chunk,
+                 ctx={"step": step, "loss": loss, "loss_smooth": loss_smooth,
+                      "threshold": loss_thr})
+
+        if gn_smooth is not None and gn_smooth > gn_pause:
+            _add("WARNING", "anomaly",
+                 f"Chunk {chunk}: grad_norm_smooth {gn_smooth:.2f} exceeds pause threshold {gn_pause}",
+                 detail=(f"Step {step:,}. Orchestrator pauses after "
+                         f"{anomaly.get('grad_spike_polls', 10)} consecutive polls above threshold."),
+                 chunk=chunk,
+                 ctx={"step": step, "grad_norm_smooth": gn_smooth, "pause_threshold": gn_pause})
+        elif gn_smooth is not None and gn_smooth > gn_warn:
+            _add("INFO", "anomaly",
+                 f"Chunk {chunk}: grad_norm_smooth {gn_smooth:.2f} above warn threshold {gn_warn}",
+                 chunk=chunk,
+                 ctx={"step": step, "grad_norm_smooth": gn_smooth, "warn_threshold": gn_warn})
+
+        if siglip_on and siglip_pct is not None and siglip_pct < siglip_min:
+            _add("WARNING", "anomaly",
+                 f"Chunk {chunk}: SigLIP coverage {siglip_pct:.1f}% below minimum {siglip_min:.0f}%",
+                 detail=(f"Step {step:,}. Some shards lack precomputed SigLIP embeddings — "
+                         f"image conditioning quality will be degraded for those samples."),
+                 fix=(f"# After training: recheck precompute coverage for chunk {chunk}\n"
+                      f"python train/scripts/pipeline_ctl.py clear-error {chunk} precompute"),
+                 chunk=chunk,
+                 ctx={"step": step, "siglip_pct": siglip_pct, "min_pct": siglip_min})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Orchestrator log analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ORCH_LOG = LOG_DIR / "orchestrator.jsonl"
+_ORCH_TAIL = 60  # events to scan for stuck-loop detection
+
+
+def _check_orchestrator_log() -> None:
+    if not _ORCH_LOG.exists():
+        return
+    try:
+        raw_lines = _ORCH_LOG.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+
+    # Parse last _ORCH_TAIL non-empty events
+    tail: list[dict] = []
+    for line in reversed(raw_lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            tail.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+        if len(tail) >= _ORCH_TAIL:
+            break
+    tail.reverse()
+
+    if not tail:
+        return
+
+    # ── error events ──────────────────────────────────────────────────────
+    for entry in tail:
+        if entry.get("event") == "error":
+            chunk = entry.get("chunk")
+            _add("WARNING", "orchestrator",
+                 f"Orchestrator error: {entry.get('message', '')[:100]}",
+                 detail=f"ts={entry.get('ts', '')}",
+                 chunk=chunk,
+                 ctx={"ts": entry.get("ts", ""), "message": entry.get("message", "")[:200],
+                      "chunk": chunk})
+
+    # ── stuck-loop detection: same message ≥5× in tail ────────────────────
+    msg_counts: dict[str, int] = {}
+    for entry in tail:
+        if entry.get("event") in ("heartbeat", "poll"):
+            continue
+        key = entry.get("message", "")[:80]
+        if key:
+            msg_counts[key] = msg_counts.get(key, 0) + 1
+    for msg, count in msg_counts.items():
+        if count >= 5:
+            _add("WARNING", "orchestrator",
+                 f"Orchestrator repeating same message {count}× in last {len(tail)} events (stuck loop?)",
+                 detail=f"Repeated: '{msg}'",
+                 ctx={"repeated_message": msg, "count": count, "tail_size": len(tail)})
+            break  # one report is enough
+
+    # ── last-event age ────────────────────────────────────────────────────
+    last = tail[-1]
+    ts_str = last.get("ts", "")
+    if ts_str:
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age > 600:
+                _add("WARNING", "orchestrator",
+                     f"Orchestrator log last event {_fmt_age(age)} (orchestrator may be down)",
+                     detail=f"Last event: {last.get('message', '')[:100]}",
+                     ctx={"last_event_age_s": round(age),
+                          "last_message": last.get("message", "")[:100]})
+        except ValueError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Dispatch queue analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_dispatch_queue() -> None:
@@ -615,7 +809,7 @@ def _check_dispatch_queue() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Data pipeline ordering sanity
+# 10. Data pipeline ordering sanity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _next_chunk_training_active(chunk: int) -> bool:
@@ -640,31 +834,24 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
 
         chunk_base, expected_end = _chunk_base_and_end(chunk, steps_map)
 
-        # Find the checkpoint file closest to expected_end
-        best_step: Optional[int] = None
-        best_delta = 10**9
-        for s in ckpt_steps:
-            delta = abs(s - expected_end)
-            if delta < best_delta:
-                best_delta = delta
-                best_step = s
+        # Use train.done sentinel mtime as the authoritative reference for when
+        # training finished.  Comparing against checkpoint file mtimes is fragile:
+        # checkpoints rotate (keep_last_n) so the chunk N final checkpoint may be
+        # gone, and chunk N+1 training creates newer checkpoints that make valid
+        # chunk N hard examples look stale by comparison.
+        train_sent = SENTINEL_DIR / f"chunk{chunk}" / "train.done"
+        train_done_mtime: Optional[float] = None
+        try:
+            train_done_mtime = train_sent.stat().st_mtime
+        except OSError:
+            pass
 
-        # mtime of the closest checkpoint file (use .json sidecar)
-        best_ckpt_mtime: Optional[float] = None
-        if best_step is not None:
-            ckpt_json = CKPT_DIR / f"step_{best_step:07d}.json"
-            if not ckpt_json.exists():
-                ckpt_json = CKPT_DIR / f"step_{best_step:010d}.json"
-            try:
-                best_ckpt_mtime = ckpt_json.stat().st_mtime
-            except OSError:
-                for f in CKPT_DIR.iterdir():
-                    if f"step_{best_step}" in f.name:
-                        try:
-                            best_ckpt_mtime = f.stat().st_mtime
-                        except OSError:
-                            pass
-                        break
+        mine_sent = SENTINEL_DIR / f"chunk{chunk}" / "mine.done"
+        mine_done_mtime: Optional[float] = None
+        try:
+            mine_done_mtime = mine_sent.stat().st_mtime
+        except OSError:
+            pass
 
         # Hard examples mtime for this chunk
         hard_dir = HARD_EX_DIR / f"chunk{chunk}"
@@ -675,11 +862,13 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
         except OSError:
             pass
 
-        if best_ckpt_mtime is not None and hard_mtime is not None:
-            if hard_mtime < best_ckpt_mtime - 60:  # 60s grace
-                age_diff = best_ckpt_mtime - hard_mtime
-                hard_age_h = round((time.time() - hard_mtime) / 3600, 1)
-                ckpt_age_h = round((time.time() - best_ckpt_mtime) / 3600, 1)
+        # Flag if mine.done predates train.done — mining completed before training
+        # finished, so hard examples were mined from a model that hadn't converged yet.
+        if train_done_mtime is not None and mine_done_mtime is not None:
+            if mine_done_mtime < train_done_mtime - 60:
+                age_diff = train_done_mtime - mine_done_mtime
+                hard_age_h = round((time.time() - hard_mtime) / 3600, 1) if hard_mtime else None
+                ckpt_age_h = round((time.time() - train_done_mtime) / 3600, 1)
                 next_chunk = chunk + 1
                 next_training_active = _next_chunk_training_active(chunk)
 
@@ -711,11 +900,11 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
                     fix = fix_strict if _quality_mode == "strict" else fix_fast
                     sev = "CRITICAL" if _quality_mode == "strict" else "WARNING"
                     detail = (
-                        f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
-                        f"Checkpoint (step_{best_step}) mtime: {_fmt_age(time.time() - best_ckpt_mtime)} old. "
-                        f"Diff: {age_diff/3600:.1f}h. "
-                        f"Chunk {next_chunk} is mid-training ({contaminated_steps} steps, ~{contaminated_hard} hard-example samples affected). "
-                        f"{'STRICT: stop and restart. ' if _quality_mode == 'strict' else 'FAST: let training finish, re-mine after.'}"
+                        f"mine.done is {age_diff/3600:.1f}h older than train.done — "
+                        f"mining completed before training finished for chunk {chunk}. "
+                        f"Chunk {next_chunk} is mid-training ({contaminated_steps} steps, "
+                        f"~{contaminated_hard} hard-example samples affected). "
+                        f"{'STRICT: stop and restart.' if _quality_mode == 'strict' else 'FAST: let training finish, re-mine after.'}"
                     )
                     ctx_extra = {"next_chunk_training_active": True, "next_chunk": next_chunk,
                                  "next_chunk_base_step": next_chunk_base,
@@ -732,18 +921,17 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
                         f"# orchestrator will re-mine then re-validate chunk {chunk}"
                     )
                     detail = (
-                        f"Hard examples mtime: {_fmt_age(time.time() - hard_mtime)} old. "
-                        f"Checkpoint (step_{best_step}) mtime: {_fmt_age(time.time() - best_ckpt_mtime)} old. "
-                        f"Diff: {age_diff/3600:.1f}h. Hard examples mined from a stale model."
+                        f"mine.done is {age_diff/3600:.1f}h older than train.done — "
+                        f"mining completed before training finished for chunk {chunk}. "
+                        f"Hard examples were mined from a model that hadn't converged yet."
                     )
                     ctx_extra = {"next_chunk_training_active": False, "quality_mode": _quality_mode}
 
                 _add(sev, "ordering",
-                     f"Chunk {chunk} hard examples are OLDER than the training checkpoint",
+                     f"Chunk {chunk} hard examples mined before training finished (stale model)",
                      detail=detail, fix=fix, chunk=chunk,
-                     ctx={"hard_ex_age_h": hard_age_h, "ckpt_step": best_step,
-                          "ckpt_age_h": ckpt_age_h, "diff_h": round(age_diff / 3600, 1),
-                          **ctx_extra})
+                     ctx={"hard_ex_age_h": hard_age_h, "train_done_age_h": ckpt_age_h,
+                          "diff_h": round(age_diff / 3600, 1), **ctx_extra})
 
     # ── next chunk's hard examples must postdate current chunk's training ──
     for chunk in chunks:
@@ -775,7 +963,7 @@ def _check_ordering_sanity(cfg: dict, chunks: list[int]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Error sentinel analysis
+# 11. Error sentinel analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_error_sentinels(chunks: list[int]) -> None:
@@ -803,7 +991,7 @@ def _check_error_sentinels(chunks: list[int]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Environment and disk checks
+# 12. Environment and disk checks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_environment() -> None:
@@ -852,6 +1040,62 @@ def _check_environment() -> None:
             _add("WARNING", "environment",
                  "pipeline_state.json unreadable or corrupt",
                  fix=f"rm {DATA_ROOT}/pipeline_state.json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Stale log detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Log filenames for each pipeline step (must match orchestrator.py)
+_STEP_LOGS: dict[str, object] = {
+    "download":     lambda c: LOG_DIR / f"download_chunk{c}.log",
+    "build_shards": lambda c: LOG_DIR / f"build_chunk{c}.log",
+    "filter_shards":lambda c: LOG_DIR / f"filter_chunk{c}.log",
+    "clip_embed":   lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
+    "clip_index":   lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
+    "clip_dups":    lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
+    "precompute":   lambda c: LOG_DIR / f"precompute_chunk{c}.log",
+    "mine":         lambda c: LOG_DIR / f"mine_chunk{c}.log",
+    "validate":     lambda c: LOG_DIR / f"validate_chunk{c}.log",
+    "train":        lambda c: LOG_DIR / f"train_chunk{c}.log",
+}
+
+
+def _check_stale_logs(chunks: list[int]) -> None:
+    """Flag log files whose mtime predates the corresponding .done sentinel.
+
+    A log older than its sentinel is from a prior run of that step and will
+    contain misleading information (wrong step counts, wrong timestamps, etc.).
+    """
+    for chunk in chunks:
+        for step, log_fn in _STEP_LOGS.items():
+            sent = SENTINEL_DIR / f"chunk{chunk}" / f"{step}.done"
+            if not sent.exists():
+                continue
+            log_file = log_fn(chunk)  # type: ignore[operator]
+            if not log_file.exists():
+                continue
+            try:
+                log_mtime  = log_file.stat().st_mtime
+                sent_mtime = sent.stat().st_mtime
+            except OSError:
+                continue
+            if log_mtime < sent_mtime - 30:  # 30s grace for filesystem clock skew
+                age_diff_s = sent_mtime - log_mtime
+                age_diff_h = age_diff_s / 3600
+                age_str = (f"{age_diff_s/60:.0f}m" if age_diff_s < 3600
+                           else f"{age_diff_h:.1f}h")
+                _add("INFO", "stale_log",
+                     f"Chunk {chunk} {step}: log predates .done sentinel by {age_str} (prior run)",
+                     detail=(f"{log_file.name} written {_fmt_age(time.time() - log_mtime)}, "
+                             f"sentinel written {_fmt_age(time.time() - sent_mtime)}. "
+                             f"Reading this log will show output from the wrong run."),
+                     fix=f"rm {log_file}",
+                     chunk=chunk,
+                     ctx={"step": step,
+                          "log_age_s":      round(time.time() - log_mtime),
+                          "sentinel_age_s": round(time.time() - sent_mtime),
+                          "age_diff_s":     round(age_diff_s)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1141,8 +1385,11 @@ def main() -> None:
     _check_checkpoint_continuity(cfg, chunks)
     _check_process_liveness(chunks)
     _check_code_consistency(cfg, chunks)
+    _check_training_anomalies(cfg, chunks)
+    _check_orchestrator_log()
     _check_dispatch_queue()
     _check_ordering_sanity(cfg, chunks)
+    _check_stale_logs(chunks)
 
     # Sort: CRITICAL first, then WARNING, INFO; within each group by chunk
     _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
