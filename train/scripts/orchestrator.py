@@ -865,7 +865,15 @@ class Orchestrator:
         lr_map = training_cfg.get("lr", {})
         lr = lr_map.get(chunk, lr_map.get(str(chunk), 1e-5))
 
-        log_orch(f"Chunk {chunk}: starting training ({steps} steps, lr={lr})", chunk=chunk)
+        # chunk_base_step: sum of all prior chunks' steps.  Passed to the
+        # training script so it can compute the correct end step regardless of
+        # whether it's a fresh chunk start or a mid-chunk crash resume.
+        chunk_base_step = sum(
+            steps_map.get(c, steps_map.get(str(c), 0))
+            for c in range(1, chunk)
+        )
+
+        log_orch(f"Chunk {chunk}: starting training ({steps} steps, lr={lr}, base_step={chunk_base_step})", chunk=chunk)
 
         resume_arg = ""
         # Resume from the latest intermediate checkpoint if one exists.
@@ -901,6 +909,7 @@ class Orchestrator:
             f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
             f"--config '{config_file}' "
             f"--max-steps {steps} --lr {lr} "
+            f"--chunk-base-step {chunk_base_step} "
             f"--data-root '{DATA_ROOT}' "
             f"--chunk {chunk} "
             f"{resume_arg} {hard_arg} {anchor_arg}"

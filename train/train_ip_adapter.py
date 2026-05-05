@@ -753,15 +753,29 @@ def train(config: dict) -> None:
         if loaded_ema is not None:
             print(f"  Loaded EMA from checkpoint")
 
+    # chunk_base_step: the global step at which this chunk's training begins.
+    # Equals sum of all prior chunks' steps.  Passed via --chunk-base-step.
+    # Without it (standalone runs), assume start_step is the base (correct for
+    # chunk-1 where base=0, and for single-chunk standalone training).
+    chunk_base_step: int = config.get("_chunk_base_step", start_step)
+
+    # _end_step: absolute global step at which this run terminates.
+    # Using chunk_base_step + num_steps (not start_step + num_steps) so that
+    # mid-chunk crash resumes stop at the same target as the original launch.
+    _end_step = chunk_base_step + tcfg["num_steps"]
+
     # ── Optimizer with built-in cosine+warmup schedule ────────────────────────
     # MLX schedule object passed directly to AdamW — it advances each step.
-    # start_step fast-forwards the schedule so LR continues from where it left
-    # off rather than restarting warmup.  (plans/ip-adapter-training.md §3.11)
+    # _lr_start fast-forwards the schedule by how many steps into this chunk we
+    # already are, so LR continues from where it left off on resume.
+    # For a cross-chunk warmstart (start_step == chunk_base_step) _lr_start=0
+    # starts the schedule fresh at the chunk's own LR.
+    _lr_start = max(0, start_step - chunk_base_step)
     lr_schedule = make_lr_schedule(
         tcfg["learning_rate"],
         tcfg["warmup_steps"],
         tcfg["num_steps"],
-        start_step=start_step,
+        start_step=_lr_start,
     )
     optimizer = optim.AdamW(
         learning_rate=lr_schedule,
@@ -911,7 +925,8 @@ def train(config: dict) -> None:
         return sum(losses) / len(losses) if losses else None
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    print(f"\nTraining: {tcfg['num_steps']:,} steps, batch_size={dcfg['batch_size']}\n")
+    _steps_this_run = _end_step - start_step
+    print(f"\nTraining: {tcfg['num_steps']:,} steps (steps {start_step:,}→{_end_step:,}), batch_size={dcfg['batch_size']}\n")
 
     step = start_step
     t0 = time.time()
@@ -982,7 +997,7 @@ def train(config: dict) -> None:
     _hb_loader_pct = 0.0     # last known from log block
 
     for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
-        if step >= tcfg["num_steps"]:
+        if step >= _end_step:
             break
 
         # How long the GPU was idle waiting for data (time from end of last eval
@@ -1171,11 +1186,11 @@ def train(config: dict) -> None:
             if len(loss_history) > 20:
                 loss_history.pop(0)
             loss_smooth = sum(loss_history) / len(loss_history)
-            steps_remaining = tcfg["num_steps"] - step
+            steps_remaining = _end_step - step
             eta_s = steps_remaining / steps_per_sec if steps_per_sec > 0 else 0
             eta_h, eta_m = divmod(int(eta_s) // 60, 60)
             print(
-                f"step {step:>7,}/{tcfg['num_steps']:,}"
+                f"step {step:>7,}/{_end_step:,}"
                 f"  loss {loss_scalar:.4f} (avg {loss_smooth:.4f})"
                 f"  lr {lr_now:.2e}"
                 f"  {steps_per_sec:.2f} steps/s"
@@ -1283,7 +1298,7 @@ def train(config: dict) -> None:
                 _write_hb(
                     "trainer", _pipeline_chunk,
                     step=step,
-                    total_steps=tcfg["num_steps"],
+                    total_steps=_end_step,
                     loss=round(loss_scalar, 6),
                     loss_smooth=round(loss_smooth, 6),
                     lr=lr_now,
@@ -1332,12 +1347,12 @@ def train(config: dict) -> None:
                     _write_hb(
                         "trainer", _pipeline_chunk,
                         step=step,
-                        total_steps=tcfg["num_steps"],
+                        total_steps=_end_step,
                         loss=round(_hb_loss, 6),
                         loss_smooth=round(_hb_loss_smooth, 6),
                         lr=float(optimizer.learning_rate),
                         steps_per_sec=round(_hb_sps, 4),
-                        eta_sec=int((tcfg["num_steps"] - step) / _hb_sps) if _hb_sps > 0 else 0,
+                        eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0,
                         elapsed_seconds=int(time.time() - t_start),
                         grad_norm=round(_gn, 4),
                         grad_norm_smooth=round(grad_norm_smooth, 4),
@@ -1359,10 +1374,10 @@ def train(config: dict) -> None:
             try:
                 from pipeline_lib import write_heartbeat as _write_hb
                 _write_hb("trainer", _pipeline_chunk, step=step,
-                           total_steps=tcfg["num_steps"],
+                           total_steps=_end_step,
                            loss=round(_hb_loss, 6),
                            steps_per_sec=round(_hb_sps, 4),
-                           eta_sec=int((tcfg["num_steps"] - step) / _hb_sps) if _hb_sps > 0 else 0)
+                           eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
             except Exception:
                 pass
 
@@ -1938,6 +1953,11 @@ def main():
                         help="Pipeline chunk number (1-4). Used to write the trainer "
                              "heartbeat to the correct pipeline location so the orchestrator "
                              "can monitor liveness and anomalies.")
+    parser.add_argument("--chunk-base-step", type=int, default=None,
+                        help="Absolute global step at which this chunk's training begins "
+                             "(sum of all previous chunks' steps). Used to compute the "
+                             "correct end step and LR schedule fast-forward when resuming "
+                             "from a cross-chunk warmstart checkpoint.")
     parser.add_argument("--data-root", default=None,
                         help="Root directory for shards and precomputed caches. "
                              "Relative paths in the config YAML are prefixed with this value. "
@@ -1988,6 +2008,8 @@ def main():
 
     if args.chunk is not None:
         config["_chunk"] = args.chunk
+    if args.chunk_base_step is not None:
+        config["_chunk_base_step"] = args.chunk_base_step
 
     if args.dry_run:
         print("Config OK:")
