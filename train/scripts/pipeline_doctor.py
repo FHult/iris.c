@@ -513,7 +513,10 @@ def _check_process_liveness(chunks: list[int]) -> None:
                          detail=detail,
                          chunk=chunk, ctx=liveness_ctx)
 
-            elif hb is None and win_running and (step != "train" or active_training_chunk == chunk):
+            elif hb is None and win_running and step == "train" and active_training_chunk == chunk:
+                # Only meaningful for training (window is chunk-dedicated).
+                # For prep steps (mine/validate/precompute) the iris-prep window is shared
+                # across all chunks, so "window alive, no heartbeat" just means queued.
                 _add("WARNING", "liveness",
                      f"Chunk {chunk} {step}: tmux window active but no heartbeat file",
                      detail="Process may have just started, or heartbeat path differs.",
