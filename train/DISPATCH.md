@@ -73,14 +73,19 @@ Training is **chunked** across up to 4 JourneyDB data batches:
 
 **Do this at the start of every new session, in order:**
 
-**Step 1 — Check pipeline state:**
+**Step 1 — Run the doctor (AI-optimised, replaces most manual file reads):**
 ```bash
-PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
-  train/.venv/bin/python train/scripts/pipeline_status.py
+train/.venv/bin/python train/scripts/pipeline_doctor.py --ai
 ```
-This reads `pipeline_state.json`, sentinel files, and heartbeats. It is the authoritative source of truth — do not infer state from logs or checkpoint names.
+Returns a single compact JSON blob with: `summary` (disk, active training step/loss/ETA, prep progress), `top_action` (the single most important thing to do), `issue_counts`, and `issues` with machine-readable context and remediation commands. **Always run this before reading any individual log, heartbeat, or sentinel file.** The doctor cross-checks sentinel claims against actual artifacts and detects phantom completions, 0-step exits, stale hard examples, stale processes, and ordering violations that `pipeline_status.py` cannot see.
 
-**Step 2 — Check tmux:**
+**Step 2 — Check pipeline state (human-readable view):**
+```bash
+train/.venv/bin/python train/scripts/pipeline_status.py
+```
+Complements the doctor: shows the live progress line (step within chunk, loss, ETA, log tail). Use this when you need to read the current training log tail or watch live progress; use the doctor when you need to investigate anomalies or verify that completed steps are genuine.
+
+**Step 3 — Check tmux:**
 ```bash
 tmux list-windows -t iris 2>/dev/null || echo "not running"
 ```
@@ -490,20 +495,26 @@ The orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of contin
 
 ## Decision Flow
 
-**"Is anything running?"**
-→ `pipeline_status.py` + `tmux list-windows -t iris`
+**Starting a new session / anything seems off**
+→ `pipeline_doctor.py --ai` **first**. Read `top_action` and `issues`. Only reach for individual logs, heartbeats, or sentinel files if the doctor output is insufficient for the specific question.
 
-**"Something is running — check progress"**
-→ `pipeline_status.py` (shows active step, heartbeat, loss, ETA)
+**"Is anything running?"**
+→ Doctor `summary.training.hb_age_s` + `summary.prep` + `tmux list-windows -t iris`
+
+**"Something is running — check live progress"**
+→ `pipeline_status.py` (step within chunk, loss, ETA, log tail)
 
 **"Nothing is running — continue where we left off"**
 → Restart orchestrator (it resumes from state automatically)
 
-**"Something looks wrong"**
-→ Check `logs/<step>_chunk1.log` for the failing step; check `pipeline/chunk1/*.error` for error sentinels
+**"Something looks wrong / unexpected state"**
+→ `pipeline_doctor.py --ai`. Do not start reading individual log files or sentinel dirs until the doctor has been run — it cross-checks all of those in one pass and surfaces the root cause directly. Only read raw logs if the doctor `issues` list points to a specific log file for further detail.
+
+**"Training completed but seems suspicious"**
+→ `pipeline_doctor.py --ai` — the doctor checks checkpoint step vs expected end, log length, and whether `--chunk-base-step` was passed. These are the common phantom-completion patterns.
 
 **"Want to free disk space"**
-→ `staging/chunk1/raw/` (deleted automatically after convert); `staging/chunk1/converted/` (safe after shards are built); never delete `hard_examples/`
+→ `staging/chunk{N}/raw/` (deleted automatically after convert); `staging/chunk{N}/converted/` (safe after shards are built); **never delete `hard_examples/`** while the dependent chunk is still training.
 
-**"Training finished chunk 1, start chunk 2"**
-→ Orchestrator starts mining automatically after training completes; then advances to chunk 2 when config specifies multiple chunks
+**"Training finished chunk N, start chunk N+1"**
+→ Orchestrator advances automatically. Before chunk N+1 training starts, run `pipeline_doctor.py --ai` to confirm hard examples are fresh and checkpoint step matches expected end.
