@@ -981,6 +981,15 @@ def train(config: dict) -> None:
     # T-11: gradient clipping events per log window
     _grad_clip_steps = 0
 
+    # T-12: conditioned vs unconditioned loss split (QUALITY-4)
+    # Tracks whether the adapter is actually helping reconstruction.
+    # Healthy: loss_cond drops below loss_null as training progresses.
+    # Flat gap throughout → adapter not learning.
+    _cond_loss_sum = 0.0
+    _cond_loss_count = 0
+    _null_loss_sum = 0.0
+    _null_loss_count = 0
+
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
@@ -1146,6 +1155,14 @@ def train(config: dict) -> None:
         bucket_stats[_bk]["loss_sum"] += _step_loss_val
         bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_bucket_start
 
+        # T-12: conditioned vs unconditioned loss split
+        if null_image:
+            _null_loss_sum += _step_loss_val
+            _null_loss_count += 1
+        else:
+            _cond_loss_sum += _step_loss_val
+            _cond_loss_count += 1
+
         # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
         if step % 500 == 0:
             try:
@@ -1282,13 +1299,60 @@ def train(config: dict) -> None:
                       f"had norm > {tcfg['grad_clip']})", flush=True)
             _grad_clip_steps = 0
 
+            # T-12: conditioned vs unconditioned loss split (QUALITY-4)
+            _loss_cond_avg = round(_cond_loss_sum / _cond_loss_count, 4) if _cond_loss_count > 0 else None
+            _loss_null_avg = round(_null_loss_sum / _null_loss_count, 4) if _null_loss_count > 0 else None
+            if _loss_cond_avg is not None and _loss_null_avg is not None:
+                _cond_gap = _loss_null_avg - _loss_cond_avg
+                _cond_gap_pct = round(100 * _cond_gap / _loss_null_avg, 1) if _loss_null_avg > 0 else 0
+                print(
+                    f"  loss_cond={_loss_cond_avg:.4f}  loss_null={_loss_null_avg:.4f}"
+                    f"  gap={_cond_gap:+.4f} ({_cond_gap_pct:+.1f}%)"
+                    f"  [n={_cond_loss_count}/{_null_loss_count}]",
+                    flush=True,
+                )
+                if _cond_gap_pct < 1.0 and step > 1000:
+                    print("  WARNING: loss_cond ≈ loss_null — adapter may not be learning", flush=True)
+            _cond_loss_sum = _cond_loss_count = 0
+            _null_loss_sum = _null_loss_count = 0
+
+            # T-13: adapter scale magnitudes (QUALITY-5)
+            _scale_all_mean = _scale_double_mean = _scale_single_mean = None
+            try:
+                _scales = adapter.scale.astype(mx.float32).tolist()
+                _scale_double = _scales[:5]
+                _scale_single = _scales[5:]
+                _scale_all_mean   = round(sum(_scales)        / len(_scales),        4)
+                _scale_double_mean = round(sum(_scale_double) / len(_scale_double),  4)
+                _scale_single_mean = round(sum(_scale_single) / len(_scale_single),  4)
+                _scale_min = round(min(_scales), 4)
+                _scale_max = round(max(_scales), 4)
+                print(
+                    f"  ip_scale: mean={_scale_all_mean:.4f}"
+                    f"  double={_scale_double_mean:.4f}  single={_scale_single_mean:.4f}"
+                    f"  range=[{_scale_min:.4f}, {_scale_max:.4f}]",
+                    flush=True,
+                )
+                if _scale_max > 2.0:
+                    print(f"  WARNING: ip_scale max {_scale_max:.2f} > 2.0 — content leakage risk",
+                          flush=True)
+                if _scale_all_mean < 0.05 and step > 500:
+                    print(f"  WARNING: ip_scale mean {_scale_all_mean:.4f} near zero — adapter not active",
+                          flush=True)
+            except Exception:
+                pass
+
             if wandb_run:
                 wandb_run.log(
                     {"loss": loss_scalar, "loss_smooth": loss_smooth,
                      "lr": lr_now, "steps_per_sec": steps_per_sec,
                      "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth,
                      "ema_drift": ema_drift, "siglip_coverage_pct": _siglip_cov,
-                     "loader_wait_pct": _loader_pct},
+                     "loader_wait_pct": _loader_pct,
+                     "loss_cond": _loss_cond_avg, "loss_null": _loss_null_avg,
+                     "ip_scale_mean": _scale_all_mean,
+                     "ip_scale_double": _scale_double_mean,
+                     "ip_scale_single": _scale_single_mean},
                     step=step,
                 )
             # Write machine-readable heartbeat to the pipeline location so the
@@ -1319,6 +1383,11 @@ def train(config: dict) -> None:
                     mem_available_gb=mem_available_gb,
                     mlx_active_gb=mlx_active_gb,
                     mlx_peak_gb=mlx_peak_gb,
+                    loss_cond=_loss_cond_avg,
+                    loss_null=_loss_null_avg,
+                    ip_scale_mean=_scale_all_mean,
+                    ip_scale_double=_scale_double_mean,
+                    ip_scale_single=_scale_single_mean,
                 )
             except Exception:
                 pass

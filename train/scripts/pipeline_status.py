@@ -437,6 +437,24 @@ def print_human(status: dict, verbose: bool = False) -> None:
                         mem_parts.append(f"sys_free={sys_avail:.1f}GB")
                     if mem_parts:
                         print(f"           mem: {' | '.join(mem_parts)}")
+                    # QUALITY-4/5: conditioning quality metrics
+                    loss_cond = hb.get("loss_cond")
+                    loss_null = hb.get("loss_null")
+                    ip_scale  = hb.get("ip_scale_mean")
+                    ip_double = hb.get("ip_scale_double")
+                    ip_single = hb.get("ip_scale_single")
+                    if loss_cond is not None and loss_null is not None:
+                        _gap = loss_null - loss_cond
+                        _gap_pct = 100 * _gap / loss_null if loss_null > 0 else 0
+                        _warn = " !" if _gap_pct < 1.0 else ""
+                        print(f"           cond: loss_cond={loss_cond:.4f}  loss_null={loss_null:.4f}  gap={_gap:+.4f} ({_gap_pct:+.1f}%){_warn}")
+                    if ip_scale is not None:
+                        _scale_parts = [f"ip_scale={ip_scale:.4f}"]
+                        if ip_double is not None:
+                            _scale_parts.append(f"double={ip_double:.4f}")
+                        if ip_single is not None:
+                            _scale_parts.append(f"single={ip_single:.4f}")
+                        print(f"           adapter: {' | '.join(_scale_parts)}")
                 else:
                     done    = hb.get("done", 0)
                     total_n = hb.get("total", 0)

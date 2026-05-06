@@ -758,6 +758,28 @@ def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
                  chunk=chunk,
                  ctx={"step": step, "siglip_pct": siglip_pct, "min_pct": siglip_min})
 
+        # QUALITY-4: adapter conditioning health checks (only after warm-up)
+        loss_cond = hb.get("loss_cond")
+        loss_null = hb.get("loss_null")
+        ip_scale  = hb.get("ip_scale_mean")
+        if step > 1000 and loss_cond is not None and loss_null is not None and loss_null > 0:
+            _gap_pct = 100 * (loss_null - loss_cond) / loss_null
+            if _gap_pct < 1.0:
+                _add("WARNING", "anomaly",
+                     f"Chunk {chunk}: IP adapter not learning — loss_cond ≈ loss_null at step {step:,}",
+                     detail=(f"loss_cond={loss_cond:.4f} loss_null={loss_null:.4f} gap={_gap_pct:+.1f}%. "
+                             f"Adapter is not improving conditioned reconstruction vs unconditioned baseline. "
+                             f"Check adapter.scale values and learning rate."),
+                     chunk=chunk,
+                     ctx={"step": step, "loss_cond": loss_cond, "loss_null": loss_null,
+                          "gap_pct": round(_gap_pct, 2)})
+        if step > 500 and ip_scale is not None and ip_scale < 0.05:
+            _add("WARNING", "anomaly",
+                 f"Chunk {chunk}: IP adapter scales near zero (mean={ip_scale:.4f}) at step {step:,}",
+                 detail="Adapter scale weights have collapsed — IP conditioning has no effect on output.",
+                 chunk=chunk,
+                 ctx={"step": step, "ip_scale_mean": ip_scale})
+
         loader_wait = hb.get("loader_wait_pct")
         if loader_wait is not None and loader_wait > 20.0:
             sev = "WARNING" if loader_wait > 40.0 else "INFO"
@@ -1286,6 +1308,11 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
             "eta_h": round(active_hb["eta_sec"] / 3600, 2) if active_hb.get("eta_sec") else None,
             "steps_per_sec": active_hb.get("steps_per_sec"),
             "siglip_coverage_pct": active_hb.get("siglip_coverage_pct"),
+            "loss_cond": active_hb.get("loss_cond"),
+            "loss_null": active_hb.get("loss_null"),
+            "ip_scale_mean": active_hb.get("ip_scale_mean"),
+            "ip_scale_double": active_hb.get("ip_scale_double"),
+            "ip_scale_single": active_hb.get("ip_scale_single"),
             "hb_age_s": round(best_age) if best_age < float("inf") else None,
         }
 
