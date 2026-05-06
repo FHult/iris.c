@@ -1,742 +1,447 @@
-# FLUX.2-klein Pure C Implementation
+# iris.c — Pure C Image Synthesis Engine
 
-This program generates images from text prompts (and optionally from other images) using the [FLUX.2-klein models](https://bfl.ai/models/flux-2-klein) from [Black Forest Labs](https://bfl.ai/). It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
+**iris.c** is a self-contained C implementation of two image synthesis model families, with zero Python or CUDA dependencies at inference time:
 
-Supported models:
+- **Flux.2 Klein** (4B and 9B) — Black Forest Labs' rectified-flow diffusion transformer
+- **Z-Image-Turbo** (6B) — Tongyi-MAI's S3-DiT distilled model
 
-- **Flux.2 Klein 4B distilled** (4 steps, auto guidance set to 1, very fast).
-- **Flux.2 Klein 4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
-- **Flux.2 Klein 9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
-- **Flux.2 Klein 9B base** (50 steps, CFG, highest quality. Non-commercial license).
+Three integrated components:
 
-## Quick Start
+| Component | Description |
+|-----------|-------------|
+| `iris` binary | CLI inference: text-to-image, img2img, interactive REPL |
+| `web/` | Flask web UI with generation history, queuing, LoRA support |
+| `train/` | MLX-based IP-Adapter training pipeline (Apple Silicon) |
+
+---
+
+## Quick Start — Inference
 
 ```bash
-# Build (choose your backend)
-make mps       # Apple Silicon (fastest)
-# or: make blas    # Intel Mac / Linux with OpenBLAS
-# or: make generic # Pure C, no dependencies
+# Build (Apple Silicon recommended)
+make mps        # Apple Silicon GPU — fastest
+make blas       # Intel Mac or Linux with OpenBLAS
+make generic    # Pure C, no dependencies — slowest
 
-# Download the model (~16GB) - pick one:
-./download_model.sh 4b                   # using curl
-# or: pip install huggingface_hub && python download_model.py 4b
+# Download model (~16 GB)
+./download_model.sh 4b
 
 # Generate an image
-./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o output.png
+./iris -d flux-klein-4b -p "a cat sitting on a windowsill" -o cat.png
 ```
 
-If you want to try the base model, instead of the distilled one (much slower, higher quality), use the following instructions. Use 10 steps if your computer is quite slow, instead of the default of 50, it will still work well enough to test it (10 seconds to generate a 256x256 image on a MacBook M3 Max).
-```
-./download_model.sh 4b-base
-# or: pip install huggingface_hub && python download_model.py 4b-base
-./flux -d flux-klein-4b-base -p "A woman wearing sunglasses" -o output.png
-```
+No Python, no CUDA, no virtual environment required.
 
-If you want to try the 9B model (higher quality, non-commercial license, ~30GB download):
-```bash
-# 9B is a gated model - you need a HuggingFace token
-# 1. Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
-# 2. Get your token from https://huggingface.co/settings/tokens
-./download_model.sh 9b --token YOUR_TOKEN
-# or: python download_model.py 9b --token YOUR_TOKEN
-# or: set HF_TOKEN env var
-./flux -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
-```
+---
 
-That's it. No Python runtime or CUDA toolkit required at inference time.
+## Supported Models
 
-## Example Output
+| Model | Flag | Steps | Speed | License |
+|-------|------|-------|-------|---------|
+| Flux.2 Klein 4B distilled | `flux-klein-4b` | 4 | ~7.6s @ 512² on M3 Max | MIT |
+| Flux.2 Klein 4B base | `flux-klein-4b-base` | 50 | ~25× slower | MIT |
+| Flux.2 Klein 9B distilled | `flux-klein-9b` | 4 | higher quality | Non-commercial |
+| Flux.2 Klein 9B base | `flux-klein-9b-base` | 50 | highest quality | Non-commercial |
+| Z-Image-Turbo 6B | `zimage-turbo` | 9 | 8 NFE | Apache 2.0 |
 
-![Woman with sunglasses](images/woman_with_sunglasses.png)
+Architecture is autodetected from each model's config files. No hardcoded dimensions.
 
-*Generated with: `./flux -d flux-klein-4b -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
+---
 
-### Image-to-Image Example
-
-![antirez to drawing](images/antirez_to_drawing.png)
-
-*Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-4b`*
-
-## Features
-
-- **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
-- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
-- **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
-- **Text-to-image**: Generate images from text prompts
-- **Image-to-image**: Transform existing images guided by prompts
-- **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
-- **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model), no external embedding computation needed
-- **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
-- **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
-- **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256×256, then render at 512×512 with the same seed
-- **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, iTerm2, WezTerm, or Konsole).
-
-### Terminal Image Display
-
-![Kitty protocol example](images/kitty-example.png)
-
-Display generated images directly in your terminal with `--show`, or watch the denoising process step-by-step with `--show-steps`:
+## Building
 
 ```bash
-# Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)
-./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show
+make            # show available backends
+make mps        # macOS Apple Silicon (Metal GPU) — recommended
+make blas       # BLAS/Accelerate acceleration
+make generic    # pure C fallback
 
-# Display each denoising step (slower, but interesting to watch)
-./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show-steps
+make test       # run test suite
+make test-quick # quick 64×64 sanity check
+make clean
 ```
 
-Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), the iTerm2 inline image protocol ([iTerm2](https://iterm2.com/), [WezTerm](https://wezfurlong.org/wezterm/)), or [Konsole](https://konsole.kde.org/). Terminal type is auto-detected from environment variables.
+**Linux OpenBLAS:**
+```bash
+sudo apt install libopenblas-dev   # Ubuntu/Debian
+sudo dnf install openblas-devel    # Fedora
+make blas
+```
 
-Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1 for non-HiDPI screens).
+---
 
-## Usage
+## Inference CLI
 
 ### Text-to-Image
 
 ```bash
-./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" -o cat.png
+./iris -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" -o cat.png
+./iris -d zimage-turbo  -p "a fish" -o fish.png
 ```
 
 ### Image-to-Image
 
-Transform an existing image based on a prompt:
+Flux uses in-context conditioning: the reference image is passed as extra tokens rather than added as noise. The model attends to both the reference and the prompt simultaneously.
 
 ```bash
-./flux -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
+./iris -d flux-klein-4b -p "oil painting, impressionist style" -i photo.png -o painting.png
 ```
 
-FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike traditional approaches that add noise to the input image, FLUX.2 passes the reference image as additional tokens that the model can attend to during generation. This means:
+### Multi-Reference
 
-- The model "sees" your input image and uses it as a reference
-- The prompt describes what you want the output to look like
-- Results tend to preserve the composition while applying the described transformation
-
-**Tips for good results:**
-- Use descriptive prompts that describe the desired output, not instructions
-- Good: `"oil painting of a woman with sunglasses, impressionist style"`
-- Less good: `"make it an oil painting"` (instructional prompts may work less well)
-
-**Super Resolution:** Since the reference image can be a different size than the output, you can use img2img for upscaling:
+Combine elements from multiple images. Each reference gets a distinct T-offset in the RoPE position encoding so the model can attend to them independently:
 
 ```bash
-./flux -d flux-klein-4b -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
+./iris -d flux-klein-4b -i car.png -i beach.png -p "a sports car on the beach" -o result.png
 ```
 
-The model will generate a higher-resolution version while preserving the composition and details of the input.
-
-### Multi-Reference Generation
-
-Combine elements from multiple reference images:
+### Interactive REPL
 
 ```bash
-./flux -d flux-klein-4b -i car.png -i beach.png -p "a sports car on the beach" -o result.png
+./iris -d flux-klein-4b
 ```
 
-Each reference image is encoded separately and passed to the transformer with different positional embeddings (T=10, T=20, T=30, ...). The model attends to all references during generation, allowing it to combine elements from each.
+```
+iris> a red sports car
+Done -> /tmp/.../image-0001.png  (ref $0)
+iris> 512x512 $0 oil painting version
+Done -> /tmp/.../image-0002.png  (ref $1)
+iris> $0 $1 combine them
+Done -> /tmp/.../image-0003.png
+```
 
-**Example:**
-- Reference 1: A red sports car
-- Reference 2: A tropical beach with palm trees
-- Prompt: "combine the two images"
-- Result: A red sports car on a tropical beach
+Syntax: `[WxH] [$ref ...] prompt` — size and references are optional inline prefixes.
 
-You can specify up to 16 reference images with multiple `-i` flags. The prompt guides how the references are combined.
+Commands: `!help` `!save` `!load` `!seed` `!size` `!steps` `!guidance` `!linear` `!power` `!explore` `!show` `!quit`
 
-### Interactive CLI Mode
-
-Start without `-p` to enter interactive mode:
+### Terminal Image Display
 
 ```bash
-./flux -d flux-klein-4b
+./iris -d flux-klein-4b -p "a robot" -o robot.png --show        # show final image
+./iris -d flux-klein-4b -p "a robot" -o robot.png --show-steps  # watch denoising
 ```
 
-Generate images by typing prompts. Each image gets a `$N` reference ID:
+Supported protocols: Kitty, Ghostty, iTerm2, WezTerm, Konsole. Auto-detected from `$TERM` / `$TERM_PROGRAM`.
+
+### Key Options
 
 ```
-flux> a red sports car
-Done -> /tmp/flux-.../image-0001.png (ref $0)
-
-flux> a tropical beach
-Done -> /tmp/flux-.../image-0002.png (ref $1)
-
-flux> $0 $1 combine them
-Generating 256x256 (multi-ref, 2 images)...
-Done -> /tmp/flux-.../image-0003.png (ref $2)
+-d PATH     Model directory
+-p TEXT     Prompt
+-o PATH     Output (.png or .ppm)
+-i PATH     Reference image (repeatable for multi-ref)
+-W / -H N   Width / height in pixels (multiples of 16, max 1792)
+-s N        Steps (default: auto — 4 distilled, 50 base, 9 Z-Image)
+-S N        Seed (-1 for random; seed always printed to stderr)
+-g N        CFG guidance (default: auto — 1.0 distilled, 4.0 base, 0.0 Z-Image)
+--linear    Linear timestep schedule (base model experimentation)
+--power     Power-curve schedule; --power-alpha N sets exponent (default 2.0)
+--no-mmap   Load all weights upfront (faster on BLAS, more RAM)
+--show      Display in terminal
+-v          Verbose timing output
 ```
 
-**Prompt syntax:**
-- `prompt` - text-to-image
-- `512x512 prompt` - set size inline
-- `$ prompt` - img2img with last image
-- `$N prompt` - img2img with reference $N
-- `$0 $3 prompt` - multi-reference (combine images)
+### Memory
 
-**Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!guidance`, `!linear`, `!power`, `!explore`, `!show`, `!quit`
+Memory-mapped weights (default) reduce peak from ~16 GB to ~4–5 GB for the 4B model, making inference possible on 8 GB systems. MPS mode uses zero-copy pointers into the mapped region — mmap is fastest on Apple Silicon. BLAS users with 32+ GB may prefer `--no-mmap` to avoid per-step bf16→f32 conversion.
 
-### Command Line Options
+| Model | Peak with mmap | Peak without mmap |
+|-------|---------------|-------------------|
+| 4B | ~4–5 GB | ~16 GB |
+| 9B | ~8–10 GB | ~32 GB |
 
-**Required:**
-```
--d, --dir PATH        Path to model directory
--p, --prompt TEXT     Text prompt for generation
--o, --output PATH     Output image path (.png or .ppm)
-```
+### PNG Metadata
 
-**Generation options:**
-```
--W, --width N         Output width in pixels (default: 256)
--H, --height N        Output height in pixels (default: 256)
--s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)
--S, --seed N          Random seed for reproducibility
--g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)
-    --linear          Use linear timestep schedule (see below)
-    --power           Use power curve timestep schedule (see below)
-    --power-alpha N   Set power schedule exponent (default: 2.0)
-    --base            Force base model mode (undistilled, CFG enabled)
-```
-
-**Image-to-image options:**
-```
--i, --input PATH      Reference image (can be specified multiple times)
-```
-
-**Output options:**
-```
--q, --quiet           Silent mode, no output
--v, --verbose         Show detailed config and timing info
-    --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)
-    --show-steps      Display each denoising step (slower)
-    --zoom N          Terminal image zoom factor (default: 2 for Retina)
-```
-
-**Other options:**
-```
--m, --mmap            Memory-mapped weights (default, fastest on MPS)
-    --no-mmap         Disable mmap, load all weights upfront
-    --no-license-info Suppress non-commercial license warning (9B model)
--e, --embeddings PATH Load pre-computed text embeddings (advanced)
--h, --help            Show help
-```
-
-## Reproducibility
-
-The seed is always printed to stderr, even when random:
-```
-$ ./flux -d flux-klein-4b -p "a landscape" -o out.png
-Seed: 1705612345
-...
-Saving... out.png 256x256 (0.1s)
-```
-
-To reproduce the same image, use the printed seed:
-```
-$ ./flux -d flux-klein-4b -p "a landscape" -o out.png -S 1705612345
-```
-
-## PNG Metadata
-
-Generated PNG images include metadata with the seed and model information, so you can always recover the seed even if you didn't save the terminal output:
+Generated PNGs embed `flux:seed` and `flux:model` in the metadata, so the seed is always recoverable:
 
 ```bash
-# Using exiftool
 exiftool image.png | grep flux
-
-# Using Python/PIL
 python3 -c "from PIL import Image; print(Image.open('image.png').info)"
-
-# Using ImageMagick
-identify -verbose image.png | grep -A1 "Properties:"
 ```
 
-The following metadata fields are stored:
-- `flux:seed` - The random seed used for generation
-- `flux:model` - The model name (e.g., FLUX.2-klein-4B, FLUX.2-klein-9B)
-- `Software` - Program identifier
+---
 
-## Building
+## Performance
 
-Choose a backend when building:
+Benchmarks on M3 Max (128 GB), Flux 4B distilled, 4 steps, including model load, no warmup:
+
+| Resolution | iris (MPS) | PyTorch (MPS) |
+|------------|-----------|---------------|
+| 256×256 | 5.2 s | 11 s |
+| 512×512 | 7.6 s | 13 s |
+| 1024×1024 | 19 s | 25 s |
+
+Community benchmarks (512×512, Flux 4B distilled):
+
+| Hardware | Backend | Time |
+|----------|---------|------|
+| M3 Ultra | MPS | 4.5 s |
+| M3 Max | MPS | 7.6 s |
+| M4 MacBook Pro | MPS | 19 s |
+| M1 Max MacBook Pro | MPS | 39.9 s |
+| AMD Ryzen 7800X3D | BLAS | 47.8 s |
+| Intel i5-1135G7 | BLAS | 218 s |
+
+---
+
+## Web UI
+
+A Flask-based web interface wrapping the `iris` binary in persistent server mode:
 
 ```bash
-make            # Show available backends
-make generic    # Pure C, no dependencies (slow)
-make blas       # BLAS acceleration (~30x faster)
-make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+pip install flask
+python web/server.py --model-dir flux-klein-4b
+# → http://localhost:5000
 ```
 
-**Recommended:**
-- macOS Apple Silicon: `make mps`
-- macOS Intel: `make blas`
-- Linux with OpenBLAS: `make blas`
-- Linux without OpenBLAS: `make generic`
+Features:
+- Generation queue with SSE progress streaming
+- Full parameter controls (steps, guidance, schedule, size, seed)
+- Style presets and prompt templates
+- Image-to-image and multi-reference generation
+- LoRA loading and scale control
+- Generation history with search and filtering
+- Lightbox with metadata overlay, download, delete
+- Side-by-side comparison view
+- Variation grid
+- Dark/light theme
+- Model switching and download from UI
 
-For `make blas` on Linux, install OpenBLAS first:
-```bash
-# Ubuntu/Debian
-sudo apt install libopenblas-dev
-
-# Fedora
-sudo dnf install openblas-devel
+```
+web/server.py          Flask server + IrisServer process manager
+web/static/            Frontend (vanilla JS, no framework)
 ```
 
-Other targets:
-```bash
-make clean      # Clean build artifacts
-make info       # Show available backends for this platform
-```
+---
 
-## Testing
+## IP-Adapter Training Pipeline
 
-Run the test suite to verify your build produces correct output:
+Train a style-reference IP-Adapter on top of Flux Klein 4B using MLX on Apple Silicon. The adapter adds `--sref`-style visual conditioning: given a reference image, the model generates images matching its style.
 
-```bash
-make test        # Run all 3 tests
-make test-quick  # Run only the quick 64x64 test
-```
-
-The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).
-
-**Test cases:**
-| Test | Size | Steps | Purpose |
-|------|------|-------|---------|
-| Quick | 64×64 | 2 | Fast txt2img sanity check |
-| Full | 512×512 | 4 | Validates txt2img at larger resolution |
-| img2img | 256×256 | 4 | Validates image-to-image transformation |
-
-You can also run the test script directly for more options:
-```bash
-python3 run_test.py --help
-python3 run_test.py --quick          # Quick test only
-python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
-```
-
-## Model Download
-
-Download model weights from HuggingFace using one of these methods:
-
-**4B Distilled model** (~16GB, fast 4-step inference):
-```bash
-./download_model.sh 4b                   # using curl
-# or: python download_model.py 4b        # using huggingface_hub
-```
-
-**4B Base model** (~16GB, 50-step inference with CFG, higher quality):
-```bash
-./download_model.sh 4b-base
-# or: python download_model.py 4b-base
-```
-
-**9B models** (~30GB, higher quality, non-commercial license):
-```bash
-# 9B models are gated - require HuggingFace authentication
-# 1. Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
-# 2. Get a token from https://huggingface.co/settings/tokens
-./download_model.sh 9b --token YOUR_TOKEN       # distilled
-./download_model.sh 9b-base --token YOUR_TOKEN   # base (CFG, highest quality)
-# or: python download_model.py 9b --token YOUR_TOKEN
-# You can also set the HF_TOKEN environment variable
-```
-
-| Model | Directory | Size | Components |
-|-------|-----------|------|------------|
-| 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
-| 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
-| 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
-| 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
-
-## How Fast Is It?
-
-Benchmarks on **Apple M3 Max** (128GB RAM), distilled model (4 steps).
-
-The MPS implementation is faster than the PyTorch optimized pipeline at all resolutions.
-
-| Size | C (MPS) | PyTorch (MPS) |
-|------|---------|---------------|
-| 256x256 | 5.2s | 11s |
-| 512x512 | 7.6s | 13s |
-| 1024x1024 | 19s | 25s |
-
-**Notes:**
-- All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
-- The base model is roughly 25x slower (50 steps × 2 passes per step vs 4 steps × 1 pass). It actually produces acceptable results even with 10 steps, so you can tune quality/time. The 25x figure is not exactly accurate because it only covers the denoising steps: text encoding and VAE use the same time for both the models, however such steps are a minor percentage of the generation time.
-- The C BLAS backend (CPU) is not shown.
-- The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
-- The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
-
-### Community Benchmarks
-
-The following timings for 512x512 generation (distilled model, 4 steps) were reported by users of Flux2.c. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
-
-| Hardware | Backend | 512x512 |
-|----------|---------|---------|
-| M3 Ultra | MPS | 4.5s |
-| M3 Max | MPS | 7.6s |
-| MacBook Pro M4 | MPS | 19s |
-| MacBook Pro M1 Max | MPS | 39.9s |
-| Apple M1 Pro | MPS | 42.4s |
-| AMD Ryzen 7800X3D | BLAS | 47.8s |
-| Intel i5-1135G7 | BLAS | 218s |
-
-## Resolution Limits
-
-**Maximum resolution**: 1792x1792 pixels. The model produces good results up to this size; beyond this resolution image quality degrades significantly (this is a model limitation, not an implementation issue).
-
-**Minimum resolution**: 64x64 pixels.
-
-Dimensions should be multiples of 16 (the VAE downsampling factor).
-
-## Model Architecture
-
-All models share the same rectified flow transformer architecture, differing only in dimensions:
-
-| Component | 4B | 9B |
-|-----------|-----|-----|
-| Transformer hidden | 3072 | 4096 |
-| Attention heads | 24 | 32 |
-| Head dim | 128 | 128 |
-| Double blocks | 5 | 8 |
-| Single blocks | 20 | 24 |
-| Text Encoder | Qwen3-4B (2560 hidden, 36 layers) | Qwen3-8B (4096 hidden, 36 layers) |
-| VAE | AutoencoderKL, 128 latent channels, 8x spatial compression | Same |
-
-Architecture dimensions are read automatically from the model's config JSON files at load time.
-
-The distilled and base variants differ in inference:
-
-| | Distilled | Base |
-|---|-----------|------|
-| Steps | 4 | 50 (default) |
-| CFG guidance | 1.0 (none) | 4.0 (default) |
-| Passes per step | 1 | 2 (conditioned + unconditioned) |
-
-The model type (distilled vs base, 4B vs 9B) is autodetected from the model directory. Use `--base` to force base model mode if autodetection fails.
-
-**Classifier-Free Guidance (CFG)**: The base model runs the transformer twice per step — once with an empty prompt (unconditioned) and once with the real prompt (conditioned). The final velocity is `v = v_uncond + guidance * (v_cond - v_uncond)`. This makes each step ~2x slower than the distilled model, and the base model needs ~12x more steps, making it roughly 25x slower overall.
-
-## Timestep Schedule
-
-By default, denoising uses a **shifted sigmoid** timestep schedule (matching the official BFL implementation). This schedule concentrates most steps in the high-noise regime and rushes through the detail-forming region near t=0. For the 4 steps distilled model, this is definitely the way to go, and changing scheduler will produce proor results.
-
-### Linear scheduling
-
-However, for the base model, the shifted sigmoid shceduler may look extremely unbalanced — for example at 10 steps, the first 5 steps cover only 12% of the denoising trajectory while the last 5 steps cover 88%. Still, the base model works well with this scheduler, but after some testing I decided to add the `--linear` flag in order to switch to a uniform timestep schedule, where each step covers an equal portion of the trajectory. This sometimes produces better results with the **base model**, at least more realistic looking results, especially at reduced step count (10 steps, for instance, which is 1/5 of execution time compared to the default 50 steps), since the linear schedule avoids the huge final steps that the shifted sigmoid creates, and this alters the generation in a significant way, often in interesting ways.
-
-### Power curve scheduler
-
-The `--power` flag provides a middle ground: a power curve schedule (`t = 1 - (i/n)^α`) that is denser at the start and sparser at the end, but less extreme than the shifted sigmoid. The default exponent is 2.0 (quadratic); use `--power-alpha` to adjust it (1.0 = linear, higher = more front-loaded).
+### Prerequisites
 
 ```bash
-# Base model with 10 steps and linear schedule
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --linear
-
-# Base model with power schedule (quadratic by default)
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power
-
-# Power schedule with custom exponent
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power-alpha 1.5
+# Python 3.11+, Apple Silicon Mac (M1 or later)
+cd train && python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-In interactive CLI mode, toggle with `!linear` or `!power [alpha]`.
+Model weights (`flux-klein-model`) must be present at the repo root (symlink or download).
 
-**Note**: for the distilled model (4 steps), the shifted sigmoid schedule is part of the distillation training, so alternative schedules are not recommended.
-
-If you have a terminal supporting the iTerm2 or Kitty terminal graphics protocols, it is strongly suggested to test the different schedulers with --show and --show-steps options. It is quite an experience to see the denoising process happening in different ways.
-
-## Memory Requirements
-
-### 4B model
-
-With mmap (default):
-
-| Phase | Memory |
-|-------|--------|
-| Text encoding | ~2GB (layers loaded on-demand) |
-| Diffusion | ~1-2GB (blocks loaded on-demand) |
-| Peak | ~4-5GB |
-
-With `--no-mmap` (all weights in RAM):
-
-| Phase | Memory |
-|-------|--------|
-| Text encoding | ~8GB (encoder weights) |
-| Diffusion | ~8GB (transformer ~4GB + VAE ~300MB + activations) |
-| Peak | ~16GB (if encoder not released) |
-
-### 9B model
-
-With mmap (default):
-
-| Phase | Memory |
-|-------|--------|
-| Text encoding | ~3-4GB (larger layers loaded on-demand) |
-| Diffusion | ~2-3GB (more/larger blocks loaded on-demand) |
-| Peak | ~8-10GB |
-
-With `--no-mmap` (all weights in RAM):
-
-| Phase | Memory |
-|-------|--------|
-| Text encoding | ~15GB (Qwen3-8B encoder weights) |
-| Diffusion | ~17GB (transformer ~17GB + VAE ~300MB + activations) |
-| Peak | ~32GB (if encoder not released) |
-
-The text encoder is automatically released after encoding, reducing peak memory during diffusion. If you generate multiple images with different prompts, the encoder reloads automatically.
-
-## Memory-Mapped Weights (Default)
-
-Memory-mapped weight loading is enabled by default. Use `--no-mmap` to disable and load all weights upfront.
+### First Run — Setup Wizard
 
 ```bash
-./flux -d flux-klein-4b -p "A cat" -o cat.png           # mmap (default)
-./flux -d flux-klein-4b -p "A cat" -o cat.png --no-mmap # load all upfront
+train/.venv/bin/python train/scripts/pipeline_setup.py
 ```
 
-**How it works:** Instead of loading all model weights into RAM upfront, mmap keeps the safetensors files memory-mapped and loads weights on-demand:
+Interactive wizard that:
+1. Presents all run scales with time/disk estimates
+2. Reviews quality feature settings
+3. Validates prerequisites (disk, tmux, model, venv)
+4. Creates required directories
+5. Generates a pipeline config
+6. Outputs exact start/status/stop commands
 
-- **Text encoder (Qwen3):** Each of the 36 transformer layers (~400MB each) is loaded, processed, and immediately freed. Only ~2GB stays resident instead of ~8GB.
-- **Denoising transformer:** Each of the 5 double-blocks (~300MB) and 20 single-blocks (~150MB) is loaded on-demand and freed after use. Only ~200MB of shared weights stays resident instead of ~4GB.
+**For automation** (Claude Code / DISPATCH):
+```bash
+train/.venv/bin/python train/scripts/pipeline_setup.py --ai --scale small
+```
+Returns a JSON blob with `ready`, `checks`, `dirs`, `existing_state`, and `commands`.
 
-This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB RAM systems where the Python ML stack cannot run FLUX.2 at all.
+### Run Scales
 
-**Performance varies by backend:**
+| Scale | Chunks | Steps | Disk | Time | Purpose |
+|-------|--------|-------|------|------|---------|
+| `dev` | 1 | 200 | ~15 GB | ~2 h | iris.c binary integration testing — no quality features |
+| `smoke` | 1 | 100 | ~40 GB | ~6 h | Full-pipeline validation — all quality features |
+| `small` | 4 | 95 K total | ~250 GB | ~3–4 days | First quality checkpoint |
+| `medium` | 4 | 225 K total | ~600 GB | ~10–14 days | Production quality |
+| `large` | 4 | 380 K total | ~1.2 TB | ~3–5 weeks | High quality |
+| `all-in` | 4 | 1.14 M total | ~2.2 TB | ~2–3 months | Maximum quality |
 
-- **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
+### Starting the Pipeline
 
-- **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16→f32 on every step (25 blocks × 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
+After running the setup wizard:
 
-- **Generic (pure C):** Same tradeoffs as BLAS, but slower overall.
+```bash
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator \
+  --config train/configs/v2_pipeline_active.yaml
+```
+
+### Pipeline Steps (per chunk)
+
+```
+download → convert → filter_shards → clip_embed → clip_index → clip_dups
+→ build_shards → precompute → promoted → validate_shards
+→ train → mine → validate
+```
+
+Each step writes a sentinel file under `{DATA_ROOT}/pipeline/chunk{N}/{step}.done`. The orchestrator is fully resumable — kill and restart at any time.
+
+### Quality Features
+
+| Feature | Config key | What it does |
+|---------|-----------|--------------|
+| SigLIP conditioning | `training.siglip: true` | Precomputes 384×384 SigLIP features for visual conditioning during training and mining. ~120 GB per run. |
+| Hard-example mining | `training.mine: true` | Evaluates per-sample loss after each chunk, extracts the hardest records for replay in later chunks. |
+| EMA checkpoint | `training.mine_use_ema: true` | Uses EMA weights for mining loss evaluation — more stable than raw checkpoint. |
+| CLIP dedup | `skip_dedup: false` | Removes near-duplicate images (cosine > 0.95) before training. |
+| Anchor shard mixing | auto-populated after chunk 1 | 20% of each batch uses chunk 1 shards to prevent forgetting. |
+
+`smoke` through `all-in` scales run with all quality features enabled. `dev` disables all of them for fastest turnaround.
+
+### Monitoring and Control
+
+```bash
+# Check status + doctor summary
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/pipeline_ctl.py status
+
+# Machine-readable JSON for AI/DISPATCH
+train/.venv/bin/python train/scripts/pipeline_doctor.py --ai
+
+# Pause / resume / abort
+train/.venv/bin/python train/scripts/pipeline_ctl.py pause
+train/.venv/bin/python train/scripts/pipeline_ctl.py resume
+train/.venv/bin/python train/scripts/pipeline_ctl.py abort
+
+# Restart from a specific chunk (restores archived checkpoint)
+train/.venv/bin/python train/scripts/pipeline_ctl.py restart-from-chunk 2
+```
+
+### Pipeline Script Reference
+
+| Script | Role |
+|--------|------|
+| `pipeline_setup.py` | First-run wizard: validates environment, creates dirs, generates config |
+| `orchestrator.py` | State machine driving all pipeline steps end-to-end |
+| `pipeline_ctl.py` | Operator interface: pause / resume / abort / retry / status |
+| `pipeline_doctor.py` | Deep diagnostic: cross-checks sentinels vs. actual artifacts and logs |
+| `pipeline_status.py` | Live progress view: step, loss, ETA, log tails |
+| `pipeline_lib.py` | Shared primitives: state I/O, sentinels, heartbeats, tmux helpers |
+| `precompute_all.py` | Single-pass Qwen3 + VAE + SigLIP precompute with restart-safe progress |
+| `mine_hard_examples.py` | Loss-ranked hard example extraction |
+| `clip_dedup.py` | CLIP embedding + FAISS deduplication |
+| `validate_shards.py` | Shard integrity scan before training |
+| `validator.py` | Post-chunk validation: weight check + CLIP-I scoring |
+| `download_convert.py` | JourneyDB tgz download + image extraction |
+| `build_shards.py` | WebDataset shard assembly |
+
+Operational reference: `train/DISPATCH.md`
+
+---
 
 ## C Library API
 
-The library can be integrated into your own C/C++ projects. Link against `libflux.a` and include `flux.h`.
-
-### Text-to-Image Generation
-
-Here's a complete program that generates an image from a text prompt:
+Link against `libflux.a` and `#include "iris.h"` to use iris.c as a library:
 
 ```c
-#include "flux.h"
-#include <stdio.h>
+iris_ctx *ctx = iris_load_dir("flux-klein-4b");
 
-int main(void) {
-    /* Load the model. This loads VAE, transformer, and text encoder. */
-    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
-    if (!ctx) {
-        fprintf(stderr, "Failed to load model: %s\n", flux_get_error());
-        return 1;
-    }
+iris_params params = IRIS_PARAMS_DEFAULT;
+params.width  = 512;
+params.height = 512;
+params.seed   = 42;
 
-    /* Configure generation parameters. Start with defaults and customize. */
-    flux_params params = FLUX_PARAMS_DEFAULT;
-    params.width = 512;
-    params.height = 512;
-    params.seed = 42;  /* Use -1 for random seed */
+iris_image *img = iris_generate(ctx, "a fluffy cat", &params);
+iris_image_save(img, "cat.png");
 
-    /* Generate the image. This handles text encoding, diffusion, and VAE decode. */
-    flux_image *img = flux_generate(ctx, "A fluffy orange cat in a sunbeam", &params);
-    if (!img) {
-        fprintf(stderr, "Generation failed: %s\n", flux_get_error());
-        flux_free(ctx);
-        return 1;
-    }
-
-    /* Save to file. Format is determined by extension (.png or .ppm). */
-    flux_image_save(img, "cat.png");
-    printf("Saved cat.png (%dx%d)\n", img->width, img->height);
-
-    /* Clean up */
-    flux_image_free(img);
-    flux_free(ctx);
-    return 0;
-}
+iris_image_free(img);
+iris_free(ctx);
 ```
 
-Compile with:
+Key functions: `iris_load_dir`, `iris_free`, `iris_generate`, `iris_img2img`, `iris_image_load`, `iris_image_save`, `iris_image_free`, `iris_set_seed`, `iris_get_error`, `iris_is_distilled`, `iris_is_zimage`.
+
+---
+
+## Source Layout
+
+```
+iris.c / iris.h                  Main library — model loading, generation routing
+iris_transformer_flux.c          Flux MMDiT double/single block forward pass
+iris_transformer_zimage.c        Z-Image S3-DiT forward pass (noise/context refiners + main layers)
+iris_sample.c                    Euler ODE denoising loop, timestep schedules
+iris_qwen3.c / iris_qwen3_tokenizer.c  Qwen3 text encoder + BPE tokenizer
+iris_vae.c                       VAE encoder / decoder
+iris_kernels.c                   CPU kernels: softmax, RMSNorm, GELU, ROPE
+iris_metal.m / iris_metal.h      Metal GPU runtime: command buffers, weight cache, buffer pools
+iris_shaders.metal               All custom Metal compute kernels
+iris_safetensors.c               Safetensors weight loader
+iris_image.c / png.c / jpeg.c    Image I/O: PNG, JPEG, PPM
+iris_lora.c                      LoRA weight loading and application
+embcache.c                       4-bit quantized embedding cache
+iris_cli.c                       Interactive REPL
+main.c                           CLI entry point
+web/                             Flask web UI
+train/                           IP-Adapter training pipeline (MLX, Apple Silicon)
+  train_ip_adapter.py            Training loop
+  ip_adapter/                    Adapter model, loss, EMA, dataset loader
+  scripts/                       Pipeline orchestration scripts
+  configs/                       Pipeline and training configs
+```
+
+---
+
+## Model Download
+
 ```bash
-gcc -o myapp myapp.c -L. -lflux -lm -framework Accelerate  # macOS
-gcc -o myapp myapp.c -L. -lflux -lm -lopenblas              # Linux
+# 4B distilled (~16 GB)
+./download_model.sh 4b
+python download_model.py 4b          # alternative using huggingface_hub
+
+# 4B base (~16 GB)
+./download_model.sh 4b-base
+
+# 9B distilled/base (~30 GB, gated — requires HuggingFace token)
+# Accept license: https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
+./download_model.sh 9b --token YOUR_HF_TOKEN
+./download_model.sh 9b-base --token YOUR_HF_TOKEN
 ```
 
-### Image-to-Image Transformation
+---
 
-Transform an existing image guided by a text prompt using in-context conditioning:
+## Testing
 
-```c
-#include "flux.h"
-#include <stdio.h>
-
-int main(void) {
-    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
-    if (!ctx) return 1;
-
-    /* Load the input image */
-    flux_image *photo = flux_image_load("photo.png");
-    if (!photo) {
-        fprintf(stderr, "Failed to load image\n");
-        flux_free(ctx);
-        return 1;
-    }
-
-    /* Set up parameters. Output size defaults to input size. */
-    flux_params params = FLUX_PARAMS_DEFAULT;
-    params.seed = 123;
-
-    /* Transform the image - describe the desired output */
-    flux_image *painting = flux_img2img(ctx, "oil painting of the scene, impressionist style",
-                                         photo, &params);
-    flux_image_free(photo);  /* Done with input */
-
-    if (!painting) {
-        fprintf(stderr, "Transformation failed: %s\n", flux_get_error());
-        flux_free(ctx);
-        return 1;
-    }
-
-    flux_image_save(painting, "painting.png");
-    printf("Saved painting.png\n");
-
-    flux_image_free(painting);
-    flux_free(ctx);
-    return 0;
-}
-```
-
-### Generating Multiple Images
-
-When generating multiple images with different seeds but the same prompt, you can avoid reloading the text encoder:
-
-```c
-flux_ctx *ctx = flux_load_dir("flux-klein-4b");
-flux_params params = FLUX_PARAMS_DEFAULT;
-params.width = 256;
-params.height = 256;
-
-/* Generate 5 variations with different seeds */
-for (int i = 0; i < 5; i++) {
-    flux_set_seed(1000 + i);
-
-    flux_image *img = flux_generate(ctx, "A mountain landscape at sunset", &params);
-
-    char filename[64];
-    snprintf(filename, sizeof(filename), "landscape_%d.png", i);
-    flux_image_save(img, filename);
-    flux_image_free(img);
-}
-
-flux_free(ctx);
-```
-
-Note: The text encoder (~8GB) is automatically released after the first generation to save memory. It reloads automatically if you use a different prompt.
-
-### Error Handling
-
-All functions that can fail return NULL on error. Use `flux_get_error()` to get a description:
-
-```c
-flux_ctx *ctx = flux_load_dir("nonexistent-model");
-if (!ctx) {
-    fprintf(stderr, "Error: %s\n", flux_get_error());
-    /* Prints something like: "Failed to load VAE - cannot generate images" */
-    return 1;
-}
-```
-
-### API Reference
-
-**Core functions:**
-```c
-flux_ctx *flux_load_dir(const char *model_dir);   /* Load model, returns NULL on error */
-void flux_free(flux_ctx *ctx);                     /* Free all resources */
-
-flux_image *flux_generate(flux_ctx *ctx, const char *prompt, const flux_params *params);
-flux_image *flux_img2img(flux_ctx *ctx, const char *prompt, const flux_image *input,
-                          const flux_params *params);
-```
-
-**Image handling:**
-```c
-flux_image *flux_image_load(const char *path);     /* Load PNG, JPEG, or PPM */
-int flux_image_save(const flux_image *img, const char *path);  /* 0=success, -1=error */
-int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);  /* Save with metadata */
-flux_image *flux_image_resize(const flux_image *img, int new_w, int new_h);
-void flux_image_free(flux_image *img);
-```
-
-**Utilities:**
-```c
-void flux_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
-const char *flux_get_error(void);                  /* Get last error message */
-void flux_release_text_encoder(flux_ctx *ctx);     /* Manually free ~8GB (optional) */
-int flux_is_distilled(flux_ctx *ctx);              /* 1 = distilled, 0 = base */
-void flux_set_base_mode(flux_ctx *ctx);            /* Force base model mode */
-```
-
-### Parameters
-
-```c
-typedef struct {
-    int width;              /* Output width in pixels (default: 256) */
-    int height;             /* Output height in pixels (default: 256) */
-    int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base) */
-    int64_t seed;           /* Random seed, -1 for random (default: -1) */
-    float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base) */
-    int linear_schedule;    /* Use linear timestep schedule (0 = shifted sigmoid) */
-    int power_schedule;     /* Use power curve timestep schedule */
-    float power_alpha;      /* Exponent for power schedule (default: 2.0) */
-} flux_params;
-
-/* Initialize with sensible defaults (auto steps and guidance from model type) */
-#define FLUX_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
-```
-
-## Debugging
-
-### Comparing with Python Reference
-
-When debugging img2img issues, the `--debug-py` flag allows you to run the C implementation with exact inputs saved from a Python reference script. This isolates whether differences are due to input preparation (VAE encoding, text encoding, noise generation) or the transformer itself.
-
-**Setup:**
-
-1. Set up the Python environment:
 ```bash
-python -m venv flux_env
-source flux_env/bin/activate
-pip install torch diffusers transformers safetensors einops huggingface_hub
+make test        # full test suite (3 test cases against reference vectors)
+make test-quick  # 64×64 sanity check only
 ```
 
-2. Clone the flux2 reference (for the model class):
-```bash
-git clone https://github.com/black-forest-labs/flux flux2
-```
+Tests compare generated images against `test_vectors/` using per-pixel difference tolerance to allow minor floating-point variation across platforms and backends.
 
-3. Run the Python debug script to save inputs:
-```bash
-python debug/debug_img2img_compare.py
-```
+---
 
-This saves to `/tmp/`:
-- `py_noise.bin` - Initial noise tensor
-- `py_ref_latent.bin` - VAE-encoded reference image
-- `py_text_emb.bin` - Text embeddings from Qwen3
+## For AI Assistants
 
-4. Run C with the same inputs:
-```bash
-./flux -d flux-klein-4b --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
-```
+**Primary reference files:**
 
-5. Compare the outputs visually or numerically.
+| File | Purpose |
+|------|---------|
+| `CLAUDE.md` | Full architecture, implementation details, known pitfalls, development rules |
+| `train/DISPATCH.md` | Pipeline operational reference — read before any pipeline work |
+| `BACKLOG.md` | Open and completed work items across all components |
+| `BUGS.md` | Known issues and observed anomalies |
+| `plans/` | Architecture and design documents |
 
-**What this helps diagnose:**
-- If C and Python produce identical outputs with identical inputs, any differences in normal operation are due to input preparation (VAE, text encoder, RNG)
-- If outputs differ even with identical inputs, the issue is in the transformer or sampling implementation
+**Starting a session on this repo:**
 
-### Debug Scripts
+1. Read `CLAUDE.md` — covers all models, file roles, critical implementation details, and known bugs
+2. For pipeline work: `train/.venv/bin/python train/scripts/pipeline_doctor.py --ai` — returns the current pipeline state as compact JSON
+3. For inference work: check `BUGS.md` and run `make test`
 
-The `debug/` directory contains Python scripts for comparing C and Python implementations:
+**Key architectural invariants** (from CLAUDE.md — do not violate):
+- Concatenation order for Flux attention is `[TEXT, IMAGE]`
+- AdaLN: `out = (1 + scale) * norm(x) + shift`
+- RoPE rotation: `out0 = cos·x0 − sin·x1`, `out1 = cos·x1 + sin·x0`
+- Z-Image sequence order is `[IMAGE | CAPTION]` (opposite of Flux)
+- Dynamic tensors (VAE K/V) must use `iris_metal_sgemm()`, not `_cached()`
+- Never hardcode model dimensions — read from config at runtime
 
-- `debug_img2img_compare.py` - Full img2img comparison with step-by-step statistics
-- `debug_rope_img2img.py` - Verify RoPE position encoding matches between C and Python
+**Pipeline sentinel files** are the authoritative state source. Never infer step state from logs or heartbeats alone — always read sentinels or call `pipeline_doctor.py --ai`.
+
+---
 
 ## License
 
-MIT
+MIT. The 9B model weights have a non-commercial use restriction from Black Forest Labs.
