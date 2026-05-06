@@ -1145,11 +1145,44 @@ _STEP_LOGS: dict[str, object] = {
     "clip_embed":   lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
     "clip_index":   lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
     "clip_dups":    lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
-    "precompute":   lambda c: LOG_DIR / f"precompute_chunk{c}.log",
-    "mine":         lambda c: LOG_DIR / f"mine_chunk{c}.log",
+    "precompute":      lambda c: LOG_DIR / f"precompute_chunk{c}.log",
+    "validate_shards": lambda c: LOG_DIR / f"validate_shards_chunk{c}.log",
+    "mine":            lambda c: LOG_DIR / f"mine_chunk{c}.log",
     "validate":     lambda c: LOG_DIR / f"validate_chunk{c}.log",
     "train":        lambda c: LOG_DIR / f"train_chunk{c}.log",
 }
+
+
+def _check_data_quality(chunks: list[int]) -> None:
+    """Surface per-chunk deduplication statistics from clip_dups quality reports."""
+    for chunk in chunks:
+        if not is_done(chunk, "clip_dups"):
+            continue
+        report_path = LOG_DIR / f"clip_dups_report_chunk{chunk}.json"
+        if not report_path.exists():
+            continue
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        dedup_rate = report.get("dedup_rate_pct", 0.0)
+        n_total    = report.get("n_total", 0)
+        n_kept     = report.get("n_kept", n_total)
+        if dedup_rate > 20:
+            _add("WARNING", "data_quality",
+                 f"Chunk {chunk}: high deduplication rate {dedup_rate:.1f}% "
+                 f"({n_total - n_kept:,} of {n_total:,} images flagged as near-duplicates)",
+                 detail="A dedup rate above 20% may indicate batch overlaps or a "
+                        "data source with many near-identical images. "
+                        "Check the blocklist and consider reviewing source proportions.",
+                 chunk=chunk,
+                 ctx={"dedup_rate_pct": dedup_rate, "n_total": n_total,
+                      "n_kept": n_kept, "n_dups": n_total - n_kept})
+        else:
+            _add("INFO", "data_quality",
+                 f"Chunk {chunk}: dedup {dedup_rate:.1f}% — {n_kept:,} of {n_total:,} images retained",
+                 chunk=chunk,
+                 ctx={"dedup_rate_pct": dedup_rate, "n_total": n_total, "n_kept": n_kept})
 
 
 def _check_stale_logs(chunks: list[int]) -> None:
@@ -1486,6 +1519,7 @@ def main() -> None:
         _check_orchestrator_log()
         _check_dispatch_queue()
         _check_ordering_sanity(cfg, chunks)
+        _check_data_quality(chunks)
         _check_stale_logs(chunks)
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 

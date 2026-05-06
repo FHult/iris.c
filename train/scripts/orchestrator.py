@@ -132,21 +132,22 @@ def _query_macos_jetsam_log(lookback_secs: int = 600) -> bool:
 # ---------------------------------------------------------------------------
 
 class ChunkState(str):
-    IDLE         = "IDLE"
-    DOWNLOADING  = "DOWNLOADING"
-    CONVERTING   = "CONVERTING"
-    BUILDING     = "BUILDING"
-    FILTERING    = "FILTERING"
-    CLIP_EMBED   = "CLIP_EMBED"
-    CLIP_INDEX   = "CLIP_INDEX"
-    CLIP_DUPS    = "CLIP_DUPS"
-    PRECOMPUTING = "PRECOMPUTING"
-    READY        = "READY"
-    TRAINING     = "TRAINING"
-    MINING       = "MINING"
-    VALIDATING   = "VALIDATING"
-    DONE         = "DONE"
-    ERROR        = "ERROR"
+    IDLE              = "IDLE"
+    DOWNLOADING       = "DOWNLOADING"
+    CONVERTING        = "CONVERTING"
+    BUILDING          = "BUILDING"
+    FILTERING         = "FILTERING"
+    CLIP_EMBED        = "CLIP_EMBED"
+    CLIP_INDEX        = "CLIP_INDEX"
+    CLIP_DUPS         = "CLIP_DUPS"
+    PRECOMPUTING      = "PRECOMPUTING"
+    READY             = "READY"
+    SHARD_VALIDATING  = "SHARD_VALIDATING"
+    TRAINING          = "TRAINING"
+    MINING            = "MINING"
+    VALIDATING        = "VALIDATING"
+    DONE              = "DONE"
+    ERROR             = "ERROR"
 
 
 # Shard ID space reserved per chunk.  Chunk N owns [N-1)*_SHARD_BLOCK, N*_SHARD_BLOCK).
@@ -165,24 +166,26 @@ CHUNK_STEPS = [
     "clip_dups",
     "precompute",
     "promoted",
+    "validate_shards",
     "train",
     "mine",
     "validate",
 ]
 
 _STEP_TO_STATE = {
-    "download":     ChunkState.CONVERTING,
-    "convert":      ChunkState.BUILDING,
-    "build_shards": ChunkState.FILTERING,
-    "filter_shards":ChunkState.CLIP_EMBED,
-    "clip_embed":   ChunkState.CLIP_INDEX,
-    "clip_index":   ChunkState.CLIP_DUPS,
-    "clip_dups":    ChunkState.PRECOMPUTING,
-    "precompute":   ChunkState.READY,
-    "promoted":     ChunkState.TRAINING,
-    "train":        ChunkState.MINING,
-    "mine":         ChunkState.VALIDATING,
-    "validate":     ChunkState.DONE,
+    "download":        ChunkState.CONVERTING,
+    "convert":         ChunkState.BUILDING,
+    "build_shards":    ChunkState.FILTERING,
+    "filter_shards":   ChunkState.CLIP_EMBED,
+    "clip_embed":      ChunkState.CLIP_INDEX,
+    "clip_index":      ChunkState.CLIP_DUPS,
+    "clip_dups":       ChunkState.PRECOMPUTING,
+    "precompute":      ChunkState.READY,
+    "promoted":        ChunkState.SHARD_VALIDATING,
+    "validate_shards": ChunkState.TRAINING,
+    "train":           ChunkState.MINING,
+    "mine":            ChunkState.VALIDATING,
+    "validate":        ChunkState.DONE,
 }
 
 
@@ -440,6 +443,7 @@ class Orchestrator:
         "clip_index_chunk{c}.log",
         "clip_dups_chunk{c}.log",
         "precompute_chunk{c}.log",
+        "validate_shards_chunk{c}.log",
     ]
 
     def _cleanup_prep_logs(self, chunk: int) -> None:
@@ -673,27 +677,29 @@ class Orchestrator:
         if not tmux_window_exists(TMUX_PREP_WIN):
             return
         _state_to_step = {
-            ChunkState.IDLE:         "download",
-            ChunkState.CONVERTING:   "download",
-            ChunkState.BUILDING:     "build_shards",
-            ChunkState.FILTERING:    "filter_shards",
-            ChunkState.CLIP_EMBED:   "clip_embed",
-            ChunkState.CLIP_INDEX:   "clip_index",
-            ChunkState.CLIP_DUPS:    "clip_dups",
-            ChunkState.PRECOMPUTING: "precompute",
-            ChunkState.MINING:       "mine",
-            ChunkState.VALIDATING:   "validate",
+            ChunkState.IDLE:             "download",
+            ChunkState.CONVERTING:       "download",
+            ChunkState.BUILDING:         "build_shards",
+            ChunkState.FILTERING:        "filter_shards",
+            ChunkState.CLIP_EMBED:       "clip_embed",
+            ChunkState.CLIP_INDEX:       "clip_index",
+            ChunkState.CLIP_DUPS:        "clip_dups",
+            ChunkState.PRECOMPUTING:     "precompute",
+            ChunkState.SHARD_VALIDATING: "validate_shards",
+            ChunkState.MINING:           "mine",
+            ChunkState.VALIDATING:       "validate",
         }
         _step_log = {
-            "download":     lambda c: LOG_DIR / f"download_chunk{c}.log",
-            "build_shards": lambda c: LOG_DIR / f"build_chunk{c}.log",
-            "filter_shards":lambda c: LOG_DIR / f"filter_chunk{c}.log",
-            "clip_embed":   lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
-            "clip_index":   lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
-            "clip_dups":    lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
-            "precompute":   lambda c: LOG_DIR / f"precompute_chunk{c}.log",
-            "mine":         lambda c: LOG_DIR / f"mine_chunk{c}.log",
-            "validate":     lambda c: LOG_DIR / f"validate_chunk{c}.log",
+            "download":        lambda c: LOG_DIR / f"download_chunk{c}.log",
+            "build_shards":    lambda c: LOG_DIR / f"build_chunk{c}.log",
+            "filter_shards":   lambda c: LOG_DIR / f"filter_chunk{c}.log",
+            "clip_embed":      lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
+            "clip_index":      lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
+            "clip_dups":       lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
+            "precompute":      lambda c: LOG_DIR / f"precompute_chunk{c}.log",
+            "validate_shards": lambda c: LOG_DIR / f"validate_shards_chunk{c}.log",
+            "mine":            lambda c: LOG_DIR / f"mine_chunk{c}.log",
+            "validate":        lambda c: LOG_DIR / f"validate_chunk{c}.log",
         }
         _GPU_STEPS  = {"precompute", "clip_embed", "mine", "validate"}
         _DISK_STEPS = {"build_shards"}
@@ -764,21 +770,22 @@ class Orchestrator:
             return
 
         handlers = {
-            ChunkState.IDLE:        self._start_download_convert,
-            ChunkState.DOWNLOADING: self._noop,  # wait for prep window
-            ChunkState.CONVERTING:  self._noop,  # wait for prep window
-            ChunkState.BUILDING:    self._start_build,
-            ChunkState.FILTERING:   self._start_filter,
-            ChunkState.CLIP_EMBED:  self._start_clip_embed,
-            ChunkState.CLIP_INDEX:  self._start_clip_index,
-            ChunkState.CLIP_DUPS:   self._start_clip_dups,
-            ChunkState.PRECOMPUTING:self._start_precompute,
-            ChunkState.READY:       self._check_ready,
-            ChunkState.TRAINING:    self._start_training,
-            ChunkState.MINING:      self._start_mining,
-            ChunkState.VALIDATING:  self._start_validation,
-            ChunkState.DONE:        self._noop,
-            ChunkState.ERROR:       self._handle_error,
+            ChunkState.IDLE:             self._start_download_convert,
+            ChunkState.DOWNLOADING:      self._noop,  # wait for prep window
+            ChunkState.CONVERTING:       self._noop,  # wait for prep window
+            ChunkState.BUILDING:         self._start_build,
+            ChunkState.FILTERING:        self._start_filter,
+            ChunkState.CLIP_EMBED:       self._start_clip_embed,
+            ChunkState.CLIP_INDEX:       self._start_clip_index,
+            ChunkState.CLIP_DUPS:        self._start_clip_dups,
+            ChunkState.PRECOMPUTING:     self._start_precompute,
+            ChunkState.READY:            self._check_ready,
+            ChunkState.SHARD_VALIDATING: self._start_shard_validation,
+            ChunkState.TRAINING:         self._start_training,
+            ChunkState.MINING:           self._start_mining,
+            ChunkState.VALIDATING:       self._start_validation,
+            ChunkState.DONE:             self._noop,
+            ChunkState.ERROR:            self._handle_error,
         }
         handler = handlers.get(state, self._noop)
         handler(chunk)
@@ -905,9 +912,11 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: finding CLIP duplicates", chunk=chunk)
         index    = DEDUP_DIR / "dedup_index.faiss"
         dups     = DEDUP_DIR / "duplicate_ids.txt"
+        report   = LOG_DIR / f"clip_dups_report_chunk{chunk}.json"
         log_file = LOG_DIR / f"clip_dups_chunk{chunk}.log"
         cmd = self._python_cmd("clip_dedup.py",
-                               f"find-dups --index '{index}' --out '{dups}'")
+                               f"find-dups --index '{index}' --out '{dups}'"
+                               f" --report-out '{report}'")
         self._launch_prep(f"clip_dups chunk {chunk}", cmd, log_file,
                           chunk, "clip_dups")
 
@@ -1042,6 +1051,18 @@ class Orchestrator:
                 # The trainer derives the internal record prefix from the production shard name.
                 f.rename(dst / f.name)
 
+    def _start_shard_validation(self, chunk: int) -> None:
+        """PIPELINE-8: fast tarfile header scan before training."""
+        if is_done(chunk, "validate_shards") or self._prep_busy():
+            return
+        log_orch(f"Chunk {chunk}: starting shard integrity scan", chunk=chunk)
+        report = LOG_DIR / f"validate_shards_chunk{chunk}.json"
+        log_file = LOG_DIR / f"validate_shards_chunk{chunk}.log"
+        cmd = self._python_cmd("validate_shards.py",
+                               f"--chunk {chunk} --report '{report}'")
+        self._launch_prep(f"validate_shards chunk {chunk}", cmd, log_file,
+                          chunk, "validate_shards")
+
     def _start_training(self, chunk: int) -> None:
         log_file = LOG_DIR / f"train_chunk{chunk}.log"
 
@@ -1126,6 +1147,26 @@ class Orchestrator:
 
         config_file = self.cfg.get("training_config",
                                    str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
+
+        # PIPELINE-14: apply per-chunk hard_mix_ratio override via a temp config
+        # so we don't need to touch the training script.
+        _by_chunk = (self.cfg.get("training", {})
+                         .get("hard_mix_ratio_by_chunk", {}))
+        _override = _by_chunk.get(chunk, _by_chunk.get(str(chunk)))
+        if _override is not None:
+            import yaml as _yaml
+            with open(config_file) as _f:
+                _train_yaml = _yaml.safe_load(_f)
+            _default = _train_yaml.get("hard_mix_ratio", 0.05)
+            _train_yaml["hard_mix_ratio"] = float(_override)
+            _tmp_cfg = Path(f"/tmp/iris_train_chunk{chunk}_config.yaml")
+            _tmp_cfg.write_text(_yaml.dump(_train_yaml, default_flow_style=False))
+            log_orch(
+                f"Chunk {chunk}: hard_mix_ratio override {_default} → {_override} "
+                f"(temp config: {_tmp_cfg})",
+                chunk=chunk)
+            config_file = str(_tmp_cfg)
+
         cmd = (
             f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
             f"--config '{config_file}' "
@@ -1171,10 +1212,13 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: mining hard examples", chunk=chunk)
         out = HARD_EX_DIR / f"chunk{chunk}"
         out.mkdir(parents=True, exist_ok=True)
-        flux_model  = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
-        qwen3_cache = PRECOMP_DIR / "qwen3"
-        vae_cache   = PRECOMP_DIR / "vae"
-        log_file    = LOG_DIR / f"mine_chunk{chunk}.log"
+        flux_model   = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
+        qwen3_cache  = PRECOMP_DIR / "qwen3"
+        vae_cache    = PRECOMP_DIR / "vae"
+        log_file     = LOG_DIR / f"mine_chunk{chunk}.log"
+        use_ema_flag = ("--use-ema "
+                        if self.cfg.get("training", {}).get("mine_use_ema", False)
+                        else "")
         cmd = self._python_cmd("mine_hard_examples.py",
                                f"--checkpoint '{best}' "
                                f"--shards '{SHARDS_DIR}' "
@@ -1182,6 +1226,7 @@ class Orchestrator:
                                f"--vae-cache '{vae_cache}' "
                                f"--flux-model {flux_model} --null-siglip "
                                f"--chunk {chunk} "
+                               f"{use_ema_flag}"
                                f"--output '{out}'")
         self._launch_prep(f"mine chunk {chunk}", cmd, log_file,
                           chunk, "mine", token="GPU_TOKEN")
@@ -1342,12 +1387,13 @@ class Orchestrator:
             "download":     "download_convert",
             "build_shards": "build_shards",
             "filter_shards":"filter_shards",
-            "clip_embed":   "clip_dedup",
-            "clip_index":   "clip_dedup",
-            "clip_dups":    "clip_dedup",
-            "precompute":   "precompute",
-            "mine":         "mine_hard_examples",
-            "validate":     "validator",
+            "clip_embed":      "clip_dedup",
+            "clip_index":      "clip_dedup",
+            "clip_dups":       "clip_dedup",
+            "precompute":      "precompute",
+            "validate_shards": "validate_shards",
+            "mine":            "mine_hard_examples",
+            "validate":        "validator",
         }
         process = _step_process.get(step)
         if not process:

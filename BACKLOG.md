@@ -66,7 +66,7 @@
 
 - ~~**PIPELINE-7: Checkpoint archive on chunk promotion**~~ ✅ DONE — Orchestrator calls `_archive_chunk_checkpoint(chunk)` after `train.done`; copies `step_NNNNNNN.{safetensors,json,.ema.safetensors}` to `checkpoints/stage1/archive/chunk{N}_final.*`. `pipeline_ctl.py restart-from-chunk N` restores from there.
 
-- **PIPELINE-8: Shard integrity scan before training** (still pending) — After `promoted.done`, run a fast tarfile header-only scan across all newly promoted shards (no decompression). Flag any truncated or zero-byte members. This catches JPEG corruption and partial writes before they silently produce NaN gradients mid-training. Implement as a short `validate_shards.py` step inserted between `promoted` and `train`.
+- ~~**PIPELINE-8: Shard integrity scan before training**~~ ✅ DONE — `validate_shards.py` added as a new pipeline step between `promoted` and `train`. Opens each .tar header-only (no JPEG decompression); checks for truncated archives, zero-byte members, and missing image/caption pairs. Orchestrator runs it via `_start_shard_validation()`, writes a JSON report to `LOG_DIR/validate_shards_chunk{N}.json`. Exit 1 on CRITICAL errors; exit 0 on warnings. `pipeline_doctor.py` reads the step log and the report is surfaced in `_check_stale_logs`.
 
 - ~~**PIPELINE-9: Disk space reservation check before each step**~~ ✅ DONE — `_disk_guard()` in orchestrator checks `min_free_gb` (config key, defaults to `DISK_ABORT_GB`) before `_launch_prep()` and `_start_training()`. Returns False and logs if below threshold.
 
@@ -74,15 +74,15 @@
 
 - ~~**PIPELINE-11: `restart-from-chunk N` subcommand**~~ ✅ DONE — `pipeline_ctl.py restart-from-chunk N`: kills iris-train, clears sentinels for chunks N..total, restores chunk N-1 final checkpoint from archive, restarts orchestrator. Requires confirmation before destructive operations.
 
-- **PIPELINE-12: Per-chunk data quality report** — After `clip_dups` finishes for each chunk, log: total images, deduplication rate (% removed), mean CLIP score, and dataset size breakdown by source (JDB / WikiArt / LAION / COYO). Helps catch bad data ratios before precompute runs. Implement by adding a `report_chunk.py` step or extending `clip_dedup.py` to emit a JSON summary.
+- ~~**PIPELINE-12: Per-chunk data quality report**~~ ✅ DONE — `clip_dedup.py find-dups` gains `--report-out PATH` (writes `n_total`, `n_dups_total`, `n_kept`, `dedup_rate_pct`). Orchestrator passes `LOG_DIR/clip_dups_report_chunk{N}.json`. `pipeline_doctor.py` reads the report in `_check_data_quality()`: WARN when dedup rate >20%, INFO otherwise.
 
 - ~~**PIPELINE-13: Precompute progress saved across restarts**~~ ✅ DONE — `precompute_all.py` maintains `qwen3_output/.precompute_done.json` (list of fully-done shard basenames). On restart, done shards are skipped before `work_items` is built, avoiding tar-open and IO prefetch for already-complete shards.
 
-- **PIPELINE-14: Configurable hard_mix_ratio per chunk** — Current `hard_mix_ratio: 0.05` is global. Chunk 2+ may benefit from a higher ratio (0.10–0.15) since the hard example set is built from chunk N-1's model. Add per-chunk override in `v2_pipeline.yaml` under `training.hard_mix_ratio_by_chunk`.
+- ~~**PIPELINE-14: Configurable hard_mix_ratio per chunk**~~ ✅ DONE — `v2_pipeline.yaml` gains `training.hard_mix_ratio_by_chunk` (defaults: chunk 2→0.10, 3→0.12, 4→0.15). Orchestrator generates a per-chunk temp YAML override at `/tmp/iris_train_chunk{N}_config.yaml` when an override exists; passes it as `--config` to the training script. No changes to `train_ip_adapter.py`.
 
-- **PIPELINE-15: EMA checkpoint auto-select for mining** — `mine_hard_examples.py` always uses `best.safetensors`. The EMA-smoothed weights (`best.ema.safetensors`) often generalise better and produce cleaner hard-example scores. Add `--use-ema` flag to `mine_hard_examples.py` and expose it via orchestrator config.
+- ~~**PIPELINE-15: EMA checkpoint auto-select for mining**~~ ✅ DONE — `mine_hard_examples.py` gains `--use-ema` flag. When set: checks for a companion `{checkpoint}.ema.safetensors` file first; falls back to `ema.*` keys inside the checkpoint; exits with error if neither EMA source is available (instead of silently using raw weights). Exposed via `training.mine_use_ema: true` in `v2_pipeline.yaml` (default enabled).
 
-- **PIPELINE-16: Validation FID/CLIP score tracking across chunks** — `validator.py` produces per-chunk images. Add CLIP score (text-image alignment) and a lightweight FID proxy metric. Store as JSON in `/Volumes/2TBSSD/logs/val_chunk{N}/metrics.json`. Orchestrator reads these to confirm chunk-over-chunk improvement at promotion time.
+- ~~**PIPELINE-16: Validation FID/CLIP score tracking across chunks**~~ ✅ DONE — `validator.py` `run_inference_and_score()` now calls `run_inference.py` + `score_validation.py` as subprocesses (skips gracefully if CLIP deps missing). Saves `val_dir/metrics.json` with `mean_clip_i`, `mean_adapter_delta`, and `clip_i_delta_vs_prev` when a prior chunk's metrics exist. Logs a WARNING when CLIP-I drops >0.05 vs the previous chunk.
 
 - ~~**PIPELINE-17: Auto-populate anchor_shards after chunk 1**~~ ✅ DONE — `_auto_populate_anchor_shards()` copies every Nth production shard to `ANCHOR_SHARDS_DIR` after chunk 1 `train.done`. Rate controlled by `training.anchor_sample_rate` in config (default 10). Skips if anchor dir already populated.
 

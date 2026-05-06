@@ -23,6 +23,7 @@ Usage (called by orchestrator):
 import argparse
 import glob
 import io
+import json
 import os
 import sys
 import tarfile
@@ -401,6 +402,23 @@ def cmd_find_dups(args) -> int:
     log_event("clip_dedup", "dups_found",
               new_dups=len(new_dups), total_dups=len(existing_dups), index_size=n)
     log_orch(f"find-dups: {len(new_dups)} new, {len(existing_dups)} total in blocklist")
+
+    if getattr(args, "report_out", None):
+        dedup_rate = round(len(existing_dups) / n * 100, 2) if n > 0 else 0.0
+        report = {
+            "ts":             now_iso(),
+            "n_total":        n,
+            "n_dups_total":   len(existing_dups),
+            "n_new_dups":     len(new_dups),
+            "n_kept":         n - len(existing_dups),
+            "dedup_rate_pct": dedup_rate,
+            "threshold":      threshold,
+        }
+        report_path = Path(args.report_out)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2))
+        log_orch(f"find-dups: quality report → {report_path}")
+
     return 0
 
 
@@ -422,9 +440,11 @@ def main() -> None:
     p_idx.add_argument("--index",      required=True)
 
     p_dup = sub.add_parser("find-dups", help="Find near-duplicates, write blocklist")
-    p_dup.add_argument("--index",     required=True)
-    p_dup.add_argument("--out",       required=True)
-    p_dup.add_argument("--threshold", type=float, default=DUP_THRESHOLD)
+    p_dup.add_argument("--index",      required=True)
+    p_dup.add_argument("--out",        required=True)
+    p_dup.add_argument("--threshold",  type=float, default=DUP_THRESHOLD)
+    p_dup.add_argument("--report-out", dest="report_out", default=None, metavar="PATH",
+                       help="Write JSON quality report to this file")
 
     args = ap.parse_args()
     handlers = {

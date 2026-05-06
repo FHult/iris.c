@@ -268,7 +268,10 @@ def main():
         "black-forest-labs/FLUX.2-Klein",
     )
     parser.add_argument("--checkpoint",    required=True,
-                        help="EMA checkpoint (best.safetensors from training)")
+                        help="Checkpoint path (best.safetensors or a step_*.safetensors)")
+    parser.add_argument("--use-ema",       dest="use_ema", action="store_true",
+                        help="Require EMA weights for scoring. Also checks for a companion "
+                             "{checkpoint}.ema.safetensors file. Exits if EMA unavailable.")
     parser.add_argument("--shards",        required=True,
                         help="Directory of unified .tar shards")
     parser.add_argument("--qwen3-cache",   required=True,
@@ -411,22 +414,43 @@ def main():
     flux = Flux2Klein(model_path=args.flux_model, quantize=None)
     flux.freeze()
 
-    print(f"  Adapter (EMA from {args.checkpoint})...")
+    print(f"  Adapter ({'EMA required' if args.use_ema else 'EMA preferred'}: {args.checkpoint})...")
     # Build adapter with same default dims as stage1 config
     adapter = IPAdapterKlein(
         num_blocks=25, hidden_dim=3072,
         num_image_tokens=128, siglip_dim=1152,
         perceiver_heads=16,
     )
-    ema_params = load_ema_from_checkpoint(args.checkpoint)
-    if ema_params:
-        from train_ip_adapter import _nested_update
-        _nested_update(adapter, ema_params)
-        print("    EMA weights loaded")
+    # When --use-ema: also try a companion .ema.safetensors file (bare EMA keys,
+    # load with load_checkpoint) before falling back to load_ema_from_checkpoint.
+    ema_params = None
+    if args.use_ema:
+        companion = Path(args.checkpoint).with_suffix(".ema.safetensors")
+        if companion.exists():
+            from train_ip_adapter import load_checkpoint as _lc, _nested_update
+            _lc(adapter, str(companion))
+            print(f"    EMA weights loaded from companion: {companion.name}")
+            companion_loaded = True
+        else:
+            companion_loaded = False
+            ema_params = load_ema_from_checkpoint(args.checkpoint)
     else:
-        from train_ip_adapter import load_checkpoint
-        load_checkpoint(adapter, args.checkpoint)
-        print("    WARNING: no EMA weights found — loaded raw adapter weights")
+        companion_loaded = False
+        ema_params = load_ema_from_checkpoint(args.checkpoint)
+
+    if not companion_loaded:
+        if ema_params:
+            from train_ip_adapter import _nested_update
+            _nested_update(adapter, ema_params)
+            print("    EMA weights loaded")
+        elif args.use_ema:
+            print(f"ERROR: --use-ema set but no EMA weights found in {args.checkpoint} "
+                  f"and no companion .ema.safetensors exists.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            from train_ip_adapter import load_checkpoint
+            load_checkpoint(adapter, args.checkpoint)
+            print("    WARNING: no EMA weights found — loaded raw adapter weights")
     adapter.freeze()
     mx.eval(adapter.parameters())
 
