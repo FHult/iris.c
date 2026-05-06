@@ -268,6 +268,20 @@ def build_status_dict(total_chunks: int = 4) -> dict:
         cs["staging"] = _staging_detail(c)
         chunks[c] = cs
 
+    # Cross-reference trainer heartbeats.  The trainer may be running even
+    # when the sentinel-derived state doesn't show TRAINING — for example when
+    # a new step was inserted into CHUNK_STEPS after training had already
+    # started (the missing sentinel makes derive_chunk_state return the
+    # earlier state instead of TRAINING).  A fresh, non-zero trainer heartbeat
+    # is authoritative: override state and active_step so the display is correct.
+    for c in range(1, total_chunks + 1):
+        if is_done(c, "train"):
+            continue  # sentinel is authoritative when done
+        thb = _trainer_heartbeat(c)
+        if thb and not thb.get("stale", True) and thb.get("step", 0) > 0:
+            chunks[c]["state"] = "TRAINING"
+            chunks[c]["active_step"] = "training"
+
     trainer_hb = {}
     active_chunk = None
     for c in range(1, total_chunks + 1):
@@ -330,9 +344,14 @@ def print_human(status: dict, verbose: bool = False) -> None:
     shard_str = f"shards={shards}" + (f" (+{staging} staging)" if staging else "")
     print(f"  {shard_str}  precomputed={precomp}")
 
-    # Overall progress summary
+    # Overall progress summary — prefer the training chunk when one is active,
+    # otherwise fall back to the first non-DONE/IDLE chunk.
     total_chunks = len(status["chunks"])
-    active_c = next(
+    training_c = next(
+        (c for c, cs in status["chunks"].items() if cs["state"] == "TRAINING"),
+        None,
+    )
+    active_c = training_c or next(
         (c for c, cs in status["chunks"].items()
          if cs["state"] not in ("DONE", "IDLE")),
         max(status["chunks"].keys()) if status["chunks"] else 1,
