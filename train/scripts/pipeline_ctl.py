@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, SENTINEL_DIR,
     TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, SCRIPTS_DIR, TRAIN_DIR,
-    CKPT_ARCHIVE_DIR, CKPT_DIR,
+    CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso,
 )
@@ -157,9 +157,12 @@ def cmd_restart_from_chunk(args) -> None:
     Safely restart the pipeline from chunk N:
       1. Kill iris-train window if running (with confirmation)
       2. Clear all sentinels for chunks N..total_chunks
-      3. Restore chunk N-1 final checkpoint from archive if available
-      4. Restart orchestrator
+      3. Delete hard_examples/chunk{M}/ for M >= N so mining re-runs against
+         the new checkpoint (stale manifests would otherwise cause a zero-op re-mine)
+      4. Restore chunk N-1 final checkpoint from archive if available
+      5. Restart orchestrator
     """
+    import shutil
     chunk = args.chunk
 
     # Detect total_chunks from sentinel dirs
@@ -168,10 +171,21 @@ def cmd_restart_from_chunk(args) -> None:
     else:
         total = 4  # fallback
 
+    # Identify hard example dirs that would be stale after the restart
+    hard_ex_to_delete = [
+        HARD_EX_DIR / f"chunk{c}"
+        for c in range(chunk, total + 1)
+        if (HARD_EX_DIR / f"chunk{c}").exists()
+    ]
+
     print(f"Restarting pipeline from chunk {chunk} (total={total})")
     print(f"This will:")
     print(f"  - Kill iris-train if running")
     print(f"  - Delete sentinels for chunks {chunk}..{total}")
+    if hard_ex_to_delete:
+        for d in hard_ex_to_delete:
+            tars = list(d.glob("*.tar"))
+            print(f"  - Delete hard_examples/{d.name}/ ({len(tars)} tar(s)) — stale without re-training")
     if chunk > 1:
         arch = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
         if arch.exists():
@@ -192,10 +206,17 @@ def cmd_restart_from_chunk(args) -> None:
     for c in range(chunk, total + 1):
         chunk_dir = SENTINEL_DIR / f"chunk{c}"
         if chunk_dir.exists():
-            import shutil
             shutil.rmtree(chunk_dir)
             chunk_dir.mkdir(parents=True, exist_ok=True)
             print(f"  Cleared sentinels for chunk {c}")
+
+    # Delete stale hard example directories so mining re-runs against the new
+    # checkpoint.  Without this, mine_hard_examples.py reads the .existing_ids.txt
+    # manifest, finds all records already extracted, and exits immediately — producing
+    # a zero-op re-mine that leaves examples scored by the old checkpoint in place.
+    for d in hard_ex_to_delete:
+        shutil.rmtree(d)
+        print(f"  Deleted hard_examples/{d.name}/ (will be re-mined after re-training)")
 
     # Restore archived checkpoint if available
     if chunk > 1:
@@ -203,7 +224,6 @@ def cmd_restart_from_chunk(args) -> None:
         arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.json"
         arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.ema.safetensors"
         if arch_st.exists():
-            import shutil
             # Find or infer the step number from the archive json
             step_name = "restored"
             if arch_js.exists():
