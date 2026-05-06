@@ -64,7 +64,7 @@ def cmd_restart_orchestrator(_args) -> None:
     if not tmux_session_exists():
         subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_ORCH_WIN],
                        check=True)
-    config = TRAIN_DIR / "configs" / "v2_pipeline.yaml"
+    config = Path(getattr(_args, "config", None) or (TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
     log_file = LOG_DIR / "orchestrator.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = (f"source '{TRAIN_DIR}/.venv/bin/activate' && "
@@ -343,7 +343,9 @@ def main() -> None:
     sub.add_parser("pause",               help="Pause orchestrator")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
-    sub.add_parser("restart-orchestrator",help="Restart iris-orch tmux window")
+    p = sub.add_parser("restart-orchestrator", help="Restart iris-orch tmux window")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config file (default: train/configs/v2_pipeline.yaml)")
 
     p = sub.add_parser("force-next-chunk",help="Force-pass validation for a chunk")
     p.add_argument("chunk", type=int)

@@ -507,6 +507,9 @@ class Orchestrator:
             log_orch("Anchor shards already populated — skipping auto-populate", chunk=chunk)
             return
         sample_rate = self.cfg.get("training", {}).get("anchor_sample_rate", 10)
+        if not sample_rate or sample_rate <= 0:
+            log_orch("Anchor shard auto-populate disabled (sample_rate=0)", chunk=chunk)
+            return
         shards = sorted(SHARDS_DIR.glob("*.tar"))
         if not shards:
             log_orch("No shards found for anchor sampling", level="warning", chunk=chunk)

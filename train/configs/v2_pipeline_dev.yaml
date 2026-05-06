@@ -45,7 +45,7 @@ training:
   mine: false           # no hard-example mining
   mine_use_ema: false
   hard_mix_ratio: 0.0   # no hard examples available
-  anchor_sample_rate: 0 # no anchor shard population
+  anchor_sample_rate: 0  # dev is 1 chunk — anchor shards never used in training
 
   steps:
     dev:
