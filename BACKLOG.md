@@ -96,6 +96,37 @@
 
 - ~~**PIPELINE-22: Dev/integration run scale**~~ ✅ DONE — `v2_pipeline_dev.yaml` added: 1 chunk, 200 steps, `skip_dedup: true`, `siglip: false`, `mine: false`. Produces a valid checkpoint in <2h from scratch for iris.c binary integration testing. `v2_pipeline_smoke.yaml` updated to enable all quality flags (`siglip: true`, `mine_use_ema: true`, `mine_eval_records: 500`, `mine_top_k: 200`). `pipeline_ctl.py populate-anchor-shards` command added for manual anchor shard population; auto-populated 6 anchor shards for the current production run.
 
+- ~~**TRAINING-1: Remove dead style_ref path; fix SigLIP cache-miss null conditioning**~~ ✅ DONE — `image_dropout_prob` and `refs_buf` removed from `make_prefetch_loader`; `style_refs_np` unpacking removed from training loop (was computed but never consumed). SigLIP cache miss now forces `use_null_image=True` so the adapter sees exact zeros from `mx.where`, not `Perceiver(zeros)` which was a distinct non-null signal.
+
+---
+
+## V3 — Style/Content Separation
+
+These three changes work together to teach the adapter to extract style independently of content.
+The core problem they address: training with reference=target lets the model use SigLIP content
+features as a reconstruction shortcut rather than learning style as an independent signal.
+
+- **QUALITY-1: Cross-image reference permutation** — In 50% of training batches, permute `siglip_feats` within the batch before passing to `loss_fn`. With B=2, this swaps reference between sample A and sample B. The model must reconstruct A's latent from A's text + B's SigLIP features — impossible without extracting style independent of content. Implementation: 3 lines in `train_ip_adapter.py` after `siglip_feats` is resolved, before `_flux_forward_no_ip`. Add `cross_ref_prob: 0.5` config key under `training`. Also add `cross_ref_loss` as a separate tracked metric (see QUALITY-4) to verify the model is improving on the harder task. Start at 50%; reduce if training destabilises.
+
+- **QUALITY-2: Freeze double-stream IP scales to zero** — Blocks 0–4 (double-stream) control structure and spatial layout (content). Blocks 5–24 (single-stream) control appearance, texture, and style. Injecting into double-stream blocks is the primary source of content leakage at inference. Initialize `adapter.scale[:5] = 0.0` and exclude them from the optimizer parameter group so they never receive gradients. At inference, only single-stream blocks carry the style signal. Implementation: add `freeze_double_stream_scales: true` config key under `training.adapter`; in `train()`, after adapter construction, zero and freeze those params before passing to optimizer.
+
+- **QUALITY-3: Patch-shuffle augmentation on reference** — Before SigLIP encoding, randomly shuffle the 14×14 patch grid of the reference image. This destroys object layout and semantic content while preserving per-patch texture/color statistics — exactly the signal the Perceiver should learn to extract. Apply to reference only, not target. Implementation: add to training loop after `images = augment_mlx(...)`, applied only to the reference copy of the image (same pixels, different spatial order). Apply with probability 0.5 (alternate with unshuffled to preserve some spatial style cues like composition). Requires keeping a separate reference image path through the pipeline — currently images and references are the same array; need to maintain a separate `refs = images.copy()` before patch shuffle.
+
+---
+
+## V3 — Training Observability
+
+Current metrics (loss, grad_norm, SigLIP coverage) are insufficient to diagnose whether the adapter
+is learning style conditioning vs. doing nothing. These additions make that visible.
+
+- **QUALITY-4: Conditioned vs unconditioned loss split** — The single most diagnostic metric. Track `loss_cond` (batches where `null_image=False`) and `loss_null` (batches where `null_image=True`) separately. If `loss_cond ≈ loss_null` throughout training, the adapter is not contributing — conditioning signal is zero. If `loss_cond < loss_null`, the adapter is helping reconstruction. Healthy pattern: `loss_cond` starts equal to `loss_null`, then drops below as training progresses. Log both at each `log_every` interval alongside the existing smoothed loss. Add to heartbeat JSON as `loss_cond` / `loss_null` for pipeline_status visibility. Implementation: two accumulators in the training loop, conditioned on `null_image` Python bool (no GPU sync needed).
+
+- **QUALITY-5: Adapter scale magnitude logging** — Log `adapter.scale` statistics (min, max, mean across all 25 blocks, and separately for double-stream blocks 0–4 vs single-stream 5–24) at each log interval. Scales near zero → conditioning not active. Scales growing large (>2) → IP conditioning dominating, content leakage risk. Expected healthy range at convergence: 0.3–1.0 for active blocks. Implementation: `mx.eval(adapter.scale)` once per log interval, extract numpy, log. Add `ip_scale_mean` to heartbeat JSON.
+
+- **QUALITY-6: Cross-reference loss tracking** — Once QUALITY-1 (permutation training) is added, track `loss_self_ref` (reference=target batches) and `loss_cross_ref` (permuted batches) separately. `loss_cross_ref` will be higher initially and should decrease as style/content separation improves. If `loss_cross_ref` never decreases, the model is not generalising to cross-image style transfer. The gap `loss_cross_ref - loss_self_ref` is a direct proxy for how well the adapter has learned style-only conditioning.
+
+- **QUALITY-7: Style transfer eval script** — `train/scripts/eval_style_transfer.py`: given a checkpoint + a fixed set of (prompt, reference_image) pairs, generate images with and without IP conditioning and report: CLIP-T (text following), CLIP-I (visual similarity to reference), and Gram-matrix style distance (VGG conv3 statistics) between generated and reference. Run after each chunk. The key signal: CLIP-T should stay high (≥ baseline), CLIP-I should increase, and Gram-distance should decrease as training progresses. Content leakage shows as CLIP-I increasing faster than Gram-distance improves. Integrates with `pipeline_validate.sh` (Pipeline Scripts section).
+
 ---
 
 ## C Binary / CLI
