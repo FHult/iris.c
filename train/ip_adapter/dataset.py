@@ -276,7 +276,6 @@ def _iter_shard_contents(contents: Dict[str, bytes]) -> list:
 def make_prefetch_loader(
     shard_paths: List[str],
     batch_size: int = 2,
-    image_dropout_prob: float = 0.30,
     text_dropout_prob: float = 0.10,
     sample_buffer: int = 6,
     bucket: Optional[Tuple[int, int]] = None,
@@ -300,7 +299,6 @@ def make_prefetch_loader(
                           on samples the model found difficult in the previous chunk.
     hard_mix_ratio:       fraction of batches drawn from hard examples (default 0.05)
     batch_size:           images per batch (default 2)
-    image_dropout_prob:   null image conditioning dropout rate (default 0.30)
     text_dropout_prob:    null text conditioning dropout rate (default 0.10)
     sample_buffer:        max batches in the level-2 queue (default 6)
     bucket:               (H, W) training resolution; if None, randomly selects from BUCKETS
@@ -311,7 +309,6 @@ def make_prefetch_loader(
     Yields batches of:
       images:      float32 numpy [B, C, H+32, W+32] — padded for GPU crop augmentation
       captions:    list of str, len B (empty string if text dropout)
-      style_refs:  float32 numpy [B, C, H+32, W+32] — same image (self-supervised)
       text_embeds: float16 numpy [B, seq, 7680] or None (if no Qwen3 cache)
       vae_latents: float16 numpy [B, 32, H/8, W/8] or None (if no VAE cache)
       siglip_feats:float16 numpy [B, 729, 1152] or None (if no SigLIP cache)
@@ -397,7 +394,7 @@ def make_prefetch_loader(
             # Pad target size by 32px for GPU random-crop augmentation
             pad_h, pad_w = bH + 32, bW + 32
 
-            imgs_buf, caps_buf, refs_buf = [], [], []
+            imgs_buf, caps_buf = [], []
             temb_buf, vlat_buf, sfeat_buf = [], [], []
 
             for rec in records:
@@ -408,12 +405,6 @@ def make_prefetch_loader(
 
                 # Resize to padded bucket size
                 img = _resize_to_bucket(img, pad_h, pad_w)
-
-                # Null conditioning dropout (decided here, outside MLX compiled region)
-                if rng.random() < image_dropout_prob:
-                    style_ref = np.zeros_like(img)
-                else:
-                    style_ref = img  # _normalize() returns a fresh array; no copy needed
 
                 caption = rec["txt"]
                 if rng.random() < text_dropout_prob:
@@ -429,7 +420,6 @@ def make_prefetch_loader(
                 siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
 
                 imgs_buf.append(_normalize(img))
-                refs_buf.append(_normalize(style_ref))
                 caps_buf.append(caption)
                 temb_buf.append(text_emb)
                 vlat_buf.append(vae_lat)
@@ -457,13 +447,12 @@ def make_prefetch_loader(
                     sample_q.put((
                         np.stack(imgs_buf),     # [B, C, H+32, W+32]
                         list(caps_buf),
-                        np.stack(refs_buf),
                         t_arr,
                         v_arr,
                         s_arr,
                         (bH, bW),
                     ))
-                    imgs_buf, caps_buf, refs_buf = [], [], []
+                    imgs_buf, caps_buf = [], []
                     temb_buf, vlat_buf, sfeat_buf = [], [], []
 
     threading.Thread(target=shard_loader, daemon=True).start()

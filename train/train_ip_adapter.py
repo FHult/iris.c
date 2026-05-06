@@ -664,7 +664,6 @@ def train(config: dict) -> None:
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
-        image_dropout_prob=tcfg["image_dropout_prob"],
         text_dropout_prob=tcfg["text_dropout_prob"],
         sample_buffer=dcfg.get("prefetch_batches", 6),
         qwen3_cache_dir=dcfg.get("qwen3_cache_dir"),
@@ -996,7 +995,7 @@ def train(config: dict) -> None:
     _hb_siglip_cov = 100.0   # last known from log block; 100% until first log fires
     _hb_loader_pct = 0.0     # last known from log block
 
-    for images_np, captions, style_refs_np, text_np, vae_np, siglip_np, bucket_hw in loader:
+    for images_np, captions, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= _end_step:
             break
 
@@ -1049,15 +1048,17 @@ def train(config: dict) -> None:
         elif siglip is not None:
             siglip_feats = siglip(images)
         else:
-            # Cache miss — use zero features (neutral image conditioning).
-            # Happens when siglip precompute is partial; treated as null-image dropout.
+            # Cache miss with no live encoder — force null image conditioning so
+            # the adapter sees exact zeros after mx.where, not Perceiver(zeros).
             if not _siglip_first_miss_logged:
                 print(f"  WARNING: SigLIP cache miss at step {step} — "
-                      f"falling back to zero features. Check siglip precompute coverage.",
+                      f"forcing null-image conditioning. Check siglip precompute coverage.",
                       flush=True)
                 _siglip_first_miss_logged = True
-            B = images.shape[0]
-            siglip_feats = mx.zeros((B, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            B_miss = images.shape[0]
+            siglip_feats = mx.zeros((B_miss, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            null_image = True
+            use_null_image = mx.array(True)
             _siglip_miss_steps += 1  # T-10
 
         _t_prep += time.time() - _t0
