@@ -298,11 +298,31 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
             n_hard = _count_hard_examples_for_chunk(chunk)
             if n_hard == 0:
                 hard_dir = HARD_EX_DIR / f"chunk{chunk}"
-                _add("CRITICAL", "phantom", f"Chunk {chunk} mine.done but 0 hard-example files",
-                     detail=f"Expected .tar files in {hard_dir}",
-                     fix=f"rm {SENTINEL_DIR}/chunk{chunk}/mine.done",
-                     chunk=chunk,
-                     ctx={"hard_ex_count": 0})
+                # Hard examples from chunk N feed into chunk N+1 training.
+                # If N+1 training is already done or in progress they were
+                # consumed (or deliberately skipped on restart) — downgrade
+                # to INFO rather than CRITICAL.
+                next_chunk = chunk + 1
+                next_train_done    = is_done(next_chunk, "train")
+                next_train_active  = heartbeat_age_secs("trainer", next_chunk) is not None
+                if next_train_done or next_train_active:
+                    _add("INFO", "phantom",
+                         f"Chunk {chunk} mine.done but 0 hard-example files "
+                         f"(chunk {next_chunk} training {'complete' if next_train_done else 'in progress'} — no longer needed)",
+                         detail=f"Hard examples in {hard_dir} are absent but chunk {next_chunk} "
+                                f"training has already started so they cannot be mixed in. "
+                                f"This is expected after a restart-from-chunk or manual sentinel backfill.",
+                         chunk=chunk,
+                         ctx={"hard_ex_count": 0, "next_chunk_trained": True})
+                else:
+                    _add("CRITICAL", "phantom",
+                         f"Chunk {chunk} mine.done but 0 hard-example files",
+                         detail=f"Expected .tar files in {hard_dir}. "
+                                f"mine.done was written but the extraction produced nothing, "
+                                f"or the directory was deleted after mining completed.",
+                         fix=f"rm {SENTINEL_DIR}/chunk{chunk}/mine.done",
+                         chunk=chunk,
+                         ctx={"hard_ex_count": 0, "next_chunk_trained": False})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
