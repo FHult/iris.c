@@ -27,6 +27,7 @@ Active scripts (all in `train/scripts/`):
 
 | Script | Role |
 |--------|------|
+| `start_pipeline.sh` | Orchestrator start script; invokes setup wizard on first run |
 | `orchestrator.py` | State machine — drives all pipeline steps end-to-end |
 | `download_convert.py` | Download + convert JDB tgzs (launched by orchestrator) |
 | `downloader.py` | Per-source download worker (imported by download_convert.py) |
@@ -112,22 +113,20 @@ PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke \
 
 ### `start` — Start or resume the orchestrator
 
-**Preferred — use `pipeline_ctl.py` (wraps with `caffeinate -dim`, manages the tmux window):**
 ```bash
-# Create the tmux session if it doesn't exist yet, then start:
-tmux new-session -d -s iris -n iris-orch 2>/dev/null || true
-PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
-  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator
+# Default (DATA_ROOT=/Volumes/2TBSSD, auto-detects active config):
+./train/start_pipeline.sh
+
+# With explicit data root or config:
+./train/start_pipeline.sh --data-root /Volumes/2TBSSD
+./train/start_pipeline.sh --config train/configs/v2_pipeline_smoke.yaml
+./train/start_pipeline.sh --data-root /Volumes/2TBSSD/smoke --config train/configs/v2_pipeline_smoke.yaml
 ```
 
-**Smoke test (full pipeline at tiny scale):**
+`start_pipeline.sh` handles tmux session creation, `caffeinate -dim` wrapping, and config resolution. If no active config exists it prompts to run the setup wizard. To bypass the script and call pipeline_ctl directly:
 ```bash
-tmux new-session -d -s iris -n iris-orch 2>/dev/null || true
-tmux send-keys -t iris:iris-orch \
-  "PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke caffeinate -dim \
-   train/.venv/bin/python train/scripts/orchestrator.py --resume \
-   --config train/configs/v2_pipeline_smoke.yaml" \
-  Enter
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator --config train/configs/v2_pipeline.yaml
 ```
 
 The orchestrator is fully resumable — it reads `pipeline_state.json` and sentinels on startup and picks up from where it left off. You do not need to pass a resume checkpoint; the trainer discovers the latest checkpoint automatically.
@@ -148,8 +147,7 @@ PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
 
 Resume (restart the orchestrator — it picks up from state):
 ```bash
-PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
-  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator
+./train/start_pipeline.sh
 ```
 
 ---
@@ -344,12 +342,16 @@ ls /Volumes/2TBSSD/pipeline/chunk1/
 | `orchestrator.json` | orchestrator each poll | `step="poll"` |
 | `precompute_chunk{N}.json` | `precompute_all.py` | `done`, `total`, `pct`, `eta_sec`, `current_shard`, `current_phase` |
 | `prep_precompute_chunk{N}.json` | `precompute_all.py` | `status` (failed/running), `exit_code` |
-| `trainer_chunk{N}.json` | `train_ip_adapter.py` | `step`, `total_steps`, `loss`, `grad_norm`, `eta_sec`, `siglip_coverage_pct` |
+| `trainer_chunk{N}.json` | `train_ip_adapter.py` | `step`, `total_steps`, `loss`, `grad_norm`, `eta_sec`, `siglip_coverage_pct`, `loss_cond`, `loss_null`, `ip_scale_mean`, `ip_scale_double`, `ip_scale_single` |
 | `build_shards_chunk{N}.json` | `build_shards.py` | `done`, `total`, `pct` |
 | `download_convert_chunk{N}.json` | `download_convert.py` | `done`, `total`, `pct`, `phase`, `current_tgz`, `dl_speed_mbps` |
 | `filter_shards_chunk{N}.json` | `filter_shards.py` | `done`, `total`, `pct` |
 | `clip_dedup_chunk{N}.json` | `clip_dedup.py` | `done`, `total`, `pct` |
 | `mine_hard_examples_chunk{N}.json` | `mine_hard_examples.py` | `done`, `total`, `pct` |
+
+**Conditioning health fields** (present from chunk 4 onwards; null in older heartbeats):
+- `loss_cond` / `loss_null` — average loss this log window for conditioned vs unconditioned batches. Gap = `loss_null - loss_cond`; should grow positive after ~1000 steps. Zero gap = adapter not learning.
+- `ip_scale_mean` / `ip_scale_double` / `ip_scale_single` — mean of `adapter.scale` across all 25 blocks, double-stream only (0–4), and single-stream only (5–24). Healthy range: 0.3–1.0. Above 2.0 = content leakage risk. Near zero = adapter inactive.
 
 To inspect a heartbeat directly:
 ```bash

@@ -261,13 +261,14 @@ Returns a JSON blob with `ready`, `checks`, `dirs`, `existing_state`, and `comma
 
 ### Starting the Pipeline
 
-After running the setup wizard:
+After running the setup wizard, or to resume an existing run:
 
 ```bash
-PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
-  train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator \
-  --config train/configs/v2_pipeline_active.yaml
+./train/start_pipeline.sh
 ```
+
+The script detects the active config automatically. Pass `--data-root` or `--config` to override.
+If no active config exists, it prompts to run the setup wizard first.
 
 ### Pipeline Steps (per chunk)
 
@@ -288,6 +289,7 @@ Each step writes a sentinel file under `{DATA_ROOT}/pipeline/chunk{N}/{step}.don
 | EMA checkpoint | `training.mine_use_ema: true` | Uses EMA weights for mining loss evaluation — more stable than raw checkpoint. |
 | CLIP dedup | `skip_dedup: false` | Removes near-duplicate images (cosine > 0.95) before training. |
 | Anchor shard mixing | auto-populated after chunk 1 | 20% of each batch uses chunk 1 shards to prevent forgetting. |
+| Training observability | `loss_cond` / `loss_null` split, `ip_scale` per block group | Logged each `log_every` steps; surfaces in `pipeline_status.py` and doctor anomaly checks. Zero gap after step 1000 = adapter not learning. |
 
 `smoke` through `all-in` scales run with all quality features enabled. `dev` disables all of them for fastest turnaround.
 
@@ -308,12 +310,16 @@ train/.venv/bin/python train/scripts/pipeline_ctl.py abort
 
 # Restart from a specific chunk (restores archived checkpoint)
 train/.venv/bin/python train/scripts/pipeline_ctl.py restart-from-chunk 2
+
+# Populate anchor shards after chunk 1 completes
+train/.venv/bin/python train/scripts/pipeline_ctl.py populate-anchor-shards
 ```
 
 ### Pipeline Script Reference
 
 | Script | Role |
 |--------|------|
+| `start_pipeline.sh` | Start or resume the orchestrator; prompts for setup wizard on first run |
 | `pipeline_setup.py` | First-run wizard: validates environment, creates dirs, generates config |
 | `orchestrator.py` | State machine driving all pipeline steps end-to-end |
 | `pipeline_ctl.py` | Operator interface: pause / resume / abort / retry / status |
