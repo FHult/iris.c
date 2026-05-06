@@ -3,7 +3,7 @@
 
 recipe: ip_adapter_flux4b
 chunks: 4
-scale: small          # small | medium | large | all-in
+scale: small          # dev | smoke | small | medium | large | all-in
 poll_interval: 60     # orchestrator poll cycle in seconds
 
 anomaly:
@@ -23,6 +23,10 @@ training_config: train/configs/stage1_512px.yaml
 # JourneyDB tgz ranges per chunk per scale (0-indexed tgz numbers)
 jdb:
   tgz_ranges:
+    dev:
+      1: [0, 0]         # single tgz — minimum for a buildable checkpoint
+    smoke:
+      1: [0, 0]
     small:
       1: [0, 4]
       2: [50, 54]
@@ -46,6 +50,8 @@ jdb:
 
 # Fraction of LAION/COYO to use per scale (applied via effective chunk denominator)
 data_volume:
+  dev:    0.005
+  smoke:  0.005
   small:  0.10
   medium: 0.25
   large:  0.50
@@ -53,6 +59,7 @@ data_volume:
 
 training:
   mine_use_ema: true            # use EMA weights for hard-example scoring (recommended)
+  mine: true                    # set false to skip mining entirely (e.g. dev scale)
   hard_mix_ratio: 0.05          # default for all chunks
   # Per-chunk overrides: higher ratio for later chunks whose hard examples
   # were mined from a stronger checkpoint.  Omit a chunk to use the default.
@@ -62,8 +69,27 @@ training:
     4: 0.15
   siglip: true        # SigLIP precompute enabled (~420 GB extra)
 
+  # Hard-example mining eval budget per scale.
+  # Records sampled for loss ranking; higher = better coverage of hard tail.
+  mine_eval_records:
+    smoke:  500
+    small:  10000
+    medium: 20000
+    large:  30000
+    all-in: 50000
+
+  # Top-K hard examples extracted per mining run.
+  mine_top_k:
+    smoke:  200
+    small:  2000
+    medium: 3000
+    large:  5000
+    all-in: 8000
+
   # Steps per chunk per scale
   steps:
+    smoke:
+      1: 100
     small:
       1: 50000
       2: 15000

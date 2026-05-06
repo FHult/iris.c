@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, SENTINEL_DIR,
     TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, SCRIPTS_DIR, TRAIN_DIR,
-    CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR,
+    CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso,
 )
@@ -247,6 +247,41 @@ def cmd_restart_from_chunk(args) -> None:
     cmd_restart_orchestrator(args)
 
 
+def cmd_populate_anchor_shards(args) -> None:
+    """Copy every Nth shard from SHARDS_DIR to ANCHOR_SHARDS_DIR.
+
+    Used to manually populate anchor shards when the orchestrator's
+    auto-populate (PIPELINE-17) did not run or ran against the wrong shards.
+    Anchor shards are mixed into chunk 2+ training to prevent forgetting.
+    """
+    import shutil
+    rate = args.rate
+    force = args.force
+
+    if not SHARDS_DIR.exists() or not any(SHARDS_DIR.glob("*.tar")):
+        print(f"No shards found in {SHARDS_DIR}")
+        return
+
+    shards = sorted(SHARDS_DIR.glob("*.tar"))
+    selected = shards[::rate]
+
+    if ANCHOR_SHARDS_DIR.exists() and any(ANCHOR_SHARDS_DIR.glob("*.tar")):
+        existing = list(ANCHOR_SHARDS_DIR.glob("*.tar"))
+        if not force:
+            print(f"Anchor shards already populated ({len(existing)} tars). "
+                  f"Use --force to overwrite.")
+            return
+        print(f"Clearing {len(existing)} existing anchor shards (--force)")
+        for f in existing:
+            f.unlink()
+
+    ANCHOR_SHARDS_DIR.mkdir(parents=True, exist_ok=True)
+    for shard in selected:
+        shutil.copy2(shard, ANCHOR_SHARDS_DIR / shard.name)
+    print(f"Populated {len(selected)} anchor shards (1/{rate} sample of "
+          f"{len(shards)} shards) → {ANCHOR_SHARDS_DIR}")
+
+
 def cmd_status(args) -> None:
     """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
     import subprocess
@@ -333,6 +368,13 @@ def main() -> None:
     p = sub.add_parser("dispatch-resolve-all", help="Resolve all open dispatch issues")
     p.add_argument("--chunk", type=int, default=None, help="Limit to a specific chunk")
 
+    p = sub.add_parser("populate-anchor-shards",
+                       help="Sample production shards into anchor_shards/ for chunk 2+ training")
+    p.add_argument("--rate", type=int, default=10,
+                   help="Copy every Nth shard (default: 10 = 10%% of shards)")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite existing anchor shards")
+
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
@@ -348,6 +390,7 @@ def main() -> None:
         "dispatch-read":           cmd_dispatch_read,
         "dispatch-resolve":        cmd_dispatch_resolve,
         "dispatch-resolve-all":    cmd_dispatch_resolve_all,
+        "populate-anchor-shards":  cmd_populate_anchor_shards,
     }
     handlers[args.command](args)
 

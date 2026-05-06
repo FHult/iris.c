@@ -1,0 +1,55 @@
+# V2 pipeline dev/integration configuration
+# Purpose: produce a trained checkpoint as fast as possible for iris.c binary
+# integration testing (checkpoint format, LoRA compatibility, inference path).
+# NOT for ML quality assessment — all quality features are disabled.
+#
+# Run with:
+#   PIPELINE_DATA_ROOT=/Volumes/2TBSSD/dev \
+#     train/.venv/bin/python train/scripts/orchestrator.py --resume \
+#     --config train/configs/v2_pipeline_dev.yaml
+#
+# Differences from smoke:
+#   - siglip: false  — skips 115 GB precompute and SigLIP conditioning
+#   - mine: false    — skips hard-example mining entirely
+#   - skip_dedup: true — skips CLIP embed / index / find-dups (saves ~30 min)
+#   - 200 training steps — smallest checkpoint that passes weight validation
+
+recipe: ip_adapter_flux4b
+chunks: 1
+scale: dev
+poll_interval: 10
+
+model:
+  flux_model: flux-klein-model
+
+training_config: train/configs/stage1_512px.yaml
+
+download:
+  jdb_only: true        # skip WikiArt (66 GB) and LAION/COYO
+
+skip_dedup: true         # skip CLIP embed / index / find-dups pipeline steps
+
+jdb:
+  tgz_ranges:
+    dev:
+      1: [0, 0]         # single tgz — minimum dataset
+
+data_volume:
+  dev: 0.005            # LAION/COYO absent, downloader warns and skips gracefully
+
+precompute:
+  max_shards: 1         # 1 shard (~5000 images) — enough for a valid checkpoint
+
+training:
+  siglip: false         # no SigLIP precompute or conditioning
+  mine: false           # no hard-example mining
+  mine_use_ema: false
+  hard_mix_ratio: 0.0   # no hard examples available
+  anchor_sample_rate: 0 # no anchor shard population
+
+  steps:
+    dev:
+      1: 200            # just enough for a non-trivial checkpoint
+
+  lr:
+    1: 1.0e-4

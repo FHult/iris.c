@@ -32,8 +32,12 @@ precompute:
   max_shards: 1     # limit to 1 shard (~5000 images) to keep smoke precompute fast
 
 training:
+  mine_use_ema: true            # exercises EMA checkpoint path
+  mine: true
   hard_mix_ratio: 0.05
-  siglip: false
+  siglip: true                  # exercises full precompute + mining path
+  mine_eval_records: 500        # small budget — covers the code path
+  mine_top_k: 200
 
   steps:
     smoke:

@@ -1197,6 +1197,15 @@ class Orchestrator:
     def _start_mining(self, chunk: int) -> None:
         if is_done(chunk, "mine") or self._prep_busy():
             return
+
+        training_cfg = self.cfg.get("training", {})
+
+        # Allow operators to disable mining entirely (e.g. dev/integration runs).
+        if not training_cfg.get("mine", True):
+            log_orch(f"Chunk {chunk}: mining disabled in config — skipping", chunk=chunk)
+            mark_done(chunk, "mine")
+            return
+
         if not gpu_is_free():
             return
         if not self.res.request("GPU_TOKEN", f"mine chunk {chunk}"):
@@ -1212,21 +1221,41 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: mining hard examples", chunk=chunk)
         out = HARD_EX_DIR / f"chunk{chunk}"
         out.mkdir(parents=True, exist_ok=True)
-        flux_model   = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
-        qwen3_cache  = PRECOMP_DIR / "qwen3"
-        vae_cache    = PRECOMP_DIR / "vae"
-        log_file     = LOG_DIR / f"mine_chunk{chunk}.log"
-        use_ema_flag = ("--use-ema "
-                        if self.cfg.get("training", {}).get("mine_use_ema", False)
-                        else "")
+        flux_model  = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
+        qwen3_cache = PRECOMP_DIR / "qwen3"
+        vae_cache   = PRECOMP_DIR / "vae"
+        log_file    = LOG_DIR / f"mine_chunk{chunk}.log"
+        use_ema_flag = "--use-ema " if training_cfg.get("mine_use_ema", False) else ""
+
+        # Use precomputed SigLIP features when available — aligns mining loss with
+        # training which conditions on real visual features.  Fall back to
+        # null-siglip only when siglip precompute is disabled or cache is absent.
+        siglip_cache = PRECOMP_DIR / "siglip"
+        if training_cfg.get("siglip", False) and siglip_cache.exists():
+            siglip_arg = f"--siglip-cache '{siglip_cache}' "
+        else:
+            siglip_arg = "--null-siglip "
+
+        # Eval budget: look up by scale (dict) or use flat value; 5000 default.
+        _ev = training_cfg.get("mine_eval_records", 5000)
+        eval_records = (
+            _ev.get(self.scale, _ev.get("default", 5000)) if isinstance(_ev, dict) else int(_ev)
+        )
+        _tk = training_cfg.get("mine_top_k", 2000)
+        top_k = (
+            _tk.get(self.scale, _tk.get("default", 2000)) if isinstance(_tk, dict) else int(_tk)
+        )
+
         cmd = self._python_cmd("mine_hard_examples.py",
                                f"--checkpoint '{best}' "
                                f"--shards '{SHARDS_DIR}' "
                                f"--qwen3-cache '{qwen3_cache}' "
                                f"--vae-cache '{vae_cache}' "
-                               f"--flux-model {flux_model} --null-siglip "
+                               f"--flux-model {flux_model} "
+                               f"{siglip_arg}"
                                f"--chunk {chunk} "
                                f"{use_ema_flag}"
+                               f"--eval-records {eval_records} --top-k {top_k} "
                                f"--output '{out}'")
         self._launch_prep(f"mine chunk {chunk}", cmd, log_file,
                           chunk, "mine", token="GPU_TOKEN")

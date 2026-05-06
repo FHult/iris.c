@@ -90,6 +90,12 @@
 
 - ~~**PIPELINE-20: Structured run metadata for each pipeline execution**~~ ✅ DONE — Orchestrator writes `run_metadata.json` at start (run_id, scale, total_chunks, config snapshot) and appends `completed_at` + `final_checkpoint` + `run_summary` path on pipeline completion.
 
+- ~~**PIPELINE-19: Use precomputed SigLIP features in hard-example mining**~~ ✅ DONE — `_start_mining()` in `orchestrator.py` now passes `--siglip-cache '{PRECOMP_DIR}/siglip'` when `training.siglip: true` and the cache dir exists, replacing the hardcoded `--null-siglip` flag. Mining loss now evaluates with real IP-adapter visual conditioning, matching the training distribution. Falls back to `--null-siglip` when siglip is disabled or the cache is absent.
+
+- ~~**PIPELINE-21: Configurable mining eval budget per scale**~~ ✅ DONE — `v2_pipeline.yaml` gains `training.mine_eval_records` and `training.mine_top_k` dicts keyed by scale (smoke: 500/200, small: 10000/2000, medium: 20000/3000, large: 30000/5000, all-in: 50000/8000). Orchestrator reads these with scale lookup and passes `--eval-records` / `--top-k` to `mine_hard_examples.py`. Falls back to script defaults if keys absent.
+
+- ~~**PIPELINE-22: Dev/integration run scale**~~ ✅ DONE — `v2_pipeline_dev.yaml` added: 1 chunk, 200 steps, `skip_dedup: true`, `siglip: false`, `mine: false`. Produces a valid checkpoint in <2h from scratch for iris.c binary integration testing. `v2_pipeline_smoke.yaml` updated to enable all quality flags (`siglip: true`, `mine_use_ema: true`, `mine_eval_records: 500`, `mine_top_k: 200`). `pipeline_ctl.py populate-anchor-shards` command added for manual anchor shard population; auto-populated 6 anchor shards for the current production run.
+
 ---
 
 ## C Binary / CLI
