@@ -254,6 +254,52 @@ is learning style conditioning vs. doing nothing. These additions make that visi
   ```
   These two lines should be part of any non-resume reset rather than requiring manual execution.
 
+- **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** — currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion. There is no persistent raw pool. Consequences:
+  - Re-running any scale re-downloads all tgzs even if they were downloaded before.
+  - After a `large` run (200 tgzs) all raw data is gone; a subsequent `small` run re-downloads its subset from scratch.
+  - Scale changes cause confusion about which tgzs belong to which chunk because chunk-to-tgz mapping is scale-dependent.
+
+  **Proposed layout:**
+  ```
+  data_root/
+    raw/
+      journeydb/
+        000.tgz   ← persistent pool; never auto-deleted
+        001.tgz
+        …
+        201.tgz
+      journeydb_anno/
+        train_anno_realease_repath.jsonl.tgz  ← downloaded once, kept
+    staging/
+      chunk1/
+        raw/journeydb/
+          000.tgz → symlink or hardlink to raw/journeydb/000.tgz
+          001.tgz → …
+  ```
+
+  **Behaviour:**
+  - On download: if `raw/journeydb/{idx:03d}.tgz` already exists, skip HuggingFace fetch entirely.
+  - After conversion: do NOT delete `raw/journeydb/{idx}.tgz` (the pool copy). Delete only the staging symlink/hardlink.
+  - `pipeline_setup.py` (or orchestrator pre-flight) populates `staging/chunk{N}/raw/journeydb/` with symlinks to the pool subset that corresponds to the selected scale + chunk assignment. For a `small` run this means symlinking the 13 tgzs that belong to chunk 1 rather than all 50.
+  - If a tgz is missing from the pool at staging time, it is flagged for download; no silent re-download of already-present files.
+
+  **Chunk assignment stays scale-independent in the pool.** The pool is a flat list of all tgz indices ever downloaded (000–201 for a full JDB run). Which indices are assigned to which chunk is purely a staging concern — `jdb_tgz_ranges()` maps scale+chunk → index range, and the setup step symlinks that subset.
+
+  **Setup wizard integration (PIPELINE-24):**
+  - During reset (full or partial), staging symlinks are deleted but the pool directory is preserved.
+  - When the user switches from `large` to `small`, setup shows: `"Raw pool: 200 tgzs present. Chunk 1 (small scale) needs 000–012 — all present, no download needed."` rather than silently re-downloading.
+
+  **`--pool-dir` override:** allow the raw pool to live on a different volume from `data_root` (e.g. a cheap spinning disk) via a config key `download.pool_dir` or CLI flag. Defaults to `data_root/raw/journeydb/`.
+
+  **Annotation file:** same treatment — `raw/journeydb_anno/` is the pool copy; staging symlinks to it. Currently it is re-downloaded to each chunk's `raw/` directory.
+
+  **Implementation scope:**
+  - `downloader.py`: `_hf_download_file_guarded()` — check pool first; download to pool, not staging.
+  - `download_convert.py`: `run_jdb_download_convert()` — create staging symlinks before producer loop; remove symlink (not pool file) after successful conversion.
+  - `pipeline_setup.py`: add a "populate staging symlinks" step; report pool coverage vs. scale requirement.
+  - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
+  - PIPELINE-24 purge logic: `full` reset removes staging but not pool; only an explicit `--purge-pool` flag clears the pool.
+
 ---
 
 ## C Binary / CLI
