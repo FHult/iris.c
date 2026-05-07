@@ -6,19 +6,19 @@ Empirical findings and strategic analysis for the precompute + training pipeline
 
 ## Dataset vs Training Coverage
 
-### Actual numbers (chunk 1)
+### Actual numbers (chunk 1, large scale default)
 
 | Metric | Value |
 |---|---|
-| Chunk 1 shards | 432 |
+| Chunk 1 shards (full pool) | 432 |
 | Chunk 1 images | ~2.15M (avg 4,970/shard) |
-| Stage 1 training samples (current plan) | 105K steps × batch=2 = **210K** |
-| Shards actually consumed | **~42** (of 432) |
-| Image coverage | **~10%** |
+| Stage 1 training samples | 200K steps × batch=2 = **400K** |
+| Shards precomputed (`precompute.max_shards: 80`) | **~80** (of 432) |
+| Image coverage | **~19%** |
 
-The plan document claims "78 visits per image over 120K steps" — this is wrong at
-the 2M-image scale. It was written for a small pilot (~3K images). At the actual
-scale, most images are never seen.
+Early planning documents claimed "78 visits per image over 120K steps" — that was
+written for a small pilot (~3K images). At the 2M-image scale, most images are
+never seen even at 200K steps.
 
 ---
 
@@ -44,35 +44,26 @@ diversity is what enables handling reference images never seen during training.
 
 **Conclusion: more unique images seen once > fewer images seen many times.**
 
-### Is 210K samples enough? Probably not.
+### Is 400K samples enough? Acceptable but not reference-class.
 
-Reference IP-Adapters used 1–10M+ training samples. At 210K:
-- The model likely learns basic style transfer
-- It will underfit on unusual artistic styles underrepresented in the sample draw
-- Style fidelity will be inconsistent across reference image types
-- The current step count (105K) is too low for the dataset size
+Reference IP-Adapters used 1–10M+ training samples. At 400K:
+- The model learns reliable style transfer across common artistic styles
+- Unusual or underrepresented styles may show weaker fidelity
+- Good balance between quality and training time on M1 Max
 
-### Should we increase steps?
-
-Yes, but paired with more shards — increasing steps alone on 42 shards overfits
-those shards. The right formula:
+Quality vs time tradeoff on M1 Max (1.5s/step, sizing formula below):
 
 ```
 target_unique_samples × (1.5–2.5 passes) = total_training_samples
 total_training_samples / batch_size = num_steps
 ```
 
-Quality vs time tradeoff on M1 Max (1.5s/step):
-
 | Steps | Wall clock | Shards needed | Unique images | Quality |
 |---|---|---|---|---|
-| 105K (current plan) | 44h | 42 | 70K | Marginal |
-| 200K | 83h | 80 | 133K | Acceptable |
+| 105K | 44h | 42 | 70K | Marginal |
+| **200K** *(current default)* | **83h** | **80** | **133K** | **Acceptable** |
 | 400K | 7 days | 160 | 267K | Good |
 | 540K | 9.4 days | ALL (432) | 2.15M (0.5×) | Reference-class |
-
-**Recommended for chunk 1: increase to 200K steps with ~80 shards.** This doubles
-wall-clock training time but meaningfully improves quality without being excessive.
 
 ---
 
@@ -105,7 +96,7 @@ shards_needed = ceil((num_steps × batch_size) / avg_records_per_shard / 1.5_pas
 |---|---|---|---|---|---|
 | `small` | 50K | 15K | 21 | 7 | ~3 days |
 | `medium` | 105K | 40K | 43 | 17 | ~7 days |
-| `large` | 200K | 60K | 81 | 25 | ~11 days |
+| **`large`** *(default)* | **200K** | **60K** | **80** | **25** | **~9 days** |
 | `god-like` | 400K | 120K | 162 | 50 | ~18 days |
 | `all-in` | 540K | 200K | ALL | ALL | ~26 days |
 
@@ -113,8 +104,7 @@ shards_needed = ceil((num_steps × batch_size) / avg_records_per_shard / 1.5_pas
 for ~0.5 pass through 432 shards at batch=2. Actual coverage depends on total
 shards available when the pipeline runs.
 
-Recommended default: **`large`**.
-Compare to current plan: 225K steps, 38h precompute, 470K images at 9% coverage.
+Default: **`large`** — 200K chunk-1 steps, 80 stratified shards, ~2 weeks end-to-end.
 
 Total precompute: **~2.5 days** across all chunks vs **~28 days** (full precompute
 of all downloads across all chunks).
@@ -137,11 +127,9 @@ mixed at 20%) handles distribution shift.
 
 ### Starting training before precompute completes
 
-Training can start as soon as ~80 shards are precomputed. Currently 13 shards are
-done — wait for ~67 more (~26h at current rate) then begin chunk 1 training.
-
-The dataset loader cycles through available shards in epochs. Do not add new shards
-mid-run; restart from a checkpoint with the expanded shard list if needed.
+Training can start as soon as ~80 shards are precomputed. The dataset loader
+cycles through available shards in epochs. Do not add new shards mid-run; restart
+from a checkpoint with the expanded shard list if needed.
 
 ---
 
@@ -185,14 +173,16 @@ encoder (~15.5 GB saved). Implementation: `_load_flux_vae_only()` in
 
 ## Wall Clock Summary
 
-| Phase | Current plan | Recommended plan |
-|---|---|---|
-| Chunk 1 precompute | ~17h (42 shards) | ~31h (80 shards) |
-| Chunk 1 training | ~44h (105K steps) | ~83h (200K steps) |
-| Chunks 2-4 precompute | ~3× 4–7h | ~3× 10h |
-| Chunks 2-4 training | ~3× 25h (60K each) | ~3× 37h (90K each) |
-| **Total** | **~170h (~7 days)** | **~275h (~11 days)** |
+Large-scale default (200K chunk-1 steps, 80 shards), M1 Max throughput:
 
-4 extra days of wall clock for meaningfully better model quality. The increased
-step counts can run overnight in stages; the machine is not blocking anything else
-during training.
+| Phase | Time |
+|---|---|
+| Chunk 1 precompute | ~31h (80 shards × 23 min) |
+| Chunk 1 training | ~83h (200K steps × 1.5 s) |
+| Chunks 2-4 precompute | ~3× 10h (25 shards each) |
+| Chunks 2-4 training | ~3× 25h (60K steps each) |
+| Per-chunk pipeline overhead (download, clip, build, validate) | ~3× 15h |
+| **Total** | **~219h (~9 days training + precompute)** |
+
+Full end-to-end wall clock including data infrastructure: **~2 weeks.**
+Training steps can run overnight; the machine is not blocked during precompute.

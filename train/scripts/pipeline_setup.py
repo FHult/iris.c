@@ -108,7 +108,7 @@ RUN_SIZES = {
     "large": {
         "title": "High-quality adapter",
         "description": (
-            "Highest quality achievable on M1 Max within a few weeks.\n"
+            "Highest quality achievable on M1 Max in ~2 weeks.\n"
             "  50 % of the LAION dataset and a full JourneyDB half.\n"
             "  Requires ~1.2 TB free space."
         ),
@@ -117,7 +117,7 @@ RUN_SIZES = {
         "jdb_display": "25 tgzs per chunk",
         "laion_display": "50 %",
         "disk_gb": 1200,
-        "time_display": "~3–5 weeks",
+        "time_display": "~2 weeks",
         "quality_defaults": {"siglip": True, "mine": True, "dedup": True, "mine_use_ema": True},
         "standard_config": None,
     },
