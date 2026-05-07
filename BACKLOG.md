@@ -139,6 +139,55 @@ is learning style conditioning vs. doing nothing. These additions make that visi
   Candidate default once validated: `style_loss_weight: 0.05`, `style_loss_every: 1`.
   Note: style loss is skipped on null-image steps (correct — no reference to match against).
 
+- **QUALITY-9: Quality tracking script** — `train/scripts/quality_tracker.py`: aggregates per-checkpoint quality signals over time and produces an HTML report with inline charts plus a compact `--ai` JSON summary.
+
+  **Data sources to aggregate (all already exist):**
+  - `eval_results.json` files under `<checkpoint_dir>/eval/step_NNNNNNN/` — CLIP-I and CLIP-T per step (from `eval.py`)
+  - `val_loss.jsonl` under `<checkpoint_dir>/` — per-step holdout MSE loss
+  - Trainer heartbeat files — step, loss_smooth, loss_cond, loss_null, ip_scale_mean (snapshot of latest, not history)
+
+  **HTML report** — single self-contained file with inline JS charts (no external deps; use plain `<canvas>` or a small bundled charting snippet). Should show:
+  - Loss curves: `loss_smooth`, `loss_cond`, `loss_null`, `val_loss` vs step
+  - CLIP-I and CLIP-T vs step (points at eval checkpoints; interpolated line)
+  - `ip_scale_mean` / `ip_scale_double` / `ip_scale_single` vs step (scale health)
+  - Summary table: best CLIP-I checkpoint, best CLIP-T checkpoint, most recent val_loss
+
+  **`--ai` mode** — prints compact JSON to stdout, same spirit as `pipeline_doctor.py --ai`:
+  ```json
+  {
+    "summary": {
+      "steps_with_eval": 3,
+      "best_clip_i": {"step": 20000, "value": 0.312},
+      "best_clip_t": {"step": 30000, "value": 0.271},
+      "latest_val_loss": {"step": 25000, "value": 0.0821},
+      "trend_clip_i": "improving",
+      "trend_clip_t": "flat",
+      "trend_val_loss": "improving"
+    },
+    "top_action": "Run eval at step 30000 — 10000 steps since last eval point.",
+    "data_points": [...]
+  }
+  ```
+  Trends (`"improving"` / `"flat"` / `"regressing"`) derived from last 3 eval points.
+  `top_action` is a single sentence: the most useful next step for a human or AI agent.
+
+  **Usage:**
+  ```bash
+  python train/scripts/quality_tracker.py \
+      --checkpoint-dir /Volumes/2TBSSD/checkpoints/stage1 \
+      --output /tmp/quality_report.html
+
+  python train/scripts/quality_tracker.py \
+      --checkpoint-dir /Volumes/2TBSSD/checkpoints/stage1 \
+      --ai
+  ```
+
+  **Implementation notes:**
+  - Pure stdlib + json + os; no numpy/matplotlib required for the script itself (keep it fast to run)
+  - HTML chart via inline `<script>` using Chart.js from a CDN or a ~5 KB vanilla canvas fallback
+  - Should work even when only `val_loss.jsonl` exists and no eval has run yet (graceful partial output)
+  - `--ai` output must be valid JSON on stdout with nothing else; errors go to stderr
+
 ---
 
 ## C Binary / CLI
