@@ -129,6 +129,16 @@ is learning style conditioning vs. doing nothing. These additions make that visi
 
 - **QUALITY-7: Style transfer eval script** — `train/scripts/eval_style_transfer.py`: given a checkpoint + a fixed set of (prompt, reference_image) pairs, generate images with and without IP conditioning and report: CLIP-T (text following), CLIP-I (visual similarity to reference), and Gram-matrix style distance (VGG conv3 statistics) between generated and reference. Run after each chunk. The key signal: CLIP-T should stay high (≥ baseline), CLIP-I should increase, and Gram-distance should decrease as training progresses. Content leakage shows as CLIP-I increasing faster than Gram-distance improves. Integrates with `pipeline_validate.sh` (Pipeline Scripts section).
 
+- **QUALITY-8: Validate and tune style_loss_weight** — The Gram matrix style loss (`style_loss_weight` in `stage1_512px.yaml`) is correctly implemented (centred Gram, unbiased x0 reconstruction via `reconstruct_x0()`) but has never been run at non-zero weight. Default is 0.0. Before enabling for a full production run, validate on a dev or smoke scale job:
+  1. Set `style_loss_weight: 0.05` and run for ~500 steps.
+  2. Check that `style_loss` (logged each interval) trends downward alongside `loss_cond`.
+  3. Check that `grad_norm` does not spike or stay elevated (would indicate weight too high).
+  4. Check that the `loss_cond`/`loss_null` gap opens faster than a baseline run without style loss.
+  If clean at 0.05, promote to default for production runs (style isolation is the goal of `--sref`).
+  If neutral or noisy, keep at 0.0 and revisit after a baseline chunk-1 checkpoint exists to compare against.
+  Candidate default once validated: `style_loss_weight: 0.05`, `style_loss_every: 1`.
+  Note: style loss is skipped on null-image steps (correct — no reference to match against).
+
 ---
 
 ## C Binary / CLI
