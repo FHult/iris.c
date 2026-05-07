@@ -1319,7 +1319,7 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     # Active prep step: check precompute/mine/validate heartbeats
     active_prep: Optional[dict] = None
     for c in chunks:
-        for step, process in [("precompute", "precompute"), ("mine", "mining"), ("validate", "validate")]:
+        for step, process in [("precompute", "precompute"), ("mine", "mine_hard_examples"), ("validate", "validate")]:
             if is_done(c, step) or has_error(c, step):
                 continue
             hb = read_heartbeat(process, c)

@@ -213,7 +213,7 @@ def _active_step_for(chunk_status: dict, prep_running: bool, train_running: bool
                 return "download"
         return ""
     if state in ("TRAINING", "MINING", "VALIDATING"):
-        return state.lower()
+        return {"TRAINING": "training", "MINING": "mine", "VALIDATING": "validating"}[state]
     # Prep pipeline states: return first pending step — where the chunk currently sits
     return next((s for s in CHUNK_STEPS if steps[s] == "pending"), "")
 
@@ -482,6 +482,12 @@ def print_human(status: dict, verbose: bool = False) -> None:
                         eta_sec = hb.get("eta_sec", 0)
                         eta_str2 = f"  ETA {int(eta_sec//3600)}h{int((eta_sec%3600)//60)}m" if eta_sec > 60 else ""
                         print(f"    {active}: {done}/{total_n} shards ({pct:.0f}%){eta_str2}{detail}  hb {age_str} ago{stale_mark}")
+                    elif active == "mine":
+                        thresh  = hb.get("threshold_loss")
+                        eta_sec = hb.get("eta_sec", 0)
+                        thresh_str = f"  threshold={thresh:.4f}" if thresh is not None else ""
+                        eta_str2 = f"  ETA {_age_str(eta_sec)}" if eta_sec and eta_sec > 60 else ""
+                        print(f"    mine: {done}/{total_n} records ({pct:.0f}%){thresh_str}{eta_str2}  hb {age_str} ago{stale_mark}")
                     else:
                         print(f"    {active}: {done}/{total_n} ({pct:.0f}%)  hb {age_str} ago{stale_mark}")
 

@@ -470,12 +470,19 @@ def main():
     done = 0
     skipped = 0
     eval_done_event = threading.Event()
+    _threshold = [0.0]   # shared with heartbeat thread via mutable container
+    _start_time = [time.time()]
 
     def _heartbeat_loop():
         while not eval_done_event.is_set():
+            elapsed = time.time() - _start_time[0]
+            rate = done / elapsed if elapsed > 0 and done > 0 else 0
+            eta = int((n_eval - done) / rate) if rate > 0 and done < n_eval else None
             write_heartbeat("mine_hard_examples", args.chunk,
                             done=done, total=n_eval,
-                            pct=round(done / n_eval * 100, 1) if n_eval else 100)
+                            pct=round(done / n_eval * 100, 1) if n_eval else 100,
+                            threshold_loss=round(_threshold[0], 4) if _threshold[0] else None,
+                            eta_sec=eta)
             time.sleep(30)
 
     hb = threading.Thread(target=_heartbeat_loop, daemon=True)
@@ -515,6 +522,7 @@ def main():
             done += 1
             if done % 100 == 0:
                 threshold = -heap[0][0] if heap else 0.0
+                _threshold[0] = threshold
                 print(f"  [{done}/{n_eval}]  skipped={skipped}  "
                       f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
 
@@ -560,9 +568,12 @@ def main():
     eval_done_event.set()
     if done % 100 != 0 and done > 0:
         threshold = -heap[0][0] if heap else 0.0
+        _threshold[0] = threshold
         print(f"  [{done}/{n_eval}]  skipped={skipped}  "
               f"top-{len(heap)} threshold loss={threshold:.4f}", flush=True)
-    write_heartbeat("mine_hard_examples", args.chunk, done=done, total=n_eval, pct=100)
+    write_heartbeat("mine_hard_examples", args.chunk, done=done, total=n_eval, pct=100,
+                    threshold_loss=round(_threshold[0], 4) if _threshold[0] else None,
+                    eta_sec=0)
 
     print(f"\nEval complete: {done} evaluated, {skipped} skipped, "
           f"{len(heap)} hard examples selected")
