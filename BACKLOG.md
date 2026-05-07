@@ -289,7 +289,11 @@ is learning style conditioning vs. doing nothing. These additions make that visi
   - During reset (full or partial), staging symlinks are deleted but the pool directory is preserved.
   - When the user switches from `large` to `small`, setup shows: `"Raw pool: 200 tgzs present. Chunk 1 (small scale) needs 000–012 — all present, no download needed."` rather than silently re-downloading.
 
-  **`--pool-dir` override:** allow the raw pool to live on a different volume from `data_root` (e.g. a cheap spinning disk) via a config key `download.pool_dir` or CLI flag. Defaults to `data_root/raw/journeydb/`.
+  **`--pool-dir` override:** allow the raw pool to live on a different volume from `data_root` (e.g. a cheap spinning disk or NAS) via a config key `download.pool_dir` or CLI flag. Defaults to `data_root/raw/journeydb/`.
+
+  **Architectural note:** separating the immutable raw pool from ephemeral staging is the right foundation for two future directions:
+  - **Cheap bulk storage**: raw tgzs are read-once, large, and not latency-sensitive. They can live on spinning disk or a NAS mount while `staging/`, `shards/`, and `precomputed/` stay on fast NVMe. The `--pool-dir` flag makes this a one-line config change.
+  - **Containerisation / multinode**: containers can mount the raw pool as a read-only volume and write only to their own staging scratch. Multiple nodes can share one pool directory (NFS/object storage) and each populate independent staging from it without stepping on each other. The symlink-based staging population maps cleanly onto a container entrypoint that materialises the per-node working set at startup.
 
   **Annotation file:** same treatment — `raw/journeydb_anno/` is the pool copy; staging symlinks to it. Currently it is re-downloaded to each chunk's `raw/` directory.
 
