@@ -32,7 +32,7 @@ train/
     build_shards.py           WebDataset shard assembly
     filter_shards.py          Drop corrupt / small / bad-caption records
   configs/
-    v2_pipeline.yaml          Production pipeline config (chunks=4, scale=small default)
+    v2_pipeline.yaml          Production pipeline config (chunks=4, scale=large default)
     v2_pipeline_smoke.yaml    Smoke test config (1 chunk, 100 steps, all quality features)
     v2_pipeline_dev.yaml      Dev config (1 chunk, 200 steps, no quality features)
     stage1_512px.yaml         Training hyperparameters (lr, batch, warmup, log_every, …)

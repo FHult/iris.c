@@ -1,6 +1,7 @@
 # train/configs/stage1_512px.yaml
-# Stage 1 training configuration — 512px, ~105K steps
-# Expected wall-clock: ~1.84 days on M1 Max 32GB (scenario B: Qwen3+VAE pre-computed)
+# Stage 1 training configuration — 512px
+# Default (large scale, chunk 1): 200K steps, ~3.5 days on M1 Max 32GB
+# num_steps here is the direct-run default only; the pipeline overrides it via --max-steps.
 
 model:
   flux_model_dir: "flux-klein-model"       # path to Flux Klein 4B weights
@@ -32,7 +33,7 @@ data:
   num_prefetch_threads: 2
 
 training:
-  num_steps: 105000
+  num_steps: 200000
   warmup_steps: 1000
   learning_rate: 1.0e-4
   weight_decay: 1.0e-2

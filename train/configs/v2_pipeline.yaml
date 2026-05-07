@@ -3,7 +3,7 @@
 
 recipe: ip_adapter_flux4b
 chunks: 4
-scale: small          # dev | smoke | small | medium | large | all-in
+scale: large          # dev | smoke | small | medium | large | all-in
 poll_interval: 60     # orchestrator poll cycle in seconds
 
 anomaly:
@@ -117,3 +117,11 @@ training:
     2: 3.0e-5
     3: 1.0e-5
     4: 1.0e-5
+
+# Precompute shard cap per scale: large/all-in produce many more shards than needed
+# for training; cap precompute so disk and wall-clock stay bounded.
+# null (or omitted) = precompute all available shards.
+precompute:
+  max_shards:
+    large: 80
+    all-in: 120

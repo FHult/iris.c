@@ -940,7 +940,8 @@ class Orchestrator:
         if not flux_model_path.is_absolute():
             flux_model_path = TRAIN_DIR.parent / flux_model_name
         flux_model_arg = f"--flux-model '{flux_model_path}'" if flux_model_path.exists() else ""
-        max_shards = self.cfg.get("precompute", {}).get("max_shards", None)
+        max_shards_raw = self.cfg.get("precompute", {}).get("max_shards", None)
+        max_shards = max_shards_raw.get(self.scale) if isinstance(max_shards_raw, dict) else max_shards_raw
         max_shards_arg = f"--max-shards {max_shards}" if max_shards else ""
         log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
         log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
@@ -1000,7 +1001,8 @@ class Orchestrator:
         # only that many shards are precomputed intentionally; use that as the
         # expected count so smoke/limited runs don't trip this check.
         n_shards = sum(1 for _ in shard_src.glob("*.tar"))
-        max_shards_cfg = self.cfg.get("precompute", {}).get("max_shards")
+        max_shards_raw = self.cfg.get("precompute", {}).get("max_shards")
+        max_shards_cfg = max_shards_raw.get(self.scale) if isinstance(max_shards_raw, dict) else max_shards_raw
         n_expected_shards = min(n_shards, max_shards_cfg) if max_shards_cfg else n_shards
         if n_expected_shards > 0:
             shard_size = self.cfg.get("data", {}).get("shard_size", 5000)

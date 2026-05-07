@@ -563,7 +563,7 @@ def run_interactive(args) -> int:
         print(f"  {dim('Scale pre-selected via --scale:')} {bold(scale)}")
         print()
     else:
-        default_idx = sizes.index("small") + 1
+        default_idx = sizes.index("large") + 1
         while True:
             raw = _ask(f"  Choose scale [1–{len(sizes)}]", str(default_idx))
             try:

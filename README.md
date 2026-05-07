@@ -256,7 +256,7 @@ Returns a JSON blob with `ready`, `checks`, `dirs`, `existing_state`, and `comma
 | `smoke` | 1 | 100 | ~40 GB | ~6 h | Full-pipeline validation — all quality features |
 | `small` | 4 | 95 K total | ~250 GB | ~3–4 days | First quality checkpoint |
 | `medium` | 4 | 225 K total | ~600 GB | ~10–14 days | Production quality |
-| `large` | 4 | 380 K total | ~1.2 TB | ~3–5 weeks | High quality |
+| **`large`** *(default)* | 4 | 380 K total | ~1.2 TB | ~3–5 weeks | High quality |
 | `all-in` | 4 | 1.14 M total | ~2.2 TB | ~2–3 months | Maximum quality |
 
 ### Starting the Pipeline
