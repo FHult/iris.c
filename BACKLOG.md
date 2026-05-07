@@ -188,6 +188,31 @@ is learning style conditioning vs. doing nothing. These additions make that visi
   - Should work even when only `val_loss.jsonl` exists and no eval has run yet (graceful partial output)
   - `--ai` output must be valid JSON on stdout with nothing else; errors go to stderr
 
+- **PIPELINE-23: Standardise `--ai` mode across all pipeline scripts** — reduce AI agent token cost when polling pipeline state. Currently only `pipeline_doctor.py` and `pipeline_setup.py` have `--ai`. All scripts that produce human-readable output should emit compact JSON instead when `--ai` is passed.
+
+  **Scripts that need `--ai` added:**
+
+  | Script | Current output | `--ai` JSON shape |
+  |--------|---------------|-------------------|
+  | `pipeline_status.py` | Rich text: chunks, heartbeats, log tails | `{step, loss, eta_sec, chunks_done, active_chunk, issues[]}` |
+  | `orchestrator.py` | Logs decisions to file; no stdout polling interface | `{state, active_chunk, last_poll_age_sec, pending_action}` (read-only snapshot; does not start the orchestrator) |
+  | `pipeline_ctl.py` | Mix of prose + subprocess output | Each sub-command (`status`, `pause`, `resume`, `abort`, `retry`) emits `{ok, message}` |
+  | `validator.py` | Prose pass/fail report | `{passed, issues[], clip_i_mean, weight_ok}` |
+  | `validate_shards.py` | Per-shard pass/fail lines | `{total, passed, failed, corrupt_paths[]}` |
+  | `validate_weights.py` | Prose weight sanity output | `{passed, issues[]}` |
+  | `mine_hard_examples.py` | Progress + top-k stats | `{done, total, pct, top_k_loss_mean}` (append `--ai` to get final-state snapshot) |
+  | `precompute_all.py` | Per-shard progress | `{done, total, pct, eta_sec, errors[]}` |
+
+  **Contract (same as `pipeline_doctor.py --ai`):**
+  - `--ai` flag: valid JSON to stdout, nothing else. All progress/prose goes to stderr.
+  - Top-level keys: always include `ok` (bool) or `passed` (bool) as the primary signal so callers can branch on one field.
+  - Errors during execution: `{"ok": false, "error": "<message>"}` on stdout; full traceback to stderr.
+  - No interactive prompts when `--ai` is set.
+
+  **Implementation approach:** each script gets a `def _ai_summary(...) -> dict` helper that collects the same data as the human path but returns a dict. `main()` branches on `args.ai`: human path prints prose, `--ai` path calls `_ai_summary()` and `json.dump`s the result. No shared library needed — the pattern is 10–20 lines per script.
+
+  **Priority order:** `pipeline_status.py` first (most frequently polled), then `validator.py` (called after each chunk), then the rest.
+
 ---
 
 ## C Binary / CLI
