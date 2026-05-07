@@ -57,6 +57,14 @@ output:
   keep_last_n: 5                            # recency window; up to 3 best-val-loss are also kept automatically
   log_every: 500
 
+eval:
+  enabled: false                             # set true to run eval every N steps
+  every_steps: 10000                         # how often to evaluate
+  num_steps: 4                               # denoising steps per sample (4 for distilled)
+  width: 512
+  height: 512
+  seed: 42
+
 logging:
   # wandb_project: "iris-ip-adapter"
   # wandb_run_name: "stage1-512px"

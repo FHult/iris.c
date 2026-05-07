@@ -477,6 +477,7 @@ def train(config: dict) -> None:
     tcfg = config["training"]
     ocfg = config["output"]
     lcfg = config.get("logging") or {}
+    ecfg = config.get("eval") or {}
 
     # ── Lineage base dict (MLX-10) ────────────────────────────────────────────
     # Written as a sidecar .json alongside each checkpoint for reproducibility.
@@ -1033,6 +1034,17 @@ def train(config: dict) -> None:
     except Exception:
         pass
 
+    # Eval hook (eval.py) — runs every _eval_every steps when enabled.
+    # Reuses the loaded flux model and current EMA params; does not reload weights.
+    _eval_enabled = ecfg.get("enabled", False)
+    _eval_every   = ecfg.get("every_steps", 10000)
+    _eval_prompts = os.path.join(
+        config.get("_config_dir", "."),
+        "eval_prompts.txt",
+    )
+    if _eval_enabled:
+        print(f"Eval hook: every {_eval_every} steps  prompts={_eval_prompts}", flush=True)
+
     # T-06: EMA vs online weight divergence
     ema_drift: float = 0.0
 
@@ -1543,6 +1555,37 @@ def train(config: dict) -> None:
                            eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
             except Exception:
                 pass
+
+        # Eval hook: generate images + compute CLIP-I/T every _eval_every steps.
+        # Runs after checkpoint save so the just-written checkpoint is coherent.
+        # Uses the in-memory flux model and current EMA params (no reload).
+        if _eval_enabled and step % _eval_every == 0 and step > 0:
+            try:
+                from eval import run_eval as _run_eval
+                _eval_out = os.path.join(ocfg["checkpoint_dir"], "eval", f"step_{step:07d}")
+                _eval_summary = _run_eval(
+                    flux=flux,
+                    adapter_cfg=acfg,
+                    adapter_params=dict(_flatten(ema_params)),
+                    prompts_file=_eval_prompts,
+                    output_dir=_eval_out,
+                    step=step,
+                    width=ecfg.get("width", 512),
+                    height=ecfg.get("height", 512),
+                    n_steps=ecfg.get("num_steps", 4),
+                    seed=ecfg.get("seed", 42),
+                    siglip_model_name=mcfg["siglip_model"],
+                    vae=flux.vae,
+                )
+                if wandb_run and _eval_summary:
+                    wandb_run.log(
+                        {"eval/clip_i": _eval_summary.get("mean_clip_i"),
+                         "eval/clip_t": _eval_summary.get("mean_clip_t")},
+                        step=step,
+                    )
+            except Exception as _eval_err:
+                print(f"  WARNING: eval hook failed at step {step}: {_eval_err}", flush=True)
+            mx.clear_cache()
 
         # Peak reset deferred until after checkpoint so the reported peak
         # covers the full interval (training + serialization spike).
@@ -2173,6 +2216,9 @@ def main():
         config["_chunk"] = args.chunk
     if args.chunk_base_step is not None:
         config["_chunk_base_step"] = args.chunk_base_step
+
+    # Store config directory so train() can locate sibling files (e.g. eval_prompts.txt).
+    config["_config_dir"] = str(Path(args.config).parent)
 
     if args.dry_run:
         print("Config OK:")
