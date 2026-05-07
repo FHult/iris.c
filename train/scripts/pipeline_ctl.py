@@ -68,7 +68,7 @@ def cmd_restart_orchestrator(_args) -> None:
     log_file = LOG_DIR / "orchestrator.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = (f"source '{TRAIN_DIR}/.venv/bin/activate' && "
-           f"caffeinate -dim python -u '{SCRIPTS_DIR}/orchestrator.py' --resume --config '{config}'")
+           f"caffeinate -dims python -u '{SCRIPTS_DIR}/orchestrator.py' --resume --config '{config}'")
     # If an old orch window exists, rename it so the session stays alive while we
     # create the replacement, then kill it after.
     if tmux_window_exists(TMUX_ORCH_WIN):
