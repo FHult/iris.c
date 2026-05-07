@@ -379,13 +379,13 @@ def _make_synthetic_shard(path: str, n_records: int = 5):
 
 
 class TestMakePrefetchLoader:
-    def test_yields_7_tuple(self, tmp_path):
+    def test_yields_6_tuple(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
         batch = next(iter(loader))
-        assert len(batch) == 7
+        assert len(batch) == 6
 
     def test_image_batch_shape(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")
@@ -393,10 +393,9 @@ class TestMakePrefetchLoader:
 
         bH, bW = 512, 512
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(bH, bW))
-        images, captions, style_refs, text_embs, vae_lats, siglip, bucket_hw = next(iter(loader))
+        images, captions, text_embs, vae_lats, siglip, bucket_hw = next(iter(loader))
 
         assert images.shape == (2, 3, bH + 32, bW + 32)
-        assert style_refs.shape == (2, 3, bH + 32, bW + 32)
         assert images.dtype == np.float32
 
     def test_captions_list_of_str(self, tmp_path):
@@ -423,7 +422,7 @@ class TestMakePrefetchLoader:
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
-        _, _, _, text_embs, vae_lats, siglip, _ = next(iter(loader))
+        _, _, text_embs, vae_lats, siglip, _ = next(iter(loader))
         assert text_embs is None
         assert vae_lats is None
         assert siglip is None

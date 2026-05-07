@@ -122,3 +122,34 @@ training:
 - Start with `style_loss_weight: 0.05` and monitor `loss_cond`/`loss_null` gap.
 - If `ip_scale_double` rises above 1.0, the weight may be too high (content leakage).
 - Combine with QUALITY-1 (cross-image reference permutation) for strongest style/content separation.
+
+---
+
+## Export
+
+Convert a trained checkpoint to an iris.c-loadable bundle:
+
+```bash
+# BF16 export (recommended)
+python train/export/export_adapter.py \
+    --checkpoint /Volumes/2TBSSD/checkpoints/stage1/step_050000.safetensors \
+    --output     /tmp/iris_ip_adapter/ \
+    --use-ema    --validate
+
+# INT8 export (~2× smaller)
+python train/export/export_adapter.py --checkpoint ... --output ... --quant int8
+
+# Style-only mode (zero double-stream blocks)
+python train/export/export_adapter.py --checkpoint ... --output ... --style-only
+```
+
+Output bundle:
+
+```
+adapter_weights.safetensors   — mmap-ready weight tensors
+adapter_meta.json             — dimensions, quant mode, provenance
+```
+
+See [export/README.md](export/README.md) for the full bundle format, quantisation
+comparison table, and C integration guide. See [export/iris_ip_adapter.h](export/iris_ip_adapter.h)
+for the C loader API.

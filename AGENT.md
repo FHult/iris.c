@@ -400,7 +400,7 @@ Returns one compact JSON blob: `summary` (disk, active training step/loss/ETA, p
 - Sentinel files: `/Volumes/2TBSSD/pipeline/chunk{N}/{step}.done|.error` — never infer step state from logs or heartbeats; always read sentinels. `derive_chunk_state(chunk)` in orchestrator.py is the canonical function.
 
 **Live progress**:
-- Heartbeat files: `/Volumes/2TBSSD/.heartbeat/{process}_chunk{N}.json` — written every ~60s by each worker. Contains `done`, `total`, `pct`, `eta_sec`, `current_shard`, and for trainer: `step`, `loss`, `grad_norm`, `siglip_coverage_pct`.
+- Heartbeat files: `/Volumes/2TBSSD/.heartbeat/{process}_chunk{N}.json` — written every ~60s by each worker. Contains `done`, `total`, `pct`, `eta_sec`, `current_shard`, and for trainer: `step`, `loss`, `grad_norm`, `siglip_coverage_pct`, `loss_cond`, `loss_null`, `ip_scale_mean`, `ip_scale_double`, `ip_scale_single`.
 - Status script: `train/.venv/bin/python train/scripts/pipeline_status.py` — reads sentinels + heartbeats + log tails. Use for live progress view; use the doctor for anomaly investigation.
 
 **Logs**:
@@ -409,6 +409,12 @@ Returns one compact JSON blob: `summary` (disk, active training step/loss/ETA, p
 
 **Escalated alerts (check after any anomaly)**:
 - `/Volumes/2TBSSD/logs/dispatch_queue.jsonl` — written by orchestrator for unresolvable problems (step failed twice, NaN loss, restart limit exceeded). **NOT shown by pipeline_status.py** (known gap).
+
+**Starting the orchestrator** — canonical command (handles tmux, caffeinate, config resolution):
+```bash
+./train/start_pipeline.sh
+```
+Pass `--data-root` or `--config` to override defaults. Replaces the manual tmux + pipeline_ctl sequence.
 
 **Stale state cleanup** — run this before any pipeline reset:
 ```bash

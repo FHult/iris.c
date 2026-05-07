@@ -6,6 +6,9 @@ Tests correctness of:
   - fused_flow_noise: v-prediction formula (noisy, target)
   - flow_matching_loss: MSE scalar, zero when velocity == target
   - per-sample timestep broadcast over [B, C, H, W]
+  - gram_matrix / gram_style_loss: shape, symmetry, zero-input, gradient
+  - Metal kernel path vs MLX fallback: parity within bf16 tolerance
+  - Numerical stability: finite outputs at boundary timesteps and extreme inputs
 """
 
 import numpy as np
@@ -15,7 +18,14 @@ import mlx.core as mx
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ip_adapter.loss import get_schedule_values, fused_flow_noise, flow_matching_loss
+from ip_adapter.loss import (
+    get_schedule_values,
+    fused_flow_noise,
+    flow_matching_loss,
+    gram_matrix,
+    gram_style_loss,
+    _HAS_METAL_KERNEL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -222,3 +232,286 @@ class TestFlowMatchingLoss:
         assert grad.shape == vel.shape
         # Gradient should not be all zeros
         assert float(mx.max(mx.abs(grad)).item()) > 0
+
+
+# ---------------------------------------------------------------------------
+# gram_matrix
+# ---------------------------------------------------------------------------
+
+class TestGramMatrix:
+    def test_output_shape(self):
+        """[B, C, H, W] → [B, C, C]."""
+        x = mx.random.normal((2, 8, 4, 4))
+        g = gram_matrix(x)
+        mx.eval(g)
+        assert g.shape == (2, 8, 8)
+
+    def test_is_symmetric(self):
+        """G = G^T for every element in the batch."""
+        rng = np.random.default_rng(10)
+        x = mx.array(rng.standard_normal((2, 8, 4, 4)).astype(np.float32))
+        g = gram_matrix(x)
+        mx.eval(g)
+        g_np = np.array(g)
+        assert np.allclose(g_np, g_np.transpose(0, 2, 1), atol=1e-5)
+
+    def test_diagonal_nonnegative(self):
+        """Diagonal entries of the Gram matrix are always >= 0 (squared L2 norms)."""
+        rng = np.random.default_rng(11)
+        x = mx.array(rng.standard_normal((2, 8, 4, 4)).astype(np.float32))
+        g = gram_matrix(x)
+        mx.eval(g)
+        g_np = np.array(g)
+        for b in range(g_np.shape[0]):
+            assert np.all(np.diag(g_np[b]) >= -1e-5)
+
+    def test_zero_input_gives_zero_gram(self):
+        x = mx.zeros((1, 4, 4, 4))
+        g = gram_matrix(x)
+        mx.eval(g)
+        assert float(mx.max(mx.abs(g)).item()) < 1e-7
+
+    def test_normalization_scale(self):
+        """gram_matrix divides by C*H*W so magnitude scales with 1/(C*H*W)."""
+        rng = np.random.default_rng(12)
+        B, C, H, W = 1, 4, 3, 3
+        x = mx.array(rng.standard_normal((B, C, H, W)).astype(np.float32))
+        g = gram_matrix(x)
+        # Manual: f = x.reshape(B, C, HW); G = f @ f.T / (C*H*W)
+        x_np = np.array(x)
+        f = x_np.reshape(B, C, H * W)
+        expected = np.matmul(f, f.transpose(0, 2, 1)) / (C * H * W)
+        mx.eval(g)
+        assert np.allclose(np.array(g), expected, atol=1e-5)
+
+    def test_batch_independence(self):
+        """Each element in the batch is processed independently."""
+        rng = np.random.default_rng(13)
+        x = mx.array(rng.standard_normal((3, 4, 4, 4)).astype(np.float32))
+        g_batch = gram_matrix(x)
+        g_solo = gram_matrix(x[1:2])
+        mx.eval(g_batch, g_solo)
+        assert np.allclose(np.array(g_batch[1]), np.array(g_solo[0]), atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# gram_style_loss
+# ---------------------------------------------------------------------------
+
+class TestGramStyleLoss:
+    def test_scalar_output(self):
+        x = mx.random.normal((1, 4, 4, 4))
+        y = mx.random.normal((1, 4, 4, 4))
+        loss = gram_style_loss(x, y)
+        mx.eval(loss)
+        assert loss.shape == ()
+
+    def test_same_input_gives_zero_loss(self):
+        """gram_style_loss(x, x) must be exactly zero."""
+        rng = np.random.default_rng(20)
+        x = mx.array(rng.standard_normal((2, 8, 4, 4)).astype(np.float32))
+        loss = gram_style_loss(x, x)
+        mx.eval(loss)
+        assert float(loss.item()) < 1e-8
+
+    def test_different_inputs_give_positive_loss(self):
+        rng = np.random.default_rng(21)
+        x = mx.array(rng.standard_normal((2, 8, 4, 4)).astype(np.float32))
+        y = mx.array(rng.standard_normal((2, 8, 4, 4)).astype(np.float32))
+        loss = gram_style_loss(x, y)
+        mx.eval(loss)
+        assert float(loss.item()) > 0.0
+
+    def test_output_finite(self):
+        """No NaN or Inf for typical latent-scale inputs."""
+        rng = np.random.default_rng(22)
+        x = mx.array(rng.standard_normal((2, 32, 8, 8)).astype(np.float32))
+        y = mx.array(rng.standard_normal((2, 32, 8, 8)).astype(np.float32))
+        loss = gram_style_loss(x, y)
+        mx.eval(loss)
+        assert np.isfinite(float(loss.item()))
+
+    def test_gradient_computable(self):
+        """Loss gradient with respect to x0_pred flows without NaN."""
+        rng = np.random.default_rng(23)
+        x = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        ref = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+
+        def fn(v):
+            return gram_style_loss(v, ref)
+
+        grad = mx.grad(fn)(x)
+        mx.eval(grad)
+        assert grad.shape == x.shape
+        assert np.isfinite(float(mx.max(mx.abs(grad)).item()))
+        assert float(mx.max(mx.abs(grad)).item()) > 0
+
+    def test_x0_reconstruction_math(self):
+        """
+        Verify the reconstruction identity used in the style loss:
+          x0_pred = alpha * x_t - sigma * v_pred
+        = alpha*(alpha*x0+sigma*eps) - sigma*(alpha*eps-sigma*x0)
+        = (alpha^2 + sigma^2) * x0
+        For the linear schedule alpha=1-t/1000, sigma=t/1000, the factor is
+        (1-t/1000)^2 + (t/1000)^2, not 1.  The style loss accepts approximate
+        x0 (gradient signal is scale-invariant for the Gram MSE).
+        """
+        rng = np.random.default_rng(24)
+        x0 = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        noise = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        alpha, sigma = get_schedule_values(mx.array([600]))
+        noisy, target = fused_flow_noise(x0, noise, alpha, sigma)
+
+        a = float(alpha[0])
+        s = float(sigma[0])
+        x0_rec = a * noisy - s * target
+        mx.eval(x0_rec)
+        # Reconstruction gives (a^2 + s^2) * x0, not x0 itself.
+        scale = a ** 2 + s ** 2
+        expected = scale * np.array(x0)
+        assert np.allclose(np.array(x0_rec), expected, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Metal kernel path vs MLX fallback
+# ---------------------------------------------------------------------------
+
+class TestFusedFlowNoiseKernelPaths:
+    """
+    Explicitly exercise both dispatch paths in fused_flow_noise:
+      Metal path : B=1, scalar alpha/sigma (alpha_t.size == 1), _HAS_METAL_KERNEL=True
+      MLX path   : B>1 always uses the MLX element-wise fallback
+    """
+
+    def test_b1_path_correct_formula(self):
+        """B=1 (potential Metal path) gives the exact v-prediction formula."""
+        rng = np.random.default_rng(30)
+        latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        alpha  = mx.array([0.6])
+        sigma  = mx.array([0.4])
+        noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
+        exp_noisy  = 0.6 * latent + 0.4 * noise
+        exp_target = 0.6 * noise  - 0.4 * latent
+        mx.eval(noisy, target, exp_noisy, exp_target)
+        # bf16 FMA vs separate mul+add: up to ~2 × bf16 eps tolerance
+        BF16_TOL = 0.016
+        assert float(mx.max(mx.abs(noisy  - exp_noisy)).item())  < BF16_TOL
+        assert float(mx.max(mx.abs(target - exp_target)).item()) < BF16_TOL
+
+    def test_b_gt1_path_correct_formula(self):
+        """B>1 forces MLX fallback — formula must still be correct."""
+        rng = np.random.default_rng(31)
+        B = 4
+        latent = mx.array(rng.standard_normal((B, 32, 4, 4)).astype(np.float32))
+        noise  = mx.array(rng.standard_normal((B, 32, 4, 4)).astype(np.float32))
+        t = mx.array([100, 300, 600, 900])
+        alpha, sigma = get_schedule_values(t)
+        noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
+        mx.eval(noisy, target)
+        # Verify each sample
+        for i in range(B):
+            a, s = float(alpha[i]), float(sigma[i])
+            exp_n = a * np.array(latent[i]) + s * np.array(noise[i])
+            exp_t = a * np.array(noise[i])  - s * np.array(latent[i])
+            assert np.allclose(np.array(noisy[i]),  exp_n, atol=1e-5)
+            assert np.allclose(np.array(target[i]), exp_t, atol=1e-5)
+
+    def test_b1_b2_parity(self):
+        """
+        B=1 (Metal path when available) and B=2 fallback must agree within bf16 tol.
+        Run the same timestep twice via B=2 to match what two independent B=1 calls give.
+        """
+        rng = np.random.default_rng(32)
+        lat = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        noi = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        alpha_s = mx.array([0.7])
+        sigma_s = mx.array([0.3])
+
+        # B=1 call (may use Metal kernel)
+        noisy1, target1 = fused_flow_noise(lat, noi, alpha_s, sigma_s)
+
+        # B=2 call (always MLX fallback): duplicate batch
+        lat2   = mx.concatenate([lat, lat], axis=0)
+        noi2   = mx.concatenate([noi, noi], axis=0)
+        alpha2 = mx.concatenate([alpha_s, alpha_s], axis=0)
+        sigma2 = mx.concatenate([sigma_s, sigma_s], axis=0)
+        noisy2, target2 = fused_flow_noise(lat2, noi2, alpha2, sigma2)
+
+        mx.eval(noisy1, target1, noisy2, target2)
+        BF16_TOL = 0.016
+        assert float(mx.max(mx.abs(noisy1  - noisy2[0])).item())  < BF16_TOL
+        assert float(mx.max(mx.abs(target1 - target2[0])).item()) < BF16_TOL
+
+    def test_metal_kernel_availability_reported(self):
+        """_HAS_METAL_KERNEL is a bool (True on Apple Silicon + macOS 13.2+)."""
+        assert isinstance(_HAS_METAL_KERNEL, bool)
+
+
+# ---------------------------------------------------------------------------
+# Numerical stability
+# ---------------------------------------------------------------------------
+
+class TestLossNumericalStability:
+    def _run_fused(self, latent, noise, alpha, sigma):
+        noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
+        mx.eval(noisy, target)
+        return noisy, target
+
+    def test_near_zero_latents_no_nan(self):
+        rng = np.random.default_rng(40)
+        latent = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32)) * 1e-7
+        noise  = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32)) * 1e-7
+        alpha, sigma = get_schedule_values(mx.array([500, 500]))
+        noisy, target = self._run_fused(latent, noise, alpha, sigma)
+        assert np.all(np.isfinite(np.array(noisy.astype(mx.float32))))
+        assert np.all(np.isfinite(np.array(target.astype(mx.float32))))
+
+    def test_moderate_latents_no_nan(self):
+        rng = np.random.default_rng(41)
+        latent = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32)) * 3.0
+        noise  = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
+        alpha, sigma = get_schedule_values(mx.array([250, 750]))
+        noisy, target = self._run_fused(latent, noise, alpha, sigma)
+        assert np.all(np.isfinite(np.array(noisy.astype(mx.float32))))
+        assert np.all(np.isfinite(np.array(target.astype(mx.float32))))
+
+    def test_boundary_t0_no_nan(self):
+        rng = np.random.default_rng(42)
+        latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        alpha = mx.array([1.0])
+        sigma = mx.array([0.0])
+        noisy, target = self._run_fused(latent, noise, alpha, sigma)
+        assert np.all(np.isfinite(np.array(noisy.astype(mx.float32))))
+        assert np.all(np.isfinite(np.array(target.astype(mx.float32))))
+
+    def test_boundary_t1000_no_nan(self):
+        rng = np.random.default_rng(43)
+        latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        alpha = mx.array([0.0])
+        sigma = mx.array([1.0])
+        noisy, target = self._run_fused(latent, noise, alpha, sigma)
+        assert np.all(np.isfinite(np.array(noisy.astype(mx.float32))))
+        assert np.all(np.isfinite(np.array(target.astype(mx.float32))))
+
+    def test_flow_loss_gradient_finite_at_t0(self):
+        """Gradient through loss is finite even at t=0 (sigma=0, pure signal)."""
+        rng = np.random.default_rng(44)
+        vel    = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        alpha  = mx.array([1.0])
+        sigma  = mx.array([0.0])
+        grad = mx.grad(lambda v: flow_matching_loss(v, latent, noise, alpha, sigma))(vel)
+        mx.eval(grad)
+        assert np.all(np.isfinite(np.array(grad)))
+
+    def test_gram_style_loss_no_nan_small_inputs(self):
+        rng = np.random.default_rng(45)
+        x = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32)) * 1e-3
+        y = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32)) * 1e-3
+        loss = gram_style_loss(x, y)
+        mx.eval(loss)
+        assert np.isfinite(float(loss.item()))

@@ -37,6 +37,8 @@ import random
 import sys
 import tarfile
 import threading
+import time
+import warnings
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -44,9 +46,13 @@ import numpy as np
 try:
     from turbojpeg import TurboJPEG as _TurboJPEG, TJPF_RGB as _TJPF_RGB
     _HAS_TURBOJPEG = True
+    print("[dataset] TurboJPEG available: using fast JPEG decode path.", flush=True)
 except ImportError:
     _HAS_TURBOJPEG = False
     _TJPF_RGB = None
+    print("[dataset] TurboJPEG not found: falling back to Pillow for JPEG decode (slower).", flush=True)
+
+_SHARD_MAX_RETRIES = 3
 
 from .utils import PERF_CORES as _PERF_CORES
 
@@ -93,15 +99,23 @@ def _decode_jpeg(raw: bytes, tj=None, rec_id: Optional[str] = None) -> Optional[
     Uses turbojpeg (2–4× faster) when available, falls back to Pillow.
     rec_id: logged alongside any turbojpeg warning (e.g. truncated JPEG).
     """
-    import warnings
-    try:
-        if tj is not None:
+    if tj is not None:
+        try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 result = tj.decode(raw, pixel_format=_TJPF_RGB)
             for w in caught:
-                print(f"[dataset] JPEG warning rec={rec_id}: {w.message}", file=sys.stderr, flush=True)
-            return result
+                src = getattr(w, "filename", "") or ""
+                if "turbojpeg" in src.lower():
+                    print(f"[dataset] JPEG warning rec={rec_id}: {w.message}", file=sys.stderr, flush=True)
+                else:
+                    warnings.warn_explicit(w.message, w.category, w.filename, w.lineno, source=w.source)
+            if result is not None:
+                return result
+        except Exception as e:
+            print(f"[dataset] TurboJPEG failed rec={rec_id}: {e} — retrying with Pillow",
+                  file=sys.stderr, flush=True)
+    try:
         from PIL import Image
         return np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
     except Exception:
@@ -355,25 +369,42 @@ def make_prefetch_loader(
                 epoch_paths += rng.choices(hard_paths, k=n_hard)
             rng.shuffle(epoch_paths)
             for path in epoch_paths:
-                try:
-                    print(f"[dataset] shard {path}", flush=True)
-                    with tarfile.open(path) as tar:
-                        contents = {
-                            m.name: tar.extractfile(m).read()
-                            for m in tar.getmembers()
-                            if m.isfile()
-                        }
-                    shard_q.put(contents)
-                    consecutive_errors = 0
-                except Exception as e:
-                    print(f"Shard error {path}: {e}", file=sys.stderr)
+                contents = None
+                for attempt in range(_SHARD_MAX_RETRIES + 1):
+                    try:
+                        if attempt == 0:
+                            print(f"[dataset] shard {path}", flush=True)
+                        with tarfile.open(path) as tar:
+                            contents = {
+                                m.name: tar.extractfile(m).read()
+                                for m in tar.getmembers()
+                                if m.isfile()
+                            }
+                        break
+                    except Exception as e:
+                        if attempt < _SHARD_MAX_RETRIES:
+                            delay = 2 ** attempt
+                            print(
+                                f"[dataset] shard open failed (attempt {attempt + 1}/{_SHARD_MAX_RETRIES + 1})"
+                                f" {path}: {e} — retrying in {delay}s",
+                                file=sys.stderr, flush=True,
+                            )
+                            time.sleep(delay)
+                        else:
+                            print(
+                                f"[dataset] shard error (all retries exhausted) {path}: {e}",
+                                file=sys.stderr, flush=True,
+                            )
+                if contents is None:
                     consecutive_errors += 1
                     if consecutive_errors >= 10:
-                        # Too many consecutive failures — signal consumer to stop
                         shard_q.put(None)
                         print("FATAL: 10 consecutive shard errors — stopping loader",
-                              file=sys.stderr)
+                              file=sys.stderr, flush=True)
                         return
+                else:
+                    shard_q.put(contents)
+                    consecutive_errors = 0
 
     # ---- Level 2: sample decoder + batch builder thread -------------------
     def sample_decoder():
@@ -382,6 +413,10 @@ def make_prefetch_loader(
 
         while True:
             contents = shard_q.get()
+            if contents is None:
+                # Fatal sentinel from shard_loader — propagate to main thread
+                sample_q.put(None)
+                return
             records = _iter_shard_contents(contents)
             rng.shuffle(records)
 
@@ -464,5 +499,9 @@ def make_prefetch_loader(
         except queue.Empty:
             raise RuntimeError(
                 "sample_q timeout (120s) — shard_loader or sample_decoder likely crashed"
+            )
+        if item is None:
+            raise RuntimeError(
+                "shard_loader encountered too many consecutive errors — dataset exhausted"
             )
         yield item
