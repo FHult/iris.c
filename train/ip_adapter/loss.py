@@ -6,10 +6,11 @@ Uses v-prediction flow matching (matching Flux Klein's training objective):
   target = alpha_t * noise  - sigma_t * latent   (v-prediction)
   loss   = MSE(model_velocity, target)
 
-The fused Metal kernel computes both noisy and target in one pass,
-saving one Metal dispatch and one temporary allocation vs two separate ops.
+fused_flow_noise has two paths:
+  Metal kernel  — single GPU dispatch; used when B=1 (standard training batch).
+  MLX fallback  — element-wise MLX ops; used for B>1 or non-Metal platforms.
 
-Based on the kernel specification in plans/ip-adapter-training.md §3.2.
+Both paths produce numerically equivalent results within bfloat16 precision.
 """
 
 import mlx.core as mx
@@ -40,29 +41,46 @@ def gram_style_loss(x0_pred: mx.array, x0_ref: mx.array) -> mx.array:
 
 # ---------------------------------------------------------------------------
 # Fused Metal kernel — v-prediction noise scheduler
-# Matches plans/ip-adapter-training.md §3.2 exactly.
-# Inputs: latent, noise, alpha (scalar arr), sigma (scalar arr)
+# Inputs: latent, noise, alpha (scalar [1]), sigma (scalar [1]), count (uint32 [1])
 # Output: noisy = alpha*latent + sigma*noise, target = alpha*noise - sigma*latent
+#
+# count is passed explicitly because the Metal device pointer type does not
+# expose a .size member; bounds-checking via a separate uint32 is the portable
+# approach across MLX versions.
+#
+# Constraint: alpha[0] / sigma[0] are read as scalars, so this kernel only
+# supports a single timestep per call (B=1). The MLX fallback handles B>1.
 # ---------------------------------------------------------------------------
 _FUSED_FLOW_NOISE_SOURCE = """
     uint i = thread_position_in_grid.x;
-    if (i >= latent.size) return;
-    float l = latent[i], n = noise[i];
+    if (i >= count[0]) return;
+    float l = latent[i], nv = noise[i];
     float a = alpha[0],  s = sigma[0];
-    noisy[i]  = a * l + s * n;
-    target[i] = a * n - s * l;
+    noisy[i]  = a * l + s * nv;
+    target[i] = a * nv - s * l;
 """
+
+_fused_flow_kernel = None
+_HAS_METAL_KERNEL = False
+_kernel_compile_error: str = ""
 
 try:
     _fused_flow_kernel = mx.fast.metal_kernel(
         name="fused_flow_noise",
-        input_names=["latent", "noise", "alpha", "sigma"],
+        input_names=["latent", "noise", "alpha", "sigma", "count"],
         output_names=["noisy", "target"],
         source=_FUSED_FLOW_NOISE_SOURCE,
     )
     _HAS_METAL_KERNEL = True
-except Exception:
-    _HAS_METAL_KERNEL = False
+    print("[loss] Metal fused kernel compiled: flow matching noise (1-pass noisy+target).")
+except Exception as _e:
+    _kernel_compile_error = str(_e)
+    print(
+        f"[loss] WARNING: Metal fused kernel compilation failed — using MLX fallback.\n"
+        f"[loss]   Reason: {_kernel_compile_error}\n"
+        f"[loss]   Training is numerically correct but uses two GPU dispatches per step.\n"
+        f"[loss]   Requires Apple Silicon + macOS 13.2+. Check your MLX version if unexpected."
+    )
 
 
 def fused_flow_noise(
@@ -81,18 +99,44 @@ def fused_flow_noise(
 
     For per-sample timesteps (alpha_t shape [B]), broadcasts over [B, C, H, W].
 
+    Uses the Metal kernel when B=1 (single scalar alpha/sigma); falls back to
+    MLX element-wise ops for B>1 or when the kernel is unavailable.
+
     Returns:
       noisy:  alpha_t * latent + sigma_t * noise
       target: alpha_t * noise  - sigma_t * latent  (v-prediction target)
     """
-    # Reshape scalar [B] to [B,1,1,1] for broadcast over [B,C,H,W]
+    if _HAS_METAL_KERNEL and alpha_t.size == 1:
+        # Metal path: single GPU kernel dispatch, float32 in/out.
+        n = latent.size
+        orig_shape = latent.shape
+        orig_dtype = latent.dtype
+        count = mx.array([n], dtype=mx.uint32)
+        noisy_flat, target_flat = _fused_flow_kernel(
+            inputs=[
+                latent.reshape(-1).astype(mx.float32),
+                noise.reshape(-1).astype(mx.float32),
+                alpha_t.reshape(-1).astype(mx.float32),  # [1], kernel reads [0]
+                sigma_t.reshape(-1).astype(mx.float32),
+                count,
+            ],
+            output_shapes=[(n,), (n,)],
+            output_dtypes=[mx.float32, mx.float32],
+            grid=(n, 1, 1),
+            threadgroup=(min(256, n), 1, 1),
+        )
+        return (
+            noisy_flat.reshape(orig_shape).astype(orig_dtype),
+            target_flat.reshape(orig_shape).astype(orig_dtype),
+        )
+
+    # MLX fallback: correct for any batch size, two element-wise ops.
     while alpha_t.ndim < latent.ndim:
         alpha_t = alpha_t[..., None]
     while sigma_t.ndim < latent.ndim:
         sigma_t = sigma_t[..., None]
-
-    noisy = alpha_t * latent + sigma_t * noise
-    target = alpha_t * noise - sigma_t * latent
+    noisy  = alpha_t * latent + sigma_t * noise
+    target = alpha_t * noise  - sigma_t * latent
     return noisy, target
 
 
