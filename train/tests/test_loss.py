@@ -24,6 +24,7 @@ from ip_adapter.loss import (
     flow_matching_loss,
     gram_matrix,
     gram_style_loss,
+    reconstruct_x0,
     _HAS_METAL_KERNEL,
 )
 
@@ -272,15 +273,16 @@ class TestGramMatrix:
         assert float(mx.max(mx.abs(g)).item()) < 1e-7
 
     def test_normalization_scale(self):
-        """gram_matrix divides by C*H*W so magnitude scales with 1/(C*H*W)."""
+        """gram_matrix centres channels then divides by C*H*W."""
         rng = np.random.default_rng(12)
         B, C, H, W = 1, 4, 3, 3
         x = mx.array(rng.standard_normal((B, C, H, W)).astype(np.float32))
         g = gram_matrix(x)
-        # Manual: f = x.reshape(B, C, HW); G = f @ f.T / (C*H*W)
+        # Manual: centre per-channel, then G = f_c @ f_c.T / (C*H*W)
         x_np = np.array(x)
         f = x_np.reshape(B, C, H * W)
-        expected = np.matmul(f, f.transpose(0, 2, 1)) / (C * H * W)
+        f_c = f - f.mean(axis=-1, keepdims=True)
+        expected = np.matmul(f_c, f_c.transpose(0, 2, 1)) / (C * H * W)
         mx.eval(g)
         assert np.allclose(np.array(g), expected, atol=1e-5)
 
@@ -370,6 +372,95 @@ class TestGramStyleLoss:
         scale = a ** 2 + s ** 2
         expected = scale * np.array(x0)
         assert np.allclose(np.array(x0_rec), expected, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# reconstruct_x0
+# ---------------------------------------------------------------------------
+
+class TestReconstructX0:
+    """
+    Tests for the unbiased x0 reconstruction helper.
+
+    Core identity (v-prediction, any schedule):
+        noisy  = alpha * x0 + sigma * noise
+        target = alpha * noise − sigma * x0
+        → x0 = (alpha * noisy − sigma * target) / (alpha² + sigma²)
+
+    For the linear schedule (alpha=1−t/1000, sigma=t/1000):
+        alpha² + sigma² ∈ [0.5, 1.0]   (min at t=500, both =0.5)
+    The raw formula alpha*noisy − sigma*v_pred gives (alpha²+sigma²)*x0 — biased.
+    reconstruct_x0 corrects for this factor.
+    """
+
+    def test_exact_when_prediction_perfect(self):
+        """When v_pred == v_target, reconstruct_x0 returns the clean latent."""
+        rng = np.random.default_rng(50)
+        x0    = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        noise = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        alpha, sigma = get_schedule_values(mx.array([500]))
+        noisy, v_target = fused_flow_noise(x0, noise, alpha, sigma)
+        x0_rec = reconstruct_x0(noisy, v_target, alpha, sigma)
+        mx.eval(x0_rec, x0)
+        assert np.allclose(np.array(x0_rec), np.array(x0), atol=1e-5)
+
+    def test_unbiased_vs_raw_at_mid_timestep(self):
+        """
+        At t=500 (alpha=sigma=0.5): raw formula gives 0.5·x0 (because
+        alpha²+sigma²=0.5); reconstruct_x0 returns x0 after dividing by 0.5.
+        """
+        rng = np.random.default_rng(51)
+        x0    = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        noise = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        alpha, sigma = get_schedule_values(mx.array([500]))
+        noisy, v_target = fused_flow_noise(x0, noise, alpha, sigma)
+
+        # Raw biased formula: equals (alpha²+sigma²)*x0 when prediction is perfect
+        a, s = float(alpha[0]), float(sigma[0])
+        raw = a * noisy.astype(mx.float32) - s * v_target.astype(mx.float32)
+        mx.eval(raw)
+        expected_biased = (a ** 2 + s ** 2) * np.array(x0)
+        assert np.allclose(np.array(raw), expected_biased, atol=1e-5), \
+            "raw formula should give (alpha²+sigma²)·x0"
+
+        # Corrected: reconstruct_x0 divides out the scale factor → exact x0
+        x0_rec = reconstruct_x0(noisy, v_target, alpha, sigma)
+        mx.eval(x0_rec)
+        assert np.allclose(np.array(x0_rec), np.array(x0), atol=1e-5), \
+            "reconstruct_x0 should return the clean latent exactly"
+
+    def test_output_finite_all_timesteps(self):
+        """No NaN/Inf at any timestep in [0, 1000]."""
+        rng = np.random.default_rng(52)
+        x0    = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        noise = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        for t in [0, 1, 100, 499, 500, 501, 900, 999, 1000]:
+            alpha, sigma = get_schedule_values(mx.array([t]))
+            noisy, v_target = fused_flow_noise(x0, noise, alpha, sigma)
+            x0_rec = reconstruct_x0(noisy, v_target, alpha, sigma)
+            mx.eval(x0_rec)
+            assert np.all(np.isfinite(np.array(x0_rec))), f"non-finite at t={t}"
+
+    def test_denominator_bounds_for_linear_schedule(self):
+        """alpha²+sigma² lies in [0.5, 1.0] for all t in [0, 1000]."""
+        for t in range(0, 1001, 50):
+            alpha, sigma = get_schedule_values(mx.array([t]))
+            a, s = float(alpha[0]), float(sigma[0])
+            denom = a ** 2 + s ** 2
+            assert 0.5 - 1e-6 <= denom <= 1.0 + 1e-6, \
+                f"denom={denom:.4f} out of [0.5,1.0] at t={t}"
+
+    def test_output_shape_matches_noisy(self):
+        rng = np.random.default_rng(53)
+        B, C, H, W = 2, 32, 8, 8
+        x0    = mx.array(rng.standard_normal((B, C, H, W)).astype(np.float32))
+        noise = mx.array(rng.standard_normal((B, C, H, W)).astype(np.float32))
+        alpha, sigma = get_schedule_values(mx.array([300, 700]))
+        noisy, v_target = fused_flow_noise(x0, noise, alpha, sigma)
+        x0_rec = reconstruct_x0(noisy, v_target, alpha, sigma)
+        mx.eval(x0_rec)
+        assert x0_rec.shape == (B, C, H, W)
+        assert x0_rec.dtype == mx.float32
 
 
 # ---------------------------------------------------------------------------

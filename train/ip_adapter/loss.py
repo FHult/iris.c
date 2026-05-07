@@ -21,22 +21,57 @@ import mlx.core as mx
 # ---------------------------------------------------------------------------
 
 def gram_matrix(x: mx.array) -> mx.array:
-    """Normalized Gram matrix. x: float32 [B, C, H, W] → [B, C, C]"""
+    """
+    Centered, normalized Gram matrix. x: float32 [B, C, H, W] → [B, C, C]
+
+    Each channel is spatially centred before computing cross-correlation so the
+    result captures covariance (local texture / style) rather than correlation
+    (which is biased by the per-channel DC mean and encodes content).
+    """
     B, C, H, W = x.shape
     f = x.reshape(B, C, H * W)
+    f = f - f.mean(axis=-1, keepdims=True)   # centre each channel over spatial dim
     return mx.matmul(f, f.transpose(0, 2, 1)) / (C * H * W)
 
 
 def gram_style_loss(x0_pred: mx.array, x0_ref: mx.array) -> mx.array:
     """
-    MSE between normalized Gram matrices of predicted and reference clean latents.
-    Both inputs: float32 [B, C, H, W].
+    MSE between centered, normalized Gram matrices of two float32 [B, C, H, W] latents.
 
-    Reconstruct x0_pred from velocity v_pred and noisy latent x_t:
-      x0_pred = alpha_t * x_t - sigma_t * v_pred
-    (exact because alpha_t^2 + sigma_t^2 = 1 in flow matching)
+    x0_pred should be an unbiased clean-latent estimate — use reconstruct_x0()
+    rather than the raw alpha·x_t − sigma·v_pred, which is biased by
+    (alpha² + sigma²) under the linear schedule.
+    x0_ref is the ground-truth clean latent.
     """
     return mx.mean((gram_matrix(x0_pred) - gram_matrix(x0_ref)) ** 2)
+
+
+def reconstruct_x0(
+    noisy:   mx.array,
+    v_pred:  mx.array,
+    alpha_t: mx.array,
+    sigma_t: mx.array,
+) -> mx.array:
+    """
+    Unbiased clean-latent estimate from the predicted velocity.
+
+    In v-prediction flow matching:
+        noisy  = alpha_t · x0 + sigma_t · noise
+        v_pred ≈ alpha_t · noise − sigma_t · x0
+    Solving for x0 exactly:
+        x0 = (alpha_t · noisy − sigma_t · v_pred) / (alpha_t² + sigma_t²)
+
+    The raw formula alpha·noisy − sigma·v_pred gives (alpha²+sigma²)·x0 — biased
+    at mid-timesteps.  For the linear schedule (alpha = 1−t/1000, sigma = t/1000)
+    the denominator lies in [0.5, 1.0] and is always safe to divide by; the clamp
+    at 1e-6 is a defensive guard for non-standard schedules.
+
+    All inputs are cast to float32 internally; output shape matches noisy.
+    """
+    a = alpha_t.reshape(-1, 1, 1, 1).astype(mx.float32)
+    s = sigma_t.reshape(-1, 1, 1, 1).astype(mx.float32)
+    denom = mx.maximum(a * a + s * s, mx.array(1e-6, dtype=mx.float32))
+    return (a * noisy.astype(mx.float32) - s * v_pred.astype(mx.float32)) / denom
 
 
 # ---------------------------------------------------------------------------

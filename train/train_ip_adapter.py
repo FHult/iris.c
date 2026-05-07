@@ -46,7 +46,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
-from ip_adapter.loss import fused_flow_noise, get_schedule_values, gram_style_loss
+from ip_adapter.loss import fused_flow_noise, get_schedule_values, gram_style_loss, reconstruct_x0
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 
@@ -912,11 +912,7 @@ def train(config: dict) -> None:
 
         flow_loss = mx.mean((pred - target) ** 2)
         if _style_weight > 0.0 and x0_ref is not None:
-            # Reconstruct predicted clean latent from velocity and noisy input.
-            # x0_pred = alpha * x_t - sigma * v_pred (exact in flow matching)
-            _a = alpha_in.reshape(-1, 1, 1, 1).astype(mx.float32)
-            _s = sigma_in.reshape(-1, 1, 1, 1).astype(mx.float32)
-            x0_pred = _a * noisy_in.astype(mx.float32) - _s * pred.astype(mx.float32)
+            x0_pred = reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
             style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
             _style_loss_accum[0] = style_term
             return flow_loss + _style_weight * style_term
