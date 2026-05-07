@@ -115,9 +115,14 @@ def generate_with_adapter(
     height: int = 512,
     seed: int = 42,
     use_adapter: bool = True,
+    style_only: bool = False,
+    sref_strength: float = 1.0,
 ) -> mx.array:
     """
     Full 4-step Euler denoising with optional IP-Adapter injection.
+
+    style_only=True:   zero double-stream ip_scale (style-only mode).
+    sref_strength:     global ip_scale multiplier (1.0 = no change).
 
     Returns: [1, 32, H/8, W/8] clean latent.
     """
@@ -128,7 +133,7 @@ def generate_with_adapter(
     if use_adapter:
         ip_embeds = adapter.get_image_embeds(siglip_feats)
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
-        ip_scale = adapter.scale
+        ip_scale = adapter.effective_scale(style_only=style_only, sref_strength=sref_strength)
     else:
         k_ip_all = v_ip_all = ip_scale = None
 
@@ -194,9 +199,13 @@ def main() -> None:
     ap.add_argument("--prompts", default="train/configs/eval_prompts.txt")
     ap.add_argument("--output",  required=True, help="Output directory for images")
     ap.add_argument("--config",  default="train/configs/stage1_512px.yaml")
-    ap.add_argument("--width",   type=int, default=512)
-    ap.add_argument("--height",  type=int, default=512)
-    ap.add_argument("--seed",    type=int, default=42)
+    ap.add_argument("--width",         type=int,   default=512)
+    ap.add_argument("--height",        type=int,   default=512)
+    ap.add_argument("--seed",          type=int,   default=42)
+    ap.add_argument("--style-only",    action="store_true", default=False,
+                    help="Zero double-stream ip_scale (style-only, no layout injection)")
+    ap.add_argument("--sref-strength", type=float, default=None,
+                    help="Global ip_scale multiplier (default: from config or 1.0)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -227,6 +236,7 @@ def main() -> None:
     acfg = cfg["adapter"]
     adapter = IPAdapterKlein(
         num_blocks=acfg["num_blocks"],
+        num_double_blocks=acfg.get("num_double_blocks", 5),
         hidden_dim=acfg["hidden_dim"],
         num_image_tokens=acfg["num_image_tokens"],
         siglip_dim=acfg["siglip_dim"],
@@ -236,6 +246,15 @@ def main() -> None:
     mx.eval(adapter.parameters())
 
     siglip_model_name = cfg["model"].get("siglip_model", "google/siglip-so400m-patch14-384")
+
+    # CLI flags override config; config overrides defaults.
+    style_only    = args.style_only or acfg.get("style_only", False)
+    sref_strength = args.sref_strength if args.sref_strength is not None \
+                    else acfg.get("sref_strength", 1.0)
+    if style_only:
+        print(f"Style-only mode: double-stream blocks disabled.")
+    if sref_strength != 1.0:
+        print(f"sref_strength={sref_strength}")
 
     # Parse eval prompts
     prompt_pairs: list[tuple[str, str]] = []
@@ -277,6 +296,7 @@ def main() -> None:
         latent_with = generate_with_adapter(
             flux, adapter, text_embeds, siglip_feats,
             width=args.width, height=args.height, seed=args.seed, use_adapter=True,
+            style_only=style_only, sref_strength=sref_strength,
         )
         img_with = decode_latent(flux, latent_with)
         out_with = os.path.join(args.output, f"{idx:02d}_{slug}_with_adapter.png")

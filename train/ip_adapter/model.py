@@ -12,7 +12,10 @@ Key design decisions (from plans/ip-adapter-training.md §3.1 / §3.2):
     get_kv_all() computes all blocks in 2 einsum dispatches (not 50 GEMMs).
   - einsum: 'btd,nde->bnte' — B batch, T tokens(128), D hidden(3072), N blocks(25)
   - ip_scale per block init to 1.0; trained to calibrate block contribution.
-  - Style-only inference: caller sets ip_scale[0:5] = 0.0 (double-stream blocks).
+  - Style-only inference: use effective_scale(style_only=True) which returns
+    self.scale with indices 0..num_double_blocks-1 zeroed out (non-mutating).
+  - sref_strength: global scalar multiplier applied on top of ip_scale at
+    inference; does not affect training (always 1.0 during training).
 """
 
 import mlx.core as mx
@@ -68,9 +71,10 @@ class IPAdapterKlein(nn.Module):
 
     All Flux Klein 4B weights are FROZEN. Only the adapter trains.
 
-    Inference modes (controlled by zeroing ip_scale slots):
-      - Style+content: all 25 blocks active
-      - Style-only:    ip_scale[0:5] = 0.0 (skip 5 double-stream blocks)
+    Inference modes (use effective_scale() to get the per-block scale array):
+      - Style+content: effective_scale()                  — all 25 blocks active
+      - Style-only:    effective_scale(style_only=True)   — double-stream zeroed
+      - Strength knob: effective_scale(sref_strength=0.7) — global multiplier
     """
 
     def __init__(
@@ -80,11 +84,13 @@ class IPAdapterKlein(nn.Module):
         num_image_tokens: int = 128,
         siglip_dim: int = 1152,
         perceiver_heads: int = 24,
+        num_double_blocks: int = 5,
     ):
         super().__init__()
         self.num_blocks = num_blocks
         self.hidden_dim = hidden_dim
         self.num_image_tokens = num_image_tokens
+        self.num_double_blocks = num_double_blocks
 
         # Image projection: SigLIP patch tokens → 128 conditioning tokens
         self.image_proj = PerceiverResampler(
@@ -131,6 +137,42 @@ class IPAdapterKlein(nn.Module):
         k = mx.einsum("btd,nde->bnte", ip_embeds, self.to_k_ip_stacked)
         v = mx.einsum("btd,nde->bnte", ip_embeds, self.to_v_ip_stacked)
         return k, v
+
+    def effective_scale(
+        self,
+        style_only: bool = False,
+        sref_strength: float = 1.0,
+    ) -> mx.array:
+        """
+        Return the per-block scale to pass to _flux_forward_with_ip.
+
+        Non-mutating — does not modify self.scale. Always safe to call from
+        training code; with default args returns self.scale unchanged.
+
+        style_only=True:
+            Zeros double-stream block scales (indices 0..num_double_blocks-1).
+            Single-stream blocks (indices num_double_blocks..num_blocks-1) are
+            unaffected. This removes layout/content injection and keeps only
+            the style signal carried by single-stream blocks.
+
+        sref_strength:
+            Global scalar multiplier applied after style_only masking.
+            1.0 = no change. 0.0 = adapter fully disabled. Values > 1.0
+            strengthen conditioning beyond what was learned during training.
+
+        Returns: [num_blocks] float array, same dtype as self.scale.
+        """
+        scale = self.scale
+        if style_only:
+            nd = self.num_double_blocks
+            mask = mx.concatenate([
+                mx.zeros((nd,), dtype=scale.dtype),
+                mx.ones((self.num_blocks - nd,), dtype=scale.dtype),
+            ])
+            scale = scale * mask
+        if sref_strength != 1.0:
+            scale = scale * sref_strength
+        return scale
 
     def inject(
         self,

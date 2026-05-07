@@ -365,3 +365,100 @@ class TestIPAdapterKlein:
         # L2 norm of the output should be non-trivial (model is not dead)
         l2 = float(np.linalg.norm(out_np))
         assert l2 > 1e-4, f"Output L2 norm {l2} is suspiciously small (dead model?)"
+
+
+# ---------------------------------------------------------------------------
+# effective_scale()
+# ---------------------------------------------------------------------------
+
+class TestEffectiveScale:
+    """Tests for IPAdapterKlein.effective_scale(style_only, sref_strength)."""
+
+    def _make_model(self, num_blocks=25, num_double_blocks=5):
+        m = IPAdapterKlein(
+            num_blocks=num_blocks,
+            num_double_blocks=num_double_blocks,
+            hidden_dim=256,
+            num_image_tokens=8,
+            siglip_dim=64,
+            perceiver_heads=4,
+        )
+        # Set scale to non-trivial values so changes are detectable.
+        m.scale = mx.array(list(range(1, num_blocks + 1)), dtype=mx.float32)
+        mx.eval(m.scale)
+        return m
+
+    def test_default_returns_scale_unchanged(self):
+        """effective_scale() with defaults must equal self.scale exactly."""
+        model = self._make_model()
+        eff = model.effective_scale()
+        mx.eval(eff)
+        assert np.allclose(np.array(eff), np.array(model.scale))
+
+    def test_style_only_zeros_double_blocks(self):
+        """style_only=True: first num_double_blocks entries must be zero."""
+        model = self._make_model(num_blocks=25, num_double_blocks=5)
+        eff = model.effective_scale(style_only=True)
+        mx.eval(eff)
+        eff_np = np.array(eff)
+        assert np.all(eff_np[:5] == 0.0), f"double-stream blocks not zeroed: {eff_np[:5]}"
+        # Single-stream blocks retain their trained values.
+        assert np.allclose(eff_np[5:], np.array(model.scale)[5:])
+
+    def test_style_only_keeps_single_blocks(self):
+        """style_only=True: single-stream blocks (5–24) must be non-zero."""
+        model = self._make_model()
+        eff = model.effective_scale(style_only=True)
+        mx.eval(eff)
+        assert np.all(np.array(eff)[5:] != 0.0)
+
+    def test_sref_strength_scales_all_blocks(self):
+        """sref_strength=0.5 halves every element of self.scale."""
+        model = self._make_model()
+        eff = model.effective_scale(sref_strength=0.5)
+        mx.eval(eff)
+        expected = np.array(model.scale) * 0.5
+        assert np.allclose(np.array(eff), expected, atol=1e-6)
+
+    def test_sref_strength_zero_disables_adapter(self):
+        """sref_strength=0.0 must produce all-zero scale (adapter fully off)."""
+        model = self._make_model()
+        eff = model.effective_scale(sref_strength=0.0)
+        mx.eval(eff)
+        assert np.all(np.array(eff) == 0.0)
+
+    def test_style_only_and_sref_strength_combined(self):
+        """Both flags: double-stream zeroed, single-stream scaled by sref_strength."""
+        model = self._make_model(num_blocks=25, num_double_blocks=5)
+        eff = model.effective_scale(style_only=True, sref_strength=2.0)
+        mx.eval(eff)
+        eff_np = np.array(eff)
+        assert np.all(eff_np[:5] == 0.0)
+        expected_single = np.array(model.scale)[5:] * 2.0
+        assert np.allclose(eff_np[5:], expected_single, atol=1e-5)
+
+    def test_does_not_mutate_model_scale(self):
+        """effective_scale() must not modify self.scale in-place."""
+        model = self._make_model()
+        original = np.array(model.scale).copy()
+        _ = model.effective_scale(style_only=True, sref_strength=0.3)
+        mx.eval(model.scale)
+        assert np.allclose(np.array(model.scale), original), \
+            "effective_scale() mutated self.scale"
+
+    def test_num_double_blocks_respected(self):
+        """num_double_blocks=3 with style_only: indices 0–2 zeroed, 3+ kept."""
+        model = self._make_model(num_blocks=10, num_double_blocks=3)
+        eff = model.effective_scale(style_only=True)
+        mx.eval(eff)
+        eff_np = np.array(eff)
+        assert np.all(eff_np[:3] == 0.0)
+        assert np.all(eff_np[3:] != 0.0)
+
+    def test_output_shape_matches_num_blocks(self):
+        """effective_scale() output shape must be (num_blocks,)."""
+        for nb in [10, 25]:
+            model = self._make_model(num_blocks=nb, num_double_blocks=3)
+            eff = model.effective_scale(style_only=True, sref_strength=0.7)
+            mx.eval(eff)
+            assert eff.shape == (nb,), f"expected ({nb},), got {eff.shape}"

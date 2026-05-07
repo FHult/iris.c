@@ -11,11 +11,15 @@ model:
 
 adapter:
   num_blocks: 25                           # 5 double + 20 single for Klein 4B
+  num_double_blocks: 5                     # used by effective_scale(style_only=True)
   hidden_dim: 3072
   num_image_tokens: 128
   siglip_dim: 1152
   perceiver_depth: 4
   perceiver_heads: 16
+  # Inference-time flags (no effect during training)
+  style_only: false                        # true → zero double-stream ip_scale (indices 0–4)
+  sref_strength: 1.0                       # global ip_scale multiplier (0.0–2.0 typical range)
 
 data:
   shard_path: "train/data/shards"

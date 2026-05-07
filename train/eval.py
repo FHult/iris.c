@@ -169,9 +169,15 @@ def _generate(
     height: int,
     n_steps: int,
     seed: int,
+    style_only: bool = False,
+    sref_strength: float = 1.0,
 ) -> mx.array:
     """
     Full Euler denoising loop with IP-Adapter.
+
+    style_only=True:    zero double-stream block scales (indices 0..num_double_blocks-1).
+    sref_strength:      global ip_scale multiplier (1.0 = no change).
+
     Returns latents [1, 32, H/8, W/8] bfloat16.
     """
     mx.random.seed(seed)
@@ -180,7 +186,7 @@ def _generate(
 
     ip_embeds = adapter.get_image_embeds(siglip_feats)
     k_ip, v_ip = adapter.get_kv_all(ip_embeds)
-    ip_scale = adapter.scale
+    ip_scale = adapter.effective_scale(style_only=style_only, sref_strength=sref_strength)
     mx.eval(ip_embeds, k_ip, v_ip, ip_scale)
 
     # Uniform schedule: 1000 → 0 in n_steps steps
@@ -304,6 +310,8 @@ def run_eval(
     seed: int = 42,
     siglip_model_name: str = "google/siglip-so400m-patch14-384",
     vae=None,
+    style_only: bool = False,
+    sref_strength: float = 1.0,
 ) -> dict:
     """
     Run evaluation against a fixed prompt set.
@@ -315,6 +323,8 @@ def run_eval(
     output_dir:      where to write images, JSON, HTML
     step:            training step (used in filenames and report)
     vae:             VAE decoder; defaults to flux.vae if None
+    style_only:      zero double-stream ip_scale (style-only mode)
+    sref_strength:   global ip_scale multiplier (1.0 = no change)
     """
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
@@ -344,6 +354,7 @@ def run_eval(
     # ── Build adapter from EMA params ────────────────────────────────────────
     adapter = IPAdapterKlein(
         num_blocks=adapter_cfg["num_blocks"],
+        num_double_blocks=adapter_cfg.get("num_double_blocks", 5),
         hidden_dim=adapter_cfg["hidden_dim"],
         num_image_tokens=adapter_cfg["num_image_tokens"],
         siglip_dim=adapter_cfg["siglip_dim"],
@@ -390,7 +401,8 @@ def run_eval(
 
         # ── Generate latents ──────────────────────────────────────────────────
         latents = _generate(flux, adapter, text_embeds, siglip_feats,
-                            width, height, n_steps, seed + idx)
+                            width, height, n_steps, seed + idx,
+                            style_only=style_only, sref_strength=sref_strength)
 
         # ── Decode + save ─────────────────────────────────────────────────────
         gen_arr = _decode_latents(vae, latents) if vae is not None else None
@@ -445,6 +457,8 @@ def run_eval(
     summary = {
         "step": step,
         "num_prompts": len(prompts),
+        "style_only": style_only,
+        "sref_strength": sref_strength,
         "mean_clip_i": round(mean_ci, 4) if mean_ci is not None else None,
         "mean_clip_t": round(mean_ct, 4) if mean_ct is not None else None,
         "elapsed_s": elapsed,
@@ -495,6 +509,10 @@ def main():
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--style-only", action="store_true", default=False,
+                        help="Zero double-stream ip_scale (style-only mode, no layout injection)")
+    parser.add_argument("--sref-strength", type=float, default=None,
+                        help="Override ip_scale global multiplier (default: from config or 1.0)")
     args = parser.parse_args()
 
     import yaml
@@ -530,6 +548,11 @@ def main():
     print(f"Loading adapter checkpoint {args.checkpoint} ...")
     adapter_params = dict(mx.load(args.checkpoint))
 
+    # CLI flags override config values; config values override defaults.
+    style_only    = args.style_only or acfg.get("style_only", False)
+    sref_strength = args.sref_strength if args.sref_strength is not None \
+                    else acfg.get("sref_strength", 1.0)
+
     run_eval(
         flux=flux,
         adapter_cfg=acfg,
@@ -543,6 +566,8 @@ def main():
         seed=args.seed,
         siglip_model_name=mcfg["siglip_model"],
         vae=flux.vae,
+        style_only=style_only,
+        sref_strength=sref_strength,
     )
 
 

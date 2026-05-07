@@ -772,6 +772,7 @@ def train(config: dict) -> None:
     else:
         adapter = IPAdapterKlein(
             num_blocks=acfg["num_blocks"],
+            num_double_blocks=acfg.get("num_double_blocks", 5),
             hidden_dim=acfg["hidden_dim"],
             num_image_tokens=acfg["num_image_tokens"],
             siglip_dim=acfg["siglip_dim"],
