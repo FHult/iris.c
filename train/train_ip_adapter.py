@@ -46,7 +46,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
-from ip_adapter.loss import fused_flow_noise, get_schedule_values
+from ip_adapter.loss import fused_flow_noise, get_schedule_values, gram_style_loss
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 
@@ -793,8 +793,14 @@ def train(config: dict) -> None:
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
+    _style_weight = float(tcfg.get("style_loss_weight", 0.0))
+    _style_every  = int(tcfg.get("style_loss_every", 1))
+    # Written by loss_fn on conditioned steps; read after eval for logging.
+    _style_loss_accum: list = [mx.array(0.0)]
+
     def loss_fn(siglip_feats, use_null_image: mx.array,
-                flux_state: dict, target: mx.array):
+                flux_state: dict, target: mx.array,
+                x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
         """
         Differentiable adapter-only loss. Flux forward has already been run
         outside this function (no grad); only the tiny adapter graph is traced.
@@ -856,7 +862,17 @@ def train(config: dict) -> None:
         pred = pred.transpose(0, 1, 4, 2, 5, 3)
         pred = pred.reshape(B, C, Lh, Lw)
 
-        return mx.mean((pred - target) ** 2)
+        flow_loss = mx.mean((pred - target) ** 2)
+        if _style_weight > 0.0 and x0_ref is not None:
+            # Reconstruct predicted clean latent from velocity and noisy input.
+            # x0_pred = alpha * x_t - sigma * v_pred (exact in flow matching)
+            _a = alpha_in.reshape(-1, 1, 1, 1).astype(mx.float32)
+            _s = sigma_in.reshape(-1, 1, 1, 1).astype(mx.float32)
+            x0_pred = _a * noisy_in.astype(mx.float32) - _s * pred.astype(mx.float32)
+            style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
+            _style_loss_accum[0] = style_term
+            return flow_loss + _style_weight * style_term
+        return flow_loss
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
 
@@ -866,9 +882,11 @@ def train(config: dict) -> None:
     # working around since the adapter step is already ~0.0s (lazy graph tracing
     # is negligible; all real work is in mx.eval dominated by Flux forward at 5-6s).
 
-    def compiled_step(siglip_feats, use_null_image, flux_state, target):
+    def compiled_step(siglip_feats, use_null_image, flux_state, target,
+                      x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
         loss_val, grads = loss_and_grad(
             siglip_feats, use_null_image, flux_state, target,
+            x0_ref, noisy_in, alpha_in, sigma_in,
         )
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
@@ -990,6 +1008,10 @@ def train(config: dict) -> None:
     _null_loss_sum = 0.0
     _null_loss_count = 0
 
+    # Style loss tracking (Gram matrix term when style_loss_weight > 0)
+    _style_loss_sum = 0.0
+    _style_loss_count = 0
+
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
@@ -1096,9 +1118,16 @@ def train(config: dict) -> None:
 
         # Adapter-only backward + optimizer update + optimizer state eval (bulk of GPU work)
         _t0 = time.time()
-        loss_val, grad_norm_val = compiled_step(
-            siglip_feats, use_null_image, flux_state, target,
-        )
+        _do_style = _style_weight > 0.0 and not null_image and step % _style_every == 0
+        if _do_style:
+            loss_val, grad_norm_val = compiled_step(
+                siglip_feats, use_null_image, flux_state, target,
+                latents, noisy, alpha_t, sigma_t,
+            )
+        else:
+            loss_val, grad_norm_val = compiled_step(
+                siglip_feats, use_null_image, flux_state, target,
+            )
         # flux_state (25 Q tensors, h_final, temb ≈ 300 MB) and target are no
         # longer needed — release before eval so Metal reclaims them promptly.
         del flux_state, target
@@ -1134,6 +1163,12 @@ def train(config: dict) -> None:
         _t_eval += _t_eval_end - _t0
 
         step += 1
+
+        # Style loss accumulation — _style_loss_accum[0] was set inside loss_fn
+        # and is already materialized by Fence 1 above (it's in loss_val's graph).
+        if _do_style:
+            _style_loss_sum += float(_style_loss_accum[0].item())
+            _style_loss_count += 1
 
         # T-01: grad norm EMA + spike alert
         _gn = float(grad_norm_val.item())
@@ -1316,6 +1351,18 @@ def train(config: dict) -> None:
             _cond_loss_sum = _cond_loss_count = 0
             _null_loss_sum = _null_loss_count = 0
 
+            # Style loss (Gram matrix term)
+            if _style_weight > 0.0 and _style_loss_count > 0:
+                _style_loss_avg = round(_style_loss_sum / _style_loss_count, 6)
+                print(
+                    f"  style_loss={_style_loss_avg:.6f}"
+                    f"  (weight={_style_weight}, {_style_loss_count}/{log_interval} steps)",
+                    flush=True,
+                )
+            else:
+                _style_loss_avg = None
+            _style_loss_sum = _style_loss_count = 0
+
             # T-13: adapter scale magnitudes (QUALITY-5)
             _scale_all_mean = _scale_double_mean = _scale_single_mean = None
             try:
@@ -1350,6 +1397,7 @@ def train(config: dict) -> None:
                      "ema_drift": ema_drift, "siglip_coverage_pct": _siglip_cov,
                      "loader_wait_pct": _loader_pct,
                      "loss_cond": _loss_cond_avg, "loss_null": _loss_null_avg,
+                     "style_loss": _style_loss_avg,
                      "ip_scale_mean": _scale_all_mean,
                      "ip_scale_double": _scale_double_mean,
                      "ip_scale_single": _scale_single_mean},
@@ -1385,6 +1433,7 @@ def train(config: dict) -> None:
                     mlx_peak_gb=mlx_peak_gb,
                     loss_cond=_loss_cond_avg,
                     loss_null=_loss_null_avg,
+                    style_loss=_style_loss_avg,
                     ip_scale_mean=_scale_all_mean,
                     ip_scale_double=_scale_double_mean,
                     ip_scale_single=_scale_single_mean,

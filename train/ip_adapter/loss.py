@@ -16,6 +16,29 @@ import mlx.core as mx
 
 
 # ---------------------------------------------------------------------------
+# Gram matrix style loss
+# ---------------------------------------------------------------------------
+
+def gram_matrix(x: mx.array) -> mx.array:
+    """Normalized Gram matrix. x: float32 [B, C, H, W] → [B, C, C]"""
+    B, C, H, W = x.shape
+    f = x.reshape(B, C, H * W)
+    return mx.matmul(f, f.transpose(0, 2, 1)) / (C * H * W)
+
+
+def gram_style_loss(x0_pred: mx.array, x0_ref: mx.array) -> mx.array:
+    """
+    MSE between normalized Gram matrices of predicted and reference clean latents.
+    Both inputs: float32 [B, C, H, W].
+
+    Reconstruct x0_pred from velocity v_pred and noisy latent x_t:
+      x0_pred = alpha_t * x_t - sigma_t * v_pred
+    (exact because alpha_t^2 + sigma_t^2 = 1 in flow matching)
+    """
+    return mx.mean((gram_matrix(x0_pred) - gram_matrix(x0_ref)) ** 2)
+
+
+# ---------------------------------------------------------------------------
 # Fused Metal kernel — v-prediction noise scheduler
 # Matches plans/ip-adapter-training.md §3.2 exactly.
 # Inputs: latent, noise, alpha (scalar arr), sigma (scalar arr)

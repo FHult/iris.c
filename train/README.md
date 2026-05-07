@@ -85,3 +85,40 @@ Two metrics distinguish "adapter is learning" from "adapter is doing nothing":
 **`ip_scale` per block group** — 25 learnable scale scalars. Double-stream blocks (indices 0–4) control content, single-stream (5–24) control appearance. Healthy range 0.3–1.0; >2.0 risks content leakage; <0.05 means the block is inactive.
 
 Both metrics surface in `pipeline_status.py` and `pipeline_doctor.py --ai`.
+
+---
+
+## Style Loss (optional)
+
+An optional Gram matrix style loss can be added on top of the flow-matching objective to push the adapter toward capturing style statistics rather than content.
+
+**How it works:** at each conditioned training step the predicted clean latent is reconstructed from the velocity prediction:
+
+```
+x0_pred = alpha_t * x_t - sigma_t * v_pred
+```
+
+The Gram matrix (channel cross-correlation) of `x0_pred` is compared to the Gram matrix of the ground-truth latent `x0_ref`. The MSE between them is added to the flow-matching loss:
+
+```
+total_loss = flow_matching_loss + style_loss_weight * gram_mse(x0_pred, x0_ref)
+```
+
+**Configuration** (`stage1_512px.yaml`):
+
+```yaml
+training:
+  style_loss_weight: 0.0   # disabled by default; try 0.05–0.2
+  style_loss_every: 1      # apply every N steps (set > 1 to reduce overhead)
+```
+
+**Properties:**
+- Zero overhead when `style_loss_weight: 0.0` (default) — no extra computation.
+- Memory cost is negligible: Gram matrix of `[B, 32, H/8, W/8]` is `[B, 32, 32]`.
+- Only applied on conditioned steps (skipped when `image_dropout_prob` fires).
+- Logged as `style_loss` in the training output and heartbeat.
+
+**Tuning guidance:**
+- Start with `style_loss_weight: 0.05` and monitor `loss_cond`/`loss_null` gap.
+- If `ip_scale_double` rises above 1.0, the weight may be too high (content leakage).
+- Combine with QUALITY-1 (cross-image reference permutation) for strongest style/content separation.
