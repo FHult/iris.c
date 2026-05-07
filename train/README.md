@@ -10,6 +10,7 @@
 ```
 train/
   train_ip_adapter.py         Main training loop (MLX)
+  eval.py                     Checkpoint eval: generate images + CLIP-I/T metrics + HTML report
   start_pipeline.sh           Start or resume the pipeline (use this)
   ip_adapter/
     model.py                  IPAdapterKlein + PerceiverResampler
@@ -153,3 +154,47 @@ adapter_meta.json             — dimensions, quant mode, provenance
 See [export/README.md](export/README.md) for the full bundle format, quantisation
 comparison table, and C integration guide. See [export/iris_ip_adapter.h](export/iris_ip_adapter.h)
 for the C loader API.
+
+---
+
+## Evaluation
+
+`train/eval.py` generates images for each entry in `configs/eval_prompts.txt`
+using a checkpoint and computes CLIP-I (style fidelity) and CLIP-T (prompt
+adherence) via SigLIP SO400M. Requires `transformers` + `torch`.
+
+```bash
+python train/eval.py \
+    --checkpoint /Volumes/2TBSSD/checkpoints/stage1/step_050000.safetensors \
+    --config     train/configs/stage1_512px.yaml
+
+# Style-only mode (suppress layout injection)
+python train/eval.py --checkpoint ... --config ... --style-only
+
+# Dial conditioning strength down to 70%
+python train/eval.py --checkpoint ... --config ... --sref-strength 0.7
+```
+
+Output per run: `eval_results.json` (CLIP scores per prompt) and `report.html`
+(reference | generated image grid with scores).
+
+**Automatic eval hook** — set `eval.enabled: true` in `stage1_512px.yaml` to
+run eval every `eval.every_steps` (default 10 000) steps during training. Uses
+the in-memory Flux model; no extra model reload. Results are also logged to
+W&B when active.
+
+---
+
+## Inference-time style control
+
+`effective_scale(style_only, sref_strength)` on `IPAdapterKlein` returns the
+per-block scale without mutating the trained weights:
+
+| Flag | Effect |
+|------|--------|
+| `style_only=True` | Zeros double-stream block scales (indices 0–4); keeps single-stream (5–24). Removes layout/content injection, leaving style-only conditioning. |
+| `sref_strength=0.7` | Multiplies all active scales by 0.7. Range 0.0 (adapter off) – 2.0+ (over-conditioned). |
+
+Both flags are available in `eval.py` (`--style-only`, `--sref-strength`) and
+`run_inference.py`. Config defaults live in `stage1_512px.yaml` under
+`adapter.style_only` / `adapter.sref_strength`; CLI flags override them.
