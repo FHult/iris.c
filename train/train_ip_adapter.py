@@ -330,14 +330,62 @@ def save_checkpoint_async(
 
 
 def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
-    files = sorted(f for f in glob.glob(os.path.join(directory, "step_*.safetensors"))
-                   if "ema." not in f)
-    for f in files[:-keep_last_n]:
+    """
+    Keep the `keep_last_n` most recent checkpoints (by step number) plus up to
+    3 checkpoints with the best validation loss recorded in val_loss.jsonl.
+    The latest checkpoint is always preserved regardless of keep_last_n.
+
+    Sorts by parsed step number (not lexically) so files with inconsistent
+    zero-padding or step counts beyond the format width sort correctly.
+    """
+    all_paths = [
+        f for f in glob.glob(os.path.join(directory, "step_*.safetensors"))
+        if "ema." not in os.path.basename(f)
+    ]
+    if not all_paths:
+        return
+
+    # Sort numerically by step, not lexically.
+    by_step = sorted(all_paths, key=step_from_checkpoint_path)
+
+    if len(by_step) <= keep_last_n:
+        return
+
+    # Collect the set of paths to protect from deletion.
+    protected: set = set()
+
+    # Always keep the latest checkpoint.
+    protected.add(by_step[-1])
+
+    # Keep the keep_last_n most recent.
+    protected.update(by_step[-keep_last_n:])
+
+    # Also protect checkpoints that match the best 3 val_loss steps.
+    val_log = os.path.join(directory, "val_loss.jsonl")
+    if os.path.exists(val_log):
+        try:
+            records = []
+            with open(val_log) as _vf:
+                for line in _vf:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            if records:
+                records.sort(key=lambda r: r.get("val_loss", float("inf")))
+                best_steps = {r["step"] for r in records[:3]}
+                for p in by_step:
+                    if step_from_checkpoint_path(p) in best_steps:
+                        protected.add(p)
+        except Exception:
+            pass  # val_loss.jsonl unreadable — keep by recency only
+
+    for f in by_step:
+        if f in protected:
+            continue
         try:
             os.remove(f)
         except FileNotFoundError:
             pass  # already removed by a concurrent thread
-        # Remove lineage JSON sidecar if present
         sidecar = f.replace(".safetensors", ".json")
         try:
             os.remove(sidecar)
