@@ -102,6 +102,137 @@
 
 ---
 
+## V3 — Versioned Precompute Cache
+
+- **PRECOMP-1: Versioned, content-addressable precompute cache** — eliminate silent stale-data reuse and avoid redundant recomputation when switching between experiments or scales.
+
+  **Current state:** `precompute_all.py` writes flat `.npz` files into fixed directories (`staging/chunk{N}/precomputed/{qwen3,vae,siglip}/`). Cache validity = file exists. No config hash, no git SHA, no manifest. Changing image size, SigLIP model, quantisation level, or prompt template silently reuses stale `.npz` files with no warning or invalidation.
+
+  **Proposed directory layout:**
+  ```
+  data_root/precomputed/
+    qwen3/
+      v_a3f9c2/                    ← short hash of (config subset + git SHA)
+        manifest.json
+        000000_0000.npz
+        000000_0001.npz
+        …
+      current -> v_a3f9c2/         ← symlink updated atomically after full precompute
+    vae/
+      v_b17d44/
+        manifest.json
+        …
+      current -> v_b17d44/
+    siglip/
+      v_c9e012/
+        manifest.json
+        …
+      current -> v_c9e012/
+  ```
+
+  **`manifest.json` format:**
+  ```json
+  {
+    "version":      "v_a3f9c2",
+    "created_at":   "2026-05-07T14:22:00Z",
+    "git_sha":      "9f9463a",
+    "config_hash":  "a3f9c2d8",
+    "encoder":      "qwen3",
+    "config": {
+      "model":        "Qwen3-4B-Q4",
+      "image_size":   512,
+      "quant":        "int8",
+      "siglip_model": "google/siglip-so400m-patch14-384",
+      "layers":       [9, 18, 27]
+    },
+    "record_count": 412800,
+    "shard_count":  80,
+    "complete":     true
+  }
+  ```
+  `complete: false` while precompute is running; set to `true` and `current` symlink updated atomically only on successful full completion.
+
+  **Version hash derivation** — deterministic, short, human-skimmable:
+  ```python
+  import hashlib, json
+  def _version_hash(config_subset: dict, git_sha: str) -> str:
+      blob = json.dumps(config_subset, sort_keys=True) + git_sha[:8]
+      return "v_" + hashlib.sha256(blob.encode()).hexdigest()[:6]
+  ```
+  `config_subset` contains only the fields that affect the precomputed output (not e.g. batch size or number of workers).
+
+  **Relevant config fields per encoder:**
+
+  | Encoder | Config fields that affect output |
+  |---------|----------------------------------|
+  | VAE     | `image_size`, `quant` (int8/fp16), flux model path |
+  | Qwen3   | model path/variant, `layers` extraction indices, quant level, chat template |
+  | SigLIP  | `siglip_model` name, `image_size`, quant level |
+
+  **New file: `train/scripts/cache_manager.py`:**
+  ```python
+  class PrecomputeCache:
+      def __init__(self, data_root: Path, encoder: str, config_subset: dict, git_sha: str): …
+      def version(self) -> str: …                          # "v_a3f9c2"
+      def cache_dir(self) -> Path: …                       # data_root/precomputed/qwen3/v_a3f9c2/
+      def is_complete(self) -> bool: …                     # manifest.complete == True
+      def record_exists(self, rec_id: str) -> bool: …      # fast path: .npz exists
+      def mark_complete(self, record_count: int, shard_count: int): …  # write manifest + flip symlink
+      def all_records(self) -> set[str]: …                 # scan for --clear-cache and coverage
+      @staticmethod
+      def list_versions(data_root: Path, encoder: str) -> list[dict]: …  # for --list-cache
+      @staticmethod
+      def clear(data_root: Path, encoder: str, version: str | None = None): …  # for --clear-cache
+  ```
+
+  **Changes to existing code:**
+
+  *`precompute_all.py`*:
+  - Instantiate `PrecomputeCache` for each encoder at startup.
+  - Print version hash and config fields so the operator can confirm which cache will be written.
+  - Write to `cache.cache_dir()` instead of fixed `staging/chunk{N}/precomputed/{enc}/`.
+  - Call `cache.mark_complete()` after all shards finish; existing last-shard sampling check remains.
+  - Add `--clear-cache [encoder]` flag: calls `PrecomputeCache.clear()` then exits.
+  - Add `--list-cache` flag: prints all versions + record counts + completion state.
+
+  *`ip_adapter/dataset.py`*:
+  - `make_prefetch_loader()` gains optional `cache_version: str | None = None`.
+  - If `None`, resolve to `current` symlink target; if no `current` symlink, fall back to old flat path for backwards compat.
+  - `_load_qwen3_embed` / `_load_vae_latent` / `_load_siglip_embed`: resolve path via cache version, not hardcoded dir.
+
+  *`orchestrator.py` `_start_precompute()`*:
+  - Pass version hash to `precompute_all.py` via `--cache-version` flag (derived from current config + git SHA) so orchestrator controls which version is written.
+  - After promotion, record the active version hashes in `run_metadata.json` alongside existing fields.
+
+  *`pipeline_setup.py`*:
+  - During "existing state" detection, also scan `precomputed/*/current` symlinks and report which versions are present and whether they match current config.
+
+  **Invalidation behaviour:**
+  - On each precompute invocation, compute the expected version hash from current config.
+  - If `cache_dir` already exists and `manifest.complete == true` → skip (all records present).
+  - If `cache_dir` exists and `manifest.complete == false` → resume (partial run).
+  - If `cache_dir` does not exist → create and start fresh.
+  - Old version directories under `data_root/precomputed/{enc}/` are NOT auto-deleted; they survive until `--clear-cache` or PIPELINE-24 reset. A `--clear-stale` option removes all non-current versions.
+
+  **Atomic `current` symlink update:**
+  ```python
+  tmp = cache_dir.parent / ".current_tmp"
+  tmp.symlink_to(cache_dir.name)
+  tmp.rename(cache_dir.parent / "current")  # atomic on POSIX
+  ```
+
+  **Backwards compatibility:**
+  - If `data_root/precomputed/qwen3/` contains `.npz` files directly (old layout), treat as an unversioned legacy cache. Dataset loader uses it as fallback; a one-time migration script (`--migrate-cache`) moves flat files into a `v_legacy/` versioned directory and writes a best-effort manifest.
+
+  **Forward-looking (multinode / PIPELINE-25):**
+  - The versioned cache directories are read-only after `mark_complete()`. Multiple nodes can read the same NFS-mounted cache concurrently with no locking.
+  - Each node writes to its own staging area; the shared pool holds completed versioned caches.
+  - The version hash is deterministic from config alone — different nodes running the same config produce the same hash and can share the cache without coordination.
+
+  **Implementation priority:** VAE cache first (most expensive to recompute, ~5 GB/chunk, no model variation between runs). Qwen3 second (prompt template changes most often). SigLIP third.
+
+---
+
 ## V3 — Style/Content Separation
 
 These three changes work together to teach the adapter to extract style independently of content.
