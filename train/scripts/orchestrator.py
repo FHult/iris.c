@@ -495,6 +495,95 @@ class Orchestrator:
                      f"{CKPT_ARCHIVE_DIR.relative_to(DATA_ROOT)} ({len(copied)} files)",
                      chunk=chunk)
 
+    def _create_release_bundle(self, chunk: int) -> None:
+        """Create a clearly-named release bundle when the final chunk finishes training.
+
+        Writes archive/release_YYYYMMDD_step{N}/ containing:
+          adapter_weights.safetensors  — copy of best.safetensors (best val-loss)
+          release.json                 — full provenance (git SHA, step, loss, config, scale)
+        """
+        if self.dry_run:
+            return
+        from datetime import datetime, timezone
+
+        best = CKPT_DIR / "best.safetensors"
+        best_meta = CKPT_DIR / "best.json"
+        if not best.exists():
+            log_orch(f"Chunk {chunk}: no best.safetensors — skipping release bundle",
+                     level="warning", chunk=chunk)
+            return
+
+        # Derive step and loss from best.json if present.
+        step, loss = 0, None
+        if best_meta.exists():
+            try:
+                with open(best_meta) as f:
+                    meta = json.load(f)
+                step = meta.get("step", 0)
+                loss = meta.get("loss")
+            except Exception:
+                pass
+
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        bundle_name = f"release_{date_str}_step{step:07d}"
+        bundle_dir = CKPT_ARCHIVE_DIR / bundle_name
+        CKPT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+        if bundle_dir.exists():
+            log_orch(f"Chunk {chunk}: release bundle already exists at {bundle_name}",
+                     chunk=chunk)
+            return
+
+        bundle_dir.mkdir(parents=True)
+
+        # Copy best weights with a clear, stable name.
+        try:
+            shutil.copy2(best, bundle_dir / "adapter_weights.safetensors")
+        except OSError as e:
+            log_orch(f"Chunk {chunk}: release bundle copy failed: {e}", level="warning",
+                     chunk=chunk)
+            return
+
+        # Write provenance.
+        provenance = {
+            "bundle": bundle_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "step": step,
+            "loss": loss,
+            "scale": self.scale,
+            "total_chunks": self.total_chunks,
+            "source": str(best.relative_to(DATA_ROOT)),
+        }
+        try:
+            import subprocess as _sp
+            provenance["git_sha"] = _sp.check_output(
+                ["git", "-C", str(TRAIN_DIR.parent), "rev-parse", "--short", "HEAD"],
+                stderr=_sp.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            pass
+        if best_meta.exists():
+            try:
+                with open(best_meta) as f:
+                    provenance["training_config"] = json.load(f).get("config", {})
+            except Exception:
+                pass
+
+        try:
+            with open(bundle_dir / "release.json", "w") as f:
+                json.dump(provenance, f, indent=2)
+        except OSError as e:
+            log_orch(f"Chunk {chunk}: failed to write release.json: {e}", level="warning",
+                     chunk=chunk)
+
+        log_orch(
+            f"Chunk {chunk}: release bundle created → "
+            f"{bundle_dir.relative_to(DATA_ROOT)}  "
+            f"(step={step:,}  loss={loss})",
+            chunk=chunk,
+        )
+        notify("iris pipeline", f"Release bundle ready: {bundle_name}  loss={loss}")
+
     # -----------------------------------------------------------------------
     # PIPELINE-17: Auto-populate anchor_shards after chunk 1
     # -----------------------------------------------------------------------
@@ -1083,6 +1172,8 @@ class Orchestrator:
                 mark_done(chunk, "train")
                 self._archive_chunk_checkpoint(chunk)
                 self._auto_populate_anchor_shards(chunk)
+                if chunk >= self.total_chunks:
+                    self._create_release_bundle(chunk)
                 notify("iris pipeline", f"Chunk {chunk} training complete")
                 if self.res.holder("GPU_TOKEN") == _train_token:
                     self.res.release("GPU_TOKEN")
