@@ -1205,6 +1205,12 @@ class Orchestrator:
 
         training_cfg = self.cfg.get("training", {})
 
+        # Hard examples feed the next chunk's training — skip for the final chunk.
+        if chunk >= self.total_chunks:
+            log_orch(f"Chunk {chunk}: final chunk — skipping mining (no next chunk)", chunk=chunk)
+            mark_done(chunk, "mine")
+            return
+
         # Allow operators to disable mining entirely (e.g. dev/integration runs).
         if not training_cfg.get("mine", True):
             log_orch(f"Chunk {chunk}: mining disabled in config — skipping", chunk=chunk)
