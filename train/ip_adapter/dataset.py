@@ -490,17 +490,35 @@ def make_prefetch_loader(
                     imgs_buf, caps_buf = [], []
                     temb_buf, vlat_buf, sfeat_buf = [], [], []
 
-    threading.Thread(target=shard_loader, daemon=True).start()
-    threading.Thread(target=sample_decoder, daemon=True).start()
+    # Shared crash-message slot: workers write their exception here before dying
+    # so the main thread can surface the root cause instead of a generic timeout.
+    _worker_crash: list[str] = []
+
+    def _guarded(fn, name):
+        """Run fn(); on unhandled exception record the traceback and unblock sample_q."""
+        import traceback as _tb
+        try:
+            fn()
+        except Exception as exc:
+            msg = f"{name} crashed: {type(exc).__name__}: {exc}\n{''.join(_tb.format_exc())}"
+            print(msg, file=sys.stderr, flush=True)
+            _worker_crash.append(msg)
+            sample_q.put(None)  # unblock the main-thread get() immediately
+
+    threading.Thread(target=_guarded, args=(shard_loader, "shard_loader"), daemon=True).start()
+    threading.Thread(target=_guarded, args=(sample_decoder, "sample_decoder"), daemon=True).start()
 
     while True:
         try:
             item = sample_q.get(timeout=120)
         except queue.Empty:
+            crash_detail = _worker_crash[0] if _worker_crash else "no exception captured"
             raise RuntimeError(
-                "sample_q timeout (120s) — shard_loader or sample_decoder likely crashed"
+                f"sample_q timeout (120s) — worker likely crashed.\n{crash_detail}"
             )
         if item is None:
+            if _worker_crash:
+                raise RuntimeError(_worker_crash[0])
             raise RuntimeError(
                 "shard_loader encountered too many consecutive errors — dataset exhausted"
             )

@@ -301,7 +301,9 @@ class Orchestrator:
         self._crash_diag: dict[tuple, tuple] = {}             # → (reason, detail)
 
         # Dispatch cooldown: {issue_key: last_dispatch_epoch_secs}
-        self._dispatch_last: dict[str, float] = {}
+        # Dispatch fire count: {issue_key: number of times dispatched}
+        self._dispatch_last:  dict[str, float] = {}
+        self._dispatch_count: dict[str, int]   = {}
 
         # Cache of last-written state per chunk — avoid redundant file writes
         self._last_written_state: dict[int, str] = {}
@@ -1546,11 +1548,18 @@ class Orchestrator:
 
     def _dispatch_once(self, key: str, issue_id: str, severity: str, message: str,
                        cooldown_secs: float = 3600.0, **kwargs) -> None:
-        """dispatch_issue with per-key cooldown to prevent alert floods."""
+        """dispatch_issue with per-key cooldown and back-off to prevent alert floods.
+
+        After 5 fires of the same key the cooldown doubles to 7200s, reducing
+        log noise during prolonged stuck states (e.g. 200+ escalations/hour).
+        """
         now = time.time()
-        if now - self._dispatch_last.get(key, 0.0) < cooldown_secs:
+        count = self._dispatch_count.get(key, 0)
+        effective_cooldown = cooldown_secs * 2 if count >= 5 else cooldown_secs
+        if now - self._dispatch_last.get(key, 0.0) < effective_cooldown:
             return
-        self._dispatch_last[key] = now
+        self._dispatch_last[key]  = now
+        self._dispatch_count[key] = count + 1
         dispatch_issue(issue_id, severity, message, **kwargs)
 
     def _check_training_anomalies(self, chunk: int) -> None:
