@@ -675,12 +675,14 @@ class Orchestrator:
                 except json.JSONDecodeError:
                     continue
                 chunk = ev.get("chunk")
-                msg   = ev.get("msg", "")
+                msg   = ev.get("message", "")
                 ts    = ev.get("ts", "")
-                if chunk and ("training started" in msg or "training complete" in msg
+                if chunk and ("starting training" in msg or "training complete" in msg
                               or "hard example mining complete" in msg):
                     events_by_chunk.setdefault(chunk, []).append(ev)
-                if chunk and "training started" in msg:
+                # Keep the latest start per chunk — chunk 1 may have many restarts;
+                # we want the start of the final successful run, not the first attempt.
+                if chunk and "starting training" in msg:
                     training_events.setdefault(chunk, {})["start"] = ts
                 if chunk and "training complete" in msg:
                     training_events.setdefault(chunk, {})["end"] = ts
