@@ -926,6 +926,32 @@ def _check_dispatch_queue() -> None:
     if not open_issues:
         return
 
+    # Drop entries whose flagged step is now sentinel-done (stale alerts from
+    # a prep step that completed after the alert was fired — e.g. precompute
+    # ran >6h legitimately, fired hung alerts, then finished successfully).
+    def _step_now_done(entry: dict) -> bool:
+        chunk = entry.get("chunk")
+        process = entry.get("process", "")
+        if chunk is None or not process:
+            return False
+        return is_done(chunk, process)
+
+    open_issues = [e for e in open_issues if not _step_now_done(e)]
+
+    # Semantic dedup: collapse hourly re-fires of the same alert into one.
+    # Each re-fire gets a unique auto-incrementing issue ID, so the by-ID
+    # dedup above keeps all N copies. Group by (chunk, process, suggested_action)
+    # and keep only the latest by timestamp.
+    seen: dict[tuple, dict] = {}
+    for e in open_issues:
+        key = (e.get("chunk"), e.get("process", ""), e.get("suggested_action", ""))
+        if e.get("ts", "") > seen.get(key, {}).get("ts", ""):
+            seen[key] = e
+    open_issues = list(seen.values())
+
+    if not open_issues:
+        return
+
     for entry in open_issues:
         sev = entry.get("severity", "warning").upper()
         msg = entry.get("message", "")
