@@ -501,10 +501,13 @@ def main():
     _hb_stop = threading.Event()
     def _hb_loop():
         while not _hb_stop.is_set():
-            done_tars = sum(1 for f in os.scandir(args.output)
-                            if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
-            write_heartbeat("build_shards", args.chunk,
-                            done=done_tars, total=n_shards, pct=round(100 * done_tars / max(n_shards, 1)))
+            try:
+                done_tars = sum(1 for f in os.scandir(args.output)
+                                if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
+                write_heartbeat("build_shards", args.chunk,
+                                done=done_tars, total=n_shards, pct=round(100 * done_tars / max(n_shards, 1)))
+            except OSError:
+                pass  # EINTR from sleep-wake signal; skip this tick, continue loop
             _hb_stop.wait(30)
     _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
     _hb_thread.start()

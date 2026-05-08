@@ -1060,6 +1060,39 @@ def main():
     if sq or sv:
         print(f"  WARNING: {sq + sv:,} records were skipped after single-record retry — check stderr for details")
 
+    # Post-run coverage verification: count .npz files per shard and flag any
+    # short shards before the orchestrator marks precompute.done.  A partial
+    # shard (e.g. from a mid-shard kill) would otherwise only be caught 12+h
+    # later at promotion time, causing a 200+ escalation storm.
+    _check_dirs = [d for d in [args.qwen3_output, args.vae_output] if d]
+    if _check_dirs and work_items:
+        print("\nVerifying per-shard .npz coverage ...", flush=True)
+        _short: list[str] = []
+        for shard_path, *_ in work_items:
+            stem = os.path.splitext(os.path.basename(shard_path))[0]
+            # Count records in the shard (fast header-only pass).
+            try:
+                expected = sum(1 for _ in iter_shard(shard_path))
+            except Exception:
+                continue
+            if expected == 0:
+                continue
+            for out_dir in _check_dirs:
+                actual = sum(1 for f in os.listdir(out_dir)
+                             if f.startswith(stem + "_") and f.endswith(".npz"))
+                if actual < expected:
+                    _short.append(
+                        f"  {os.path.basename(out_dir)}/{stem}: {actual}/{expected} records"
+                    )
+        if _short:
+            print(f"  COVERAGE GAPS ({len(_short)} shard(s)):", flush=True)
+            for s in _short:
+                print(s, flush=True)
+            print("  Rerun precompute to fill gaps — exiting with error.", flush=True)
+            sys.exit(1)
+        else:
+            print(f"  Coverage OK — all {len(work_items)} shard(s) complete.", flush=True)
+
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
