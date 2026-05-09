@@ -52,6 +52,7 @@ import yaml  # available in train/.venv
 # ── Repo layout ───────────────────────────────────────────────────────────────
 _SCRIPT_DIR  = Path(__file__).resolve().parent
 _TRAIN_DIR   = _SCRIPT_DIR.parent
+_REPO_ROOT   = _TRAIN_DIR.parent  # model dir is relative to repo root
 _VENV_PYTHON = _TRAIN_DIR / ".venv" / "bin" / "python"
 _BASE_CONFIG = _TRAIN_DIR / "configs" / "stage1_512px.yaml"
 _TRAINER     = _TRAIN_DIR / "train_ip_adapter.py"
@@ -735,7 +736,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            cwd=str(_TRAIN_DIR),
+            cwd=str(_REPO_ROOT),
         )
 
         for raw_line in proc.stdout:  # type: ignore[union-attr]

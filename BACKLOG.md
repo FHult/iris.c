@@ -11,24 +11,7 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ---
 
-## Training Quality Improvements
-
-- ~~**TRAIN-4: Reset timing accumulator on resume to avoid misleading `data=` %**~~ ✅ DONE —
-  On resume (`step == start_step > chunk_base_step`): reset `_t_eval_end = None` and
-  `t0 = time.time()` so the first interval excludes idle time between crash and restart and
-  startup/warmup overhead. Also added 300 s per-step cap on data-wait accumulation to discard
-  sleep/wake stale timestamps (caffeinate failure), which was the root cause of the observed
-  `data=288971.7s (99%)` at chunk 2 step 57,000.
-
----
-
 ## Pipeline Improvements
-
-- ~~**PIPELINE-3: Never run pipeline jobs while training is active on 2TBSSD**~~ ✅ DONE —
-  Replaced the hard block with `taskpolicy -d throttle` + `nice -n 10` wrappers on download,
-  build, and filter. These steps now run concurrently with training; the kernel services their
-  disk I/O only when the drive queue is otherwise idle so training reads always take priority.
-  Precompute and clip_embed remain gated on `gpu_is_free()` (GPU contention is the hard limit).
 
 - **PIPELINE-4: Investigate MLX CLIP for clip_embed step** — `clip_dedup.py` currently uses
   `open_clip` ViT-L-14 via PyTorch MPS (fp16) in `_load_clip()` / `_embed_batch()`. MLX is
@@ -37,21 +20,6 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   step. Measure actual img/s on a real chunk before implementing; only worthwhile if clip_embed
   is a bottleneck. Implementation: `pip install mlx-clip`, add MLX branch to `_load_clip()` /
   `_embed_batch()`.
-
-- ~~**PIPELINE-23: Cap shard build count to match precompute `max_shards`**~~ ✅ DONE — Added
-  `--max-shards` argument to `build_shards.py` (truncates record list after shuffle so we never
-  build more shards than `precompute.max_shards` for the active scale). `_start_build()` in
-  orchestrator reads `precompute.max_shards` (same config key used by precompute) and passes
-  `--max-shards {n}` to the build script, logging the cap decision to the orchestrator JSONL.
-
-- ~~**PIPELINE-24: `pipeline_setup.py` — clean-slate / selective-purge wizard**~~ ✅ DONE —
-  Added `_interactive_reset_wizard()` (3 modes: resume / partial / full), `_find_checkpoints()`,
-  `_archive_checkpoints()`, and `_purge_pipeline_state()`. Interactive mode prompts the user
-  when existing state is found; `--reset {full,partial,resume}` skips the prompt for scripted
-  use. `--ai --reset partial/full` emits `{"action":"purge","archived_to":…,"deleted_bytes":…}`
-  and executes immediately. Checkpoint archiving is prompted before any destructive reset.
-  Stale-state cleanup (logs/*.log, logs/*.jsonl, .heartbeat/*.json) is automated in both reset
-  modes. `archive/` is never touched by any reset mode.
 
 - **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** — currently
   `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/`
@@ -100,23 +68,6 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   - `download_convert.py`: `run_jdb_download_convert()` — create staging symlinks before producer loop; remove symlink (not pool file) after conversion.
   - `pipeline_setup.py`: add "populate staging symlinks" step; report pool coverage vs. scale requirement.
   - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
-
-- ~~**PIPELINE-26: Standardise `--ai` mode across all pipeline scripts**~~ ✅ DONE —
-  All scripts now emit compact JSON to stdout when `--ai` is passed; all progress/prose
-  goes to stderr. `pipeline_ctl.py` was already done. New implementations:
-  - `pipeline_status.py`: `{ok, step, loss, eta_sec, chunks_done, total_chunks, active_chunk, disk_free_gb, issues[]}`
-  - `orchestrator.py`: read-only snapshot `{state, active_chunk, last_poll_age_sec, pending_action, run_id, scale}` — exits immediately, does not start the orchestrator
-  - `validator.py`: `{passed, verdict, reason, clip_i_mean, weight_ok, issues[], chunk, elapsed_secs}`
-  - `validate_shards.py`: `{ok, total, passed, failed, warnings, corrupt_paths[]}`
-  - `validate_weights.py`: `{passed, issues[], num_keys}`
-  - `mine_hard_examples.py`: `{ok, done, total, pct, top_k_loss_mean, extracted, output}`
-  - `precompute_all.py`: `{ok, done, total, pct, elapsed_hours, qwen3_written, vae_written, siglip_written, errors[]}`
-
-- ~~**PIPE-26: Start memory_pressure.log from orchestrator startup**~~ ✅ DONE — Memory watchdog
-  daemon thread already starts in `Orchestrator.__init__` (unconditional, not on-demand),
-  polling `vm_stat` every 30 s and writing to `LOG_DIR/memory_pressure.log`. Added
-  `orchestrator_pid` and `memory_watchdog_log` fields to `run_metadata.json` so the log path
-  is always recorded at startup (thread is daemon-owned; no separate PID to track).
 
 ---
 
@@ -241,48 +192,6 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
   **Implementation priority:** VAE first (most expensive, ~5 GB/chunk, no model variation).
   Qwen3 second (prompt template changes most often). SigLIP third.
-
----
-
-## V3 — Style/Content Separation
-
-These three changes work together to teach the adapter to extract style independently of content.
-The core problem: training with reference=target lets the model use SigLIP content features as a
-reconstruction shortcut rather than learning style as an independent signal.
-
-- ~~**QUALITY-1: Cross-image reference permutation**~~ ✅ DONE — In 50% of training batches
-  (`cross_ref_prob: 0.5` in config), `siglip_feats` is permuted along the batch dimension before
-  `compiled_step`. Forces style/content separation; tracked via `loss_self_ref` / `loss_cross_ref`
-  split in logs and heartbeat.
-
-- ~~**QUALITY-2: Freeze double-stream IP scales to zero**~~ ✅ DONE — `freeze_double_stream_scales:
-  true` in adapter config section zeros `adapter.scale[:nd]` after checkpoint load and zeroes
-  the corresponding gradient slice in `compiled_step` so the optimizer never updates them.
-  Blocks 0–4 (double-stream) stay silent; style is learnt via single-stream blocks only.
-
-- ~~**QUALITY-3: Patch-shuffle augmentation on reference**~~ ✅ DONE — After `siglip_feats`
-  resolved, with probability `patch_shuffle_prob: 0.5`, the 729-token SigLIP sequence is randomly
-  permuted (`siglip_feats[:, perm, :]`). Destroys spatial layout while preserving per-patch
-  texture statistics.
-
----
-
-## V3 — Training Observability
-
-- ~~**QUALITY-6: Cross-reference loss tracking**~~ ✅ DONE — `_self_ref_loss_sum/count` and
-  `_cross_ref_loss_sum/count` accumulators added. At each log interval, prints
-  `loss_ref: self=X.XXXX [n=N]  cross=X.XXXX [n=N]  gap=+X.XXXX` and warns if cross < self.
-  Both fields included in the heartbeat JSON.
-
-- ~~**QUALITY-8: Validate and tune `style_loss_weight`**~~ ✅ DONE — Set `style_loss_weight: 0.05`
-  in `stage1_512px.yaml`. Monitor `style_loss` and `grad_norm` in the first 500 steps; reduce to
-  0.01 if grad spikes appear. Style loss is already skipped on null-image steps (correct).
-
-- ~~**QUALITY-9: Quality tracking script**~~ ✅ DONE — `train/scripts/quality_tracker.py`: reads
-  `<ckpt_dir>/eval/step_*/eval_results.json`, `<ckpt_dir>/val_loss.jsonl`, and
-  `DATA_ROOT/.heartbeat/trainer_chunk*.json`. Produces self-contained HTML with canvas charts
-  (loss, CLIP-I/T, ip_scale). `--ai` emits compact JSON with `summary`, `top_action`,
-  `data_points`. Pure stdlib; no numpy/matplotlib required.
 
 ---
 

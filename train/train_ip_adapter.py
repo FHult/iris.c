@@ -843,6 +843,12 @@ def train(config: dict) -> None:
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
+    # QUALITY-2: freeze double-stream IP scales throughout training.
+    # Double-stream blocks (0..nd-1) primarily inject content/structure; keeping
+    # them at zero forces the adapter to learn style via single-stream blocks only.
+    _freeze_double_stream = acfg.get("freeze_double_stream_scales", False)
+    _nd = adapter.num_double_blocks  # number of double-stream blocks (default 5)
+
     # QUALITY-2: zero double-stream scales after checkpoint load so content-injecting
     # blocks stay silent for the entire run (grad zeroing in compiled_step keeps them zero).
     if _freeze_double_stream:
@@ -856,12 +862,6 @@ def train(config: dict) -> None:
     _style_every  = int(tcfg.get("style_loss_every", 1))
     # Written by loss_fn on conditioned steps; read after eval for logging.
     _style_loss_accum: list = [mx.array(0.0)]
-
-    # QUALITY-2: freeze double-stream IP scales throughout training.
-    # Double-stream blocks (0..nd-1) primarily inject content/structure; keeping
-    # them at zero forces the adapter to learn style via single-stream blocks only.
-    _freeze_double_stream = acfg.get("freeze_double_stream_scales", False)
-    _nd = adapter.num_double_blocks  # number of double-stream blocks (default 5)
 
     # QUALITY-1 / QUALITY-3 aug probabilities
     _cross_ref_prob    = float(tcfg.get("cross_ref_prob", 0.0))
