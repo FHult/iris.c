@@ -13,16 +13,12 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ## Training Quality Improvements
 
-- **TRAIN-4: Reset timing accumulator on resume to avoid misleading `data=` %** — After a
-  training resume (crash + restart), the five timing accumulators (`_t_data`, `_t_prep`,
-  `_t_fwd`, `_t_step`, `_t_eval`) are initialised to 0.0 at session start but the first
-  log-interval window includes all wall-clock time since session start — which may include the
-  idle gap between crash and restart. Chunk 2 step 57,000 showed `data=288971.7s (99%)` —
-  80+ accumulated hours of idle time classified as data-wait. Fix: reset all five accumulators
-  to 0.0 at the first step after a resume, i.e., when `step == start_step` and
-  `start_step > chunk_base_step`. The existing per-interval reset at `_t_data = _t_prep =
-  _t_fwd = _t_step = _t_eval = 0.0` already clears them every `log_every` steps; the missing
-  piece is a one-time reset at the entry to the loop when not starting from step 0.
+- ~~**TRAIN-4: Reset timing accumulator on resume to avoid misleading `data=` %**~~ ✅ DONE —
+  On resume (`step == start_step > chunk_base_step`): reset `_t_eval_end = None` and
+  `t0 = time.time()` so the first interval excludes idle time between crash and restart and
+  startup/warmup overhead. Also added 300 s per-step cap on data-wait accumulation to discard
+  sleep/wake stale timestamps (caffeinate failure), which was the root cause of the observed
+  `data=288971.7s (99%)` at chunk 2 step 57,000.
 
 ---
 

@@ -1090,8 +1090,19 @@ def train(config: dict) -> None:
         # How long the GPU was idle waiting for data (time from end of last eval
         # to receiving this batch). Zero on first step (loader pre-filled).
         _t_now = time.time()
+        # On resume (start_step > chunk_base_step), discard the gap between the
+        # previous session's last eval and this session's first batch — it includes
+        # idle time between crash and restart.  Also reset t0 so the first interval's
+        # steps_per_sec excludes startup/warmup overhead.
+        if step == start_step and start_step > chunk_base_step:
+            _t_eval_end = None
+            t0 = _t_now
         if _t_eval_end is not None:
-            _t_data += _t_now - _t_eval_end
+            _step_data_wait = _t_now - _t_eval_end
+            # Skip outliers caused by machine sleep (caffeinate failure etc.):
+            # a wait ≥ 300 s between steps is stale, not real loader latency.
+            if _step_data_wait < 300.0:
+                _t_data += _step_data_wait
 
         bH, bW = bucket_hw
 

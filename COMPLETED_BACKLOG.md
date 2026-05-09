@@ -31,6 +31,8 @@ are in git history.
 
 ## Training Quality — Completed
 
+- **TRAIN-4** — On resume, reset `_t_eval_end = None` + `t0 = time.time()` at first step; cap per-step data wait to 300 s to discard sleep/wake stale timestamps.
+
 - **PERF-1** — `log_every` 100→500 in `stage1_512px.yaml`. ~16–17% wall-clock saving.
 - **PERF-2** — Logit-normal timestep sampling in `train_ip_adapter.py`.
 - **TRAINING-1** — Removed dead `style_ref` path. SigLIP cache-miss now forces `use_null_image=True` with exact zeros.
