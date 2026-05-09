@@ -627,11 +627,13 @@ class Orchestrator:
         state = read_state()
         run_id = state.get("run_id", f"run_{now_iso()[:10].replace('-', '')}")
         meta = {
-            "run_id":       run_id,
-            "scale":        self.scale,
-            "total_chunks": self.total_chunks,
-            "started_at":   now_iso(),
-            "config":       {k: v for k, v in self.cfg.items() if k != "_config_path"},
+            "run_id":               run_id,
+            "scale":                self.scale,
+            "total_chunks":         self.total_chunks,
+            "started_at":           now_iso(),
+            "orchestrator_pid":     os.getpid(),
+            "memory_watchdog_log":  str(self._mem_log),
+            "config":               {k: v for k, v in self.cfg.items() if k != "_config_path"},
         }
         try:
             RUN_METADATA_FILE.write_text(json.dumps(meta, indent=2))

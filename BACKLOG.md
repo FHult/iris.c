@@ -135,13 +135,11 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
   **Priority order:** `pipeline_status.py` first, then `validator.py`, then the rest.
 
-- **PIPE-26: Start memory_pressure.log from orchestrator startup** — `memory_pressure.log` was
-  absent for the entire chunk 1 training period (the most crash-intensive phase) because it was
-  started on demand rather than at pipeline launch. 37 jetsam kills happened with no memory
-  trace. Fix: `start_pipeline.sh` (or `orchestrator.py` startup) should launch the memory
-  pressure logger unconditionally, writing to `LOG_DIR/memory_pressure.log` from the first poll
-  cycle. Include the PID of the logger in `run_metadata.json` so it can be killed cleanly on
-  pipeline stop.
+- ~~**PIPE-26: Start memory_pressure.log from orchestrator startup**~~ ✅ DONE — Memory watchdog
+  daemon thread already starts in `Orchestrator.__init__` (unconditional, not on-demand),
+  polling `vm_stat` every 30 s and writing to `LOG_DIR/memory_pressure.log`. Added
+  `orchestrator_pid` and `memory_watchdog_log` fields to `run_metadata.json` so the log path
+  is always recorded at startup (thread is daemon-owned; no separate PID to track).
 
 ---
 
