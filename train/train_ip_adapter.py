@@ -843,10 +843,29 @@ def train(config: dict) -> None:
     mx.eval(adapter.parameters())
     mx.eval(ema_params)
 
+    # QUALITY-2: zero double-stream scales after checkpoint load so content-injecting
+    # blocks stay silent for the entire run (grad zeroing in compiled_step keeps them zero).
+    if _freeze_double_stream:
+        adapter.scale = mx.concatenate([
+            mx.zeros((_nd,), dtype=adapter.scale.dtype),
+            adapter.scale[_nd:],
+        ])
+        mx.eval(adapter.scale)
+
     _style_weight = float(tcfg.get("style_loss_weight", 0.0))
     _style_every  = int(tcfg.get("style_loss_every", 1))
     # Written by loss_fn on conditioned steps; read after eval for logging.
     _style_loss_accum: list = [mx.array(0.0)]
+
+    # QUALITY-2: freeze double-stream IP scales throughout training.
+    # Double-stream blocks (0..nd-1) primarily inject content/structure; keeping
+    # them at zero forces the adapter to learn style via single-stream blocks only.
+    _freeze_double_stream = acfg.get("freeze_double_stream_scales", False)
+    _nd = adapter.num_double_blocks  # number of double-stream blocks (default 5)
+
+    # QUALITY-1 / QUALITY-3 aug probabilities
+    _cross_ref_prob    = float(tcfg.get("cross_ref_prob", 0.0))
+    _patch_shuffle_prob = float(tcfg.get("patch_shuffle_prob", 0.0))
 
     def loss_fn(siglip_feats, use_null_image: mx.array,
                 flux_state: dict, target: mx.array,
@@ -934,6 +953,13 @@ def train(config: dict) -> None:
             siglip_feats, use_null_image, flux_state, target,
             x0_ref, noisy_in, alpha_in, sigma_in,
         )
+        # QUALITY-2: zero double-stream scale gradients so the optimizer never
+        # updates indices 0.._nd-1, keeping them pinned at zero.
+        if _freeze_double_stream:
+            grads["scale"] = mx.concatenate([
+                mx.zeros((_nd,), dtype=grads["scale"].dtype),
+                grads["scale"][_nd:],
+            ])
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
         optimizer.update(adapter, grads)
         # Return all lazy. Eval is split into two fences in the caller AFTER
@@ -1069,6 +1095,12 @@ def train(config: dict) -> None:
     _style_loss_sum = 0.0
     _style_loss_count = 0
 
+    # QUALITY-6: cross-ref vs self-ref loss split (populated by QUALITY-1 permutation)
+    _self_ref_loss_sum   = 0.0
+    _self_ref_loss_count = 0
+    _cross_ref_loss_sum   = 0.0
+    _cross_ref_loss_count = 0
+
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
@@ -1159,6 +1191,27 @@ def train(config: dict) -> None:
             null_image = True
             use_null_image = mx.array(True)
             _siglip_miss_steps += 1  # T-10
+
+        # QUALITY-3: patch-shuffle — shuffle 729 SigLIP token positions to destroy
+        # spatial layout while preserving per-patch texture/color statistics.
+        # Applied before cross-ref permutation so the shuffled features are what
+        # the model receives; only on conditioned (non-null) steps.
+        if _patch_shuffle_prob > 0.0 and not null_image:
+            if random.random() < _patch_shuffle_prob:
+                import numpy as _np
+                _perm_sf = mx.array(_np.random.permutation(siglip_feats.shape[1]))
+                siglip_feats = siglip_feats[:, _perm_sf, :]
+
+        # QUALITY-1: cross-ref permutation — swap SigLIP features across batch items
+        # so the model must match target latent using a *different* image's style.
+        # Forces style/content separation: impossible to use content as a shortcut.
+        is_cross_ref = False
+        if _cross_ref_prob > 0.0 and not null_image and siglip_feats.shape[0] > 1:
+            if random.random() < _cross_ref_prob:
+                import numpy as _np
+                _perm_cf = mx.array(_np.random.permutation(siglip_feats.shape[0]))
+                siglip_feats = siglip_feats[_perm_cf]
+                is_cross_ref = True
 
         _t_prep += time.time() - _t0
 
@@ -1265,6 +1318,13 @@ def train(config: dict) -> None:
         else:
             _cond_loss_sum += _step_loss_val
             _cond_loss_count += 1
+            # QUALITY-6: cross-ref vs self-ref split within conditioned steps
+            if is_cross_ref:
+                _cross_ref_loss_sum   += _step_loss_val
+                _cross_ref_loss_count += 1
+            else:
+                _self_ref_loss_sum   += _step_loss_val
+                _self_ref_loss_count += 1
 
         # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
         if step % 500 == 0:
@@ -1431,6 +1491,24 @@ def train(config: dict) -> None:
                 _style_loss_avg = None
             _style_loss_sum = _style_loss_count = 0
 
+            # QUALITY-6: cross-ref vs self-ref loss split
+            _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None
+            _loss_cross_ref_avg = round(_cross_ref_loss_sum / _cross_ref_loss_count, 4) if _cross_ref_loss_count > 0 else None
+            if _loss_self_ref_avg is not None or _loss_cross_ref_avg is not None:
+                _ref_parts = []
+                if _loss_self_ref_avg is not None:
+                    _ref_parts.append(f"self={_loss_self_ref_avg:.4f} [n={_self_ref_loss_count}]")
+                if _loss_cross_ref_avg is not None:
+                    _ref_parts.append(f"cross={_loss_cross_ref_avg:.4f} [n={_cross_ref_loss_count}]")
+                if _loss_self_ref_avg is not None and _loss_cross_ref_avg is not None:
+                    _ref_gap = _loss_cross_ref_avg - _loss_self_ref_avg
+                    _ref_parts.append(f"gap={_ref_gap:+.4f}")
+                    if _ref_gap < 0 and step > 1000:
+                        _ref_parts.append("WARNING: cross_ref < self_ref — unexpected, check augmentation")
+                print(f"  loss_ref: {'  '.join(_ref_parts)}", flush=True)
+            _self_ref_loss_sum  = _self_ref_loss_count  = 0
+            _cross_ref_loss_sum = _cross_ref_loss_count = 0
+
             # T-13: adapter scale magnitudes (QUALITY-5)
             _scale_all_mean = _scale_double_mean = _scale_single_mean = None
             try:
@@ -1502,6 +1580,8 @@ def train(config: dict) -> None:
                     loss_cond=_loss_cond_avg,
                     loss_null=_loss_null_avg,
                     style_loss=_style_loss_avg,
+                    loss_self_ref=_loss_self_ref_avg,
+                    loss_cross_ref=_loss_cross_ref_avg,
                     ip_scale_mean=_scale_all_mean,
                     ip_scale_double=_scale_double_mean,
                     ip_scale_single=_scale_single_mean,

@@ -263,110 +263,39 @@ These three changes work together to teach the adapter to extract style independ
 The core problem: training with reference=target lets the model use SigLIP content features as a
 reconstruction shortcut rather than learning style as an independent signal.
 
-- **QUALITY-1: Cross-image reference permutation** — In 50% of training batches, permute
-  `siglip_feats` within the batch before passing to `compiled_step`. With B=2, this swaps the
-  reference between sample A and sample B. The model must reconstruct A's latent from A's text +
-  B's SigLIP features — impossible without extracting style independent of content.
+- ~~**QUALITY-1: Cross-image reference permutation**~~ ✅ DONE — In 50% of training batches
+  (`cross_ref_prob: 0.5` in config), `siglip_feats` is permuted along the batch dimension before
+  `compiled_step`. Forces style/content separation; tracked via `loss_self_ref` / `loss_cross_ref`
+  split in logs and heartbeat.
 
-  Implementation: in the training loop, after `siglip_feats` is resolved (line ~1135–1149,
-  where it is set from cache or live SigLIP encoding) and before the `compiled_step` call (line
-  ~1181–1186), add a permutation branch controlled by `cross_ref_prob: 0.5` config key under
-  `training`. Also add `cross_ref_loss` as a separate tracked metric (see QUALITY-6). Start at
-  50%; reduce if training destabilises.
+- ~~**QUALITY-2: Freeze double-stream IP scales to zero**~~ ✅ DONE — `freeze_double_stream_scales:
+  true` in adapter config section zeros `adapter.scale[:nd]` after checkpoint load and zeroes
+  the corresponding gradient slice in `compiled_step` so the optimizer never updates them.
+  Blocks 0–4 (double-stream) stay silent; style is learnt via single-stream blocks only.
 
-- **QUALITY-2: Freeze double-stream IP scales to zero** — Blocks 0–`num_double_blocks-1`
-  (double-stream) control structure and spatial layout (content). Blocks `num_double_blocks`–end
-  (single-stream) control appearance, texture, and style. Injecting into double-stream blocks is
-  the primary source of content leakage at inference.
-
-  `IPAdapterKlein` exposes `num_double_blocks` (default 5) and `_effective_scale()` which
-  already returns a non-mutating zero-masked version for inference. The training fix is:
-  1. After adapter construction, zero `adapter.scale[:adapter.num_double_blocks]`.
-  2. Exclude those parameter indices from the optimizer parameter group so they never receive
-     gradients.
-  Add `freeze_double_stream_scales: true` config key under `training.adapter`.
-
-- **QUALITY-3: Patch-shuffle augmentation on reference** — Before SigLIP encoding, randomly
-  shuffle the 14×14 patch grid of the reference image. This destroys object layout and semantic
-  content while preserving per-patch texture/color statistics — exactly the signal the Perceiver
-  should learn to extract.
-
-  Implementation: after `images = augment_mlx(images, bH, bW)` (which applies random crop/flip
-  for both target and reference), make a copy `refs = mx.array(images)`. Then patch-shuffle
-  `refs` (probability 0.5) before passing to SigLIP. Currently `images` is used directly for
-  SigLIP encoding; the change introduces a separate `refs` tensor that goes through the shuffler
-  while `images` continues as the training target. Apply with probability 0.5 to preserve some
-  spatial style cues like composition.
+- ~~**QUALITY-3: Patch-shuffle augmentation on reference**~~ ✅ DONE — After `siglip_feats`
+  resolved, with probability `patch_shuffle_prob: 0.5`, the 729-token SigLIP sequence is randomly
+  permuted (`siglip_feats[:, perm, :]`). Destroys spatial layout while preserving per-patch
+  texture statistics.
 
 ---
 
 ## V3 — Training Observability
 
-- **QUALITY-6: Cross-reference loss tracking** — Once QUALITY-1 (permutation training) is added,
-  track `loss_self_ref` (reference=target batches) and `loss_cross_ref` (permuted batches)
-  separately. `loss_cross_ref` will be higher initially and should decrease as style/content
-  separation improves. If `loss_cross_ref` never decreases, the model is not generalising to
-  cross-image style transfer. The gap `loss_cross_ref - loss_self_ref` is a direct proxy for how
-  well the adapter has learned style-only conditioning.
+- ~~**QUALITY-6: Cross-reference loss tracking**~~ ✅ DONE — `_self_ref_loss_sum/count` and
+  `_cross_ref_loss_sum/count` accumulators added. At each log interval, prints
+  `loss_ref: self=X.XXXX [n=N]  cross=X.XXXX [n=N]  gap=+X.XXXX` and warns if cross < self.
+  Both fields included in the heartbeat JSON.
 
-- **QUALITY-8: Validate and tune `style_loss_weight`** — The Gram matrix style loss
-  (`style_loss_weight` in `stage1_512px.yaml`, default 0.0) is correctly implemented (centred
-  Gram, unbiased x0 reconstruction via `reconstruct_x0()`) but has never been run at non-zero
-  weight. `style_loss` is already tracked per log interval when the weight is non-zero. Before
-  enabling for a production run:
-  1. Set `style_loss_weight: 0.05` and run for ~500 steps.
-  2. Check `style_loss` trends downward alongside `loss_cond`.
-  3. Check `grad_norm` does not spike (would indicate weight too high).
-  4. Check the `loss_cond`/`loss_null` gap opens faster than a baseline run.
-  If clean at 0.05, promote to default. Note: style loss is already skipped on null-image steps
-  (correct — no reference to match against).
+- ~~**QUALITY-8: Validate and tune `style_loss_weight`**~~ ✅ DONE — Set `style_loss_weight: 0.05`
+  in `stage1_512px.yaml`. Monitor `style_loss` and `grad_norm` in the first 500 steps; reduce to
+  0.01 if grad spikes appear. Style loss is already skipped on null-image steps (correct).
 
-- **QUALITY-9: Quality tracking script** — `train/scripts/quality_tracker.py`: aggregates
-  per-checkpoint quality signals over time and produces an HTML report with inline charts plus a
-  compact `--ai` JSON summary.
-
-  **Data sources to aggregate (all already exist):**
-  - `eval_results.json` files under `<checkpoint_dir>/eval/step_NNNNNNN/` (from `eval.py`)
-  - `val_loss.jsonl` under `<checkpoint_dir>/`
-  - Trainer heartbeat files — step, loss_smooth, loss_cond, loss_null, ip_scale_mean (latest
-    snapshot only)
-
-  **HTML report** — single self-contained file with inline JS charts (no external deps; plain
-  `<canvas>` or small bundled snippet). Show: loss curves (`loss_smooth`, `loss_cond`,
-  `loss_null`, `val_loss` vs step), CLIP-I and CLIP-T vs step, `ip_scale_mean/double/single` vs
-  step, summary table (best CLIP-I/T checkpoint, latest val_loss).
-
-  **`--ai` mode:**
-  ```json
-  {
-    "summary": {
-      "steps_with_eval": 3,
-      "best_clip_i": {"step": 20000, "value": 0.312},
-      "best_clip_t": {"step": 30000, "value": 0.271},
-      "latest_val_loss": {"step": 25000, "value": 0.0821},
-      "trend_clip_i": "improving",
-      "trend_clip_t": "flat",
-      "trend_val_loss": "improving"
-    },
-    "top_action": "Run eval at step 30000 — 10000 steps since last eval point.",
-    "data_points": [...]
-  }
-  ```
-
-  **Usage:**
-  ```bash
-  python train/scripts/quality_tracker.py \
-      --checkpoint-dir /Volumes/2TBSSD/checkpoints/stage1 \
-      --output /tmp/quality_report.html
-
-  python train/scripts/quality_tracker.py \
-      --checkpoint-dir /Volumes/2TBSSD/checkpoints/stage1 \
-      --ai
-  ```
-
-  Pure stdlib + json + os; no numpy/matplotlib required. Works when only `val_loss.jsonl` exists
-  and no eval has run yet (graceful partial output). `--ai` output is valid JSON on stdout only;
-  errors go to stderr.
+- ~~**QUALITY-9: Quality tracking script**~~ ✅ DONE — `train/scripts/quality_tracker.py`: reads
+  `<ckpt_dir>/eval/step_*/eval_results.json`, `<ckpt_dir>/val_loss.jsonl`, and
+  `DATA_ROOT/.heartbeat/trainer_chunk*.json`. Produces self-contained HTML with canvas charts
+  (loss, CLIP-I/T, ip_scale). `--ai` emits compact JSON with `summary`, `top_action`,
+  `data_points`. Pure stdlib; no numpy/matplotlib required.
 
 ---
 

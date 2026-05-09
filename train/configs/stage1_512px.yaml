@@ -20,6 +20,8 @@ adapter:
   # Inference-time flags (no effect during training)
   style_only: false                        # true → zero double-stream ip_scale (indices 0–4)
   sref_strength: 1.0                       # global ip_scale multiplier (0.0–2.0 typical range)
+  # Training: freeze double-stream scales at zero (QUALITY-2)
+  freeze_double_stream_scales: true        # blocks 0–4 stay zero; style learnt via single-stream only
 
 data:
   shard_path: "train/data/shards"
@@ -50,10 +52,17 @@ training:
   text_dropout_prob: 0.10                  # 10%: use empty text prompt
 
   # Optional Gram matrix style loss (see train/README.md — Style Loss section)
-  # 0.0 = disabled (default). Try 0.05–0.2 to strengthen style conditioning.
   # Adds a Gram matrix MSE term on predicted vs. reference clean latent channels.
-  style_loss_weight: 0.0
+  style_loss_weight: 0.05                  # enabled; monitor grad_norm — reduce to 0.01 if spikes
   style_loss_every: 1                      # compute every N steps (higher = less overhead)
+
+  # QUALITY-1: cross-ref permutation — swap SigLIP features across batch items (50% of steps)
+  # Forces style/content separation; tracked via loss_self_ref vs loss_cross_ref in logs.
+  cross_ref_prob: 0.5
+
+  # QUALITY-3: patch-shuffle — randomise 729-token SigLIP sequence (50% of steps)
+  # Destroys spatial layout while preserving per-patch texture statistics.
+  patch_shuffle_prob: 0.5
 
 output:
   checkpoint_dir: "train/data/checkpoints/stage1"
