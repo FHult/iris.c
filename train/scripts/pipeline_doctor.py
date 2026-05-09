@@ -780,14 +780,31 @@ def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
                  chunk=chunk,
                  ctx={"step": step, "ip_scale_mean": ip_scale})
 
+        # QUALITY-1/6: cross-ref vs self-ref loss health check (only when permutation training is active)
+        loss_self_ref  = hb.get("loss_self_ref")
+        loss_cross_ref = hb.get("loss_cross_ref")
+        if step > 1000 and loss_self_ref is not None and loss_cross_ref is not None:
+            if loss_cross_ref < loss_self_ref - 0.01:
+                _add("WARNING", "anomaly",
+                     f"Chunk {chunk}: loss_cross_ref < loss_self_ref at step {step:,} — unexpected",
+                     detail=(f"loss_self_ref={loss_self_ref:.4f} loss_cross_ref={loss_cross_ref:.4f}. "
+                             f"Cross-ref batches (different style reference) should be harder than "
+                             f"self-ref; this inversion suggests the model may be ignoring SigLIP "
+                             f"conditioning entirely and relying on text only."),
+                     chunk=chunk,
+                     ctx={"step": step, "loss_self_ref": loss_self_ref,
+                          "loss_cross_ref": loss_cross_ref,
+                          "gap": round(loss_cross_ref - loss_self_ref, 4)})
+
         loader_wait = hb.get("loader_wait_pct")
         if loader_wait is not None and loader_wait > 20.0:
             sev = "WARNING" if loader_wait > 40.0 else "INFO"
             _add(sev, "anomaly",
                  f"Chunk {chunk}: loader_wait_pct {loader_wait:.1f}% — training I/O bound",
                  detail=(f"Step {step:,}. Training is spending {loader_wait:.1f}% of wall-clock "
-                         f"time waiting for the data loader. Causes: precomputed cache read "
-                         f"contention, slow 2TBSSD, or pipeline steps competing for disk I/O."),
+                         f"time waiting for the data loader. Note: download/build/filter steps "
+                         f"run throttled (IOPOL_THROTTLE) during training and should not cause "
+                         f"this. Likely causes: precomputed cache read contention or slow 2TBSSD."),
                  chunk=chunk,
                  ctx={"step": step, "loader_wait_pct": loader_wait})
 
@@ -1336,13 +1353,16 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
             "siglip_coverage_pct": active_hb.get("siglip_coverage_pct"),
             "loss_cond": active_hb.get("loss_cond"),
             "loss_null": active_hb.get("loss_null"),
+            "loss_self_ref": active_hb.get("loss_self_ref"),
+            "loss_cross_ref": active_hb.get("loss_cross_ref"),
             "ip_scale_mean": active_hb.get("ip_scale_mean"),
             "ip_scale_double": active_hb.get("ip_scale_double"),
             "ip_scale_single": active_hb.get("ip_scale_single"),
             "hb_age_s": round(best_age) if best_age < float("inf") else None,
         }
 
-    # Active prep step: check precompute/mine/validate heartbeats
+    # Active GPU-bound prep step: precompute / mine / validate
+    # These hold the GPU token and can't overlap with each other or with training.
     active_prep: Optional[dict] = None
     for c in chunks:
         for step, process in [("precompute", "precompute"), ("mine", "mine_hard_examples"), ("validate", "validate")]:
@@ -1361,6 +1381,27 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
                 break
         if active_prep:
             break
+
+    # Throttled parallel prep steps: download / build / filter run during training
+    # under taskpolicy -d throttle (PIPELINE-3) — show as informational, not GPU-blocking.
+    parallel_prep: Optional[dict] = None
+    if train_info:  # only meaningful when training is active
+        next_chunk = train_info["chunk"] + 1
+        for step, process in [
+            ("download", "download_convert"),
+            ("build_shards", "build_shards"),
+            ("filter_shards", "filter_shards"),
+        ]:
+            hb = read_heartbeat(process, next_chunk)
+            age = heartbeat_age_secs(process, next_chunk)
+            if hb is not None and age is not None and age <= HEARTBEAT_STALE_SECS:
+                parallel_prep = {
+                    "chunk": next_chunk, "step": step,
+                    "done": hb.get("done"), "total": hb.get("total"),
+                    "pct": hb.get("pct"),
+                    "hb_age_s": round(age),
+                }
+                break
 
     # Orchestrator last poll
     orch_age: Optional[int] = None
@@ -1386,6 +1427,8 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         summary["training"] = train_info
     if active_prep:
         summary["prep"] = active_prep
+    if parallel_prep:
+        summary["parallel_prep"] = parallel_prep
 
     return summary
 
