@@ -186,3 +186,69 @@ Large-scale default (200K chunk-1 steps, 80 shards), M1 Max throughput:
 
 Full end-to-end wall clock including data infrastructure: **~2 weeks.**
 Training steps can run overnight; the machine is not blocked during precompute.
+
+---
+
+## Style Separation Features (QUALITY-1/2/3/6/8)
+
+These features are active by default in `stage1_512px.yaml` and require SigLIP features
+(`training.siglip: true`). They are silently skipped when `siglip: false`.
+
+| Feature | Config key | Default | Effect |
+|---|---|---|---|
+| Cross-ref permutation | `training.cross_ref_prob` | 0.5 | 50% of conditioned steps: permute batch-dim of SigLIP feats so reference image doesn't match caption. Forces style/content separation. |
+| Patch shuffle | `training.patch_shuffle_prob` | 0.5 | 50% of conditioned steps: shuffle the 729-token SigLIP sequence. Destroys spatial layout, preserves texture statistics. |
+| Freeze double-stream scales | `adapter.freeze_double_stream_scales` | true | Zeros adapter scale for double-stream blocks (0–4) at init and zeroes their gradients during training. Single-stream blocks (5–24) learn normally. |
+| Style loss | `training.style_loss_weight` | 0.05 | Gram-matrix style loss weight. 0.0 disables. |
+| Ref loss tracking | always on | — | Logs `loss_ref: self=X cross=X gap=+X` at each log interval. Heartbeat includes `loss_self_ref`/`loss_cross_ref`. |
+
+### Interpreting cross-ref metrics
+
+In the training log:
+```
+loss_ref: self=0.231 [n=52] cross=0.278 [n=48] gap=+0.047
+```
+
+- `self` = loss when reference image matches the caption (normal conditioning)
+- `cross` = loss when reference image is shuffled across the batch (mismatched conditioning)
+- `gap` = cross − self; positive means the model correctly finds mismatched references harder
+
+**Healthy signal:** gap > 0.01 after ~2K steps. The adapter is learning to distinguish
+reference style from unrelated images.
+
+**Warning:** if `cross < self` after 1K steps, the adapter may be ignoring SigLIP
+features entirely (losses equalize). Try lowering `cross_ref_prob` to 0.3.
+
+### Pre-flight validation
+
+Before running a full training chunk, validate that all QUALITY features are active
+and producing healthy signal with the smoke-test script:
+
+```bash
+# Conservative (300 steps, cross_ref_prob=0.3, patch_shuffle_prob=0.3)
+train/.venv/bin/python train/scripts/test_quality_features.py \
+  --shards /Volumes/2TBSSD/shards \
+  --siglip-cache /Volumes/2TBSSD/precomputed/siglip
+
+# Production settings (500 steps, probabilities=0.5, matches stage1_512px.yaml)
+train/.venv/bin/python train/scripts/test_quality_features.py \
+  --shards /Volumes/2TBSSD/shards \
+  --siglip-cache /Volumes/2TBSSD/precomputed/siglip \
+  --aggressive
+
+# AI/CI mode (compact JSON verdict to stdout)
+train/.venv/bin/python train/scripts/test_quality_features.py \
+  --shards /Volumes/2TBSSD/shards \
+  --siglip-cache /Volumes/2TBSSD/precomputed/siglip \
+  --aggressive --ai
+```
+
+The script writes an HTML report to `/tmp/quality_test/quality_test_report.html` by
+default. Pass `--output-dir` and `--report` to override. Key verdicts:
+
+- **PASS** — loss stable, cross > self, double-stream scales frozen at 0, single-stream learning
+- **WARN** — minor issues (small gap, borderline stability) — check the HTML charts
+- **FAIL** — training diverged, scales not frozen, or QUALITY features not firing
+
+The `--no-freeze-double` flag disables QUALITY-2 for isolated testing. Individual
+probabilities can be overridden with `--cross-ref-prob` and `--patch-shuffle-prob`.
