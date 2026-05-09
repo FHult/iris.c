@@ -261,6 +261,126 @@ def _model_path(cfg_model: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+def _find_checkpoints(data_root: Path) -> list:
+    """Return sorted list of step_NNNNNNN.safetensors paths in checkpoints/stage1/."""
+    ckpt_dir = data_root / "checkpoints" / "stage1"
+    if not ckpt_dir.exists():
+        return []
+    return sorted(
+        p for p in ckpt_dir.glob("step_*.safetensors")
+        if p.is_file() and p.stat().st_size > 0
+    )
+
+
+def _archive_checkpoints(data_root: Path,
+                          archive_to: Optional[Path] = None) -> tuple:
+    """
+    Copy all files from checkpoints/stage1/ (not the archive/ subdir) to a
+    timestamped archive directory.  Returns (archive_path, bytes_copied).
+    """
+    if archive_to is None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_to = data_root / "checkpoints" / "stage1" / "archive" / f"run_{ts}"
+    archive_to.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = data_root / "checkpoints" / "stage1"
+    total = 0
+    if ckpt_dir.exists():
+        for p in ckpt_dir.iterdir():
+            if p.is_file():
+                dst = archive_to / p.name
+                shutil.copy2(p, dst)
+                total += dst.stat().st_size
+    return archive_to, total
+
+
+def _purge_pipeline_state(data_root: Path, mode: str) -> int:
+    """
+    Delete pipeline state.  Returns total bytes freed.
+
+    partial — delete shards, precomputed, hard_examples, dedup_ids, staging,
+              pipeline sentinels, logs, heartbeats.  Keeps raw/ downloads and
+              checkpoints/ so a re-run skips slow downloads and weights survive.
+    full    — same as partial, plus checkpoints/stage1/* (non-archive files).
+              checkpoints/stage1/archive/ is never touched by any reset mode.
+    """
+    total = 0
+
+    def _rmtree(p: Path) -> int:
+        if not p.exists():
+            return 0
+        n = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        shutil.rmtree(p)
+        return n
+
+    def _rm_glob(parent: Path, pattern: str) -> int:
+        if not parent.exists():
+            return 0
+        n = 0
+        for f in parent.glob(pattern):
+            if f.is_file():
+                n += f.stat().st_size
+                f.unlink()
+        return n
+
+    # Common to both modes
+    for rel in ["shards", "precomputed", "hard_examples", "dedup_ids",
+                "staging", "pipeline"]:
+        total += _rmtree(data_root / rel)
+    total += _rm_glob(data_root / "logs", "*.log")
+    total += _rm_glob(data_root / "logs", "*.jsonl")
+    total += _rm_glob(data_root / ".heartbeat", "*.json")
+
+    if mode == "full":
+        ckpt_dir = data_root / "checkpoints" / "stage1"
+        if ckpt_dir.exists():
+            for p in ckpt_dir.iterdir():
+                if p.is_file():
+                    total += p.stat().st_size
+                    p.unlink()
+                elif p.is_dir() and p.name != "archive":
+                    total += _rmtree(p)
+
+    return total
+
+
+def _interactive_reset_wizard(data_root: Path, existing: dict) -> str:
+    """
+    Display existing state and ask the user to choose a reset mode.
+    Returns 'full', 'partial', or 'resume'.
+    """
+    print(bold("Existing pipeline state detected"))
+    print()
+    done_chunks = [k for k, steps in existing["chunks"].items()
+                   if "validate" in steps or len(steps) >= 12]
+    if done_chunks:
+        print(f"  Completed chunks: {', '.join(str(c) for c in sorted(done_chunks))}")
+    in_progress = {k: steps for k, steps in existing["chunks"].items()
+                   if k not in done_chunks and steps}
+    for cnum, steps in in_progress.items():
+        last = steps[-1] if steps else "—"
+        print(f"  Chunk {cnum}: {len(steps)} steps completed, last = {last}")
+    checkpoints = _find_checkpoints(data_root)
+    if checkpoints:
+        print(f"  Checkpoints: {len(checkpoints)} found, latest = {checkpoints[-1].name}")
+    print()
+    print(bold("How do you want to proceed?"))
+    print()
+    print(f"  {hi('[1]')}  {bold('Resume')}        — continue from where it left off (default)")
+    print(f"  {hi('[2]')}  {bold('Partial reset')} — delete processed data, keep raw downloads")
+    print(f"         {dim('   Removes: shards, precomputed, sentinels, logs, heartbeats, checkpoints')}")
+    print(f"         {dim('   Keeps:   raw/ (JDB tgzs), anchor_shards/, archive/ weights')}")
+    print(f"  {hi('[3]')}  {bold('Full reset')}    — delete everything except archived weights")
+    print(f"         {dim('   Removes all of the above plus checkpoints/stage1/* (not archive/)')}")
+    print()
+    raw = _ask("  Choose [1-3]", "1")
+    try:
+        choice = int(raw)
+    except ValueError:
+        choice = 1
+    return {1: "resume", 2: "partial", 3: "full"}.get(choice, "resume")
+
+
 def _detect_existing_state(data_root: Path) -> dict:
     """Read sentinel dirs to summarise existing pipeline state."""
     sentinel_dir = data_root / "pipeline"
@@ -659,21 +779,48 @@ def run_interactive(args) -> int:
 
     # ── Existing state ─────────────────────────────────────────────────────
     existing = _detect_existing_state(data_root)
-    if existing["found"]:
-        done_chunks = [k for k, steps in existing["chunks"].items()
-                       if "validate" in steps or len(steps) >= 12]
-        print(bold("Existing state detected"))
-        print()
-        if done_chunks:
-            print(f"  Completed chunks: {', '.join(str(c) for c in sorted(done_chunks))}")
-        in_progress = {k: steps for k, steps in existing["chunks"].items()
-                       if k not in done_chunks and steps}
-        for cnum, steps in in_progress.items():
-            last = steps[-1] if steps else "—"
-            print(f"  Chunk {cnum}: last completed step = {last}")
-        print()
-        print("  The orchestrator will automatically resume from where it left off.")
-        print()
+
+    # --reset flag skips the interactive menu and uses the chosen mode directly.
+    reset_mode = getattr(args, "reset", None)
+
+    if existing["found"] or reset_mode:
+        if reset_mode is None:
+            reset_mode = _interactive_reset_wizard(data_root, existing)
+        else:
+            # Brief status display even when --reset was passed non-interactively.
+            checkpoints = _find_checkpoints(data_root)
+            print(bold("Existing state detected"))
+            print()
+            for cnum, steps in sorted(existing.get("chunks", {}).items()):
+                last = steps[-1] if steps else "—"
+                print(f"  Chunk {cnum}: {len(steps)} steps completed, last = {last}")
+            if checkpoints:
+                print(f"  Checkpoints: {len(checkpoints)} found, latest = {checkpoints[-1].name}")
+            print(f"  Reset mode: {bold(reset_mode)} (from --reset flag)")
+            print()
+
+        if reset_mode in ("full", "partial"):
+            checkpoints = _find_checkpoints(data_root)
+            if checkpoints and not getattr(args, "check", False):
+                print(f"  Found {len(checkpoints)} checkpoint(s), latest: {bold(checkpoints[-1].name)}")
+                do_archive = _ask_bool("  Archive checkpoints before purging?", default=True)
+                if do_archive:
+                    archive_path, arc_bytes = _archive_checkpoints(data_root)
+                    print(f"  {ok('+')}  Archived to: {archive_path}  ({arc_bytes // 1024 // 1024} MB)")
+                else:
+                    print(f"  {warn('Skipping archive — checkpoint files will be deleted.')}")
+                print()
+            if not getattr(args, "check", False):
+                deleted = _purge_pipeline_state(data_root, reset_mode)
+                print(f"  {ok('✓')}  Purged {deleted // 1024 // 1024} MB  (mode={reset_mode})")
+                print()
+            else:
+                print(f"  {dim('(--check mode: skipping purge)')}")
+                print()
+        else:
+            # Resume — show summary and continue
+            print("  The orchestrator will automatically resume from where it left off.")
+            print()
 
     # ── Setup ──────────────────────────────────────────────────────────────
     print(bold("Summary"))
@@ -764,6 +911,7 @@ def run_ai(args) -> int:
     data_root  = Path(getattr(args, "data_root", None) or "/Volumes/2TBSSD")
     model_str  = getattr(args, "model", "flux-klein-model")
     check_only = getattr(args, "check", False)
+    reset_mode = getattr(args, "reset", None)
 
     if scale and scale not in RUN_SIZES:
         print(json.dumps({"error": f"Unknown scale '{scale}'. "
@@ -803,6 +951,30 @@ def run_ai(args) -> int:
     state     = _detect_existing_state(data_root)
     done_chunks = [k for k, steps in state.get("chunks", {}).items()
                    if "validate" in steps or len(steps) >= 12]
+
+    # Execute reset immediately in --ai mode when --reset is specified.
+    if reset_mode and reset_mode in ("full", "partial") and not check_only:
+        checkpoints = _find_checkpoints(data_root)
+        archive_path = None
+        arc_bytes = 0
+        if checkpoints:
+            archive_path, arc_bytes = _archive_checkpoints(data_root)
+        deleted_bytes = _purge_pipeline_state(data_root, reset_mode)
+        _setup_dirs(data_root)  # recreate required dirs that were just deleted
+        print(json.dumps({
+            "action": "purge",
+            "mode": reset_mode,
+            "archived_to": str(archive_path) if archive_path else None,
+            "archived_bytes": arc_bytes,
+            "deleted_bytes": deleted_bytes,
+        }))
+        return 0
+
+    # Default suggested action when existing state found and no --reset given.
+    if state["found"] and reset_mode is None:
+        suggested_reset = "partial"
+    else:
+        suggested_reset = None
 
     # Config path (no generation in --ai mode — just report the path).
     if RUN_SIZES[scale]["standard_config"]:
@@ -849,9 +1021,10 @@ def run_ai(args) -> int:
             "existing_count": len(existing_dirs),
         },
         "existing_pipeline_state": {
-            "found":       state["found"],
-            "chunks_done": done_chunks,
-            "chunk_detail": {str(k): v for k, v in state.get("chunks", {}).items()},
+            "found":          state["found"],
+            "chunks_done":    done_chunks,
+            "chunk_detail":   {str(k): v for k, v in state.get("chunks", {}).items()},
+            "suggested_reset": suggested_reset,
         },
         "issues":   issues,
         "warnings": warnings,
@@ -890,6 +1063,10 @@ def main() -> int:
     ap.add_argument("--no-dedup",   dest="dedup",      action="store_false")
     ap.add_argument("--ema",        dest="mine_use_ema", action="store_true", default=None)
     ap.add_argument("--no-ema",     dest="mine_use_ema", action="store_false")
+    ap.add_argument("--reset",      choices=["full", "partial", "resume"], default=None,
+                    help="Reset mode: skip interactive menu and use this mode directly. "
+                         "'partial' keeps raw downloads; 'full' also removes checkpoints "
+                         "(archive/ is never deleted). Only acts when existing state is found.")
 
     args = ap.parse_args()
 

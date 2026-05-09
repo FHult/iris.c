@@ -54,51 +54,14 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   `--max-shards` to the build script so we never build more than we intend to precompute.
   Alternatively, after build, truncate staging shards to `max_shards` before precompute starts.
 
-- **PIPELINE-24: `pipeline_setup.py` — clean-slate / selective-purge wizard** — the setup
-  script detects existing state but has no path to clear it. Add an interactive reset flow so it
-  is easy to start fresh or partially purge without losing valuable weights.
-
-  **Three reset modes (user chooses interactively when existing state is detected):**
-
-  | Mode | What is removed | What is kept |
-  |------|----------------|--------------|
-  | **Full reset** | Everything under `data_root` except archived weights | Nothing locally |
-  | **Partial reset** | Processed/trained files only (shards, precomputed, sentinels, heartbeats, logs, checkpoints) | Raw downloaded data (`raw/journeydb/`) intact so re-run skips the slow download step |
-  | **Resume** | Nothing (current behaviour) | Everything |
-
-  **Checkpoint archiving prompt (before any purge):**
-
-  When existing checkpoints are found (`checkpoints/stage1/*.safetensors`) the wizard asks before
-  deleting:
-
-  ```
-  Found 12 checkpoints in /Volumes/2TBSSD/checkpoints/stage1/
-    Best val-loss: step_047000.safetensors  (loss=0.412)
-    Latest:        step_050000.safetensors
-
-  Archive checkpoints before purging?
-    [1] Archive to /Volumes/2TBSSD/checkpoints/archive/run_YYYYMMDD_HHMMSS/  (recommended)
-    [2] Archive to custom path …
-    [3] Skip — delete them
-  ```
-
-  The `archive/` directory survives all purges; its contents are never touched by any reset mode.
-
-  **Implementation notes:**
-  - Detect checkpoint existence with `_detect_existing_state()` (already reads sentinels) + a
-    direct `glob` of `checkpoints/stage1/*.safetensors`.
-  - Archive = `shutil.copytree(src, dst)` then delete src; no compression needed.
-  - `REQUIRED_DIRS` already includes `checkpoints/stage1/archive` — never purged.
-  - When `--ai` is passed, emit `{"action": "purge", "archived_to": "...", "deleted_bytes": N}`
-    or `{"action": "resume"}` rather than interactive prompts; use partial reset + archive as
-    the safe default.
-  - Add `--reset {full,partial,resume}` CLI flag to skip the interactive question for scripted
-    use.
-  - Stale state cleanup (currently manual) should be part of any non-resume reset:
-    ```bash
-    rm -f /Volumes/2TBSSD/logs/*.log /Volumes/2TBSSD/logs/*.jsonl
-    rm -f /Volumes/2TBSSD/.heartbeat/*.json
-    ```
+- ~~**PIPELINE-24: `pipeline_setup.py` — clean-slate / selective-purge wizard**~~ ✅ DONE —
+  Added `_interactive_reset_wizard()` (3 modes: resume / partial / full), `_find_checkpoints()`,
+  `_archive_checkpoints()`, and `_purge_pipeline_state()`. Interactive mode prompts the user
+  when existing state is found; `--reset {full,partial,resume}` skips the prompt for scripted
+  use. `--ai --reset partial/full` emits `{"action":"purge","archived_to":…,"deleted_bytes":…}`
+  and executes immediately. Checkpoint archiving is prompted before any destructive reset.
+  Stale-state cleanup (logs/*.log, logs/*.jsonl, .heartbeat/*.json) is automated in both reset
+  modes. `archive/` is never touched by any reset mode.
 
 - **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** — currently
   `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/`

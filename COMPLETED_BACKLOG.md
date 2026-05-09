@@ -68,3 +68,4 @@ are in git history.
 - **PIPE-28** — `build_shards.py` heartbeat thread: `os.scandir()` wrapped in `try/except OSError` to survive sleep-wake SIGCONT.
 - **PIPE-29** — Post-precompute per-shard `.npz` coverage verification at `precompute_all.py` exit; exits 1 with gap report.
 - **PIPE-30** — `train/eval_refs/` populated with 5 public-domain MET Museum artworks (512×512 JPEG, 350 KB total).
+- **PIPELINE-24** — `pipeline_setup.py` clean-slate/selective-purge wizard: `_interactive_reset_wizard` (resume/partial/full), `_find_checkpoints`, `_archive_checkpoints`, `_purge_pipeline_state`. `--reset` CLI flag, `--ai --reset` executes non-interactively. Stale log/heartbeat cleanup automated in both reset modes.
