@@ -899,14 +899,15 @@ class Orchestrator:
         """Download + convert all sources for this chunk (combined, MLX-19 pattern)."""
         if self._prep_busy():
             return
-        if self._training_active():
-            return
-        log_orch(f"Chunk {chunk}: starting download+convert", chunk=chunk)
+        training = self._training_active()
+        log_orch(f"Chunk {chunk}: starting download+convert"
+                 + (" (throttled — training active)" if training else ""), chunk=chunk)
         log_file = LOG_DIR / f"download_chunk{chunk}.log"
         jdb_only = self.cfg.get("download", {}).get("jdb_only", False)
         extra = " --jdb-only" if jdb_only else ""
         cmd = self._python_cmd("download_convert.py",
                                f"--chunk {chunk} --scale {self.scale} --config '{self._config_path()}'{extra}")
+        cmd = self._throttle_wrap(cmd)
         # Marks both download.done AND convert.done on exit 0
         self._launch_prep(f"download+convert chunk {chunk}", cmd, log_file,
                           chunk, "download", also_mark=["convert"])
@@ -926,15 +927,11 @@ class Orchestrator:
     def _start_build(self, chunk: int) -> None:
         if is_done(chunk, "build_shards") or self._prep_busy():
             return
-        # PIPELINE-3: build_shards generates heavy SSD write pressure.  Running it
-        # concurrently with training on the same volume caused two kernel panics
-        # (WindowServer watchdog timeout from memory/IO exhaustion).  Wait until
-        # training is idle before launching any disk-intensive step.
-        if self._training_active():
-            return
         if not self.res.request("DISK_WRITE_HIGH", f"build chunk {chunk}"):
             return
-        log_orch(f"Chunk {chunk}: building shards", chunk=chunk)
+        training = self._training_active()
+        log_orch(f"Chunk {chunk}: building shards"
+                 + (" (throttled — training active)" if training else ""), chunk=chunk)
         out      = STAGING_DIR / f"chunk{chunk}" / "shards"
         sources  = self._build_sources(chunk)
         blocklist_arg = ""
@@ -965,19 +962,21 @@ class Orchestrator:
                                f"--start-idx {start_idx} "
                                f"--chunk {chunk} "
                                f"--workers 1 {blocklist_arg} {max_shards_arg}")
+        cmd = self._throttle_wrap(cmd)
         self._launch_prep(f"build chunk {chunk}", cmd, log_file,
                           chunk, "build_shards", token="DISK_WRITE_HIGH")
 
     def _start_filter(self, chunk: int) -> None:
         if is_done(chunk, "filter_shards") or self._prep_busy():
             return
-        if self._training_active():
-            return
-        log_orch(f"Chunk {chunk}: filtering shards", chunk=chunk)
+        training = self._training_active()
+        log_orch(f"Chunk {chunk}: filtering shards"
+                 + (" (throttled — training active)" if training else ""), chunk=chunk)
         shard_dir = STAGING_DIR / f"chunk{chunk}" / "shards"
         log_file  = LOG_DIR / f"filter_chunk{chunk}.log"
         cmd = self._python_cmd("filter_shards.py",
                                f"--shards '{shard_dir}' --chunk {chunk} --workers 1")
+        cmd = self._throttle_wrap(cmd)
         self._launch_prep(f"filter chunk {chunk}", cmd, log_file,
                           chunk, "filter_shards")
 
@@ -1867,6 +1866,18 @@ class Orchestrator:
 
     def _python_cmd(self, script: str, args: str) -> str:
         return f"python -u '{SCRIPTS_DIR}/{script}' {args}"
+
+    def _throttle_wrap(self, cmd: str) -> str:
+        """Wrap cmd with background I/O + CPU deprioritisation when training is active.
+
+        Uses macOS taskpolicy(1) to set IOPOL_THROTTLE: the kernel services
+        the wrapped process's disk I/O only when the device queue is otherwise
+        idle, so training reads always take precedence.  nice -n 10 gives a
+        matching CPU yield.  No-op when training is not active.
+        """
+        if not self._training_active():
+            return cmd
+        return f"nice -n 10 taskpolicy -d throttle {cmd}"
 
     def _config_path(self) -> str:
         return self.cfg.get("_config_path", str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))

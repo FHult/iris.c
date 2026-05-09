@@ -24,12 +24,11 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ## Pipeline Improvements
 
-- **PIPELINE-3: Never run pipeline jobs while training is active on 2TBSSD** — Two
-  epoch-boundary stalls during chunk 1 training (at steps ~19,900 and ~24,900) were extended by
-  competing I/O from the JDB chunk 2 conversion running in parallel. The step ~24,900 stall
-  lasted 2.6h instead of the typical ~15–20 min. Rule: fully complete all pipeline work (WDS
-  conversion, precompute) before starting training, or ensure pipeline and training use separate
-  storage volumes.
+- ~~**PIPELINE-3: Never run pipeline jobs while training is active on 2TBSSD**~~ ✅ DONE —
+  Replaced the hard block with `taskpolicy -d throttle` + `nice -n 10` wrappers on download,
+  build, and filter. These steps now run concurrently with training; the kernel services their
+  disk I/O only when the drive queue is otherwise idle so training reads always take priority.
+  Precompute and clip_embed remain gated on `gpu_is_free()` (GPU contention is the hard limit).
 
 - **PIPELINE-4: Investigate MLX CLIP for clip_embed step** — `clip_dedup.py` currently uses
   `open_clip` ViT-L-14 via PyTorch MPS (fp16) in `_load_clip()` / `_embed_batch()`. MLX is
