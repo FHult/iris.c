@@ -1384,9 +1384,14 @@ class Orchestrator:
     def _start_validation(self, chunk: int) -> None:
         if is_done(chunk, "validate") or self._prep_busy():
             return
+        if not gpu_is_free():
+            return
+        if not self.res.request("GPU_TOKEN", f"validate chunk {chunk}"):
+            return
         best = CKPT_DIR / "best.safetensors"
         if not best.exists():
             log_orch(f"Chunk {chunk}: no checkpoint — skipping validation", chunk=chunk)
+            self.res.release("GPU_TOKEN")
             mark_done(chunk, "validate")
             return
         log_orch(f"Chunk {chunk}: starting validation", chunk=chunk)
@@ -1400,7 +1405,7 @@ class Orchestrator:
                                f"--chunk {chunk} --checkpoint '{best}' "
                                f"--config '{self._config_path()}' {prev_val_arg}")
         self._launch_prep(f"validate chunk {chunk}", cmd, log_file,
-                          chunk, "validate")
+                          chunk, "validate", token="GPU_TOKEN")
 
     def _handle_error(self, chunk: int) -> None:
         for step in CHUNK_STEPS:
