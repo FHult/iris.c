@@ -627,9 +627,36 @@ def _auto_chunk_count(default: int = 4) -> int:
     return default
 
 
+def _ai_summary(status: dict) -> dict:
+    """Compact JSON summary for AI agent consumption."""
+    chunks_done = sum(1 for cs in status["chunks"].values()
+                      if str(cs.get("state", "")) == "DONE")
+    active_chunk = status.get("active_chunk")
+    trainer = status.get("trainer") or {}
+    issues: list[str] = []
+    for i in status.get("dispatch_issues", []):
+        issues.append(i.get("message", str(i)))
+    for c, cs in status["chunks"].items():
+        for step, msg in cs.get("errors", {}).items():
+            issues.append(f"chunk {c} {step} failed: {str(msg)[:100]}")
+    return {
+        "ok": len(issues) == 0,
+        "step": trainer.get("step"),
+        "loss": trainer.get("loss"),
+        "eta_sec": trainer.get("eta_sec"),
+        "chunks_done": chunks_done,
+        "total_chunks": len(status["chunks"]),
+        "active_chunk": active_chunk,
+        "disk_free_gb": status.get("disk_free_gb"),
+        "issues": issues,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json",      action="store_true")
+    ap.add_argument("--ai",        action="store_true",
+                    help="Emit compact JSON to stdout only (no prose)")
     ap.add_argument("--brief",     action="store_true", help="Single-line summary output")
     ap.add_argument("--chunks",    type=int, default=None,
                     help="Total chunks (default: auto-detect)")
@@ -646,7 +673,9 @@ def main() -> None:
 
     def once():
         status = build_status_dict(total_chunks)
-        if args.json:
+        if args.ai:
+            print(json.dumps(_ai_summary(status)))
+        elif args.json:
             print(json.dumps(status, indent=2, default=str))
         elif args.brief:
             print_brief(status)

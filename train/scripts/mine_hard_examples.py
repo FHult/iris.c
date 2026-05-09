@@ -300,6 +300,8 @@ def main():
     parser.add_argument("--eval-batch",   type=int, default=8,
                         help="Flux forward batch size during eval (default 8; use 4 or 1 if OOM)")
     parser.add_argument("--seed",          type=int, default=0)
+    parser.add_argument("--ai",            action="store_true",
+                        help="Emit compact JSON summary to stdout at completion; progress to stderr")
     args = parser.parse_args()
 
     # Block manual runs when GPU is already in use by training or the pipeline.
@@ -641,9 +643,10 @@ def main():
         out_idx += 1
 
     total = len(records_to_write)
-    print(f"\nDone: {total} hard examples in {args.output}/")
-    print(f"  Mix into training with:  hard_example_dir: {args.output}")
-    print(f"                           hard_mix_ratio: 0.05")
+    _out = sys.stderr if args.ai else sys.stdout
+    print(f"\nDone: {total} hard examples in {args.output}/", file=_out)
+    print(f"  Mix into training with:  hard_example_dir: {args.output}", file=_out)
+    print(f"                           hard_mix_ratio: 0.05", file=_out)
     log_event("mine_hard_examples", "done", total=total, output=args.output)
 
     # Update manifest: append new IDs so future resumes skip re-scanning tars.
@@ -651,6 +654,23 @@ def main():
     if new_ids:
         with open(manifest_path, "a") as _mf:
             _mf.write("\n".join(new_ids) + "\n")
+
+    if args.ai:
+        import json as _json
+        top_k_loss_mean = None
+        if heap:
+            # heap entries are (-loss, rec_id, shard_path) — negate to get positive loss
+            top_k_loss_mean = round(sum(-neg_loss for neg_loss, *_ in heap) / len(heap), 6)
+        ai_out = {
+            "ok": True,
+            "done": done,
+            "total": n_eval,
+            "pct": round(100 * done / n_eval, 1) if n_eval > 0 else 0,
+            "top_k_loss_mean": top_k_loss_mean,
+            "extracted": total,
+            "output": args.output,
+        }
+        print(_json.dumps(ai_out))
 
 
 if __name__ == "__main__":

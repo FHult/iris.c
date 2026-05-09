@@ -1955,6 +1955,60 @@ class Orchestrator:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _orchestrator_snapshot() -> dict:
+    """Read-only state snapshot for --ai mode. Does not start or modify anything."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    state = read_state()
+    active_chunk = None
+    best_age = float("inf")
+    for c in range(1, 9):
+        age = heartbeat_age_secs("trainer", c)
+        if age is not None and age < best_age:
+            best_age = age
+            active_chunk = c
+
+    orch_age: int | None = None
+    try:
+        updated = state.get("last_updated", "")
+        if updated:
+            ts = datetime.fromisoformat(updated)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            orch_age = round((datetime.now(timezone.utc) - ts).total_seconds())
+    except Exception:
+        pass
+
+    # Pending action: read control file if present
+    pending_action = None
+    if CONTROL_FILE.exists():
+        try:
+            ctl = _json.loads(CONTROL_FILE.read_text())
+            pending_action = ctl.get("action")
+        except Exception:
+            pass
+
+    # Derive overall state string
+    if active_chunk is not None and best_age <= HEARTBEAT_STALE_SECS:
+        overall_state = "training"
+    elif pending_action in ("pause", "abort"):
+        overall_state = pending_action
+    elif state:
+        overall_state = "idle"
+    else:
+        overall_state = "unknown"
+
+    return {
+        "state": overall_state,
+        "active_chunk": active_chunk,
+        "last_poll_age_sec": orch_age,
+        "pending_action": pending_action,
+        "run_id": state.get("run_id"),
+        "scale": state.get("scale"),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="V2 pipeline orchestrator")
     ap.add_argument("--config",     default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
@@ -1962,7 +2016,14 @@ def main() -> None:
     ap.add_argument("--resume",     action="store_true")
     ap.add_argument("--dry-run",    action="store_true")
     ap.add_argument("--skip-dedup", action="store_true")
+    ap.add_argument("--ai",         action="store_true",
+                    help="Emit read-only JSON snapshot to stdout and exit (does not start orchestrator)")
     args = ap.parse_args()
+
+    if args.ai:
+        import json as _json
+        print(_json.dumps(_orchestrator_snapshot()))
+        sys.exit(0)
 
     try:
         cfg = load_config(args.config)

@@ -101,29 +101,16 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   - `pipeline_setup.py`: add "populate staging symlinks" step; report pool coverage vs. scale requirement.
   - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
 
-- **PIPELINE-26: Standardise `--ai` mode across all pipeline scripts** — reduce AI agent token
-  cost when polling pipeline state. Currently only `pipeline_doctor.py` and `pipeline_setup.py`
-  have `--ai`. All scripts that produce human-readable output should emit compact JSON instead
-  when `--ai` is passed.
-
-  **Scripts that need `--ai` added:**
-
-  | Script | Current output | `--ai` JSON shape |
-  |--------|---------------|-------------------|
-  | `pipeline_status.py` | Rich text: chunks, heartbeats, log tails | `{step, loss, eta_sec, chunks_done, active_chunk, issues[]}` |
-  | `orchestrator.py` | Logs decisions to file; no stdout polling interface | `{state, active_chunk, last_poll_age_sec, pending_action}` (read-only snapshot; does not start the orchestrator) |
-  | `pipeline_ctl.py` | Mix of prose + subprocess output | Each sub-command (`status`, `pause`, `resume`, `abort`, `retry`) emits `{ok, message}` |
-  | `validator.py` | Prose pass/fail report | `{passed, issues[], clip_i_mean, weight_ok}` |
-  | `validate_shards.py` | Per-shard pass/fail lines | `{total, passed, failed, corrupt_paths[]}` |
-  | `validate_weights.py` | Prose weight sanity output | `{passed, issues[]}` |
-  | `mine_hard_examples.py` | Progress + top-k stats | `{done, total, pct, top_k_loss_mean}` |
-  | `precompute_all.py` | Per-shard progress | `{done, total, pct, eta_sec, errors[]}` |
-
-  **Contract:** `--ai` flag emits valid JSON to stdout only. All progress/prose goes to stderr.
-  Top-level `ok` (bool) or `passed` (bool) as the primary signal. On error:
-  `{"ok": false, "error": "<message>"}`. No interactive prompts when `--ai` is set.
-
-  **Priority order:** `pipeline_status.py` first, then `validator.py`, then the rest.
+- ~~**PIPELINE-26: Standardise `--ai` mode across all pipeline scripts**~~ ✅ DONE —
+  All scripts now emit compact JSON to stdout when `--ai` is passed; all progress/prose
+  goes to stderr. `pipeline_ctl.py` was already done. New implementations:
+  - `pipeline_status.py`: `{ok, step, loss, eta_sec, chunks_done, total_chunks, active_chunk, disk_free_gb, issues[]}`
+  - `orchestrator.py`: read-only snapshot `{state, active_chunk, last_poll_age_sec, pending_action, run_id, scale}` — exits immediately, does not start the orchestrator
+  - `validator.py`: `{passed, verdict, reason, clip_i_mean, weight_ok, issues[], chunk, elapsed_secs}`
+  - `validate_shards.py`: `{ok, total, passed, failed, warnings, corrupt_paths[]}`
+  - `validate_weights.py`: `{passed, issues[], num_keys}`
+  - `mine_hard_examples.py`: `{ok, done, total, pct, top_k_loss_mean, extracted, output}`
+  - `precompute_all.py`: `{ok, done, total, pct, elapsed_hours, qwen3_written, vae_written, siglip_written, errors[]}`
 
 - ~~**PIPE-26: Start memory_pressure.log from orchestrator startup**~~ ✅ DONE — Memory watchdog
   daemon thread already starts in `Orchestrator.__init__` (unconditional, not on-demand),

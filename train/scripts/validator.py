@@ -242,6 +242,8 @@ def main() -> None:
     ap.add_argument("--config",       default="train/configs/v2_pipeline.yaml")
     ap.add_argument("--prompts",      default="train/configs/eval_prompts.txt")
     ap.add_argument("--prev-val-dir", default=None)
+    ap.add_argument("--ai",           action="store_true",
+                    help="Emit compact JSON to stdout only; all progress goes to stderr")
     args = ap.parse_args()
 
     chunk = args.chunk
@@ -307,6 +309,24 @@ def main() -> None:
 
     log_event("validator", "done", chunk=chunk, verdict=verdict, reason=reason)
     log_orch(f"Validator chunk {chunk}: {verdict} — {reason}")
+
+    if args.ai:
+        v03 = summary.get("v03_04") or {}
+        v01 = summary.get("v01") or {}
+        issues = list(v01.get("errors", [])) + list(v01.get("warnings", []))
+        if not v03.get("ok", True) and v03.get("verdict"):
+            issues.append(f"clip: {v03['verdict']}")
+        ai_out = {
+            "passed": verdict != "FAIL",
+            "verdict": verdict,
+            "reason": reason,
+            "clip_i_mean": v03.get("mean_clip_i"),
+            "weight_ok": v01.get("ok", False),
+            "issues": issues,
+            "chunk": chunk,
+            "elapsed_secs": summary["elapsed_secs"],
+        }
+        print(json.dumps(ai_out))
 
     if verdict == "FAIL":
         mark_error(chunk, "validate")

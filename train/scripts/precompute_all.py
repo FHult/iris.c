@@ -775,6 +775,8 @@ def main():
                              "existing qwen3 or vae run instead of a new random selection.")
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
+    parser.add_argument("--ai", action="store_true",
+                        help="Emit compact JSON summary to stdout at completion; progress to stderr")
     args = parser.parse_args()
 
     # Block manual runs when GPU is already in use by training or the pipeline.
@@ -1050,15 +1052,16 @@ def main():
     sv = sum(r.get("skipped_v", 0) for r in results)
     errs = sum(1 for r in results if r["error"])
     elapsed = (_time.time() - t_start) / 3600
-    print(f"\nDone in {elapsed:.1f}h.")
-    print(f"  Qwen3:  {wq:,} embeddings  → {args.qwen3_output}/" + (f"  ({sq:,} skipped after retry)" if sq else ""))
-    print(f"  VAE:    {wv:,} latents      → {args.vae_output}/" + (f"  ({sv:,} skipped after retry)" if sv else ""))
+    _summary_out = sys.stderr if args.ai else sys.stdout
+    print(f"\nDone in {elapsed:.1f}h.", file=_summary_out)
+    print(f"  Qwen3:  {wq:,} embeddings  → {args.qwen3_output}/" + (f"  ({sq:,} skipped after retry)" if sq else ""), file=_summary_out)
+    print(f"  VAE:    {wv:,} latents      → {args.vae_output}/" + (f"  ({sv:,} skipped after retry)" if sv else ""), file=_summary_out)
     if siglip_out:
-        print(f"  SigLIP: {ws:,} features    → {siglip_out}/")
+        print(f"  SigLIP: {ws:,} features    → {siglip_out}/", file=_summary_out)
     if errs:
-        print(f"  {errs} shards had errors (check stderr)")
+        print(f"  {errs} shards had errors (check stderr)", file=_summary_out)
     if sq or sv:
-        print(f"  WARNING: {sq + sv:,} records were skipped after single-record retry — check stderr for details")
+        print(f"  WARNING: {sq + sv:,} records were skipped after single-record retry — check stderr for details", file=_summary_out)
 
     # Post-run coverage verification: count .npz files per shard and flag any
     # short shards before the orchestrator marks precompute.done.  A partial
@@ -1066,7 +1069,8 @@ def main():
     # later at promotion time, causing a 200+ escalation storm.
     _check_dirs = [d for d in [args.qwen3_output, args.vae_output] if d]
     if _check_dirs and work_items:
-        print("\nVerifying per-shard .npz coverage ...", flush=True)
+        print("\nVerifying per-shard .npz coverage ...",
+              file=sys.stderr if args.ai else sys.stdout, flush=True)
         _short: list[str] = []
         for shard_path, *_ in work_items:
             stem = os.path.splitext(os.path.basename(shard_path))[0]
@@ -1085,13 +1089,38 @@ def main():
                         f"  {os.path.basename(out_dir)}/{stem}: {actual}/{expected} records"
                     )
         if _short:
-            print(f"  COVERAGE GAPS ({len(_short)} shard(s)):", flush=True)
+            print(f"  COVERAGE GAPS ({len(_short)} shard(s)):",
+                  file=sys.stderr if args.ai else sys.stdout, flush=True)
             for s in _short:
-                print(s, flush=True)
-            print("  Rerun precompute to fill gaps — exiting with error.", flush=True)
+                print(s, file=sys.stderr if args.ai else sys.stdout, flush=True)
+            print("  Rerun precompute to fill gaps — exiting with error.",
+                  file=sys.stderr if args.ai else sys.stdout, flush=True)
+            if args.ai:
+                import json as _json
+                print(_json.dumps({"ok": False, "error": "coverage gaps",
+                                   "gap_count": len(_short),
+                                   "done": len(work_items), "total": len(work_items),
+                                   "pct": 100, "errors": _short[:10]}))
             sys.exit(1)
         else:
-            print(f"  Coverage OK — all {len(work_items)} shard(s) complete.", flush=True)
+            print(f"  Coverage OK — all {len(work_items)} shard(s) complete.",
+                  file=sys.stderr if args.ai else sys.stdout, flush=True)
+
+    if args.ai:
+        import json as _json
+        error_list = [r.get("error") for r in results if r.get("error")]
+        print(_json.dumps({
+            "ok": errs == 0,
+            "done": len(work_items),
+            "total": len(work_items),
+            "pct": 100,
+            "eta_sec": 0,
+            "elapsed_hours": round(elapsed, 2),
+            "qwen3_written": wq,
+            "vae_written": wv,
+            "siglip_written": ws if siglip_out else None,
+            "errors": error_list[:10],
+        }))
 
 
 if __name__ == "__main__":

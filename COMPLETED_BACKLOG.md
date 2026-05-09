@@ -82,3 +82,5 @@ are in git history.
 - **PIPELINE-23** — `build_shards.py` `--max-shards` arg + cap after shuffle; `_start_build()` in orchestrator passes cap from `precompute.max_shards` config key.
 - **PIPELINE-24** — `pipeline_setup.py` clean-slate/selective-purge wizard: `_interactive_reset_wizard` (resume/partial/full), `_find_checkpoints`, `_archive_checkpoints`, `_purge_pipeline_state`. `--reset` CLI flag, `--ai --reset` executes non-interactively. Stale log/heartbeat cleanup automated in both reset modes.
 - **PIPE-26** — Memory watchdog daemon thread already starts in `Orchestrator.__init__` unconditionally. Added `orchestrator_pid` and `memory_watchdog_log` to `run_metadata.json`.
+
+- **PIPELINE-26** — `--ai` mode added to all 7 remaining pipeline scripts: `pipeline_status.py`, `orchestrator.py` (read-only snapshot), `validator.py`, `validate_shards.py`, `validate_weights.py`, `mine_hard_examples.py`, `precompute_all.py`. Contract: JSON to stdout, all prose/progress to stderr, `ok`/`passed` as primary signal.

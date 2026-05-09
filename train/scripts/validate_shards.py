@@ -98,9 +98,14 @@ def main() -> None:
                          "(by shard ID range)")
     ap.add_argument("--json",    dest="json_out", action="store_true",
                     help="Output JSON summary to stdout instead of human text")
+    ap.add_argument("--ai",      action="store_true",
+                    help="Emit compact JSON to stdout only; progress goes to stderr")
     ap.add_argument("--report",  default=None, metavar="PATH",
                     help="Write JSON report to this file")
     args = ap.parse_args()
+
+    if args.ai:
+        args.json_out = True  # suppress per-shard lines
 
     shards_dir = Path(args.shards)
     if not shards_dir.exists():
@@ -123,7 +128,8 @@ def main() -> None:
     else:
         tars = all_tars
 
-    print(f"Scanning {len(tars)} shard(s) in {shards_dir} ...", flush=True)
+    print(f"Scanning {len(tars)} shard(s) in {shards_dir} ...",
+          file=sys.stderr if args.ai else sys.stdout, flush=True)
 
     results = []
     n_critical = 0
@@ -162,9 +168,21 @@ def main() -> None:
     if args.report:
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
         Path(args.report).write_text(json.dumps(summary, indent=2))
-        print(f"Report written → {args.report}")
+        print(f"Report written → {args.report}",
+              file=sys.stderr if args.ai else sys.stdout)
 
-    if args.json_out:
+    if args.ai:
+        corrupt_paths = [r["path"] for r in summary["results"] if not r["ok"]]
+        ai_out = {
+            "ok": n_critical == 0,
+            "total": len(tars),
+            "passed": len(tars) - n_critical,
+            "failed": n_critical,
+            "warnings": n_warn,
+            "corrupt_paths": corrupt_paths,
+        }
+        print(json.dumps(ai_out))
+    elif args.json_out:
         print(json.dumps(summary, indent=2))
     else:
         print(f"\nScan complete: {len(tars)} shards — "

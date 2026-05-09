@@ -79,29 +79,43 @@ def check_weights(checkpoint_path: str) -> dict:
 
 
 def main() -> None:
+    import json
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--ai", action="store_true",
+                    help="Emit compact JSON to stdout only; all output goes to stderr")
     args = ap.parse_args()
 
     result = check_weights(args.checkpoint)
 
+    if args.ai:
+        ai_out = {
+            "passed": result["ok"],
+            "issues": result["errors"] + result["warnings"],
+            "num_keys": result["num_keys"],
+        }
+        print(json.dumps(ai_out))
+        sys.exit(0 if result["ok"] else 1)
+
+    _out = sys.stdout
     if result["errors"]:
-        print("FAIL — weight integrity errors:")
+        print("FAIL — weight integrity errors:", file=_out)
         for e in result["errors"]:
-            print(f"  ERROR: {e}")
+            print(f"  ERROR: {e}", file=_out)
     else:
-        print("PASS — no weight integrity errors")
+        print("PASS — no weight integrity errors", file=_out)
 
     if result["warnings"]:
         for w in result["warnings"]:
-            print(f"  WARN: {w}")
+            print(f"  WARN: {w}", file=_out)
 
-    print(f"  {result['num_keys']} keys checked")
+    print(f"  {result['num_keys']} keys checked", file=_out)
 
     if args.verbose:
         for k, s in sorted(result["stats"].items()):
-            print(f"  {k}: shape={s['shape']} dtype={s['dtype']} min={s['min']:.4f} max={s['max']:.4f}")
+            print(f"  {k}: shape={s['shape']} dtype={s['dtype']} min={s['min']:.4f} max={s['max']:.4f}",
+                  file=_out)
 
     sys.exit(0 if result["ok"] else 1)
 
