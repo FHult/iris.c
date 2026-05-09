@@ -859,12 +859,15 @@ class Orchestrator:
             update_state(**{"chunks": {str(chunk): {"state": state}}})
             self._last_written_state[chunk] = state
 
-        # Chunk N+1 doesn't start until chunk N is at least BUILDING.
-        # Block on both IDLE and ERROR: an error means download/convert hasn't
-        # completed, so the next chunk must still wait.
-        if chunk > 1 and derive_chunk_state(chunk - 1) in (
-            ChunkState.IDLE, ChunkState.DOWNLOADING, ChunkState.CONVERTING, ChunkState.ERROR
-        ):
+        # Chunk N+1 only starts prep when chunk N has entered the training phase.
+        # This enforces strict one-ahead pipelining: chunk 1 trains → chunk 2 preps,
+        # chunk 2 trains → chunk 3 preps, etc.  Prevents disk pressure from multiple
+        # future chunks building simultaneously.
+        _training_or_later = (
+            ChunkState.TRAINING, ChunkState.MINING,
+            ChunkState.VALIDATING, ChunkState.DONE,
+        )
+        if chunk > 1 and derive_chunk_state(chunk - 1) not in _training_or_later:
             return
 
         handlers = {
