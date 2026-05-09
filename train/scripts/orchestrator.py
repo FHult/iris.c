@@ -949,11 +949,22 @@ class Orchestrator:
         # precomputed/ directory.  200000 shards × 5000 images = 1B images per
         # chunk.  _promote_chunk enforces this ceiling with a hard error.
         start_idx = (chunk - 1) * _SHARD_BLOCK
+        # Cap build output to the precompute budget so downstream steps (filter,
+        # clip_embed, clip_dups, validate_shards) never process shards that won't
+        # be trained on.  Reads the same precompute.max_shards config key used by
+        # _start_precompute() so the two steps stay in sync automatically.
+        max_shards_raw = self.cfg.get("precompute", {}).get("max_shards")
+        max_shards_cfg = (max_shards_raw.get(self.scale)
+                          if isinstance(max_shards_raw, dict) else max_shards_raw)
+        max_shards_arg = f"--max-shards {max_shards_cfg}" if max_shards_cfg else ""
+        if max_shards_cfg:
+            log_orch(f"Chunk {chunk}: build capped at {max_shards_cfg} shards "
+                     f"(precompute.max_shards[{self.scale}])", chunk=chunk)
         cmd = self._python_cmd("build_shards.py",
                                f"--sources {sources} --output '{out}' "
                                f"--start-idx {start_idx} "
                                f"--chunk {chunk} "
-                               f"--workers 1 {blocklist_arg}")
+                               f"--workers 1 {blocklist_arg} {max_shards_arg}")
         self._launch_prep(f"build chunk {chunk}", cmd, log_file,
                           chunk, "build_shards", token="DISK_WRITE_HIGH")
 

@@ -426,6 +426,10 @@ def main():
     )
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
+    parser.add_argument("--max-shards", type=int, default=None,
+                        help="Cap output at this many shards; records beyond the cap are "
+                             "discarded after shuffle. Use to match the precompute budget "
+                             "so downstream steps never process shards that won't be trained on.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -448,6 +452,16 @@ def main():
     rng = random.Random(args.seed)
     rng.shuffle(records)
     print(f"  Shuffled with seed={args.seed}")
+
+    # Cap to max_shards * shard_size records so we never build more shards
+    # than precompute is configured to process.  The cap is applied after shuffle
+    # so the kept records are a representative random sample of the full source pool.
+    if args.max_shards is not None:
+        cap = args.max_shards * args.shard_size
+        if len(records) > cap:
+            print(f"  Capping to {cap:,} records ({args.max_shards} shards × {args.shard_size} images/shard — "
+                  f"discarding {len(records) - cap:,} excess records)")
+            records = records[:cap]
 
     # Load blocklist
     blocklist = []

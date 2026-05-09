@@ -43,16 +43,11 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   is a bottleneck. Implementation: `pip install mlx-clip`, add MLX branch to `_load_clip()` /
   `_embed_batch()`.
 
-- **PIPELINE-23: Cap shard build count to match precompute `max_shards`** — At `large`/`all-in`
-  scale, `precompute.max_shards` caps precompute at 80/120 shards, but the shard-build step
-  still builds ALL shards from the full JourneyDB tgz range + LAION/COYO fraction. All excess
-  shards are promoted to `SHARDS_DIR` but never trained on (trainer self-filters at startup to
-  only precomputed shards). Costs: (1) wasted disk space in production `shards/`, (2)
-  build/filter/validate/clip-dedup runs on shards that will never be used, (3) anchor shard
-  sampling (every 10th) draws from the full pool including unprecomputed shards — those batches
-  are silently skipped at training time. Fix: in `_start_shard_build()` (orchestrator), pass
-  `--max-shards` to the build script so we never build more than we intend to precompute.
-  Alternatively, after build, truncate staging shards to `max_shards` before precompute starts.
+- ~~**PIPELINE-23: Cap shard build count to match precompute `max_shards`**~~ ✅ DONE — Added
+  `--max-shards` argument to `build_shards.py` (truncates record list after shuffle so we never
+  build more shards than `precompute.max_shards` for the active scale). `_start_build()` in
+  orchestrator reads `precompute.max_shards` (same config key used by precompute) and passes
+  `--max-shards {n}` to the build script, logging the cap decision to the orchestrator JSONL.
 
 - ~~**PIPELINE-24: `pipeline_setup.py` — clean-slate / selective-purge wizard**~~ ✅ DONE —
   Added `_interactive_reset_wizard()` (3 modes: resume / partial / full), `_find_checkpoints()`,
