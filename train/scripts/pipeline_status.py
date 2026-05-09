@@ -27,6 +27,12 @@ from pipeline_lib import (
 )
 
 try:
+    from pipeline_profile import build_profile, _load_launch_events, _load_sentinel_times, _load_trainer_heartbeats
+    _HAS_PROFILE = True
+except ImportError:
+    _HAS_PROFILE = False
+
+try:
     from orchestrator import CHUNK_STEPS, derive_chunk_state, ChunkState
     _HAS_ORCH = True
 except ImportError:
@@ -539,6 +545,30 @@ def print_human(status: dict, verbose: bool = False) -> None:
         if n > 1:
             print(f"    to clear all: pipeline_ctl.py dispatch-resolve-all")
 
+    # Timing summary footer — show slowest stage across completed chunks
+    if _HAS_PROFILE:
+        try:
+            profile = build_profile(
+                _load_launch_events(),
+                _load_sentinel_times(),
+                _load_trainer_heartbeats(),
+            )
+            summary = profile.get("summary", {})
+            bottleneck = profile.get("bottleneck_stage")
+            if summary:
+                # Show top 3 slowest stages by mean duration
+                ranked = sorted(summary.items(), key=lambda x: x[1]["mean_h"], reverse=True)[:3]
+                parts = []
+                for stage, s in ranked:
+                    marker = " !" if stage == bottleneck else ""
+                    h = int(s["mean_h"]); m = int((s["mean_h"] - h) * 60)
+                    parts.append(f"{stage}={h}h{m:02d}m{marker}")
+                print(f"  stage timing (mean):  {' | '.join(parts)}")
+                if bottleneck == "precompute":
+                    print(f"  bottleneck note:      precompute is VAE-dominated; run pipeline_profile.py for breakdown")
+        except Exception:
+            pass
+
     print(f"{'─'*64}\n")
 
 
@@ -639,7 +669,7 @@ def _ai_summary(status: dict) -> dict:
     for c, cs in status["chunks"].items():
         for step, msg in cs.get("errors", {}).items():
             issues.append(f"chunk {c} {step} failed: {str(msg)[:100]}")
-    return {
+    out: dict = {
         "ok": len(issues) == 0,
         "step": trainer.get("step"),
         "loss": trainer.get("loss"),
@@ -650,6 +680,19 @@ def _ai_summary(status: dict) -> dict:
         "disk_free_gb": status.get("disk_free_gb"),
         "issues": issues,
     }
+    if _HAS_PROFILE:
+        try:
+            profile = build_profile(
+                _load_launch_events(),
+                _load_sentinel_times(),
+                _load_trainer_heartbeats(),
+            )
+            summary = profile.get("summary", {})
+            out["stage_mean_hours"] = {s: v["mean_h"] for s, v in summary.items()}
+            out["bottleneck_stage"] = profile.get("bottleneck_stage")
+        except Exception:
+            pass
+    return out
 
 
 def main() -> None:

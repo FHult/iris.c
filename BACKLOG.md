@@ -193,6 +193,49 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   **Implementation priority:** VAE first (most expensive, ~5 GB/chunk, no model variation).
   Qwen3 second (prompt template changes most often). SigLIP third.
 
+### V4 Pipeline Speed & Precompute Optimizations (New)
+
+**PRECOMP-2: Adopt distilled / tiny VAE encoder for precompute only** (HIGH priority)  
+- Integrate a lightweight distilled Flux VAE encoder (TAEF1 by madebyollin, FLUX.2 Small Encoder, or custom distilled CNN) **only** for the precompute stage.  
+- Keep the full accurate VAE decoder for final inference, validation, and export.  
+- Tie into PRECOMP-1 for versioned caching (`vae_variant` in cache key).  
+- Expected impact: 40–70% reduction in per-shard precompute time (biggest iteration speed win).  
+- Add config flag: `vae_precompute_variant: full | tiny | taef1`
+
+**PRECOMP-3: VAE tiling + intelligent batching** (HIGH priority)  
+- Implement tiled mid-block attention for the 64×64 layer in the VAE encoder.  
+- Dynamically adjust `--vae-batch` based on available memory (watchdog integration).  
+- Expected additional 20–40% speedup on top of distilled encoder.
+
+**PRECOMP-4: Multi-worker precompute with per-process memory caps** (Medium priority)  
+- Support multiple parallel precompute workers with `mx.set_memory_limit` per process.  
+- Smart shard distribution to avoid unified memory thrashing on 32–64 GB systems.
+
+**PRECOMP-1: Versioned, content-addressable precompute cache** (HIGH priority)  
+- Current flat cache is fragile when changing VAE variant, model, or config.  
+- Implement hash-based cache keys (config + VAE variant + shard version).  
+- Automatic invalidation + migration path from old cache.
+
+**TRAIN-5: Gradient checkpointing + QLoRA foundation** (Medium priority)  
+- Prepare for future LoRA training and higher-rank adapters.  
+- Enable larger effective batch sizes on current hardware.
+
+~~**PIPELINE-26: End-to-end pipeline profiler**~~ ✅ DONE — `pipeline_profile.py`: per-stage wall-clock from orchestrator JSONL launch events + sentinel mtimes; cross-chunk summary with bottleneck flag; VAE note when precompute is slowest. `pipeline_status.py`: timing footer in human output; `stage_mean_hours` + `bottleneck_stage` in `--ai` JSON.
+
+**QUALITY-10: Automated style feature ablation harness** (Medium priority)  
+- Extend `test_quality_features.py` to run matrix tests over combinations of:
+  - `cross_ref_prob`, `patch_shuffle_prob`, `freeze_double_stream_scales`, `style_loss_weight`
+- Generate comparative HTML reports with loss curves and final recommendation.
+
+**PIPELINE-27: Smart precompute shard selection v2** (Medium-High priority)  
+- Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.  
+- Strong synergy with:
+  - Persistent raw-data pool (PIPELINE-25)
+  - Versioned precompute cache (PRECOMP-1)
+  - Distilled VAE (PRECOMP-2)
+- Goal: Evolve from static stratification to a self-improving, curated training set that delivers higher style quality with fewer total samples and lower precompute cost.  
+- Output: `shard_scores.json` + weighted sampling logic with configurable performance vs diversity trade-off.
+
 ---
 
 ## C Binary / CLI
