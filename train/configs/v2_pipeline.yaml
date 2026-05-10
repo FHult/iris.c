@@ -125,3 +125,6 @@ precompute:
   max_shards:
     large: 80
     all-in: 120
+  # VAE encode batch size. Profiled on M1 Max at 512px: B=4 is optimal (145ms/img).
+  # B=16 (prior default) is 20% slower; B=32+ degrades further; B=64 OOM.
+  vae_batch: 4

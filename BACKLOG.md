@@ -187,17 +187,21 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ### V4 Pipeline Speed & Precompute Optimizations (New)
 
-**PRECOMP-2: Adopt distilled / tiny VAE encoder for precompute only** (HIGH priority)  
-- Integrate a lightweight distilled Flux VAE encoder (TAEF1 by madebyollin, FLUX.2 Small Encoder, or custom distilled CNN) **only** for the precompute stage.  
-- Keep the full accurate VAE decoder for final inference, validation, and export.  
-- Tie into PRECOMP-1 for versioned caching (`vae_variant` in cache key).  
-- Expected impact: 40–70% reduction in per-shard precompute time (biggest iteration speed win).  
-- Add config flag: `vae_precompute_variant: full | tiny | taef1`
+**PRECOMP-2: Adopt distilled / tiny VAE encoder for precompute only** — ❌ NOT VIABLE  
+- Investigated (2026-05-10): TAEF1 produces approximate latents in the same 32-channel space
+  but with ~10% SSIM error. Using TAEF1 for precompute creates a train/inference distribution
+  mismatch: the diffusion model is pretrained on full-VAE latents, and img2img at inference uses
+  the full VAE encoder. Training on TAEF1 latents degrades quality without a clear recovery path.
+  `diffusers` not installed; TAEF1 weights not available. The correct path is PRECOMP-3 (optimal
+  batching of the full VAE encoder, which is already using Flash Attention internally).
 
-**PRECOMP-3: VAE tiling + intelligent batching** (HIGH priority)  
-- Implement tiled mid-block attention for the 64×64 layer in the VAE encoder.  
-- Dynamically adjust `--vae-batch` based on available memory (watchdog integration).  
-- Expected additional 20–40% speedup on top of distilled encoder.
+~~**PRECOMP-3: VAE tiling + intelligent batching**~~ ✅ DONE  
+- Profiled VAE encode on M1 Max at 512px: B=4 is optimal (145.7 ms/img); B=16 (prior runtime
+  default) is 20% slower; B=32 (prior code default) is 74% slower; B=64 OOMs.
+- Changed `--vae-batch` default from 32 → 4 in `precompute_all.py`.
+- Added `precompute.vae_batch: 4` to `v2_pipeline.yaml`; orchestrator passes it as `--vae-batch`.
+- Tiled mid-block attention: already implemented — mflux uses `mx.fast.scaled_dot_product_attention`
+  (Flash Attention) and ships `VAETiler`; at 512px the full image is one tile, no-op needed.
 
 **PRECOMP-4: Multi-worker precompute with per-process memory caps** (Medium priority)  
 - Support multiple parallel precompute workers with `mx.set_memory_limit` per process.  

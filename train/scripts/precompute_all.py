@@ -753,8 +753,8 @@ def main():
                         help="Ignored (GPU precompute is single-threaded); kept for CLI compat")
     parser.add_argument("--qwen3-batch", type=int, default=16,
                         help="Captions per Qwen3 forward pass (default 16)")
-    parser.add_argument("--vae-batch", type=int, default=32,
-                        help="Images per VAE encode call (default 32)")
+    parser.add_argument("--vae-batch", type=int, default=4,
+                        help="Images per VAE encode call (default 4; profiled optimum on M1 Max at 512px)")
     parser.add_argument("--siglip-batch", type=int, default=8,
                         help="Images per SigLIP forward pass (default 8)")
     parser.add_argument("--max-shards", type=int, default=None,
