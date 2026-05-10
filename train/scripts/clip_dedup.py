@@ -72,58 +72,64 @@ def _clip_device() -> str:
 _clip_model      = None
 _clip_preprocess = None
 _clip_backend    = None
+_mlx_embedder    = None
 
 
-def _load_clip() -> None:
-    global _clip_model, _clip_preprocess, _clip_backend
-    if _clip_model is not None:
+def _load_clip(backend: str = "auto") -> None:
+    global _clip_model, _clip_preprocess, _clip_backend, _mlx_embedder
+    if _clip_model is not None or _mlx_embedder is not None:
         return
-    device = _clip_device()
-    try:
-        import torch, open_clip
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            "ViT-L-14-quickgelu", pretrained="openai"
-        )
-        model = model.to(device).half().eval()
-        _clip_model, _clip_preprocess, _clip_backend = model, preprocess, "open_clip"
-        log_orch(f"CLIP: ViT-L-14 via open_clip on {device}")
-        return
-    except ImportError:
-        pass
-    try:
-        import torch
-        from transformers import CLIPModel, CLIPProcessor
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        model = model.to(device).eval()
-        proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        _clip_model, _clip_preprocess, _clip_backend = model, proc, "transformers"
-        log_orch(f"CLIP: ViT-B-32 via transformers on {device}")
-        return
-    except ImportError:
-        pass
+
+    # open_clip (MPS) is ~2x faster than MLX on Apple Silicon for ViT-L-14;
+    # prefer it in auto mode; use mlx only when explicitly requested or as last resort.
+    if backend in ("open_clip", "auto"):
+        device = _clip_device()
+        try:
+            import torch, open_clip
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                "ViT-L-14-quickgelu", pretrained="openai"
+            )
+            model = model.to(device).half().eval()
+            _clip_model, _clip_preprocess, _clip_backend = model, preprocess, "open_clip"
+            log_orch(f"CLIP: ViT-L-14 via open_clip on {device}")
+            return
+        except ImportError:
+            if backend == "open_clip":
+                raise RuntimeError("open_clip not installed: pip install open-clip-torch")
+
+    if backend in ("mlx", "auto"):
+        try:
+            from mlx_clip_embed import MLXCLIPEmbedder
+            embedder = MLXCLIPEmbedder()
+            embedder.load()
+            _mlx_embedder = embedder
+            _clip_backend = "mlx"
+            log_orch("CLIP: ViT-L-14 via MLX (native Apple Silicon)")
+            return
+        except Exception as e:
+            if backend == "mlx":
+                raise RuntimeError(f"MLX CLIP backend failed: {e}") from e
+            log_orch(f"CLIP: MLX unavailable ({e}), trying transformers", level="warning")
+
+    if backend in ("transformers", "auto"):
+        device = _clip_device()
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            model = model.to(device).eval()
+            proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            _clip_model, _clip_preprocess, _clip_backend = model, proc, "transformers"
+            log_orch(f"CLIP: ViT-B-32 via transformers on {device}")
+            return
+        except ImportError:
+            if backend == "transformers":
+                raise RuntimeError("transformers not installed: pip install transformers torch")
+
     raise RuntimeError(
-        "CLIP requires open_clip or transformers+torch: "
-        "pip install open-clip-torch  OR  pip install transformers torch"
+        "No CLIP backend available. Install one of: "
+        "mlx (recommended on Apple Silicon), open-clip-torch, or transformers+torch"
     )
-
-
-def _embed_batch(images: list) -> np.ndarray:
-    """Embed PIL images; return L2-normalised float32 [N, D]."""
-    import torch
-    device = next(_clip_model.parameters()).device
-    if _clip_backend == "open_clip":
-        batch = torch.stack([_clip_preprocess(img) for img in images]).to(device)
-        with torch.no_grad():
-            feats = _clip_model.encode_image(batch.half()).float()
-    else:
-        inputs = _clip_preprocess(images=images, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            feats = _clip_model.get_image_features(**inputs).float()
-    arr   = feats.cpu().numpy()
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-8, 1.0, norms)
-    return (arr / norms).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -184,19 +190,76 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
 # embed subcommand
 # ---------------------------------------------------------------------------
 
+def _run_benchmark(shard_path: str, preferred_backend: str) -> int:
+    """Time available CLIP backends on a sample shard and print throughput."""
+    print(f"Benchmark: decoding {os.path.basename(shard_path)} ...", flush=True)
+    ids, pil_images = _decode_shard(shard_path, lambda img: img)
+    if not pil_images:
+        print("No images decoded; aborting benchmark.", file=sys.stderr)
+        return 1
+    n = min(200, len(pil_images))
+    pil_images = pil_images[:n]
+    print(f"Benchmark: {n} images\n")
+    print(f"{'Backend':<14} {'img/s':>8}  {'dim':>5}")
+    print("-" * 32)
+
+    def _time_mlx():
+        from mlx_clip_embed import MLXCLIPEmbedder
+        emb = MLXCLIPEmbedder()
+        emb.load()
+        emb.embed_batch(pil_images[:4])   # warmup JIT
+        t0 = time.perf_counter()
+        out = emb.embed_batch(pil_images)
+        t1 = time.perf_counter()
+        return out.shape[1], n / (t1 - t0)
+
+    def _time_open_clip():
+        import torch, open_clip
+        device = _clip_device()
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-L-14-quickgelu", pretrained="openai")
+        model = model.to(device).half().eval()
+        tensors = [preprocess(img) for img in pil_images]
+        batch = torch.stack(tensors).to(device)
+        with torch.no_grad():
+            model.encode_image(batch[:4].half())   # warmup
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model.encode_image(batch.half()).float()
+        t1 = time.perf_counter()
+        return out.shape[1], n / (t1 - t0)
+
+    for label, fn in [("mlx", _time_mlx), ("open_clip", _time_open_clip)]:
+        try:
+            dim, ips = fn()
+            marker = "  <-- preferred" if label == preferred_backend else ""
+            print(f"{label:<14} {ips:>8.0f}  {dim:>5}{marker}")
+        except Exception as e:
+            print(f"{label:<14} {'N/A':>8}  {'':>5}  ({e})")
+
+    return 0
+
+
 def cmd_embed(args) -> int:
-    import torch
     shard_dir = Path(args.shards)
     embed_dir = Path(args.embeddings)
-    embed_dir.mkdir(parents=True, exist_ok=True)
 
     shards = sorted(shard_dir.glob("*.tar"))
     if not shards:
         log_orch(f"embed: no .tar files in {shard_dir}")
         return 0
 
-    _load_clip()
+    backend = getattr(args, "clip_backend", "auto")
+
+    if getattr(args, "benchmark", False):
+        return _run_benchmark(str(shards[0]), backend)
+
+    embed_dir.mkdir(parents=True, exist_ok=True)
+    _load_clip(backend)
     batch_size = args.batch_size
+
+    # MLX takes raw PIL images; PyTorch backends need preprocessed tensors.
+    _decode_preprocess = (lambda img: img) if _clip_backend == "mlx" else _clip_preprocess
 
     total = len(shards)
     done  = 0
@@ -217,38 +280,44 @@ def cmd_embed(args) -> int:
         pending = [(i, p) for i, p in enumerate(shards)
                    if not (embed_dir / (p.stem + ".npz")).exists()]
 
-        log_orch(f"embed: {total} shards total, {len(pending)} to process")
+        log_orch(f"embed: {total} shards total, {len(pending)} to process, backend={_clip_backend}")
 
         with ThreadPoolExecutor(max_workers=2) as loader:
             from collections import deque
             q: deque = deque()
             for k in range(min(2, len(pending))):
-                q.append(loader.submit(_decode_shard, str(pending[k][1]), _clip_preprocess))
+                q.append(loader.submit(_decode_shard, str(pending[k][1]), _decode_preprocess))
 
             for batch_i, (shard_idx, shard_path) in enumerate(pending):
                 out_npz = embed_dir / (shard_path.stem + ".npz")
-                ids, tensors = q.popleft().result()
+                ids, images = q.popleft().result()
 
                 # Enqueue shard 2 ahead
                 nxt = batch_i + 2
                 if nxt < len(pending):
-                    q.append(loader.submit(_decode_shard, str(pending[nxt][1]), _clip_preprocess))
+                    q.append(loader.submit(_decode_shard, str(pending[nxt][1]), _decode_preprocess))
 
-                if ids is None or not tensors:
+                if ids is None or not images:
                     done += 1
                     continue
 
-                device = next(_clip_model.parameters()).device
                 all_embs = []
-                with torch.no_grad():
-                    for i in range(0, len(tensors), batch_size):
-                        b = torch.stack(tensors[i:i + batch_size]).to(device)
-                        if _clip_backend == "open_clip":
-                            e = _clip_model.encode_image(b.half()).float()
-                        else:
-                            e = _clip_model.get_image_features(pixel_values=b).float()
-                        e = e / e.norm(dim=-1, keepdim=True)
-                        all_embs.append(e.cpu().numpy())
+                if _clip_backend == "mlx":
+                    for i in range(0, len(images), batch_size):
+                        e = _mlx_embedder.embed_batch(images[i:i + batch_size])
+                        all_embs.append(e)
+                else:
+                    import torch
+                    device = next(_clip_model.parameters()).device
+                    with torch.no_grad():
+                        for i in range(0, len(images), batch_size):
+                            b = torch.stack(images[i:i + batch_size]).to(device)
+                            if _clip_backend == "open_clip":
+                                e = _clip_model.encode_image(b.half()).float()
+                            else:
+                                e = _clip_model.get_image_features(pixel_values=b).float()
+                            e = e / e.norm(dim=-1, keepdim=True)
+                            all_embs.append(e.cpu().numpy())
 
                 emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
                 np.savez(out_npz, ids=np.array(ids), embeddings=emb_arr)
@@ -434,6 +503,12 @@ def main() -> None:
     p_emb.add_argument("--shards",     required=True)
     p_emb.add_argument("--embeddings", required=True)
     p_emb.add_argument("--batch-size", dest="batch_size", type=int, default=512)
+    p_emb.add_argument("--clip-backend", dest="clip_backend",
+                       choices=("auto", "mlx", "open_clip", "transformers"),
+                       default="auto",
+                       help="CLIP backend (default: auto — prefers open_clip>mlx>transformers)")
+    p_emb.add_argument("--benchmark", action="store_true",
+                       help="Time all available backends on the first shard and exit")
 
     p_idx = sub.add_parser("build-index", help="Build/extend cumulative FAISS index")
     p_idx.add_argument("--embeddings", required=True)

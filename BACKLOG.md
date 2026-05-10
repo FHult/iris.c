@@ -13,14 +13,6 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ## Pipeline Improvements
 
-- **PIPELINE-4: Investigate MLX CLIP for clip_embed step** — `clip_dedup.py` currently uses
-  `open_clip` ViT-L-14 via PyTorch MPS (fp16) in `_load_clip()` / `_embed_batch()`. MLX is
-  installed in the venv (`mlx==0.31.1`) but `mlx_clip` is not. MLX runs natively on Apple
-  Silicon without PyTorch overhead and may offer meaningfully higher throughput for the embedding
-  step. Measure actual img/s on a real chunk before implementing; only worthwhile if clip_embed
-  is a bottleneck. Implementation: `pip install mlx-clip`, add MLX branch to `_load_clip()` /
-  `_embed_batch()`.
-
 - **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** — currently
   `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/`
   and deletes it immediately after conversion. There is no persistent raw pool. Consequences:

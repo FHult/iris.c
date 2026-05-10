@@ -49,6 +49,8 @@ are in git history.
 
 ## Pipeline — Completed
 
+- **PIPELINE-4** — Native MLX ViT-L-14 CLIP backend in `clip_dedup.py`. `mlx_clip_embed.py` implements the full ViT-L-14 architecture in MLX (NHWC Conv2d, fused QKV, `mx.fast.scaled_dot_product_attention`). Loads weights from the timm safetensors already cached by open_clip — no extra download. `clip_dedup.py embed` gains `--clip-backend auto|mlx|open_clip|transformers` and `--benchmark`. Parity vs open_clip: cosine ≥ 0.9999. Benchmark on M1 Max: open_clip ~61 img/s, MLX ~30 img/s — `auto` mode prefers open_clip for throughput; MLX is fallback when PyTorch is absent.
+
 - **PIPELINE-3** — Replaced hard block with `taskpolicy -d throttle` + `nice -n 10` wrappers on download/build/filter; these front-run next-chunk prep during training with kernel-level I/O yield. Precompute/clip_embed still gated on GPU.
 
 - **RESILIENCE-1** — Training runs in dedicated tmux window (`iris-train`) with `caffeinate -dim`. Orchestrator in `iris-orch` via `pipeline_ctl.py restart-orchestrator`.

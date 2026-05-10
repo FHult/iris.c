@@ -252,3 +252,35 @@ default. Pass `--output-dir` and `--report` to override. Key verdicts:
 
 The `--no-freeze-double` flag disables QUALITY-2 for isolated testing. Individual
 probabilities can be overridden with `--cross-ref-prob` and `--patch-shuffle-prob`.
+
+---
+
+## CLIP Embedding Backend (PIPELINE-4)
+
+`clip_dedup.py embed` supports three backends via `--clip-backend`:
+
+| Backend | Model | Speed (M1 Max, 200 img) | Notes |
+|---|---|---|---|
+| `open_clip` | ViT-L-14 | ~61 img/s | Default; requires `open-clip-torch` + `torch` |
+| `mlx` | ViT-L-14 | ~30 img/s | Fallback; no PyTorch required; uses cached timm weights |
+| `transformers` | ViT-B-32 | — | Last resort; lower quality (smaller model) |
+
+**Default (`auto`):** prefers `open_clip → mlx → transformers` in that order.
+
+The `mlx` backend loads weights directly from the safetensors file already cached by
+open_clip (`~/.cache/huggingface/hub/models--timm--vit_large_patch14_clip_224.openai/`).
+No separate download or conversion is needed.
+
+**Parity:** MLX vs open_clip cosine similarity ≥ 0.9999 (validated on M1 Max).
+
+**When to use `--clip-backend mlx`:**
+- PyTorch / open_clip is not installed in the venv
+- Reducing RAM footprint matters more than throughput
+
+**Benchmark any shard:**
+```bash
+train/.venv/bin/python train/scripts/clip_dedup.py embed \
+  --shards /Volumes/2TBSSD/shards \
+  --embeddings /tmp/bench_out \
+  --benchmark
+```
