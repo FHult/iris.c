@@ -66,11 +66,11 @@ _DEFAULT_SIGLIP     = _DATA_ROOT / "precomputed" / "siglip"
 
 # ── Log-line regexes (match train_ip_adapter.py output format) ────────────────
 _RE_STEP    = re.compile(
-    r"^step\s+(\d+)[,/]\d+\s+loss\s+([\d.]+)\s+\(avg\s+([\d.]+)\)")
+    r"^step\s+([\d,]+)/([\d,]+)\s+loss\s+([\d.]+)\s+\(avg\s+([\d.]+)\)")
 _RE_COND    = re.compile(
     r"loss_cond=([\d.]+)\s+loss_null=([\d.]+)\s+gap=([+-][\d.]+)")
 _RE_REF     = re.compile(
-    r"loss_ref:.*?self=([\d.]+).*?cross=([\d.]+).*?gap=([+-][\d.]+)")
+    r"loss_ref:.*?self=([\d.]+)(?:.*?cross=([\d.]+).*?gap=([+-][\d.]+))?")
 _RE_GRAD    = re.compile(
     r"grad_norm\s+([\d.]+)\s+\(smooth\s+([\d.]+)\)")
 _RE_SCALE   = re.compile(
@@ -172,9 +172,9 @@ class MetricCollector:
         m = _RE_STEP.search(line)
         if m:
             self._pending = {
-                "step": int(m.group(1)),
-                "loss": float(m.group(2)),
-                "loss_smooth": float(m.group(3)),
+                "step": int(m.group(1).replace(",", "")),
+                "loss": float(m.group(3)),
+                "loss_smooth": float(m.group(4)),
             }
             return None
 
@@ -190,9 +190,10 @@ class MetricCollector:
 
         m = _RE_REF.search(line)
         if m:
-            self._pending["loss_self_ref"]  = float(m.group(1))
-            self._pending["loss_cross_ref"] = float(m.group(2))
-            self._pending["ref_gap"]        = float(m.group(3))
+            self._pending["loss_self_ref"] = float(m.group(1))
+            if m.group(2) is not None:
+                self._pending["loss_cross_ref"] = float(m.group(2))
+                self._pending["ref_gap"]        = float(m.group(3))
             return None
 
         m = _RE_GRAD.search(line)

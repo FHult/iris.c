@@ -1101,6 +1101,10 @@ def train(config: dict) -> None:
     _cross_ref_loss_sum   = 0.0
     _cross_ref_loss_count = 0
 
+    # QUALITY-1: single-step feature buffer — stores siglip_feats from the previous
+    # conditioned step so cross-ref works at batch_size=1 (no within-batch permutation).
+    _cross_ref_buffer: Optional[mx.array] = None
+
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
@@ -1202,16 +1206,17 @@ def train(config: dict) -> None:
                 _perm_sf = mx.array(_np.random.permutation(siglip_feats.shape[1]))
                 siglip_feats = siglip_feats[:, _perm_sf, :]
 
-        # QUALITY-1: cross-ref permutation — swap SigLIP features across batch items
-        # so the model must match target latent using a *different* image's style.
-        # Forces style/content separation: impossible to use content as a shortcut.
+        # QUALITY-1: cross-ref swap — replace current SigLIP features with the
+        # previous conditioned step's features. Forces style/content separation:
+        # the model must match the target latent using a *different* image's style.
+        # Buffer-based approach works at any batch size including batch_size=1.
         is_cross_ref = False
-        if _cross_ref_prob > 0.0 and not null_image and siglip_feats.shape[0] > 1:
-            if random.random() < _cross_ref_prob:
-                import numpy as _np
-                _perm_cf = mx.array(_np.random.permutation(siglip_feats.shape[0]))
-                siglip_feats = siglip_feats[_perm_cf]
+        if _cross_ref_prob > 0.0 and not null_image:
+            if _cross_ref_buffer is not None and random.random() < _cross_ref_prob:
+                siglip_feats, _cross_ref_buffer = _cross_ref_buffer, siglip_feats
                 is_cross_ref = True
+            else:
+                _cross_ref_buffer = siglip_feats
 
         _t_prep += time.time() - _t0
 
