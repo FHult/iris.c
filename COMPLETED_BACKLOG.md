@@ -51,6 +51,8 @@ are in git history.
 
 - **PRECOMP-1** — Versioned, content-addressable precompute cache: hash-based versioned dirs, atomic `current` symlink, `cache_manager.py`, `cache_inspect.py`, backwards-compatible legacy migration. Shards with unchanged source data reuse cached VAE latents across chunks.
 
+- **PRECOMP-4** (NOT VIABLE) — Multi-worker precompute with per-process memory caps. Investigated 2026-05-11: on Apple Silicon, Metal serialises GPU submissions across processes — two workers do not run in parallel on the GPU. The bottleneck is Conv2d at 512×512 spatial resolution (38% of encode time per profiling), which is memory-bandwidth-bound; two workers splitting the 400 GB/s bus each get 200 GB/s, yielding the same total throughput at higher contention. CPU–GPU overlap is already near-optimal via the single-worker prefetch architecture (`_encode_with_prefetch`); JPEG decode (~15 ms) is 10× faster than GPU encode (~148 ms), so there is nothing left to hide. Closed as not viable on Apple Silicon for GPU-bound stages.
+
 - **PRECOMP-2** (NOT VIABLE) — Adopt distilled/tiny VAE encoder (TAEF1) for precompute speed. Investigated 2026-05-10: TAEF1 creates train/inference distribution mismatch because training would use TAEF1 latents but inference uses the full VAE decoder. Correct path is PRECOMP-3 (VAE batch tuning) instead.
 
 - **PRECOMP-3** — VAE batch size optimised: profiled on M1 Max at 512px, B=4 is the throughput sweet spot (145.7 ms/img vs 174.6 ms/img at prior default B=16, 20% faster). Default changed in `precompute_all.py`; `precompute.vae_batch: 4` added to `v2_pipeline.yaml`; orchestrator wires it through. Mid-block attention tiling already handled by MLX Flash Attention.

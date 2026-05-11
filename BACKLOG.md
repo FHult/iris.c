@@ -73,9 +73,6 @@ data_root/
 - `pipeline_setup.py`: add "populate staging symlinks" step; report pool coverage vs. scale requirement.
 - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
 
-**PRECOMP-4: Multi-worker precompute with per-process memory caps** (Medium priority)
-- Support multiple parallel precompute workers with `mx.set_memory_limit` per process.
-- Smart shard distribution to avoid unified memory thrashing on 32–64 GB systems.
 
 **PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
 - Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.
