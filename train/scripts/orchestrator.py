@@ -1408,13 +1408,9 @@ class Orchestrator:
             return
 
         log_orch(f"Chunk {chunk}: warming up IP Adapter Metal training graphs", chunk=chunk)
-        training_config = self.cfg.get("training_config", "train/configs/stage1_512px.yaml")
-        cfg_path = TRAIN_DIR / training_config
+        cfg_path = self.cfg.get("training_config", str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         log_file = LOG_DIR / f"training_warmup_chunk{chunk}.log"
-        cmd = self._python_cmd(
-            "train_ip_adapter.py",
-            f"--config '{cfg_path}' --warmup-only --data-root '{DATA_ROOT}'",
-        )
+        cmd = f"python -u '{TRAIN_DIR}/train_ip_adapter.py' --config '{cfg_path}' --warmup-only --data-root '{DATA_ROOT}'"
         self._launch_prep(
             f"training_warmup chunk {chunk}", cmd, log_file,
             chunk, "training_warmup", token="GPU_TOKEN",

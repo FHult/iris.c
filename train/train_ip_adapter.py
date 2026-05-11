@@ -1111,7 +1111,7 @@ def train(config: dict) -> None:
     # optimizer-eval cycle once per bucket so the Metal compiler populates its PSO
     # cache.  The cache persists across process restarts so subsequent training
     # sessions (including all chunk 2+ runs) start without any compilation delay.
-    if args.warmup_only:
+    if config.get("_warmup_only"):
         _txt_dim_wu = flux.transformer.context_embedder.weight.shape[1]
         _txt_wu   = mx.zeros((1, 64, _txt_dim_wu), dtype=mx.bfloat16)
         _t_wu     = mx.array([500], dtype=mx.int32)
@@ -2374,6 +2374,7 @@ def main():
 
     # Store config directory so train() can locate sibling files (e.g. eval_prompts.txt).
     config["_config_dir"] = str(Path(args.config).parent)
+    config["_warmup_only"] = args.warmup_only
 
     if args.dry_run:
         print("Config OK:")
