@@ -1,14 +1,25 @@
 # V2 pipeline smoke-test configuration
 # Exercises the full orchestrator state machine with minimal data and compute.
-# Run with: PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke python train/scripts/orchestrator.py \
-#               --config train/configs/v2_pipeline_smoke.yaml
+# Run with:
+#   PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke \
+#     train/.venv/bin/python train/scripts/orchestrator.py \
+#     --config train/configs/v2_pipeline_smoke.yaml
 #
 # Isolation: PIPELINE_DATA_ROOT keeps all output isolated from the production tree.
 # LAION/COYO will be absent and skipped gracefully.
 # JDB tgz 000 (~2-3 GB) is the only network download required.
+#
+# Two chunks are used so the full stager integration is exercised:
+#   - Chunk 1 training start  → predictive stage chunk 2 (iris-stage window)
+#   - Chunk 1 training done   → archive chunk 1 + stage chunk 2 (iris-stage window)
+#   - Chunk 2 _check_ready    → gate on stage.done sentinel before training
+#   - Chunk 2 training done   → archive chunk 2 (iris-stage window)
+#
+# Storage: cold_root ≠ hot_root forces stager.enabled=True on a single SSD.
+# Same physical device → symlinks (instant), but every code path fires.
 
 recipe: ip_adapter_flux4b
-chunks: 1
+chunks: 2
 scale: smoke
 poll_interval: 10     # fast polling — smoke run is short
 
@@ -23,25 +34,42 @@ download:
 jdb:
   tgz_ranges:
     smoke:
-      1: [0, 0]       # single tgz — enough to produce a handful of shards
+      1: [0, 0]       # single tgz for chunk 1
+      2: [0, 0]       # reuse same tgz for chunk 2 (different shard ID space)
 
 data_volume:
-  smoke: 0.005        # 0.5% — LAION/COYO absent in /tmp, downloader warns and skips
+  smoke: 0.005        # 0.5% — LAION/COYO absent, downloader warns and skips
 
 precompute:
-  max_shards: 1     # limit to 1 shard (~5000 images) to keep smoke precompute fast
+  max_shards: 1       # 1 shard per chunk — enough to verify precompute fires
 
 training:
-  mine_use_ema: true            # exercises EMA checkpoint path
+  mine_use_ema: true
   mine: true
   hard_mix_ratio: 0.05
   siglip: true                  # exercises full precompute + mining path
-  mine_eval_records: 500        # small budget — covers the code path
+  mine_eval_records: 500
   mine_top_k: 200
 
   steps:
     smoke:
-      1: 100          # just enough to verify training fires
+      1: 100          # enough to verify training fires and produce a checkpoint
+      2: 100          # chunk 2: exercises warm-start resume + stager gate
 
   lr:
     1: 1.0e-4
+    2: 3.0e-5
+
+# Storage: different cold/hot roots so stager.enabled=True.
+# Both point to subdirs of PIPELINE_DATA_ROOT so they share the same physical
+# device — same-device detection uses symlinks (zero copy cost).
+# cold_root is relative to the DATA_ROOT value set at runtime; override here
+# uses absolute-looking paths that will only be correct when DATA_ROOT is the
+# smoke root.  Adjust if running against a different DATA_ROOT.
+storage:
+  cold_root: "/Volumes/2TBSSD/smoke/cold"
+  hot_root:  "/Volumes/2TBSSD/smoke"
+  staging_margin_gb: 2
+  cleanup_safety_gb: 1
+  archive_after_chunk: true
+  max_parallel_transfers: 2
