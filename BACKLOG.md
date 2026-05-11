@@ -291,11 +291,4 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 - **TB-011: LoRA Integration load+apply in transformer** (P3) — requires model
 - **TB-009: 9B Model Regression** (P3) — requires model
 
----
 
-## Pipeline Scripts (Unimplemented)
-
-- **pipeline_benchmark.sh** — Parse training log for steps/hour, ETA, timing breakdown. Quick win.
-- **pipeline_validate.sh** — Generate N sample images from current checkpoint to spot-check quality
-- **pipeline_export.sh** — Package adapter for deployment / int4 quantise for inference
-- **pipeline_recaption.sh** — Re-caption short captions across dataset (parallelised, ~2 days GPU time)
