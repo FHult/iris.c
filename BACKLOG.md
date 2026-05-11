@@ -30,10 +30,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 **References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite), QUALITY-10 (ablation harness).
 
-**QUALITY-10: Automated style feature ablation harness** (Medium priority)
-- Extend `test_quality_features.py` to run matrix tests over combinations of:
-  - `cross_ref_prob`, `patch_shuffle_prob`, `freeze_double_stream_scales`, `style_loss_weight`
-- Generate comparative HTML reports with loss curves and final recommendation.
+~~**QUALITY-10: Automated style feature ablation harness**~~ ✓ Done — `train/scripts/ablation_harness.py`
 
 ---
 

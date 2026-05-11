@@ -4,6 +4,114 @@ Empirical findings and strategic analysis for the precompute + training pipeline
 
 ---
 
+## Ablation Harness (QUALITY-10)
+
+`train/scripts/ablation_harness.py` runs a matrix of short training experiments
+with different QUALITY hyperparameter combinations and ranks them by style fidelity.
+
+### When to use it
+
+Run the harness before committing to a full production chunk when you want to answer:
+- "Does `cross_ref_prob=0.5` outperform `0.3` at this scale?"
+- "Does `patch_shuffle_prob=0.5` help or hurt with the current data mix?"
+- "Is freezing double-stream scales worth the quality trade-off?"
+- "What `style_loss_weight` gives the best ref_gap without instability?"
+
+It does not require inference — ranking is derived entirely from training signal:
+`ref_gap = mean(loss_cross_ref - loss_self_ref)` over the tail of each run.
+
+### Quick start
+
+```bash
+# 4-combo exploration (small matrix, ~4× 8000 steps ≈ 3–5 hours):
+python train/scripts/ablation_harness.py \
+    --shards /Volumes/2TBSSD/shards \
+    --output-dir train/reports/ablation_run1
+
+# 12-combo medium matrix (freeze vs no-freeze sweep):
+python train/scripts/ablation_harness.py --matrix medium --steps 5000 \
+    --shards /Volumes/2TBSSD/shards \
+    --output-dir train/reports/ablation_run2
+
+# Resume an interrupted run:
+python train/scripts/ablation_harness.py \
+    --output-dir train/reports/ablation_run1 --resume
+
+# Dry run — see the matrix without training:
+python train/scripts/ablation_harness.py --matrix full --dry-run
+```
+
+### Matrix presets
+
+| Preset | Variables swept | Combos | Recommended steps |
+|--------|-----------------|--------|-------------------|
+| `small` (default) | `cross_ref_prob=[0.3,0.5]` × `patch_shuffle_prob=[0.0,0.5]` | 4 | 8 000 |
+| `medium` | adds `freeze_double=[T,F]`; 3-value `cross_ref` | 12 | 5 000–8 000 |
+| `full` | all 4 variables at 3 values each | 54 | 5 000 |
+
+Custom matrices can be defined in YAML (`--matrix-file`):
+
+```yaml
+ablation:
+  variables:
+    cross_ref_prob: [0.0, 0.3, 0.5]
+    patch_shuffle_prob: [0.0, 0.5]
+    freeze_double_stream_scales: [true, false]
+    style_loss_weight: [0.0, 0.05, 0.1]
+  steps_per_run: 8000
+```
+
+### Scoring formula
+
+```
+score = 100 × mean_ref_gap + 200 × mean_cond_gap − 3 × final_loss
+```
+
+`ref_gap` is the primary signal: a positive gap (cross-ref harder than self-ref)
+means the adapter is style-aware. Without SigLIP precomputed embeddings `ref_gap`
+will be absent — always run with `--siglip-cache` for meaningful results.
+
+### Output
+
+```
+train/reports/ablation_run1/
+  index.html          — ranked report with charts (open in browser)
+  results.json        — slim results for all combos (no snapshots)
+  runs/small/
+    combo_001/
+      config.yaml     — exact config used
+      metrics.json    — full metric snapshots (used by index.html charts)
+      training.log    — raw trainer output
+```
+
+### Flags
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--matrix` | `small` | Preset name |
+| `--matrix-file` | — | Custom YAML (overrides `--matrix`) |
+| `--steps` | 8000 | Steps per combo |
+| `--log-every` | auto | Default: `steps // 80`, min 50 |
+| `--max-runs N` | — | Stop after N combos (for testing the harness) |
+| `--resume` | off | Skip combos already in `results.json` |
+| `--dry-run` | off | Print matrix without training |
+| `--quiet` | off | Suppress per-step trainer output |
+| `--keep-checkpoints` | off | Keep checkpoint files (disk-intensive) |
+| `--ai` | off | Emit compact JSON summary to stdout |
+
+### Signal quality vs run length
+
+Reliable signal on ref_gap requires SigLIP cache and enough steps to pass warmup.
+Rule of thumb for step budget:
+
+| Goal | Steps | Notes |
+|------|-------|-------|
+| Screening (eliminate clearly bad configs) | 3 000 | Enough to see if ref_gap goes positive |
+| Comparative ranking | 8 000 | Standard; catches mid-run instabilities |
+| High-confidence ranking | 15 000 | Use for final config before a full chunk |
+
+---
+
 ## Dataset vs Training Coverage
 
 ### Actual numbers (chunk 1, large scale default)
