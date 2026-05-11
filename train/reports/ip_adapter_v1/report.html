@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IP-Adapter v1 Inference Report</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    line-height: 1.6;
+    padding: 2rem;
+  }
+  h1 { font-size: 1.75rem; font-weight: 700; color: #f8fafc; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.1rem; font-weight: 600; color: #94a3b8; text-transform: uppercase;
+       letter-spacing: 0.08em; margin: 2.5rem 0 0.75rem; }
+  .meta { color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }
+  .meta span { margin-right: 1.5rem; }
+
+  /* Cards */
+  .card {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1rem;
+  }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th { text-align: left; color: #64748b; font-weight: 500; padding: 0.4rem 0.75rem;
+       border-bottom: 1px solid #2d3748; }
+  td { padding: 0.45rem 0.75rem; border-bottom: 1px solid #1a1f2e; }
+  tr:last-child td { border-bottom: none; }
+  td:not(:first-child) { color: #cbd5e1; font-variant-numeric: tabular-nums; }
+
+  /* Metric tiles */
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
+  .metric {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    text-align: center;
+  }
+  .metric .value { font-size: 2rem; font-weight: 700; color: #f8fafc; line-height: 1.1; }
+  .metric .label { font-size: 0.75rem; color: #64748b; text-transform: uppercase;
+                   letter-spacing: 0.06em; margin-top: 0.3rem; }
+  .metric.highlight .value { color: #60a5fa; }
+  .metric.warn .value { color: #fbbf24; }
+
+  /* ip_scale bar chart */
+  .scale-chart { margin-top: 0.5rem; }
+  .scale-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.3rem; }
+  .scale-label { width: 2.5rem; text-align: right; font-size: 0.75rem; color: #64748b;
+                 font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .scale-bar-wrap { flex: 1; height: 16px; background: #2d3748; border-radius: 3px; overflow: hidden; }
+  .scale-bar { height: 100%; border-radius: 3px; display: flex; align-items: center;
+               padding-left: 6px; font-size: 0.7rem; color: #0f1117; font-weight: 600; }
+  .scale-bar.double { background: #3b82f6; }
+  .scale-bar.single { background: #6366f1; }
+  .scale-section-label { font-size: 0.75rem; color: #64748b; margin: 0.6rem 0 0.3rem;
+                          text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Images */
+  .img-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .img-grid.three { grid-template-columns: repeat(3, 1fr); }
+  .img-card {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .img-card img { width: 100%; display: block; }
+  .img-card .caption {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.78rem;
+    color: #64748b;
+    border-top: 1px solid #2d3748;
+  }
+  .comparison-wrap {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 1rem;
+  }
+  .comparison-wrap img { width: 100%; display: block; }
+  .comparison-wrap .caption {
+    padding: 0.6rem 1rem;
+    font-size: 0.8rem;
+    color: #64748b;
+    border-top: 1px solid #2d3748;
+    display: flex; gap: 2rem;
+  }
+  .comparison-wrap .caption span { display: flex; align-items: center; gap: 0.4rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .dot.ref   { background: #94a3b8; }
+  .dot.base  { background: #22c55e; }
+  .dot.adapt { background: #3b82f6; }
+
+  /* CLIP-I gauge */
+  .clip-gauge { margin: 0.5rem 0; }
+  .gauge-track { height: 12px; background: #2d3748; border-radius: 6px; overflow: hidden; position: relative; }
+  .gauge-fill { height: 100%; border-radius: 6px; background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+  .gauge-labels { display: flex; justify-content: space-between; font-size: 0.72rem;
+                  color: #4b5563; margin-top: 0.25rem; }
+  .gauge-marker { position: absolute; top: -3px; width: 2px; height: 18px;
+                  background: #fbbf24; border-radius: 1px; }
+
+  /* Notes */
+  .note {
+    background: #1e2330;
+    border-left: 3px solid #3b82f6;
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+    color: #94a3b8;
+    margin-bottom: 0.6rem;
+  }
+  .note.warn { border-left-color: #f59e0b; }
+  code {
+    font-family: "SF Mono", "Fira Code", monospace;
+    background: #2d3748;
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.85em;
+    color: #93c5fd;
+  }
+  hr { border: none; border-top: 1px solid #2d3748; margin: 2rem 0; }
+</style>
+</head>
+<body>
+
+<h1>IP-Adapter v1 — Inference Report</h1>
+<div class="meta">
+  <span>📅 2026-05-11</span>
+  <span>Checkpoint: <code>best.safetensors</code> · EMA · chunk 4 · step ~95 000</span>
+  <span>Script: <code>train/scripts/test_ip_adapter_inference.py</code></span>
+</div>
+
+<!-- ── Key metrics ── -->
+<h2>Key Metrics</h2>
+<div class="metrics">
+  <div class="metric highlight">
+    <div class="value">0.529</div>
+    <div class="label">CLIP-I</div>
+  </div>
+  <div class="metric">
+    <div class="value">4</div>
+    <div class="label">Denoising steps</div>
+  </div>
+  <div class="metric">
+    <div class="value">512²</div>
+    <div class="label">Resolution</div>
+  </div>
+  <div class="metric">
+    <div class="value">7.1s</div>
+    <div class="label">Adapter inference</div>
+  </div>
+  <div class="metric">
+    <div class="value">25</div>
+    <div class="label">IP blocks</div>
+  </div>
+  <div class="metric">
+    <div class="value">128</div>
+    <div class="label">Image tokens</div>
+  </div>
+</div>
+
+<!-- ── Comparison ── -->
+<h2>Visual Comparison</h2>
+<div class="comparison-wrap">
+  <img src="comparison.png" alt="style ref | baseline | adapter">
+  <div class="caption">
+    <span><span class="dot ref"></span> Style reference (1024×1024, watercolour feathers)</span>
+    <span><span class="dot base"></span> Baseline — Flux Klein 4B, no adapter, seed 42</span>
+    <span><span class="dot adapt"></span> Adapter — strength 1.0, same seed</span>
+  </div>
+</div>
+
+<div class="img-grid three">
+  <div class="img-card">
+    <img src="style_ref.jpg" alt="style reference">
+    <div class="caption">Style reference · 1024×1024 · JourneyDB shard 000000_0000</div>
+  </div>
+  <div class="img-card">
+    <img src="baseline.png" alt="baseline">
+    <div class="caption">Baseline · strength=0.0 · 10.2s</div>
+  </div>
+  <div class="img-card">
+    <img src="adapter.png" alt="adapter output">
+    <div class="caption">Adapter · strength=1.0 · 7.1s</div>
+  </div>
+</div>
+
+<!-- ── CLIP-I ── -->
+<h2>CLIP-I Score</h2>
+<div class="card">
+  <div class="clip-gauge">
+    <div class="gauge-track">
+      <!-- 0.529 out of 1.0 = 52.9% width. Threshold at 0.5 = 50%, good at 0.7 = 70% -->
+      <div class="gauge-fill" style="width: 52.9%"></div>
+      <div class="gauge-marker" style="left: 50%" title="threshold 0.5"></div>
+      <div class="gauge-marker" style="left: 70%; background:#22c55e" title="good 0.7"></div>
+    </div>
+    <div class="gauge-labels">
+      <span>0.0</span>
+      <span style="color:#fbbf24">0.5 threshold</span>
+      <span style="color:#22c55e">0.7 good</span>
+      <span>1.0</span>
+    </div>
+  </div>
+  <p style="margin-top:0.75rem; font-size:0.88rem; color:#94a3b8;">
+    <strong style="color:#60a5fa">0.5291</strong> — above threshold, moderate style transfer.
+    Gap to "good" (0.7) is expected: training used the h_final end-sum approximation rather than
+    block-by-block injection, and the model is not fully converged at step ~95 000
+    (flow-matching loss 0.622). See <code>TRAIN-6</code> in <code>BACKLOG.md</code> for the
+    path to higher scores.
+  </p>
+</div>
+
+<!-- ── ip_scale ── -->
+<h2>ip_scale per Block</h2>
+<div class="card">
+  <div class="scale-chart">
+    <div class="scale-section-label">Double-stream blocks (0–4) · mean 0.697</div>
+    <div class="scale-row"><span class="scale-label">0</span><div class="scale-bar-wrap"><div class="scale-bar double" style="width:9.2%">0.460</div></div></div>
+    <div class="scale-row"><span class="scale-label">1</span><div class="scale-bar-wrap"><div class="scale-bar double" style="width:16.9%">0.845</div></div></div>
+    <div class="scale-row"><span class="scale-label">2</span><div class="scale-bar-wrap"><div class="scale-bar double" style="width:14.7%">0.735</div></div></div>
+    <div class="scale-row"><span class="scale-label">3</span><div class="scale-bar-wrap"><div class="scale-bar double" style="width:14.3%">0.713</div></div></div>
+    <div class="scale-row"><span class="scale-label">4</span><div class="scale-bar-wrap"><div class="scale-bar double" style="width:14.7%">0.734</div></div></div>
+
+    <div class="scale-section-label" style="margin-top:1rem;">Single-stream blocks (5–24) · mean 0.566</div>
+    <div class="scale-row"><span class="scale-label">5</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:12.9%">0.647</div></div></div>
+    <div class="scale-row"><span class="scale-label">6</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:10.1%">0.504</div></div></div>
+    <div class="scale-row"><span class="scale-label">7</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:8.5%">0.425</div></div></div>
+    <div class="scale-row"><span class="scale-label">8</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:7.7%">0.385</div></div></div>
+    <div class="scale-row"><span class="scale-label">9</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:6.9%">0.343</div></div></div>
+    <div class="scale-row"><span class="scale-label">10–19</span><div class="scale-bar-wrap" style="background:#1a2035;display:flex;align-items:center;padding-left:8px;"><span style="font-size:0.7rem;color:#475569">— not shown individually —</span></div></div>
+    <div class="scale-row"><span class="scale-label">20</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:13.9%">0.695</div></div></div>
+    <div class="scale-row"><span class="scale-label">21</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:13.8%">0.690</div></div></div>
+    <div class="scale-row"><span class="scale-label">22</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:12.5%">0.624</div></div></div>
+    <div class="scale-row"><span class="scale-label">23</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:13.7%">0.683</div></div></div>
+    <div class="scale-row"><span class="scale-label">24</span><div class="scale-bar-wrap"><div class="scale-bar single" style="width:12.4%">0.622</div></div></div>
+  </div>
+  <p style="margin-top:0.75rem;font-size:0.8rem;color:#64748b;">
+    Bars scaled to max=5.0. All values finite; no anomalies detected.
+    Bar widths are proportional — the chart is not normalised to the visible max.
+  </p>
+</div>
+
+<!-- ── Token norms ── -->
+<h2>Token Norms</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Tensor</th><th>Shape</th><th>Mean L2</th><th>Std</th><th>Min</th><th>Max</th></tr></thead>
+    <tbody>
+      <tr><td>Perceiver output</td><td>[128, 3072]</td><td>47.35</td><td>1.65</td><td>42.52</td><td>50.74</td></tr>
+      <tr><td>IP-K tokens</td><td>[25 × 128, 3072]</td><td>501.97</td><td>88.60</td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:0.75rem;font-size:0.82rem;color:#94a3b8;">
+    IP-K norms (~500) are large relative to the Perceiver output (~47) — the K projection weights
+    grew during training. The learned ip_scale values calibrate the effective injection at
+    <code>h_final</code>.
+  </p>
+</div>
+
+<!-- ── Setup ── -->
+<h2>Setup</h2>
+<div class="card">
+  <table>
+    <tbody>
+      <tr><td>Adapter type</td><td><code>ip_adapter_klein</code></td></tr>
+      <tr><td>Source checkpoint</td><td><code>best.safetensors</code> (EMA, chunk 4)</td></tr>
+      <tr><td>Quantisation</td><td>bfloat16</td></tr>
+      <tr><td>Blocks</td><td>25 (5 double-stream + 20 single-stream)</td></tr>
+      <tr><td>Hidden dim</td><td>3072</td></tr>
+      <tr><td>Perceiver heads</td><td>16</td></tr>
+      <tr><td>SigLIP model</td><td><code>google/siglip-so400m-patch14-384</code></td></tr>
+      <tr><td>Flux model</td><td><code>flux-klein-4b</code> (distilled, 4 steps)</td></tr>
+      <tr><td>Prompt</td><td>"A pile of feathers depicted in a watercolour style, providing a simple and unadorned view with no intricate details."</td></tr>
+      <tr><td>Seed</td><td>42</td></tr>
+      <tr><td>Resolution</td><td>512 × 512</td></tr>
+      <tr><td>Strength</td><td>1.0</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ── Notes ── -->
+<h2>Notes</h2>
+<div class="note">
+  Inference uses the <strong>training-matching forward pass</strong>: <code>_flux_forward_no_ip</code>
+  collects Q vectors and <code>h_final</code> from a clean Flux run; all 25 IP contributions are
+  summed and added to <code>h_final</code> before <code>norm_out</code>/<code>proj_out</code>.
+  This exactly matches the training computation.
+</div>
+<div class="note warn">
+  <code>_flux_forward_with_ip</code> (block-by-block injection) is <strong>not used</strong> —
+  it was never part of the training graph and produces degenerate output with the current weights.
+  Fixing this requires retraining: see <code>TRAIN-6</code> in <code>BACKLOG.md</code>.
+</div>
+<div class="note">
+  The adapter time (7.1s) is lower than baseline (10.2s) because MLX compiles Metal kernels on
+  the first (baseline) pass; the adapter pass benefits from the warm kernel cache.
+</div>
+
+</body>
+</html>
