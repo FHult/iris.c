@@ -75,11 +75,25 @@
   }
   .img-card img { width: 100%; display: block; }
   .img-card .caption {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.78rem;
-    color: #64748b;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.8rem;
+    color: #94a3b8;
     border-top: 1px solid #2d3748;
   }
+  .img-card .caption .tag {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.15em 0.5em;
+    border-radius: 3px;
+    margin-bottom: 0.35rem;
+  }
+  .tag.ref-tag   { background: #334155; color: #94a3b8; }
+  .tag.base-tag  { background: #14532d; color: #4ade80; }
+  .tag.adapt-tag { background: #1e3a5f; color: #60a5fa; }
+  .img-card .caption .sub { font-size: 0.75rem; color: #64748b; margin-top: 0.2rem; }
   .comparison-wrap {
     background: #1e2330;
     border: 1px solid #2d3748;
@@ -100,6 +114,52 @@
   .dot.ref   { background: #94a3b8; }
   .dot.base  { background: #22c55e; }
   .dot.adapt { background: #3b82f6; }
+
+  /* Prompt box */
+  .prompt-box {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-left: 3px solid #a78bfa;
+    border-radius: 0 10px 10px 0;
+    padding: 0.9rem 1.25rem;
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+    color: #e2e8f0;
+    font-style: italic;
+  }
+  .prompt-box .prompt-label {
+    font-style: normal;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: #a78bfa;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+  }
+
+  /* Explainer */
+  .explainer {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  .explainer-card {
+    background: #1e2330;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    padding: 0.9rem 1rem;
+  }
+  .explainer-card .ex-title {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-bottom: 0.4rem;
+  }
+  .explainer-card .ex-title.green { color: #4ade80; }
+  .explainer-card .ex-title.blue  { color: #60a5fa; }
+  .explainer-card p { font-size: 0.83rem; color: #94a3b8; line-height: 1.5; }
 
   /* CLIP-I gauge */
   .clip-gauge { margin: 0.5rem 0; }
@@ -172,27 +232,61 @@
 
 <!-- ── Comparison ── -->
 <h2>Visual Comparison</h2>
+
+<div class="prompt-box">
+  <div class="prompt-label">Prompt — identical for both baseline and adapter</div>
+  "A pile of feathers depicted in a watercolour style, providing a simple and unadorned view with no intricate details."
+</div>
+
+<div class="explainer">
+  <div class="explainer-card">
+    <div class="ex-title green">Baseline — what does Flux generate from the prompt alone?</div>
+    <p>Flux Klein 4B runs normally from the text prompt with no style conditioning. The adapter
+    weights are loaded but ip_scale is set to zero, so the IP-Adapter has zero effect on the
+    output. This is the pure text-to-image result — the control case.</p>
+  </div>
+  <div class="explainer-card">
+    <div class="ex-title blue">Adapter — same prompt, same seed, plus style conditioning</div>
+    <p>Exactly the same generation as baseline — same noise, same prompt, same 4 steps — but
+    the IP-Adapter is active at strength 1.0. The style reference image is encoded by SigLIP
+    and compressed to 128 conditioning tokens by the PerceiverResampler. Those tokens are
+    injected into Flux at all 25 blocks, nudging the output toward the style of the reference.</p>
+  </div>
+</div>
+
 <div class="comparison-wrap">
   <img src="comparison.png" alt="style ref | baseline | adapter">
   <div class="caption">
-    <span><span class="dot ref"></span> Style reference (1024×1024, watercolour feathers)</span>
-    <span><span class="dot base"></span> Baseline — Flux Klein 4B, no adapter, seed 42</span>
-    <span><span class="dot adapt"></span> Adapter — strength 1.0, same seed</span>
+    <span><span class="dot ref"></span> Style reference (1024×1024 input)</span>
+    <span><span class="dot base"></span> Baseline — prompt only, no style conditioning</span>
+    <span><span class="dot adapt"></span> Adapter — prompt + style reference at strength 1.0</span>
   </div>
 </div>
 
 <div class="img-grid three">
   <div class="img-card">
     <img src="style_ref.jpg" alt="style reference">
-    <div class="caption">Style reference · 1024×1024 · JourneyDB shard 000000_0000</div>
+    <div class="caption">
+      <div class="tag ref-tag">Style reference</div>
+      <div>JourneyDB shard 000000_0000 · 1024×1024</div>
+      <div class="sub">Input to SigLIP → PerceiverResampler → 128 conditioning tokens</div>
+    </div>
   </div>
   <div class="img-card">
     <img src="baseline.png" alt="baseline">
-    <div class="caption">Baseline · strength=0.0 · 10.2s</div>
+    <div class="caption">
+      <div class="tag base-tag">Baseline</div>
+      <div>Flux Klein 4B · prompt only · seed 42 · 4 steps · 10.2s</div>
+      <div class="sub">IP-Adapter loaded but ip_scale=0 — adapter has no effect</div>
+    </div>
   </div>
   <div class="img-card">
     <img src="adapter.png" alt="adapter output">
-    <div class="caption">Adapter · strength=1.0 · 7.1s</div>
+    <div class="caption">
+      <div class="tag adapt-tag">Adapter</div>
+      <div>Same prompt · same seed · strength 1.0 · 7.1s</div>
+      <div class="sub">IP-Adapter active — style reference conditions all 25 blocks</div>
+    </div>
   </div>
 </div>
 
