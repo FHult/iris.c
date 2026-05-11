@@ -309,6 +309,7 @@ class PrecomputeCache:
 
 def _atomic_symlink(link_path: Path, target: str) -> None:
     """Atomically create or replace a symlink (POSIX rename is atomic)."""
+    link_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = link_path.parent / ".current_tmp"
     if tmp.exists() or tmp.is_symlink():
         tmp.unlink()

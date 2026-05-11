@@ -897,11 +897,10 @@ def main():
 
     # Write incomplete manifests at startup so the orchestrator can detect
     # in-progress runs and the config that generated them.
+    _active_caches: dict = {}
     try:
-        from cache_manager import PrecomputeCache, get_git_sha, version_hash
-        _git_sha = get_git_sha()
-        _script_dir_path = Path(os.path.dirname(os.path.abspath(__file__)))
-        _git_sha = get_git_sha(_script_dir_path)
+        from cache_manager import PrecomputeCache, get_git_sha
+        _git_sha = get_git_sha(Path(os.path.dirname(os.path.abspath(__file__))))
         _cache_configs = {
             "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [9, 18, 27]},
             "vae":    {"flux_model": Path(args.flux_model).name,
@@ -909,7 +908,6 @@ def main():
             "siglip": {"siglip_model": "google/siglip-so400m-patch14-384",
                        "image_size": 384},
         }
-        _active_caches: dict[str, "PrecomputeCache"] = {}
         for _enc, _out in [("qwen3", args.qwen3_output),
                            ("vae",   args.vae_output),
                            ("siglip", siglip_out)]:
@@ -923,7 +921,7 @@ def main():
                 _cache.write_manifest_incomplete()
                 _active_caches[_enc] = _cache
     except Exception:
-        _active_caches = {}  # manifest writing is best-effort
+        pass  # manifest writing is best-effort
 
     qwen3_gb  = len(shards) * 0.46
     latent_h  = args.image_size // 8

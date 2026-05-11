@@ -421,7 +421,7 @@ def _scan_cache_versions(precomp_root: Path) -> dict:
     """Return a summary of versioned precompute cache state per encoder."""
     try:
         import sys as _sys
-        _sys.path.insert(0, str(precomp_root.parent.parent / "train" / "scripts"))
+        _sys.path.insert(0, str(Path(__file__).parent))
         from cache_manager import PrecomputeCache, ENCODERS
     except ImportError:
         return {}
