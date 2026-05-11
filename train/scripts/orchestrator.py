@@ -320,6 +320,10 @@ class Orchestrator:
 
         self.stager = DataStager(self.cfg)
 
+        # Issue IDs that have been dispatched for stager errors.  Cleared when
+        # the operator resolves the error sentinel so re-dispatch fires on recurrence.
+        self._stager_dispatched_errors: set[str] = set()
+
         _validate_config(config)
 
     # -----------------------------------------------------------------------
@@ -347,6 +351,7 @@ class Orchestrator:
                 for chunk in range(1, self.total_chunks + 1):
                     self._advance_chunk(chunk)
 
+                self._poll_stager()
                 write_heartbeat("orchestrator", step="poll")
                 if self._all_done():
                     log_orch("All chunks complete — pipeline finished")
@@ -809,6 +814,115 @@ class Orchestrator:
         tmux_new_window(TMUX_STAGE_WIN, activated, log_file)
         log_orch(f"Launched: {description} → {log_file}", chunk=chunk)
 
+    def _poll_stager(self) -> None:
+        """
+        Called every orchestrator tick.  Handles four responsibilities:
+
+        1. Retry pending archive:  if chunk N training is done but archive is
+           not yet done (and no error is set), re-launch archive when iris-stage
+           is free.  This recovers from the initial launch being skipped because
+           iris-stage was busy, or from an orchestrator restart.
+
+        2. Retry pending stage:  if chunk N is ready to enter training (its
+           predecessor has been promoted) but staging is not yet done, re-launch
+           stage when iris-stage is free.
+
+        3. Dispatch errors:  write a dispatch_issue for any stage or archive
+           error sentinel that has not already been reported.  The dispatch cache
+           is cleared when the operator resolves the sentinel so that a subsequent
+           failure re-triggers a new alert.
+
+        4. Stale heartbeat:  if iris-stage is running but its most-recently-written
+           heartbeat is older than HEARTBEAT_STALE_SECS, dispatch a warning so the
+           operator can kill and restart the window.
+        """
+        if not self.stager.enabled:
+            return
+
+        stage_busy = tmux_window_exists(TMUX_STAGE_WIN)
+
+        for chunk in range(1, self.total_chunks + 1):
+            # ---- archive retry ------------------------------------------------
+            archive_err_id = f"stager_archive_{chunk}"
+            if is_done(chunk, "train") and not is_done(chunk, "archive"):
+                if has_error(chunk, "archive"):
+                    # Error is set — dispatch if not already, then wait for operator.
+                    if archive_err_id not in self._stager_dispatched_errors:
+                        dispatch_issue(
+                            archive_err_id, "error",
+                            f"Chunk {chunk}: archive to cold storage failed",
+                            chunk=chunk, process="stager",
+                            context={"error": read_error(chunk, "archive")},
+                            suggested_action=(
+                                f"Resolve the issue then run: "
+                                f"pipeline_ctl.py clear-error --chunk {chunk} --step archive"
+                            ),
+                        )
+                        self._stager_dispatched_errors.add(archive_err_id)
+                elif not stage_busy:
+                    self._launch_stager(
+                        f"archive --chunk {chunk}",
+                        description=f"archive chunk {chunk} (retry)",
+                        chunk=chunk,
+                        log_name=f"stager_archive_chunk{chunk}",
+                    )
+            else:
+                # Not in an error state (or already done) — clear dispatch cache so
+                # a future error re-triggers an alert.
+                self._stager_dispatched_errors.discard(archive_err_id)
+
+            # ---- stage retry --------------------------------------------------
+            # Only retry staging for chunk N once chunk N-1 has been promoted
+            # (training is imminent).  Chunk 1 is never gated on staging.
+            stage_err_id = f"stager_stage_{chunk}"
+            predecessor_ready = (chunk == 1 or is_done(chunk - 1, "promoted"))
+            if predecessor_ready and not is_done(chunk, "stage") and chunk > 1:
+                if has_error(chunk, "stage"):
+                    if stage_err_id not in self._stager_dispatched_errors:
+                        dispatch_issue(
+                            stage_err_id, "error",
+                            f"Chunk {chunk}: staging from cold storage failed — "
+                            f"training for this chunk is blocked",
+                            chunk=chunk, process="stager",
+                            context={"error": read_error(chunk, "stage")},
+                            suggested_action=(
+                                f"Resolve the issue then run: "
+                                f"pipeline_ctl.py clear-error --chunk {chunk} --step stage"
+                            ),
+                        )
+                        self._stager_dispatched_errors.add(stage_err_id)
+                elif not stage_busy:
+                    self._launch_stager(
+                        f"stage --chunk {chunk}",
+                        description=f"stage chunk {chunk} (retry)",
+                        chunk=chunk,
+                        log_name=f"stager_stage_chunk{chunk}",
+                    )
+            else:
+                self._stager_dispatched_errors.discard(stage_err_id)
+
+            # ---- stale heartbeat ----------------------------------------------
+            stale_id = f"stager_stale_{chunk}"
+            if stage_busy:
+                age = heartbeat_age_secs("stager", chunk)
+                if age is not None and age > HEARTBEAT_STALE_SECS:
+                    if stale_id not in self._stager_dispatched_errors:
+                        dispatch_issue(
+                            stale_id, "warning",
+                            f"Stager heartbeat for chunk {chunk} is stale "
+                            f"({age:.0f}s > {HEARTBEAT_STALE_SECS}s threshold) — "
+                            f"iris-stage may be hung",
+                            chunk=chunk, process="stager",
+                            suggested_action=(
+                                "Kill iris-stage window, then clear the error sentinel "
+                                "if one was written; stager will auto-retry on next poll."
+                            ),
+                        )
+                        self._stager_dispatched_errors.add(stale_id)
+            else:
+                # Window gone — clear stale alert so it can re-fire on the next run.
+                self._stager_dispatched_errors.discard(stale_id)
+
     # Fix 2: recover _active_prep after orchestrator restart mid-step.
     # _active_prep is in-memory; if orchestrator is killed while iris-prep runs,
     # on restart _poll_prep_window() returns early and the step is never marked done.
@@ -1118,6 +1232,20 @@ class Orchestrator:
             return  # wait for previous chunk's training
         if not gpu_is_free():
             return
+
+        # Gate chunk N ≥ 2 on staging completion (two-device setup only).
+        # Chunk 1 is never subject to predictive staging; the gate only applies
+        # to chunks that were predictively staged while the predecessor trained.
+        # If staging errored: _poll_stager already dispatched an issue; proceed
+        # anyway so a bad cold drive doesn't permanently stall the pipeline.
+        if self.stager.enabled and chunk > 1 and not is_done(chunk, "stage"):
+            if not has_error(chunk, "stage"):
+                log_orch(f"Chunk {chunk}: waiting for staging to complete before training",
+                         chunk=chunk)
+                return
+            log_orch(f"Chunk {chunk}: staging failed — proceeding without staged data "
+                     f"(see dispatch queue for details)", chunk=chunk, level="warning")
+
         if not is_done(chunk, "promoted"):
             self._promote_chunk(chunk)
         if not is_done(chunk, "promoted"):

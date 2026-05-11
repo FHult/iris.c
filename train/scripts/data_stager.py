@@ -46,7 +46,10 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pipeline_lib import DATA_ROOT, load_config, log_event
+from pipeline_lib import (
+    DATA_ROOT, load_config, log_event,
+    write_heartbeat, mark_done, mark_error, has_error, clear_error,
+)
 
 log = logging.getLogger("data_stager")
 
@@ -55,6 +58,10 @@ log = logging.getLogger("data_stager")
 _SHARD_BLOCK = 200_000
 
 _ENCODERS = ("qwen3", "vae", "siglip")
+
+# Write a heartbeat to the sentinel dir every this many file completions so the
+# orchestrator can detect a hung stager even during long multi-GB transfers.
+_HEARTBEAT_EVERY = 100
 
 
 # ---------------------------------------------------------------------------
@@ -110,26 +117,42 @@ class DataStager:
         Returns a summary dict: {shards_staged, npz_staged, bytes_transferred}.
         Skips files already present on hot.  Aborts if hot storage has less
         than staging_margin_gb free after the estimated transfer.
+
+        Writes stage.done on success, stage.error on any failure.  The
+        orchestrator polls these sentinels to gate training and retry on error.
+        Clears any prior stage.error at the start of each attempt so a retry
+        (after operator intervention) begins with a clean slate.
         """
         if not self.enabled:
             return {"shards_staged": 0, "npz_staged": 0, "bytes_transferred": 0}
 
+        clear_error(chunk, "stage")
+        write_heartbeat("stager", chunk, phase="stage", status="running")
         log.info("Staging chunk %d: cold=%s → hot=%s", chunk, self.cold_root, self.hot_root)
         _log("stage_start", chunk)
 
-        total_bytes = 0
-        shards_staged = self._stage_shards(chunk)
-        npz_staged, nbytes = self._stage_precomputed()
-        total_bytes += nbytes
+        try:
+            total_bytes = 0
+            shards_staged = self._stage_shards(chunk)
+            npz_staged, nbytes = self._stage_precomputed(chunk)
+            total_bytes += nbytes
 
-        summary = {
-            "shards_staged": shards_staged,
-            "npz_staged": npz_staged,
-            "bytes_transferred": total_bytes,
-        }
-        _log("stage_done", chunk, **summary)
-        log.info("Staging chunk %d complete: %s", chunk, summary)
-        return summary
+            summary = {
+                "shards_staged": shards_staged,
+                "npz_staged": npz_staged,
+                "bytes_transferred": total_bytes,
+            }
+            mark_done(chunk, "stage")
+            write_heartbeat("stager", chunk, phase="stage", status="done", **summary)
+            _log("stage_done", chunk, **summary)
+            log.info("Staging chunk %d complete: %s", chunk, summary)
+            return summary
+        except Exception as exc:
+            msg = str(exc)
+            mark_error(chunk, "stage", msg)
+            write_heartbeat("stager", chunk, phase="stage", status="error", error=msg)
+            _log("stage_error", chunk, error=msg)
+            raise
 
     def archive_chunk(self, chunk: int) -> dict:
         """
@@ -139,25 +162,41 @@ class DataStager:
         exist on hot but not yet on cold.  Never deletes from cold.
 
         Returns a summary dict: {npz_archived, ckpt_archived, bytes_transferred}.
+
+        Writes archive.done on success, archive.error on failure.  Archive
+        errors dispatch an issue but do not block the pipeline — the orchestrator
+        retries automatically until cold storage is updated.  Clears any prior
+        archive.error at the start of each attempt.
         """
         if not self.enabled or not self.archive_after_chunk:
             return {"npz_archived": 0, "ckpt_archived": 0, "bytes_transferred": 0}
 
+        clear_error(chunk, "archive")
+        write_heartbeat("stager", chunk, phase="archive", status="running")
         log.info("Archiving chunk %d: hot=%s → cold=%s", chunk, self.hot_root, self.cold_root)
         _log("archive_start", chunk)
 
-        npz_archived, nb_precomp = self._archive_precomputed()
-        ckpt_archived, nb_ckpts  = self._archive_checkpoints(chunk)
-        total_bytes = nb_precomp + nb_ckpts
+        try:
+            npz_archived, nb_precomp = self._archive_precomputed(chunk)
+            ckpt_archived, nb_ckpts  = self._archive_checkpoints(chunk)
+            total_bytes = nb_precomp + nb_ckpts
 
-        summary = {
-            "npz_archived": npz_archived,
-            "ckpt_archived": ckpt_archived,
-            "bytes_transferred": total_bytes,
-        }
-        _log("archive_done", chunk, **summary)
-        log.info("Archiving chunk %d complete: %s", chunk, summary)
-        return summary
+            summary = {
+                "npz_archived": npz_archived,
+                "ckpt_archived": ckpt_archived,
+                "bytes_transferred": total_bytes,
+            }
+            mark_done(chunk, "archive")
+            write_heartbeat("stager", chunk, phase="archive", status="done", **summary)
+            _log("archive_done", chunk, **summary)
+            log.info("Archiving chunk %d complete: %s", chunk, summary)
+            return summary
+        except Exception as exc:
+            msg = str(exc)
+            mark_error(chunk, "archive", msg)
+            write_heartbeat("stager", chunk, phase="archive", status="error", error=msg)
+            _log("archive_error", chunk, error=msg)
+            raise
 
     def status(self) -> dict:
         """Return a status snapshot for pipeline_status.py."""
@@ -207,12 +246,15 @@ class DataStager:
             return 1
 
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
-            for _ in as_completed(pool.submit(_do, t) for t in tasks):
-                staged += _.result()
+            for i, fut in enumerate(as_completed(pool.submit(_do, t) for t in tasks)):
+                staged += fut.result()
+                if i % _HEARTBEAT_EVERY == 0:
+                    write_heartbeat("stager", chunk, phase="stage", status="running",
+                                    shards_staged=staged, shards_total=len(tasks))
 
         return staged
 
-    def _stage_precomputed(self) -> tuple[int, int]:
+    def _stage_precomputed(self, chunk: int) -> tuple[int, int]:
         """
         Stage versioned precomputed .npz caches from cold → hot for all encoders.
 
@@ -253,11 +295,14 @@ class DataStager:
                 return self._link_or_copy(*src_dst)
 
             with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
-                for fut in as_completed(pool.submit(_do, t) for t in tasks):
+                for i, fut in enumerate(as_completed(pool.submit(_do, t) for t in tasks)):
                     nb = fut.result()
                     if nb >= 0:  # -1 → already existed / symlinked
                         total_bytes += nb
                     total_npz += 1
+                    if i % _HEARTBEAT_EVERY == 0:
+                        write_heartbeat("stager", chunk, phase="stage", status="running",
+                                        npz_staged=total_npz, encoder=encoder)
 
             # Keep hot's `current` symlink pointing at the same version as cold.
             _atomic_symlink(hot_enc / "current", ver)
@@ -268,7 +313,7 @@ class DataStager:
     # Archiving internals
     # ------------------------------------------------------------------
 
-    def _archive_precomputed(self) -> tuple[int, int]:
+    def _archive_precomputed(self, chunk: int) -> tuple[int, int]:
         """
         Copy new versioned precomputed dirs from hot → cold for all encoders.
 
@@ -316,10 +361,15 @@ class DataStager:
                     return self._atomic_copy(src, dst)
 
                 with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
-                    for fut in as_completed(pool.submit(_do, f) for f in files_to_copy):
+                    for i, fut in enumerate(
+                            as_completed(pool.submit(_do, f) for f in files_to_copy)):
                         nb = fut.result()
                         total_bytes += nb
                         total_npz += 1
+                        if i % _HEARTBEAT_EVERY == 0:
+                            write_heartbeat("stager", chunk, phase="archive",
+                                            status="running", npz_archived=total_npz,
+                                            encoder=encoder)
 
             # Update cold's `current` to match hot's if hot has a current pointer.
             if current_ver and (cold_enc / current_ver).exists():
@@ -484,8 +534,12 @@ def cmd_stage(args) -> None:
     if not s.enabled:
         print("Stager disabled (cold_root == hot_root). Nothing to do.")
         return
-    result = s.stage_for_chunk(args.chunk)
-    print(json.dumps(result, indent=2))
+    try:
+        result = s.stage_for_chunk(args.chunk)
+        print(json.dumps(result, indent=2))
+    except Exception as exc:
+        log.error("Stage chunk %d failed: %s", args.chunk, exc)
+        sys.exit(1)
 
 
 def cmd_archive(args) -> None:
@@ -493,8 +547,12 @@ def cmd_archive(args) -> None:
     if not s.enabled:
         print("Stager disabled (cold_root == hot_root). Nothing to do.")
         return
-    result = s.archive_chunk(args.chunk)
-    print(json.dumps(result, indent=2))
+    try:
+        result = s.archive_chunk(args.chunk)
+        print(json.dumps(result, indent=2))
+    except Exception as exc:
+        log.error("Archive chunk %d failed: %s", args.chunk, exc)
+        sys.exit(1)
 
 
 def cmd_status(args) -> None:
