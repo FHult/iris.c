@@ -233,14 +233,16 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
   - `cross_ref_prob`, `patch_shuffle_prob`, `freeze_double_stream_scales`, `style_loss_weight`
 - Generate comparative HTML reports with loss curves and final recommendation.
 
-**PIPELINE-27: Smart precompute shard selection v2** (Medium-High priority)  
-- Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.  
-- Strong synergy with:
-  - Persistent raw-data pool (PIPELINE-25)
-  - Versioned precompute cache (PRECOMP-1)
-  - Distilled VAE (PRECOMP-2)
-- Goal: Evolve from static stratification to a self-improving, curated training set that delivers higher style quality with fewer total samples and lower precompute cost.  
-- Output: `shard_scores.json` + weighted sampling logic with configurable performance vs diversity trade-off.
+**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
+- Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.
+- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool).** Without a persistent pool there is no candidate set to select from — each chunk's raw data is ephemeral and selection is impossible.
+- Synergy with:
+  - Versioned precompute cache (PRECOMP-1) ✅ done — makes selective re-precomputing safe
+  - Persistent raw-data pool (PIPELINE-25) ⛔ not done — hard blocker
+- ~~Distilled VAE (PRECOMP-2)~~ — dependency removed. PRECOMP-2 was not viable; without cheap precompute the "score candidates before committing" approach costs as much as precomputing everything. Selectivity benefit only comes from quality, not cost reduction.
+- **Revised goal:** deliver higher style quality with fewer chunks by biasing shard selection toward underrepresented styles and away from shards where the current model already performs well. "Lower precompute cost" is no longer part of the claim.
+- Note: `mine_hard_examples.py` already provides adaptive selection at the record level post-chunk; shard-level scoring is an upstream complement, not a replacement. Marginal gain is modest while training on ~320 of ~50,000 JDB shards since random selection already provides wide diversity.
+- Output: `shard_scores.json` + weighted sampling logic with configurable quality vs diversity trade-off.
 
 ---
 
