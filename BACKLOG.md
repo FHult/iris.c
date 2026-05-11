@@ -39,10 +39,6 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
-**PIPE-V03: V-03/04 CLIP scoring fails with unexpected-key warning** (Low priority)
-- `score_validation.py` loads `openai/clip-vit-base-patch32` via HuggingFace; the checkpoint includes `text_model.embeddings.position_ids` and `vision_model.embeddings.position_ids` as UNEXPECTED keys, causing the scorer to exit 1.
-- The validator treats V-03/04 as non-fatal (CLIP skipped, overall PASS), but the score is lost.
-- Fix: pass `ignore_mismatched_sizes=True` or suppress the unexpected-key check in `score_validation.py` for known-benign position_ids keys.
 
 **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging**
 
