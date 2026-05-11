@@ -32,7 +32,7 @@ from pipeline_lib import (
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
     CKPT_ARCHIVE_DIR, RUN_METADATA_FILE,
-    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
+    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
     STATE_FILE,
     read_state, write_state, update_state,
@@ -772,6 +772,43 @@ class Orchestrator:
         """True when the prep window is occupied."""
         return self._active_prep is not None or tmux_window_exists(TMUX_PREP_WIN)
 
+    def _launch_stager(self, stager_args: str, description: str,
+                       chunk: int, log_name: str) -> None:
+        """
+        Launch data_stager.py in the iris-stage tmux window.
+
+        Uses `nice -n 10 taskpolicy -d throttle` unconditionally — the stager
+        is always I/O-heavy background work that must yield to training and
+        precompute regardless of what else is running.
+
+        If iris-stage is already occupied (e.g. a previous archive/stage job is
+        still running), the launch is skipped and logged; the caller is
+        responsible for retry if the operation is mandatory.
+
+        For the no-op single-SSD case (stager.enabled == False) the stager CLI
+        exits immediately, so a spurious window is harmless but we skip the
+        launch to avoid noise in the tmux session list.
+        """
+        if not self.stager.enabled:
+            return
+        if tmux_window_exists(TMUX_STAGE_WIN):
+            log_orch(f"iris-stage busy — skipping {description} (will retry next poll)", chunk=chunk)
+            return
+        if self.dry_run:
+            log_orch(f"DRY RUN: would launch {description}")
+            return
+        cfg_path = self._config_path()
+        inner = self._python_cmd("data_stager.py", f"{stager_args} --config '{cfg_path}'")
+        # Always throttle; wrap only the inner python command so the shell &&
+        # chain itself runs at normal priority.
+        cmd = f"nice -n 10 taskpolicy -d throttle {inner}"
+        log_file = LOG_DIR / f"{log_name}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
+                     f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
+        tmux_new_window(TMUX_STAGE_WIN, activated, log_file)
+        log_orch(f"Launched: {description} → {log_file}", chunk=chunk)
+
     # Fix 2: recover _active_prep after orchestrator restart mid-step.
     # _active_prep is in-memory; if orchestrator is killed while iris-prep runs,
     # on restart _poll_prep_window() returns early and the step is never marked done.
@@ -1215,9 +1252,16 @@ class Orchestrator:
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
-                self.stager.archive_chunk_background(chunk)
-                if chunk < self.total_chunks:
-                    self.stager.stage_for_chunk_background(chunk + 1)
+                # Archive chunk N then stage chunk N+1 — sequential in iris-stage so
+                # archiving takes priority over predictive staging after completion.
+                self._launch_stager(
+                    f"archive --chunk {chunk}" +
+                    (f" && {self._python_cmd('data_stager.py', f'stage --chunk {chunk + 1}')}"
+                     if chunk < self.total_chunks else ""),
+                    description=f"archive chunk {chunk}",
+                    chunk=chunk,
+                    log_name=f"stager_archive_chunk{chunk}",
+                )
                 self._archive_chunk_checkpoint(chunk)
                 self._auto_populate_anchor_shards(chunk)
                 if chunk >= self.total_chunks:
@@ -1260,7 +1304,15 @@ class Orchestrator:
         )
 
         log_orch(f"Chunk {chunk}: starting training ({steps} steps, lr={lr}, base_step={chunk_base_step})", chunk=chunk)
-        self.stager.notify_training_start(chunk, self.total_chunks)
+        # Predictive staging: stage chunk N+1's data while chunk N trains, so it
+        # is ready on hot storage before training finishes.
+        if chunk < self.total_chunks:
+            self._launch_stager(
+                f"stage --chunk {chunk + 1}",
+                description=f"predictive stage chunk {chunk + 1}",
+                chunk=chunk + 1,
+                log_name=f"stager_stage_chunk{chunk + 1}",
+            )
 
         resume_arg = ""
         # Resume from the latest intermediate checkpoint if one exists.

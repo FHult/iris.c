@@ -25,10 +25,8 @@ Same-device staging
   write to a temp path, then rename — so a crash never leaves partial files.
 
 Orchestrator integration (see orchestrator.py)
-  • notify_training_start(chunk)  — called when chunk N training begins;
-    triggers background staging for chunk N+1 while training runs.
-  • archive_chunk_background(chunk) — called when chunk N training succeeds;
-    archives new precomputed data and weights back to cold.
+  The orchestrator launches this script as a dedicated iris-stage tmux window
+  using `nice -n 10 taskpolicy -d throttle` for I/O isolation.
 
 CLI usage (standalone)
   python data_stager.py stage   --chunk 2 [--config PATH]
@@ -43,19 +41,12 @@ import logging
 import os
 import shutil
 import sys
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-# Pipeline library — provides DATA_ROOT, PRECOMP_DIR, SHARDS_DIR, CKPT_DIR,
-# heartbeat helpers, and log_event for structured JSONL logging.
 sys.path.insert(0, str(Path(__file__).parent))
-from pipeline_lib import (
-    DATA_ROOT, PRECOMP_DIR, SHARDS_DIR, CKPT_DIR, CKPT_ARCHIVE_DIR,
-    load_config, write_heartbeat, log_event,
-)
+from pipeline_lib import DATA_ROOT, load_config, log_event
 
 log = logging.getLogger("data_stager")
 
@@ -74,8 +65,9 @@ class DataStager:
     """
     Manages staging (cold→hot) and archiving (hot→cold) of pipeline data.
 
-    Instantiate once in the orchestrator; call notify_training_start() and
-    archive_chunk_background() at the appropriate lifecycle points.
+    Instantiated in the orchestrator for `enabled` checks; the actual
+    stage/archive operations run in a dedicated iris-stage tmux window via
+    `_launch_stager()` in orchestrator.py.
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -87,11 +79,10 @@ class DataStager:
         self.staging_margin_gb   = float(storage.get("staging_margin_gb",   50.0))
         self.cleanup_safety_gb   = float(storage.get("cleanup_safety_gb",   20.0))
         self.archive_after_chunk = bool(storage.get("archive_after_chunk",  True))
-        self.background_staging  = bool(storage.get("background_staging",   True))
         self.max_parallel        = int(storage.get("max_parallel_transfers", 3))
 
         # Derived paths on cold storage.
-        self._cold_shards = self.cold_root / "shards"
+        self._cold_shards  = self.cold_root / "shards"
         self._cold_precomp = self.cold_root / "precomputed"
         self._cold_ckpts   = self.cold_root / "checkpoints" / "stage1"
 
@@ -103,10 +94,6 @@ class DataStager:
         # Detect same-device at init; cached for the lifetime of the process.
         self._use_symlinks: bool = self._detect_symlinks()
 
-        # Background thread handles — keep references to prevent GC.
-        self._staging_threads: dict[int, threading.Thread] = {}
-        self._archive_threads: dict[int, threading.Thread] = {}
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -115,17 +102,6 @@ class DataStager:
     def enabled(self) -> bool:
         """False when cold and hot are the same path (single-SSD, no-op mode)."""
         return self.cold_root != self.hot_root
-
-    def notify_training_start(self, chunk: int, total_chunks: int) -> None:
-        """
-        Called when chunk N training begins.  Triggers background staging for
-        chunk N+1 so its data is ready on hot storage before training ends.
-        """
-        next_chunk = chunk + 1
-        if not self.enabled or next_chunk > total_chunks:
-            return
-        if self.background_staging:
-            self.stage_for_chunk_background(next_chunk)
 
     def stage_for_chunk(self, chunk: int) -> dict:
         """
@@ -155,18 +131,6 @@ class DataStager:
         log.info("Staging chunk %d complete: %s", chunk, summary)
         return summary
 
-    def stage_for_chunk_background(self, chunk: int) -> threading.Thread:
-        """Non-blocking wrapper: runs stage_for_chunk in a daemon thread."""
-        t = threading.Thread(
-            target=self._stage_with_heartbeat,
-            args=(chunk,),
-            daemon=True,
-            name=f"stager-stage-{chunk}",
-        )
-        self._staging_threads[chunk] = t
-        t.start()
-        return t
-
     def archive_chunk(self, chunk: int) -> dict:
         """
         Archive hot-storage data for chunk N back to cold storage.
@@ -195,35 +159,17 @@ class DataStager:
         log.info("Archiving chunk %d complete: %s", chunk, summary)
         return summary
 
-    def archive_chunk_background(self, chunk: int) -> threading.Thread:
-        """Non-blocking wrapper: runs archive_chunk in a daemon thread."""
-        t = threading.Thread(
-            target=self._archive_with_heartbeat,
-            args=(chunk,),
-            daemon=True,
-            name=f"stager-archive-{chunk}",
-        )
-        self._archive_threads[chunk] = t
-        t.start()
-        return t
-
     def status(self) -> dict:
         """Return a status snapshot for pipeline_status.py."""
         hot_free  = _free_gb(self.hot_root)  if self.hot_root.exists()  else None
         cold_free = _free_gb(self.cold_root) if self.cold_root.exists() else None
-        staging_threads  = {c: t.is_alive() for c, t in self._staging_threads.items()}
-        archiving_threads = {c: t.is_alive() for c, t in self._archive_threads.items()}
         return {
-            "enabled":   self.enabled,
+            "enabled":      self.enabled,
             "use_symlinks": self._use_symlinks,
-            "cold_root": str(self.cold_root),
-            "hot_root":  str(self.hot_root),
+            "cold_root":    str(self.cold_root),
+            "hot_root":     str(self.hot_root),
             "hot_free_gb":  round(hot_free,  1) if hot_free  is not None else None,
             "cold_free_gb": round(cold_free, 1) if cold_free is not None else None,
-            "staging_active":  any(staging_threads.values()),
-            "archiving_active": any(archiving_threads.values()),
-            "staging_chunks":  [c for c, alive in staging_threads.items()  if alive],
-            "archiving_chunks": [c for c, alive in archiving_threads.items() if alive],
         }
 
     # ------------------------------------------------------------------
@@ -498,28 +444,6 @@ class DataStager:
             pass
         return True
 
-    def _stage_with_heartbeat(self, chunk: int) -> None:
-        """Thread target for background staging with periodic heartbeat."""
-        try:
-            _lower_priority()
-            write_heartbeat("stager", chunk, phase="staging", status="running")
-            result = self.stage_for_chunk(chunk)
-            write_heartbeat("stager", chunk, phase="staging", status="done", **result)
-        except Exception as exc:
-            log.exception("Background staging for chunk %d failed: %s", chunk, exc)
-            write_heartbeat("stager", chunk, phase="staging", status="error", error=str(exc))
-
-    def _archive_with_heartbeat(self, chunk: int) -> None:
-        """Thread target for background archiving with periodic heartbeat."""
-        try:
-            _lower_priority()
-            write_heartbeat("stager", chunk, phase="archiving", status="running")
-            result = self.archive_chunk(chunk)
-            write_heartbeat("stager", chunk, phase="archiving", status="done", **result)
-        except Exception as exc:
-            log.exception("Background archiving for chunk %d failed: %s", chunk, exc)
-            write_heartbeat("stager", chunk, phase="archiving", status="error", error=str(exc))
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -537,14 +461,6 @@ def _atomic_symlink(link_path: Path, target: str) -> None:
         tmp.unlink()
     os.symlink(target, tmp)
     os.replace(tmp, link_path)
-
-
-def _lower_priority() -> None:
-    """Reduce process/thread scheduling priority so staging doesn't starve compute."""
-    try:
-        os.nice(10)
-    except (OSError, AttributeError):
-        pass
 
 
 def _log(event: str, chunk: Optional[int] = None, **fields) -> None:
