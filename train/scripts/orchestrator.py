@@ -33,7 +33,7 @@ from pipeline_lib import (
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
     CKPT_ARCHIVE_DIR, RUN_METADATA_FILE,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
-    DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS,
+    DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS, SHARD_BLOCK,
     STATE_FILE,
     read_state, write_state, update_state,
     is_done, mark_done, mark_error, has_error, read_error, clear_error,
@@ -154,11 +154,6 @@ class ChunkState(str):
     ERROR             = "ERROR"
 
 
-# Shard ID space reserved per chunk.  Chunk N owns [N-1)*_SHARD_BLOCK, N*_SHARD_BLOCK).
-# Ceiling: 200000 shards × 5000 images = 1B images per chunk.
-# 4 chunks × 200000 = 800000 < 999999 (6-digit shard format limit).
-# _promote_chunk enforces this with a hard error if staging overflows.
-_SHARD_BLOCK = 200_000
 
 CHUNK_STEPS = [
     "download",
@@ -1105,7 +1100,7 @@ class Orchestrator:
         # files from colliding when chunks are promoted to the shared production
         # precomputed/ directory.  200000 shards × 5000 images = 1B images per
         # chunk.  _promote_chunk enforces this ceiling with a hard error.
-        start_idx = (chunk - 1) * _SHARD_BLOCK
+        start_idx = (chunk - 1) * SHARD_BLOCK
         # Cap build output to the precompute budget so downstream steps (filter,
         # clip_embed, clip_dups, validate_shards) never process shards that won't
         # be trained on.  Reads the same precompute.max_shards config key used by
@@ -1259,7 +1254,7 @@ class Orchestrator:
         precomp_src = staging / "precomputed"
 
         # Canary: verify no shard index overflows this chunk's reserved ID space.
-        ceiling = chunk * _SHARD_BLOCK
+        ceiling = chunk * SHARD_BLOCK
         overflow = []
         for tar in shard_src.glob("*.tar"):
             try:
@@ -1271,9 +1266,9 @@ class Orchestrator:
         if overflow:
             msg = (
                 f"Chunk {chunk}: SHARD ID OVERFLOW — {len(overflow)} shard(s) exceed "
-                f"reserved ceiling {ceiling - 1} (block size {_SHARD_BLOCK}). "
+                f"reserved ceiling {ceiling - 1} (block size {SHARD_BLOCK}). "
                 f"First offenders: {sorted(overflow)[:5]}. "
-                f"Increase _SHARD_BLOCK or reduce data volume per chunk."
+                f"Increase SHARD_BLOCK or reduce data volume per chunk."
             )
             log_orch(msg, chunk=chunk)
             mark_error(chunk, "promoted", msg)

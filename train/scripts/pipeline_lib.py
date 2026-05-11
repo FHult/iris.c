@@ -55,6 +55,11 @@ HEARTBEAT_STALE_SECS = 900
 DISK_WARN_GB  = 80
 DISK_ABORT_GB = 40
 
+# Shard ID space reserved per chunk.  Chunk N owns IDs [(N-1)*SHARD_BLOCK, N*SHARD_BLOCK).
+# 200 000 shards × 5 000 images/shard = 1 billion images per chunk — ample headroom.
+# Single authoritative definition; imported by orchestrator.py and data_stager.py.
+SHARD_BLOCK = 200_000
+
 
 # ---------------------------------------------------------------------------
 # Timestamps

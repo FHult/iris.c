@@ -49,13 +49,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, load_config, log_event,
     write_heartbeat, mark_done, mark_error, has_error, clear_error,
+    SHARD_BLOCK,
 )
 
 log = logging.getLogger("data_stager")
-
-# Shard ID block size per chunk — must match orchestrator.py's _SHARD_BLOCK.
-# Chunk N owns shard IDs in [(N-1)*SHARD_BLOCK, N*SHARD_BLOCK).
-_SHARD_BLOCK = 200_000
 
 _ENCODERS = ("qwen3", "vae", "siglip")
 
@@ -219,14 +216,14 @@ class DataStager:
         """
         Symlink/copy shards for chunk N from cold_shards → hot_shards.
 
-        Chunk N owns shard IDs [(N-1)*_SHARD_BLOCK, N*_SHARD_BLOCK).
+        Chunk N owns shard IDs [(N-1)*SHARD_BLOCK, N*SHARD_BLOCK).
         Shards are named {shard_id:06d}.tar — match by numeric stem.
         """
         if not self._cold_shards.exists():
             return 0
 
-        lo = (chunk - 1) * _SHARD_BLOCK
-        hi =  chunk      * _SHARD_BLOCK
+        lo = (chunk - 1) * SHARD_BLOCK
+        hi =  chunk      * SHARD_BLOCK
         self._hot_shards.mkdir(parents=True, exist_ok=True)
 
         staged = 0
