@@ -72,6 +72,7 @@ training:
   # Hard-example mining eval budget per scale.
   # Records sampled for loss ranking; higher = better coverage of hard tail.
   mine_eval_records:
+    dev:    200
     smoke:  500
     small:  10000
     medium: 20000
@@ -80,6 +81,7 @@ training:
 
   # Top-K hard examples extracted per mining run.
   mine_top_k:
+    dev:    50
     smoke:  200
     small:  2000
     medium: 3000
@@ -88,6 +90,8 @@ training:
 
   # Steps per chunk per scale
   steps:
+    dev:
+      1: 1000
     smoke:
       1: 100
     small:
