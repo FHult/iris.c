@@ -97,7 +97,8 @@ def _compute_clip_i(model, processor, ref_pil, gen_pil) -> Optional[float]:
         import torch
         inputs = processor(images=[ref_pil, gen_pil], return_tensors="pt")
         with torch.no_grad():
-            feats = model.get_image_features(**inputs)  # [2, 1152]
+            out = model.get_image_features(**inputs)
+        feats = out.pooler_output if hasattr(out, "pooler_output") else out
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return float((feats[0] * feats[1]).sum().item())
     except Exception as e:
@@ -115,8 +116,10 @@ def _compute_clip_t(model, processor, prompt: str, gen_pil) -> Optional[float]:
         )
         i_inputs = processor(images=[gen_pil], return_tensors="pt")
         with torch.no_grad():
-            t_feat = model.get_text_features(**t_inputs)   # [1, 1152]
-            i_feat = model.get_image_features(**i_inputs)  # [1, 1152]
+            t_out = model.get_text_features(**t_inputs)
+            i_out = model.get_image_features(**i_inputs)
+        t_feat = t_out.pooler_output if hasattr(t_out, "pooler_output") else t_out
+        i_feat = i_out.pooler_output if hasattr(i_out, "pooler_output") else i_out
         t_feat = t_feat / t_feat.norm(dim=-1, keepdim=True)
         i_feat = i_feat / i_feat.norm(dim=-1, keepdim=True)
         return float((t_feat[0] * i_feat[0]).sum().item())
@@ -543,7 +546,7 @@ def main():
         sys.exit(1)
 
     print(f"Loading Flux Klein from {mcfg['flux_model_dir']} ...")
-    flux = Flux2Klein.from_pretrained(mcfg["flux_model_dir"])
+    flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
 
     print(f"Loading adapter checkpoint {args.checkpoint} ...")
     adapter_params = dict(mx.load(args.checkpoint))

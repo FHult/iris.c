@@ -559,13 +559,14 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def export(
-    checkpoint:  str,
-    out_dir:     str,
-    quant:       str       = "bfloat16",
-    use_ema:     bool      = False,
-    style_only:  bool      = False,
-    step:        int | None = None,
-    do_validate: bool      = False,
+    checkpoint:      str,
+    out_dir:         str,
+    quant:           str       = "bfloat16",
+    use_ema:         bool      = False,
+    style_only:      bool      = False,
+    step:            int | None = None,
+    do_validate:     bool      = False,
+    perceiver_heads: int | None = None,
 ) -> None:
     t0 = time.monotonic()
 
@@ -599,6 +600,7 @@ def export(
         "model_target":       "flux-klein-4b" if dims["hidden_dim"] == 3072 else "flux-klein-9b",
         "iris_version":       "v2.7",
         **dims,
+        "perceiver_heads":    perceiver_heads if perceiver_heads is not None else dims["num_heads"],
         "style_only":         style_only,
         "quant":              quant,
         "training_step":      step,
@@ -660,6 +662,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override training step recorded in metadata (auto-detected from filename)",
     )
     p.add_argument(
+        "--perceiver-heads", type=int, default=None,
+        help="Number of heads in PerceiverResampler cross-attention (default: inferred as "
+             "transformer num_heads, which is wrong if perceiver_heads differs — pass "
+             "the value from your training config's adapter.perceiver_heads)",
+    )
+    p.add_argument(
         "--validate",
         action="store_true",
         help="Validate the written bundle after export (re-reads, checks shapes/dtypes)",
@@ -670,13 +678,14 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     export(
-        checkpoint  = args.checkpoint,
-        out_dir     = args.output,
-        quant       = args.quant,
-        use_ema     = args.use_ema,
-        style_only  = args.style_only,
-        step        = args.step,
-        do_validate = args.validate,
+        checkpoint      = args.checkpoint,
+        out_dir         = args.output,
+        quant           = args.quant,
+        use_ema         = args.use_ema,
+        style_only      = args.style_only,
+        step            = args.step,
+        do_validate     = args.validate,
+        perceiver_heads = args.perceiver_heads,
     )
 
 
