@@ -118,6 +118,24 @@ training:
     3: 1.0e-5
     4: 1.0e-5
 
+# Multi-tier storage — cold (archive) and hot (active compute) roots.
+# See train/TRAINING.md §Storage Tiers for full documentation.
+#
+# Single-SSD prototyping (default): omit this block or set both roots to
+# the same path. All staging/archiving operations become no-ops.
+#
+# Two-device setup example:
+#   cold_root: "/Volumes/RawHDD"    # HDD or secondary SSD — source of truth
+#   hot_root:  "/Volumes/FastTB5"   # primary NVMe — active compute runs here
+storage:
+  cold_root: "/Volumes/2TBSSD"   # same as DATA_ROOT → single-SSD no-op
+  hot_root:  "/Volumes/2TBSSD"   # same as DATA_ROOT → single-SSD no-op
+  staging_margin_gb: 50          # abort staging if hot free space would drop below this
+  cleanup_safety_gb: 20          # minimum hot free space before any cleanup
+  archive_after_chunk: true      # archive precomputed + weights to cold after each chunk
+  background_staging: true       # stage next chunk in background while training runs
+  max_parallel_transfers: 3      # concurrent symlink/copy workers
+
 # Precompute shard cap per scale: large/all-in produce many more shards than needed
 # for training; cap precompute so disk and wall-clock stay bounded.
 # null (or omitted) = precompute all available shards.

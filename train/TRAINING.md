@@ -284,3 +284,96 @@ train/.venv/bin/python train/scripts/clip_dedup.py embed \
   --embeddings /tmp/bench_out \
   --benchmark
 ```
+
+---
+
+## Storage Tiers
+
+### Overview
+
+The pipeline supports a two-tier storage model for situations where fast NVMe
+capacity is limited but a larger/cheaper drive (HDD or secondary SSD) is
+available for long-term data.
+
+| Tier | Role | Typical device |
+|---|---|---|
+| **Cold** (`cold_root`) | Source of truth. Raw shards, all versioned precompute caches, archived weights. Never auto-deleted. | HDD or secondary TB4/TB5 SSD |
+| **Hot** (`hot_root`) | Active compute. Only the current and next chunk's data. | Primary NVMe SSD |
+
+The stager (`train/scripts/data_stager.py`) moves data bidirectionally:
+
+- **Staging (cold → hot):** Before precompute or training, symlinks or copies
+  the required shards and versioned `.npz` caches from cold to hot storage.
+- **Archiving (hot → cold):** After a chunk completes successfully, copies new
+  precomputed data and adapter weight snapshots from hot back to cold.
+
+### Single-SSD prototyping (default)
+
+Set `cold_root == hot_root` (or omit the `storage:` block entirely). All
+staging and archiving operations become no-ops — nothing is copied or
+symlinked. This is the default in `v2_pipeline.yaml`.
+
+### Two-device setup
+
+Edit `train/configs/v2_pipeline.yaml`:
+
+```yaml
+storage:
+  cold_root: "/Volumes/RawHDD"    # HDD — source of truth
+  hot_root:  "/Volumes/FastTB5"   # fast NVMe — active compute
+  staging_margin_gb: 250          # keep this much free headroom on hot
+  cleanup_safety_gb: 100
+  archive_after_chunk: true
+  background_staging: true
+  max_parallel_transfers: 3
+```
+
+**Same-device detection:** If `cold_root` and `hot_root` happen to share the
+same physical filesystem (`os.stat().st_dev` match), symlinks are used
+(instant, zero disk cost). On different physical devices, files are copied
+atomically (temp-write → `os.replace`), so a crash never leaves partial data.
+
+### Orchestrator lifecycle
+
+The stager hooks into the orchestrator at two points automatically:
+
+1. **Training start** (`notify_training_start`): When chunk N training begins,
+   staging for chunk N+1 starts in background. By the time training finishes
+   (~25–83 h), chunk N+1's shards and precomputed caches are already on hot.
+
+2. **Training complete** (`archive_chunk_background`): When chunk N training
+   succeeds, new precomputed data and weight snapshots are copied to cold in
+   background while the orchestrator moves on to the next step.
+
+Both run as low-priority daemon threads (`os.nice(10)`) and write heartbeats
+to `.heartbeat/stager_chunk{N}.json` for visibility.
+
+### Manual CLI usage
+
+```bash
+# Stage chunk 2's shards and precomputed data from cold to hot
+train/.venv/bin/python train/scripts/data_stager.py stage --chunk 2
+
+# Archive chunk 1's results from hot to cold
+train/.venv/bin/python train/scripts/data_stager.py archive --chunk 1
+
+# Show stager status (enabled, device type, free space, active threads)
+train/.venv/bin/python train/scripts/data_stager.py status
+```
+
+### Hot storage budget (two-device setup)
+
+At `large` scale with `max_shards: 80`:
+
+| Data type | Approx size |
+|---|---|
+| 80 shards (`.tar`) | ~2 GB |
+| Qwen3 precomputed (80 shards × ~5K records × ~30 KB) | ~12 GB |
+| VAE precomputed (80 shards × ~5K records × ~8 KB) | ~3 GB |
+| SigLIP precomputed (80 shards × ~5K records × ~2 KB) | ~0.8 GB |
+| Checkpoint (`best.safetensors`) | ~2 GB |
+| **Total active chunk** | **~20 GB** |
+
+Two chunks (current + next) requires ~40 GB on hot, well within a 500 GB NVMe.
+Cold storage accumulates all historical versions; at 4 chunks that is ~80 GB of
+precomputed data plus ~8 GB of weight snapshots.

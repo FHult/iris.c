@@ -47,6 +47,7 @@ from pipeline_lib import (
 from cache_manager import (
     PrecomputeCache, encoder_config_subset, get_git_sha,
 )
+from data_stager import DataStager
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +317,8 @@ class Orchestrator:
         self._mem_log = LOG_DIR / "memory_pressure.log"
         self._mem_watchdog_stop = False
         self._start_memory_watchdog()
+
+        self.stager = DataStager(self.cfg)
 
         _validate_config(config)
 
@@ -1212,6 +1215,9 @@ class Orchestrator:
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
+                self.stager.archive_chunk_background(chunk)
+                if chunk < self.total_chunks:
+                    self.stager.stage_for_chunk_background(chunk + 1)
                 self._archive_chunk_checkpoint(chunk)
                 self._auto_populate_anchor_shards(chunk)
                 if chunk >= self.total_chunks:
@@ -1254,6 +1260,7 @@ class Orchestrator:
         )
 
         log_orch(f"Chunk {chunk}: starting training ({steps} steps, lr={lr}, base_step={chunk_base_step})", chunk=chunk)
+        self.stager.notify_training_start(chunk, self.total_chunks)
 
         resume_arg = ""
         # Resume from the latest intermediate checkpoint if one exists.
