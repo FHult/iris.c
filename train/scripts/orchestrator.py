@@ -147,6 +147,7 @@ class ChunkState(str):
     PRECOMPUTING      = "PRECOMPUTING"
     READY             = "READY"
     SHARD_VALIDATING  = "SHARD_VALIDATING"
+    WARMING_UP        = "WARMING_UP"
     TRAINING          = "TRAINING"
     MINING            = "MINING"
     VALIDATING        = "VALIDATING"
@@ -166,25 +167,27 @@ CHUNK_STEPS = [
     "precompute",
     "promoted",
     "validate_shards",
+    "training_warmup",
     "train",
     "mine",
     "validate",
 ]
 
 _STEP_TO_STATE = {
-    "download":        ChunkState.CONVERTING,
-    "convert":         ChunkState.BUILDING,
-    "build_shards":    ChunkState.FILTERING,
-    "filter_shards":   ChunkState.CLIP_EMBED,
-    "clip_embed":      ChunkState.CLIP_INDEX,
-    "clip_index":      ChunkState.CLIP_DUPS,
-    "clip_dups":       ChunkState.PRECOMPUTING,
-    "precompute":      ChunkState.READY,
-    "promoted":        ChunkState.SHARD_VALIDATING,
-    "validate_shards": ChunkState.TRAINING,
-    "train":           ChunkState.MINING,
-    "mine":            ChunkState.VALIDATING,
-    "validate":        ChunkState.DONE,
+    "download":         ChunkState.CONVERTING,
+    "convert":          ChunkState.BUILDING,
+    "build_shards":     ChunkState.FILTERING,
+    "filter_shards":    ChunkState.CLIP_EMBED,
+    "clip_embed":       ChunkState.CLIP_INDEX,
+    "clip_index":       ChunkState.CLIP_DUPS,
+    "clip_dups":        ChunkState.PRECOMPUTING,
+    "precompute":       ChunkState.READY,
+    "promoted":         ChunkState.SHARD_VALIDATING,
+    "validate_shards":  ChunkState.WARMING_UP,
+    "training_warmup":  ChunkState.TRAINING,
+    "train":            ChunkState.MINING,
+    "mine":             ChunkState.VALIDATING,
+    "validate":         ChunkState.DONE,
 }
 
 
@@ -432,6 +435,17 @@ class Orchestrator:
             self._delete_staging_raw(chunk)
         if step == "mine":
             notify("iris pipeline", f"Chunk {chunk} hard example mining complete")
+            if not is_done(chunk, "archive"):
+                # Archive now that shards are no longer needed for mining.
+                # Chain stage of next chunk so cold→hot transfer starts immediately.
+                self._launch_stager(
+                    f"archive --chunk {chunk}" +
+                    (f" && {self._python_cmd('data_stager.py', f'stage --chunk {chunk + 1}')}"
+                     if chunk < self.total_chunks else ""),
+                    description=f"archive chunk {chunk}",
+                    chunk=chunk,
+                    log_name=f"stager_archive_chunk{chunk}",
+                )
         if step in ("train", "mine"):
             update_state(**{"chunks": {str(chunk): {"completed_at": now_iso()}}})
 
@@ -452,6 +466,7 @@ class Orchestrator:
         "clip_dups_chunk{c}.log",
         "precompute_chunk{c}.log",
         "validate_shards_chunk{c}.log",
+        "training_warmup_chunk{c}.log",
     ]
 
     def _cleanup_prep_logs(self, chunk: int) -> None:
@@ -798,7 +813,7 @@ class Orchestrator:
             log_orch(f"DRY RUN: would launch {description}")
             return
         cfg_path = self._config_path()
-        inner = self._python_cmd("data_stager.py", f"{stager_args} --config '{cfg_path}'")
+        inner = self._python_cmd("data_stager.py", f"--config '{cfg_path}' {stager_args}")
         # Always throttle; wrap only the inner python command so the shell &&
         # chain itself runs at normal priority.
         cmd = f"nice -n 10 taskpolicy -d throttle {inner}"
@@ -813,7 +828,7 @@ class Orchestrator:
         """
         Called every orchestrator tick.  Handles four responsibilities:
 
-        1. Retry pending archive:  if chunk N training is done but archive is
+        1. Retry pending archive:  if chunk N mining is done but archive is
            not yet done (and no error is set), re-launch archive when iris-stage
            is free.  This recovers from the initial launch being skipped because
            iris-stage was busy, or from an orchestrator restart.
@@ -839,7 +854,7 @@ class Orchestrator:
         for chunk in range(1, self.total_chunks + 1):
             # ---- archive retry ------------------------------------------------
             archive_err_id = f"stager_archive_{chunk}"
-            if is_done(chunk, "train") and not is_done(chunk, "archive"):
+            if is_done(chunk, "mine") and not is_done(chunk, "archive"):
                 if has_error(chunk, "archive"):
                     # Error is set — dispatch if not already, then wait for operator.
                     if archive_err_id not in self._stager_dispatched_errors:
@@ -936,22 +951,24 @@ class Orchestrator:
             ChunkState.CLIP_DUPS:        "clip_dups",
             ChunkState.PRECOMPUTING:     "precompute",
             ChunkState.SHARD_VALIDATING: "validate_shards",
+            ChunkState.WARMING_UP:       "training_warmup",
             ChunkState.MINING:           "mine",
             ChunkState.VALIDATING:       "validate",
         }
         _step_log = {
-            "download":        lambda c: LOG_DIR / f"download_chunk{c}.log",
-            "build_shards":    lambda c: LOG_DIR / f"build_chunk{c}.log",
-            "filter_shards":   lambda c: LOG_DIR / f"filter_chunk{c}.log",
-            "clip_embed":      lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
-            "clip_index":      lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
-            "clip_dups":       lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
-            "precompute":      lambda c: LOG_DIR / f"precompute_chunk{c}.log",
-            "validate_shards": lambda c: LOG_DIR / f"validate_shards_chunk{c}.log",
-            "mine":            lambda c: LOG_DIR / f"mine_chunk{c}.log",
-            "validate":        lambda c: LOG_DIR / f"validate_chunk{c}.log",
+            "download":         lambda c: LOG_DIR / f"download_chunk{c}.log",
+            "build_shards":     lambda c: LOG_DIR / f"build_chunk{c}.log",
+            "filter_shards":    lambda c: LOG_DIR / f"filter_chunk{c}.log",
+            "clip_embed":       lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
+            "clip_index":       lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
+            "clip_dups":        lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
+            "precompute":       lambda c: LOG_DIR / f"precompute_chunk{c}.log",
+            "validate_shards":  lambda c: LOG_DIR / f"validate_shards_chunk{c}.log",
+            "training_warmup":  lambda c: LOG_DIR / f"training_warmup_chunk{c}.log",
+            "mine":             lambda c: LOG_DIR / f"mine_chunk{c}.log",
+            "validate":         lambda c: LOG_DIR / f"validate_chunk{c}.log",
         }
-        _GPU_STEPS  = {"precompute", "clip_embed", "mine", "validate"}
+        _GPU_STEPS  = {"precompute", "clip_embed", "training_warmup", "mine", "validate"}
         _DISK_STEPS = {"build_shards"}
         # Collect all chunks in a pending state, then pick the one whose log
         # file was most recently written — that is the step actually running.
@@ -1034,6 +1051,7 @@ class Orchestrator:
             ChunkState.PRECOMPUTING:     self._start_precompute,
             ChunkState.READY:            self._check_ready,
             ChunkState.SHARD_VALIDATING: self._start_shard_validation,
+            ChunkState.WARMING_UP:       self._start_training_warmup,
             ChunkState.TRAINING:         self._start_training,
             ChunkState.MINING:           self._start_mining,
             ChunkState.VALIDATING:       self._start_validation,
@@ -1362,6 +1380,46 @@ class Orchestrator:
         self._launch_prep(f"validate_shards chunk {chunk}", cmd, log_file,
                           chunk, "validate_shards")
 
+    def _start_training_warmup(self, chunk: int) -> None:
+        """Compile Metal PSO training graphs before training starts.
+
+        Runs train_ip_adapter.py --warmup-only, which loads the model, runs one
+        forward+backward eval per bucket shape to populate the Metal PSO cache,
+        then exits.  The cache is machine-wide and persists across restarts, so
+        subsequent chunks skip warmup immediately.
+        """
+        if is_done(chunk, "training_warmup") or self._prep_busy():
+            return
+
+        # Metal PSO cache is machine-wide — if any prior chunk completed warmup,
+        # the compiled kernels are already cached.  Mark done and move on.
+        if chunk > 1 and is_done(chunk - 1, "training_warmup"):
+            log_orch(
+                f"Chunk {chunk}: Metal PSO cache warm (chunk {chunk - 1} warmup done)"
+                f" — skipping training_warmup",
+                chunk=chunk,
+            )
+            mark_done(chunk, "training_warmup")
+            return
+
+        if not gpu_is_free():
+            return
+        if not self.res.request("GPU_TOKEN", f"training_warmup chunk {chunk}"):
+            return
+
+        log_orch(f"Chunk {chunk}: warming up IP Adapter Metal training graphs", chunk=chunk)
+        training_config = self.cfg.get("training_config", "train/configs/stage1_512px.yaml")
+        cfg_path = TRAIN_DIR / training_config
+        log_file = LOG_DIR / f"training_warmup_chunk{chunk}.log"
+        cmd = self._python_cmd(
+            "train_ip_adapter.py",
+            f"--config '{cfg_path}' --warmup-only --data-root '{DATA_ROOT}'",
+        )
+        self._launch_prep(
+            f"training_warmup chunk {chunk}", cmd, log_file,
+            chunk, "training_warmup", token="GPU_TOKEN",
+        )
+
     def _start_training(self, chunk: int) -> None:
         log_file = LOG_DIR / f"train_chunk{chunk}.log"
 
@@ -1375,16 +1433,8 @@ class Orchestrator:
             if code == 0:
                 log_orch(f"Chunk {chunk}: training complete", chunk=chunk)
                 mark_done(chunk, "train")
-                # Archive chunk N then stage chunk N+1 — sequential in iris-stage so
-                # archiving takes priority over predictive staging after completion.
-                self._launch_stager(
-                    f"archive --chunk {chunk}" +
-                    (f" && {self._python_cmd('data_stager.py', f'stage --chunk {chunk + 1}')}"
-                     if chunk < self.total_chunks else ""),
-                    description=f"archive chunk {chunk}",
-                    chunk=chunk,
-                    log_name=f"stager_archive_chunk{chunk}",
-                )
+                # Archive fires after mine.done (see _post_step / _poll_stager) so that
+                # shards remain hot and readable during hard-example scoring.
                 self._archive_chunk_checkpoint(chunk)
                 self._auto_populate_anchor_shards(chunk)
                 if chunk >= self.total_chunks:

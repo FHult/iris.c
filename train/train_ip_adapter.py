@@ -1105,6 +1105,38 @@ def train(config: dict) -> None:
     # conditioned step so cross-ref works at batch_size=1 (no within-batch permutation).
     _cross_ref_buffer: Optional[mx.array] = None
 
+    # ── training_warmup: compile Metal PSO graphs for all bucket shapes then exit ──
+    # Triggered by the orchestrator's training_warmup pipeline step, or by running
+    # train_ip_adapter.py --warmup-only directly.  Runs the full forward+backward+
+    # optimizer-eval cycle once per bucket so the Metal compiler populates its PSO
+    # cache.  The cache persists across process restarts so subsequent training
+    # sessions (including all chunk 2+ runs) start without any compilation delay.
+    if args.warmup_only:
+        _txt_dim_wu = flux.transformer.context_embedder.weight.shape[1]
+        _txt_wu   = mx.zeros((1, 64, _txt_dim_wu), dtype=mx.bfloat16)
+        _t_wu     = mx.array([500], dtype=mx.int32)
+        print("Warming up IP Adapter training graphs (all bucket shapes)...")
+        for _bH, _bW in BUCKETS:
+            _lat_H, _lat_W = _bH // 8, _bW // 8
+            _dummy_lat    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
+            _dummy_tgt    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
+            _dummy_siglip = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            print(f"  [{_bH}x{_bW}] compiling...", flush=True)
+            _t0_wu = time.time()
+            _fs = _flux_forward_no_ip(flux, _dummy_lat, _txt_wu, _t_wu)
+            mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"])
+            _loss_wu, _gnorm_wu = compiled_step(_dummy_siglip, mx.array(False), _fs, _dummy_tgt)
+            mx.eval(optimizer.state, _loss_wu, _gnorm_wu)
+            mx.clear_cache()
+            mx.eval(adapter.parameters())
+            mx.clear_cache()
+            _elapsed = time.time() - _t0_wu
+            _label = "cold compile" if _elapsed > 5.0 else "warm cache"
+            print(f"  [{_bH}x{_bW}] done ({_elapsed:.1f}s — {_label})", flush=True)
+            del _fs, _dummy_lat, _dummy_tgt, _dummy_siglip, _loss_wu, _gnorm_wu
+        print("IP Adapter training graphs ready.")
+        sys.exit(0)
+
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
@@ -2265,6 +2297,11 @@ def main():
                         help="Root directory for shards and precomputed caches. "
                              "Relative paths in the config YAML are prefixed with this value. "
                              "Defaults to the current working directory.")
+    parser.add_argument("--warmup-only", action="store_true",
+                        help="Compile Metal PSO training graphs for all bucket shapes "
+                             "and exit. Populates the Metal kernel cache so the first "
+                             "real training step starts immediately. Run once per machine "
+                             "after initial setup or after an OS/MLX version change.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate config without training")
     parser.add_argument("--log-every", type=int, default=None,
