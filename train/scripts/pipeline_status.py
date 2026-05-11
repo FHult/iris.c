@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
-    STATE_FILE, CONTROL_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN,
+    STATE_FILE, CONTROL_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN, TMUX_STAGE_WIN,
     read_state, is_done, has_error, read_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
 )
@@ -60,12 +60,13 @@ def _age_str(secs: float) -> str:
 
 
 def _tmux_status() -> dict:
-    result = {"session": False, "train": False, "prep": False, "orch": False}
+    result = {"session": False, "train": False, "prep": False, "orch": False, "stage": False}
     result["session"] = tmux_session_exists()
     if result["session"]:
         result["train"] = tmux_window_exists(TMUX_TRAIN_WIN)
         result["prep"]  = tmux_window_exists(TMUX_PREP_WIN)
         result["orch"]  = tmux_window_exists(TMUX_ORCH_WIN)
+        result["stage"] = tmux_window_exists(TMUX_STAGE_WIN)
     return result
 
 
@@ -143,6 +144,15 @@ def _worker_heartbeat(process: str, chunk: int) -> dict:
         return {}
     age = heartbeat_age_secs(process, chunk)
     return {**hb, "age_secs": age, "stale": age is not None and age > 300}
+
+
+def _stager_heartbeat(chunk: int) -> dict:
+    """Read the stager heartbeat for a chunk (phase: stage or archive)."""
+    hb = read_heartbeat("stager", chunk)
+    if hb is None:
+        return {}
+    age = heartbeat_age_secs("stager", chunk)
+    return {**hb, "age_secs": age, "stale": age is not None and age > 900}
 
 
 def _read_dispatch_issues(resolved: bool = False) -> list:
@@ -333,7 +343,8 @@ def print_human(status: dict, verbose: bool = False) -> None:
     train = "🟢 iris-train" if tmux["train"] else "⬜ iris-train"
     prep  = "🟢 iris-prep"  if tmux["prep"]  else "⬜ iris-prep"
     orch  = "🟢 iris-orch"  if tmux["orch"]  else "⬜ iris-orch"
-    print(f"  tmux {sess}  {train}  {prep}  {orch}")
+    stage = "🟢 iris-stage" if tmux["stage"] else "⬜ iris-stage"
+    print(f"  tmux {sess}  {train}  {prep}  {orch}  {stage}")
 
     # Orchestrator liveness
     orch_age = status.get("orchestrator_age_secs")
@@ -406,6 +417,36 @@ def print_human(status: dict, verbose: bool = False) -> None:
             active_mark = ""
         step_prog = f"  step {s_done_c}/{s_total_c}"
         print(f"  Chunk {c}: {state_str:<16}{step_prog}  last: {last}{active_mark}{err_mark}{stg_str}")
+
+        # Stager status — show when iris-stage is running or heartbeat is recent (<5 min)
+        shb = _stager_heartbeat(c)
+        if shb:
+            shb_age = shb.get("age_secs")
+            shb_phase = shb.get("phase", "?")
+            shb_status = shb.get("status", "?")
+            age_str_s = _age_str(shb_age) if shb_age is not None else "?"
+            stale_mark = " ⚠️ STALE" if shb.get("stale") else ""
+            if shb_status == "running" and tmux["stage"]:
+                shards_staged = shb.get("shards_staged", 0)
+                shards_total  = shb.get("shards_total", 0)
+                npz_staged    = shb.get("npz_staged", 0)
+                bytes_xfer    = shb.get("bytes_transferred", 0)
+                gb_xfer       = bytes_xfer / 1e9 if bytes_xfer else 0
+                if shb_phase == "stage":
+                    count_str = f"{shards_staged}/{shards_total} shards  {npz_staged} NPZ  {gb_xfer:.1f} GB"
+                else:
+                    npz_arch  = shb.get("npz_archived", 0)
+                    ckpt_arch = shb.get("ckpt_archived", 0)
+                    count_str = f"{npz_arch} NPZ  {ckpt_arch} ckpts  {gb_xfer:.1f} GB"
+                print(f"    stager: {shb_phase} — {count_str}  hb {age_str_s} ago{stale_mark}")
+            elif shb_status == "done" and shb_age is not None and shb_age < 300:
+                npz_arch  = shb.get("npz_archived", 0)
+                ckpt_arch = shb.get("ckpt_archived", 0)
+                bytes_xfer = shb.get("bytes_transferred", 0)
+                gb_xfer    = bytes_xfer / 1e9 if bytes_xfer else 0
+                print(f"    stager: {shb_phase} complete — {npz_arch} NPZ  {ckpt_arch} ckpts  {gb_xfer:.1f} GB  ({age_str_s} ago)")
+            elif shb_status == "error":
+                print(f"    stager: {shb_phase} ERROR  hb {age_str_s} ago{stale_mark}")
 
         # Error details with clear instructions
         for step, emsg in errors.items():

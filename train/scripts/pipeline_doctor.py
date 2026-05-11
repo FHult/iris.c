@@ -36,7 +36,7 @@ from pipeline_lib import (
     SENTINEL_DIR, LOG_DIR, SHARDS_DIR, PRECOMP_DIR,
     HARD_EX_DIR, STAGING_DIR, DEDUP_DIR, DISPATCH_QUEUE,
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
-    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
+    TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -653,6 +653,95 @@ def _check_process_liveness(chunks: list[int]) -> None:
              "GPU lock file exists but owner process is dead",
              detail=str(GPU_LOCK_FILE),
              fix=f"rm {GPU_LOCK_FILE}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6a. Stager health checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_stager_health(chunks: list[int]) -> None:
+    sess = tmux_session_exists()
+    stage_win_alive = sess and tmux_window_exists(TMUX_STAGE_WIN)
+
+    for chunk in chunks:
+        # ── mine.done present but archive.done missing and stager not running ──
+        # archive.done is written by data_stager.py after archiving training outputs.
+        # If mine.done is set (training is complete and mined) but archive.done is
+        # absent and the stager window is not running, the archive step was skipped
+        # or crashed without leaving a .error sentinel.
+        if (is_done(chunk, "mine") and
+                not is_done(chunk, "archive") and
+                not has_error(chunk, "archive")):
+            shb = read_heartbeat("stager", chunk)
+            shb_age = heartbeat_age_secs("stager", chunk)
+            stager_active = (shb is not None and shb_age is not None
+                             and shb_age <= HEARTBEAT_STALE_SECS
+                             and shb.get("phase") == "archive")
+            if not stager_active:
+                _add("WARNING", "stager",
+                     f"Chunk {chunk}: mine.done present but archive.done missing and stager not running",
+                     detail=(f"Training outputs have not been archived to cold storage. "
+                             f"If staging completed silently (no sentinel written), "
+                             f"check the stager log or manually verify {CKPT_ARCHIVE_DIR}."),
+                     fix=(f"# If archive was already done manually, create the sentinel:\n"
+                          f"touch {SENTINEL_DIR}/chunk{chunk}/archive.done\n"
+                          f"# Or restart the stager to archive now:\n"
+                          f"python train/scripts/data_stager.py --chunk {chunk} --phase archive"),
+                     chunk=chunk,
+                     ctx={"stager_hb_age_s": round(shb_age) if shb_age is not None else None,
+                          "stage_win_alive": stage_win_alive})
+
+        # ── stager heartbeat stale while iris-stage window is alive (hung transfer) ──
+        shb = read_heartbeat("stager", chunk)
+        shb_age = heartbeat_age_secs("stager", chunk)
+        if (shb is not None and shb_age is not None
+                and shb_age > 900
+                and stage_win_alive
+                and shb.get("status") == "running"):
+            phase = shb.get("phase", "?")
+            bytes_xfer = shb.get("bytes_transferred", 0)
+            _add("WARNING", "stager",
+                 f"Chunk {chunk}: stager heartbeat stale ({_fmt_age(shb_age)}) but iris-stage window alive (hung transfer?)",
+                 detail=(f"Phase: {phase}. Last bytes transferred: {bytes_xfer / 1e9:.1f} GB. "
+                         f"Stager heartbeats every ~60s; 900s gap with a live window suggests "
+                         f"the transfer is blocked or the process is hung."),
+                 fix=(f"# Check stager log, then if hung:\n"
+                      f"tmux kill-window -t {TMUX_SESSION}:{TMUX_STAGE_WIN}"),
+                 chunk=chunk,
+                 ctx={"hb_age_s": round(shb_age), "phase": phase,
+                      "bytes_transferred": bytes_xfer, "stage_win_alive": True})
+
+        # ── stage.done gate: chunk in TRAINING state but stage.done absent ──
+        # The orchestrator gates training for chunk N+1 on stage.done for chunk N.
+        # If a chunk has started training (train heartbeat is fresh) but the prior
+        # chunk's stage.done sentinel is missing, the gate was bypassed or the
+        # sentinel was deleted — and the stager may not be running.
+        if chunk > 1:
+            prev = chunk - 1
+            thb_age = heartbeat_age_secs("trainer", chunk)
+            training_active = (thb_age is not None and thb_age <= HEARTBEAT_STALE_SECS)
+            if (training_active
+                    and not is_done(prev, "stage")
+                    and not has_error(prev, "stage")):
+                prev_shb = read_heartbeat("stager", prev)
+                prev_shb_age = heartbeat_age_secs("stager", prev)
+                stager_staging = (prev_shb is not None and prev_shb_age is not None
+                                  and prev_shb_age <= HEARTBEAT_STALE_SECS
+                                  and prev_shb.get("phase") == "stage")
+                if not stager_staging:
+                    _add("CRITICAL", "stager",
+                         f"Chunk {chunk} training active but chunk {prev} stage.done is missing and stager not staging",
+                         detail=(f"The orchestrator should gate chunk {chunk} training on chunk {prev} "
+                                 f"stage.done. Either the gate was skipped or the stager crashed "
+                                 f"without writing the sentinel. Precomputed data for chunk {chunk} "
+                                 f"may not have been staged to the hot volume."),
+                         fix=(f"# Verify hot-volume contents, then if staging was actually done:\n"
+                              f"touch {SENTINEL_DIR}/chunk{prev}/stage.done\n"
+                              f"# Or restart staging for chunk {prev}:\n"
+                              f"python train/scripts/data_stager.py --chunk {prev} --phase stage"),
+                         chunk=chunk,
+                         ctx={"prev_chunk": prev, "stage_done_missing": True,
+                              "stager_hb_age_s": round(prev_shb_age) if prev_shb_age is not None else None})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1627,6 +1716,7 @@ def main() -> None:
         _check_precompute_forensics(cfg, chunks)
         _check_checkpoint_continuity(cfg, chunks)
         _check_process_liveness(chunks)
+        _check_stager_health(chunks)
         _check_code_consistency(cfg, chunks)
         _check_training_anomalies(cfg, chunks)
         _check_orchestrator_log()
