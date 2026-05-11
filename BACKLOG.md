@@ -226,6 +226,12 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 - Prepare for future LoRA training and higher-rank adapters.  
 - Enable larger effective batch sizes on current hardware.
 
+**TRAIN-6: Retrain IP-adapter with block-by-block injection** (Medium priority, next major release)  
+- Current training uses `_flux_forward_no_ip` + end-sum approximation: all IP contributions are summed and added to `h_final` after all 25 blocks. Q vectors are collected from a clean (no-IP) Flux forward, so earlier blocks cannot adapt their computation to the style signal. This limits quality; CLIP-I ~0.56 vs ~0.7–0.85 for canonical IP-Adapter.  
+- Replace with `_flux_forward_with_ip` as the actual training forward pass (block-by-block injection matching inference). Each block's Q is computed from IP-conditioned hidden states, matching the canonical IP-Adapter approach.  
+- **Warm-start**: current checkpoint (`best.safetensors`, step 95000) gives a good init for perceiver and ip_scale; `to_k_ip_stacked`/`to_v_ip_stacked` will re-learn at the correct injection points.  
+- **Memory cost**: gradient flows through IP injection at each of 25 blocks (no longer fully isolated from Flux), significantly increasing peak memory vs the current isolated approach. Requires profiling on 64 GB unified memory before committing.
+
 ~~**PIPELINE-26: End-to-end pipeline profiler**~~ ✅ DONE — `pipeline_profile.py`: per-stage wall-clock from orchestrator JSONL launch events + sentinel mtimes; cross-chunk summary with bottleneck flag; VAE note when precompute is slowest. `pipeline_status.py`: timing footer in human output; `stage_mean_hours` + `bottleneck_stage` in `--ai` JSON.
 
 **QUALITY-10: Automated style feature ablation harness** (Medium priority)  
