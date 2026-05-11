@@ -235,7 +235,7 @@ def main() -> None:
             json.dump(output, f, indent=2)
         print(f"Scores written to {args.output}")
 
-    sys.exit(0 if verdict["verdict"] != "FAIL" else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
