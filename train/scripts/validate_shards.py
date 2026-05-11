@@ -26,16 +26,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, LOG_DIR, SHARDS_DIR,
+    DATA_ROOT, LOG_DIR, SHARDS_DIR, SHARD_BLOCK,
     mark_done, mark_error, log_orch, log_event, now_iso,
 )
 
-# Shard IDs reserved per chunk: chunk N owns [N-1)*200_000, N*200_000)
-_SHARD_BLOCK = 200_000
-
 
 def _chunk_shard_range(chunk: int) -> tuple[int, int]:
-    return (chunk - 1) * _SHARD_BLOCK, chunk * _SHARD_BLOCK
+    return (chunk - 1) * SHARD_BLOCK, chunk * SHARD_BLOCK
 
 
 def validate_shard(tar_path: Path) -> dict:

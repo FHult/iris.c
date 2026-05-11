@@ -35,7 +35,7 @@ from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, CKPT_DIR, CKPT_ARCHIVE_DIR,
     SENTINEL_DIR, LOG_DIR, SHARDS_DIR, PRECOMP_DIR,
     HARD_EX_DIR, STAGING_DIR, DEDUP_DIR, DISPATCH_QUEUE,
-    HEARTBEAT_STALE_SECS, GPU_LOCK_FILE,
+    HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
     read_state, load_config,
     is_done, has_error, read_error,
@@ -51,9 +51,6 @@ _GREEN  = "\033[92m"
 _CYAN   = "\033[96m"
 _BOLD   = "\033[1m"
 _RESET  = "\033[0m"
-
-# Chunk N owns shard IDs [(N-1)*SHARD_BLOCK, N*SHARD_BLOCK)
-_SHARD_BLOCK = 200_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +96,7 @@ def _add(severity: str, category: str, title: str,
 
 def _chunk_shard_range(chunk: int) -> tuple[int, int]:
     """Return (start_id, end_id_exclusive) for a chunk's shard IDs."""
-    return (chunk - 1) * _SHARD_BLOCK, chunk * _SHARD_BLOCK
+    return (chunk - 1) * SHARD_BLOCK, chunk * SHARD_BLOCK
 
 
 def _count_shards_for_chunk(chunk: int) -> int:
