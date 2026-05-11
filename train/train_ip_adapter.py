@@ -2296,6 +2296,27 @@ def main():
                 rel = val[len(_strip_prefix):] if val.startswith(_strip_prefix) else val
                 config[section][key] = os.path.join(_dr, rel)
 
+        # Resolve versioned cache dirs: if enc_dir/current symlink exists, follow it.
+        # This is transparent to everything downstream — the resolved path is an
+        # ordinary directory containing .npz files.
+        try:
+            _scripts = Path(__file__).parent / "scripts"
+            import sys as _sys
+            _sys.path.insert(0, str(_scripts))
+            from cache_manager import PrecomputeCache as _PCC
+            _precomp_root = Path(_dr) / "precomputed"
+            _enc_for_key = {"qwen3_cache_dir": "qwen3",
+                            "vae_cache_dir":   "vae",
+                            "siglip_cache_dir": "siglip"}
+            for _cache_key, _enc in _enc_for_key.items():
+                if not config.get("data", {}).get(_cache_key):
+                    continue
+                _eff = _PCC.effective_dir(_precomp_root, _enc)
+                if _eff:
+                    config["data"][_cache_key] = str(_eff)
+        except Exception:
+            pass  # cache_manager unavailable or no versioned cache — keep flat path
+
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
     if args.lr is not None:

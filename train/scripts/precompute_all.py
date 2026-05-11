@@ -777,7 +777,36 @@ def main():
                         help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--ai", action="store_true",
                         help="Emit compact JSON summary to stdout at completion; progress to stderr")
+    parser.add_argument("--list-cache", default=None, metavar="PRECOMP_ROOT",
+                        help="List versioned cache versions under PRECOMP_ROOT and exit")
+    parser.add_argument("--clear-stale", default=None, metavar="PRECOMP_ROOT",
+                        help="Delete non-current cache versions under PRECOMP_ROOT and exit")
     args = parser.parse_args()
+
+    # Cache management shortcuts — these exit immediately without doing any precompute.
+    if args.list_cache or args.clear_stale:
+        from cache_manager import PrecomputeCache, ENCODERS
+        import json as _json
+        _precomp_root = Path(args.list_cache or args.clear_stale)
+        if args.clear_stale:
+            for _enc in ENCODERS:
+                _del = PrecomputeCache.clear(_precomp_root, _enc, stale_only=True)
+                if _del:
+                    print(f"{_enc}: deleted {_del}")
+        else:
+            for _enc in ENCODERS:
+                _vs = PrecomputeCache.list_versions(_precomp_root, _enc)
+                if not _vs:
+                    print(f"{_enc}: (no versioned cache)")
+                    continue
+                print(f"{_enc}:")
+                for _v in _vs:
+                    _tag  = " [current]" if _v["current"] else ""
+                    _done = "complete" if _v["complete"] else "incomplete"
+                    print(f"  {_v['version']}{_tag}  {_done}  "
+                          f"{_v.get('record_count', 0):,} records  "
+                          f"{_v.get('config', {})}")
+        return
 
     # Block manual runs when GPU is already in use by training or the pipeline.
     # Orchestrated runs (PIPELINE_ORCHESTRATED=1) skip this — the orchestrator
@@ -865,6 +894,36 @@ def main():
 
     for d in filter(None, [args.qwen3_output, args.vae_output, siglip_out]):
         os.makedirs(d, exist_ok=True)
+
+    # Write incomplete manifests at startup so the orchestrator can detect
+    # in-progress runs and the config that generated them.
+    try:
+        from cache_manager import PrecomputeCache, get_git_sha, version_hash
+        _git_sha = get_git_sha()
+        _script_dir_path = Path(os.path.dirname(os.path.abspath(__file__)))
+        _git_sha = get_git_sha(_script_dir_path)
+        _cache_configs = {
+            "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [9, 18, 27]},
+            "vae":    {"flux_model": Path(args.flux_model).name,
+                       "image_size": args.image_size},
+            "siglip": {"siglip_model": "google/siglip-so400m-patch14-384",
+                       "image_size": 384},
+        }
+        _active_caches: dict[str, "PrecomputeCache"] = {}
+        for _enc, _out in [("qwen3", args.qwen3_output),
+                           ("vae",   args.vae_output),
+                           ("siglip", siglip_out)]:
+            if not _out:
+                continue
+            _enc_dir = Path(_out).parent
+            _cache = PrecomputeCache(_enc_dir, _enc, _cache_configs[_enc], _git_sha)
+            # Only write a manifest if this output dir IS the versioned cache dir
+            # (i.e. the path ends with the version hash the cache would produce).
+            if Path(_out).name == _cache.version():
+                _cache.write_manifest_incomplete()
+                _active_caches[_enc] = _cache
+    except Exception:
+        _active_caches = {}  # manifest writing is best-effort
 
     qwen3_gb  = len(shards) * 0.46
     latent_h  = args.image_size // 8
@@ -1105,6 +1164,17 @@ def main():
         else:
             print(f"  Coverage OK — all {len(work_items)} shard(s) complete.",
                   file=sys.stderr if args.ai else sys.stdout, flush=True)
+
+    # Mark versioned cache dirs complete (best-effort; only when the output path
+    # matched the version hash written at startup).
+    if _active_caches:
+        try:
+            _total_shards = len(work_items)
+            for _enc, _cache in _active_caches.items():
+                _rec_count = _cache.record_count()
+                _cache.mark_complete(record_count=_rec_count, shard_count=_total_shards)
+        except Exception:
+            pass
 
     if args.ai:
         import json as _json

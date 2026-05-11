@@ -65,7 +65,17 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ## V3 — Versioned Precompute Cache
 
-- **PRECOMP-1: Versioned, content-addressable precompute cache** — eliminate silent stale-data
+~~**PRECOMP-1: Versioned, content-addressable precompute cache**~~ ✅ DONE
+- Implemented hash-based versioned dirs (`PRECOMP_DIR/{encoder}/v_{hash}/`) and atomic `current` symlink.
+- `train/scripts/cache_manager.py` (new): `PrecomputeCache`, `encoder_config_subset()`, `get_git_sha()`, `version_hash()`, plus `list_versions()`, `clear()`, `migrate_legacy()` statics.
+- `train/scripts/cache_inspect.py` (new): standalone diagnostic CLI — list, clear-stale, clear-version, migrate-legacy.
+- `precompute_all.py`: writes incomplete/complete manifests in staging output dirs (best-effort); `--list-cache` and `--clear-stale` standalone ops.
+- `orchestrator.py` `_promote_chunk()`: moves files to `PRECOMP_DIR/{encoder}/v_{hash}/` and updates `current` symlink atomically; training/mining paths now use `PrecomputeCache.effective_dir()` with fallback to flat layout.
+- `train_ip_adapter.py`: resolves versioned cache dirs at startup via `PrecomputeCache.effective_dir()` when `--data-root` is given.
+- `pipeline_setup.py`: reports versioned cache state (version, record count, staleness) in existing-state display and `--ai` JSON.
+- Backwards compatible: existing flat `.npz` dirs detected as legacy; `--migrate-legacy` moves them to `v_legacy/` with a `current` symlink.
+
+- **PRECOMP-1 (original spec, archived):** eliminate silent stale-data
   reuse and avoid redundant recomputation when switching between experiments or scales.
 
   **Current state:** `precompute_all.py` writes flat `.npz` files into fixed directories

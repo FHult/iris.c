@@ -44,6 +44,9 @@ from pipeline_lib import (
     last_exit_code, free_gb, notify, now_iso, load_config,
     acquire_gpu_lock, release_gpu_lock, gpu_lock_holder,
 )
+from cache_manager import (
+    PrecomputeCache, encoder_config_subset, get_git_sha,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1157,16 +1160,32 @@ class Orchestrator:
         mark_done(chunk, "promoted")
         self._cleanup_prep_logs(chunk)
 
+        # Move precomputed files to versioned production dirs and update `current` symlink.
+        # Version hash derived from the same config fields used by precompute_all.py.
+        _git_sha  = get_git_sha(Path(__file__).parent)
         for subdir in ["qwen3", "vae", "siglip"]:
             src = precomp_src / subdir
             if not src.exists():
                 continue
-            dst = PRECOMP_DIR / subdir
+            _cfg_subset = encoder_config_subset(subdir, self.cfg)
+            from cache_manager import version_hash as _vh
+            _ver = _vh(_cfg_subset, _git_sha)
+            dst = PRECOMP_DIR / subdir / _ver
             dst.mkdir(parents=True, exist_ok=True)
+            moved = 0
             for f in src.iterdir():
                 # Precomputed files keep their staging-derived names (e.g. "000000_0012.npz").
                 # The trainer derives the internal record prefix from the production shard name.
                 f.rename(dst / f.name)
+                moved += 1
+            # Atomic symlink: PRECOMP_DIR/{encoder}/current → v_XXXXXX/
+            from cache_manager import _atomic_symlink
+            _atomic_symlink(PRECOMP_DIR / subdir / "current", _ver)
+            log_orch(
+                f"Chunk {chunk}: promoted {moved} {subdir} records → "
+                f"{PRECOMP_DIR / subdir / _ver} (current → {_ver})",
+                chunk=chunk,
+            )
 
     def _start_shard_validation(self, chunk: int) -> None:
         """PIPELINE-8: fast tarfile header scan before training."""
@@ -1347,16 +1366,20 @@ class Orchestrator:
         out = HARD_EX_DIR / f"chunk{chunk}"
         out.mkdir(parents=True, exist_ok=True)
         flux_model  = self.cfg.get("model", {}).get("flux_model", "flux-klein-4b")
-        qwen3_cache = PRECOMP_DIR / "qwen3"
-        vae_cache   = PRECOMP_DIR / "vae"
+        # Resolve versioned cache dirs; fall back to flat layout for backwards compat.
+        qwen3_cache = (PrecomputeCache.effective_dir(PRECOMP_DIR, "qwen3")
+                       or PRECOMP_DIR / "qwen3")
+        vae_cache   = (PrecomputeCache.effective_dir(PRECOMP_DIR, "vae")
+                       or PRECOMP_DIR / "vae")
         log_file    = LOG_DIR / f"mine_chunk{chunk}.log"
         use_ema_flag = "--use-ema " if training_cfg.get("mine_use_ema", False) else ""
 
         # Use precomputed SigLIP features when available — aligns mining loss with
         # training which conditions on real visual features.  Fall back to
         # null-siglip only when siglip precompute is disabled or cache is absent.
-        siglip_cache = PRECOMP_DIR / "siglip"
-        if training_cfg.get("siglip", False) and siglip_cache.exists():
+        siglip_eff   = PrecomputeCache.effective_dir(PRECOMP_DIR, "siglip")
+        siglip_cache = siglip_eff or PRECOMP_DIR / "siglip"
+        if training_cfg.get("siglip", False) and siglip_eff:
             siglip_arg = f"--siglip-cache '{siglip_cache}' "
         else:
             siglip_arg = "--null-siglip "

@@ -363,6 +363,20 @@ def _interactive_reset_wizard(data_root: Path, existing: dict) -> str:
     checkpoints = _find_checkpoints(data_root)
     if checkpoints:
         print(f"  Checkpoints: {len(checkpoints)} found, latest = {checkpoints[-1].name}")
+    cache_state = existing.get("precompute_cache", {})
+    if cache_state:
+        for enc, info in cache_state.items():
+            if info.get("layout") == "versioned":
+                cur  = info.get("current", "?")
+                recs = info.get("record_count", 0)
+                done = "complete" if info.get("complete") else "in-progress"
+                stale = info.get("versions", 1) - 1
+                stale_s = f"  ({stale} stale version(s))" if stale else ""
+                print(f"  Cache {enc}: {cur}  {recs:,} records  {done}{stale_s}")
+            elif info.get("layout") == "legacy_flat":
+                recs = info.get("record_count", 0)
+                print(f"  Cache {enc}: legacy flat layout  {recs:,} records"
+                      f"  (run cache_inspect.py --migrate-legacy to version)")
     print()
     print(bold("How do you want to proceed?"))
     print()
@@ -397,7 +411,40 @@ def _detect_existing_state(data_root: Path) -> dict:
             continue
         done = sorted(p.stem for p in chunk_dir.glob("*.done"))
         state["chunks"][cnum] = done
+
+    # Versioned cache state
+    state["precompute_cache"] = _scan_cache_versions(data_root / "precomputed")
     return state
+
+
+def _scan_cache_versions(precomp_root: Path) -> dict:
+    """Return a summary of versioned precompute cache state per encoder."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(precomp_root.parent.parent / "train" / "scripts"))
+        from cache_manager import PrecomputeCache, ENCODERS
+    except ImportError:
+        return {}
+
+    result = {}
+    for enc in ENCODERS:
+        versions = PrecomputeCache.list_versions(precomp_root, enc)
+        if not versions:
+            # Check for flat legacy layout
+            flat_count = sum(1 for f in (precomp_root / enc).glob("*.npz")) \
+                if (precomp_root / enc).is_dir() else 0
+            if flat_count:
+                result[enc] = {"layout": "legacy_flat", "record_count": flat_count}
+            continue
+        cur = next((v for v in versions if v["current"]), None)
+        result[enc] = {
+            "layout":        "versioned",
+            "versions":      len(versions),
+            "current":       cur["version"] if cur else None,
+            "record_count":  cur.get("record_count", 0) if cur else 0,
+            "complete":      cur.get("complete", False) if cur else False,
+        }
+    return result
 
 
 def _run_yaml_load(path: Path) -> Optional[dict]:
@@ -1025,6 +1072,7 @@ def run_ai(args) -> int:
             "chunks_done":    done_chunks,
             "chunk_detail":   {str(k): v for k, v in state.get("chunks", {}).items()},
             "suggested_reset": suggested_reset,
+            "precompute_cache": state.get("precompute_cache", {}),
         },
         "issues":   issues,
         "warnings": warnings,
