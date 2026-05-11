@@ -49,6 +49,10 @@ are in git history.
 
 ## Pipeline — Completed
 
+- **PRECOMP-1** — Versioned, content-addressable precompute cache: hash-based versioned dirs, atomic `current` symlink, `cache_manager.py`, `cache_inspect.py`, backwards-compatible legacy migration. Shards with unchanged source data reuse cached VAE latents across chunks.
+
+- **PRECOMP-2** (NOT VIABLE) — Adopt distilled/tiny VAE encoder (TAEF1) for precompute speed. Investigated 2026-05-10: TAEF1 creates train/inference distribution mismatch because training would use TAEF1 latents but inference uses the full VAE decoder. Correct path is PRECOMP-3 (VAE batch tuning) instead.
+
 - **PRECOMP-3** — VAE batch size optimised: profiled on M1 Max at 512px, B=4 is the throughput sweet spot (145.7 ms/img vs 174.6 ms/img at prior default B=16, 20% faster). Default changed in `precompute_all.py`; `precompute.vae_batch: 4` added to `v2_pipeline.yaml`; orchestrator wires it through. Mid-block attention tiling already handled by MLX Flash Attention.
 
 - **PIPELINE-4** — Native MLX ViT-L-14 CLIP backend in `clip_dedup.py`. `mlx_clip_embed.py` implements the full ViT-L-14 architecture in MLX (NHWC Conv2d, fused QKV, `mx.fast.scaled_dot_product_attention`). Loads weights from the timm safetensors already cached by open_clip — no extra download. `clip_dedup.py embed` gains `--clip-backend auto|mlx|open_clip|transformers` and `--benchmark`. Parity vs open_clip: cosine ≥ 0.9999. Benchmark on M1 Max: open_clip ~61 img/s, MLX ~30 img/s — `auto` mode prefers open_clip for throughput; MLX is fallback when PyTorch is absent.
