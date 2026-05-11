@@ -39,8 +39,12 @@ _MLP_W   = 4096
 _EMB_DIM = 768
 
 # CLIP normalisation (openai pretrained)
-_MEAN = np.array([0.48145466, 0.4578275,  0.40821073], dtype=np.float32)
-_STD  = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+_MEAN  = np.array([0.48145466, 0.4578275,  0.40821073], dtype=np.float32)
+_STD   = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+# Optimal sub-batch size: B=16 is the throughput sweet-spot on M1 Max at 224px.
+# MLX compiles a new graph per distinct batch size; calling embed_batch() with
+# the same sub-batch size on every call keeps compilation amortised.
+_BATCH = 16
 
 # Default weights: open_clip caches via timm HuggingFace hub
 _SNAP_ID = "18d0535469bb561bf468d76c1d73aa35156c922b"
@@ -255,9 +259,13 @@ class MLXCLIPEmbedder:
         if self._model is None:
             self.load()
         imgs  = _preprocess(pil_images)
-        feats = self._model(imgs)          # (B, 768) float16 MLX
-        mx.eval(feats)
-        arr   = np.array(feats, dtype=np.float32)
+        N     = imgs.shape[0]
+        parts = []
+        for i in range(0, N, _BATCH):
+            out = self._model(imgs[i:i + _BATCH])
+            mx.eval(out)                   # materialise each sub-batch; MLX is lazy
+            parts.append(np.array(out, dtype=np.float32))
+        arr   = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.where(norms < 1e-8, 1.0, norms)
         return (arr / norms).astype(np.float32)

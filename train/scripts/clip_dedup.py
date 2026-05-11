@@ -80,8 +80,9 @@ def _load_clip(backend: str = "auto") -> None:
     if _clip_model is not None or _mlx_embedder is not None:
         return
 
-    # open_clip (MPS) is ~2x faster than MLX on Apple Silicon for ViT-L-14;
-    # prefer it in auto mode; use mlx only when explicitly requested or as last resort.
+    # At sustained workloads (≥512 images, B=16), MLX and open_clip/MPS are at parity
+    # (~39 img/s on M1 Max).  Prefer open_clip in auto mode only because it's already
+    # installed; fall through to MLX when open_clip/torch are absent.
     if backend in ("open_clip", "auto"):
         device = _clip_device()
         try:
