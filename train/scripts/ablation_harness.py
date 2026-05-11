@@ -270,10 +270,11 @@ def _build_run_config(
             cfg["training"][key] = val
 
     cfg.setdefault("output", {})
-    cfg["output"]["checkpoint_dir"]   = checkpoint_dir
-    cfg["output"]["log_every"]        = log_every
-    cfg["output"]["checkpoint_every"] = max(steps, 500)
-    cfg["output"]["keep_last_n"]      = 1
+    cfg["output"]["checkpoint_dir"]      = checkpoint_dir
+    cfg["output"]["log_every"]           = log_every
+    cfg["output"]["checkpoint_every"]    = steps * 100  # prevent periodic saves
+    cfg["output"]["keep_last_n"]         = 1
+    cfg["output"]["skip_checkpoint_save"] = True  # skip final ~8 GB write; not needed for ranking
 
     cfg.setdefault("eval", {})
     cfg["eval"]["enabled"] = False

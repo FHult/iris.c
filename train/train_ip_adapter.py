@@ -1723,27 +1723,32 @@ def train(config: dict) -> None:
 
 
     # Final checkpoint + EMA export
-    _lineage = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6)}
-    save_checkpoint_async(adapter, ema_params, step,
-                          ocfg["checkpoint_dir"], keep_last_n=999,
-                          lineage=_lineage)
+    # skip_checkpoint_save=true suppresses all final writes (used by ablation harness
+    # to avoid writing ~8 GB per short run that would be deleted immediately).
+    if not ocfg.get("skip_checkpoint_save", False):
+        _lineage = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6)}
+        save_checkpoint_async(adapter, ema_params, step,
+                              ocfg["checkpoint_dir"], keep_last_n=999,
+                              lineage=_lineage)
 
-    # Save best EMA as final export using the streaming writer so the bulk
-    # mx.save_safetensors staging buffer (~2 GB) is avoided.
-    mx.eval(ema_params)
-    _best_path = os.path.join(ocfg["checkpoint_dir"], "best.safetensors")
-    _save_safetensors_streaming(_best_path, list(_flatten(ema_params)))
-    _purge_file_page_cache(_best_path)
+        # Save best EMA as final export using the streaming writer so the bulk
+        # mx.save_safetensors staging buffer (~2 GB) is avoided.
+        mx.eval(ema_params)
+        _best_path = os.path.join(ocfg["checkpoint_dir"], "best.safetensors")
+        _save_safetensors_streaming(_best_path, list(_flatten(ema_params)))
+        _purge_file_page_cache(_best_path)
 
-    # Write lineage sidecar so best.safetensors is self-documenting.
-    _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
-                  "chunk": _pipeline_chunk}
-    try:
-        with open(_best_path.replace(".safetensors", ".json"), "w") as _f:
-            json.dump(_best_meta, _f, indent=2)
-    except OSError:
-        pass
-    print(f"\nTraining complete. EMA weights: {ocfg['checkpoint_dir']}/best.safetensors")
+        # Write lineage sidecar so best.safetensors is self-documenting.
+        _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
+                      "chunk": _pipeline_chunk}
+        try:
+            with open(_best_path.replace(".safetensors", ".json"), "w") as _f:
+                json.dump(_best_meta, _f, indent=2)
+        except OSError:
+            pass
+        print(f"\nTraining complete. EMA weights: {ocfg['checkpoint_dir']}/best.safetensors")
+    else:
+        print(f"\nTraining complete. (skip_checkpoint_save=true — no weights written)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
