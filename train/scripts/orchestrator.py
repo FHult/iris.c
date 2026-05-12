@@ -2394,7 +2394,10 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     log_orch, dispatch_issue, tmux.
     """
     sys.path.insert(0, str(SCRIPTS_DIR))
-    from flywheel_lib import FlywheelDB, collect_metrics_from_log, render_flywheel_index
+    from flywheel_lib import (
+        FlywheelDB, collect_metrics_from_log, render_flywheel_index,
+        _checkpoint_hash,
+    )
     from shard_selector import (
         ShardScoreDB, scan_shard_pool, select_shards,
         stage_shards_for_iteration, render_shard_report,
@@ -2407,6 +2410,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     poll_interval  = int(fw_cfg.get("poll_interval", 60))
     ablation_every = int(fw_cfg.get("ablation_every_n", 0))
     shards_dir     = Path(fw_cfg.get("shards_dir", str(SHARDS_DIR)))
+    manifest_path  = Path(fw_cfg["shard_manifest"]) if fw_cfg.get("shard_manifest") else None
 
     fw_db    = FlywheelDB()
     score_db = ShardScoreDB()
@@ -2451,8 +2455,8 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         write_heartbeat("flywheel", status="selecting",
                         flywheel_name=name, iteration=iteration)
 
-        # Register any new shards
-        scan_shard_pool(score_db, shards_dir, verbose=False)
+        # Register any new shards (with SigLIP embeddings and manifest if configured)
+        scan_shard_pool(score_db, shards_dir, manifest_path=manifest_path, verbose=False)
 
         # Select shards
         shard_cfg = dict(fw_cfg.get("shard_selection", {}))
@@ -2479,12 +2483,16 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         shard_html = render_shard_report(score_db, shard_ids, iteration, name)
         (reports_dir / f"shard_selection_iter{iteration:04d}.html").write_text(shard_html)
 
+        # Checkpoint hash for this iteration (derived from the checkpoint we're resuming from)
+        ckpt_hash = _checkpoint_hash(resume_ckpt)
+
         # Insert DB record (status=running)
         row_id = fw_db.insert_iteration(
             name=name, iteration=iteration,
             n_shards=len(shard_ids), shard_ids=shard_ids,
             hyperparams=hyperparams, steps=steps_per_iter,
             git_commit=_git_sha(),
+            checkpoint_hash=ckpt_hash,
         )
 
         # Build temp training config pointing at staged shards
@@ -2566,6 +2574,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
         if ckpts:
             ckpt_path = str(ckpts[-1])
+        new_ckpt_hash = _checkpoint_hash(ckpt_path)
 
         # Update iteration record
         fw_db.update_iteration(
@@ -2576,10 +2585,24 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
             ref_gap=metrics.get("ref_gap"),
             cond_gap=metrics.get("cond_gap"),
             checkpoint=ckpt_path,
+            checkpoint_hash=new_ckpt_hash,
         )
 
-        # Update per-shard EMA scores
-        if metrics.get("ref_gap") is not None or metrics.get("cond_gap") is not None:
+        # Record checkpoint to checkpoint_log and mark as best if quality improved
+        if ckpt_path:
+            fw_db.upsert_checkpoint(
+                name=name, iteration=iteration,
+                checkpoint_path=ckpt_path,
+                checkpoint_hash=new_ckpt_hash,
+                ref_gap=metrics.get("ref_gap"),
+                cond_gap=metrics.get("cond_gap"),
+                train_loss=metrics.get("loss_smooth"),
+            )
+
+        # Update per-shard included EMA scores
+        has_metrics = (metrics.get("ref_gap") is not None
+                       or metrics.get("cond_gap") is not None)
+        if has_metrics:
             for sid in shard_ids:
                 score_db.update_scores(
                     shard_id=sid,
@@ -2588,10 +2611,33 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                     loss=metrics.get("loss_smooth"),
                     flywheel_name=name,
                     iteration=iteration,
+                    checkpoint_hash=new_ckpt_hash,
+                    checkpoint_iter=iteration,
+                    n_in_batch=len(shard_ids),
                 )
+            # Update excluded EMA for all other shards (contrastive attribution)
+            all_pool_ids = [s["shard_id"] for s in score_db.get_all_shards()]
+            score_db.update_excluded_scores(
+                all_shard_ids=all_pool_ids,
+                selected_ids=set(shard_ids),
+                ref_gap=metrics.get("ref_gap"),
+                cond_gap=metrics.get("cond_gap"),
+                flywheel_name=name,
+                iteration=iteration,
+                checkpoint_hash=new_ckpt_hash,
+                checkpoint_iter=iteration,
+                n_in_batch=len(shard_ids),
+            )
 
-        # Promote checkpoint for the next iteration
+        # Promote checkpoint for the next iteration; mark as best if quality improved
         if status == "done" and ckpt_path:
+            prior_best = fw_db.get_best(name)
+            prior_ref  = prior_best.get("ref_gap") if prior_best else None
+            new_ref    = metrics.get("ref_gap")
+            if new_ref is not None and (prior_ref is None or new_ref > prior_ref):
+                fw_db.mark_best_checkpoint(name, iteration)
+                log_orch(f"[flywheel:{name}] new best checkpoint  "
+                         f"ref_gap={new_ref:.4f}  hash={new_ckpt_hash}")
             resume_ckpt = ckpt_path
 
         # Clean up staging symlinks
@@ -2617,6 +2663,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                     ref_gap=metrics.get("ref_gap"),
                     cond_gap=metrics.get("cond_gap"),
                     checkpoint=ckpt_path,
+                    checkpoint_hash=new_ckpt_hash,
                     ablation_run=ablation_run,
                 )
 

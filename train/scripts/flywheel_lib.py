@@ -61,15 +61,40 @@ CREATE TABLE IF NOT EXISTS iterations (
     exit_code     INTEGER,
     elapsed_secs  INTEGER,
     checkpoint    TEXT,
+    checkpoint_hash TEXT,   -- first 12 chars of checkpoint stem (version tag)
     git_commit    TEXT,
     ts_start      TEXT NOT NULL,
     ts_end        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fw_iter ON iterations(flywheel_name, iteration);
 
+CREATE TABLE IF NOT EXISTS checkpoint_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    flywheel_name   TEXT    NOT NULL,
+    iteration       INTEGER NOT NULL,
+    checkpoint_path TEXT,
+    checkpoint_hash TEXT,
+    ref_gap         REAL,
+    cond_gap        REAL,
+    train_loss      REAL,
+    is_best         INTEGER NOT NULL DEFAULT 0,
+    ts              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ckpt_fw ON checkpoint_log(flywheel_name, iteration);
+
 CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
-INSERT OR IGNORE INTO _meta VALUES ('schema_version', '1');
+INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
 """
+
+# v1→v2: add checkpoint_hash to iterations
+_V2_MIGRATION = "ALTER TABLE iterations ADD COLUMN checkpoint_hash TEXT"
+
+
+def _checkpoint_hash(ckpt_path: Optional[str]) -> str:
+    """Stable 12-char version tag derived from the checkpoint filename."""
+    if not ckpt_path:
+        return ""
+    return Path(ckpt_path).stem[:12]
 
 
 class FlywheelDB:
@@ -81,6 +106,11 @@ class FlywheelDB:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.executescript(_SCHEMA)
+        # v1 → v2 migration
+        try:
+            self._conn.execute(_V2_MIGRATION)
+        except Exception:
+            pass
         self._conn.commit()
 
     def insert_iteration(
@@ -92,16 +122,18 @@ class FlywheelDB:
         hyperparams: dict,
         steps: int,
         git_commit: str = "",
+        checkpoint_hash: str = "",
     ) -> int:
         ts = now_iso()
         with self._lock:
             cur = self._conn.execute("""
                 INSERT INTO iterations
                   (flywheel_name, iteration, n_shards, selected_shards,
-                   hyperparams, steps, git_commit, ts_start)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   hyperparams, steps, git_commit, checkpoint_hash, ts_start)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (name, iteration, n_shards, json.dumps(shard_ids),
-                  json.dumps(hyperparams, default=str), steps, git_commit, ts))
+                  json.dumps(hyperparams, default=str), steps, git_commit,
+                  checkpoint_hash or None, ts))
             self._conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
 
@@ -115,6 +147,7 @@ class FlywheelDB:
         ref_gap: Optional[float],
         cond_gap: Optional[float],
         checkpoint: Optional[str] = None,
+        checkpoint_hash: str = "",
         ablation_run: Optional[str] = None,
     ) -> None:
         ts = now_iso()
@@ -123,12 +156,57 @@ class FlywheelDB:
                 UPDATE iterations SET
                   status=?, exit_code=?, elapsed_secs=?,
                   train_loss=?, ref_gap=?, cond_gap=?,
-                  checkpoint=?, ablation_run=?, ts_end=?
+                  checkpoint=?, checkpoint_hash=?, ablation_run=?, ts_end=?
                 WHERE id=?
             """, (status, exit_code, elapsed_secs,
                   train_loss, ref_gap, cond_gap,
-                  checkpoint, ablation_run, ts, row_id))
+                  checkpoint, checkpoint_hash or None, ablation_run, ts, row_id))
             self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Checkpoint log
+
+    def upsert_checkpoint(
+        self,
+        name: str,
+        iteration: int,
+        checkpoint_path: str,
+        checkpoint_hash: str,
+        ref_gap: Optional[float],
+        cond_gap: Optional[float],
+        train_loss: Optional[float],
+    ) -> None:
+        """Record a checkpoint produced by this iteration."""
+        ts = now_iso()
+        with self._lock:
+            self._conn.execute("""
+                INSERT INTO checkpoint_log
+                    (flywheel_name, iteration, checkpoint_path, checkpoint_hash,
+                     ref_gap, cond_gap, train_loss, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (name, iteration, checkpoint_path or None, checkpoint_hash or None,
+                  ref_gap, cond_gap, train_loss, ts))
+            self._conn.commit()
+
+    def mark_best_checkpoint(self, name: str, iteration: int) -> None:
+        """Mark the checkpoint at <iteration> as the current best; clear prior bests."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE checkpoint_log SET is_best=0 WHERE flywheel_name=?", (name,)
+            )
+            self._conn.execute(
+                "UPDATE checkpoint_log SET is_best=1 "
+                "WHERE flywheel_name=? AND iteration=?", (name, iteration)
+            )
+            self._conn.commit()
+
+    def get_checkpoint_history(self, name: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM checkpoint_log WHERE flywheel_name=? ORDER BY iteration",
+                (name,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_iterations(self, name: str) -> list[dict]:
         with self._lock:

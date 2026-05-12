@@ -32,11 +32,26 @@ flywheel:
 
   # Shard selection policy
   shard_selection:
-    performance_weight: 0.60     # fraction of slots for top-scoring shards
-    min_diversity_pct:  0.20     # fraction reserved for source diversity
+    performance_weight: 0.60     # fraction of slots for top-scoring shards (uses effective_score)
+    min_diversity_pct:  0.20     # fraction for diversity (SigLIP max-min-dist, or source-tag fallback)
     exploration_rate:   0.15     # fraction for unseen / least-seen shards
     recency_penalty:    0.30     # discount factor for recently-selected shards
     recency_window_iters: 3      # iterations over which recency penalty applies
+
+  # Attribution configuration
+  # min_attribution_obs: minimum observations in BOTH included and excluded sets before
+  # the attributed (causal) score is used for ranking.  Lower = faster trust, noisier.
+  min_attribution_obs: 3
+
+  # SigLIP mean embedding
+  # siglip_sample_n: images sampled per shard when computing mean embedding.
+  # Larger = more accurate diversity but slower scan.
+  siglip_sample_n: 50
+
+  # Shard manifest JSON path: {shard_id: {source: str, ...}}
+  # If set, overrides the heuristic _infer_source() for source tagging.
+  # Leave null to use the built-in heuristic.
+  shard_manifest: null
 
   # Ablation integration — set ablation_every_n: 0 to disable
   ablation_every_n: 5            # run ablation burst every N successful iterations
