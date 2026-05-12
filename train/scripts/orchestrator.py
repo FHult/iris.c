@@ -2576,6 +2576,11 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
             ckpt_path = str(ckpts[-1])
         new_ckpt_hash = _checkpoint_hash(ckpt_path)
 
+        # Snapshot best-so-far BEFORE writing the current iteration's ref_gap.
+        # get_best() queries all iterations; snapshotting here avoids comparing
+        # new_ref against itself after update_iteration() writes it to the DB.
+        prior_best = fw_db.get_best(name)
+
         # Update iteration record
         fw_db.update_iteration(
             row_id=row_id, status=status,
@@ -2588,8 +2593,8 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
             checkpoint_hash=new_ckpt_hash,
         )
 
-        # Record checkpoint to checkpoint_log and mark as best if quality improved
-        if ckpt_path:
+        # Record checkpoint to checkpoint_log (successful iterations only)
+        if status == "done" and ckpt_path:
             fw_db.upsert_checkpoint(
                 name=name, iteration=iteration,
                 checkpoint_path=ckpt_path,
@@ -2631,9 +2636,8 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
 
         # Promote checkpoint for the next iteration; mark as best if quality improved
         if status == "done" and ckpt_path:
-            prior_best = fw_db.get_best(name)
-            prior_ref  = prior_best.get("ref_gap") if prior_best else None
-            new_ref    = metrics.get("ref_gap")
+            prior_ref = prior_best.get("ref_gap") if prior_best else None
+            new_ref   = metrics.get("ref_gap")
             if new_ref is not None and (prior_ref is None or new_ref > prior_ref):
                 fw_db.mark_best_checkpoint(name, iteration)
                 log_orch(f"[flywheel:{name}] new best checkpoint  "

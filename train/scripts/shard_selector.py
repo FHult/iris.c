@@ -233,7 +233,8 @@ class ShardScoreDB:
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(shard_id) DO UPDATE SET
                     path=excluded.path,
-                    source=excluded.source,
+                    source=CASE WHEN excluded.source='unknown' THEN shards.source
+                                ELSE excluded.source END,
                     manifest_source=COALESCE(excluded.manifest_source, shards.manifest_source),
                     n_images=CASE WHEN excluded.n_images > 0
                                   THEN excluded.n_images ELSE shards.n_images END,
