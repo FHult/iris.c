@@ -286,6 +286,9 @@ def cmd_populate_anchor_shards(args) -> None:
 
 def cmd_start_ablation(args) -> None:
     """Launch ablation_harness.py in a dedicated iris-ablation tmux window."""
+    from pipeline_lib import (
+        SHARDS_DIR, PRECOMP_DIR,
+    )
     config = Path(args.ablation_config)
     if not config.exists():
         print(f"ERROR: config not found: {config}")
@@ -307,16 +310,26 @@ def cmd_start_ablation(args) -> None:
     # Clear any stale stop signal
     ABLATION_CONTROL_FILE.unlink(missing_ok=True)
 
+    shards      = args.shards      or str(SHARDS_DIR)
+    qwen3_cache = args.qwen3_cache or str(PRECOMP_DIR / "qwen3")
+    vae_cache   = args.vae_cache   or str(PRECOMP_DIR / "vae")
+    siglip_cache= args.siglip_cache or str(PRECOMP_DIR / "siglip")
+
     cmd = (
         f"source '{TRAIN_DIR}/.venv/bin/activate' && "
         f"caffeinate -dims python -u '{SCRIPTS_DIR}/ablation_harness.py' "
-        f"--config '{config}' --output-dir '{output_dir}' --db '{db_path}'"
+        f"--config '{config}' --output-dir '{output_dir}' --db '{db_path}' "
+        f"--shards '{shards}' "
+        f"--qwen3-cache '{qwen3_cache}' "
+        f"--vae-cache '{vae_cache}' "
+        f"--siglip-cache '{siglip_cache}'"
     )
     tmux_new_window(TMUX_ABLATION_WIN, cmd, log_file)
     print(f"Ablation started → {TMUX_ABLATION_WIN} window")
     print(f"  config:  {config}")
     print(f"  output:  {output_dir}")
     print(f"  db:      {db_path}")
+    print(f"  shards:  {shards}")
     print(f"  log:     {log_file}")
 
 
@@ -487,8 +500,16 @@ def main() -> None:
                        help="Launch long-term ablation harness in iris-ablation tmux window")
     p.add_argument("ablation_config", metavar="CONFIG",
                    help="Harness config YAML (ablation: name/strategy/variables/...)")
-    p.add_argument("--output-dir", default=None, metavar="PATH",
+    p.add_argument("--output-dir",    default=None, metavar="PATH",
                    help=f"Output dir (default: {DATA_ROOT}/ablation_long)")
+    p.add_argument("--shards",        default=None, metavar="PATH",
+                   help="Shard directory (default: DATA_ROOT/shards)")
+    p.add_argument("--qwen3-cache",   default=None, metavar="PATH",
+                   help="Qwen3 cache dir (default: DATA_ROOT/precomputed/qwen3)")
+    p.add_argument("--vae-cache",     default=None, metavar="PATH",
+                   help="VAE cache dir (default: DATA_ROOT/precomputed/vae)")
+    p.add_argument("--siglip-cache",  default=None, metavar="PATH",
+                   help="SigLIP cache dir (default: DATA_ROOT/precomputed/siglip)")
 
     sub.add_parser("stop-ablation",    help="Send stop signal to running ablation harness")
     sub.add_parser("pause-ablation",   help="Pause harness after current run")

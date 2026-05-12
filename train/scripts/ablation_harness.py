@@ -77,6 +77,9 @@ from typing import Optional
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pipeline_lib import ABLATION_CONTROL_FILE as _ABLATION_CONTROL  # noqa: E402
+
 # ── Optional ML deps (Bayesian search only) ──────────────────────────────────
 try:
     import numpy as np
@@ -99,8 +102,6 @@ _DEFAULT_QWEN3   = _DATA_ROOT / "precomputed" / "qwen3"
 _DEFAULT_VAE     = _DATA_ROOT / "precomputed" / "vae"
 _DEFAULT_SIGLIP  = _DATA_ROOT / "precomputed" / "siglip"
 
-# Control and state files for long-term mode
-_ABLATION_CONTROL = _DATA_ROOT / "ablation_control.json"
 _ABLATION_HB_PATH = _DATA_ROOT / ".heartbeat" / "ablation.json"
 
 # ── Batch-mode matrix presets ─────────────────────────────────────────────────
@@ -351,7 +352,6 @@ class GridSearch(SearchStrategy):
     """Exhaustive grid: tries every candidate in fixed order."""
     def __init__(self, candidates: list[dict]) -> None:
         self._candidates = candidates
-        self._tried: set[str] = set()
 
     def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
         tried_keys = {_params_key(t["params"]) for t in tried_results}
@@ -409,8 +409,7 @@ class BayesianSearch(SearchStrategy):
             self._feature_keys = []
 
     def _encode(self, params: dict) -> "np.ndarray":
-        vec = [float(params[k]) if not isinstance(params[k], bool) else float(params[k])
-               for k in self._feature_keys]
+        vec = [float(params[k]) for k in self._feature_keys]
         return np.array(vec, dtype=np.float64)
 
     def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
@@ -944,9 +943,9 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     hb = HeartbeatWriter(run_name)
     hb.start()
 
-    # Load what's already in the DB
+    # Load what's already in the DB (tried = all experiments, scored or not)
     all_experiments = db.get_experiments(run_name)
-    scored = [e for e in all_experiments if e.get("score") is not None]
+    tried = list(all_experiments)
     n_done = len(all_experiments)
 
     print()
@@ -967,14 +966,14 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             print("\n  Stop signal received — exiting")
             break
 
-        params = searcher.next_candidate(scored)
+        params = searcher.next_candidate(tried)
         if params is None:
             print("\n  Candidate pool exhausted — all combinations tried")
             break
 
         # Double-check DB (another process could have run this)
         if db.is_duplicate(run_name, params):
-            scored.append({"params": params, "score": None})  # mark tried
+            tried.append({"params": params, "score": None})
             continue
 
         n_done += 1
@@ -1019,10 +1018,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             snapshots=result.get("snapshots", []),
         )
 
-        if result["score"] is not None:
-            scored.append({"params": params, "score": result["score"]})
-        else:
-            scored.append({"params": params, "score": None})
+        tried.append({"params": params, "score": result["score"]})
 
         _print_result_line(result)
 
