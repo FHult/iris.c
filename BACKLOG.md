@@ -136,6 +136,14 @@ data_root/
 
 ## Flywheel Performance
 
+**FLYWHEEL-BUG-1: Restart uses best-by-ref_gap checkpoint instead of latest**
+
+On unclean flywheel restart, `orchestrator.py:2435` calls `fw_db.get_best(name)["checkpoint"]` to determine the resume checkpoint. `get_best` returns the iteration with the highest `ref_gap`, which in trial 1 was iter 7 (`step_0095000`) — the same as the pre-flywheel base. Iters 8–10 had trained cumulatively to `step_0098000`, but the restart reverted to `step_0095000`, causing iter 11 to fork from the stale base (cond_gap dropped from +0.385 to +0.146).
+
+Fix: on restart, prefer `max(CKPT_DIR.glob("step_*.safetensors"), key=step_number)` over `get_best()`. Only fall back to the DB best if CKPT_DIR has no checkpoints. The "best quality" vs "most recent" distinction only matters for external use; the flywheel should always continue from the most recent iteration's output to preserve the cumulative training chain.
+
+Affected code: `orchestrator.py` lines 2432–2439, function `run_flywheel_loop`.
+
 **FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
 
 The ablation burst was disabled for trial 1 (`ablation_every_n: 0`) after it launched a 12,000-step run (~12.8h) that would have blocked the flywheel for ~51h (4 runs × 12.8h). Three things need fixing before re-enabling:
