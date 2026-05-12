@@ -2269,8 +2269,13 @@ def _build_flywheel_train_config(
     # Override shard path with the staged symlink dir (absolute — not prefixed by --data-root)
     cfg.setdefault("data", {})["shard_path"] = str(staging_dir)
 
-    # Apply hyperparams into training section
+    # Scale warmup_steps to at most 10% of the iteration steps so we never hit
+    # decay_steps=0 when steps_per_iteration is small (e.g. 1000 with warmup=1000).
     cfg.setdefault("training", {})
+    base_warmup = cfg["training"].get("warmup_steps", 1000)
+    cfg["training"]["warmup_steps"] = max(1, min(base_warmup, steps // 10))
+
+    # Apply hyperparams into training section
     for k, v in hyperparams.items():
         cfg["training"][k] = v
 

@@ -88,7 +88,7 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
     collapsing to the hardcoded 1e-6 floor.
     """
     eta_min = max(1e-8, lr_max * 0.01)
-    decay_steps = total_steps - warmup_steps
+    decay_steps = max(1, total_steps - warmup_steps)
 
     if start_step == 0:
         return optim.join_schedules(

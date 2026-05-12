@@ -134,6 +134,16 @@ data_root/
 
 ---
 
+## Flywheel Performance
+
+**FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**
+- The frozen Flux forward pass dominates step time (~2.4s/step = 63%). The adapter backward is only ~1.4s/step.
+- Since `qs` (Flux Q vectors) are `stop_gradient`'d and computed without any IP contribution, they can safely be reused across N adapter backward steps for the same (noise, timestep, target) sample. This is equivalent to N gradient descent steps on the same mini-batch — valid for style injection learning.
+- Implementation: add `n_grad_steps_per_fwd: N` option to the training config and loop `compiled_step` N times before releasing `flux_state`. At N=3: effective step time drops from ~3.8s to ~2.2s (~1.7x throughput). Step counter, EMA, and heartbeat must all increment by 1 per inner loop iteration.
+- Measured baseline: 3.8s/step at 512×512 (fwd=2.4s + eval=1.4s). At N=3: (2.4 + 3×1.4) / 3 = 1.8s/step.
+
+---
+
 ## Metal / GPU Performance
 
 - **BL-004: simdgroup_matrix for Custom GEMM Tiles** — M3+ only

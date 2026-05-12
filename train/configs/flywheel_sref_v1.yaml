@@ -11,8 +11,8 @@
 
 flywheel:
   name: "sref-v1"
-  max_iterations: 15             # trial 1: enough to see attribution activate (~iter 12)
-  steps_per_iteration: 8000      # training steps per iteration (~9 min at 512px)
+  max_iterations: 21             # trial 1: 15 + 6 wasted on warmup bug
+  steps_per_iteration: 1000      # training steps per iteration (~63 min at 512px, 3.8s/step)
   n_shards: 20                   # shards selected per iteration
   poll_interval: 60              # seconds between training-window polls
   min_free_gb: 40                # abort if disk drops below this
