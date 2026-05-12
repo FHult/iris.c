@@ -47,9 +47,15 @@ TMUX_ORCH_WIN  = "iris-orch"
 TMUX_WATCH_WIN = "iris-watchdog"
 TMUX_STAGE_WIN    = "iris-stage"     # data_stager.py — cold/hot staging, runs alongside training
 TMUX_ABLATION_WIN = "iris-ablation"  # ablation_harness.py — long-term autonomous ablation
+TMUX_FLYWHEEL_WIN = "iris-flywheel"  # flywheel.py — self-improving sref optimization loop
 
 ABLATION_CONTROL_FILE = DATA_ROOT / "ablation_control.json"
 ABLATION_DB_PATH      = DATA_ROOT / "ablation_history.db"
+
+FLYWHEEL_CONTROL_FILE = DATA_ROOT / "flywheel_control.json"
+FLYWHEEL_DB_PATH      = DATA_ROOT / "flywheel_history.db"
+SHARD_SCORES_DB_PATH  = DATA_ROOT / "shard_scores.db"
+FLYWHEEL_REPORTS_DIR  = DATA_ROOT / "reports"
 
 # Trainer heartbeat is written every min(log_every, 100) steps.
 # At 0.19 steps/s: 100 steps ≈ 526s.  900s = ~1.7× that interval.

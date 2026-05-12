@@ -35,6 +35,7 @@ from pipeline_lib import (
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS, SHARD_BLOCK,
     STATE_FILE,
+    ABLATION_DB_PATH, FLYWHEEL_CONTROL_FILE, FLYWHEEL_REPORTS_DIR,
     read_state, write_state, update_state,
     is_done, mark_done, mark_error, has_error, read_error, clear_error,
     log_event, log_orch,
@@ -2207,6 +2208,413 @@ class Orchestrator:
 
 
 # ---------------------------------------------------------------------------
+# Flywheel loop
+# ---------------------------------------------------------------------------
+
+def _git_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(TRAIN_DIR.parent), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _check_flywheel_control(name: str) -> None:
+    """Handle pause/stop signals from FLYWHEEL_CONTROL_FILE."""
+    if not FLYWHEEL_CONTROL_FILE.exists():
+        return
+    try:
+        ctrl = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
+        action = ctrl.get("action")
+        if action == "stop":
+            log_orch(f"[flywheel:{name}] stop signal — exiting")
+            FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+            sys.exit(0)
+        elif action == "pause":
+            log_orch(f"[flywheel:{name}] paused — waiting for resume")
+            while True:
+                time.sleep(30)
+                if not FLYWHEEL_CONTROL_FILE.exists():
+                    log_orch(f"[flywheel:{name}] resumed (control file removed)")
+                    break
+                ctrl2 = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
+                if ctrl2.get("action") in ("run", "resume"):
+                    FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+                    log_orch(f"[flywheel:{name}] resumed")
+                    break
+        else:
+            FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        log_orch(f"[flywheel:{name}] control file error: {e}", level="warning")
+
+
+def _build_flywheel_train_config(
+    fw_cfg: dict,
+    staging_dir: Path,
+    steps: int,
+    hyperparams: dict,
+    resume_ckpt: Optional[str],
+    iteration: int,
+    name: str,
+) -> Path:
+    """Write a temp training config YAML for this flywheel iteration."""
+    import yaml
+    base_config = fw_cfg.get("training_config",
+                             str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
+    with open(base_config) as f:
+        cfg = yaml.safe_load(f)
+
+    # Override shard path with the staged symlink dir (absolute — not prefixed by --data-root)
+    cfg.setdefault("data", {})["shard_path"] = str(staging_dir)
+
+    # Apply hyperparams into training section
+    cfg.setdefault("training", {})
+    for k, v in hyperparams.items():
+        cfg["training"][k] = v
+
+    # Always save checkpoints in flywheel mode
+    cfg["training"]["skip_checkpoint_save"] = False
+
+    tmp_path = Path(f"/tmp/flywheel_{name}_iter{iteration:04d}_train.yaml")
+    tmp_path.write_text(yaml.dump(cfg, default_flow_style=False))
+    return tmp_path
+
+
+def _run_flywheel_ablation(
+    fw_cfg: dict,
+    name: str,
+    iteration: int,
+    resume_ckpt: Optional[str],
+) -> Optional[str]:
+    """
+    Run a capped ablation burst to tune hyperparams.
+    Blocks until the ablation subprocess exits.
+    Returns the ablation run_name on success, None on failure.
+    """
+    import yaml
+    abl_cfg_path = fw_cfg.get("ablation_config")
+    if not abl_cfg_path:
+        log_orch(f"[flywheel:{name}] no ablation_config in flywheel config — skipping")
+        return None
+    abl_cfg_path = Path(abl_cfg_path)
+    if not abl_cfg_path.exists():
+        log_orch(f"[flywheel:{name}] ablation_config not found: {abl_cfg_path}", level="warning")
+        return None
+
+    with open(abl_cfg_path) as f:
+        abl_cfg = yaml.safe_load(f)
+
+    max_runs = int(fw_cfg.get("ablation_max_runs", 10))
+    abl_cfg["max_total_runs"] = max_runs
+    run_name = abl_cfg.get("name", abl_cfg_path.stem)
+
+    tmp_cfg = Path(f"/tmp/flywheel_{name}_ablation_{iteration:04d}.yaml")
+    tmp_cfg.write_text(yaml.dump(abl_cfg, default_flow_style=False))
+
+    output_dir = DATA_ROOT / "ablation_long" / f"{name}_iter{iteration:04d}"
+    log_file   = LOG_DIR / f"flywheel_{name}_ablation_iter{iteration:04d}.log"
+    shards_dir = fw_cfg.get("shards_dir", str(SHARDS_DIR))
+
+    log_orch(f"[flywheel:{name}] iter {iteration}: ablation burst ({max_runs} runs) → {log_file}")
+
+    cmd = (
+        f"source '{TRAIN_DIR}/.venv/bin/activate' && "
+        f"python -u '{SCRIPTS_DIR}/ablation_harness.py' "
+        f"--config '{tmp_cfg}' "
+        f"--output-dir '{output_dir}' "
+        f"--db '{ABLATION_DB_PATH}' "
+        f"--shards '{shards_dir}' "
+        f"--qwen3-cache '{PRECOMP_DIR / 'qwen3'}' "
+        f"--vae-cache '{PRECOMP_DIR / 'vae'}' "
+        f"--siglip-cache '{PRECOMP_DIR / 'siglip'}'"
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
+    subprocess.run(["bash", "-c", full_cmd])
+
+    exit_code = last_exit_code(log_file)
+    if exit_code == 0:
+        log_orch(f"[flywheel:{name}] ablation complete — run_name={run_name}")
+        return run_name
+    log_orch(f"[flywheel:{name}] ablation failed (exit {exit_code})", level="warning")
+    return None
+
+
+def _read_ablation_best(run_name: str) -> Optional[dict]:
+    """Return the best hyperparams for a given ablation run_name, or None."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from ablation_harness import AblationDB
+    db = AblationDB(ABLATION_DB_PATH)
+    best_list = db.get_best(run_name, 1)
+    db.close()
+    if not best_list:
+        return None
+    return best_list[0].get("params") or None
+
+
+def _flywheel_report_only(fw_cfg: dict) -> None:
+    """Regenerate the HTML report from existing DB data and exit."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from flywheel_lib import FlywheelDB, render_flywheel_index
+    from shard_selector import ShardScoreDB
+
+    name = fw_cfg["name"]
+    fw_db    = FlywheelDB()
+    score_db = ShardScoreDB()
+
+    iterations_data = fw_db.get_iterations(name)
+    shard_stats     = score_db.get_stats()
+    top_shards      = score_db.get_top_shards(20)
+    hyperparams     = dict(fw_cfg.get("hyperparams", {}))
+
+    reports_dir = FLYWHEEL_REPORTS_DIR / name
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    html = render_flywheel_index(name, iterations_data, shard_stats, top_shards, hyperparams)
+    report_path = reports_dir / "index.html"
+    report_path.write_text(html)
+    print(f"Report written → {report_path}")
+    fw_db.close()
+    score_db.close()
+
+
+def _run_flywheel_loop(fw_cfg: dict) -> None:
+    """
+    Self-improving sref optimization flywheel.
+
+    Each iteration: select shards → stage as symlinks → train N steps →
+    collect metrics → update shard scores → (every N iters) run ablation →
+    regenerate HTML report → repeat.
+
+    Reuses pipeline infrastructure: GPU lock, heartbeat, disk checks,
+    log_orch, dispatch_issue, tmux.
+    """
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from flywheel_lib import FlywheelDB, collect_metrics_from_log, render_flywheel_index
+    from shard_selector import (
+        ShardScoreDB, scan_shard_pool, select_shards,
+        stage_shards_for_iteration, render_shard_report,
+    )
+
+    name           = fw_cfg["name"]
+    max_iters      = int(fw_cfg.get("max_iterations", 20))
+    steps_per_iter = int(fw_cfg.get("steps_per_iteration", 5000))
+    n_shards       = int(fw_cfg.get("n_shards", 20))
+    poll_interval  = int(fw_cfg.get("poll_interval", 60))
+    ablation_every = int(fw_cfg.get("ablation_every_n", 0))
+    shards_dir     = Path(fw_cfg.get("shards_dir", str(SHARDS_DIR)))
+
+    fw_db    = FlywheelDB()
+    score_db = ShardScoreDB()
+
+    reports_dir = FLYWHEEL_REPORTS_DIR / name
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resume: start after the last recorded iteration
+    prior     = fw_db.get_iterations(name)
+    iteration = (max(r["iteration"] for r in prior) + 1) if prior else 1
+    hyperparams = dict(fw_cfg.get("hyperparams", {}))
+
+    # Determine starting checkpoint
+    resume_ckpt: Optional[str] = None
+    done_iters = [r for r in prior if r["status"] == "done"]
+    if done_iters:
+        best = fw_db.get_best(name)
+        if best and best.get("checkpoint"):
+            resume_ckpt = best["checkpoint"]
+    if resume_ckpt is None:
+        resume_ckpt = fw_cfg.get("base_checkpoint")
+
+    log_orch(f"[flywheel:{name}] starting — iter={iteration}/{max_iters}  "
+             f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
+             f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
+
+    while iteration <= max_iters:
+        _check_flywheel_control(name)
+
+        # Disk guard
+        gb     = free_gb()
+        min_gb = float(fw_cfg.get("min_free_gb", DISK_ABORT_GB))
+        if gb < min_gb:
+            log_orch(f"[flywheel:{name}] disk low ({gb:.1f} GB < {min_gb} GB) — waiting 300s",
+                     level="warning")
+            write_heartbeat("flywheel", status="disk_wait",
+                            flywheel_name=name, iteration=iteration)
+            time.sleep(300)
+            continue
+
+        log_orch(f"[flywheel:{name}] === iteration {iteration}/{max_iters} ===")
+        write_heartbeat("flywheel", status="selecting",
+                        flywheel_name=name, iteration=iteration)
+
+        # Register any new shards
+        scan_shard_pool(score_db, shards_dir, verbose=False)
+
+        # Select shards
+        shard_cfg = dict(fw_cfg.get("shard_selection", {}))
+        selected_paths = select_shards(score_db, n_shards, shard_cfg, name, iteration)
+
+        if len(selected_paths) < 2:
+            msg = f"only {len(selected_paths)} shards available in {shards_dir}"
+            log_orch(f"[flywheel:{name}] {msg} — waiting 300s", level="warning")
+            dispatch_issue(f"fw_{name}_no_shards", "warning",
+                           f"Flywheel {name}: {msg}",
+                           suggested_action="populate_shards_dir")
+            time.sleep(300)
+            continue
+
+        shard_ids = [Path(p).stem for p in selected_paths]
+
+        # Stage selected shards as symlinks
+        staging_dir = DATA_ROOT / "flywheel_staging" / name / f"iter{iteration:04d}"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        stage_shards_for_iteration(selected_paths, staging_dir)
+
+        # Per-iteration shard report
+        shard_html = render_shard_report(score_db, shard_ids, iteration, name)
+        (reports_dir / f"shard_selection_iter{iteration:04d}.html").write_text(shard_html)
+
+        # Insert DB record (status=running)
+        row_id = fw_db.insert_iteration(
+            name=name, iteration=iteration,
+            n_shards=len(shard_ids), shard_ids=shard_ids,
+            hyperparams=hyperparams, steps=steps_per_iter,
+            git_commit=_git_sha(),
+        )
+
+        # Build temp training config pointing at staged shards
+        train_cfg_path = _build_flywheel_train_config(
+            fw_cfg, staging_dir, steps_per_iter, hyperparams,
+            resume_ckpt, iteration, name,
+        )
+
+        # Launch training in TMUX_TRAIN_WIN
+        log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        acquire_gpu_lock(f"flywheel_{name}_iter{iteration}")
+        write_heartbeat("trainer", status="booting", step=0)
+
+        train_cmd = (
+            f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
+            f"--config '{train_cfg_path}' "
+            f"--max-steps {steps_per_iter} "
+            f"--data-root '{DATA_ROOT}'"
+        )
+        if resume_ckpt and Path(resume_ckpt).exists():
+            train_cmd += f" --resume '{resume_ckpt}'"
+
+        activated = (
+            f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+            f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
+        )
+        tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
+        write_heartbeat("flywheel", status="training",
+                        flywheel_name=name, iteration=iteration)
+        log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
+        t_start = time.time()
+
+        # Monitor training window
+        while True:
+            time.sleep(poll_interval)
+            _check_flywheel_control(name)
+            write_heartbeat("flywheel", status="training",
+                            flywheel_name=name, iteration=iteration)
+            if not tmux_window_exists(TMUX_TRAIN_WIN):
+                break
+
+        elapsed   = int(time.time() - t_start)
+        exit_code = last_exit_code(log_file)
+        status    = "done" if exit_code == 0 else "failed"
+        release_gpu_lock()
+
+        # Collect training metrics
+        metrics = collect_metrics_from_log(log_file)
+        log_orch(
+            f"[flywheel:{name}] iter {iteration}: {status}  "
+            f"ref_gap={metrics.get('ref_gap')}  loss={metrics.get('loss_smooth')}  "
+            f"elapsed={elapsed}s"
+        )
+
+        # Locate the checkpoint produced by this iteration
+        ckpt_path: Optional[str] = None
+        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        if ckpts:
+            ckpt_path = str(ckpts[-1])
+
+        # Update iteration record
+        fw_db.update_iteration(
+            row_id=row_id, status=status, exit_code=exit_code or -1,
+            elapsed_secs=elapsed,
+            train_loss=metrics.get("loss_smooth"),
+            ref_gap=metrics.get("ref_gap"),
+            cond_gap=metrics.get("cond_gap"),
+            checkpoint=ckpt_path,
+        )
+
+        # Update per-shard EMA scores
+        if metrics.get("ref_gap") is not None or metrics.get("cond_gap") is not None:
+            for sid in shard_ids:
+                score_db.update_scores(
+                    shard_id=sid,
+                    ref_gap=metrics.get("ref_gap"),
+                    cond_gap=metrics.get("cond_gap"),
+                    loss=metrics.get("loss_smooth"),
+                    flywheel_name=name,
+                    iteration=iteration,
+                )
+
+        # Promote checkpoint for the next iteration
+        if status == "done" and ckpt_path:
+            resume_ckpt = ckpt_path
+
+        # Clean up staging symlinks
+        try:
+            shutil.rmtree(staging_dir)
+        except OSError:
+            pass
+
+        # Ablation burst (every N iterations, only on successful runs)
+        ablation_run: Optional[str] = None
+        if ablation_every > 0 and iteration % ablation_every == 0 and status == "done":
+            ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration, resume_ckpt)
+            if ablation_run:
+                new_hp = _read_ablation_best(ablation_run)
+                if new_hp:
+                    hyperparams.update(new_hp)
+                    log_orch(f"[flywheel:{name}] hyperparams updated → {hyperparams}")
+                fw_db.update_iteration(
+                    row_id=row_id, status=status, exit_code=exit_code or 0,
+                    elapsed_secs=elapsed,
+                    train_loss=metrics.get("loss_smooth"),
+                    ref_gap=metrics.get("ref_gap"),
+                    cond_gap=metrics.get("cond_gap"),
+                    checkpoint=ckpt_path,
+                    ablation_run=ablation_run,
+                )
+
+        # Regenerate HTML report
+        iterations_data = fw_db.get_iterations(name)
+        shard_stats     = score_db.get_stats()
+        top_shards      = score_db.get_top_shards(20)
+        html = render_flywheel_index(name, iterations_data, shard_stats, top_shards, hyperparams)
+        (reports_dir / "index.html").write_text(html)
+
+        notify("iris flywheel",
+               f"Iter {iteration}/{max_iters}: {status}  ref_gap={metrics.get('ref_gap')}")
+
+        iteration += 1
+
+    log_orch(f"[flywheel:{name}] loop complete — {max_iters} iterations done")
+    notify("iris flywheel", f"{name} complete ({max_iters} iterations)")
+    fw_db.close()
+    score_db.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -2266,18 +2674,32 @@ def _orchestrator_snapshot() -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="V2 pipeline orchestrator")
-    ap.add_argument("--config",     default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
-    ap.add_argument("--scale",      default=None)
-    ap.add_argument("--resume",     action="store_true")
-    ap.add_argument("--dry-run",    action="store_true")
-    ap.add_argument("--skip-dedup", action="store_true")
-    ap.add_argument("--ai",         action="store_true",
-                    help="Emit read-only JSON snapshot to stdout and exit (does not start orchestrator)")
+    ap.add_argument("--config",          default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
+    ap.add_argument("--scale",           default=None)
+    ap.add_argument("--resume",          action="store_true")
+    ap.add_argument("--dry-run",         action="store_true")
+    ap.add_argument("--skip-dedup",      action="store_true")
+    ap.add_argument("--flywheel-config", default=None, metavar="PATH",
+                    help="YAML flywheel config — enables self-improving sref optimization loop")
+    ap.add_argument("--report-only",     action="store_true",
+                    help="With --flywheel-config: regenerate HTML report from DB and exit")
+    ap.add_argument("--ai",              action="store_true",
+                    help="Emit read-only JSON snapshot to stdout and exit")
     args = ap.parse_args()
 
     if args.ai:
         import json as _json
         print(_json.dumps(_orchestrator_snapshot()))
+        sys.exit(0)
+
+    if args.flywheel_config:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from flywheel_lib import load_flywheel_config
+        fw_cfg = load_flywheel_config(Path(args.flywheel_config))
+        if args.report_only:
+            _flywheel_report_only(fw_cfg)
+        else:
+            _run_flywheel_loop(fw_cfg)
         sys.exit(0)
 
     try:

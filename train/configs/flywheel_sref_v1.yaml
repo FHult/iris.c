@@ -1,0 +1,44 @@
+# Flywheel config — self-improving sref optimization loop
+#
+# Launch:
+#   pipeline_ctl start-flywheel train/configs/flywheel_sref_v1.yaml
+#   pipeline_ctl flywheel-status
+#   pipeline_ctl pause-flywheel / resume-flywheel / stop-flywheel
+#
+# Report-only (regenerate HTML from existing DB):
+#   train/.venv/bin/python train/scripts/orchestrator.py \
+#       --flywheel-config train/configs/flywheel_sref_v1.yaml --report-only
+
+flywheel:
+  name: "sref-v1"
+  max_iterations: 30             # stop after N complete iterations
+  steps_per_iteration: 8000      # training steps per iteration (~9 min at 512px)
+  n_shards: 20                   # shards selected per iteration
+  poll_interval: 60              # seconds between training-window polls
+  min_free_gb: 40                # abort if disk drops below this
+
+  # Base checkpoint to resume from on first iteration.
+  # Leave null to start from scratch (randomly initialised adapter weights).
+  base_checkpoint: null
+
+  # Training config YAML — shard_path and max_steps are overridden per iteration.
+  training_config: "train/configs/stage1_512px.yaml"
+
+  # Starting hyperparams applied on top of training_config.
+  # After each ablation burst the best-found values are merged in here.
+  hyperparams:
+    cross_ref_prob: 0.35
+    style_loss_weight: 0.07
+
+  # Shard selection policy
+  shard_selection:
+    performance_weight: 0.60     # fraction of slots for top-scoring shards
+    min_diversity_pct:  0.20     # fraction reserved for source diversity
+    exploration_rate:   0.15     # fraction for unseen / least-seen shards
+    recency_penalty:    0.30     # discount factor for recently-selected shards
+    recency_window_iters: 3      # iterations over which recency penalty applies
+
+  # Ablation integration — set ablation_every_n: 0 to disable
+  ablation_every_n: 5            # run ablation burst every N successful iterations
+  ablation_max_runs: 10          # cap ablation at N experiments per burst
+  ablation_config: "train/configs/ablation_sref_v1.yaml"

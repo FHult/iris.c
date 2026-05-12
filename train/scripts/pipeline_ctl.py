@@ -14,6 +14,13 @@ Usage:
     python train/scripts/pipeline_ctl.py dispatch-read       # show open issues
     python train/scripts/pipeline_ctl.py dispatch-resolve I-001
     python train/scripts/pipeline_ctl.py restart-from-chunk 2  # restart from chunk 2
+
+Flywheel:
+    python train/scripts/pipeline_ctl.py start-flywheel train/configs/flywheel_sref_v1.yaml
+    python train/scripts/pipeline_ctl.py flywheel-status
+    python train/scripts/pipeline_ctl.py pause-flywheel
+    python train/scripts/pipeline_ctl.py resume-flywheel
+    python train/scripts/pipeline_ctl.py stop-flywheel
 """
 
 import argparse
@@ -25,10 +32,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, SENTINEL_DIR,
-    TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ABLATION_WIN,
+    TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
+    TMUX_ABLATION_WIN, TMUX_FLYWHEEL_WIN,
     SCRIPTS_DIR, TRAIN_DIR,
     CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
     ABLATION_CONTROL_FILE, ABLATION_DB_PATH,
+    FLYWHEEL_CONTROL_FILE, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso, read_heartbeat, heartbeat_age_secs,
 )
@@ -401,6 +410,111 @@ def cmd_ablation_status(_args) -> None:
         print(f"  DB: not found ({ABLATION_DB_PATH})")
 
 
+def cmd_start_flywheel(args) -> None:
+    """Launch the flywheel loop via orchestrator.py in a dedicated tmux window."""
+    config = Path(args.flywheel_config)
+    if not config.exists():
+        print(f"ERROR: config not found: {config}")
+        return
+
+    if tmux_window_exists(TMUX_FLYWHEEL_WIN):
+        print(f"ERROR: {TMUX_FLYWHEEL_WIN} window already running — stop it first")
+        return
+
+    if not tmux_session_exists():
+        subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION,
+                        "-n", TMUX_FLYWHEEL_WIN], check=True)
+
+    FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+
+    log_file = LOG_DIR / "flywheel.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    cmd = (
+        f"source '{TRAIN_DIR}/.venv/bin/activate' && "
+        f"caffeinate -dims {venv_python} -u '{SCRIPTS_DIR}/orchestrator.py' "
+        f"--flywheel-config '{config}'"
+    )
+    tmux_new_window(TMUX_FLYWHEEL_WIN, cmd, log_file)
+    print(f"Flywheel started → {TMUX_FLYWHEEL_WIN} window")
+    print(f"  config: {config}")
+    print(f"  log:    {log_file}")
+
+
+def cmd_stop_flywheel(_args) -> None:
+    FLYWHEEL_CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FLYWHEEL_CONTROL_FILE.write_text(json.dumps({"action": "stop", "ts": now_iso()}))
+    print("Stop signal written — flywheel will exit after the current iteration")
+    print(f"  control file: {FLYWHEEL_CONTROL_FILE}")
+
+
+def cmd_pause_flywheel(_args) -> None:
+    FLYWHEEL_CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FLYWHEEL_CONTROL_FILE.write_text(json.dumps({"action": "pause", "ts": now_iso()}))
+    print("Pause signal written — flywheel will pause after the current training window exits")
+
+
+def cmd_resume_flywheel(_args) -> None:
+    FLYWHEEL_CONTROL_FILE.write_text(json.dumps({"action": "resume", "ts": now_iso()}))
+    print("Resume signal written")
+
+
+def cmd_flywheel_status(_args) -> None:
+    """Show flywheel heartbeat, window status, and iteration DB summary."""
+    running = tmux_window_exists(TMUX_FLYWHEEL_WIN)
+    print(f"  {TMUX_FLYWHEEL_WIN} window: {'running' if running else 'not running'}")
+
+    hb = read_heartbeat("flywheel")
+    if hb:
+        age = heartbeat_age_secs("flywheel")
+        age_str = f"{int(age)}s ago" if age is not None else "unknown"
+        print(f"  heartbeat:  {age_str}  name={hb.get('flywheel_name','')}  "
+              f"iter={hb.get('iteration','')}  status={hb.get('status','')}")
+    else:
+        print("  heartbeat:  not found")
+
+    ctrl_str = "none"
+    try:
+        ctrl = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
+        ctrl_str = ctrl.get("action", "none")
+    except (OSError, json.JSONDecodeError):
+        pass
+    print(f"  control:    {ctrl_str}")
+
+    if FLYWHEEL_DB_PATH.exists():
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect(str(FLYWHEEL_DB_PATH))
+            rows = conn.execute(
+                "SELECT flywheel_name, COUNT(*) as n, "
+                "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done, "
+                "MAX(ref_gap) as best_ref_gap "
+                "FROM iterations GROUP BY flywheel_name ORDER BY flywheel_name"
+            ).fetchall()
+            conn.close()
+            if rows:
+                print(f"\n  DB: {FLYWHEEL_DB_PATH}")
+                for fw_name, n, done, best_rg in rows:
+                    best_str = f"{best_rg:.4f}" if best_rg is not None else "—"
+                    print(f"    {fw_name}: {n} iters ({done} done)  best_ref_gap={best_str}")
+        except Exception as e:
+            print(f"  DB: error reading {FLYWHEEL_DB_PATH}: {e}")
+    else:
+        print(f"  DB: not found ({FLYWHEEL_DB_PATH})")
+
+    if SHARD_SCORES_DB_PATH.exists():
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect(str(SHARD_SCORES_DB_PATH))
+            total  = conn.execute("SELECT COUNT(*) FROM shards").fetchone()[0]
+            scored = conn.execute("SELECT COUNT(*) FROM shards WHERE n_scored>0").fetchone()[0]
+            conn.close()
+            print(f"  shard DB:   {total} shards, {scored} scored")
+        except Exception:
+            pass
+
+
 def cmd_status(args) -> None:
     """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
     import subprocess
@@ -516,6 +630,16 @@ def main() -> None:
     sub.add_parser("resume-ablation",  help="Clear pause/stop signal")
     sub.add_parser("ablation-status",  help="Show ablation heartbeat and DB summary")
 
+    p = sub.add_parser("start-flywheel",
+                       help="Launch self-improving sref flywheel in iris-flywheel tmux window")
+    p.add_argument("flywheel_config", metavar="CONFIG",
+                   help="Flywheel config YAML (flywheel: name/max_iterations/...)")
+
+    sub.add_parser("stop-flywheel",    help="Stop flywheel after current iteration")
+    sub.add_parser("pause-flywheel",   help="Pause flywheel (resumes on resume-flywheel)")
+    sub.add_parser("resume-flywheel",  help="Resume a paused flywheel")
+    sub.add_parser("flywheel-status",  help="Show flywheel heartbeat and iteration DB summary")
+
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
@@ -537,6 +661,11 @@ def main() -> None:
         "pause-ablation":          cmd_pause_ablation,
         "resume-ablation":         cmd_resume_ablation,
         "ablation-status":         cmd_ablation_status,
+        "start-flywheel":          cmd_start_flywheel,
+        "stop-flywheel":           cmd_stop_flywheel,
+        "pause-flywheel":          cmd_pause_flywheel,
+        "resume-flywheel":         cmd_resume_flywheel,
+        "flywheel-status":         cmd_flywheel_status,
     }
     handlers[args.command](args)
 
