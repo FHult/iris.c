@@ -460,6 +460,14 @@ def cmd_resume_flywheel(_args) -> None:
     print("Resume signal written")
 
 
+def cmd_force_continue_flywheel(_args) -> None:
+    """Clear any auto-pause (plateau or manual) and resume the flywheel immediately."""
+    FLYWHEEL_CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FLYWHEEL_CONTROL_FILE.write_text(json.dumps({"action": "resume", "ts": now_iso(),
+                                                  "force": True}))
+    print("Force-continue signal written — flywheel will resume on next poll")
+
+
 def cmd_flywheel_status(_args) -> None:
     """Show flywheel heartbeat, window status, and iteration DB summary."""
     running = tmux_window_exists(TMUX_FLYWHEEL_WIN)
@@ -475,12 +483,15 @@ def cmd_flywheel_status(_args) -> None:
         print("  heartbeat:  not found")
 
     ctrl_str = "none"
+    plateau_reason_str = ""
     try:
         ctrl = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
         ctrl_str = ctrl.get("action", "none")
+        if ctrl.get("auto") and ctrl.get("reason"):
+            plateau_reason_str = f"  [auto-pause: {ctrl['reason']}]"
     except (OSError, json.JSONDecodeError):
         pass
-    print(f"  control:    {ctrl_str}")
+    print(f"  control:    {ctrl_str}{plateau_reason_str}")
 
     if FLYWHEEL_DB_PATH.exists():
         try:
@@ -652,10 +663,12 @@ def main() -> None:
     p.add_argument("flywheel_config", metavar="CONFIG",
                    help="Flywheel config YAML (flywheel: name/max_iterations/...)")
 
-    sub.add_parser("stop-flywheel",    help="Stop flywheel after current iteration")
-    sub.add_parser("pause-flywheel",   help="Pause flywheel (resumes on resume-flywheel)")
-    sub.add_parser("resume-flywheel",  help="Resume a paused flywheel")
-    sub.add_parser("flywheel-status",  help="Show flywheel heartbeat and iteration DB summary")
+    sub.add_parser("stop-flywheel",          help="Stop flywheel after current iteration")
+    sub.add_parser("pause-flywheel",         help="Pause flywheel (resumes on resume-flywheel)")
+    sub.add_parser("resume-flywheel",        help="Resume a paused flywheel")
+    sub.add_parser("force-continue-flywheel",
+                   help="Clear auto-pause (plateau) and resume flywheel immediately")
+    sub.add_parser("flywheel-status",        help="Show flywheel heartbeat and iteration DB summary")
 
     sub.add_parser("data-explorer",
                    help="Data intelligence layer: shards, checkpoints, coverage, warm-start")
@@ -685,6 +698,7 @@ def main() -> None:
         "stop-flywheel":           cmd_stop_flywheel,
         "pause-flywheel":          cmd_pause_flywheel,
         "resume-flywheel":         cmd_resume_flywheel,
+        "force-continue-flywheel": cmd_force_continue_flywheel,
         "flywheel-status":         cmd_flywheel_status,
         "data-explorer":           cmd_data_explorer,
     }

@@ -2401,7 +2401,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     sys.path.insert(0, str(SCRIPTS_DIR))
     from flywheel_lib import (
         FlywheelDB, collect_metrics_from_log, render_flywheel_index,
-        _checkpoint_hash,
+        _checkpoint_hash, check_plateau,
     )
     from shard_selector import (
         ShardScoreDB, scan_shard_pool, select_shards,
@@ -2691,11 +2691,34 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                     ablation_run=ablation_run,
                 )
 
+        # Plateau detection
+        plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
+        plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
+        plateau_reason: Optional[str] = None
+        if plateau_patience > 0:
+            done_iters = [r for r in fw_db.get_iterations(name) if r["status"] == "done"]
+            plateau_reason = check_plateau(done_iters, plateau_patience, plateau_threshold)
+            if plateau_reason:
+                log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
+                         level="warning")
+                try:
+                    from pipeline_lib import FLYWHEEL_CONTROL_FILE
+                    import json as _json
+                    FLYWHEEL_CONTROL_FILE.write_text(
+                        _json.dumps({"action": "pause",
+                                     "reason": plateau_reason,
+                                     "auto":   True})
+                    )
+                except Exception as _e:
+                    log_orch(f"[flywheel:{name}] could not write plateau pause: {_e}",
+                             level="warning")
+
         # Regenerate HTML report
         iterations_data = fw_db.get_iterations(name)
         shard_stats     = score_db.get_stats()
         top_shards      = score_db.get_top_shards(20)
-        html = render_flywheel_index(name, iterations_data, shard_stats, top_shards, hyperparams)
+        html = render_flywheel_index(name, iterations_data, shard_stats, top_shards,
+                                     hyperparams, plateau_reason=plateau_reason)
         (reports_dir / "index.html").write_text(html)
 
         notify("iris flywheel",

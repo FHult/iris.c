@@ -80,9 +80,20 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_lib import ABLATION_CONTROL_FILE as _ABLATION_CONTROL  # noqa: E402
 
-# ── Optional ML deps (Bayesian search only) ──────────────────────────────────
+# ── Optional ML deps ─────────────────────────────────────────────────────────
 try:
     import numpy as np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+
+try:
+    import scipy.optimize as _scipy_opt
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
+try:
     from sklearn.gaussian_process import GaussianProcessRegressor
     from sklearn.gaussian_process.kernels import Matern, WhiteKernel
     _SKLEARN_OK = True
@@ -224,12 +235,13 @@ class AblationDB:
             exit_code    INTEGER,
             git_commit   TEXT,
             ts           TEXT    NOT NULL,
-            snapshots    TEXT
+            snapshots    TEXT,
+            is_pareto    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_run  ON experiments(run_name);
         CREATE INDEX IF NOT EXISTS idx_hash ON experiments(run_name, config_hash);
         CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
-        INSERT OR IGNORE INTO _meta VALUES ('schema_version', '1');
+        INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -239,6 +251,13 @@ class AblationDB:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.executescript(self.SCHEMA)
+        # v1 → v2: add is_pareto column
+        try:
+            self._conn.execute(
+                "ALTER TABLE experiments ADD COLUMN is_pareto INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
         self._conn.commit()
 
     @staticmethod
@@ -320,6 +339,25 @@ class AblationDB:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def update_pareto_front(self, run_name: str) -> int:
+        """Recompute Pareto-efficient experiments (3-objective) and update is_pareto flag.
+
+        Objectives: maximise ref_gap, maximise cond_gap, minimise final_loss.
+        Returns the number of experiments on the Pareto front.
+        """
+        exps = self.get_experiments(run_name, scored_only=True)
+        pareto_ids = _pareto_efficient(exps)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE experiments SET is_pareto=0 WHERE run_name=?", (run_name,)
+            )
+            for exp_id in pareto_ids:
+                self._conn.execute(
+                    "UPDATE experiments SET is_pareto=1 WHERE id=?", (exp_id,)
+                )
+            self._conn.commit()
+        return len(pareto_ids)
+
     @staticmethod
     def _decode_row(row: sqlite3.Row) -> dict:
         r = dict(row)
@@ -377,75 +415,164 @@ class RandomSearch(SearchStrategy):
         return None
 
 
+class _NumpyGP:
+    """Pure numpy/scipy Gaussian Process with Matern-5/2 kernel.
+
+    Log marginal likelihood is optimised via scipy L-BFGS-B over log-space
+    hyperparameters (length_scale, signal_variance, noise_variance).
+
+    Only used when scikit-learn is not available.  Requires numpy + scipy.
+    """
+
+    def __init__(self) -> None:
+        self._l      = 1.0    # length scale
+        self._sf2    = 1.0    # signal variance
+        self._sn2    = 0.1    # noise variance
+        self._alpha  = None   # (K + sn2 I)^{-1} y_norm
+        self._L      = None   # Cholesky factor
+        self._Xtrain = None
+        self._ymean  = 0.0
+        self._ystd   = 1.0
+
+    @staticmethod
+    def _k52(X: "np.ndarray", Y: "np.ndarray", l: float) -> "np.ndarray":
+        """Matern-5/2 kernel matrix, shapes [n,d] × [m,d] → [n,m]."""
+        diff = X[:, None, :] - Y[None, :, :]            # [n, m, d]
+        r    = np.sqrt(np.maximum(np.sum(diff ** 2, axis=-1), 0.0)) / l
+        return (1.0 + np.sqrt(5.0) * r + 5.0 * r ** 2 / 3.0) * np.exp(-np.sqrt(5.0) * r)
+
+    def _neg_lml(self, log_p: "np.ndarray", X: "np.ndarray", y: "np.ndarray") -> float:
+        l, sf2, sn2 = np.exp(log_p[0]), np.exp(log_p[1]), np.exp(log_p[2])
+        n   = X.shape[0]
+        K   = sf2 * self._k52(X, X, l) + sn2 * np.eye(n)
+        try:
+            L = np.linalg.cholesky(K)
+        except np.linalg.LinAlgError:
+            return 1e9
+        a   = np.linalg.solve(L.T, np.linalg.solve(L, y))
+        lml = -0.5 * y @ a - np.sum(np.log(np.diag(L))) - 0.5 * n * np.log(2.0 * np.pi)
+        return float(-lml)
+
+    def fit(self, X: "np.ndarray", y: "np.ndarray") -> None:
+        self._ymean = float(y.mean())
+        self._ystd  = float(y.std()) + 1e-8
+        yn = (y - self._ymean) / self._ystd
+        x0 = np.array([0.0, 0.0, -2.0])
+        try:
+            res = _scipy_opt.minimize(
+                self._neg_lml, x0, args=(X, yn), method="L-BFGS-B",
+                bounds=[(-3.0, 3.0), (-3.0, 3.0), (-6.0, 2.0)],
+                options={"maxiter": 100, "ftol": 1e-4},
+            )
+            self._l, self._sf2, self._sn2 = (
+                float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(np.exp(res.x[2]))
+            )
+        except Exception:
+            pass  # keep defaults if optimizer fails
+        n = X.shape[0]
+        K = self._sf2 * self._k52(X, X, self._l) + self._sn2 * np.eye(n)
+        for jitter in (0.0, 1e-6, 1e-4, 1e-2):
+            try:
+                self._L = np.linalg.cholesky(K + jitter * np.eye(n))
+                break
+            except np.linalg.LinAlgError:
+                continue
+        else:
+            self._L = np.eye(n)
+        self._alpha  = np.linalg.solve(self._L.T, np.linalg.solve(self._L, yn))
+        self._Xtrain = X.copy()
+
+    def predict(self, Xstar: "np.ndarray") -> "tuple[np.ndarray, np.ndarray]":
+        Ks  = self._sf2 * self._k52(Xstar, self._Xtrain, self._l)  # [m, n]
+        mu_n = Ks @ self._alpha
+        v    = np.linalg.solve(self._L, Ks.T)                       # [n, m]
+        var_n = np.maximum(self._sf2 - np.sum(v ** 2, axis=0), 0.0)
+        return mu_n * self._ystd + self._ymean, np.sqrt(var_n) * self._ystd
+
+
 class BayesianSearch(SearchStrategy):
     """GP-UCB Bayesian optimisation over the discrete candidate grid.
 
-    Encodes each candidate as a float feature vector, fits a Gaussian Process
-    on observed (params, score) pairs, and selects the next candidate with the
-    highest Upper Confidence Bound.  Falls back to random selection for the
-    first n_initial experiments.
+    Uses sklearn GaussianProcessRegressor when available; falls back to a pure
+    numpy/scipy GP (_NumpyGP, Matern-5/2 with log-MLL optimisation) otherwise.
+
+    Key improvement: X normalisation uses the FULL candidate range (computed at
+    construction time), not the observed range.  Using the observed range causes
+    UCB variance to collapse when all observed points share the same region,
+    forcing random fallback even after n_initial runs have been collected.
     """
+
     def __init__(
         self,
         candidates: list[dict],
         n_initial: int = 10,
         kappa: float = 2.0,
     ) -> None:
-        if not _SKLEARN_OK:
-            raise ImportError(
-                "Bayesian search requires numpy + scikit-learn: "
-                "pip install numpy scikit-learn"
+        self._candidates   = candidates
+        self._n_initial    = n_initial
+        self._kappa        = kappa
+        self._feature_keys = list(candidates[0].keys()) if candidates else []
+        self._sklearn_gp   = None  # lazy init
+
+        # Pre-compute full-range normalisation constants (stable across iterations)
+        if candidates and _NUMPY_OK:
+            all_X = np.array(
+                [[float(c.get(k, 0)) for k in self._feature_keys] for c in candidates],
+                dtype=np.float64,
             )
-        self._candidates = candidates
-        self._n_initial = n_initial
-        self._kappa = kappa
-        kernel = Matern(nu=2.5, length_scale_bounds=(1e-2, 10.0)) + WhiteKernel(noise_level=0.1)
-        self._gp = GaussianProcessRegressor(
-            kernel=kernel, normalize_y=True, n_restarts_optimizer=3
-        )
-        if candidates:
-            self._feature_keys = list(candidates[0].keys())
+            self._X_min   = all_X.min(axis=0)
+            self._X_max   = all_X.max(axis=0)
+            self._X_range = np.where(self._X_max > self._X_min,
+                                     self._X_max - self._X_min, 1.0)
         else:
-            self._feature_keys = []
+            self._X_min = self._X_max = self._X_range = None
 
     def _encode(self, params: dict) -> "np.ndarray":
-        vec = [float(params[k]) for k in self._feature_keys]
-        return np.array(vec, dtype=np.float64)
+        return np.array([float(params.get(k, 0)) for k in self._feature_keys],
+                        dtype=np.float64)
+
+    def _normalize(self, X: "np.ndarray") -> "np.ndarray":
+        if self._X_range is None:
+            return X
+        return (X - self._X_min) / self._X_range
 
     def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
         import random
         tried_keys = {_params_key(t["params"]) for t in tried_results}
-        remaining = [c for c in self._candidates if _params_key(c) not in tried_keys]
+        remaining  = [c for c in self._candidates if _params_key(c) not in tried_keys]
         if not remaining:
             return None
 
         scored = [t for t in tried_results if t.get("score") is not None]
-
-        if len(scored) < self._n_initial:
-            # Random warm-up exploration
+        if len(scored) < self._n_initial or not _NUMPY_OK:
             return random.choice(remaining)
 
-        X_obs = np.array([self._encode(t["params"]) for t in scored])
-        y_obs = np.array([float(t["score"]) for t in scored])
+        X_obs  = np.array([self._encode(t["params"]) for t in scored])
+        y_obs  = np.array([float(t["score"]) for t in scored])
+        X_norm = self._normalize(X_obs)
 
-        # Normalise features to [0, 1] across observed range
-        X_min = X_obs.min(axis=0)
-        X_max = X_obs.max(axis=0)
-        X_range = np.where(X_max > X_min, X_max - X_min, 1.0)
-        X_norm = (X_obs - X_min) / X_range
+        X_cand      = np.array([self._encode(c) for c in remaining])
+        X_cand_norm = self._normalize(X_cand)
 
         try:
-            self._gp.fit(X_norm, y_obs)
+            if _SKLEARN_OK:
+                if self._sklearn_gp is None:
+                    kernel = (Matern(nu=2.5, length_scale_bounds=(1e-2, 10.0))
+                              + WhiteKernel(noise_level=0.1))
+                    self._sklearn_gp = GaussianProcessRegressor(
+                        kernel=kernel, normalize_y=True, n_restarts_optimizer=3
+                    )
+                self._sklearn_gp.fit(X_norm, y_obs)
+                mu, sigma = self._sklearn_gp.predict(X_cand_norm, return_std=True)
+            else:
+                gp = _NumpyGP()
+                gp.fit(X_norm, y_obs)
+                mu, sigma = gp.predict(X_cand_norm)
+
+            ucb = mu + self._kappa * sigma
+            return remaining[int(np.argmax(ucb))]
         except Exception:
             return random.choice(remaining)
-
-        X_cand = np.array([self._encode(c) for c in remaining])
-        X_cand_norm = (X_cand - X_min) / X_range
-        mu, sigma = self._gp.predict(X_cand_norm, return_std=True)
-        ucb = mu + self._kappa * sigma
-
-        best_idx = int(np.argmax(ucb))
-        return remaining[best_idx]
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
@@ -737,6 +864,58 @@ def _export_best_config(result: dict, output_dir: Path, run_name: str = "") -> N
         print(f"WARNING: could not write best_config.yaml: {e}", file=sys.stderr)
 
 
+# ── Early stopping ────────────────────────────────────────────────────────────
+
+class EarlyStopper:
+    """Monitor training snapshots and SIGTERM the subprocess when cond_gap is persistently bad.
+
+    Activates only after `min_snapshots` snapshots have been collected (warmup guard).
+    After `patience` consecutive snapshots with cond_gap < min_cond_gap, the process
+    receives SIGTERM and the run is recorded as an early-stopped result.
+    """
+
+    def __init__(self, min_cond_gap: float, patience: int, min_snapshots: int) -> None:
+        self.min_cond_gap  = min_cond_gap
+        self.patience      = patience
+        self.min_snapshots = min_snapshots
+        self._proc: Optional[subprocess.Popen] = None
+        self._n_snapshots  = 0
+        self._bad_streak   = 0
+        self._triggered    = False
+
+    def attach(self, proc: subprocess.Popen) -> None:
+        """Wire up immediately after Popen()."""
+        self._proc        = proc
+        self._n_snapshots = 0
+        self._bad_streak  = 0
+        self._triggered   = False
+
+    def feed_snapshot(self, snap: dict) -> bool:
+        """Returns True if early stopping was triggered this call or previously."""
+        if self._triggered:
+            return True
+        self._n_snapshots += 1
+        if self._n_snapshots < self.min_snapshots:
+            return False
+        cond_gap = snap.get("cond_gap")
+        if cond_gap is None:
+            return False
+        if cond_gap < self.min_cond_gap:
+            self._bad_streak += 1
+        else:
+            self._bad_streak = 0
+        if self._bad_streak >= self.patience:
+            self._triggered = True
+            if self._proc is not None and self._proc.poll() is None:
+                try:
+                    import signal as _sig
+                    self._proc.send_signal(_sig.SIGTERM)
+                except Exception:
+                    pass
+            return True
+        return False
+
+
 # ── Single-run execution ──────────────────────────────────────────────────────
 
 def _run_one(
@@ -746,6 +925,7 @@ def _run_one(
     log_every: int,
     quiet: bool = False,
     hb: Optional[HeartbeatWriter] = None,
+    early_stopper: Optional[EarlyStopper] = None,
 ) -> dict:
     combo_id = combo["combo_id"]
     params   = combo["params"]
@@ -794,6 +974,8 @@ def _run_one(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=str(_REPO_ROOT),
         )
+        if early_stopper is not None:
+            early_stopper.attach(proc)
         with open(log_path, "w") as log_f:
             for raw_line in proc.stdout:  # type: ignore[union-attr]
                 line = raw_line.rstrip()
@@ -818,6 +1000,10 @@ def _run_one(
                             current_loss=round(loss, 4),
                             current_ref_gap=round(ref_gap, 4),
                         )
+                    if early_stopper is not None and early_stopper.feed_snapshot(snap):
+                        print(_c("yellow",
+                                 f"  ↳ early stopping triggered at step {snap['step']} "
+                                 f"(cond_gap={cond_gap:+.4f})"), flush=True)
         proc.wait()
         exit_code = proc.returncode
     except KeyboardInterrupt:
@@ -895,17 +1081,24 @@ def _load_harness_config(path: Path) -> dict:
 
 
 def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
-    strategy = cfg.get("strategy", "random").lower()
+    strategy  = cfg.get("strategy", "random").lower()
     n_initial = int(cfg.get("n_initial", max(8, len(candidates) // 5)))
     if strategy == "grid":
         return GridSearch(candidates)
     if strategy == "random":
         return RandomSearch(candidates, seed=cfg.get("seed"))
     if strategy == "bayesian":
-        if not _SKLEARN_OK:
-            print("WARNING: scikit-learn not available — falling back to random search",
+        if not _NUMPY_OK:
+            print("WARNING: numpy not available — falling back to random search",
                   file=sys.stderr)
             return RandomSearch(candidates)
+        if not (_SKLEARN_OK or _SCIPY_OK):
+            print("WARNING: neither scikit-learn nor scipy available — "
+                  "falling back to random search", file=sys.stderr)
+            return RandomSearch(candidates)
+        if not _SKLEARN_OK:
+            print("INFO: scikit-learn not available — using pure numpy/scipy GP",
+                  file=sys.stderr)
         return BayesianSearch(candidates, n_initial=n_initial)
     print(f"ERROR: unknown strategy '{strategy}'. Use: grid, random, bayesian", file=sys.stderr)
     sys.exit(1)
@@ -940,6 +1133,16 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
     searcher = _build_search_strategy(harness_cfg, candidates)
 
+    # Early stopping
+    es_cfg = harness_cfg.get("early_stopping", {})
+    early_stopper: Optional[EarlyStopper] = None
+    if es_cfg.get("enabled", False) and _NUMPY_OK:
+        early_stopper = EarlyStopper(
+            min_cond_gap=float(es_cfg.get("min_cond_gap", -0.3)),
+            patience=int(es_cfg.get("patience", 4)),
+            min_snapshots=int(es_cfg.get("min_snapshots", 5)),
+        )
+
     hb = HeartbeatWriter(run_name)
     hb.start()
 
@@ -956,6 +1159,10 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     print(f"  candidates={len(candidates)}  already_done={n_done}")
     print(f"  db: {db._db_path}")
     print(f"  output: {output_dir}")
+    if early_stopper is not None:
+        print(f"  early_stopping: min_cond_gap={early_stopper.min_cond_gap}  "
+              f"patience={early_stopper.patience}  "
+              f"min_snapshots={early_stopper.min_snapshots}")
     print(_c("cyan", f"{'═'*64}\n"))
 
     hb.update(status="running", strategy=strategy, n_candidates=len(candidates),
@@ -997,7 +1204,8 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         )
 
         _print_combo_header(combo, n_done, max_runs, steps)
-        result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb)
+        result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb,
+                          early_stopper=early_stopper)
 
         # Re-score with configurable objective
         n_skip = max(0, len(result.get("snapshots", [])) * 2 // 5)
@@ -1017,6 +1225,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             exit_code=result["exit_code"],
             snapshots=result.get("snapshots", []),
         )
+        db.update_pareto_front(run_name)
 
         tried.append({"params": params, "score": result["score"]})
 
@@ -1041,6 +1250,41 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
     hb.update(status="done", n_done=n_done)
     hb.stop()
+
+
+def _pareto_efficient(experiments: list[dict]) -> set:
+    """Return set of experiment IDs on the 3-objective Pareto front.
+
+    Objectives: maximise ref_gap, maximise cond_gap, minimise final_loss.
+    An experiment is Pareto-efficient if no other scored experiment dominates
+    it on all three objectives simultaneously.
+    """
+    valid = [e for e in experiments
+             if e.get("ref_gap") is not None
+             and e.get("cond_gap") is not None
+             and e.get("final_loss") is not None]
+    if not valid:
+        return set()
+
+    pareto_ids: set = set()
+    for j, ej in enumerate(valid):
+        dominated = False
+        for k, ek in enumerate(valid):
+            if k == j:
+                continue
+            # ek dominates ej if ek is ≥ ej on all objectives AND strictly > on at least one
+            if (ek["ref_gap"]    >= ej["ref_gap"]    and
+                    ek["cond_gap"]   >= ej["cond_gap"]   and
+                    ek["final_loss"] <= ej["final_loss"]  and
+                    (ek["ref_gap"]    > ej["ref_gap"]    or
+                     ek["cond_gap"]   > ej["cond_gap"]   or
+                     ek["final_loss"] < ej["final_loss"])):
+                dominated = True
+                break
+        if not dominated:
+            pareto_ids.add(ej["id"])
+
+    return pareto_ids
 
 
 def _generate_lt_report(
@@ -1212,6 +1456,23 @@ def _render_html(
             running_best = s
         best_so_far.append(running_best)
 
+    # Pareto scatter: ref_gap vs cond_gap coloured by rank, Pareto front highlighted
+    ranked_ids = {r["id"]: i + 1 for i, r in enumerate(ranked)}
+    pareto_data = [
+        {
+            "id":         r["id"],
+            "combo_id":   r.get("combo_id", ""),
+            "ref_gap":    r.get("ref_gap"),
+            "cond_gap":   r.get("cond_gap"),
+            "final_loss": r.get("final_loss"),
+            "score":      r.get("score"),
+            "is_pareto":  r.get("is_pareto", 0),
+            "color":      _html_color(ranked_ids.get(r["id"], 99)),
+        }
+        for r in results
+        if r.get("ref_gap") is not None and r.get("cond_gap") is not None
+    ]
+
     return _HTML_TEMPLATE.format(
         ts=ts,
         matrix_name=matrix_name,
@@ -1227,6 +1488,8 @@ def _render_html(
         bar_data=json.dumps(bar_data),
         trend_data=json.dumps(trend_data),
         best_so_far=json.dumps(best_so_far),
+        pareto_data=json.dumps(pareto_data),
+        show_pareto="true" if len(pareto_data) >= 3 else "false",
         run_dir_name=run_dir_name,
         show_trend="true" if len(results) >= 5 else "false",
     )
@@ -1294,6 +1557,10 @@ _HTML_TEMPLATE = """\
     <div class="chart-label">Score over time — learning progression (rolling best in white)</div>
     <canvas id="trendChart" width="480" height="220"></canvas>
   </div>
+  <div id="paretoBox" style="display:none">
+    <div class="chart-label">Pareto front — ref_gap vs cond_gap (★ = Pareto-efficient)</div>
+    <canvas id="paretoChart" width="480" height="220"></canvas>
+  </div>
 </div>
 
 <h2>Data</h2>
@@ -1302,11 +1569,13 @@ _HTML_TEMPLATE = """\
 <p>Best config: <code>best_config.yaml</code></p>
 
 <script>
-const SERIES     = {js_series};
-const BAR        = {bar_data};
-const TREND      = {trend_data};
-const BEST_LINE  = {best_so_far};
-const SHOW_TREND = {show_trend};
+const SERIES      = {js_series};
+const BAR         = {bar_data};
+const TREND       = {trend_data};
+const BEST_LINE   = {best_so_far};
+const PARETO      = {pareto_data};
+const SHOW_TREND  = {show_trend};
+const SHOW_PARETO = {show_pareto};
 
 function drawChart(id, key, zeroLine) {{
   const cv = document.getElementById(id); if (!cv) return;
@@ -1437,12 +1706,64 @@ function drawTrend(id) {{
   }}
 }}
 
+function drawPareto(id) {{
+  const cv = document.getElementById(id); if (!cv) return;
+  if (!SHOW_PARETO || !PARETO.length) return;
+  document.getElementById('paretoBox').style.display = 'block';
+  const ctx = cv.getContext('2d');
+  const W=cv.width, H=cv.height, pad={{t:16,r:16,b:32,l:52}};
+  const cw=W-pad.l-pad.r, ch=H-pad.t-pad.b;
+  const pts = PARETO.filter(p=>p.ref_gap!=null&&p.cond_gap!=null);
+  if (!pts.length) return;
+  const xs=pts.map(p=>p.ref_gap), ys=pts.map(p=>p.cond_gap);
+  let xMin=Math.min(...xs), xMax=Math.max(...xs);
+  let yMin=Math.min(...ys), yMax=Math.max(...ys);
+  const xp=(xMax-xMin)*0.12||0.05, yp=(yMax-yMin)*0.12||0.05;
+  xMin-=xp; xMax+=xp; yMin-=yp; yMax+=yp;
+  const sx=x=>pad.l+(x-xMin)/(xMax-xMin)*cw;
+  const sy=y=>pad.t+ch-(y-yMin)/(yMax-yMin)*ch;
+  ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
+  for(let i=0;i<=4;i++) {{
+    const y=yMin+(yMax-yMin)*i/4;
+    ctx.beginPath(); ctx.moveTo(pad.l,sy(y)); ctx.lineTo(pad.l+cw,sy(y)); ctx.stroke();
+    ctx.fillStyle='#555'; ctx.font='9px monospace'; ctx.fillText(y.toFixed(3),2,sy(y)+3);
+  }}
+  for(let i=0;i<=4;i++) {{
+    const x=xMin+(xMax-xMin)*i/4;
+    ctx.beginPath(); ctx.moveTo(sx(x),pad.t); ctx.lineTo(sx(x),pad.t+ch); ctx.stroke();
+    ctx.fillStyle='#555'; ctx.font='9px monospace'; ctx.fillText(x.toFixed(3),sx(x)-16,pad.t+ch+20);
+  }}
+  if(xMin<0&&xMax>0){{
+    ctx.strokeStyle='#444'; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(sx(0),pad.t); ctx.lineTo(sx(0),pad.t+ch); ctx.stroke();
+    ctx.setLineDash([]);
+  }}
+  if(yMin<0&&yMax>0){{
+    ctx.strokeStyle='#444'; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l,sy(0)); ctx.lineTo(pad.l+cw,sy(0)); ctx.stroke();
+    ctx.setLineDash([]);
+  }}
+  ctx.fillStyle='#666'; ctx.font='9px monospace';
+  ctx.fillText('cond_gap ↑',2,pad.t+ch/2);
+  ctx.fillText('ref_gap →',pad.l+cw/2-25,pad.t+ch+28);
+  pts.forEach(p=>{{
+    const x=sx(p.ref_gap), y=sy(p.cond_gap);
+    const ip=p.is_pareto===1;
+    ctx.fillStyle=ip?p.color:'rgba(90,90,90,0.6)';
+    ctx.strokeStyle=ip?'rgba(255,255,255,0.8)':'transparent';
+    ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(x,y,ip?6:3,0,2*Math.PI); ctx.fill();
+    if(ip){{ ctx.stroke(); ctx.fillStyle='#ccc'; ctx.font='8px monospace'; ctx.fillText('★ '+p.combo_id,x+8,y+3); }}
+  }});
+}}
+
 drawChart('refChart',  'ref_gap',  true);
 drawChart('condChart', 'cond_gap', true);
 drawChart('lossChart', 'loss',     false);
 drawChart('scaleChart','scale',    false);
 drawBar('barChart');
 drawTrend('trendChart');
+drawPareto('paretoChart');
 </script>
 </body>
 </html>

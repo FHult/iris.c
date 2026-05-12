@@ -35,3 +35,12 @@ ablation:
     # Style loss weight > 0 only makes sense when cross-ref sampling is enabled.
     # This removes 3×4 = 12 invalid combos, leaving 116 valid candidates.
     - "style_loss_weight == 0 or cross_ref_prob > 0"
+
+  # Early stopping — terminate individual runs where cond_gap is persistently bad.
+  # Only activates after min_snapshots to avoid killing warmup.
+  # patience consecutive snapshots with cond_gap < min_cond_gap triggers SIGTERM.
+  early_stopping:
+    enabled:        true
+    min_cond_gap:  -0.30   # below this for `patience` consecutive snapshots → stop
+    patience:       4      # consecutive bad snapshots needed
+    min_snapshots:  5      # snapshots collected before early stopping can activate

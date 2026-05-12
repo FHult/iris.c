@@ -55,6 +55,13 @@ flywheel:
   # Leave null to use the built-in heuristic.
   shard_manifest: null
 
+  # Plateau detection — pause flywheel when cond_gap improvement stalls.
+  # Set plateau_patience: 0 to disable.
+  # A plateau is declared when max(cond_gap) - min(cond_gap) over the last
+  # plateau_patience done iterations is < plateau_threshold.
+  plateau_patience:   5          # require 5 consecutive done iters before declaring plateau
+  plateau_threshold:  0.02       # spread < 0.02 triggers pause (~half a typical cond_gap step)
+
   # Ablation integration — set ablation_every_n: 0 to disable
   ablation_every_n: 0            # disabled for trial 1 — ablation steps_per_run (12000) >> flywheel steps (1000)
   ablation_max_runs: 4           # trial 1: limit ablation overhead (2 bursts at iter 5 + 10)
