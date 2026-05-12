@@ -11,7 +11,7 @@
 
 flywheel:
   name: "sref-v1"
-  max_iterations: 30             # stop after N complete iterations
+  max_iterations: 15             # trial 1: enough to see attribution activate (~iter 12)
   steps_per_iteration: 8000      # training steps per iteration (~9 min at 512px)
   n_shards: 20                   # shards selected per iteration
   poll_interval: 60              # seconds between training-window polls
@@ -55,5 +55,5 @@ flywheel:
 
   # Ablation integration — set ablation_every_n: 0 to disable
   ablation_every_n: 5            # run ablation burst every N successful iterations
-  ablation_max_runs: 10          # cap ablation at N experiments per burst
+  ablation_max_runs: 4           # trial 1: limit ablation overhead (2 bursts at iter 5 + 10)
   ablation_config: "train/configs/ablation_sref_v1.yaml"
