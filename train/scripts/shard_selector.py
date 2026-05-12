@@ -1101,6 +1101,11 @@ def _cmd_scan(args) -> None:
 def _cmd_status(args) -> None:
     db = ShardScoreDB(Path(args.db))
     stats = db.get_stats()
+    if getattr(args, "ai", False):
+        stats["db"] = args.db
+        print(json.dumps(stats, default=str))
+        db.close()
+        return
     print(f"DB: {args.db}")
     print(f"  total shards     : {stats['total']}")
     print(f"  scored shards    : {stats['scored']}")
@@ -1141,6 +1146,10 @@ def _cmd_select(args) -> None:
 def _cmd_attribution(args) -> None:
     db = ShardScoreDB(Path(args.db))
     report = db.get_attribution_report()
+    if getattr(args, "ai", False):
+        print(json.dumps(report, default=str))
+        db.close()
+        return
     if not report:
         print("No scored shards yet.")
         db.close()
@@ -1170,6 +1179,8 @@ def main() -> None:
                     help="SigLIP precomputed dir (default: DATA_ROOT/precomputed/siglip)")
     ap.add_argument("--manifest", default=None,
                     help="Shard manifest JSON {shard_id: {source: str}}")
+    ap.add_argument("--ai", action="store_true",
+                    help="Output compact JSON for AI consumption (status and attribution)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("scan",        help="Scan shard pool and populate DB")

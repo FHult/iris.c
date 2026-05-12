@@ -1578,6 +1578,146 @@ def print_report(args_chunk: Optional[int]) -> None:
         print()
 
 
+_DOC_HTML_STYLE = """
+body{font-family:system-ui,sans-serif;margin:0;background:#f0f2f5;color:#222;font-size:13px}
+.hdr{background:#1a1a2e;color:#eee;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
+.hdr h1{margin:0;font-size:16px;font-weight:700}.ts{font-size:11px;color:#aaa}
+.card{background:#fff;border-radius:6px;padding:14px 18px;margin:10px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h2{margin:0 0 10px;font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.8px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+td,th{padding:7px 10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+th{background:#f7f7f7;font-weight:600;color:#555}tr:last-child td{border-bottom:none}
+pre{background:#1e1e1e;color:#ccc;padding:10px;border-radius:4px;overflow-x:auto;font-size:11px;
+    margin:4px 0;white-space:pre-wrap;word-break:break-all}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+.ok{background:#d4edda;color:#155724}.warn{background:#fff3cd;color:#856404}
+.err{background:#fde8e8;color:#a00}.info{background:#d1ecf1;color:#0c5460}
+.top{border-radius:6px;padding:14px 18px;margin:10px 18px;font-size:14px;font-weight:500;
+     display:flex;align-items:center;gap:10px}
+.top-ok{background:#d4edda;border-left:4px solid #27ae60}
+.top-warn{background:#fff3cd;border-left:4px solid #e67e22}
+.top-crit{background:#fde8e8;border-left:4px solid #c0392b}
+.top-icon{font-size:20px}
+.mrow{display:flex;gap:20px;flex-wrap:wrap}
+.metric{display:flex;flex-direction:column;gap:1px}
+.mlabel{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px}
+.mval{font-size:15px;font-weight:700;font-family:monospace}
+code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:11px;font-family:monospace}
+.sev-CRITICAL{color:#c0392b;font-weight:700}.sev-WARNING{color:#856404;font-weight:700}
+.sev-INFO{color:#0c5460}.category{color:#888;font-size:11px}
+"""
+
+
+def _dh(s) -> str:
+    import html as _hm
+    return _hm.escape(str(s)) if s is not None else ""
+
+
+def _dmetric(label: str, val, fmt: str = "") -> str:
+    if val is None:
+        return ""
+    v = f"{val:{fmt}}" if fmt else str(val)
+    return (f'<div class="metric"><span class="mlabel">{_dh(label)}</span>'
+            f'<span class="mval">{_dh(v)}</span></div>')
+
+
+def render_html_doctor(summary: dict, args_chunk: Optional[int] = None) -> str:
+    """Render pipeline doctor output as a self-contained HTML page."""
+    issues = _issues
+    if args_chunk is not None:
+        issues = [i for i in issues if i.chunk is None or i.chunk == args_chunk]
+
+    criticals = [i for i in issues if i.severity == "CRITICAL"]
+    warnings   = [i for i in issues if i.severity == "WARNING"]
+
+    if criticals:
+        top_action = criticals[0].title
+        top_cls, top_icon = "top-crit", "🔴"
+    elif warnings:
+        top_action = warnings[0].title
+        top_cls, top_icon = "top-warn", "🟡"
+    else:
+        top_action = "Pipeline healthy — no issues detected"
+        top_cls, top_icon = "top-ok", "🟢"
+
+    top_html = (
+        f'<div class="top {top_cls}">'
+        f'<span class="top-icon">{top_icon}</span>'
+        f'<span>{_dh(top_action)}</span></div>'
+    )
+
+    # Summary card (disk, training, prep)
+    ti = summary.get("training", {})
+    pi = summary.get("active_prep", {})
+    disk = summary.get("disk_gb")
+    disk_cls = ("ok" if isinstance(disk, (int, float)) and disk > 80
+                else "warn" if isinstance(disk, (int, float)) and disk > 40
+                else "err")
+    crit_c = len(criticals)
+    warn_c = len(warnings)
+    info_c = len([i for i in issues if i.severity == "INFO"])
+
+    counts_html = (
+        f'<span class="badge err" style="margin-right:4px">{crit_c} critical</span>'
+        f'<span class="badge warn" style="margin-right:4px">{warn_c} warning</span>'
+        f'<span class="badge info">{info_c} info</span>'
+    )
+    summary_metrics = (
+        _dmetric("Disk free", f"{disk} GB" if disk is not None else None)
+        + _dmetric("Training chunk", ti.get("chunk"))
+        + _dmetric("Step", f"{ti['step']:,}/{ti.get('total_steps','?'):,}" if ti.get("step") else None)
+        + _dmetric("Loss", ti.get("loss_smooth") or ti.get("loss"), fmt=".4f")
+        + _dmetric("ETA", f"{ti.get('eta_h','?')}h" if ti.get("eta_h") is not None else None)
+        + _dmetric("Prep step", pi.get("step"))
+        + _dmetric("Prep %", f"{pi.get('pct', 0):.0f}%" if pi.get("pct") is not None else None)
+    )
+    summary_card = (
+        f'<div class="card"><h2>Summary &nbsp; {counts_html}</h2>'
+        f'<div class="mrow">{summary_metrics}</div>'
+        f'<div style="margin-top:8px"><span class="badge {disk_cls}">{disk} GB free</span></div>'
+        f'</div>'
+    )
+
+    # Issues table
+    if issues:
+        rows = ""
+        for i in issues:
+            sev_cls = {"CRITICAL": "err", "WARNING": "warn", "INFO": "info"}.get(i.severity, "")
+            chunk_s = f" (chunk {i.chunk})" if i.chunk is not None else ""
+            fix_html = (
+                f'<pre>{_dh(i.fix.strip())}</pre>' if i.fix else ""
+            )
+            detail_html = (
+                f'<div style="font-size:11px;color:#555;margin:3px 0">{_dh((i.detail or "")[:300])}</div>'
+                if i.detail else ""
+            )
+            rows += (
+                f'<tr><td><span class="badge {sev_cls}">{_dh(i.severity)}</span></td>'
+                f'<td><span class="category">{_dh(i.category)}{_dh(chunk_s)}</span><br>'
+                f'<b>{_dh(i.title)}</b>{detail_html}{fix_html}</td></tr>'
+            )
+        issues_card = (
+            f'<div class="card"><h2>Issues ({len(issues)})</h2>'
+            f'<table><tr><th style="width:90px">Severity</th><th>Details</th></tr>'
+            f'{rows}</table></div>'
+        )
+    else:
+        issues_card = '<div class="card"><h2>Issues</h2><p style="color:#27ae60">No issues found.</p></div>'
+
+    ts = now_iso()
+    body = (
+        f'<div class="hdr"><h1>iris Pipeline Doctor</h1>'
+        f'<span class="ts">{_dh(ts)}</span></div>'
+        f'{top_html}{summary_card}{issues_card}'
+    )
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta http-equiv="refresh" content="60">'
+        f'<title>iris Pipeline Doctor</title>'
+        f'<style>{_DOC_HTML_STYLE}</style></head><body>{body}</body></html>'
+    )
+
+
 def print_json_output(args_chunk: Optional[int]) -> None:
     issues = _issues
     if args_chunk is not None:
@@ -1688,6 +1828,8 @@ def main() -> None:
                         ))
     parser.add_argument("--config", default=None, metavar="PATH",
                         help="Path to v2_pipeline.yaml (auto-detected if omitted)")
+    parser.add_argument("--html", metavar="PATH",
+                        help="Write rich HTML report to PATH (use - for stdout); auto-refreshes every 60s")
     parser.add_argument("--watch", action="store_true",
                         help="Re-run every --watch-interval seconds; only print when issue set changes")
     parser.add_argument("--watch-interval", type=int, default=60, metavar="SECS",
@@ -1703,7 +1845,7 @@ def main() -> None:
     if args.chunk is not None:
         chunks = [args.chunk]
 
-    if not args.json and not args.ai and not args.watch:
+    if not args.json and not args.ai and not args.html and not args.watch:
         print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
 
     def _run_checks() -> None:
@@ -1732,15 +1874,24 @@ def main() -> None:
     if args.watch:
         interval = args.watch_interval
         last_fp: Optional[frozenset] = None
-        print(f"Watching pipeline — refreshing every {interval}s (Ctrl-C to stop)")
+        if not args.html:
+            print(f"Watching pipeline — refreshing every {interval}s (Ctrl-C to stop)")
         try:
             while True:
                 _run_checks()
                 fp = _issue_fingerprint()
-                if fp != last_fp:
-                    os.system("clear")
-                    print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
-                    print_report(args.chunk)
+                if fp != last_fp or args.html:
+                    if args.html:
+                        summary = _build_summary(cfg, chunks)
+                        html = render_html_doctor(summary, args.chunk)
+                        if args.html == "-":
+                            print(html)
+                        else:
+                            Path(args.html).write_text(html)
+                    else:
+                        os.system("clear")
+                        print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
+                        print_report(args.chunk)
                     last_fp = fp
                 time.sleep(interval)
         except KeyboardInterrupt:
@@ -1751,7 +1902,15 @@ def main() -> None:
     _run_checks()
 
     # ── output ────────────────────────────────────────────────────────────
-    if args.ai:
+    if args.html:
+        summary = _build_summary(cfg, chunks)
+        html = render_html_doctor(summary, args.chunk)
+        if args.html == "-":
+            print(html)
+        else:
+            Path(args.html).write_text(html)
+            print(f"HTML written to {args.html}")
+    elif args.ai:
         summary = _build_summary(cfg, chunks)
         print_ai_output(summary, args.chunk)
     elif args.json:

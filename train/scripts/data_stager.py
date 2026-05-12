@@ -554,7 +554,8 @@ def cmd_archive(args) -> None:
 
 def cmd_status(args) -> None:
     s = _build_stager(args)
-    print(json.dumps(s.status(), indent=2))
+    indent = None if getattr(args, "ai", False) else 2
+    print(json.dumps(s.status(), indent=indent))
 
 
 def main() -> None:
@@ -574,6 +575,8 @@ def main() -> None:
     p_arch.set_defaults(func=cmd_archive)
 
     p_stat = sub.add_parser("status", help="Show stager status")
+    p_stat.add_argument("--ai", action="store_true",
+                        help="Compact JSON for AI consumption")
     p_stat.set_defaults(func=cmd_status)
 
     args = ap.parse_args()

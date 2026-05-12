@@ -736,6 +736,205 @@ def _ai_summary(status: dict) -> dict:
     return out
 
 
+_HTML_STYLE = """
+body{font-family:system-ui,sans-serif;margin:0;background:#f0f2f5;color:#222;font-size:13px}
+.hdr{background:#1a1a2e;color:#eee;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
+.hdr h1{margin:0;font-size:16px;font-weight:700}.ts{font-size:11px;color:#aaa}
+.card{background:#fff;border-radius:6px;padding:14px 18px;margin:10px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h2{margin:0 0 10px;font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.8px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+td,th{padding:6px 10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+th{background:#f7f7f7;font-weight:600;color:#555}tr:last-child td{border-bottom:none}
+pre{background:#1e1e1e;color:#ccc;padding:10px;border-radius:4px;overflow-x:auto;font-size:11px;
+    margin:4px 0;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow-y:auto}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+.ok{background:#d4edda;color:#155724}.warn{background:#fff3cd;color:#856404}
+.err{background:#fde8e8;color:#a00}.info{background:#d1ecf1;color:#0c5460}
+.state-done{color:#27ae60;font-weight:600}.state-training{color:#2980b9;font-weight:600}
+.state-error{color:#c0392b;font-weight:600}.state-dim{color:#999}
+.win-row{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.win{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700}
+.win-up{background:#d4edda;color:#155724}.win-down{background:#f8d7da;color:#721c24}
+.pbar{height:6px;background:#e0e0e0;border-radius:3px;overflow:hidden;margin:4px 0}
+.pbar-fill{height:100%;background:#3498db;border-radius:3px}
+.mrow{display:flex;gap:20px;flex-wrap:wrap;margin-top:8px}
+.metric{display:flex;flex-direction:column;gap:1px}
+.mlabel{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px}
+.mval{font-size:15px;font-weight:700;font-family:monospace}
+.issue{border-left:3px solid #ccc;padding:4px 8px;margin:4px 0;font-size:12px}
+.issue-critical{border-color:#c00}.issue-warning{border-color:#e67e22}
+code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:11px}
+"""
+
+
+def _h(s) -> str:
+    import html as _html_mod
+    return _html_mod.escape(str(s)) if s is not None else ""
+
+
+def _metric(label: str, val, fmt: str = ".4f") -> str:
+    if val is None:
+        return ""
+    v = f"{val:{fmt}}" if fmt else str(val)
+    return (f'<div class="metric">'
+            f'<span class="mlabel">{_h(label)}</span>'
+            f'<span class="mval">{_h(v)}</span></div>')
+
+
+def render_html_status(status: dict) -> str:
+    """Render pipeline status as a self-contained auto-refreshing HTML page."""
+    ts      = status.get("ts", "")
+    disk    = status.get("disk_free_gb", "?")
+    shards  = status.get("shards_production", 0)
+    staging = status.get("shards_staging", 0)
+    precomp = status.get("precomputed_records", 0)
+    tmux    = status.get("tmux", {})
+    trainer = status.get("trainer", {})
+    dispatch_issues = status.get("dispatch_issues", [])
+
+    # tmux windows row
+    wins = ["session", "train", "prep", "orch", "stage"]
+    win_html = "".join(
+        f'<span class="win win-{"up" if tmux.get(w) else "down"}">'
+        f'{"●" if tmux.get(w) else "○"} {_h(w)}</span>'
+        for w in wins
+    )
+
+    # disk badge colour
+    disk_cls = ("ok" if isinstance(disk, (int, float)) and disk > 80
+                else "warn" if isinstance(disk, (int, float)) and disk > 40
+                else "err")
+
+    overview = (
+        f'<div class="card"><h2>Overview</h2>'
+        f'<div class="win-row">{win_html}</div>'
+        f'<table><tr><th>Disk free</th><th>Shards</th>'
+        f'<th>Staging</th><th>Precomputed</th></tr>'
+        f'<tr><td><span class="badge {disk_cls}">{_h(disk)} GB</span></td>'
+        f'<td>{shards:,}</td><td>{staging:,}</td><td>{precomp:,}</td></tr>'
+        f'</table></div>'
+    )
+
+    # Chunk table
+    chunk_rows = ""
+    for c, cs in sorted(status.get("chunks", {}).items()):
+        state = str(cs.get("state", "?"))
+        state_cls = {"DONE": "state-done", "TRAINING": "state-training",
+                     "ERROR": "state-error"}.get(state, "state-dim")
+        steps_done  = cs.get("steps_done", 0)
+        steps_total = cs.get("steps_total", 1)
+        active = _h(cs.get("active_step") or cs.get("last_done") or "")
+
+        detail_parts = []
+        for step, msg in cs.get("errors", {}).items():
+            lines = [l for l in msg.splitlines() if l.strip()]
+            detail = _h((lines[-1] if lines else "unknown error")[:120])
+            detail_parts.append(
+                f'<div class="issue issue-critical">'
+                f'<span class="badge err">ERR</span> {_h(step)}: {detail}</div>'
+            )
+        if state == "TRAINING":
+            thb = _trainer_heartbeat(c)
+            if thb:
+                sn = thb.get("step", 0)
+                st = thb.get("total_steps", 1) or 1
+                loss = thb.get("loss_smooth") or thb.get("loss")
+                eta  = thb.get("eta_sec")
+                pct  = int(sn / st * 100) if st else 0
+                loss_s = f"{loss:.4f}" if loss is not None else "—"
+                eta_s  = _age_str(eta) if eta else "—"
+                rc = thb.get("loss_cross_ref")
+                rs = thb.get("loss_self_ref")
+                gap_s = f" · ref_gap={rc-rs:+.4f}" if rc is not None and rs is not None else ""
+                detail_parts.append(
+                    f'<div class="pbar"><div class="pbar-fill" style="width:{pct}%"></div></div>'
+                    f'<span style="font-size:11px;color:#666">step {sn:,}/{st:,} '
+                    f'· loss {loss_s} · ETA {eta_s}{gap_s}</span>'
+                )
+        chunk_rows += (
+            f'<tr><td><b>chunk {c}</b></td>'
+            f'<td><span class="{state_cls}">{_h(state)}</span></td>'
+            f'<td>{steps_done}/{steps_total}</td>'
+            f'<td>{active}</td>'
+            f'<td>{"".join(detail_parts)}</td></tr>'
+        )
+
+    chunks_card = (
+        f'<div class="card"><h2>Chunk Status</h2>'
+        f'<table><tr><th>Chunk</th><th>State</th><th>Steps</th>'
+        f'<th>Active</th><th>Detail</th></tr>'
+        f'{chunk_rows}</table></div>'
+    )
+
+    # Active training metrics card
+    train_card = ""
+    if trainer and trainer.get("step"):
+        sn = trainer.get("step", 0)
+        st = trainer.get("total_steps", 1) or 1
+        pct = int(sn / st * 100) if st else 0
+        loss  = trainer.get("loss_smooth") or trainer.get("loss")
+        grad  = trainer.get("grad_norm")
+        eta   = trainer.get("eta_sec")
+        lc    = trainer.get("loss_cond")
+        ln    = trainer.get("loss_null")
+        ls    = trainer.get("loss_self_ref")
+        lcr   = trainer.get("loss_cross_ref")
+        ipm   = trainer.get("ip_scale_mean")
+        age_s = _age_str(trainer.get("hb_age_s")) if trainer.get("hb_age_s") else "?"
+        metrics = (
+            _metric("Loss", loss)
+            + _metric("Grad norm", grad)
+            + _metric("ETA", _age_str(eta) if eta else None, fmt="")
+            + (_metric("cond_gap", ln - lc) if lc is not None and ln is not None else "")
+            + (_metric("ref_gap",  lcr - ls) if ls is not None and lcr is not None else "")
+            + _metric("ip_scale", ipm)
+        )
+        stale = trainer.get("stale", False)
+        stale_html = ' <span class="badge warn">STALE HB</span>' if stale else ""
+        train_card = (
+            f'<div class="card"><h2>Active Training — chunk {_h(trainer.get("chunk","?"))}'
+            f' <span style="font-weight:400;font-size:11px;color:#888">'
+            f'hb {age_s} ago{stale_html}</span></h2>'
+            f'<div class="pbar"><div class="pbar-fill" style="width:{pct}%"></div></div>'
+            f'<div style="font-size:11px;color:#666;margin:2px 0">'
+            f'step {sn:,} / {st:,} ({pct}%)</div>'
+            f'<div class="mrow">{metrics}</div></div>'
+        )
+
+    # Dispatch issues card
+    issues_card = ""
+    if dispatch_issues:
+        rows = ""
+        for i in dispatch_issues[:20]:
+            sev = i.get("severity", "").upper()
+            cls = "issue-critical" if "CRITICAL" in sev else "issue-warning"
+            badge_cls = "err" if "CRITICAL" in sev else "warn"
+            action = i.get("suggested_action", "")
+            rows += (
+                f'<div class="issue {cls}">'
+                f'<span class="badge {badge_cls}">{_h(sev)}</span> '
+                f'{_h((i.get("message",""))[:150])}'
+                + (f' <code>{_h(action)}</code>' if action else "")
+                + "</div>"
+            )
+        issues_card = (
+            f'<div class="card"><h2>{len(dispatch_issues)} Dispatch Issue(s)</h2>'
+            f'{rows}</div>'
+        )
+
+    body = (
+        f'<div class="hdr"><h1>iris Pipeline Status</h1>'
+        f'<span class="ts">{_h(ts)}</span></div>'
+        f'{overview}{chunks_card}{train_card}{issues_card}'
+    )
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta http-equiv="refresh" content="30">'
+        f'<title>iris Pipeline Status</title>'
+        f'<style>{_HTML_STYLE}</style></head><body>{body}</body></html>'
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json",      action="store_true")
@@ -746,6 +945,8 @@ def main() -> None:
                     help="Total chunks (default: auto-detect)")
     ap.add_argument("--watch",     action="store_true", help="Refresh every 30s")
     ap.add_argument("--verbose",   action="store_true", help="Extended log tails + full heartbeats")
+    ap.add_argument("--html",      metavar="PATH",
+                    help="Write rich HTML report to PATH (use - for stdout); auto-refreshes every 30s")
     ap.add_argument("--data-root", default=None)
     args = ap.parse_args()
 
@@ -761,6 +962,14 @@ def main() -> None:
             print(json.dumps(_ai_summary(status)))
         elif args.json:
             print(json.dumps(status, indent=2, default=str))
+        elif args.html:
+            html = render_html_status(status)
+            if args.html == "-":
+                print(html)
+            else:
+                Path(args.html).write_text(html)
+                if not args.watch:
+                    print(f"HTML written to {args.html}")
         elif args.brief:
             print_brief(status)
         else:
@@ -768,7 +977,8 @@ def main() -> None:
 
     if args.watch:
         while True:
-            os.system("clear")
+            if not args.html:
+                os.system("clear")
             once()
             time.sleep(30)
     else:

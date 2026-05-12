@@ -77,6 +77,22 @@ def cmd_list(precomp: Path, encoder: str | None) -> None:
               "convert an existing flat cache.")
 
 
+def cmd_list_ai(precomp: Path, encoder: str | None) -> None:
+    import json
+    encs = (encoder,) if encoder else ENCODERS
+    result = {}
+    for enc in encs:
+        versions = PrecomputeCache.list_versions(precomp, enc)
+        cur = PrecomputeCache.effective_dir(precomp, enc)
+        n_current = sum(1 for f in cur.iterdir() if f.suffix == ".npz") if cur else 0
+        result[enc] = {
+            "versions": versions,
+            "current_dir": str(cur) if cur else None,
+            "current_record_count": n_current,
+        }
+    print(json.dumps(result, default=str))
+
+
 def cmd_clear_stale(precomp: Path, encoder: str | None) -> None:
     encs = (encoder,) if encoder else ENCODERS
     for enc in encs:
@@ -137,6 +153,10 @@ def main() -> None:
         "--migrate-legacy", action="store_true",
         help="Move flat .npz files in enc_dir into v_legacy/ and create current symlink",
     )
+    ap.add_argument(
+        "--ai", action="store_true",
+        help="Output compact JSON for AI consumption (list mode only)",
+    )
     args = ap.parse_args()
 
     precomp = args.data_root / "precomputed"
@@ -147,6 +167,8 @@ def main() -> None:
         cmd_clear_version(precomp, args.encoder, args.clear_version)
     elif args.migrate_legacy:
         cmd_migrate(precomp, args.encoder)
+    elif args.ai:
+        cmd_list_ai(precomp, args.encoder)
     else:
         cmd_list(precomp, args.encoder)
 

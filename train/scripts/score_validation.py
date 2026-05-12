@@ -191,6 +191,8 @@ def main() -> None:
     ap.add_argument("--output",  default=None, help="Write scores JSON to this path")
     ap.add_argument("--weight-errors", nargs="*", default=None,
                     help="Pass weight integrity errors to include in verdict")
+    ap.add_argument("--ai", action="store_true",
+                    help="Print compact JSON verdict to stdout; suppress prose")
     args = ap.parse_args()
 
     _load_clip()
@@ -221,19 +223,24 @@ def main() -> None:
               f"delta={result.get('adapter_delta', 'n/a')}")
 
     verdict = compute_verdict(pair_results, args.weight_errors or [])
-    print(f"\nVerdict: {verdict['verdict']}")
-    print(f"  mean_clip_i={verdict.get('mean_clip_i')}  "
-          f"mean_delta={verdict.get('mean_adapter_delta')}")
 
     output = {
         "verdict": verdict,
         "pairs": pair_results,
     }
 
+    if args.ai:
+        print(json.dumps(verdict, default=str))
+    else:
+        print(f"\nVerdict: {verdict['verdict']}")
+        print(f"  mean_clip_i={verdict.get('mean_clip_i')}  "
+              f"mean_delta={verdict.get('mean_adapter_delta')}")
+
     if args.output:
         with open(args.output, "w") as f:
             json.dump(output, f, indent=2)
-        print(f"Scores written to {args.output}")
+        if not args.ai:
+            print(f"Scores written to {args.output}")
 
     sys.exit(0)
 
