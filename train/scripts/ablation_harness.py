@@ -1457,19 +1457,19 @@ def _render_html(
         best_so_far.append(running_best)
 
     # Pareto scatter: ref_gap vs cond_gap coloured by rank, Pareto front highlighted
-    ranked_ids = {r["id"]: i + 1 for i, r in enumerate(ranked)}
+    ranked_rank = {id(r): i + 1 for i, r in enumerate(ranked)}
     pareto_data = [
         {
-            "id":         r["id"],
+            "id":         r.get("id", idx),
             "combo_id":   r.get("combo_id", ""),
             "ref_gap":    r.get("ref_gap"),
             "cond_gap":   r.get("cond_gap"),
             "final_loss": r.get("final_loss"),
             "score":      r.get("score"),
             "is_pareto":  r.get("is_pareto", 0),
-            "color":      _html_color(ranked_ids.get(r["id"], 99)),
+            "color":      _html_color(ranked_rank.get(id(r), 99)),
         }
-        for r in results
+        for idx, r in enumerate(results)
         if r.get("ref_gap") is not None and r.get("cond_gap") is not None
     ]
 

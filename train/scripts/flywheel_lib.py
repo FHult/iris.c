@@ -505,7 +505,7 @@ def render_flywheel_index(
     <canvas id="condTrend" width="560" height="200"></canvas>
   </div>
   <div>
-    <div class="chart-label">ref_gap (cross − self) secondary · Pareto front: ref_gap vs cond_gap</div>
+    <div class="chart-label">Pareto front: ref_gap vs cond_gap</div>
     <canvas id="refTrend" width="340" height="200"></canvas>
   </div>
 </div>

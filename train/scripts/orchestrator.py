@@ -2456,6 +2456,9 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
              f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
              f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
 
+    plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
+    plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
+
     while iteration <= max_iters:
         _check_flywheel_control(name)
 
@@ -2692,8 +2695,6 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 )
 
         # Plateau detection
-        plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
-        plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
         plateau_reason: Optional[str] = None
         if plateau_patience > 0:
             done_iters = [r for r in fw_db.get_iterations(name) if r["status"] == "done"]
@@ -2702,12 +2703,10 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
                          level="warning")
                 try:
-                    from pipeline_lib import FLYWHEEL_CONTROL_FILE
-                    import json as _json
                     FLYWHEEL_CONTROL_FILE.write_text(
-                        _json.dumps({"action": "pause",
-                                     "reason": plateau_reason,
-                                     "auto":   True})
+                        json.dumps({"action": "pause",
+                                    "reason": plateau_reason,
+                                    "auto":   True})
                     )
                 except Exception as _e:
                     log_orch(f"[flywheel:{name}] could not write plateau pause: {_e}",
