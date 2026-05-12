@@ -54,6 +54,6 @@ flywheel:
   shard_manifest: null
 
   # Ablation integration — set ablation_every_n: 0 to disable
-  ablation_every_n: 5            # run ablation burst every N successful iterations
+  ablation_every_n: 0            # disabled for trial 1 — ablation steps_per_run (12000) >> flywheel steps (1000)
   ablation_max_runs: 4           # trial 1: limit ablation overhead (2 bursts at iter 5 + 10)
   ablation_config: "train/configs/ablation_sref_v1.yaml"
