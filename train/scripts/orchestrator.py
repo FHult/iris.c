@@ -2231,6 +2231,7 @@ def _check_flywheel_control(name: str) -> None:
         if action == "stop":
             log_orch(f"[flywheel:{name}] stop signal — exiting")
             FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+            release_gpu_lock()
             sys.exit(0)
         elif action == "pause":
             log_orch(f"[flywheel:{name}] paused — waiting for resume")
@@ -2255,7 +2256,6 @@ def _build_flywheel_train_config(
     staging_dir: Path,
     steps: int,
     hyperparams: dict,
-    resume_ckpt: Optional[str],
     iteration: int,
     name: str,
 ) -> Path:
@@ -2286,7 +2286,6 @@ def _run_flywheel_ablation(
     fw_cfg: dict,
     name: str,
     iteration: int,
-    resume_ckpt: Optional[str],
 ) -> Optional[str]:
     """
     Run a capped ablation burst to tune hyperparams.
@@ -2306,9 +2305,12 @@ def _run_flywheel_ablation(
     with open(abl_cfg_path) as f:
         abl_cfg = yaml.safe_load(f)
 
+    # _load_harness_config strips the top-level "ablation:" key, so we must
+    # write the override into the inner dict to ensure it is honoured.
+    inner = abl_cfg.get("ablation", abl_cfg)
     max_runs = int(fw_cfg.get("ablation_max_runs", 10))
-    abl_cfg["max_total_runs"] = max_runs
-    run_name = abl_cfg.get("name", abl_cfg_path.stem)
+    inner["max_total_runs"] = max_runs
+    run_name = inner.get("name", abl_cfg_path.stem)
 
     tmp_cfg = Path(f"/tmp/flywheel_{name}_ablation_{iteration:04d}.yaml")
     tmp_cfg.write_text(yaml.dump(abl_cfg, default_flow_style=False))
@@ -2488,7 +2490,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         # Build temp training config pointing at staged shards
         train_cfg_path = _build_flywheel_train_config(
             fw_cfg, staging_dir, steps_per_iter, hyperparams,
-            resume_ckpt, iteration, name,
+            iteration, name,
         )
 
         # Launch training in TMUX_TRAIN_WIN
@@ -2547,7 +2549,8 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
 
         # Update iteration record
         fw_db.update_iteration(
-            row_id=row_id, status=status, exit_code=exit_code or -1,
+            row_id=row_id, status=status,
+            exit_code=exit_code if exit_code is not None else -1,
             elapsed_secs=elapsed,
             train_loss=metrics.get("loss_smooth"),
             ref_gap=metrics.get("ref_gap"),
@@ -2580,14 +2583,15 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         # Ablation burst (every N iterations, only on successful runs)
         ablation_run: Optional[str] = None
         if ablation_every > 0 and iteration % ablation_every == 0 and status == "done":
-            ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration, resume_ckpt)
+            ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration)
             if ablation_run:
                 new_hp = _read_ablation_best(ablation_run)
                 if new_hp:
                     hyperparams.update(new_hp)
                     log_orch(f"[flywheel:{name}] hyperparams updated → {hyperparams}")
                 fw_db.update_iteration(
-                    row_id=row_id, status=status, exit_code=exit_code or 0,
+                    row_id=row_id, status=status,
+                    exit_code=exit_code if exit_code is not None else -1,
                     elapsed_secs=elapsed,
                     train_loss=metrics.get("loss_smooth"),
                     ref_gap=metrics.get("ref_gap"),

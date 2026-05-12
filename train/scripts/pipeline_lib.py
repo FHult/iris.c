@@ -47,7 +47,7 @@ TMUX_ORCH_WIN  = "iris-orch"
 TMUX_WATCH_WIN = "iris-watchdog"
 TMUX_STAGE_WIN    = "iris-stage"     # data_stager.py — cold/hot staging, runs alongside training
 TMUX_ABLATION_WIN = "iris-ablation"  # ablation_harness.py — long-term autonomous ablation
-TMUX_FLYWHEEL_WIN = "iris-flywheel"  # flywheel.py — self-improving sref optimization loop
+TMUX_FLYWHEEL_WIN = "iris-flywheel"  # orchestrator.py --flywheel-config — sref optimization loop
 
 ABLATION_CONTROL_FILE = DATA_ROOT / "ablation_control.json"
 ABLATION_DB_PATH      = DATA_ROOT / "ablation_history.db"

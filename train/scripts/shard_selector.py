@@ -326,6 +326,9 @@ def select_shards(
         print("WARNING: no shards in DB — returning empty selection", file=sys.stderr)
         return []
     if len(all_shards) <= n_shards:
+        selected_ids = [s["shard_id"] for s in all_shards]
+        db.mark_selected(selected_ids)
+        db.log_selection(flywheel_name, iteration, selected_ids, cfg)
         return [s["path"] for s in all_shards]
 
     selected_ids: set[str] = set()
