@@ -41,7 +41,9 @@ flywheel:
   # Attribution configuration
   # min_attribution_obs: minimum observations in BOTH included and excluded sets before
   # the attributed (causal) score is used for ranking.  Lower = faster trust, noisier.
-  min_attribution_obs: 3
+  # Trial 1: only 2 shards activated attribution after 12 iterations at obs=3.
+  # Lowered to 2 for faster convergence; still requires evidence on both sides.
+  min_attribution_obs: 2
 
   # SigLIP mean embedding
   # siglip_sample_n: images sampled per shard when computing mean embedding.

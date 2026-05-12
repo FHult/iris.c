@@ -2653,14 +2653,15 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 n_in_batch=len(shard_ids),
             )
 
-        # Promote checkpoint for the next iteration; mark as best if quality improved
+        # Promote checkpoint for the next iteration; mark as best if quality improved.
+        # cond_gap is the primary criterion: stable and informative at 1000-step budgets.
         if status == "done" and ckpt_path:
-            prior_ref = prior_best.get("ref_gap") if prior_best else None
-            new_ref   = metrics.get("ref_gap")
-            if new_ref is not None and (prior_ref is None or new_ref > prior_ref):
+            prior_cond = prior_best.get("cond_gap") if prior_best else None
+            new_cond   = metrics.get("cond_gap")
+            if new_cond is not None and (prior_cond is None or new_cond > prior_cond):
                 fw_db.mark_best_checkpoint(name, iteration)
                 log_orch(f"[flywheel:{name}] new best checkpoint  "
-                         f"ref_gap={new_ref:.4f}  hash={new_ckpt_hash}")
+                         f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
             resume_ckpt = ckpt_path
 
         # Clean up staging symlinks

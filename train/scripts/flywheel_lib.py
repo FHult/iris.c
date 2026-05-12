@@ -217,10 +217,12 @@ class FlywheelDB:
         return [dict(r) for r in rows]
 
     def get_best(self, name: str) -> Optional[dict]:
+        # cond_gap is the primary quality signal: stable and monotonically informative
+        # at 1000-step iteration budgets.  ref_gap is noisy at this scale.
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM iterations WHERE flywheel_name=? AND ref_gap IS NOT NULL "
-                "ORDER BY ref_gap DESC LIMIT 1",
+                "SELECT * FROM iterations WHERE flywheel_name=? AND cond_gap IS NOT NULL "
+                "ORDER BY cond_gap DESC LIMIT 1",
                 (name,),
             ).fetchone()
         return dict(row) if row else None

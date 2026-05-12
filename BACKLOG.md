@@ -163,6 +163,23 @@ Before launching trial 2, complete the following:
    rm -f /Volumes/2TBSSD/.heartbeat/*.json
    ```
 
+**FLYWHEEL-METRIC-1: Composite score and best-checkpoint criterion use wrong primary metric** ✓ Done
+
+Trial 1 showed `ref_gap` is consistently negative and noisy at 1000-step iteration budgets (avg −0.016 across all shards; only iter 7 positive). `cond_gap` is the reliable signal: positive, monotonically growing (0.182→0.385 over clean iters 7–10), and has 2.6× spread across shards (0.15–0.38) vs ref_gap's near-zero spread.
+
+Fixed (same commit):
+- `shard_selector.py` `_compute_raw_composite`: weights changed to `cond_gap=0.65 / ref_gap=0.20 / loss=0.15`; cond_gap normalization tightened from `[-3, +0.5]` to `[-0.5, +0.5]` to give meaningful spread at observed values.
+- `flywheel_lib.py` `get_best`: `ORDER BY ref_gap DESC` → `ORDER BY cond_gap DESC`.
+- `orchestrator.py` mark-best trigger: comparison switched from `ref_gap` to `cond_gap`.
+
+**FLYWHEEL-ATTR-1: Attribution convergence too slow — min_attribution_obs=3 too conservative** ✓ Done
+
+After 12 flywheel iterations, only 2 of 42 scored shards had `attr_confidence > 0`. The `min_attribution_obs=3` gate requires ≥3 inclusions AND ≥3 exclusions before attribution activates. With 20 shards/iteration from a 42-shard pool, high-frequency shards (e.g. shard 000002, selected 5/6 iters) never accumulate enough exclusion observations.
+
+Fixed: `min_attribution_obs: 3 → 2` in `flywheel_sref_v1.yaml`. This activates attribution ~2× faster while still requiring evidence on both inclusion and exclusion sides.
+
+Note: if the same shards keep dominating the performance slots (see shard 000002 above), `performance_weight: 0.60` or `recency_penalty: 0.30` may also need tuning in trial 2. A tighter recency window or higher exploration rate would force more exclusion observations for consistently top-ranked shards.
+
 **FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
 
 The ablation burst was disabled for trial 1 (`ablation_every_n: 0`) after it launched a 12,000-step run (~12.8h) that would have blocked the flywheel for ~51h (4 runs × 12.8h). Three things need fixing before re-enabling:

@@ -599,8 +599,13 @@ def _compute_raw_composite(
     """
     Normalise each signal to ~[0,1] and return weighted composite.
     ref_gap:  cross−self style gap.  Typical range [−0.5, +0.5].  Higher=better.
-    cond_gap: null−cond loss gap.    Typical range [−3,  +0.5].  Higher=better.
+    cond_gap: null−cond loss gap.    Typical range [−0.5, +0.5].  Higher=better.
     loss:     smooth training loss.  Typical range [0.3,  3.0].  Lower=better.
+
+    Weights: cond_gap is primary (0.65) because it is stable and monotonically
+    informative at 1000-step iteration budgets.  ref_gap (0.20) is noisy at this
+    scale and consistently negative; it is kept to preserve long-run signal once
+    training has converged further.  Loss (0.15) is secondary smoothing.
     """
     if ref_gap is None and cond_gap is None and loss is None:
         return None
@@ -609,13 +614,13 @@ def _compute_raw_composite(
     if ref_gap is not None:
         norm = (ref_gap + 0.5) / 1.0
         norm = max(0.0, min(1.0, norm))
-        score  += 0.55 * norm
-        w_total += 0.55
+        score  += 0.20 * norm
+        w_total += 0.20
     if cond_gap is not None:
-        norm = (cond_gap + 3.0) / 3.5
+        norm = (cond_gap + 0.5) / 1.0
         norm = max(0.0, min(1.0, norm))
-        score  += 0.30 * norm
-        w_total += 0.30
+        score  += 0.65 * norm
+        w_total += 0.65
     if loss is not None:
         norm = 1.0 - min(1.0, max(0.0, (loss - 0.3) / 2.7))
         score  += 0.15 * norm
