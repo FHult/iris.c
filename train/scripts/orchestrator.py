@@ -2428,13 +2428,27 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     iteration = (max(r["iteration"] for r in prior) + 1) if prior else 1
     hyperparams = dict(fw_cfg.get("hyperparams", {}))
 
-    # Determine starting checkpoint
+    # Determine starting checkpoint.
+    # Prefer the chronologically latest step_*.safetensors from CKPT_DIR so that
+    # restarts always continue the cumulative training chain.  get_best() returns
+    # best-by-ref_gap which may be an older checkpoint (FLYWHEEL-BUG-1).
     resume_ckpt: Optional[str] = None
-    done_iters = [r for r in prior if r["status"] == "done"]
-    if done_iters:
-        best = fw_db.get_best(name)
-        if best and best.get("checkpoint"):
-            resume_ckpt = best["checkpoint"]
+
+    def _step_num(p: Path) -> int:
+        try:
+            return int(p.stem.split("_")[1])
+        except (IndexError, ValueError):
+            return 0
+
+    ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"), key=_step_num)
+    if ckpts:
+        resume_ckpt = str(ckpts[-1])
+    else:
+        done_iters = [r for r in prior if r["status"] == "done"]
+        if done_iters:
+            best = fw_db.get_best(name)
+            if best and best.get("checkpoint"):
+                resume_ckpt = best["checkpoint"]
     if resume_ckpt is None:
         resume_ckpt = fw_cfg.get("base_checkpoint")
 

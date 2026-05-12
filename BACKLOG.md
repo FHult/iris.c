@@ -136,13 +136,32 @@ data_root/
 
 ## Flywheel Performance
 
-**FLYWHEEL-BUG-1: Restart uses best-by-ref_gap checkpoint instead of latest**
+~~**FLYWHEEL-BUG-1: Restart uses best-by-ref_gap checkpoint instead of latest**~~ ✓ Done
 
-On unclean flywheel restart, `orchestrator.py:2435` calls `fw_db.get_best(name)["checkpoint"]` to determine the resume checkpoint. `get_best` returns the iteration with the highest `ref_gap`, which in trial 1 was iter 7 (`step_0095000`) — the same as the pre-flywheel base. Iters 8–10 had trained cumulatively to `step_0098000`, but the restart reverted to `step_0095000`, causing iter 11 to fork from the stale base (cond_gap dropped from +0.385 to +0.146).
+Fixed in `orchestrator.py`: on restart, prefer the chronologically latest `step_*.safetensors` from CKPT_DIR. Falls back to `get_best()` only if CKPT_DIR is empty, then to `base_checkpoint` from config.
 
-Fix: on restart, prefer `max(CKPT_DIR.glob("step_*.safetensors"), key=step_number)` over `get_best()`. Only fall back to the DB best if CKPT_DIR has no checkpoints. The "best quality" vs "most recent" distinction only matters for external use; the flywheel should always continue from the most recent iteration's output to preserve the cumulative training chain.
+**FLYWHEEL-TRIAL2: Pre-trial-2 warm-start checklist**
 
-Affected code: `orchestrator.py` lines 2432–2439, function `run_flywheel_loop`.
+Before launching trial 2, complete the following:
+
+1. **Set `base_checkpoint`** in `flywheel_sref_v1.yaml` to the best checkpoint from trial 1. Use `cond_gap` (not `ref_gap` — too noisy at 1000 steps) to select it:
+   ```bash
+   sqlite3 /Volumes/2TBSSD/flywheel_history.db \
+     "SELECT iteration, checkpoint FROM checkpoint_log \
+      WHERE flywheel_name='sref-v1' \
+      ORDER BY cond_gap DESC LIMIT 1;"
+   ```
+   Set the returned path as `base_checkpoint:` in the config. This gives trial 2 a warm-started perceiver and K/V projections instead of random init, saving ~5–7 early iterations of convergence.
+
+2. **Fix FLYWHEEL-ABL-1** (ablation config) if re-enabling ablation for trial 2. See entry below.
+
+3. **Rename the flywheel** (`name: "sref-v2"`) and point to a fresh `flywheel_history.db` path, or clear the existing DB, so iteration numbering starts from 1.
+
+4. **Stale-state cleanup** before launch:
+   ```bash
+   rm -f /Volumes/2TBSSD/logs/*.log /Volumes/2TBSSD/logs/*.jsonl
+   rm -f /Volumes/2TBSSD/.heartbeat/*.json
+   ```
 
 **FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
 
