@@ -1,0 +1,34 @@
+# Ablation harness config — long-term style-feature search (QUALITY-10+)
+#
+# Launch:
+#   pipeline_ctl start-ablation train/configs/ablation_sref_v1.yaml
+#   pipeline_ctl ablation-status
+#   pipeline_ctl stop-ablation
+#
+# Or run directly:
+#   train/.venv/bin/python train/scripts/ablation_harness.py \
+#       --config train/configs/ablation_sref_v1.yaml \
+#       --output-dir /Volumes/2TBSSD/ablation_sref_v1
+
+ablation:
+  name: "sref-v1"
+  max_total_runs: 128        # full grid = 4×4×2×4 = 128 candidates
+  steps_per_run: 12000       # ~14 min/run at 512px
+  strategy: "bayesian"       # grid | random | bayesian
+  n_initial: 12              # random warm-up before GP kicks in (bayesian only)
+
+  objective:
+    clip_i_weight: 0.55          # ref_gap proxy for CLIP-I style fidelity (most important)
+    cross_ref_gap_weight: 0.30   # cond_gap: adapter learning signal
+    stability_weight: 0.15       # stability: low final loss
+
+  variables:
+    cross_ref_prob:              [0.0, 0.2, 0.35, 0.5]
+    patch_shuffle_prob:          [0.0, 0.25, 0.4, 0.5]
+    freeze_double_stream_scales: [true, false]
+    style_loss_weight:           [0.0, 0.03, 0.07, 0.12]
+
+  conditions:
+    # Style loss weight > 0 only makes sense when cross-ref sampling is enabled.
+    # This removes 3×4 = 12 invalid combos, leaving 116 valid candidates.
+    - "style_loss_weight == 0 or cross_ref_prob > 0"

@@ -25,10 +25,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, CONTROL_FILE, DISPATCH_QUEUE, LOG_DIR, SENTINEL_DIR,
-    TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, SCRIPTS_DIR, TRAIN_DIR,
+    TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ABLATION_WIN,
+    SCRIPTS_DIR, TRAIN_DIR,
     CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
+    ABLATION_CONTROL_FILE, ABLATION_DB_PATH,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
-    tmux_new_window, now_iso,
+    tmux_new_window, now_iso, read_heartbeat, heartbeat_age_secs,
 )
 
 
@@ -282,6 +284,110 @@ def cmd_populate_anchor_shards(args) -> None:
           f"{len(shards)} shards) → {ANCHOR_SHARDS_DIR}")
 
 
+def cmd_start_ablation(args) -> None:
+    """Launch ablation_harness.py in a dedicated iris-ablation tmux window."""
+    config = Path(args.ablation_config)
+    if not config.exists():
+        print(f"ERROR: config not found: {config}")
+        return
+    output_dir = Path(args.output_dir) if args.output_dir else DATA_ROOT / "ablation_long"
+    db_path = ABLATION_DB_PATH
+
+    if tmux_window_exists(TMUX_ABLATION_WIN):
+        print(f"ERROR: {TMUX_ABLATION_WIN} window already running — stop it first with ablation-stop")
+        return
+
+    if not tmux_session_exists():
+        subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_ABLATION_WIN],
+                       check=True)
+
+    log_file = LOG_DIR / "ablation.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clear any stale stop signal
+    ABLATION_CONTROL_FILE.unlink(missing_ok=True)
+
+    cmd = (
+        f"source '{TRAIN_DIR}/.venv/bin/activate' && "
+        f"caffeinate -dims python -u '{SCRIPTS_DIR}/ablation_harness.py' "
+        f"--config '{config}' --output-dir '{output_dir}' --db '{db_path}'"
+    )
+    tmux_new_window(TMUX_ABLATION_WIN, cmd, log_file)
+    print(f"Ablation started → {TMUX_ABLATION_WIN} window")
+    print(f"  config:  {config}")
+    print(f"  output:  {output_dir}")
+    print(f"  db:      {db_path}")
+    print(f"  log:     {log_file}")
+
+
+def cmd_stop_ablation(_args) -> None:
+    payload = {"action": "stop", "ts": now_iso()}
+    ABLATION_CONTROL_FILE.write_text(json.dumps(payload))
+    print("Stop signal written — harness will exit after the current run completes")
+    print(f"  control file: {ABLATION_CONTROL_FILE}")
+
+
+def cmd_pause_ablation(_args) -> None:
+    payload = {"action": "pause", "ts": now_iso()}
+    ABLATION_CONTROL_FILE.write_text(json.dumps(payload))
+    print("Pause signal written — harness will pause after the current run")
+
+
+def cmd_resume_ablation(_args) -> None:
+    ABLATION_CONTROL_FILE.unlink(missing_ok=True)
+    print("Resumed (cleared ablation control signal)")
+
+
+def cmd_ablation_status(_args) -> None:
+    """Show ablation heartbeat, window status, and DB summary."""
+    running = tmux_window_exists(TMUX_ABLATION_WIN)
+    print(f"  iris-ablation window: {'🟢 running' if running else '⬜ not running'}")
+
+    hb = read_heartbeat("ablation")
+    if hb:
+        age = heartbeat_age_secs("ablation")
+        age_str = f"{int(age)}s ago" if age is not None else "unknown"
+        print(f"  heartbeat: {age_str}  run={hb.get('run_name','')}  "
+              f"status={hb.get('status','')}  "
+              f"n_done={hb.get('n_done','?')}/{hb.get('n_max','?')}")
+        if hb.get("current_combo"):
+            print(f"  current:   {hb['current_combo']}  "
+                  f"step={hb.get('current_step','?')}  "
+                  f"loss={hb.get('current_loss','?')}  "
+                  f"ref_gap={hb.get('current_ref_gap','?')}")
+    else:
+        print("  heartbeat: not found")
+
+    ctrl_str = "none"
+    try:
+        ctrl = json.loads(ABLATION_CONTROL_FILE.read_text())
+        ctrl_str = ctrl.get("action", "none")
+    except (OSError, json.JSONDecodeError):
+        pass
+    print(f"  control signal: {ctrl_str}")
+
+    if ABLATION_DB_PATH.exists():
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect(str(ABLATION_DB_PATH))
+            rows = conn.execute(
+                "SELECT run_name, COUNT(*) as n, "
+                "SUM(CASE WHEN score IS NOT NULL THEN 1 ELSE 0 END) as scored, "
+                "MAX(score) as best_score "
+                "FROM experiments GROUP BY run_name ORDER BY run_name"
+            ).fetchall()
+            conn.close()
+            if rows:
+                print(f"\n  DB: {ABLATION_DB_PATH}")
+                for run, n, scored, best in rows:
+                    best_str = f"{best:.2f}" if best is not None else "—"
+                    print(f"    {run}: {n} experiments ({scored} scored)  best_score={best_str}")
+        except Exception as e:
+            print(f"  DB: error reading {ABLATION_DB_PATH}: {e}")
+    else:
+        print(f"  DB: not found ({ABLATION_DB_PATH})")
+
+
 def cmd_status(args) -> None:
     """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
     import subprocess
@@ -377,6 +483,18 @@ def main() -> None:
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing anchor shards")
 
+    p = sub.add_parser("start-ablation",
+                       help="Launch long-term ablation harness in iris-ablation tmux window")
+    p.add_argument("ablation_config", metavar="CONFIG",
+                   help="Harness config YAML (ablation: name/strategy/variables/...)")
+    p.add_argument("--output-dir", default=None, metavar="PATH",
+                   help=f"Output dir (default: {DATA_ROOT}/ablation_long)")
+
+    sub.add_parser("stop-ablation",    help="Send stop signal to running ablation harness")
+    sub.add_parser("pause-ablation",   help="Pause harness after current run")
+    sub.add_parser("resume-ablation",  help="Clear pause/stop signal")
+    sub.add_parser("ablation-status",  help="Show ablation heartbeat and DB summary")
+
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
@@ -393,6 +511,11 @@ def main() -> None:
         "dispatch-resolve":        cmd_dispatch_resolve,
         "dispatch-resolve-all":    cmd_dispatch_resolve_all,
         "populate-anchor-shards":  cmd_populate_anchor_shards,
+        "start-ablation":          cmd_start_ablation,
+        "stop-ablation":           cmd_stop_ablation,
+        "pause-ablation":          cmd_pause_ablation,
+        "resume-ablation":         cmd_resume_ablation,
+        "ablation-status":         cmd_ablation_status,
     }
     handlers[args.command](args)
 

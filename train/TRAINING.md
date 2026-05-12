@@ -4,44 +4,127 @@ Empirical findings and strategic analysis for the precompute + training pipeline
 
 ---
 
-## Ablation Harness (QUALITY-10)
+## Ablation Harness (QUALITY-10+)
 
-`train/scripts/ablation_harness.py` runs a matrix of short training experiments
-with different QUALITY hyperparameter combinations and ranks them by style fidelity.
+`train/scripts/ablation_harness.py` — long-term autonomous style-feature ablation
+with SQLite-backed persistent memory, Bayesian/random/grid search, and fire-and-forget
+operation. Two modes: **batch** (run a fixed matrix once) and **long-term** (runs for
+days, never repeats a config, gets smarter over time).
 
 ### When to use it
 
-Run the harness before committing to a full production chunk when you want to answer:
-- "Does `cross_ref_prob=0.5` outperform `0.3` at this scale?"
-- "Does `patch_shuffle_prob=0.5` help or hurt with the current data mix?"
-- "Is freezing double-stream scales worth the quality trade-off?"
-- "What `style_loss_weight` gives the best ref_gap without instability?"
+- Before committing to a full production chunk: "What `cross_ref_prob` + `style_loss_weight`
+  combination gives the best style separation at my current data scale?"
+- As a background daemon that keeps exploring while production training is between chunks.
 
-It does not require inference — ranking is derived entirely from training signal:
-`ref_gap = mean(loss_cross_ref - loss_self_ref)` over the tail of each run.
+All ranking is from training signal only — no inference pass needed:
+`ref_gap = mean(loss_cross_ref − loss_self_ref)` over the tail of each run.
 
-### Quick start
+---
+
+### Long-term mode (recommended)
 
 ```bash
-# 4-combo exploration (small matrix, ~4× 8000 steps ≈ 3–5 hours):
-python train/scripts/ablation_harness.py \
+# Start the fire-and-forget daemon (uses iris-ablation tmux window):
+pipeline_ctl start-ablation train/configs/ablation_sref_v1.yaml
+
+# Check status:
+pipeline_ctl ablation-status
+
+# Pause between runs:
+pipeline_ctl pause-ablation
+pipeline_ctl resume-ablation
+
+# Stop after the current run completes:
+pipeline_ctl stop-ablation
+
+# Regenerate HTML report from existing DB without running new experiments:
+train/.venv/bin/python train/scripts/ablation_harness.py \
+    --config train/configs/ablation_sref_v1.yaml \
+    --output-dir /Volumes/2TBSSD/ablation_long --report-only
+```
+
+**Long-term harness config** (`train/configs/ablation_sref_v1.yaml`):
+
+```yaml
+ablation:
+  name: "sref-v1"
+  max_total_runs: 128        # full grid = 4×4×2×4 = 128; Bayesian picks the best order
+  steps_per_run: 12000
+  strategy: "bayesian"       # grid | random | bayesian
+  n_initial: 12              # random warm-up experiments before GP kicks in
+
+  objective:
+    clip_i_weight: 0.55          # ref_gap proxy for CLIP-I style fidelity
+    cross_ref_gap_weight: 0.30   # cond_gap: adapter learning signal
+    stability_weight: 0.15       # stability: low final loss
+
+  variables:
+    cross_ref_prob:              [0.0, 0.2, 0.35, 0.5]
+    patch_shuffle_prob:          [0.0, 0.25, 0.4, 0.5]
+    freeze_double_stream_scales: [true, false]
+    style_loss_weight:           [0.0, 0.03, 0.07, 0.12]
+
+  conditions:
+    - "style_loss_weight == 0 or cross_ref_prob > 0"
+```
+
+**Strategies:**
+- `grid` — exhaustive, fixed order, all candidates
+- `random` — shuffled grid, same coverage as grid but avoids correlated runs early on
+- `bayesian` — GP-UCB Bayesian optimisation (sklearn). Fits a Gaussian Process on
+  observed (params → score) pairs and selects the next candidate with highest Upper
+  Confidence Bound. Focuses exploration on promising regions automatically.
+
+**Long-term scoring** (configurable weights, normalised per component):
+```
+score = 100 × (clip_i_w × ref_norm + gap_w × cond_norm + stab_w × stab_norm)
+```
+where `ref_norm ≈ mean_ref_gap × 2`, `cond_norm ≈ mean_cond_gap / 2.5`,
+`stab_norm ≈ -(final_loss − 1) / 4`.
+
+**Persistent memory:** all experiments are stored in `ablation_history.db` (SQLite).
+The harness never repeats a config (checked by SHA-256 hash of the param dict). After
+a reboot or restart, it resumes from where it left off.
+
+**Long-term output:**
+```
+/Volumes/2TBSSD/ablation_long/
+  index.html               — ranked report (regenerated after every run)
+  best_config.yaml         — best params as ready-to-use training config
+  ablation_history.db      — SQLite: every experiment ever run
+  runs/sref-v1/
+    exp_0001/
+      config.yaml          — exact config used
+      metrics.json         — full metric snapshots
+      training.log         — raw trainer output
+```
+
+---
+
+### Batch mode (short sweeps / testing)
+
+```bash
+# 4-combo exploration (small matrix, ~4× steps):
+train/.venv/bin/python train/scripts/ablation_harness.py \
     --shards /Volumes/2TBSSD/shards \
     --output-dir train/reports/ablation_run1
 
-# 12-combo medium matrix (freeze vs no-freeze sweep):
-python train/scripts/ablation_harness.py --matrix medium --steps 5000 \
+# 12-combo medium matrix:
+train/.venv/bin/python train/scripts/ablation_harness.py \
+    --matrix medium --steps 5000 \
     --shards /Volumes/2TBSSD/shards \
     --output-dir train/reports/ablation_run2
 
-# Resume an interrupted run:
-python train/scripts/ablation_harness.py \
+# Resume an interrupted batch run:
+train/.venv/bin/python train/scripts/ablation_harness.py \
     --output-dir train/reports/ablation_run1 --resume
 
-# Dry run — see the matrix without training:
-python train/scripts/ablation_harness.py --matrix full --dry-run
+# Dry run — print the matrix without training:
+train/.venv/bin/python train/scripts/ablation_harness.py --matrix full --dry-run
 ```
 
-### Matrix presets
+**Batch matrix presets:**
 
 | Preset | Variables swept | Combos | Recommended steps |
 |--------|-----------------|--------|-------------------|
@@ -49,66 +132,36 @@ python train/scripts/ablation_harness.py --matrix full --dry-run
 | `medium` | adds `freeze_double=[T,F]`; 3-value `cross_ref` | 12 | 5 000–8 000 |
 | `full` | all 4 variables at 3 values each | 54 | 5 000 |
 
-Custom matrices can be defined in YAML (`--matrix-file`):
-
-```yaml
-ablation:
-  variables:
-    cross_ref_prob: [0.0, 0.3, 0.5]
-    patch_shuffle_prob: [0.0, 0.5]
-    freeze_double_stream_scales: [true, false]
-    style_loss_weight: [0.0, 0.05, 0.1]
-  steps_per_run: 8000
-```
-
-### Scoring formula
-
+**Batch scoring formula:**
 ```
 score = 100 × mean_ref_gap + 200 × mean_cond_gap − 3 × final_loss
 ```
 
-`ref_gap` is the primary signal: a positive gap (cross-ref harder than self-ref)
-means the adapter is style-aware. Without SigLIP precomputed embeddings `ref_gap`
-will be absent — always run with `--siglip-cache` for meaningful results.
-
-### Output
-
-```
-train/reports/ablation_run1/
-  index.html          — ranked report with charts (open in browser)
-  results.json        — slim results for all combos (no snapshots)
-  runs/small/
-    combo_001/
-      config.yaml     — exact config used
-      metrics.json    — full metric snapshots (used by index.html charts)
-      training.log    — raw trainer output
-```
-
-### Flags
-
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--matrix` | `small` | Preset name |
-| `--matrix-file` | — | Custom YAML (overrides `--matrix`) |
-| `--steps` | 8000 | Steps per combo |
-| `--log-every` | auto | Default: `steps // 80`, min 50 |
-| `--max-runs N` | — | Stop after N combos (for testing the harness) |
-| `--resume` | off | Skip combos already in `results.json` |
-| `--dry-run` | off | Print matrix without training |
-| `--quiet` | off | Suppress per-step trainer output |
-| `--keep-checkpoints` | off | Keep checkpoint files (disk-intensive) |
-| `--ai` | off | Emit compact JSON summary to stdout |
-
-### Signal quality vs run length
-
-Reliable signal on ref_gap requires SigLIP cache and enough steps to pass warmup.
-Rule of thumb for step budget:
+**Signal quality vs step budget:**
 
 | Goal | Steps | Notes |
 |------|-------|-------|
-| Screening (eliminate clearly bad configs) | 3 000 | Enough to see if ref_gap goes positive |
+| Screening (eliminate bad configs) | 3 000 | Enough to see if ref_gap goes positive |
 | Comparative ranking | 8 000 | Standard; catches mid-run instabilities |
-| High-confidence ranking | 15 000 | Use for final config before a full chunk |
+| High-confidence ranking | 15 000 | Use before committing a full chunk |
+
+**Batch flags:**
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--config PATH` | — | Enable long-term mode (harness YAML) |
+| `--db PATH` | auto | SQLite DB path (long-term mode) |
+| `--report-only` | off | Re-render HTML from DB, no new runs |
+| `--matrix` | `small` | Batch preset name |
+| `--matrix-file` | — | Custom matrix YAML (overrides `--matrix`) |
+| `--steps` | 8000 | Steps per combo |
+| `--log-every` | auto | Default: `steps // 80`, min 50 |
+| `--max-runs N` | — | Run at most N combos then stop |
+| `--resume` | off | Skip combos already in `results.json` |
+| `--dry-run` | off | Print matrix without training |
+| `--quiet` | off | Suppress per-step trainer output |
+| `--keep-checkpoints` | off | Keep checkpoint files after each run |
+| `--ai` | off | Emit compact JSON summary on completion |
 
 ---
 

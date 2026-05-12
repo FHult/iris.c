@@ -1,78 +1,90 @@
 #!/usr/bin/env python3
 """
-train/scripts/ablation_harness.py — QUALITY-10: Automated style feature ablation harness.
+train/scripts/ablation_harness.py — QUALITY-10+: Long-term autonomous style-feature ablation.
 
-Runs a matrix of short training experiments with different QUALITY hyperparameter
-combinations and produces a ranked HTML report identifying the best settings for
-style fidelity (measured by cross-ref vs self-ref loss gap and adapter learning).
+Two operating modes:
 
-Usage:
-    # Quick 4-combo exploration (default 'small' matrix, 8000 steps each):
+  BATCH (original): Fixed matrix of combos, sequential, HTML report.
     python train/scripts/ablation_harness.py \\
-        --shards /Volumes/2TBSSD/shards \\
-        --output-dir train/reports/ablation_run1
+        --matrix small --steps 300 --log-every 50 \\
+        --shards /Volumes/2TBSSD/shards --output-dir /Volumes/2TBSSD/ablation_test
 
-    # Medium matrix (12 combos), 5000 steps each:
-    python train/scripts/ablation_harness.py --matrix medium --steps 5000 \\
-        --shards /Volumes/2TBSSD/shards \\
-        --output-dir train/reports/ablation_run2
-
-    # Full 54-combo matrix:
-    python train/scripts/ablation_harness.py --matrix full --steps 8000 \\
-        --shards /Volumes/2TBSSD/shards \\
-        --output-dir train/reports/ablation_full
-
-    # Resume an interrupted run:
+  LONG-TERM: SQLite-backed, Bayesian/random/grid search, fire-and-forget.
     python train/scripts/ablation_harness.py \\
-        --output-dir train/reports/ablation_run1 --resume
+        --config train/configs/ablation_v2.yaml \\
+        --output-dir /Volumes/2TBSSD/ablation_long
 
-    # Dry run — print the combo matrix without training:
-    python train/scripts/ablation_harness.py --matrix medium --dry-run
-
-    # Custom matrix from YAML file:
+  Report only (re-render HTML from existing DB without running):
     python train/scripts/ablation_harness.py \\
-        --matrix-file my_matrix.yaml --output-dir train/reports/ablation_custom
+        --config train/configs/ablation_v2.yaml \\
+        --output-dir /Volumes/2TBSSD/ablation_long --report-only
 
-Custom matrix YAML format:
+Harness config YAML (long-term mode):
+
     ablation:
+      name: "sref-quality-v2"
+      max_total_runs: 300
+      steps_per_run: 12000
+      strategy: "bayesian"           # grid | random | bayesian
+      n_initial: 10                  # bayesian only: random explorations before GP kicks in
+      objective:
+        clip_i_weight: 0.55          # proxy for CLIP-I style fidelity (ref_gap)
+        cross_ref_gap_weight: 0.30   # cond_gap: adapter learning signal
+        stability_weight: 0.15       # training stability (low final loss)
       variables:
-        cross_ref_prob: [0.0, 0.3, 0.5]
-        patch_shuffle_prob: [0.0, 0.3, 0.5]
+        cross_ref_prob: [0.0, 0.2, 0.35, 0.5]
+        patch_shuffle_prob: [0.0, 0.25, 0.4, 0.5]
         freeze_double_stream_scales: [true, false]
-        style_loss_weight: [0.0, 0.05, 0.1]
-      steps_per_run: 8000          # optional, overridden by --steps
+        style_loss_weight: [0.0, 0.03, 0.07, 0.12]
+      conditions:                    # optional: filter invalid param combinations
+        - "style_loss_weight > 0 or cross_ref_prob == 0"
 
-Matrix presets:
-    small  (default): 4  combos — cross_ref=[0.3,0.5] × patch=[0.0,0.5]
-    medium:           12 combos — cross_ref=[0.0,0.3,0.5] × patch=[0.0,0.5] × freeze=[T,F]
-    full:             54 combos — cross_ref=[0.0,0.3,0.5] × patch=[0.0,0.3,0.5] × freeze=[T,F] × slw=[0.0,0.05,0.1]
+Control signals (long-term mode):
+    pipeline_ctl start-ablation train/configs/ablation_v2.yaml
+    pipeline_ctl ablation-status
+    pipeline_ctl stop-ablation
+    pipeline_ctl pause-ablation
+    pipeline_ctl resume-ablation
 
-Scoring:
-    Each combo is ranked by a composite score derived entirely from training logs
-    (no inference pass required):
-      - ref_gap:   mean(loss_cross_ref - loss_self_ref) over the final 40% of steps
-                   Positive = style-aware; negative = adapter ignores SigLIP features
-      - cond_gap:  mean(loss_null - loss_cond) over the final 40% of steps
-                   Positive = adapter is learning; near-zero = collapsed
-      - loss_pen:  small penalty for high final loss (instability signal)
+Batch-mode scoring:
+    score = 100 * ref_gap + 200 * cond_gap - 3 * final_loss
 
-    score = 100 × ref_gap + 200 × cond_gap - 3 × final_loss
+Long-term scoring (configurable weights):
+    score = 100 * (clip_i_w * ref_norm + gap_w * cond_norm + stab_w * stab_norm)
+
+Batch mode matrix presets:
+    small  (4  combos): cross_ref=[0.3,0.5] x patch=[0.0,0.5]
+    medium (12 combos): cross_ref=[0.0,0.3,0.5] x patch=[0.0,0.5] x freeze=[T,F]
+    full   (54 combos): cross_ref x patch x freeze x style_loss_weight
 """
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+# ── Optional ML deps (Bayesian search only) ──────────────────────────────────
+try:
+    import numpy as np
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+    _SKLEARN_OK = True
+except ImportError:
+    _SKLEARN_OK = False
 
 # ── Repo layout ───────────────────────────────────────────────────────────────
 _SCRIPT_DIR  = Path(__file__).resolve().parent
@@ -87,36 +99,39 @@ _DEFAULT_QWEN3   = _DATA_ROOT / "precomputed" / "qwen3"
 _DEFAULT_VAE     = _DATA_ROOT / "precomputed" / "vae"
 _DEFAULT_SIGLIP  = _DATA_ROOT / "precomputed" / "siglip"
 
-# ── Matrix presets ────────────────────────────────────────────────────────────
+# Control and state files for long-term mode
+_ABLATION_CONTROL = _DATA_ROOT / "ablation_control.json"
+_ABLATION_HB_PATH = _DATA_ROOT / ".heartbeat" / "ablation.json"
 
+# ── Batch-mode matrix presets ─────────────────────────────────────────────────
 MATRIX_PRESETS: dict[str, dict] = {
     "small": {
         "variables": {
-            "cross_ref_prob":            [0.3, 0.5],
-            "patch_shuffle_prob":        [0.0, 0.5],
+            "cross_ref_prob":             [0.3, 0.5],
+            "patch_shuffle_prob":         [0.0, 0.5],
             "freeze_double_stream_scales": [True],
-            "style_loss_weight":         [0.05],
+            "style_loss_weight":          [0.05],
         },
     },
     "medium": {
         "variables": {
-            "cross_ref_prob":            [0.0, 0.3, 0.5],
-            "patch_shuffle_prob":        [0.0, 0.5],
+            "cross_ref_prob":             [0.0, 0.3, 0.5],
+            "patch_shuffle_prob":         [0.0, 0.5],
             "freeze_double_stream_scales": [True, False],
-            "style_loss_weight":         [0.05],
+            "style_loss_weight":          [0.05],
         },
     },
     "full": {
         "variables": {
-            "cross_ref_prob":            [0.0, 0.3, 0.5],
-            "patch_shuffle_prob":        [0.0, 0.3, 0.5],
+            "cross_ref_prob":             [0.0, 0.3, 0.5],
+            "patch_shuffle_prob":         [0.0, 0.3, 0.5],
             "freeze_double_stream_scales": [True, False],
-            "style_loss_weight":         [0.0, 0.05, 0.1],
+            "style_loss_weight":          [0.0, 0.05, 0.1],
         },
     },
 }
 
-# ── Metric log regexes (match train_ip_adapter.py output format) ──────────────
+# ── Metric log regexes ────────────────────────────────────────────────────────
 _RE_STEP  = re.compile(r"^step\s+([\d,]+)/([\d,]+)\s+loss\s+([\d.]+)\s+\(avg\s+([\d.]+)\)")
 _RE_COND  = re.compile(r"loss_cond=([\d.]+)\s+loss_null=([\d.]+)\s+gap=([+-][\d.]+)")
 _RE_REF   = re.compile(r"loss_ref:.*?self=([\d.]+)(?:.*?cross=([\d.]+).*?gap=([+-][\d.]+))?")
@@ -145,8 +160,6 @@ class MetricCollector:
         self._pending: dict = {}
 
     def feed(self, line: str) -> Optional[dict]:
-        """Parse one output line. Returns a completed snapshot when the ip_scale
-        line is seen (which closes a log interval), else None."""
         m = _RE_STEP.search(line)
         if m:
             self._pending = {
@@ -187,10 +200,358 @@ class MetricCollector:
         return None
 
 
+# ── Persistent SQLite history ─────────────────────────────────────────────────
+
+class AblationDB:
+    """SQLite-backed experiment history. Never forgets a run, never repeats a config."""
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS experiments (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_name     TEXT    NOT NULL,
+            config_hash  TEXT    NOT NULL,
+            strategy     TEXT,
+            params       TEXT    NOT NULL,
+            score        REAL,
+            verdict      TEXT,
+            ref_gap      REAL,
+            cond_gap     REAL,
+            final_loss   REAL,
+            elapsed_secs INTEGER,
+            steps        INTEGER,
+            n_snapshots  INTEGER,
+            exit_code    INTEGER,
+            git_commit   TEXT,
+            ts           TEXT    NOT NULL,
+            snapshots    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_run  ON experiments(run_name);
+        CREATE INDEX IF NOT EXISTS idx_hash ON experiments(run_name, config_hash);
+        CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
+        INSERT OR IGNORE INTO _meta VALUES ('schema_version', '1');
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_path = db_path
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        self._conn.executescript(self.SCHEMA)
+        self._conn.commit()
+
+    @staticmethod
+    def params_hash(params: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(params, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+
+    def is_duplicate(self, run_name: str, params: dict) -> bool:
+        h = self.params_hash(params)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM experiments WHERE run_name=? AND config_hash=?",
+                (run_name, h),
+            ).fetchone()
+        return row is not None
+
+    def insert_experiment(self, run_name: str, params: dict, strategy: str, steps: int) -> int:
+        h = self.params_hash(params)
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        gc = _get_git_commit()
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO experiments
+                   (run_name, config_hash, strategy, params, steps, git_commit, ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_name, h, strategy, json.dumps(params, default=str), steps, gc, ts),
+            )
+            self._conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def update_experiment(
+        self,
+        exp_id: int,
+        score: Optional[float],
+        verdict: str,
+        ref_gap: Optional[float],
+        cond_gap: Optional[float],
+        final_loss: Optional[float],
+        elapsed_secs: int,
+        n_snapshots: int,
+        exit_code: int,
+        snapshots: list,
+    ) -> None:
+        snaps_json = json.dumps(snapshots)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE experiments SET
+                   score=?, verdict=?, ref_gap=?, cond_gap=?, final_loss=?,
+                   elapsed_secs=?, n_snapshots=?, exit_code=?, snapshots=?
+                   WHERE id=?""",
+                (score, verdict, ref_gap, cond_gap, final_loss,
+                 elapsed_secs, n_snapshots, exit_code, snaps_json, exp_id),
+            )
+            self._conn.commit()
+
+    def get_experiments(self, run_name: str, scored_only: bool = False) -> list[dict]:
+        q = "SELECT * FROM experiments WHERE run_name=?"
+        if scored_only:
+            q += " AND score IS NOT NULL"
+        q += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(q, (run_name,)).fetchall()
+        return [self._decode_row(r) for r in rows]
+
+    def get_best(self, run_name: str, n: int = 5) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM experiments WHERE run_name=? AND score IS NOT NULL "
+                "ORDER BY score DESC LIMIT ?",
+                (run_name, n),
+            ).fetchall()
+        return [self._decode_row(r) for r in rows]
+
+    def get_all_run_names(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT run_name FROM experiments ORDER BY run_name"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    @staticmethod
+    def _decode_row(row: sqlite3.Row) -> dict:
+        r = dict(row)
+        r["params"] = json.loads(r["params"])
+        snaps_raw = r.get("snapshots")
+        r["snapshots"] = json.loads(snaps_raw) if snaps_raw else []
+        r["combo_id"] = f"exp_{r['id']:04d}"
+        # Normalise to the field names expected by _render_html / _print_final_ranking
+        r["mean_ref_gap"]  = r.get("ref_gap")
+        r["mean_cond_gap"] = r.get("cond_gap")
+        return r
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ── Search strategies ─────────────────────────────────────────────────────────
+
+def _params_key(params: dict) -> str:
+    return json.dumps(params, sort_keys=True, default=str)
+
+
+class SearchStrategy:
+    """Returns the next parameter dict to try, or None when exhausted."""
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        raise NotImplementedError
+
+
+class GridSearch(SearchStrategy):
+    """Exhaustive grid: tries every candidate in fixed order."""
+    def __init__(self, candidates: list[dict]) -> None:
+        self._candidates = candidates
+        self._tried: set[str] = set()
+
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        tried_keys = {_params_key(t["params"]) for t in tried_results}
+        for c in self._candidates:
+            if _params_key(c) not in tried_keys:
+                return c
+        return None
+
+
+class RandomSearch(SearchStrategy):
+    """Random permutation of the candidate grid."""
+    def __init__(self, candidates: list[dict], seed: Optional[int] = None) -> None:
+        import random
+        self._candidates = list(candidates)
+        random.seed(seed)
+        random.shuffle(self._candidates)
+
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        tried_keys = {_params_key(t["params"]) for t in tried_results}
+        for c in self._candidates:
+            if _params_key(c) not in tried_keys:
+                return c
+        return None
+
+
+class BayesianSearch(SearchStrategy):
+    """GP-UCB Bayesian optimisation over the discrete candidate grid.
+
+    Encodes each candidate as a float feature vector, fits a Gaussian Process
+    on observed (params, score) pairs, and selects the next candidate with the
+    highest Upper Confidence Bound.  Falls back to random selection for the
+    first n_initial experiments.
+    """
+    def __init__(
+        self,
+        candidates: list[dict],
+        n_initial: int = 10,
+        kappa: float = 2.0,
+    ) -> None:
+        if not _SKLEARN_OK:
+            raise ImportError(
+                "Bayesian search requires numpy + scikit-learn: "
+                "pip install numpy scikit-learn"
+            )
+        self._candidates = candidates
+        self._n_initial = n_initial
+        self._kappa = kappa
+        kernel = Matern(nu=2.5, length_scale_bounds=(1e-2, 10.0)) + WhiteKernel(noise_level=0.1)
+        self._gp = GaussianProcessRegressor(
+            kernel=kernel, normalize_y=True, n_restarts_optimizer=3
+        )
+        if candidates:
+            self._feature_keys = list(candidates[0].keys())
+        else:
+            self._feature_keys = []
+
+    def _encode(self, params: dict) -> "np.ndarray":
+        vec = [float(params[k]) if not isinstance(params[k], bool) else float(params[k])
+               for k in self._feature_keys]
+        return np.array(vec, dtype=np.float64)
+
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        import random
+        tried_keys = {_params_key(t["params"]) for t in tried_results}
+        remaining = [c for c in self._candidates if _params_key(c) not in tried_keys]
+        if not remaining:
+            return None
+
+        scored = [t for t in tried_results if t.get("score") is not None]
+
+        if len(scored) < self._n_initial:
+            # Random warm-up exploration
+            return random.choice(remaining)
+
+        X_obs = np.array([self._encode(t["params"]) for t in scored])
+        y_obs = np.array([float(t["score"]) for t in scored])
+
+        # Normalise features to [0, 1] across observed range
+        X_min = X_obs.min(axis=0)
+        X_max = X_obs.max(axis=0)
+        X_range = np.where(X_max > X_min, X_max - X_min, 1.0)
+        X_norm = (X_obs - X_min) / X_range
+
+        try:
+            self._gp.fit(X_norm, y_obs)
+        except Exception:
+            return random.choice(remaining)
+
+        X_cand = np.array([self._encode(c) for c in remaining])
+        X_cand_norm = (X_cand - X_min) / X_range
+        mu, sigma = self._gp.predict(X_cand_norm, return_std=True)
+        ucb = mu + self._kappa * sigma
+
+        best_idx = int(np.argmax(ucb))
+        return remaining[best_idx]
+
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+class HeartbeatWriter:
+    """Writes a JSON heartbeat file every 60 s from a background thread."""
+
+    def __init__(self, run_name: str, path: Path = _ABLATION_HB_PATH) -> None:
+        self._path = path
+        self._run_name = run_name
+        self._state: dict = {}
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def update(self, **fields) -> None:
+        with self._lock:
+            self._state.update(fields)
+        self._write()
+
+    def _write(self) -> None:
+        with self._lock:
+            payload = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "process": "ablation",
+                "run_name": self._run_name,
+                **self._state,
+            }
+        tmp = self._path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.rename(self._path)
+        except OSError:
+            pass
+
+    def _loop(self) -> None:
+        while not self._stop_event.wait(60):
+            self._write()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# ── Control signals ───────────────────────────────────────────────────────────
+
+def _read_control() -> str:
+    """Returns 'run', 'pause', or 'stop'."""
+    try:
+        ctrl = json.loads(_ABLATION_CONTROL.read_text())
+        return ctrl.get("action", "run")
+    except (OSError, json.JSONDecodeError):
+        return "run"
+
+
+def _wait_if_paused(hb: HeartbeatWriter) -> bool:
+    """Block while paused. Returns False if a stop signal arrives."""
+    first = True
+    while True:
+        action = _read_control()
+        if action == "stop":
+            return False
+        if action == "run":
+            return True
+        if first:
+            print("  [paused — waiting for resume signal]", flush=True)
+            hb.update(status="paused")
+            first = False
+        time.sleep(15)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(_REPO_ROOT), stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _eval_conditions(params: dict, conditions: list[str]) -> bool:
+    """Return True if all conditions pass for this param set. Fails open on errors."""
+    for cond in conditions:
+        try:
+            if not eval(cond, {"__builtins__": {}}, dict(params)):  # noqa: S307
+                return False
+        except Exception:
+            pass  # malformed condition — don't filter this candidate
+    return True
+
+
 # ── Matrix generation ─────────────────────────────────────────────────────────
 
 def _generate_combos(matrix_def: dict) -> list[dict]:
-    """Return list of {combo_id, params} dicts from a matrix definition."""
     variables = matrix_def.get("variables", {})
     if not variables:
         return []
@@ -206,7 +567,6 @@ def _generate_combos(matrix_def: dict) -> list[dict]:
 
 
 def _load_matrix(args) -> dict:
-    """Resolve the ablation matrix from --matrix-file or --matrix preset."""
     if args.matrix_file:
         p = Path(args.matrix_file)
         if not p.exists():
@@ -215,7 +575,6 @@ def _load_matrix(args) -> dict:
         with open(p) as f:
             raw = yaml.safe_load(f)
         return raw.get("ablation", raw)
-
     name = args.matrix or "small"
     if name not in MATRIX_PRESETS:
         print(f"ERROR: unknown matrix preset '{name}'. "
@@ -237,7 +596,6 @@ def _build_run_config(
     log_every: int,
     params: dict,
 ) -> dict:
-    """Load base config and apply ablation overrides for one combo."""
     with open(base_config_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -252,13 +610,12 @@ def _build_run_config(
     cfg["data"]["num_prefetch_threads"] = 1
 
     cfg.setdefault("training", {})
-    cfg["training"]["num_steps"]    = steps
-    cfg["training"]["warmup_steps"] = min(cfg["training"].get("warmup_steps", 1000), steps // 5)
+    cfg["training"]["num_steps"]     = steps
+    cfg["training"]["warmup_steps"]  = min(cfg["training"].get("warmup_steps", 1000), steps // 5)
     cfg["training"]["style_loss_every"] = 1
 
     cfg.setdefault("adapter", {})
 
-    # Apply per-combo parameters
     for key, val in params.items():
         if key == "freeze_double_stream_scales":
             cfg["adapter"]["freeze_double_stream_scales"] = val
@@ -266,15 +623,14 @@ def _build_run_config(
                      "style_loss_weight", "learning_rate"):
             cfg["training"][key] = val
         else:
-            # Best-effort: try training section first, then adapter
             cfg["training"][key] = val
 
     cfg.setdefault("output", {})
-    cfg["output"]["checkpoint_dir"]      = checkpoint_dir
-    cfg["output"]["log_every"]           = log_every
-    cfg["output"]["checkpoint_every"]    = steps * 100  # prevent periodic saves
-    cfg["output"]["keep_last_n"]         = 1
-    cfg["output"]["skip_checkpoint_save"] = True  # skip final ~8 GB write; not needed for ranking
+    cfg["output"]["checkpoint_dir"]       = checkpoint_dir
+    cfg["output"]["log_every"]            = log_every
+    cfg["output"]["checkpoint_every"]     = steps * 100
+    cfg["output"]["keep_last_n"]          = 1
+    cfg["output"]["skip_checkpoint_save"] = True
 
     cfg.setdefault("eval", {})
     cfg["eval"]["enabled"] = False
@@ -285,29 +641,51 @@ def _build_run_config(
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
 def _score(snapshots: list[dict], exit_code: int) -> float:
-    """Composite score for ranking: higher is better style conditioning.
+    """Batch-mode fixed scoring: 100*ref_gap + 200*cond_gap - 3*final_loss."""
+    if exit_code != 0 or not snapshots:
+        return float("-inf")
+    n_skip = max(0, len(snapshots) * 2 // 5)
+    tail = snapshots[n_skip:] or snapshots
+    ref_gaps  = [s["ref_gap"]    for s in tail if "ref_gap"    in s]
+    cond_gaps = [s["cond_gap"]   for s in tail if "cond_gap"   in s]
+    loss_vals = [s["loss_smooth"] for s in tail if "loss_smooth" in s]
+    mean_ref   = sum(ref_gaps)  / len(ref_gaps)  if ref_gaps  else 0.0
+    mean_cond  = sum(cond_gaps) / len(cond_gaps) if cond_gaps else 0.0
+    final_loss = loss_vals[-1] if loss_vals else 9.9
+    return 100.0 * mean_ref + 200.0 * mean_cond - 3.0 * final_loss
 
-    Primary signal: ref_gap (cross_ref - self_ref) — positive = style-aware.
-    Secondary: cond_gap (loss_null - loss_cond) — positive = adapter learning.
-    Penalty: high final loss (instability).
-    Returns -inf for crashed runs.
+
+def _score_weighted(snapshots: list[dict], exit_code: int, objective: dict) -> float:
+    """Long-term mode scoring with configurable objective weights.
+
+    Each component is normalised to approximately [-1, +1] then weighted:
+      clip_i_w    → mean_ref_gap  (style fidelity proxy; typical ±0.5 → ×2)
+      gap_w       → mean_cond_gap (adapter learning; typical [-2, 0.5] → /2.5)
+      stability_w → -(final_loss - 1) / 4  (stability; typical 0.5–5.0)
     """
     if exit_code != 0 or not snapshots:
         return float("-inf")
 
-    # Skip warmup (first 40% of log intervals) — signal is noisy there
+    clip_i_w    = float(objective.get("clip_i_weight", 0.55))
+    gap_w       = float(objective.get("cross_ref_gap_weight", 0.30))
+    stability_w = float(objective.get("stability_weight", 0.15))
+
     n_skip = max(0, len(snapshots) * 2 // 5)
     tail = snapshots[n_skip:] or snapshots
 
-    ref_gaps   = [s["ref_gap"]   for s in tail if "ref_gap"   in s]
-    cond_gaps  = [s["cond_gap"]  for s in tail if "cond_gap"  in s]
-    loss_vals  = [s["loss_smooth"] for s in tail if "loss_smooth" in s]
+    ref_gaps  = [s["ref_gap"]    for s in tail if "ref_gap"    in s]
+    cond_gaps = [s["cond_gap"]   for s in tail if "cond_gap"   in s]
+    losses    = [s["loss_smooth"] for s in tail if "loss_smooth" in s]
 
-    mean_ref  = sum(ref_gaps)  / len(ref_gaps)  if ref_gaps  else 0.0
-    mean_cond = sum(cond_gaps) / len(cond_gaps) if cond_gaps else 0.0
-    final_loss = loss_vals[-1] if loss_vals else 9.9
+    mean_ref   = sum(ref_gaps)  / len(ref_gaps)  if ref_gaps  else 0.0
+    mean_cond  = sum(cond_gaps) / len(cond_gaps) if cond_gaps else 0.0
+    final_loss = losses[-1] if losses else 9.9
 
-    return 100.0 * mean_ref + 200.0 * mean_cond - 3.0 * final_loss
+    ref_norm  = max(-1.0, min(1.0, mean_ref  * 2.0))
+    cond_norm = max(-1.0, min(1.0, mean_cond / 2.5))
+    stab_norm = max(-1.0, min(0.5, -(final_loss - 1.0) / 4.0))
+
+    return (clip_i_w * ref_norm + gap_w * cond_norm + stability_w * stab_norm) * 100.0
 
 
 def _verdict(snapshots: list[dict], exit_code: int) -> str:
@@ -328,6 +706,38 @@ def _verdict(snapshots: list[dict], exit_code: int) -> str:
     return "WARN"
 
 
+# ── Best-config export ────────────────────────────────────────────────────────
+
+def _export_best_config(result: dict, output_dir: Path, run_name: str = "") -> None:
+    """Write a ready-to-use training config YAML for the best result."""
+    params = result.get("params", {})
+    out = {
+        "ablation_source": {
+            "run_name":  run_name,
+            "combo_id":  result.get("combo_id"),
+            "score":     result.get("score"),
+            "ref_gap":   result.get("mean_ref_gap"),
+            "cond_gap":  result.get("mean_cond_gap"),
+            "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+        "training": {},
+        "adapter":  {},
+    }
+    for k, v in params.items():
+        if k == "freeze_double_stream_scales":
+            out["adapter"][k] = v
+        else:
+            out["training"][k] = v
+
+    path = output_dir / "best_config.yaml"
+    try:
+        with open(path, "w") as f:
+            yaml.dump(out, f, default_flow_style=False, sort_keys=False)
+        print(f"  Best config exported: {path}")
+    except OSError as e:
+        print(f"WARNING: could not write best_config.yaml: {e}", file=sys.stderr)
+
+
 # ── Single-run execution ──────────────────────────────────────────────────────
 
 def _run_one(
@@ -336,8 +746,8 @@ def _run_one(
     args,
     log_every: int,
     quiet: bool = False,
+    hb: Optional[HeartbeatWriter] = None,
 ) -> dict:
-    """Execute one training combo. Returns result dict."""
     combo_id = combo["combo_id"]
     params   = combo["params"]
 
@@ -348,9 +758,9 @@ def _run_one(
     cfg = _build_run_config(
         base_config_path=Path(args.base_config),
         shards=args.shards,
-        qwen3_cache=args.qwen3_cache,
-        vae_cache=args.vae_cache,
-        siglip_cache=args.siglip_cache,
+        qwen3_cache=getattr(args, "qwen3_cache", None),
+        vae_cache=getattr(args, "vae_cache", None),
+        siglip_cache=getattr(args, "siglip_cache", None),
         checkpoint_dir=str(ckpt_dir),
         steps=args.steps,
         log_every=log_every,
@@ -362,7 +772,6 @@ def _run_one(
         yaml.dump(cfg, tf)
         tmp_cfg = tf.name
 
-    # Save the config used for reproducibility
     try:
         with open(run_dir / "config.yaml", "w") as f:
             yaml.dump(cfg, f)
@@ -383,11 +792,8 @@ def _run_one(
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            cwd=str(_REPO_ROOT),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=str(_REPO_ROOT),
         )
         with open(log_path, "w") as log_f:
             for raw_line in proc.stdout:  # type: ignore[union-attr]
@@ -397,15 +803,22 @@ def _run_one(
                 if not quiet:
                     print(f"  {line}", flush=True)
                 snap = collector.feed(line)
-                if snap is not None and not quiet:
+                if snap is not None:
                     ref_gap  = snap.get("ref_gap", 0.0)
                     cond_gap = snap.get("cond_gap", 0.0)
                     loss     = snap.get("loss_smooth", snap.get("loss", 0.0))
                     flag = "✓" if ref_gap > 0 else "○"
-                    print(_c("dim", f"  ↳ step {snap['step']:>6}  "
-                              f"loss={loss:.4f}  "
-                              f"ref_gap={ref_gap:+.4f}{flag}  "
-                              f"cond_gap={cond_gap:+.4f}"), flush=True)
+                    if not quiet:
+                        print(_c("dim", f"  ↳ step {snap['step']:>6}  "
+                                  f"loss={loss:.4f}  "
+                                  f"ref_gap={ref_gap:+.4f}{flag}  "
+                                  f"cond_gap={cond_gap:+.4f}"), flush=True)
+                    if hb is not None:
+                        hb.update(
+                            current_step=snap["step"],
+                            current_loss=round(loss, 4),
+                            current_ref_gap=round(ref_gap, 4),
+                        )
         proc.wait()
         exit_code = proc.returncode
     except KeyboardInterrupt:
@@ -425,22 +838,22 @@ def _run_one(
             pass
 
     elapsed = time.time() - t_start
-    score = _score(collector.snapshots, exit_code)
+    batch_score = _score(collector.snapshots, exit_code)
     verdict = _verdict(collector.snapshots, exit_code)
 
-    # Summarise tail metrics for the result record
-    tail = collector.snapshots[max(0, len(collector.snapshots) * 2 // 5):] or collector.snapshots
+    n_skip = max(0, len(collector.snapshots) * 2 // 5)
+    tail = collector.snapshots[n_skip:] or collector.snapshots
     last = collector.snapshots[-1] if collector.snapshots else {}
 
     result = {
-        "combo_id":    combo_id,
-        "params":      params,
-        "score":       round(score, 4) if score != float("-inf") else None,
-        "verdict":     verdict,
-        "exit_code":   exit_code,
-        "elapsed_secs": round(elapsed),
-        "n_snapshots": len(collector.snapshots),
-        "final_loss":  last.get("loss_smooth"),
+        "combo_id":       combo_id,
+        "params":         params,
+        "score":          round(batch_score, 4) if batch_score != float("-inf") else None,
+        "verdict":        verdict,
+        "exit_code":      exit_code,
+        "elapsed_secs":   round(elapsed),
+        "n_snapshots":    len(collector.snapshots),
+        "final_loss":     last.get("loss_smooth"),
         "final_ref_gap":  last.get("ref_gap"),
         "final_cond_gap": last.get("cond_gap"),
         "mean_ref_gap":   round(sum(s["ref_gap"] for s in tail if "ref_gap" in s) /
@@ -449,25 +862,220 @@ def _run_one(
         "mean_cond_gap":  round(sum(s["cond_gap"] for s in tail if "cond_gap" in s) /
                                 max(1, sum(1 for s in tail if "cond_gap" in s)), 4)
                           if any("cond_gap" in s for s in tail) else None,
-        "snapshots":   collector.snapshots,
-        "log_path":    str(log_path),
+        "snapshots":      collector.snapshots,
+        "log_path":       str(log_path),
     }
 
-    # Save per-run metrics JSON
     try:
         with open(run_dir / "metrics.json", "w") as f:
             json.dump(result, f, indent=2)
     except OSError:
         pass
 
-    # Clean up checkpoints unless requested
-    if not args.keep_checkpoints and ckpt_dir.exists():
+    keep_ckpts = getattr(args, "keep_checkpoints", False)
+    if not keep_ckpts and ckpt_dir.exists():
         try:
             shutil.rmtree(ckpt_dir)
         except OSError:
             pass
 
     return result
+
+
+# ── Long-term harness config loading ─────────────────────────────────────────
+
+def _load_harness_config(path: Path) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    cfg = raw.get("ablation", raw)
+    # Validate required keys
+    if "variables" not in cfg:
+        print(f"ERROR: harness config missing 'variables' section: {path}", file=sys.stderr)
+        sys.exit(1)
+    return cfg
+
+
+def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
+    strategy = cfg.get("strategy", "random").lower()
+    n_initial = int(cfg.get("n_initial", max(8, len(candidates) // 5)))
+    if strategy == "grid":
+        return GridSearch(candidates)
+    if strategy == "random":
+        return RandomSearch(candidates, seed=cfg.get("seed"))
+    if strategy == "bayesian":
+        if not _SKLEARN_OK:
+            print("WARNING: scikit-learn not available — falling back to random search",
+                  file=sys.stderr)
+            return RandomSearch(candidates)
+        return BayesianSearch(candidates, n_initial=n_initial)
+    print(f"ERROR: unknown strategy '{strategy}'. Use: grid, random, bayesian", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Long-term run loop ────────────────────────────────────────────────────────
+
+def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
+    """Fire-and-forget long-term loop.  Runs until max_total_runs or stop signal."""
+    run_name   = harness_cfg.get("name", "default")
+    max_runs   = int(harness_cfg.get("max_total_runs", 100))
+    steps      = int(harness_cfg.get("steps_per_run", 8000))
+    strategy   = harness_cfg.get("strategy", "random")
+    objective  = harness_cfg.get("objective", {})
+    variables  = harness_cfg.get("variables", {})
+    conditions = harness_cfg.get("conditions", [])
+    log_every  = max(50, steps // 80)
+    output_dir = Path(cli_args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build candidate pool
+    raw_combos = _generate_combos({"variables": variables})
+    candidates = [c["params"] for c in raw_combos]
+    if conditions:
+        before = len(candidates)
+        candidates = [c for c in candidates if _eval_conditions(c, conditions)]
+        print(f"  Conditions filtered: {before} → {len(candidates)} candidates")
+
+    if not candidates:
+        print("ERROR: all candidates filtered by conditions", file=sys.stderr)
+        sys.exit(1)
+
+    searcher = _build_search_strategy(harness_cfg, candidates)
+
+    hb = HeartbeatWriter(run_name)
+    hb.start()
+
+    # Load what's already in the DB
+    all_experiments = db.get_experiments(run_name)
+    scored = [e for e in all_experiments if e.get("score") is not None]
+    n_done = len(all_experiments)
+
+    print()
+    print(_c("cyan", f"{'═'*64}"))
+    print(_c("bold", f"  Long-Term Ablation — {run_name}"))
+    print(_c("cyan", f"{'═'*64}"))
+    print(f"  strategy={strategy}  steps={steps}  max_runs={max_runs}")
+    print(f"  candidates={len(candidates)}  already_done={n_done}")
+    print(f"  db: {db._db_path}")
+    print(f"  output: {output_dir}")
+    print(_c("cyan", f"{'═'*64}\n"))
+
+    hb.update(status="running", strategy=strategy, n_candidates=len(candidates),
+               n_done=n_done, n_max=max_runs)
+
+    while n_done < max_runs:
+        if not _wait_if_paused(hb):
+            print("\n  Stop signal received — exiting")
+            break
+
+        params = searcher.next_candidate(scored)
+        if params is None:
+            print("\n  Candidate pool exhausted — all combinations tried")
+            break
+
+        # Double-check DB (another process could have run this)
+        if db.is_duplicate(run_name, params):
+            scored.append({"params": params, "score": None})  # mark tried
+            continue
+
+        n_done += 1
+        combo_id = f"exp_{n_done:04d}"
+        combo = {"combo_id": combo_id, "params": params}
+
+        hb.update(status="running", current_combo=combo_id,
+                  n_done=n_done, n_max=max_runs, params=params)
+
+        exp_id = db.insert_experiment(run_name, params, strategy, steps)
+
+        run_dir = output_dir / "runs" / run_name / combo_id
+        run_args = argparse.Namespace(
+            base_config=getattr(cli_args, "base_config", str(_BASE_CONFIG)),
+            shards=cli_args.shards,
+            qwen3_cache=getattr(cli_args, "qwen3_cache", None),
+            vae_cache=getattr(cli_args, "vae_cache", None),
+            siglip_cache=getattr(cli_args, "siglip_cache", None),
+            steps=steps,
+            keep_checkpoints=False,
+        )
+
+        _print_combo_header(combo, n_done, max_runs, steps)
+        result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb)
+
+        # Re-score with configurable objective
+        n_skip = max(0, len(result.get("snapshots", [])) * 2 // 5)
+        tail_snaps = (result.get("snapshots", [])[n_skip:] or result.get("snapshots", []))
+        weighted_score = _score_weighted(tail_snaps, result["exit_code"], objective)
+        result["score"] = round(weighted_score, 4) if weighted_score != float("-inf") else None
+
+        db.update_experiment(
+            exp_id=exp_id,
+            score=result["score"],
+            verdict=result["verdict"],
+            ref_gap=result.get("mean_ref_gap"),
+            cond_gap=result.get("mean_cond_gap"),
+            final_loss=result.get("final_loss"),
+            elapsed_secs=result.get("elapsed_secs", 0),
+            n_snapshots=result.get("n_snapshots", 0),
+            exit_code=result["exit_code"],
+            snapshots=result.get("snapshots", []),
+        )
+
+        if result["score"] is not None:
+            scored.append({"params": params, "score": result["score"]})
+        else:
+            scored.append({"params": params, "score": None})
+
+        _print_result_line(result)
+
+        # Regenerate report after every run
+        all_experiments = db.get_experiments(run_name)
+        _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
+
+        if result.get("exit_code") == -2:  # KeyboardInterrupt inside _run_one
+            print("\n  Interrupted — exiting")
+            break
+
+    # Final
+    all_experiments = db.get_experiments(run_name)
+    _print_final_ranking(all_experiments)
+    _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
+
+    best_list = db.get_best(run_name, 1)
+    if best_list:
+        _export_best_config(best_list[0], output_dir, run_name)
+
+    hb.update(status="done", n_done=n_done)
+    hb.stop()
+
+
+def _generate_lt_report(
+    experiments: list[dict],
+    output_dir: Path,
+    run_name: str,
+    steps: int,
+    objective: dict,
+) -> None:
+    """Write index.html from DB experiments for the long-term run."""
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ranked = sorted(
+        [e for e in experiments if e.get("score") is not None],
+        key=lambda e: e["score"],
+        reverse=True,
+    )
+    total_elapsed = sum(e.get("elapsed_secs", 0) for e in experiments)
+    html = _render_html(
+        results=experiments,
+        matrix_name=run_name,
+        steps=steps,
+        ts=ts,
+        total_elapsed=total_elapsed,
+        run_dir_name=run_name,
+        objective=objective,
+    )
+    try:
+        with open(output_dir / "index.html", "w") as f:
+            f.write(html)
+    except OSError as e:
+        print(f"WARNING: could not write report: {e}", file=sys.stderr)
 
 
 # ── HTML report ───────────────────────────────────────────────────────────────
@@ -478,17 +1086,17 @@ _PALETTE = [
 ]
 
 
-def _html_color(i: int, n: int, rank: int) -> str:
-    """Color for combo i (by rank). Top 3 get saturated, rest greyed."""
+def _html_color(rank: int) -> str:
     if rank == 1:
         return "#7f7"
     if rank == 2:
         return "#7af"
     if rank == 3:
         return "#fa7"
-    if i < len(_PALETTE):
-        return _PALETTE[i]
-    hue = (i * 137) % 360
+    idx = rank - 1
+    if idx < len(_PALETTE):
+        return _PALETTE[idx]
+    hue = (idx * 137) % 360
     return f"hsl({hue},55%,60%)"
 
 
@@ -499,6 +1107,7 @@ def _render_html(
     ts: str,
     total_elapsed: int,
     run_dir_name: str,
+    objective: Optional[dict] = None,
 ) -> str:
     ranked = sorted(
         [r for r in results if r.get("score") is not None],
@@ -508,7 +1117,6 @@ def _render_html(
     crashed = [r for r in results if r.get("score") is None]
     all_sorted = ranked + crashed
 
-    # Build per-row score (None → "—")
     def _fmt(v, fmt=".4f"):
         return f"{v:{fmt}}" if v is not None else "—"
 
@@ -517,37 +1125,36 @@ def _render_html(
                 "CRASH": "color:#f77", "UNSTABLE": "color:#f77",
                 "NO_DATA": "color:#888"}.get(v, "")
 
-    # Table rows
     rows_html = ""
     for rank_i, r in enumerate(all_sorted):
         rank_disp = rank_i + 1 if r.get("score") is not None else "—"
-        col = _html_color(rank_i, len(all_sorted), rank_disp if isinstance(rank_disp, int) else 99)
+        col = _html_color(rank_i + 1 if isinstance(rank_disp, int) else 99)
         p = r["params"]
-        score_str = _fmt(r.get("score"), ".2f")
-        ref_str   = _fmt(r.get("mean_ref_gap"))
-        cond_str  = _fmt(r.get("mean_cond_gap"))
-        loss_str  = _fmt(r.get("final_loss"))
-        elapsed   = r.get("elapsed_secs", 0)
-        elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s" if elapsed else "—"
         params_str = "  ".join(
             f"{k.replace('freeze_double_stream_scales','freeze').replace('_prob','').replace('_weight','_w')}="
             f"{'T' if v is True else 'F' if v is False else v}"
             for k, v in p.items()
         )
+        elapsed = r.get("elapsed_secs", 0)
+        elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s" if elapsed else "—"
         vstyle = _verdict_style(r.get("verdict", ""))
+        ts_str = str(r.get("ts", ""))[:16]
         rows_html += (
             f"<tr>"
             f"<td style='color:{col};font-weight:bold'>{rank_disp}</td>"
             f"<td style='color:{col}'>{r['combo_id']}</td>"
             f"<td style='font-size:0.8em;color:#ccc'>{params_str}</td>"
-            f"<td style='color:{col};font-weight:bold'>{score_str}</td>"
-            f"<td>{ref_str}</td><td>{cond_str}</td><td>{loss_str}</td>"
+            f"<td style='color:{col};font-weight:bold'>{_fmt(r.get('score'),'.2f')}</td>"
+            f"<td>{_fmt(r.get('mean_ref_gap'))}</td>"
+            f"<td>{_fmt(r.get('mean_cond_gap'))}</td>"
+            f"<td>{_fmt(r.get('final_loss'))}</td>"
             f"<td>{elapsed_str}</td>"
             f"<td style='{vstyle}'>{r.get('verdict','?')}</td>"
+            f"<td style='color:#666;font-size:0.78em'>{ts_str}</td>"
             f"</tr>\n"
         )
 
-    # Best config box
+    # Best-config box
     best = ranked[0] if ranked else None
     best_html = ""
     if best:
@@ -558,33 +1165,24 @@ def _render_html(
                  f"cond_gap={best.get('mean_cond_gap') or 0:.4f}"]
         lines.append("")
         for k, v in p.items():
-            label = k
-            lines.append(f"  <b>{label}</b>: {v}")
+            lines.append(f"  <b>{k}</b>: {v}")
         lines.append("")
-        lines.append("<b>Command to use this config:</b>")
-        overrides = []
-        for k, v in p.items():
-            if k == "freeze_double_stream_scales":
-                overrides.append("" if v else "--no-freeze-double")
-            elif k == "cross_ref_prob":
-                overrides.append(f"--cross-ref-prob {v}")
-            elif k == "patch_shuffle_prob":
-                overrides.append(f"--patch-shuffle-prob {v}")
-            elif k == "style_loss_weight":
-                overrides.append(f"--style-loss-weight {v}")
-        cmd = (f"python train/scripts/test_quality_features.py "
-               f"{' '.join(o for o in overrides if o)} --steps {steps * 2}")
-        lines.append(f"  <code style='color:#7af'>{cmd}</code>")
+        lines.append(f"  Config exported to: <code style='color:#7af'>best_config.yaml</code>")
         best_html = "<br>".join(lines)
 
-    # JS data for charts: per-combo series
+    # Objective display
+    obj_str = ""
+    if objective:
+        parts = [f"{k}={v}" for k, v in objective.items()]
+        obj_str = "  objective: " + "  ".join(parts)
+
+    # JS series for line charts (capped at 20 combos for readability)
     js_series = []
-    for rank_i, r in enumerate(all_sorted[:20]):  # cap at 20 for readability
-        col = _html_color(rank_i, len(all_sorted), rank_i + 1 if r.get("score") is not None else 99)
+    for rank_i, r in enumerate(all_sorted[:20]):
+        col = _html_color(rank_i + 1 if r.get("score") is not None else 99)
         snaps = r.get("snapshots", [])
-        label = r["combo_id"]
         js_series.append({
-            "label":    label,
+            "label":    r["combo_id"],
             "color":    col,
             "rank":     rank_i + 1,
             "ref_gap":  [[s["step"], s.get("ref_gap")]  for s in snaps],
@@ -593,12 +1191,30 @@ def _render_html(
             "scale":    [[s["step"], s.get("ip_scale_mean")] for s in snaps],
         })
 
-    # Score bar data (for all ranked combos)
+    # Score bar chart
     bar_data = [
         {"label": r["combo_id"], "score": r.get("score") or 0,
-         "color": _html_color(i, len(ranked), i + 1)}
+         "color": _html_color(i + 1)}
         for i, r in enumerate(ranked)
     ]
+
+    # Trend chart: score by experiment order (for long-term runs)
+    trend_data = [
+        {"i": idx + 1, "score": r.get("score"), "combo_id": r.get("combo_id", ""),
+         "strategy": r.get("strategy", ""),
+         "color": _html_color(
+             ranked.index(r) + 1 if r in ranked else 99
+         ) if r.get("score") is not None else "#444"}
+        for idx, r in enumerate(results)
+    ]
+    # Rolling best
+    best_so_far: list = []
+    running_best = None
+    for pt in trend_data:
+        s = pt.get("score")
+        if s is not None and (running_best is None or s > running_best):
+            running_best = s
+        best_so_far.append(running_best)
 
     return _HTML_TEMPLATE.format(
         ts=ts,
@@ -610,9 +1226,13 @@ def _render_html(
         total_elapsed=f"{total_elapsed // 3600}h {(total_elapsed % 3600) // 60}m",
         rows_html=rows_html,
         best_html=best_html,
+        obj_str=obj_str,
         js_series=json.dumps(js_series),
         bar_data=json.dumps(bar_data),
+        trend_data=json.dumps(trend_data),
+        best_so_far=json.dumps(best_so_far),
         run_dir_name=run_dir_name,
+        show_trend="true" if len(results) >= 5 else "false",
     )
 
 
@@ -643,9 +1263,10 @@ _HTML_TEMPLATE = """\
 <body>
 <h1>Ablation Harness</h1>
 <div class="meta">
-  matrix={matrix_name} &nbsp;|&nbsp; steps/run={steps} &nbsp;|&nbsp;
-  {n_combos} combos ({n_ranked} scored, {n_crashed} crashed) &nbsp;|&nbsp;
-  total wall-clock: {total_elapsed} &nbsp;|&nbsp; {ts}
+  run={matrix_name} &nbsp;|&nbsp; steps/run={steps} &nbsp;|&nbsp;
+  {n_combos} experiments ({n_ranked} scored, {n_crashed} crashed) &nbsp;|&nbsp;
+  total wall-clock: {total_elapsed} &nbsp;|&nbsp; {ts}<br>
+  {obj_str}
 </div>
 
 <h2>Recommended Config</h2>
@@ -654,9 +1275,9 @@ _HTML_TEMPLATE = """\
 <h2>Ranked Results</h2>
 <table>
   <tr>
-    <th>Rank</th><th>Combo</th><th>Parameters</th>
+    <th>Rank</th><th>ID</th><th>Parameters</th>
     <th>Score ↓</th><th>ref_gap</th><th>cond_gap</th><th>final_loss</th>
-    <th>Elapsed</th><th>Verdict</th>
+    <th>Elapsed</th><th>Verdict</th><th>Timestamp</th>
   </tr>
   {rows_html}
 </table>
@@ -669,19 +1290,27 @@ _HTML_TEMPLATE = """\
        <canvas id="condChart" width="480" height="220"></canvas></div>
   <div><div class="chart-label">Loss (smooth)</div>
        <canvas id="lossChart" width="480" height="220"></canvas></div>
-  <div><div class="chart-label">IP scale (mean) — adapter weight magnitude</div>
+  <div><div class="chart-label">IP scale mean</div>
        <canvas id="scaleChart" width="480" height="220"></canvas></div>
-  <div><div class="chart-label">Score ranking</div>
+  <div><div class="chart-label">Score ranking (all experiments)</div>
        <canvas id="barChart" width="480" height="220"></canvas></div>
+  <div id="trendBox" style="display:none">
+    <div class="chart-label">Score over time — learning progression (rolling best in white)</div>
+    <canvas id="trendChart" width="480" height="220"></canvas>
+  </div>
 </div>
 
 <h2>Data</h2>
 <p><a href="results.json" style="color:#7af">results.json</a> — full metric data for further analysis</p>
-<p>Per-run logs and configs: <code>runs/{run_dir_name}/combo_NNN/</code></p>
+<p>Per-run logs: <code>runs/{run_dir_name}/&lt;combo_id&gt;/training.log</code></p>
+<p>Best config: <code>best_config.yaml</code></p>
 
 <script>
-const SERIES = {js_series};
-const BAR    = {bar_data};
+const SERIES     = {js_series};
+const BAR        = {bar_data};
+const TREND      = {trend_data};
+const BEST_LINE  = {best_so_far};
+const SHOW_TREND = {show_trend};
 
 function drawChart(id, key, zeroLine) {{
   const cv = document.getElementById(id); if (!cv) return;
@@ -709,8 +1338,7 @@ function drawChart(id, key, zeroLine) {{
     ctx.fillText(y.toPrecision(3),2,sy(y)+3);
   }}
   if (zeroLine && yMin<0 && yMax>0) {{
-    ctx.strokeStyle='#444'; ctx.lineWidth=1.5;
-    ctx.setLineDash([4,4]);
+    ctx.strokeStyle='#444'; ctx.lineWidth=1.5; ctx.setLineDash([4,4]);
     ctx.beginPath(); ctx.moveTo(pad.l,sy(0)); ctx.lineTo(pad.l+cw,sy(0)); ctx.stroke();
     ctx.setLineDash([]);
   }}
@@ -730,10 +1358,8 @@ function drawChart(id, key, zeroLine) {{
     }});
     ctx.stroke(); ctx.globalAlpha=1;
   }}
-  // Legend (top 5 + "others")
-  let lx=pad.l; let ly=pad.t+10;
-  const show = SERIES.slice(0,5);
-  for(const s of show) {{
+  let lx=pad.l, ly=pad.t+10;
+  for(const s of SERIES.slice(0,5)) {{
     ctx.fillStyle=s.color; ctx.fillRect(lx,ly-6,16,2);
     ctx.fillStyle='#ccc'; ctx.font='8px monospace';
     ctx.fillText(s.label,lx+20,ly);
@@ -749,18 +1375,16 @@ function drawChart(id, key, zeroLine) {{
 function drawBar(id) {{
   const cv = document.getElementById(id); if (!cv) return;
   const ctx = cv.getContext('2d');
-  const W=cv.width, H=cv.height;
-  const pad={{t:16,r:16,b:16,l:72}};
+  const W=cv.width, H=cv.height, pad={{t:16,r:60,b:16,l:72}};
   const cw=W-pad.l-pad.r, ch=H-pad.t-pad.b;
   if(!BAR.length) return;
-  const maxScore=Math.max(...BAR.map(b=>b.score));
-  const minScore=Math.min(0,...BAR.map(b=>b.score));
-  const barH=Math.floor((ch-4*BAR.length)/Math.max(BAR.length,1));
+  const scores=BAR.map(b=>b.score);
+  const maxS=Math.max(...scores), minS=Math.min(0,...scores);
+  const barH=Math.max(2,Math.floor((ch-4*BAR.length)/Math.max(BAR.length,1)));
   BAR.forEach((b,i) => {{
     const y=pad.t+i*(barH+4);
-    const w=Math.max(2,(b.score-minScore)/(maxScore-minScore+1e-9)*cw);
-    ctx.fillStyle=b.color;
-    ctx.fillRect(pad.l,y,w,Math.max(barH,2));
+    const w=Math.max(2,(b.score-minS)/(maxS-minS+1e-9)*cw);
+    ctx.fillStyle=b.color; ctx.fillRect(pad.l,y,w,Math.max(barH,2));
     ctx.fillStyle='#888'; ctx.font='8px monospace';
     ctx.fillText(b.label,2,y+barH/2+3);
     ctx.fillStyle='#ccc'; ctx.font='8px monospace';
@@ -768,11 +1392,61 @@ function drawBar(id) {{
   }});
 }}
 
+function drawTrend(id) {{
+  const cv = document.getElementById(id); if (!cv) return;
+  if(!SHOW_TREND || !TREND.length) return;
+  document.getElementById('trendBox').style.display='block';
+  const ctx = cv.getContext('2d');
+  const W=cv.width, H=cv.height, pad={{t:16,r:16,b:28,l:52}};
+  const cw=W-pad.l-pad.r, ch=H-pad.t-pad.b;
+  const pts=TREND.filter(p=>p.score!=null);
+  if(!pts.length) return;
+  const allY=pts.map(p=>p.score).concat(BEST_LINE.filter(v=>v!=null));
+  let yMin=Math.min(...allY), yMax=Math.max(...allY);
+  yMin=yMin*1.03-0.01; yMax=yMax*1.03+0.01;
+  const n=TREND.length;
+  const sx=i=>pad.l+cw*i/(n-1||1);
+  const sy=y=>pad.t+ch-(yMax>yMin?(y-yMin)/(yMax-yMin)*ch:ch/2);
+  ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
+  for(let k=0;k<=4;k++) {{
+    const y=yMin+(yMax-yMin)*k/4;
+    ctx.beginPath(); ctx.moveTo(pad.l,sy(y)); ctx.lineTo(pad.l+cw,sy(y)); ctx.stroke();
+    ctx.fillStyle='#555'; ctx.font='9px monospace';
+    ctx.fillText(y.toFixed(1),2,sy(y)+3);
+  }}
+  if(yMin<0&&yMax>0) {{
+    ctx.strokeStyle='#444'; ctx.lineWidth=1.5; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l,sy(0)); ctx.lineTo(pad.l+cw,sy(0)); ctx.stroke();
+    ctx.setLineDash([]);
+  }}
+  // dots per experiment
+  TREND.forEach((p,i)=>{{
+    if(p.score==null) return;
+    ctx.fillStyle=p.color;
+    ctx.beginPath(); ctx.arc(sx(i),sy(p.score),4,0,2*Math.PI); ctx.fill();
+  }});
+  // rolling best line (white)
+  ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=1.5;
+  ctx.beginPath();
+  let first=true;
+  BEST_LINE.forEach((v,i)=>{{
+    if(v==null) return;
+    first?ctx.moveTo(sx(i),sy(v)):ctx.lineTo(sx(i),sy(v)); first=false;
+  }});
+  ctx.stroke();
+  for(let k=0;k<=4;k++) {{
+    const i=Math.round(k*(n-1)/4);
+    ctx.fillStyle='#555'; ctx.font='9px monospace';
+    ctx.fillText(i+1,sx(i)-4,pad.t+ch+18);
+  }}
+}}
+
 drawChart('refChart',  'ref_gap',  true);
 drawChart('condChart', 'cond_gap', true);
 drawChart('lossChart', 'loss',     false);
 drawChart('scaleChart','scale',    false);
 drawBar('barChart');
+drawTrend('trendChart');
 </script>
 </body>
 </html>
@@ -783,11 +1457,10 @@ drawBar('barChart');
 
 def _print_combo_header(combo: dict, idx: int, total: int, steps: int) -> None:
     p = combo["params"]
-    cid = combo["combo_id"]
     params_str = "  ".join(f"{k}={v}" for k, v in p.items())
     print()
     print(_c("cyan", f"{'─'*64}"))
-    print(_c("bold", f"  [{idx}/{total}] {cid}  ({steps} steps)"))
+    print(_c("bold", f"  [{idx}/{total}] {combo['combo_id']}  ({steps} steps)"))
     print(f"  {params_str}")
     print(_c("cyan", f"{'─'*64}"))
 
@@ -800,8 +1473,8 @@ def _print_result_line(r: dict) -> None:
     score_str = f"{score:.2f}" if score is not None else "—"
     ref_str   = f"{ref:+.4f}"  if ref  is not None else "—"
     cond_str  = f"{cond:+.4f}" if cond is not None else "—"
-    vcol = {"PASS": "green", "WARN": "yellow", "CRASH": "red", "UNSTABLE": "red",
-             "NO_DATA": "dim"}.get(v, "reset")
+    vcol = {"PASS": "green", "WARN": "yellow", "CRASH": "red",
+            "UNSTABLE": "red", "NO_DATA": "dim"}.get(v, "reset")
     print(f"  {_c(vcol, v):<12}  score={score_str}  "
           f"ref_gap={ref_str}  cond_gap={cond_str}  "
           f"elapsed={r.get('elapsed_secs', 0)}s")
@@ -821,18 +1494,19 @@ def _print_final_ranking(results: list[dict]) -> None:
     for i, r in enumerate(ranked):
         rank = i + 1
         col = "green" if rank == 1 else "cyan" if rank == 2 else "yellow" if rank == 3 else "reset"
+        p = r["params"]
         p_str = "  ".join(
             f"{k.replace('freeze_double_stream_scales','freeze').replace('_prob','').replace('_weight','_w')}="
             f"{'T' if v is True else 'F' if v is False else v}"
-            for k, v in r["params"].items()
+            for k, v in p.items()
         )
         ref  = r.get("mean_ref_gap")
         cond = r.get("mean_cond_gap")
         score = r.get("score", 0)
-        print(f"  {_c(col, f'#{rank}')}  {r['combo_id']}  score={score:.2f}  "
-              f"ref_gap={ref:+.4f}  cond_gap={cond:+.4f}"
-              if ref is not None and cond is not None else
-              f"  {_c(col, f'#{rank}')}  {r['combo_id']}  score={score:.2f}")
+        line = f"  {_c(col, f'#{rank}')}  {r['combo_id']}  score={score:.2f}"
+        if ref is not None and cond is not None:
+            line += f"  ref_gap={ref:+.4f}  cond_gap={cond:+.4f}"
+        print(line)
         print(f"     {p_str}")
     if ranked:
         best = ranked[0]
@@ -843,7 +1517,7 @@ def _print_final_ranking(results: list[dict]) -> None:
     print(_c("cyan", "═" * 64))
 
 
-# ── Results persistence ────────────────────────────────────────────────────────
+# ── Batch-mode results persistence ────────────────────────────────────────────
 
 def _load_results(output_dir: Path) -> list[dict]:
     p = output_dir / "results.json"
@@ -857,7 +1531,6 @@ def _load_results(output_dir: Path) -> list[dict]:
 
 
 def _save_results(output_dir: Path, results: list[dict]) -> None:
-    # Write metrics JSON without snapshots (too large for results.json)
     slim = [{k: v for k, v in r.items() if k != "snapshots"} for r in results]
     try:
         with open(output_dir / "results.json", "w") as f:
@@ -870,45 +1543,84 @@ def _save_results(output_dir: Path, results: list[dict]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="QUALITY-10: Automated style feature ablation harness",
+        description="QUALITY-10+: Automated style feature ablation harness",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Custom matrix YAML format:")[0].strip(),
     )
+
+    # Long-term mode
+    ap.add_argument("--config", default=None, metavar="PATH",
+                    help="Harness config YAML (enables long-term mode)")
+    ap.add_argument("--db", default=None, metavar="PATH",
+                    help="SQLite DB path (long-term mode; default: output-dir/ablation_history.db)")
+    ap.add_argument("--report-only", action="store_true",
+                    help="Regenerate HTML report from existing DB without running new experiments")
+
+    # Batch mode
     ap.add_argument("--matrix", default="small", metavar="PRESET",
-                    help=f"Built-in matrix preset: {list(MATRIX_PRESETS)} (default: small)")
+                    help=f"Built-in matrix: {list(MATRIX_PRESETS)} (default: small)")
     ap.add_argument("--matrix-file", default=None, metavar="PATH",
-                    help="Custom matrix YAML file (overrides --matrix)")
+                    help="Custom matrix YAML (overrides --matrix)")
     ap.add_argument("--steps", type=int, default=8000,
                     help="Training steps per combo (default: 8000)")
     ap.add_argument("--log-every", type=int, default=None,
-                    help="Log interval in steps (default: auto — steps//80, min 50)")
+                    help="Log interval in steps (default: auto)")
+
+    # Shared
     ap.add_argument("--output-dir", default="train/reports/ablation_run",
-                    help="Output directory for report and results (default: %(default)s)")
+                    help="Output directory (default: %(default)s)")
     ap.add_argument("--base-config", default=str(_BASE_CONFIG),
-                    help="Base training config YAML (default: stage1_512px.yaml)")
-    ap.add_argument("--shards", default=str(_DEFAULT_SHARDS),
-                    help="Shard directory (default: %(default)s)")
-    ap.add_argument("--qwen3-cache", default=str(_DEFAULT_QWEN3) if _DEFAULT_QWEN3.exists() else None,
-                    help="Precomputed Qwen3 cache dir")
-    ap.add_argument("--vae-cache",   default=str(_DEFAULT_VAE)   if _DEFAULT_VAE.exists()   else None,
-                    help="Precomputed VAE cache dir")
-    ap.add_argument("--siglip-cache",default=str(_DEFAULT_SIGLIP) if _DEFAULT_SIGLIP.exists() else None,
-                    help="Precomputed SigLIP cache dir (required for ref_gap signal)")
+                    help="Base training config YAML")
+    ap.add_argument("--shards", default=str(_DEFAULT_SHARDS))
+    ap.add_argument("--qwen3-cache", default=str(_DEFAULT_QWEN3) if _DEFAULT_QWEN3.exists() else None)
+    ap.add_argument("--vae-cache",   default=str(_DEFAULT_VAE)   if _DEFAULT_VAE.exists()   else None)
+    ap.add_argument("--siglip-cache",default=str(_DEFAULT_SIGLIP) if _DEFAULT_SIGLIP.exists() else None)
     ap.add_argument("--max-runs", type=int, default=None,
-                    help="Run at most N combos then stop (useful for testing the harness)")
+                    help="Run at most N combos then stop")
     ap.add_argument("--resume", action="store_true",
-                    help="Skip combos whose combo_id already appears in output-dir/results.json")
+                    help="Skip combos already in results.json (batch mode)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the combo matrix without training")
     ap.add_argument("--quiet", action="store_true",
-                    help="Suppress per-step training output (show only progress summaries)")
+                    help="Suppress per-step training output")
     ap.add_argument("--keep-checkpoints", action="store_true",
-                    help="Keep checkpoint files after each run (disk-intensive for many combos)")
+                    help="Keep checkpoint files after each run")
     ap.add_argument("--ai", action="store_true",
-                    help="Emit compact JSON summary to stdout when done")
+                    help="Emit compact JSON summary on completion")
     args = ap.parse_args()
 
-    # ── Resolve matrix and combos ─────────────────────────────────────────────
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Long-term mode ────────────────────────────────────────────────────────
+    if args.config:
+        harness_cfg = _load_harness_config(Path(args.config))
+        db_path = Path(args.db) if args.db else output_dir / "ablation_history.db"
+        db = AblationDB(db_path)
+        run_name = harness_cfg.get("name", "default")
+
+        if args.report_only:
+            exps = db.get_experiments(run_name)
+            if not exps:
+                print(f"No experiments found for run '{run_name}' in {db_path}")
+                sys.exit(1)
+            steps = harness_cfg.get("steps_per_run", args.steps)
+            objective = harness_cfg.get("objective", {})
+            _generate_lt_report(exps, output_dir, run_name, steps, objective)
+            best_list = db.get_best(run_name, 1)
+            if best_list:
+                _export_best_config(best_list[0], output_dir, run_name)
+            _print_final_ranking(exps)
+            print(f"\n  Report: {output_dir / 'index.html'}")
+            db.close()
+            return
+
+        try:
+            run_long_term(harness_cfg, db, args)
+        finally:
+            db.close()
+        return
+
+    # ── Batch mode ────────────────────────────────────────────────────────────
     matrix_def  = _load_matrix(args)
     all_combos  = _generate_combos(matrix_def)
     matrix_name = args.matrix or "custom"
@@ -917,18 +1629,12 @@ def main() -> None:
         print("ERROR: empty matrix — no variables defined", file=sys.stderr)
         sys.exit(1)
 
-    # Auto log_every: aim for ~80 log lines per run, but not less than 50
     log_every = args.log_every or max(50, args.steps // 80)
 
-    # ── Output directory setup ────────────────────────────────────────────────
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     runs_dir = output_dir / "runs" / matrix_name
     runs_dir.mkdir(parents=True, exist_ok=True)
-
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # ── Pre-flight checks ─────────────────────────────────────────────────────
     shards_dir = Path(args.shards)
     if not args.dry_run:
         if not shards_dir.exists() or not list(shards_dir.glob("*.tar")):
@@ -941,36 +1647,29 @@ def main() -> None:
             print(f"ERROR: venv Python not found: {_VENV_PYTHON}", file=sys.stderr)
             sys.exit(1)
         if not args.siglip_cache or not Path(args.siglip_cache).exists():
-            print(_c("yellow", "WARNING: no siglip-cache — ref_gap signal will be absent. "
-                     "Run precompute_all.py --siglip first for meaningful ablation."))
+            print(_c("yellow", "WARNING: no siglip-cache — ref_gap signal unavailable"))
 
-    # ── Dry run: just print the matrix ───────────────────────────────────────
     if args.dry_run:
         print(_c("bold", f"\nAblation matrix — {matrix_name}"))
-        print(f"  {len(all_combos)} combos × {args.steps} steps = "
-              f"~{len(all_combos) * args.steps // 1000}k total steps")
-        print(f"  log_every={log_every}  output-dir={output_dir}\n")
+        print(f"  {len(all_combos)} combos × {args.steps} steps")
         for c in all_combos:
-            params_str = "  ".join(f"{k}={v}" for k, v in c["params"].items())
-            print(f"  {c['combo_id']}:  {params_str}")
+            print(f"  {c['combo_id']}:  " +
+                  "  ".join(f"{k}={v}" for k, v in c["params"].items()))
         print()
         return
 
-    # ── Resume: load existing results ─────────────────────────────────────────
     done_ids: set[str] = set()
     all_results: list[dict] = []
     if args.resume:
         all_results = _load_results(output_dir)
         done_ids = {r["combo_id"] for r in all_results}
         if done_ids:
-            print(f"  Resuming: {len(done_ids)} combos already done, "
-                  f"{len(all_combos) - len(done_ids)} remaining")
+            print(f"  Resuming: {len(done_ids)} done, {len(all_combos)-len(done_ids)} remaining")
 
     pending = [c for c in all_combos if c["combo_id"] not in done_ids]
     if args.max_runs is not None:
         pending = pending[:args.max_runs]
 
-    # ── Banner ────────────────────────────────────────────────────────────────
     print(_c("cyan", f"\n{'═'*64}"))
     print(_c("bold", f"  Ablation Harness — matrix={matrix_name}"))
     print(_c("cyan", f"{'═'*64}"))
@@ -981,11 +1680,8 @@ def main() -> None:
     print(f"  siglip:  {args.siglip_cache or '⚠ not set — ref_gap unavailable'}")
     if not args.qwen3_cache:
         print(_c("yellow", "  WARNING: no qwen3-cache — live Qwen3 encoding (slow)"))
-    if not args.vae_cache:
-        print(_c("yellow", "  WARNING: no vae-cache — live VAE encoding (slow)"))
     print(_c("cyan", f"{'═'*64}\n"))
 
-    # ── Run loop ──────────────────────────────────────────────────────────────
     run_start = time.time()
     for idx, combo in enumerate(pending, start=len(done_ids) + 1):
         _print_combo_header(combo, idx, len(all_combos), args.steps)
@@ -994,18 +1690,13 @@ def main() -> None:
         all_results.append(result)
         _save_results(output_dir, all_results)
         _print_result_line(result)
-
-        if result.get("exit_code") == -2:  # KeyboardInterrupt
+        if result.get("exit_code") == -2:
             print(_c("yellow", "\n  Run interrupted — generating report with partial results"))
             break
 
     total_elapsed = int(time.time() - run_start)
-
-    # ── Final ranking ─────────────────────────────────────────────────────────
     _print_final_ranking(all_results)
 
-    # ── HTML report ───────────────────────────────────────────────────────────
-    # Include snapshots from per-run metrics.json files for charts
     results_with_snaps = []
     for r in all_results:
         run_dir = runs_dir / r["combo_id"]
@@ -1038,26 +1729,26 @@ def main() -> None:
     except OSError as e:
         print(f"WARNING: could not write report: {e}", file=sys.stderr)
 
-    # ── AI JSON output ────────────────────────────────────────────────────────
+    ranked = sorted(
+        [r for r in all_results if r.get("score") is not None],
+        key=lambda r: r["score"],
+        reverse=True,
+    )
+    if ranked:
+        _export_best_config(ranked[0], output_dir)
+
     if args.ai:
-        ranked = sorted(
-            [r for r in all_results if r.get("score") is not None],
-            key=lambda r: r["score"],
-            reverse=True,
-        )
         ai_out = {
-            "matrix":       matrix_name,
-            "n_combos":     len(all_results),
-            "n_scored":     len(ranked),
-            "n_crashed":    len(all_results) - len(ranked),
+            "matrix":             matrix_name,
+            "n_combos":           len(all_results),
+            "n_scored":           len(ranked),
+            "n_crashed":          len(all_results) - len(ranked),
             "total_elapsed_secs": total_elapsed,
             "best": ranked[0] if ranked else None,
-            "top5": [
-                {"combo_id": r["combo_id"], "params": r["params"],
-                 "score": r.get("score"), "mean_ref_gap": r.get("mean_ref_gap"),
-                 "mean_cond_gap": r.get("mean_cond_gap")}
-                for r in ranked[:5]
-            ],
+            "top5": [{"combo_id": r["combo_id"], "params": r["params"],
+                      "score": r.get("score"), "mean_ref_gap": r.get("mean_ref_gap"),
+                      "mean_cond_gap": r.get("mean_cond_gap")}
+                     for r in ranked[:5]],
             "report": str(report_path),
         }
         print(json.dumps(ai_out, indent=2))
