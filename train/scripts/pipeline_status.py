@@ -922,10 +922,16 @@ def render_html_status(status: dict) -> str:
             f'{rows}</div>'
         )
 
+    explorer_link = (
+        '<div style="padding:8px 20px 0;font-size:11px;color:#888">'
+        'Data: <code>pipeline_ctl data-explorer --overview</code> &nbsp;|&nbsp; '
+        '<code>pipeline_ctl data-explorer --html /tmp/data.html</code>'
+        '</div>'
+    )
     body = (
         f'<div class="hdr"><h1>iris Pipeline Status</h1>'
         f'<span class="ts">{_h(ts)}</span></div>'
-        f'{overview}{chunks_card}{train_card}{issues_card}'
+        f'{overview}{chunks_card}{train_card}{issues_card}{explorer_link}'
     )
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'

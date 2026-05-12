@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import sys
@@ -37,7 +36,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pipeline_lib import (
     CKPT_DIR,
-    CKPT_ARCHIVE_DIR,
     DATA_ROOT,
     FLYWHEEL_DB_PATH,
     PRECOMP_DIR,
@@ -189,10 +187,19 @@ def collect_weights(best_only: bool = False, flywheel_name: Optional[str] = None
         try:
             fw = FlywheelDB(FLYWHEEL_DB_PATH)
             names = [flywheel_name] if flywheel_name else fw.get_all_run_names()
+
+            # Determine actual best iteration per flywheel by cond_gap (not DB is_best flag,
+            # which may be stale if the best-checkpoint criterion changed).
+            best_iters: dict[str, Optional[int]] = {}
+            for name in names:
+                b = fw.get_best(name)
+                best_iters[name] = b.get("iteration") if b else None
+
             for name in names:
                 history = fw.get_checkpoint_history(name)
                 for r in history:
-                    if best_only and not r.get("is_best"):
+                    is_best = (r.get("iteration") == best_iters.get(name))
+                    if best_only and not is_best:
                         continue
                     rows.append({
                         "flywheel":   name,
@@ -202,7 +209,7 @@ def collect_weights(best_only: bool = False, flywheel_name: Optional[str] = None
                         "cond_gap":   r.get("cond_gap"),
                         "ref_gap":    r.get("ref_gap"),
                         "train_loss": r.get("train_loss"),
-                        "is_best":    bool(r.get("is_best")),
+                        "is_best":    is_best,
                         "ts":         r.get("ts"),
                     })
             fw.close()
@@ -227,18 +234,6 @@ def collect_weights(best_only: bool = False, flywheel_name: Optional[str] = None
             pass
 
     return rows
-
-
-def collect_precompute_versions() -> dict:
-    out = {}
-    if not _HAS_CACHE_MGR:
-        return out
-    for enc in ENCODERS:
-        try:
-            out[enc] = PrecomputeCache.list_versions(PRECOMP_DIR, enc)
-        except Exception:
-            out[enc] = []
-    return out
 
 
 def validate_coverage() -> dict:
@@ -339,16 +334,17 @@ def _apply_warm_start(config_path: Path, checkpoint: str) -> str:
     except Exception as e:
         return f"error reading {config_path}: {e}"
 
-    # Replace existing base_checkpoint line or append under [model] section
-    pattern = re.compile(r'^(\s*base_checkpoint\s*:).*$', re.MULTILINE)
-    new_line = f'base_checkpoint: "{checkpoint}"'
+    # Replace existing base_checkpoint line, preserving leading whitespace.
+    # Capture leading spaces so the key stays in its YAML section.
+    pattern = re.compile(r'^(\s*)base_checkpoint\s*:.*$', re.MULTILINE)
+    esc = checkpoint.replace('"', '\\"')
     if pattern.search(text):
-        new_text = pattern.sub(new_line, text)
+        new_text = pattern.sub(lambda m: f'{m.group(1)}base_checkpoint: "{esc}"', text)
     else:
-        # Append after model: section header
+        # Append under model: section header with 2-space indent
         new_text = re.sub(
             r'(^model\s*:.*$)',
-            r'\1\n  ' + new_line,
+            lambda m: m.group(0) + f'\n  base_checkpoint: "{esc}"',
             text,
             count=1,
             flags=re.MULTILINE,
