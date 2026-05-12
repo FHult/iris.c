@@ -530,6 +530,7 @@ class ShardScoreDB:
             ).fetchone()[0]
             best_row = self._conn.execute(
                 "SELECT shard_id, effective_score FROM shards "
+                "WHERE effective_score IS NOT NULL "
                 "ORDER BY effective_score DESC LIMIT 1"
             ).fetchone()
             worst_row = self._conn.execute(
