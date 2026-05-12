@@ -13,13 +13,16 @@
 ablation:
   name: "sref-v1"
   max_total_runs: 128        # full grid = 4×4×2×4 = 128 candidates
-  steps_per_run: 12000       # ~14 min/run at 512px
+  steps_per_run: 1000        # match steps_per_iteration in flywheel config (~63 min/run at 512px, 3.8s/step)
   strategy: "bayesian"       # grid | random | bayesian
   n_initial: 12              # random warm-up before GP kicks in (bayesian only)
 
   objective:
-    clip_i_weight: 0.55          # ref_gap proxy for CLIP-I style fidelity (most important)
-    cross_ref_gap_weight: 0.30   # cond_gap: adapter learning signal
+    # cond_gap is the primary signal at 1000-step budgets: stable, positive,
+    # and has meaningful spread across hyperparameter configs.  ref_gap is
+    # consistently negative and noisy at this scale (trial 1 observation).
+    clip_i_weight: 0.15          # ref_gap: kept as weak secondary signal
+    cross_ref_gap_weight: 0.70   # cond_gap: primary adapter learning signal
     stability_weight: 0.15       # stability: low final loss
 
   variables:

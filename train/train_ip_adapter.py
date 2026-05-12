@@ -1274,452 +1274,461 @@ def train(config: dict) -> None:
         mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
         _t_fwd += time.time() - _t0
 
-        # Adapter-only backward + optimizer update + optimizer state eval (bulk of GPU work)
-        _t0 = time.time()
-        _do_style = _style_weight > 0.0 and not null_image and step % _style_every == 0
-        if _do_style:
-            loss_val, grad_norm_val = compiled_step(
-                siglip_feats, use_null_image, flux_state, target,
-                latents, noisy, alpha_t, sigma_t,
-            )
-        else:
-            loss_val, grad_norm_val = compiled_step(
-                siglip_feats, use_null_image, flux_state, target,
-            )
-        # flux_state (25 Q tensors, h_final, temb ≈ 300 MB) and target are no
-        # longer needed — release before eval so Metal reclaims them promptly.
-        del flux_state, target
-        _t_step += time.time() - _t0
+        # Adapter-only backward — repeated n_grad_steps_per_fwd times, reusing
+        # flux_state (stop_gradient'd Q vectors). Each inner iteration is a full
+        # gradient step with complete per-step accounting.
+        _n_grad_steps = tcfg.get("n_grad_steps_per_fwd", 1)
+        for _grad_i in range(_n_grad_steps):
+            if step >= _end_step:
+                break
+            _t_inner_start = time.time()
 
-        # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
-        # Built lazily here so it references the same lazy adapter.parameters()
-        # that Fence 2 will concretize — Fence 3 then evaluates only the new EMA.
-        _do_ema = (step % tcfg["ema_update_every"] == 0)
-        if _do_ema:
-            ema_params = update_ema(ema_params, adapter,
-                                   decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
-
-        # Synchronous eval split into three fences to bound peak Metal allocation.
-        #
-        # Fence 1 — backward + optimizer state (m, v):
-        #   Peak = steady_state(17.73 GB) + grads(~2 GB) + new_m(~2 GB) + new_v(~2 GB)
-        #        ≈ 23.7 GB.  After this fence grads are freed (no remaining refs).
-        #
-        # Fence 2 — new params from concrete m/v (no backward re-run):
-        #   Peak = steady_state(17.73 GB) + new_params(~2 GB) ≈ 19.7 GB.
-        #
-        # Fence 3 — EMA (if due): old_ema + new_ema, isolated from param update.
-        _t0 = time.time()
-        mx.eval(optimizer.state, loss_val, grad_norm_val)
-        mx.clear_cache()
-        mx.eval(adapter.parameters())
-        mx.clear_cache()
-        if _do_ema:
-            mx.eval(ema_params)
-            mx.clear_cache()
-        _t_eval_end = time.time()
-        _t_eval += _t_eval_end - _t0
-
-        step += 1
-
-        # Style loss accumulation — _style_loss_accum[0] was set inside loss_fn
-        # and is already materialized by Fence 1 above (it's in loss_val's graph).
-        if _do_style:
-            _style_loss_sum += float(_style_loss_accum[0].item())
-            _style_loss_count += 1
-
-        # T-01: grad norm EMA + spike alert
-        _gn = float(grad_norm_val.item())
-        if grad_norm_smooth == 0.0:
-            grad_norm_smooth = _gn
-        else:
-            grad_norm_smooth = _grad_ema_decay * grad_norm_smooth + (1 - _grad_ema_decay) * _gn
-        if grad_norm_smooth > 0 and _gn > 10 * grad_norm_smooth:
-            print(f"  WARNING: grad norm spike step {step}: "
-                  f"{_gn:.3f} vs smooth {grad_norm_smooth:.3f}", flush=True)
-        # T-11: count steps where clipping actually fired
-        if _gn > tcfg["grad_clip"]:
-            _grad_clip_steps += 1
-
-        # T-02: per-bucket throughput
-        _bk = f"{bH}x{bW}"
-        _step_loss_val = float(loss_val.item())
-        bucket_stats[_bk]["steps"]    += 1
-        bucket_stats[_bk]["loss_sum"] += _step_loss_val
-        bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_bucket_start
-
-        # T-12: conditioned vs unconditioned loss split
-        if null_image:
-            _null_loss_sum += _step_loss_val
-            _null_loss_count += 1
-        else:
-            _cond_loss_sum += _step_loss_val
-            _cond_loss_count += 1
-            # QUALITY-6: cross-ref vs self-ref split within conditioned steps
-            if is_cross_ref:
-                _cross_ref_loss_sum   += _step_loss_val
-                _cross_ref_loss_count += 1
+            # Adapter-only backward + optimizer update + optimizer state eval (bulk of GPU work)
+            _t0 = time.time()
+            _do_style = _style_weight > 0.0 and not null_image and step % _style_every == 0
+            if _do_style:
+                loss_val, grad_norm_val = compiled_step(
+                    siglip_feats, use_null_image, flux_state, target,
+                    latents, noisy, alpha_t, sigma_t,
+                )
             else:
-                _self_ref_loss_sum   += _step_loss_val
-                _self_ref_loss_count += 1
+                loss_val, grad_norm_val = compiled_step(
+                    siglip_feats, use_null_image, flux_state, target,
+                )
+            _t_step += time.time() - _t0
 
-        # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
-        if step % 500 == 0:
-            try:
-                _flat_online = dict(_flatten(adapter.parameters()))
-                _flat_ema    = dict(_flatten(ema_params))
-                _drift_vals  = []
-                for _k in list(_flat_online)[:5]:
-                    if _k in _flat_ema:
-                        _a = _flat_online[_k].astype(mx.float32)
-                        _b = _flat_ema[_k].astype(mx.float32)
-                        if _a.shape == _b.shape:
-                            _drift_vals.append(float(mx.mean((_a - _b) ** 2).item() ** 0.5))
-                if _drift_vals:
-                    ema_drift = sum(_drift_vals) / len(_drift_vals)
-            except Exception:
-                pass
+            # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
+            # Built lazily here so it references the same lazy adapter.parameters()
+            # that Fence 2 will concretize — Fence 3 then evaluates only the new EMA.
+            _do_ema = (step % tcfg["ema_update_every"] == 0)
+            if _do_ema:
+                ema_params = update_ema(ema_params, adapter,
+                                       decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
-        # T-05: validation loss on held-out set
-        if _val_shards and step % _val_every == 0:
-            val_loss_last = _compute_val_loss()
-            if val_loss_last is not None:
+            # Synchronous eval split into three fences to bound peak Metal allocation.
+            #
+            # Fence 1 — backward + optimizer state (m, v):
+            #   Peak = steady_state(17.73 GB) + grads(~2 GB) + new_m(~2 GB) + new_v(~2 GB)
+            #        ≈ 23.7 GB.  After this fence grads are freed (no remaining refs).
+            #
+            # Fence 2 — new params from concrete m/v (no backward re-run):
+            #   Peak = steady_state(17.73 GB) + new_params(~2 GB) ≈ 19.7 GB.
+            #
+            # Fence 3 — EMA (if due): old_ema + new_ema, isolated from param update.
+            _t0 = time.time()
+            mx.eval(optimizer.state, loss_val, grad_norm_val)
+            mx.clear_cache()
+            mx.eval(adapter.parameters())
+            mx.clear_cache()
+            if _do_ema:
+                mx.eval(ema_params)
+                mx.clear_cache()
+            _t_eval_end = time.time()
+            _t_eval += _t_eval_end - _t0
+
+            step += 1
+
+            # Style loss accumulation — _style_loss_accum[0] was set inside loss_fn
+            # and is already materialized by Fence 1 above (it's in loss_val's graph).
+            if _do_style:
+                _style_loss_sum += float(_style_loss_accum[0].item())
+                _style_loss_count += 1
+
+            # T-01: grad norm EMA + spike alert
+            _gn = float(grad_norm_val.item())
+            if grad_norm_smooth == 0.0:
+                grad_norm_smooth = _gn
+            else:
+                grad_norm_smooth = _grad_ema_decay * grad_norm_smooth + (1 - _grad_ema_decay) * _gn
+            if grad_norm_smooth > 0 and _gn > 10 * grad_norm_smooth:
+                print(f"  WARNING: grad norm spike step {step}: "
+                      f"{_gn:.3f} vs smooth {grad_norm_smooth:.3f}", flush=True)
+            # T-11: count steps where clipping actually fired
+            if _gn > tcfg["grad_clip"]:
+                _grad_clip_steps += 1
+
+            # T-02: per-bucket throughput
+            _bk = f"{bH}x{bW}"
+            _step_loss_val = float(loss_val.item())
+            bucket_stats[_bk]["steps"]    += 1
+            bucket_stats[_bk]["loss_sum"] += _step_loss_val
+            bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_inner_start
+
+            # T-12: conditioned vs unconditioned loss split
+            if null_image:
+                _null_loss_sum += _step_loss_val
+                _null_loss_count += 1
+            else:
+                _cond_loss_sum += _step_loss_val
+                _cond_loss_count += 1
+                # QUALITY-6: cross-ref vs self-ref split within conditioned steps
+                if is_cross_ref:
+                    _cross_ref_loss_sum   += _step_loss_val
+                    _cross_ref_loss_count += 1
+                else:
+                    _self_ref_loss_sum   += _step_loss_val
+                    _self_ref_loss_count += 1
+
+            # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
+            if step % 500 == 0:
                 try:
-                    os.makedirs(os.path.dirname(val_loss_log_path), exist_ok=True)
-                    with open(val_loss_log_path, "a") as _vf:
-                        json.dump({"step": step, "val_loss": round(val_loss_last, 6),
-                                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}, _vf)
-                        _vf.write("\n")
-                except OSError:
+                    _flat_online = dict(_flatten(adapter.parameters()))
+                    _flat_ema    = dict(_flatten(ema_params))
+                    _drift_vals  = []
+                    for _k in list(_flat_online)[:5]:
+                        if _k in _flat_ema:
+                            _a = _flat_online[_k].astype(mx.float32)
+                            _b = _flat_ema[_k].astype(mx.float32)
+                            if _a.shape == _b.shape:
+                                _drift_vals.append(float(mx.mean((_a - _b) ** 2).item() ** 0.5))
+                    if _drift_vals:
+                        ema_drift = sum(_drift_vals) / len(_drift_vals)
+                except Exception:
                     pass
-                print(f"  val_loss={val_loss_last:.4f} (step {step})", flush=True)
 
-        # Logging
-        if step % log_interval == 0:
-            elapsed = time.time() - t0
-            steps_per_sec = log_interval / elapsed
-            loss_scalar = float(loss_val.item())
-            lr_now = float(optimizer.learning_rate)
-            loss_history.append(loss_scalar)
-            if len(loss_history) > 20:
-                loss_history.pop(0)
-            loss_smooth = sum(loss_history) / len(loss_history)
-            steps_remaining = _end_step - step
-            eta_s = steps_remaining / steps_per_sec if steps_per_sec > 0 else 0
-            eta_h, eta_m = divmod(int(eta_s) // 60, 60)
-            print(
-                f"step {step:>7,}/{_end_step:,}"
-                f"  loss {loss_scalar:.4f} (avg {loss_smooth:.4f})"
-                f"  lr {lr_now:.2e}"
-                f"  {steps_per_sec:.2f} steps/s"
-                f"  ETA {eta_h}h{eta_m:02d}m",
-                flush=True,
-            )
-            # TP-005: per-phase timing breakdown
-            # fwd = Flux forward + flux_state eval (no grad)
-            # step = compiled_step: backward + optimizer m/v eval (now includes bulk of eval time)
-            # eval = outer Fence 1: just new_params (~2 GB), should be small
-            total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
-            if total_phase > 0:
+            # T-05: validation loss on held-out set
+            if _val_shards and step % _val_every == 0:
+                val_loss_last = _compute_val_loss()
+                if val_loss_last is not None:
+                    try:
+                        os.makedirs(os.path.dirname(val_loss_log_path), exist_ok=True)
+                        with open(val_loss_log_path, "a") as _vf:
+                            json.dump({"step": step, "val_loss": round(val_loss_last, 6),
+                                       "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}, _vf)
+                            _vf.write("\n")
+                    except OSError:
+                        pass
+                    print(f"  val_loss={val_loss_last:.4f} (step {step})", flush=True)
+
+            # Logging
+            if step % log_interval == 0:
+                elapsed = time.time() - t0
+                steps_per_sec = log_interval / elapsed
+                loss_scalar = float(loss_val.item())
+                lr_now = float(optimizer.learning_rate)
+                loss_history.append(loss_scalar)
+                if len(loss_history) > 20:
+                    loss_history.pop(0)
+                loss_smooth = sum(loss_history) / len(loss_history)
+                steps_remaining = _end_step - step
+                eta_s = steps_remaining / steps_per_sec if steps_per_sec > 0 else 0
+                eta_h, eta_m = divmod(int(eta_s) // 60, 60)
                 print(
-                    f"  timing/{log_interval}steps:"
-                    f"  data={_t_data:.1f}s ({100*_t_data/total_phase:.0f}%)"
-                    f"  prep={_t_prep:.1f}s ({100*_t_prep/total_phase:.0f}%)"
-                    f"  fwd={_t_fwd:.1f}s ({100*_t_fwd/total_phase:.0f}%)"
-                    f"  step={_t_step:.1f}s ({100*_t_step/total_phase:.0f}%)"
-                    f"  eval={_t_eval:.1f}s ({100*_t_eval/total_phase:.0f}%)",
+                    f"step {step:>7,}/{_end_step:,}"
+                    f"  loss {loss_scalar:.4f} (avg {loss_smooth:.4f})"
+                    f"  lr {lr_now:.2e}"
+                    f"  {steps_per_sec:.2f} steps/s"
+                    f"  ETA {eta_h}h{eta_m:02d}m",
                     flush=True,
                 )
-            # T-07: loader wait fraction — computed before zeroing accumulators
-            _loader_pct = round(100 * _t_data / total_phase, 1) if total_phase > 0 else 0.0
-            _loader_wait_ms = round(_t_data * 1000 / log_interval, 1)
-            _compute_ms = round((_t_prep + _t_fwd + _t_step + _t_eval) * 1000 / log_interval, 1)
-            if _loader_pct > 20:
-                print(f"  WARNING: loader wait {_loader_pct:.0f}% — consider increasing prefetch_batches",
-                      flush=True)
-            _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
-
-            # T-01: grad norm at log interval
-            print(f"  grad_norm {_gn:.3f}  (smooth {grad_norm_smooth:.3f})", flush=True)
-
-            # T-02: per-bucket summary at log interval
-            _bkt_summary = {}
-            for _bk, _bv in sorted(bucket_stats.items()):
-                _n = _bv["steps"]
-                if _n > 0:
-                    _bkt_summary[_bk] = {
-                        "steps": _n,
-                        "loss_avg": round(_bv["loss_sum"] / _n, 4),
-                        "secs_avg": round(_bv["time_sum"] / _n, 2),
-                    }
-            if _bkt_summary:
-                _bkt_str = "  ".join(
-                    f"{k}:{v['steps']}steps loss={v['loss_avg']:.4f} {v['secs_avg']:.1f}s/step"
-                    for k, v in _bkt_summary.items()
-                )
-                print(f"  buckets: {_bkt_str}", flush=True)
-
-            # T-03: memory pressure (peak read here; reset deferred until after
-            # the checkpoint save so the interval peak captures both training
-            # AND checkpoint serialization spikes in the same window)
-            mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
-            mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
-            print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
-                  flush=True)
-            if _HAS_PSUTIL:
-                _vm = _psutil.virtual_memory()
-                mem_used_gb = round(_vm.used / 1e9, 1)
-                mem_available_gb = round(_vm.available / 1e9, 1)
-                print(f"  sys_mem: {mem_used_gb:.1f} GB used  {mem_available_gb:.1f} GB free",
-                      flush=True)
-                if mem_available_gb < 6.0:
-                    print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
+                # TP-005: per-phase timing breakdown
+                # fwd = Flux forward + flux_state eval (no grad)
+                # step = compiled_step: backward + optimizer m/v eval (now includes bulk of eval time)
+                # eval = outer Fence 1: just new_params (~2 GB), should be small
+                total_phase = _t_data + _t_prep + _t_fwd + _t_step + _t_eval
+                if total_phase > 0:
+                    print(
+                        f"  timing/{log_interval}steps:"
+                        f"  data={_t_data:.1f}s ({100*_t_data/total_phase:.0f}%)"
+                        f"  prep={_t_prep:.1f}s ({100*_t_prep/total_phase:.0f}%)"
+                        f"  fwd={_t_fwd:.1f}s ({100*_t_fwd/total_phase:.0f}%)"
+                        f"  step={_t_step:.1f}s ({100*_t_step/total_phase:.0f}%)"
+                        f"  eval={_t_eval:.1f}s ({100*_t_eval/total_phase:.0f}%)",
+                        flush=True,
+                    )
+                # T-07: loader wait fraction — computed before zeroing accumulators
+                _loader_pct = round(100 * _t_data / total_phase, 1) if total_phase > 0 else 0.0
+                _loader_wait_ms = round(_t_data * 1000 / log_interval, 1)
+                _compute_ms = round((_t_prep + _t_fwd + _t_step + _t_eval) * 1000 / log_interval, 1)
+                if _loader_pct > 20:
+                    print(f"  WARNING: loader wait {_loader_pct:.0f}% — consider increasing prefetch_batches",
                           flush=True)
+                _t_data = _t_prep = _t_fwd = _t_step = _t_eval = 0.0
 
-            # T-06: EMA drift
-            if ema_drift > 0:
-                print(f"  ema_drift={ema_drift:.5f}", flush=True)
+                # T-01: grad norm at log interval
+                print(f"  grad_norm {_gn:.3f}  (smooth {grad_norm_smooth:.3f})", flush=True)
 
-            # T-10: SigLIP coverage
-            _siglip_cov = round(100 * (1 - _siglip_miss_steps / log_interval), 1)
-            if _siglip_miss_steps > 0:
-                print(f"  siglip_coverage={_siglip_cov:.0f}% ({_siglip_miss_steps}/{log_interval} steps missing)",
+                # T-02: per-bucket summary at log interval
+                _bkt_summary = {}
+                for _bk, _bv in sorted(bucket_stats.items()):
+                    _n = _bv["steps"]
+                    if _n > 0:
+                        _bkt_summary[_bk] = {
+                            "steps": _n,
+                            "loss_avg": round(_bv["loss_sum"] / _n, 4),
+                            "secs_avg": round(_bv["time_sum"] / _n, 2),
+                        }
+                if _bkt_summary:
+                    _bkt_str = "  ".join(
+                        f"{k}:{v['steps']}steps loss={v['loss_avg']:.4f} {v['secs_avg']:.1f}s/step"
+                        for k, v in _bkt_summary.items()
+                    )
+                    print(f"  buckets: {_bkt_str}", flush=True)
+
+                # T-03: memory pressure (peak read here; reset deferred until after
+                # the checkpoint save so the interval peak captures both training
+                # AND checkpoint serialization spikes in the same window)
+                mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
+                mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
+                print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
                       flush=True)
-                if _siglip_cov < 90:
-                    print(f"  WARNING: SigLIP coverage below 90%", flush=True)
-            _siglip_miss_steps = 0
-            # Keep inter-log heartbeats up-to-date with latest quality metrics.
-            _hb_siglip_cov = _siglip_cov
-            _hb_loader_pct = _loader_pct
-
-            # T-11: gradient clipping report
-            if _grad_clip_steps > 0:
-                _clip_pct = round(100 * _grad_clip_steps / log_interval, 1)
-                print(f"  grad_clipped={_clip_pct:.0f}% ({_grad_clip_steps}/{log_interval} steps "
-                      f"had norm > {tcfg['grad_clip']})", flush=True)
-            _grad_clip_steps = 0
-
-            # T-12: conditioned vs unconditioned loss split (QUALITY-4)
-            _loss_cond_avg = round(_cond_loss_sum / _cond_loss_count, 4) if _cond_loss_count > 0 else None
-            _loss_null_avg = round(_null_loss_sum / _null_loss_count, 4) if _null_loss_count > 0 else None
-            if _loss_cond_avg is not None and _loss_null_avg is not None:
-                _cond_gap = _loss_null_avg - _loss_cond_avg
-                _cond_gap_pct = round(100 * _cond_gap / _loss_null_avg, 1) if _loss_null_avg > 0 else 0
-                print(
-                    f"  loss_cond={_loss_cond_avg:.4f}  loss_null={_loss_null_avg:.4f}"
-                    f"  gap={_cond_gap:+.4f} ({_cond_gap_pct:+.1f}%)"
-                    f"  [n={_cond_loss_count}/{_null_loss_count}]",
-                    flush=True,
-                )
-                if _cond_gap_pct < 1.0 and step > 1000:
-                    print("  WARNING: loss_cond ≈ loss_null — adapter may not be learning", flush=True)
-            _cond_loss_sum = _cond_loss_count = 0
-            _null_loss_sum = _null_loss_count = 0
-
-            # Style loss (Gram matrix term)
-            if _style_weight > 0.0 and _style_loss_count > 0:
-                _style_loss_avg = round(_style_loss_sum / _style_loss_count, 6)
-                print(
-                    f"  style_loss={_style_loss_avg:.6f}"
-                    f"  (weight={_style_weight}, {_style_loss_count}/{log_interval} steps)",
-                    flush=True,
-                )
-            else:
-                _style_loss_avg = None
-            _style_loss_sum = _style_loss_count = 0
-
-            # QUALITY-6: cross-ref vs self-ref loss split
-            _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None
-            _loss_cross_ref_avg = round(_cross_ref_loss_sum / _cross_ref_loss_count, 4) if _cross_ref_loss_count > 0 else None
-            if _loss_self_ref_avg is not None or _loss_cross_ref_avg is not None:
-                _ref_parts = []
-                if _loss_self_ref_avg is not None:
-                    _ref_parts.append(f"self={_loss_self_ref_avg:.4f} [n={_self_ref_loss_count}]")
-                if _loss_cross_ref_avg is not None:
-                    _ref_parts.append(f"cross={_loss_cross_ref_avg:.4f} [n={_cross_ref_loss_count}]")
-                if _loss_self_ref_avg is not None and _loss_cross_ref_avg is not None:
-                    _ref_gap = _loss_cross_ref_avg - _loss_self_ref_avg
-                    _ref_parts.append(f"gap={_ref_gap:+.4f}")
-                    if _ref_gap < 0 and step > 1000:
-                        _ref_parts.append("WARNING: cross_ref < self_ref — unexpected, check augmentation")
-                print(f"  loss_ref: {'  '.join(_ref_parts)}", flush=True)
-            _self_ref_loss_sum  = _self_ref_loss_count  = 0
-            _cross_ref_loss_sum = _cross_ref_loss_count = 0
-
-            # T-13: adapter scale magnitudes (QUALITY-5)
-            _scale_all_mean = _scale_double_mean = _scale_single_mean = None
-            try:
-                _scales = adapter.scale.astype(mx.float32).tolist()
-                _scale_double = _scales[:5]
-                _scale_single = _scales[5:]
-                _scale_all_mean   = round(sum(_scales)        / len(_scales),        4)
-                _scale_double_mean = round(sum(_scale_double) / len(_scale_double),  4)
-                _scale_single_mean = round(sum(_scale_single) / len(_scale_single),  4)
-                _scale_min = round(min(_scales), 4)
-                _scale_max = round(max(_scales), 4)
-                print(
-                    f"  ip_scale: mean={_scale_all_mean:.4f}"
-                    f"  double={_scale_double_mean:.4f}  single={_scale_single_mean:.4f}"
-                    f"  range=[{_scale_min:.4f}, {_scale_max:.4f}]",
-                    flush=True,
-                )
-                if _scale_max > 2.0:
-                    print(f"  WARNING: ip_scale max {_scale_max:.2f} > 2.0 — content leakage risk",
+                if _HAS_PSUTIL:
+                    _vm = _psutil.virtual_memory()
+                    mem_used_gb = round(_vm.used / 1e9, 1)
+                    mem_available_gb = round(_vm.available / 1e9, 1)
+                    print(f"  sys_mem: {mem_used_gb:.1f} GB used  {mem_available_gb:.1f} GB free",
                           flush=True)
-                if _scale_all_mean < 0.05 and step > 500:
-                    print(f"  WARNING: ip_scale mean {_scale_all_mean:.4f} near zero — adapter not active",
+                    if mem_available_gb < 6.0:
+                        print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
+                              flush=True)
+
+                # T-06: EMA drift
+                if ema_drift > 0:
+                    print(f"  ema_drift={ema_drift:.5f}", flush=True)
+
+                # T-10: SigLIP coverage
+                _siglip_cov = round(100 * (1 - _siglip_miss_steps / log_interval), 1)
+                if _siglip_miss_steps > 0:
+                    print(f"  siglip_coverage={_siglip_cov:.0f}% ({_siglip_miss_steps}/{log_interval} steps missing)",
                           flush=True)
-            except Exception:
-                pass
+                    if _siglip_cov < 90:
+                        print(f"  WARNING: SigLIP coverage below 90%", flush=True)
+                _siglip_miss_steps = 0
+                # Keep inter-log heartbeats up-to-date with latest quality metrics.
+                _hb_siglip_cov = _siglip_cov
+                _hb_loader_pct = _loader_pct
 
-            if wandb_run:
-                wandb_run.log(
-                    {"loss": loss_scalar, "loss_smooth": loss_smooth,
-                     "lr": lr_now, "steps_per_sec": steps_per_sec,
-                     "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth,
-                     "ema_drift": ema_drift, "siglip_coverage_pct": _siglip_cov,
-                     "loader_wait_pct": _loader_pct,
-                     "loss_cond": _loss_cond_avg, "loss_null": _loss_null_avg,
-                     "style_loss": _style_loss_avg,
-                     "ip_scale_mean": _scale_all_mean,
-                     "ip_scale_double": _scale_double_mean,
-                     "ip_scale_single": _scale_single_mean},
-                    step=step,
-                )
-            # Write machine-readable heartbeat to the pipeline location so the
-            # orchestrator and pipeline_status.py can monitor liveness and anomalies.
-            total_elapsed = time.time() - t_start
-            try:
-                from pipeline_lib import write_heartbeat as _write_hb
-                _write_hb(
-                    "trainer", _pipeline_chunk,
-                    step=step,
-                    total_steps=_end_step,
-                    loss=round(loss_scalar, 6),
-                    loss_smooth=round(loss_smooth, 6),
-                    lr=lr_now,
-                    steps_per_sec=round(steps_per_sec, 4),
-                    eta_sec=int(eta_s),
-                    elapsed_seconds=int(total_elapsed),
-                    grad_norm=round(_gn, 4),
-                    grad_norm_smooth=round(grad_norm_smooth, 4),
-                    grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
-                    ema_drift=round(ema_drift, 5),
-                    val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
-                    siglip_coverage_pct=_siglip_cov,
-                    loader_wait_ms_avg=_loader_wait_ms,
-                    compute_ms_avg=_compute_ms,
-                    buckets=_bkt_summary,
-                    mem_used_gb=mem_used_gb,
-                    mem_available_gb=mem_available_gb,
-                    mlx_active_gb=mlx_active_gb,
-                    mlx_peak_gb=mlx_peak_gb,
-                    loss_cond=_loss_cond_avg,
-                    loss_null=_loss_null_avg,
-                    style_loss=_style_loss_avg,
-                    loss_self_ref=_loss_self_ref_avg,
-                    loss_cross_ref=_loss_cross_ref_avg,
-                    ip_scale_mean=_scale_all_mean,
-                    ip_scale_double=_scale_double_mean,
-                    ip_scale_single=_scale_single_mean,
-                )
-            except Exception:
-                pass
-            # Reset rolling stats so per-interval averages don't drift over the
-            # entire run as loss improves and bucket distribution shifts.
-            bucket_stats.clear()
-            # Release unused Metal buffer pool entries every log interval.
-            # MLX pools buffers internally; without periodic clearing, pool
-            # growth can exhaust unified memory after ~1200 steps (~12 evals).
-            mx.clear_cache()
-            import gc; gc.collect()
-            t0 = time.time()
+                # T-11: gradient clipping report
+                if _grad_clip_steps > 0:
+                    _clip_pct = round(100 * _grad_clip_steps / log_interval, 1)
+                    print(f"  grad_clipped={_clip_pct:.0f}% ({_grad_clip_steps}/{log_interval} steps "
+                          f"had norm > {tcfg['grad_clip']})", flush=True)
+                _grad_clip_steps = 0
 
-        # Heartbeat — decoupled from log_every so the orchestrator always sees
-        # liveness even when log_every is large.  The full rich heartbeat is
-        # written by the log block above at log_interval steps; this lightweight
-        # one fires at _heartbeat_every (≤50) steps for the intervals between.
-        if step % _heartbeat_every == 0 and step > 0:
-            _hb_elapsed = time.time() - _hb_t0
-            _hb_t0 = time.time()
-            _hb_sps = _heartbeat_every / _hb_elapsed if _hb_elapsed > 0 else 0.0
-            _hb_loss = float(loss_val.item())
-            _hb_loss_smooth = 0.98 * _hb_loss_smooth + 0.02 * _hb_loss
-            if step % log_interval != 0:
+                # T-12: conditioned vs unconditioned loss split (QUALITY-4)
+                _loss_cond_avg = round(_cond_loss_sum / _cond_loss_count, 4) if _cond_loss_count > 0 else None
+                _loss_null_avg = round(_null_loss_sum / _null_loss_count, 4) if _null_loss_count > 0 else None
+                if _loss_cond_avg is not None and _loss_null_avg is not None:
+                    _cond_gap = _loss_null_avg - _loss_cond_avg
+                    _cond_gap_pct = round(100 * _cond_gap / _loss_null_avg, 1) if _loss_null_avg > 0 else 0
+                    print(
+                        f"  loss_cond={_loss_cond_avg:.4f}  loss_null={_loss_null_avg:.4f}"
+                        f"  gap={_cond_gap:+.4f} ({_cond_gap_pct:+.1f}%)"
+                        f"  [n={_cond_loss_count}/{_null_loss_count}]",
+                        flush=True,
+                    )
+                    if _cond_gap_pct < 1.0 and step > 1000:
+                        print("  WARNING: loss_cond ≈ loss_null — adapter may not be learning", flush=True)
+                _cond_loss_sum = _cond_loss_count = 0
+                _null_loss_sum = _null_loss_count = 0
+
+                # Style loss (Gram matrix term)
+                if _style_weight > 0.0 and _style_loss_count > 0:
+                    _style_loss_avg = round(_style_loss_sum / _style_loss_count, 6)
+                    print(
+                        f"  style_loss={_style_loss_avg:.6f}"
+                        f"  (weight={_style_weight}, {_style_loss_count}/{log_interval} steps)",
+                        flush=True,
+                    )
+                else:
+                    _style_loss_avg = None
+                _style_loss_sum = _style_loss_count = 0
+
+                # QUALITY-6: cross-ref vs self-ref loss split
+                _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None
+                _loss_cross_ref_avg = round(_cross_ref_loss_sum / _cross_ref_loss_count, 4) if _cross_ref_loss_count > 0 else None
+                if _loss_self_ref_avg is not None or _loss_cross_ref_avg is not None:
+                    _ref_parts = []
+                    if _loss_self_ref_avg is not None:
+                        _ref_parts.append(f"self={_loss_self_ref_avg:.4f} [n={_self_ref_loss_count}]")
+                    if _loss_cross_ref_avg is not None:
+                        _ref_parts.append(f"cross={_loss_cross_ref_avg:.4f} [n={_cross_ref_loss_count}]")
+                    if _loss_self_ref_avg is not None and _loss_cross_ref_avg is not None:
+                        _ref_gap = _loss_cross_ref_avg - _loss_self_ref_avg
+                        _ref_parts.append(f"gap={_ref_gap:+.4f}")
+                        if _ref_gap < 0 and step > 1000:
+                            _ref_parts.append("WARNING: cross_ref < self_ref — unexpected, check augmentation")
+                    print(f"  loss_ref: {'  '.join(_ref_parts)}", flush=True)
+                _self_ref_loss_sum  = _self_ref_loss_count  = 0
+                _cross_ref_loss_sum = _cross_ref_loss_count = 0
+
+                # T-13: adapter scale magnitudes (QUALITY-5)
+                _scale_all_mean = _scale_double_mean = _scale_single_mean = None
+                try:
+                    _scales = adapter.scale.astype(mx.float32).tolist()
+                    _scale_double = _scales[:5]
+                    _scale_single = _scales[5:]
+                    _scale_all_mean   = round(sum(_scales)        / len(_scales),        4)
+                    _scale_double_mean = round(sum(_scale_double) / len(_scale_double),  4)
+                    _scale_single_mean = round(sum(_scale_single) / len(_scale_single),  4)
+                    _scale_min = round(min(_scales), 4)
+                    _scale_max = round(max(_scales), 4)
+                    print(
+                        f"  ip_scale: mean={_scale_all_mean:.4f}"
+                        f"  double={_scale_double_mean:.4f}  single={_scale_single_mean:.4f}"
+                        f"  range=[{_scale_min:.4f}, {_scale_max:.4f}]",
+                        flush=True,
+                    )
+                    if _scale_max > 2.0:
+                        print(f"  WARNING: ip_scale max {_scale_max:.2f} > 2.0 — content leakage risk",
+                              flush=True)
+                    if _scale_all_mean < 0.05 and step > 500:
+                        print(f"  WARNING: ip_scale mean {_scale_all_mean:.4f} near zero — adapter not active",
+                              flush=True)
+                except Exception:
+                    pass
+
+                if wandb_run:
+                    wandb_run.log(
+                        {"loss": loss_scalar, "loss_smooth": loss_smooth,
+                         "lr": lr_now, "steps_per_sec": steps_per_sec,
+                         "grad_norm": _gn, "grad_norm_smooth": grad_norm_smooth,
+                         "ema_drift": ema_drift, "siglip_coverage_pct": _siglip_cov,
+                         "loader_wait_pct": _loader_pct,
+                         "loss_cond": _loss_cond_avg, "loss_null": _loss_null_avg,
+                         "style_loss": _style_loss_avg,
+                         "ip_scale_mean": _scale_all_mean,
+                         "ip_scale_double": _scale_double_mean,
+                         "ip_scale_single": _scale_single_mean},
+                        step=step,
+                    )
+                # Write machine-readable heartbeat to the pipeline location so the
+                # orchestrator and pipeline_status.py can monitor liveness and anomalies.
+                total_elapsed = time.time() - t_start
                 try:
                     from pipeline_lib import write_heartbeat as _write_hb
                     _write_hb(
                         "trainer", _pipeline_chunk,
                         step=step,
                         total_steps=_end_step,
-                        loss=round(_hb_loss, 6),
-                        loss_smooth=round(_hb_loss_smooth, 6),
-                        lr=float(optimizer.learning_rate),
-                        steps_per_sec=round(_hb_sps, 4),
-                        eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0,
-                        elapsed_seconds=int(time.time() - t_start),
+                        loss=round(loss_scalar, 6),
+                        loss_smooth=round(loss_smooth, 6),
+                        lr=lr_now,
+                        steps_per_sec=round(steps_per_sec, 4),
+                        eta_sec=int(eta_s),
+                        elapsed_seconds=int(total_elapsed),
                         grad_norm=round(_gn, 4),
                         grad_norm_smooth=round(grad_norm_smooth, 4),
-                        siglip_coverage_pct=_hb_siglip_cov,
-                        loader_wait_pct=_hb_loader_pct,
+                        grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
+                        ema_drift=round(ema_drift, 5),
+                        val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
+                        siglip_coverage_pct=_siglip_cov,
+                        loader_wait_ms_avg=_loader_wait_ms,
+                        compute_ms_avg=_compute_ms,
+                        buckets=_bkt_summary,
+                        mem_used_gb=mem_used_gb,
+                        mem_available_gb=mem_available_gb,
+                        mlx_active_gb=mlx_active_gb,
+                        mlx_peak_gb=mlx_peak_gb,
+                        loss_cond=_loss_cond_avg,
+                        loss_null=_loss_null_avg,
+                        style_loss=_style_loss_avg,
+                        loss_self_ref=_loss_self_ref_avg,
+                        loss_cross_ref=_loss_cross_ref_avg,
+                        ip_scale_mean=_scale_all_mean,
+                        ip_scale_double=_scale_double_mean,
+                        ip_scale_single=_scale_single_mean,
                     )
                 except Exception:
                     pass
+                # Reset rolling stats so per-interval averages don't drift over the
+                # entire run as loss improves and bucket distribution shifts.
+                bucket_stats.clear()
+                # Release unused Metal buffer pool entries every log interval.
+                # MLX pools buffers internally; without periodic clearing, pool
+                # growth can exhaust unified memory after ~1200 steps (~12 evals).
+                mx.clear_cache()
+                import gc; gc.collect()
+                t0 = time.time()
 
-        # Checkpoint (async background write; plans §3.12)
-        if step % ocfg["checkpoint_every"] == 0:
-            _lineage = {**_lineage_base, "step": step,
-                        "loss": round(loss_smooth, 6)}
-            save_checkpoint_async(adapter, ema_params, step,
-                                  ocfg["checkpoint_dir"], ocfg["keep_last_n"],
-                                  lineage=_lineage)
-            # Write a heartbeat after the potentially slow checkpoint save so
-            # the orchestrator doesn't see a stale heartbeat and restart us.
-            try:
-                from pipeline_lib import write_heartbeat as _write_hb
-                _write_hb("trainer", _pipeline_chunk, step=step,
-                           total_steps=_end_step,
-                           loss=round(_hb_loss, 6),
-                           steps_per_sec=round(_hb_sps, 4),
-                           eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
-            except Exception:
-                pass
+            # Heartbeat — decoupled from log_every so the orchestrator always sees
+            # liveness even when log_every is large.  The full rich heartbeat is
+            # written by the log block above at log_interval steps; this lightweight
+            # one fires at _heartbeat_every (≤50) steps for the intervals between.
+            if step % _heartbeat_every == 0 and step > 0:
+                _hb_elapsed = time.time() - _hb_t0
+                _hb_t0 = time.time()
+                _hb_sps = _heartbeat_every / _hb_elapsed if _hb_elapsed > 0 else 0.0
+                _hb_loss = float(loss_val.item())
+                _hb_loss_smooth = 0.98 * _hb_loss_smooth + 0.02 * _hb_loss
+                if step % log_interval != 0:
+                    try:
+                        from pipeline_lib import write_heartbeat as _write_hb
+                        _write_hb(
+                            "trainer", _pipeline_chunk,
+                            step=step,
+                            total_steps=_end_step,
+                            loss=round(_hb_loss, 6),
+                            loss_smooth=round(_hb_loss_smooth, 6),
+                            lr=float(optimizer.learning_rate),
+                            steps_per_sec=round(_hb_sps, 4),
+                            eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0,
+                            elapsed_seconds=int(time.time() - t_start),
+                            grad_norm=round(_gn, 4),
+                            grad_norm_smooth=round(grad_norm_smooth, 4),
+                            siglip_coverage_pct=_hb_siglip_cov,
+                            loader_wait_pct=_hb_loader_pct,
+                        )
+                    except Exception:
+                        pass
 
-        # Eval hook: generate images + compute CLIP-I/T every _eval_every steps.
-        # Runs after checkpoint save so the just-written checkpoint is coherent.
-        # Uses the in-memory flux model and current EMA params (no reload).
-        if _eval_enabled and step % _eval_every == 0 and step > 0:
-            try:
-                from eval import run_eval as _run_eval
-                _eval_out = os.path.join(ocfg["checkpoint_dir"], "eval", f"step_{step:07d}")
-                _eval_summary = _run_eval(
-                    flux=flux,
-                    adapter_cfg=acfg,
-                    adapter_params=dict(_flatten(ema_params)),
-                    prompts_file=_eval_prompts,
-                    output_dir=_eval_out,
-                    step=step,
-                    width=ecfg.get("width", 512),
-                    height=ecfg.get("height", 512),
-                    n_steps=ecfg.get("num_steps", 4),
-                    seed=ecfg.get("seed", 42),
-                    siglip_model_name=mcfg["siglip_model"],
-                    vae=flux.vae,
-                )
-                if wandb_run and _eval_summary:
-                    wandb_run.log(
-                        {"eval/clip_i": _eval_summary.get("mean_clip_i"),
-                         "eval/clip_t": _eval_summary.get("mean_clip_t")},
+            # Checkpoint (async background write; plans §3.12)
+            if step % ocfg["checkpoint_every"] == 0:
+                _lineage = {**_lineage_base, "step": step,
+                            "loss": round(loss_smooth, 6)}
+                save_checkpoint_async(adapter, ema_params, step,
+                                      ocfg["checkpoint_dir"], ocfg["keep_last_n"],
+                                      lineage=_lineage)
+                # Write a heartbeat after the potentially slow checkpoint save so
+                # the orchestrator doesn't see a stale heartbeat and restart us.
+                try:
+                    from pipeline_lib import write_heartbeat as _write_hb
+                    _write_hb("trainer", _pipeline_chunk, step=step,
+                               total_steps=_end_step,
+                               loss=round(_hb_loss, 6),
+                               steps_per_sec=round(_hb_sps, 4),
+                               eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
+                except Exception:
+                    pass
+
+            # Eval hook: generate images + compute CLIP-I/T every _eval_every steps.
+            # Runs after checkpoint save so the just-written checkpoint is coherent.
+            # Uses the in-memory flux model and current EMA params (no reload).
+            if _eval_enabled and step % _eval_every == 0 and step > 0:
+                try:
+                    from eval import run_eval as _run_eval
+                    _eval_out = os.path.join(ocfg["checkpoint_dir"], "eval", f"step_{step:07d}")
+                    _eval_summary = _run_eval(
+                        flux=flux,
+                        adapter_cfg=acfg,
+                        adapter_params=dict(_flatten(ema_params)),
+                        prompts_file=_eval_prompts,
+                        output_dir=_eval_out,
                         step=step,
+                        width=ecfg.get("width", 512),
+                        height=ecfg.get("height", 512),
+                        n_steps=ecfg.get("num_steps", 4),
+                        seed=ecfg.get("seed", 42),
+                        siglip_model_name=mcfg["siglip_model"],
+                        vae=flux.vae,
                     )
-            except Exception as _eval_err:
-                print(f"  WARNING: eval hook failed at step {step}: {_eval_err}", flush=True)
-            mx.clear_cache()
+                    if wandb_run and _eval_summary:
+                        wandb_run.log(
+                            {"eval/clip_i": _eval_summary.get("mean_clip_i"),
+                             "eval/clip_t": _eval_summary.get("mean_clip_t")},
+                            step=step,
+                        )
+                except Exception as _eval_err:
+                    print(f"  WARNING: eval hook failed at step {step}: {_eval_err}", flush=True)
+                mx.clear_cache()
 
-        # Peak reset deferred until after checkpoint so the reported peak
-        # covers the full interval (training + serialization spike).
-        if step % log_interval == 0:
-            mx.reset_peak_memory()
+            # Peak reset deferred until after checkpoint so the reported peak
+            # covers the full interval (training + serialization spike).
+            if step % log_interval == 0:
+                mx.reset_peak_memory()
+
+        # Release flux_state (25 Q tensors ≈ 300 MB) after all gradient steps.
+        del flux_state, target
 
 
     # Final checkpoint + EMA export

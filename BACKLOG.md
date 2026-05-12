@@ -178,7 +178,13 @@ After 12 flywheel iterations, only 2 of 42 scored shards had `attr_confidence > 
 
 Fixed: `min_attribution_obs: 3 → 2` in `flywheel_sref_v1.yaml`. This activates attribution ~2× faster while still requiring evidence on both inclusion and exclusion sides.
 
-Note: if the same shards keep dominating the performance slots (see shard 000002 above), `performance_weight: 0.60` or `recency_penalty: 0.30` may also need tuning in trial 2. A tighter recency window or higher exploration rate would force more exclusion observations for consistently top-ranked shards.
+Note: `n_selected` (used in the recency formula) counts ALL selections including pre-flywheel pipeline runs, which inflates the penalty for long-running shards. A follow-up improvement would track per-shard selections within the last N flywheel iterations only.
+
+**FLYWHEEL-RECENCY-1: Performance slots had no recency penalty** ✓ Done
+
+Trial 1: shard 000002 was selected 5/6 clean iterations despite `recency_penalty: 0.30` because the penalty only applied to step 4 (random fill). Step 1 (performance slots, `performance_weight=0.60`) sorted by raw `_score()` with no discount, so the top-scoring shard was always selected.
+
+Fixed in `shard_selector.py`: step 1 now sorts by `_score_penalised()`, applying the same `recency_penalty × selection_rate` discount as step 4. The same `n_selected` / `(iteration / recency_window)` formula is used throughout, maintaining consistency.
 
 **FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
 
@@ -188,11 +194,11 @@ The ablation burst was disabled for trial 1 (`ablation_every_n: 0`) after it lau
 2. **`ablation_every_n`**: currently fires every 5 iterations. For short trials (1000 steps/iter) ablation overhead is proportional to the flywheel step budget, so every 5 is reasonable once step counts match.
 3. **Ablation score metric**: `ablation_sref_v1.yaml` uses `clip_i_weight: 0.55` as objective, but trial 1 shows `ref_gap` is noisy at 1000 steps. Consider using `cond_gap` as the primary ablation objective, or average over the final N steps rather than the last log window.
 
-**FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**
-- The frozen Flux forward pass dominates step time (~2.4s/step = 63%). The adapter backward is only ~1.4s/step.
-- Since `qs` (Flux Q vectors) are `stop_gradient`'d and computed without any IP contribution, they can safely be reused across N adapter backward steps for the same (noise, timestep, target) sample. This is equivalent to N gradient descent steps on the same mini-batch — valid for style injection learning.
-- Implementation: add `n_grad_steps_per_fwd: N` option to the training config and loop `compiled_step` N times before releasing `flux_state`. At N=3: effective step time drops from ~3.8s to ~2.2s (~1.7x throughput). Step counter, EMA, and heartbeat must all increment by 1 per inner loop iteration.
-- Measured baseline: 3.8s/step at 512×512 (fwd=2.4s + eval=1.4s). At N=3: (2.4 + 3×1.4) / 3 = 1.8s/step.
+~~**FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**~~ ✓ Done
+
+Implemented `n_grad_steps_per_fwd` in `train_ip_adapter.py`. The inner loop reuses `flux_state` (stop_gradient'd Q vectors) across N adapter backward steps. All per-step accounting (step counter, EMA, grad norm, loss splits, logging, heartbeat, checkpoint) runs inside the inner loop so `step % X == 0` triggers fire at the correct absolute step values.
+
+Config: `stage1_512px.yaml` → `n_grad_steps_per_fwd: 1` (default disabled). Set to 2 for ~1.47x throughput. At N=2: (2.4 + 2×1.4) / 2 = 2.6s/step vs 3.8s/step baseline. N=3 gives ~1.7x but increases peak memory by ~300 MB (flux_state kept alive across 2 extra eval fences; still well within 32 GB).
 
 ---
 

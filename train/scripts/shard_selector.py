@@ -685,11 +685,23 @@ def select_shards(
             selected_shards.append(s)
 
     # ------------------------------------------------------------------
-    # Step 1: top performers by effective_score (raw + attribution blend)
+    # Step 1: top performers by effective_score (raw + attribution blend),
+    # with the same recency penalty applied as in step 4.  Without this,
+    # high-scoring shards monopolise the performance slots every iteration
+    # (observed: shard 000002 selected 5/6 clean iters in trial 1).
     n_perf = max(1, int(n_shards * performance_weight))
     scored = [s for s in all_shards if s.get("effective_score") is not None
               or s.get("composite_score") is not None]
-    scored.sort(key=_score, reverse=True)
+
+    def _score_penalised(s: dict) -> float:
+        w = _score(s) if _score(s) > 0 else 0.3
+        n_sel = s.get("n_selected", 0)
+        if n_sel > 0 and recency_window > 0 and iteration > 0:
+            penalty = min(1.0, n_sel / max(1, iteration / max(1, recency_window)))
+            w = w * (1.0 - recency_penalty * penalty)
+        return w
+
+    scored.sort(key=_score_penalised, reverse=True)
     for s in scored[:n_perf]:
         _add_shard(s)
 
