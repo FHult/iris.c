@@ -312,10 +312,15 @@ def tmux_new_window(window_name: str, cmd: str, log_file: Path,
     """Launch cmd in a new tmux window, logging stdout+stderr to log_file."""
     import subprocess
     full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
-    subprocess.run([
-        "tmux", "new-window", "-t", f"{session}:", "-n", window_name,
-        "bash", "-c", full_cmd
-    ], check=True)
+    try:
+        subprocess.run([
+            "tmux", "new-window", "-t", f"{session}:", "-n", window_name,
+            "bash", "-c", full_cmd
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"tmux new-window failed (session={session!r}, window={window_name!r}): {e}"
+        ) from e
 
 
 def tmux_send_keys(window_name: str, cmd: str, session: str = TMUX_SESSION) -> None:
@@ -429,9 +434,11 @@ def free_gb(path: Path = DATA_ROOT) -> float:
 def notify(title: str, message: str) -> None:
     import subprocess
     try:
+        safe_msg   = message.replace('\\', '\\\\').replace('"', '\\"')
+        safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
         subprocess.run([
             "osascript", "-e",
-            f'display notification "{message}" with title "{title}"'
+            f'display notification "{safe_msg}" with title "{safe_title}"'
         ], capture_output=True)
     except Exception:
         pass

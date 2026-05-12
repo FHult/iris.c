@@ -295,7 +295,7 @@ def check_plateau(done_iters: list[dict], patience: int, threshold: float) -> Op
     last `patience` done iterations is smaller than `threshold`.  Returns None
     when there is insufficient data or no plateau.
     """
-    if len(done_iters) < patience:
+    if patience <= 0 or len(done_iters) < patience:
         return None
     recent = done_iters[-patience:]
     vals   = [i.get("cond_gap") for i in recent if i.get("cond_gap") is not None]
@@ -342,11 +342,8 @@ def render_flywheel_index(
         return f"{v:{f}}" if v is not None else "—"
 
     # ── Iteration table ───────────────────────────────────────────────────────
-    best_iter = max((it["iteration"] for it in done
-                     if it.get("cond_gap") is not None),
-                    key=lambda n: next(it["cond_gap"] for it in done
-                                       if it["iteration"] == n),
-                    default=None) if done else None
+    _cond_by_iter = {it["iteration"]: it["cond_gap"] for it in done if it.get("cond_gap") is not None}
+    best_iter = max(_cond_by_iter, key=_cond_by_iter.__getitem__) if _cond_by_iter else None
 
     rows = ""
     for it in iterations:

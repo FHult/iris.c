@@ -1947,7 +1947,6 @@ class Orchestrator:
         if self.dry_run:
             log_orch(f"[dry-run] would restart trainer for chunk {chunk}")
             return
-        import subprocess
         key = ("restart_trainer", chunk)
         count = self._restart_counts.get(key, 0) + 1
         self._restart_counts[key] = count
@@ -1973,9 +1972,8 @@ class Orchestrator:
     def _write_pause(self) -> None:
         """Write a pause control signal so the operator can investigate."""
         try:
-            import json as _json
             with open(CONTROL_FILE, "w") as _f:
-                _json.dump({"action": "pause"}, _f)
+                json.dump({"action": "pause"}, _f)
         except OSError:
             pass
         notify("iris pipeline WARNING", "Training paused by anomaly — check dispatch queue")
@@ -2241,6 +2239,11 @@ def _check_flywheel_control(name: str) -> None:
                     log_orch(f"[flywheel:{name}] resumed (control file removed)")
                     break
                 ctrl2 = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
+                if ctrl2.get("action") == "stop":
+                    log_orch(f"[flywheel:{name}] stop signal while paused — exiting")
+                    FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+                    release_gpu_lock()
+                    sys.exit(0)
                 if ctrl2.get("action") in ("run", "resume"):
                     FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
                     log_orch(f"[flywheel:{name}] resumed")
@@ -2339,7 +2342,10 @@ def _run_flywheel_ablation(
     )
     log_file.parent.mkdir(parents=True, exist_ok=True)
     full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
-    subprocess.run(["bash", "-c", full_cmd])
+    try:
+        subprocess.run(["bash", "-c", full_cmd])
+    finally:
+        tmp_cfg.unlink(missing_ok=True)
 
     exit_code = last_exit_code(log_file)
     if exit_code == 0:
@@ -2420,315 +2426,317 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     fw_db    = FlywheelDB()
     score_db = ShardScoreDB()
 
-    reports_dir = FLYWHEEL_REPORTS_DIR / name
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        reports_dir = FLYWHEEL_REPORTS_DIR / name
+        reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resume: start after the last recorded iteration
-    prior     = fw_db.get_iterations(name)
-    iteration = (max(r["iteration"] for r in prior) + 1) if prior else 1
-    hyperparams = dict(fw_cfg.get("hyperparams", {}))
+        # Resume: start after the last recorded iteration
+        prior     = fw_db.get_iterations(name)
+        iteration = (max(r["iteration"] for r in prior) + 1) if prior else 1
+        hyperparams = dict(fw_cfg.get("hyperparams", {}))
 
-    # Determine starting checkpoint.
-    # Prefer the chronologically latest step_*.safetensors from CKPT_DIR so that
-    # restarts always continue the cumulative training chain.  get_best() returns
-    # best-by-ref_gap which may be an older checkpoint (FLYWHEEL-BUG-1).
-    resume_ckpt: Optional[str] = None
+        # Determine starting checkpoint.
+        # Prefer the chronologically latest step_*.safetensors from CKPT_DIR so that
+        # restarts always continue the cumulative training chain.  get_best() returns
+        # best-by-ref_gap which may be an older checkpoint (FLYWHEEL-BUG-1).
+        resume_ckpt: Optional[str] = None
 
-    def _step_num(p: Path) -> int:
-        try:
-            return int(p.stem.split("_")[1])
-        except (IndexError, ValueError):
-            return 0
+        def _step_num(p: Path) -> int:
+            try:
+                return int(p.stem.split("_")[1])
+            except (IndexError, ValueError):
+                return 0
 
-    ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"), key=_step_num)
-    if ckpts:
-        resume_ckpt = str(ckpts[-1])
-    else:
-        done_iters = [r for r in prior if r["status"] == "done"]
-        if done_iters:
-            best = fw_db.get_best(name)
-            if best and best.get("checkpoint"):
-                resume_ckpt = best["checkpoint"]
-    if resume_ckpt is None:
-        resume_ckpt = fw_cfg.get("base_checkpoint")
+        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"), key=_step_num)
+        if ckpts:
+            resume_ckpt = str(ckpts[-1])
+        else:
+            done_iters = [r for r in prior if r["status"] == "done"]
+            if done_iters:
+                best = fw_db.get_best(name)
+                if best and best.get("checkpoint"):
+                    resume_ckpt = best["checkpoint"]
+        if resume_ckpt is None:
+            resume_ckpt = fw_cfg.get("base_checkpoint")
 
-    log_orch(f"[flywheel:{name}] starting — iter={iteration}/{max_iters}  "
-             f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
-             f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
+        log_orch(f"[flywheel:{name}] starting — iter={iteration}/{max_iters}  "
+                 f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
+                 f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
 
-    plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
-    plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
+        plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
+        plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
 
-    while iteration <= max_iters:
-        _check_flywheel_control(name)
-
-        # Disk guard
-        gb     = free_gb()
-        min_gb = float(fw_cfg.get("min_free_gb", DISK_ABORT_GB))
-        if gb < min_gb:
-            log_orch(f"[flywheel:{name}] disk low ({gb:.1f} GB < {min_gb} GB) — waiting 300s",
-                     level="warning")
-            write_heartbeat("flywheel", status="disk_wait",
-                            flywheel_name=name, iteration=iteration)
-            time.sleep(300)
-            continue
-
-        log_orch(f"[flywheel:{name}] === iteration {iteration}/{max_iters} ===")
-        write_heartbeat("flywheel", status="selecting",
-                        flywheel_name=name, iteration=iteration)
-
-        # Register any new shards (with SigLIP embeddings and manifest if configured)
-        scan_shard_pool(score_db, shards_dir, manifest_path=manifest_path, verbose=False)
-
-        # Select shards
-        shard_cfg = dict(fw_cfg.get("shard_selection", {}))
-        selected_paths = select_shards(score_db, n_shards, shard_cfg, name, iteration)
-
-        if len(selected_paths) < 2:
-            msg = f"only {len(selected_paths)} shards available in {shards_dir}"
-            log_orch(f"[flywheel:{name}] {msg} — waiting 300s", level="warning")
-            dispatch_issue(f"fw_{name}_no_shards", "warning",
-                           f"Flywheel {name}: {msg}",
-                           suggested_action="populate_shards_dir")
-            time.sleep(300)
-            continue
-
-        shard_ids = [Path(p).stem for p in selected_paths]
-
-        # Stage selected shards as symlinks
-        staging_dir = DATA_ROOT / "flywheel_staging" / name / f"iter{iteration:04d}"
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
-        stage_shards_for_iteration(selected_paths, staging_dir)
-
-        # Per-iteration shard report
-        shard_html = render_shard_report(score_db, shard_ids, iteration, name)
-        (reports_dir / f"shard_selection_iter{iteration:04d}.html").write_text(shard_html)
-
-        # Checkpoint hash for this iteration (derived from the checkpoint we're resuming from)
-        ckpt_hash = _checkpoint_hash(resume_ckpt)
-
-        # Insert DB record (status=running)
-        row_id = fw_db.insert_iteration(
-            name=name, iteration=iteration,
-            n_shards=len(shard_ids), shard_ids=shard_ids,
-            hyperparams=hyperparams, steps=steps_per_iter,
-            git_commit=_git_sha(),
-            checkpoint_hash=ckpt_hash,
-        )
-
-        # Build temp training config pointing at staged shards
-        train_cfg_path = _build_flywheel_train_config(
-            fw_cfg, staging_dir, steps_per_iter, hyperparams,
-            iteration, name,
-        )
-
-        # Launch training in TMUX_TRAIN_WIN
-        log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Wait for any pre-existing training window to finish (crash-restart guard)
-        if tmux_window_exists(TMUX_TRAIN_WIN):
-            log_orch(f"[flywheel:{name}] {TMUX_TRAIN_WIN} already running — waiting",
-                     level="warning")
-            while tmux_window_exists(TMUX_TRAIN_WIN):
-                _check_flywheel_control(name)
-                time.sleep(poll_interval)
-
-        # Wait until GPU lock is successfully acquired
-        while True:
-            if acquire_gpu_lock(f"flywheel_{name}_iter{iteration}"):
-                break
-            holder = gpu_lock_holder()
-            log_orch(f"[flywheel:{name}] GPU busy (holder={holder}), waiting 30s",
-                     level="warning")
+        while iteration <= max_iters:
             _check_flywheel_control(name)
-            time.sleep(30)
 
-        t_start = time.time()
-        try:
-            write_heartbeat("trainer", status="booting", step=0)
+            # Disk guard
+            gb     = free_gb()
+            min_gb = float(fw_cfg.get("min_free_gb", DISK_ABORT_GB))
+            if gb < min_gb:
+                log_orch(f"[flywheel:{name}] disk low ({gb:.1f} GB < {min_gb} GB) — waiting 300s",
+                         level="warning")
+                write_heartbeat("flywheel", status="disk_wait",
+                                flywheel_name=name, iteration=iteration)
+                time.sleep(300)
+                continue
 
-            train_cmd = (
-                f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
-                f"--config '{train_cfg_path}' "
-                f"--max-steps {steps_per_iter} "
-                f"--data-root '{DATA_ROOT}'"
-            )
-            if resume_ckpt and Path(resume_ckpt).exists():
-                train_cmd += f" --resume '{resume_ckpt}'"
-
-            activated = (
-                f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
-                f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
-            )
-            tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
-            write_heartbeat("flywheel", status="training",
+            log_orch(f"[flywheel:{name}] === iteration {iteration}/{max_iters} ===")
+            write_heartbeat("flywheel", status="selecting",
                             flywheel_name=name, iteration=iteration)
-            log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
-            t_start = time.time()
 
-            # Monitor training window
+            # Register any new shards (with SigLIP embeddings and manifest if configured)
+            scan_shard_pool(score_db, shards_dir, manifest_path=manifest_path, verbose=False)
+
+            # Select shards
+            shard_cfg = dict(fw_cfg.get("shard_selection", {}))
+            selected_paths = select_shards(score_db, n_shards, shard_cfg, name, iteration)
+
+            if len(selected_paths) < 2:
+                msg = f"only {len(selected_paths)} shards available in {shards_dir}"
+                log_orch(f"[flywheel:{name}] {msg} — waiting 300s", level="warning")
+                dispatch_issue(f"fw_{name}_no_shards", "warning",
+                               f"Flywheel {name}: {msg}",
+                               suggested_action="populate_shards_dir")
+                time.sleep(300)
+                continue
+
+            shard_ids = [Path(p).stem for p in selected_paths]
+
+            # Stage selected shards as symlinks
+            staging_dir = DATA_ROOT / "flywheel_staging" / name / f"iter{iteration:04d}"
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            stage_shards_for_iteration(selected_paths, staging_dir)
+
+            # Per-iteration shard report
+            shard_html = render_shard_report(score_db, shard_ids, iteration, name)
+            (reports_dir / f"shard_selection_iter{iteration:04d}.html").write_text(shard_html)
+
+            # Checkpoint hash for this iteration (derived from the checkpoint we're resuming from)
+            ckpt_hash = _checkpoint_hash(resume_ckpt)
+
+            # Insert DB record (status=running)
+            row_id = fw_db.insert_iteration(
+                name=name, iteration=iteration,
+                n_shards=len(shard_ids), shard_ids=shard_ids,
+                hyperparams=hyperparams, steps=steps_per_iter,
+                git_commit=_git_sha(),
+                checkpoint_hash=ckpt_hash,
+            )
+
+            # Build temp training config pointing at staged shards
+            train_cfg_path = _build_flywheel_train_config(
+                fw_cfg, staging_dir, steps_per_iter, hyperparams,
+                iteration, name,
+            )
+
+            # Launch training in TMUX_TRAIN_WIN
+            log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Wait for any pre-existing training window to finish (crash-restart guard)
+            if tmux_window_exists(TMUX_TRAIN_WIN):
+                log_orch(f"[flywheel:{name}] {TMUX_TRAIN_WIN} already running — waiting",
+                         level="warning")
+                while tmux_window_exists(TMUX_TRAIN_WIN):
+                    _check_flywheel_control(name)
+                    time.sleep(poll_interval)
+
+            # Wait until GPU lock is successfully acquired
             while True:
-                time.sleep(poll_interval)
+                if acquire_gpu_lock(f"flywheel_{name}_iter{iteration}"):
+                    break
+                holder = gpu_lock_holder()
+                log_orch(f"[flywheel:{name}] GPU busy (holder={holder}), waiting 30s",
+                         level="warning")
                 _check_flywheel_control(name)
+                time.sleep(30)
+
+            try:
+                write_heartbeat("trainer", status="booting", step=0)
+
+                train_cmd = (
+                    f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
+                    f"--config '{train_cfg_path}' "
+                    f"--max-steps {steps_per_iter} "
+                    f"--data-root '{DATA_ROOT}'"
+                )
+                if resume_ckpt and Path(resume_ckpt).exists():
+                    train_cmd += f" --resume '{resume_ckpt}'"
+
+                activated = (
+                    f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+                    f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
+                )
+                tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
                 write_heartbeat("flywheel", status="training",
                                 flywheel_name=name, iteration=iteration)
-                if not tmux_window_exists(TMUX_TRAIN_WIN):
-                    break
-        finally:
-            release_gpu_lock()
+                log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
+                t_start = time.time()
 
-        elapsed   = int(time.time() - t_start)
-        exit_code = last_exit_code(log_file)
-        status    = "done" if exit_code == 0 else "failed"
+                # Monitor training window
+                while True:
+                    time.sleep(poll_interval)
+                    _check_flywheel_control(name)
+                    write_heartbeat("flywheel", status="training",
+                                    flywheel_name=name, iteration=iteration)
+                    if not tmux_window_exists(TMUX_TRAIN_WIN):
+                        break
+            finally:
+                release_gpu_lock()
+                train_cfg_path.unlink(missing_ok=True)
 
-        # Collect training metrics
-        metrics = collect_metrics_from_log(log_file)
-        log_orch(
-            f"[flywheel:{name}] iter {iteration}: {status}  "
-            f"ref_gap={metrics.get('ref_gap')}  loss={metrics.get('loss_smooth')}  "
-            f"elapsed={elapsed}s"
-        )
+            elapsed   = int(time.time() - t_start)
+            exit_code = last_exit_code(log_file)
+            status    = "done" if exit_code == 0 else "failed"
 
-        # Locate the checkpoint produced by this iteration
-        ckpt_path: Optional[str] = None
-        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
-        if ckpts:
-            ckpt_path = str(ckpts[-1])
-        new_ckpt_hash = _checkpoint_hash(ckpt_path)
-
-        # Snapshot best-so-far BEFORE writing the current iteration's ref_gap.
-        # get_best() queries all iterations; snapshotting here avoids comparing
-        # new_ref against itself after update_iteration() writes it to the DB.
-        prior_best = fw_db.get_best(name)
-
-        # Update iteration record
-        fw_db.update_iteration(
-            row_id=row_id, status=status,
-            exit_code=exit_code if exit_code is not None else -1,
-            elapsed_secs=elapsed,
-            train_loss=metrics.get("loss_smooth"),
-            ref_gap=metrics.get("ref_gap"),
-            cond_gap=metrics.get("cond_gap"),
-            checkpoint=ckpt_path,
-            checkpoint_hash=new_ckpt_hash,
-        )
-
-        # Record checkpoint to checkpoint_log (successful iterations only)
-        if status == "done" and ckpt_path:
-            fw_db.upsert_checkpoint(
-                name=name, iteration=iteration,
-                checkpoint_path=ckpt_path,
-                checkpoint_hash=new_ckpt_hash,
-                ref_gap=metrics.get("ref_gap"),
-                cond_gap=metrics.get("cond_gap"),
-                train_loss=metrics.get("loss_smooth"),
+            # Collect training metrics
+            metrics = collect_metrics_from_log(log_file)
+            log_orch(
+                f"[flywheel:{name}] iter {iteration}: {status}  "
+                f"ref_gap={metrics.get('ref_gap')}  loss={metrics.get('loss_smooth')}  "
+                f"elapsed={elapsed}s"
             )
 
-        # Update per-shard included EMA scores
-        has_metrics = (metrics.get("ref_gap") is not None
-                       or metrics.get("cond_gap") is not None)
-        if has_metrics:
-            for sid in shard_ids:
-                score_db.update_scores(
-                    shard_id=sid,
+            # Locate the checkpoint produced by this iteration
+            ckpt_path: Optional[str] = None
+            ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+            if ckpts:
+                ckpt_path = str(ckpts[-1])
+            new_ckpt_hash = _checkpoint_hash(ckpt_path)
+
+            # Snapshot best-so-far BEFORE writing the current iteration's ref_gap.
+            # get_best() queries all iterations; snapshotting here avoids comparing
+            # new_ref against itself after update_iteration() writes it to the DB.
+            prior_best = fw_db.get_best(name)
+
+            # Update iteration record
+            fw_db.update_iteration(
+                row_id=row_id, status=status,
+                exit_code=exit_code if exit_code is not None else -1,
+                elapsed_secs=elapsed,
+                train_loss=metrics.get("loss_smooth"),
+                ref_gap=metrics.get("ref_gap"),
+                cond_gap=metrics.get("cond_gap"),
+                checkpoint=ckpt_path,
+                checkpoint_hash=new_ckpt_hash,
+            )
+
+            # Record checkpoint to checkpoint_log (successful iterations only)
+            if status == "done" and ckpt_path:
+                fw_db.upsert_checkpoint(
+                    name=name, iteration=iteration,
+                    checkpoint_path=ckpt_path,
+                    checkpoint_hash=new_ckpt_hash,
                     ref_gap=metrics.get("ref_gap"),
                     cond_gap=metrics.get("cond_gap"),
-                    loss=metrics.get("loss_smooth"),
+                    train_loss=metrics.get("loss_smooth"),
+                )
+
+            # Update per-shard included EMA scores
+            has_metrics = (metrics.get("ref_gap") is not None
+                           or metrics.get("cond_gap") is not None)
+            if has_metrics:
+                for sid in shard_ids:
+                    score_db.update_scores(
+                        shard_id=sid,
+                        ref_gap=metrics.get("ref_gap"),
+                        cond_gap=metrics.get("cond_gap"),
+                        loss=metrics.get("loss_smooth"),
+                        flywheel_name=name,
+                        iteration=iteration,
+                        checkpoint_hash=new_ckpt_hash,
+                        checkpoint_iter=iteration,
+                        n_in_batch=len(shard_ids),
+                    )
+                # Update excluded EMA for all other shards (contrastive attribution)
+                all_pool_ids = [s["shard_id"] for s in score_db.get_all_shards()]
+                score_db.update_excluded_scores(
+                    all_shard_ids=all_pool_ids,
+                    selected_ids=set(shard_ids),
+                    ref_gap=metrics.get("ref_gap"),
+                    cond_gap=metrics.get("cond_gap"),
                     flywheel_name=name,
                     iteration=iteration,
                     checkpoint_hash=new_ckpt_hash,
                     checkpoint_iter=iteration,
                     n_in_batch=len(shard_ids),
                 )
-            # Update excluded EMA for all other shards (contrastive attribution)
-            all_pool_ids = [s["shard_id"] for s in score_db.get_all_shards()]
-            score_db.update_excluded_scores(
-                all_shard_ids=all_pool_ids,
-                selected_ids=set(shard_ids),
-                ref_gap=metrics.get("ref_gap"),
-                cond_gap=metrics.get("cond_gap"),
-                flywheel_name=name,
-                iteration=iteration,
-                checkpoint_hash=new_ckpt_hash,
-                checkpoint_iter=iteration,
-                n_in_batch=len(shard_ids),
-            )
 
-        # Promote checkpoint for the next iteration; mark as best if quality improved.
-        # cond_gap is the primary criterion: stable and informative at 1000-step budgets.
-        if status == "done" and ckpt_path:
-            prior_cond = prior_best.get("cond_gap") if prior_best else None
-            new_cond   = metrics.get("cond_gap")
-            if new_cond is not None and (prior_cond is None or new_cond > prior_cond):
-                fw_db.mark_best_checkpoint(name, iteration)
-                log_orch(f"[flywheel:{name}] new best checkpoint  "
-                         f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
-            resume_ckpt = ckpt_path
+            # Promote checkpoint for the next iteration; mark as best if quality improved.
+            # cond_gap is the primary criterion: stable and informative at 1000-step budgets.
+            if status == "done" and ckpt_path:
+                prior_cond = prior_best.get("cond_gap") if prior_best else None
+                new_cond   = metrics.get("cond_gap")
+                if new_cond is not None and (prior_cond is None or new_cond > prior_cond):
+                    fw_db.mark_best_checkpoint(name, iteration)
+                    log_orch(f"[flywheel:{name}] new best checkpoint  "
+                             f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
+                resume_ckpt = ckpt_path
 
-        # Clean up staging symlinks
-        try:
-            shutil.rmtree(staging_dir)
-        except OSError:
-            pass
+            # Clean up staging symlinks
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError:
+                pass
 
-        # Ablation burst (every N iterations, only on successful runs)
-        ablation_run: Optional[str] = None
-        if ablation_every > 0 and iteration % ablation_every == 0 and status == "done":
-            ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration)
-            if ablation_run:
-                new_hp = _read_ablation_best(ablation_run)
-                if new_hp:
-                    hyperparams.update(new_hp)
-                    log_orch(f"[flywheel:{name}] hyperparams updated → {hyperparams}")
-                fw_db.update_iteration(
-                    row_id=row_id, status=status,
-                    exit_code=exit_code if exit_code is not None else -1,
-                    elapsed_secs=elapsed,
-                    train_loss=metrics.get("loss_smooth"),
-                    ref_gap=metrics.get("ref_gap"),
-                    cond_gap=metrics.get("cond_gap"),
-                    checkpoint=ckpt_path,
-                    checkpoint_hash=new_ckpt_hash,
-                    ablation_run=ablation_run,
-                )
-
-        # Plateau detection
-        plateau_reason: Optional[str] = None
-        if plateau_patience > 0:
-            done_iters = [r for r in fw_db.get_iterations(name) if r["status"] == "done"]
-            plateau_reason = check_plateau(done_iters, plateau_patience, plateau_threshold)
-            if plateau_reason:
-                log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
-                         level="warning")
-                try:
-                    FLYWHEEL_CONTROL_FILE.write_text(
-                        json.dumps({"action": "pause",
-                                    "reason": plateau_reason,
-                                    "auto":   True})
+            # Ablation burst (every N iterations, only on successful runs)
+            ablation_run: Optional[str] = None
+            if ablation_every > 0 and iteration % ablation_every == 0 and status == "done":
+                ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration)
+                if ablation_run:
+                    new_hp = _read_ablation_best(ablation_run)
+                    if new_hp:
+                        hyperparams.update(new_hp)
+                        log_orch(f"[flywheel:{name}] hyperparams updated → {hyperparams}")
+                    fw_db.update_iteration(
+                        row_id=row_id, status=status,
+                        exit_code=exit_code if exit_code is not None else -1,
+                        elapsed_secs=elapsed,
+                        train_loss=metrics.get("loss_smooth"),
+                        ref_gap=metrics.get("ref_gap"),
+                        cond_gap=metrics.get("cond_gap"),
+                        checkpoint=ckpt_path,
+                        checkpoint_hash=new_ckpt_hash,
+                        ablation_run=ablation_run,
                     )
-                except Exception as _e:
-                    log_orch(f"[flywheel:{name}] could not write plateau pause: {_e}",
+
+            # Plateau detection
+            plateau_reason: Optional[str] = None
+            if plateau_patience > 0:
+                done_iters = [r for r in fw_db.get_iterations(name) if r["status"] == "done"]
+                plateau_reason = check_plateau(done_iters, plateau_patience, plateau_threshold)
+                if plateau_reason:
+                    log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
                              level="warning")
+                    try:
+                        FLYWHEEL_CONTROL_FILE.write_text(
+                            json.dumps({"action": "pause",
+                                        "reason": plateau_reason,
+                                        "auto":   True})
+                        )
+                    except Exception as _e:
+                        log_orch(f"[flywheel:{name}] could not write plateau pause: {_e}",
+                                 level="warning")
 
-        # Regenerate HTML report
-        iterations_data = fw_db.get_iterations(name)
-        shard_stats     = score_db.get_stats()
-        top_shards      = score_db.get_top_shards(20)
-        html = render_flywheel_index(name, iterations_data, shard_stats, top_shards,
-                                     hyperparams, plateau_reason=plateau_reason)
-        (reports_dir / "index.html").write_text(html)
+            # Regenerate HTML report
+            iterations_data = fw_db.get_iterations(name)
+            shard_stats     = score_db.get_stats()
+            top_shards      = score_db.get_top_shards(20)
+            html = render_flywheel_index(name, iterations_data, shard_stats, top_shards,
+                                         hyperparams, plateau_reason=plateau_reason)
+            (reports_dir / "index.html").write_text(html)
 
-        notify("iris flywheel",
-               f"Iter {iteration}/{max_iters}: {status}  ref_gap={metrics.get('ref_gap')}")
+            notify("iris flywheel",
+                   f"Iter {iteration}/{max_iters}: {status}  ref_gap={metrics.get('ref_gap')}")
 
-        iteration += 1
+            iteration += 1
 
-    log_orch(f"[flywheel:{name}] loop complete — {max_iters} iterations done")
-    notify("iris flywheel", f"{name} complete ({max_iters} iterations)")
-    fw_db.close()
-    score_db.close()
+        log_orch(f"[flywheel:{name}] loop complete — {max_iters} iterations done")
+        notify("iris flywheel", f"{name} complete ({max_iters} iterations)")
+    finally:
+        fw_db.close()
+        score_db.close()
 
 
 # ---------------------------------------------------------------------------

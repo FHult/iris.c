@@ -1436,13 +1436,15 @@ def _render_html(
         for i, r in enumerate(ranked)
     ]
 
+    # Object-identity rank lookup — works for both DB-sourced (has "id") and
+    # batch-mode results (no "id").  Must be built before trend_data.
+    ranked_rank = {id(r): i + 1 for i, r in enumerate(ranked)}
+
     # Trend chart: score by experiment order (for long-term runs)
     trend_data = [
         {"i": idx + 1, "score": r.get("score"), "combo_id": r.get("combo_id", ""),
          "strategy": r.get("strategy", ""),
-         "color": _html_color(
-             ranked.index(r) + 1 if r in ranked else 99
-         ) if r.get("score") is not None else "#444"}
+         "color": _html_color(ranked_rank.get(id(r), 99)) if r.get("score") is not None else "#444"}
         for idx, r in enumerate(results)
     ]
     # Rolling best
@@ -1455,7 +1457,6 @@ def _render_html(
         best_so_far.append(running_best)
 
     # Pareto scatter: ref_gap vs cond_gap coloured by rank, Pareto front highlighted
-    ranked_rank = {id(r): i + 1 for i, r in enumerate(ranked)}
     pareto_data = [
         {
             "id":         r.get("id", idx),
