@@ -2497,41 +2497,61 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        acquire_gpu_lock(f"flywheel_{name}_iter{iteration}")
-        write_heartbeat("trainer", status="booting", step=0)
+        # Wait for any pre-existing training window to finish (crash-restart guard)
+        if tmux_window_exists(TMUX_TRAIN_WIN):
+            log_orch(f"[flywheel:{name}] {TMUX_TRAIN_WIN} already running — waiting",
+                     level="warning")
+            while tmux_window_exists(TMUX_TRAIN_WIN):
+                _check_flywheel_control(name)
+                time.sleep(poll_interval)
 
-        train_cmd = (
-            f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
-            f"--config '{train_cfg_path}' "
-            f"--max-steps {steps_per_iter} "
-            f"--data-root '{DATA_ROOT}'"
-        )
-        if resume_ckpt and Path(resume_ckpt).exists():
-            train_cmd += f" --resume '{resume_ckpt}'"
-
-        activated = (
-            f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
-            f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
-        )
-        tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
-        write_heartbeat("flywheel", status="training",
-                        flywheel_name=name, iteration=iteration)
-        log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
-        t_start = time.time()
-
-        # Monitor training window
+        # Wait until GPU lock is successfully acquired
         while True:
-            time.sleep(poll_interval)
+            if acquire_gpu_lock(f"flywheel_{name}_iter{iteration}"):
+                break
+            holder = gpu_lock_holder()
+            log_orch(f"[flywheel:{name}] GPU busy (holder={holder}), waiting 30s",
+                     level="warning")
             _check_flywheel_control(name)
+            time.sleep(30)
+
+        t_start = time.time()
+        try:
+            write_heartbeat("trainer", status="booting", step=0)
+
+            train_cmd = (
+                f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
+                f"--config '{train_cfg_path}' "
+                f"--max-steps {steps_per_iter} "
+                f"--data-root '{DATA_ROOT}'"
+            )
+            if resume_ckpt and Path(resume_ckpt).exists():
+                train_cmd += f" --resume '{resume_ckpt}'"
+
+            activated = (
+                f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+                f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
+            )
+            tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
             write_heartbeat("flywheel", status="training",
                             flywheel_name=name, iteration=iteration)
-            if not tmux_window_exists(TMUX_TRAIN_WIN):
-                break
+            log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
+            t_start = time.time()
+
+            # Monitor training window
+            while True:
+                time.sleep(poll_interval)
+                _check_flywheel_control(name)
+                write_heartbeat("flywheel", status="training",
+                                flywheel_name=name, iteration=iteration)
+                if not tmux_window_exists(TMUX_TRAIN_WIN):
+                    break
+        finally:
+            release_gpu_lock()
 
         elapsed   = int(time.time() - t_start)
         exit_code = last_exit_code(log_file)
         status    = "done" if exit_code == 0 else "failed"
-        release_gpu_lock()
 
         # Collect training metrics
         metrics = collect_metrics_from_log(log_file)
