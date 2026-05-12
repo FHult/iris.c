@@ -136,6 +136,14 @@ data_root/
 
 ## Flywheel Performance
 
+**FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
+
+The ablation burst was disabled for trial 1 (`ablation_every_n: 0`) after it launched a 12,000-step run (~12.8h) that would have blocked the flywheel for ~51h (4 runs × 12.8h). Three things need fixing before re-enabling:
+
+1. **`steps_per_run` in `ablation_sref_v1.yaml`**: set proportionally to `steps_per_iteration`. Current `steps_per_run: 12000` has a comment "~14 min/run" which is wrong by 55× (actual: 12.8h at 0.26 steps/sec). A sensible default is `steps_per_run = steps_per_iteration` (same training budget as one flywheel iteration). For a 1000-step flywheel, set `steps_per_run: 1000`.
+2. **`ablation_every_n`**: currently fires every 5 iterations. For short trials (1000 steps/iter) ablation overhead is proportional to the flywheel step budget, so every 5 is reasonable once step counts match.
+3. **Ablation score metric**: `ablation_sref_v1.yaml` uses `clip_i_weight: 0.55` as objective, but trial 1 shows `ref_gap` is noisy at 1000 steps. Consider using `cond_gap` as the primary ablation objective, or average over the final N steps rather than the last log window.
+
 **FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**
 - The frozen Flux forward pass dominates step time (~2.4s/step = 63%). The adapter backward is only ~1.4s/step.
 - Since `qs` (Flux Q vectors) are `stop_gradient`'d and computed without any IP contribution, they can safely be reused across N adapter backward steps for the same (noise, timestep, target) sample. This is equivalent to N gradient descent steps on the same mini-batch — valid for style injection learning.
