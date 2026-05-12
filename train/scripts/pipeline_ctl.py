@@ -515,6 +515,18 @@ def cmd_flywheel_status(_args) -> None:
             pass
 
 
+def cmd_data_explorer(_args) -> None:
+    """Passthrough to data_explorer.py — data intelligence layer."""
+    import subprocess
+    venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    explorer = str(SCRIPTS_DIR / "data_explorer.py")
+    # Forward all remaining CLI args directly (strip 'data-explorer' from sys.argv)
+    pos = sys.argv.index("data-explorer")
+    forwarded = sys.argv[pos + 1:]
+    result = subprocess.run([venv_python, explorer] + forwarded)
+    sys.exit(result.returncode)
+
+
 def cmd_status(args) -> None:
     """Run pipeline_status.py (brief summary) then pipeline_doctor.py --ai."""
     import subprocess
@@ -563,6 +575,11 @@ def cmd_dispatch_resolve_all(args) -> None:
 
 
 def main() -> None:
+    # data-explorer is a transparent passthrough; intercept before argparse sees the flags.
+    if len(sys.argv) >= 2 and sys.argv[1] == "data-explorer":
+        cmd_data_explorer(None)
+        return
+
     ap = argparse.ArgumentParser(description="Pipeline V2 control")
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -640,6 +657,9 @@ def main() -> None:
     sub.add_parser("resume-flywheel",  help="Resume a paused flywheel")
     sub.add_parser("flywheel-status",  help="Show flywheel heartbeat and iteration DB summary")
 
+    sub.add_parser("data-explorer",
+                   help="Data intelligence layer: shards, checkpoints, coverage, warm-start")
+
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
@@ -666,6 +686,7 @@ def main() -> None:
         "pause-flywheel":          cmd_pause_flywheel,
         "resume-flywheel":         cmd_resume_flywheel,
         "flywheel-status":         cmd_flywheel_status,
+        "data-explorer":           cmd_data_explorer,
     }
     handlers[args.command](args)
 

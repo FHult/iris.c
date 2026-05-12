@@ -457,6 +457,56 @@ def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4a. Versioned precompute cache staleness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_precompute_cache_staleness() -> None:
+    """Warn if any encoder's versioned cache is stale/incomplete, or if no cache exists."""
+    try:
+        from cache_manager import PrecomputeCache
+    except ImportError:
+        return
+
+    encoders = ("qwen3", "vae", "siglip")
+    for enc in encoders:
+        try:
+            versions = PrecomputeCache.list_versions(PRECOMP_DIR, enc)
+        except Exception:
+            continue
+        if not versions:
+            _add("INFO", "precompute",
+                 f"Precompute: no versioned cache for encoder '{enc}'",
+                 detail=f"No version directories found under {PRECOMP_DIR}/{enc}. "
+                        "Run precompute step to populate.",
+                 fix=f"pipeline_ctl start (or run precompute step manually)")
+            continue
+        current = [v for v in versions if v.get("current")]
+        if not current:
+            _add("WARNING", "precompute",
+                 f"Precompute: no 'current' symlink for encoder '{enc}'",
+                 detail=f"{len(versions)} version dir(s) exist under {PRECOMP_DIR}/{enc} "
+                        "but none is marked current. Training will fall back to legacy flat layout.",
+                 fix=f"Re-run precompute for '{enc}' to update the current symlink.",
+                 ctx={"encoder": enc, "n_versions": len(versions)})
+            continue
+        cur = current[0]
+        if not cur.get("complete"):
+            _add("WARNING", "precompute",
+                 f"Precompute: current version for '{enc}' is incomplete",
+                 detail=f"Version {cur.get('version','?')} has complete=False in its manifest. "
+                        "Training may use partial embeddings.",
+                 fix=f"Re-run precompute for '{enc}' to complete the cache.",
+                 ctx={"encoder": enc, "version": cur.get("version"), "records": cur.get("record_count", 0)})
+        elif cur.get("record_count", 0) == 0:
+            _add("WARNING", "precompute",
+                 f"Precompute: current '{enc}' cache reports 0 records",
+                 detail=f"Version {cur.get('version','?')} is complete but has 0 records. "
+                        "Manifest may be stale.",
+                 fix=f"Re-run precompute for '{enc}'.",
+                 ctx={"encoder": enc, "version": cur.get("version")})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. Checkpoint continuity
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1856,6 +1906,7 @@ def main() -> None:
         _check_phantom_completions(cfg, chunks)
         _check_training_integrity(cfg, chunks)
         _check_precompute_forensics(cfg, chunks)
+        _check_precompute_cache_staleness()
         _check_checkpoint_continuity(cfg, chunks)
         _check_process_liveness(chunks)
         _check_stager_health(chunks)
