@@ -895,7 +895,7 @@ class EarlyStopper:
         if self._triggered:
             return True
         self._n_snapshots += 1
-        if self._n_snapshots < self.min_snapshots:
+        if self._n_snapshots <= self.min_snapshots:
             return False
         cond_gap = snap.get("cond_gap")
         if cond_gap is None:
@@ -1207,10 +1207,8 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb,
                           early_stopper=early_stopper)
 
-        # Re-score with configurable objective
-        n_skip = max(0, len(result.get("snapshots", [])) * 2 // 5)
-        tail_snaps = (result.get("snapshots", [])[n_skip:] or result.get("snapshots", []))
-        weighted_score = _score_weighted(tail_snaps, result["exit_code"], objective)
+        # Re-score with configurable objective (_score_weighted handles tail-skip internally)
+        weighted_score = _score_weighted(result.get("snapshots", []), result["exit_code"], objective)
         result["score"] = round(weighted_score, 4) if weighted_score != float("-inf") else None
 
         db.update_experiment(
