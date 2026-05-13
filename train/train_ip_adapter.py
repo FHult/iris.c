@@ -1082,14 +1082,19 @@ def train(config: dict) -> None:
                 _noise = mx.random.normal(_lat.shape, dtype=_lat.dtype)
                 _alpha, _sigma = get_schedule_values(_t)
                 _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
-                _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
-                mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
-                # No-grad forward: call loss_fn directly (not through value_and_grad)
+                # No-grad forward: call loss function directly (not through value_and_grad).
                 _siglip_zero = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
-                _loss = loss_fn(_siglip_zero, mx.array(True), _fs, _target)
+                if _use_block_injection:
+                    mx.eval(_target)
+                    _loss = loss_fn_with_ip(_siglip_zero, mx.array(True), _noisy, _txt, _t, _target)
+                else:
+                    _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
+                    mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
+                    _loss = loss_fn(_siglip_zero, mx.array(True), _fs, _target)
+                    del _fs
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
-                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip_zero, _fs, _loss, _noisy, _target
+                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip_zero, _loss, _noisy, _target
                 mx.clear_cache()
                 if len(losses) >= 16:
                     break
