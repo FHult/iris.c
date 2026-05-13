@@ -863,6 +863,12 @@ def train(config: dict) -> None:
     # Written by loss_fn on conditioned steps; read after eval for logging.
     _style_loss_accum: list = [mx.array(0.0)]
 
+    # TRAIN-5 Stage 0: per-fence peak memory profiling.
+    # Gate behind memory_profile: true in training config. Resets peak counter
+    # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
+    _mem_profile = bool(tcfg.get("memory_profile", False))
+    _mem_fwd_peak = _mem_bwd_peak = _mem_param_peak = _mem_ema_peak = 0
+
     # QUALITY-1 / QUALITY-3 aug probabilities
     _cross_ref_prob    = float(tcfg.get("cross_ref_prob", 0.0))
     _patch_shuffle_prob = float(tcfg.get("patch_shuffle_prob", 0.0))
@@ -1265,6 +1271,8 @@ def train(config: dict) -> None:
         alpha_t, sigma_t = get_schedule_values(t_int)
         noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)
 
+        if _mem_profile:
+            mx.reset_peak_memory()
         flux_state = _flux_forward_no_ip(flux, noisy, text_embeds, t_int)
         # Force-materialize all Flux tensors before entering autodiff graph.
         # Without this, MLX defers Flux computation into the gradient trace,
@@ -1272,6 +1280,8 @@ def train(config: dict) -> None:
         # target has no dependency on Flux; batching into one eval lets Metal
         # schedule both concurrently rather than across two separate fences.
         mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
+        if _mem_profile:
+            _mem_fwd_peak = max(_mem_fwd_peak, mx.get_peak_memory())
         _t_fwd += time.time() - _t0
 
         # Adapter-only backward — repeated n_grad_steps_per_fwd times, reusing
@@ -1316,13 +1326,24 @@ def train(config: dict) -> None:
             #
             # Fence 3 — EMA (if due): old_ema + new_ema, isolated from param update.
             _t0 = time.time()
+            if _mem_profile:
+                mx.reset_peak_memory()
             mx.eval(optimizer.state, loss_val, grad_norm_val)
             mx.clear_cache()
+            if _mem_profile:
+                _mem_bwd_peak = max(_mem_bwd_peak, mx.get_peak_memory())
+                mx.reset_peak_memory()
             mx.eval(adapter.parameters())
             mx.clear_cache()
+            if _mem_profile:
+                _mem_param_peak = max(_mem_param_peak, mx.get_peak_memory())
+                mx.reset_peak_memory()
             if _do_ema:
                 mx.eval(ema_params)
                 mx.clear_cache()
+                if _mem_profile:
+                    _mem_ema_peak = max(_mem_ema_peak, mx.get_peak_memory())
+                    mx.reset_peak_memory()
             _t_eval_end = time.time()
             _t_eval += _t_eval_end - _t0
 
@@ -1467,11 +1488,17 @@ def train(config: dict) -> None:
 
                 # T-03: memory pressure (peak read here; reset deferred until after
                 # the checkpoint save so the interval peak captures both training
-                # AND checkpoint serialization spikes in the same window)
+                # AND checkpoint serialization spikes in the same window).
+                # When memory_profile=true, intra-step resets make the interval peak
+                # meaningless; per-fence data below replaces it.
                 mlx_active_gb  = round(mx.get_active_memory()  / 1e9, 2)
                 mlx_peak_gb    = round(mx.get_peak_memory()    / 1e9, 2)
-                print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
-                      flush=True)
+                if _mem_profile:
+                    print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  (per-fence peaks below)",
+                          flush=True)
+                else:
+                    print(f"  mlx_mem: active={mlx_active_gb:.2f} GB  peak={mlx_peak_gb:.2f} GB",
+                          flush=True)
                 if _HAS_PSUTIL:
                     _vm = _psutil.virtual_memory()
                     mem_used_gb = round(_vm.used / 1e9, 1)
@@ -1481,6 +1508,22 @@ def train(config: dict) -> None:
                     if mem_available_gb < 6.0:
                         print(f"  WARNING: memory pressure — only {mem_available_gb:.1f} GB available",
                               flush=True)
+                # TRAIN-5 Stage 0: per-fence peak breakdown (enabled by memory_profile: true).
+                # fwd  = Flux forward (noisy+target+all Flux intermediates)
+                # bwd  = adapter backward + optimizer m/v state
+                # param = new adapter params from concrete m/v
+                # ema  = EMA update (only on ema_update_every steps)
+                if _mem_profile:
+                    _gb = 1 / 2**30
+                    print(
+                        f"  [mem/fence] fwd={_mem_fwd_peak*_gb:.2f} GB"
+                        f"  bwd={_mem_bwd_peak*_gb:.2f} GB"
+                        f"  param={_mem_param_peak*_gb:.2f} GB"
+                        f"  ema={_mem_ema_peak*_gb:.2f} GB"
+                        f"  (peak-of-{log_interval}-steps per fence)",
+                        flush=True,
+                    )
+                    _mem_fwd_peak = _mem_bwd_peak = _mem_param_peak = _mem_ema_peak = 0
 
                 # T-06: EMA drift
                 if ema_drift > 0:
