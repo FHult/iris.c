@@ -170,28 +170,9 @@ data_root/
 
 Fixed in `orchestrator.py`: on restart, prefer the chronologically latest `step_*.safetensors` from CKPT_DIR. Falls back to `get_best()` only if CKPT_DIR is empty, then to `base_checkpoint` from config.
 
-**FLYWHEEL-TRIAL2: Pre-trial-2 warm-start checklist**
+~~**FLYWHEEL-TRIAL2: Pre-trial-2 warm-start checklist**~~ ✓ Resolved
 
-Before launching trial 2, complete the following:
-
-1. **Set `base_checkpoint`** in `flywheel_sref_v1.yaml` to the best checkpoint from trial 1. Use `cond_gap` (not `ref_gap` — too noisy at 1000 steps) to select it:
-   ```bash
-   sqlite3 /Volumes/2TBSSD/flywheel_history.db \
-     "SELECT iteration, checkpoint FROM checkpoint_log \
-      WHERE flywheel_name='sref-v1' \
-      ORDER BY cond_gap DESC LIMIT 1;"
-   ```
-   Set the returned path as `base_checkpoint:` in the config. This gives trial 2 a warm-started perceiver and K/V projections instead of random init, saving ~5–7 early iterations of convergence.
-
-2. **Fix FLYWHEEL-ABL-1** (ablation config) if re-enabling ablation for trial 2. See entry below.
-
-3. **Rename the flywheel** (`name: "sref-v2"`) and point to a fresh `flywheel_history.db` path, or clear the existing DB, so iteration numbering starts from 1.
-
-4. **Stale-state cleanup** before launch:
-   ```bash
-   rm -f /Volumes/2TBSSD/logs/*.log /Volumes/2TBSSD/logs/*.jsonl
-   rm -f /Volumes/2TBSSD/.heartbeat/*.json
-   ```
+Checklist was written assuming a clean restart (rename, clear DB). We chose to extend trial 1 instead by bumping `max_iterations: 21 → 42`. The flywheel auto-discovers the latest checkpoint on startup (FLYWHEEL-BUG-1 fix), so warm-start is automatic. DB history is continuous; iteration numbering continues from 22. Items 1, 3, 4 are moot. Item 2 (FLYWHEEL-ABL-1) addressed separately below.
 
 **FLYWHEEL-METRIC-1: Composite score and best-checkpoint criterion use wrong primary metric** ✓ Done
 
@@ -216,13 +197,12 @@ Trial 1: shard 000002 was selected 5/6 clean iterations despite `recency_penalty
 
 Fixed in `shard_selector.py`: step 1 now sorts by `_score_penalised()`, applying the same `recency_penalty × selection_rate` discount as step 4. The same `n_selected` / `(iteration / recency_window)` formula is used throughout, maintaining consistency.
 
-**FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**
+~~**FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**~~ ✓ Done
 
-The ablation burst was disabled for trial 1 (`ablation_every_n: 0`) after it launched a 12,000-step run (~12.8h) that would have blocked the flywheel for ~51h (4 runs × 12.8h). Three things need fixing before re-enabling:
-
-1. **`steps_per_run` in `ablation_sref_v1.yaml`**: set proportionally to `steps_per_iteration`. Current `steps_per_run: 12000` has a comment "~14 min/run" which is wrong by 55× (actual: 12.8h at 0.26 steps/sec). A sensible default is `steps_per_run = steps_per_iteration` (same training budget as one flywheel iteration). For a 1000-step flywheel, set `steps_per_run: 1000`.
-2. **`ablation_every_n`**: currently fires every 5 iterations. For short trials (1000 steps/iter) ablation overhead is proportional to the flywheel step budget, so every 5 is reasonable once step counts match.
-3. **Ablation score metric**: `ablation_sref_v1.yaml` uses `clip_i_weight: 0.55` as objective, but trial 1 shows `ref_gap` is noisy at 1000 steps. Consider using `cond_gap` as the primary ablation objective, or average over the final N steps rather than the last log window.
+All three items were already addressed in prior commits; only the enable switch remained:
+1. `steps_per_run: 1000` — already correct in `ablation_sref_v1.yaml` (matches flywheel `steps_per_iteration`).
+2. Ablation objective — `ablation_sref_v1.yaml` already weights `cond_gap` at 0.70 (primary) and `ref_gap` (`clip_i_weight`) at 0.15 (weak secondary).
+3. `ablation_every_n: 0 → 5` in `flywheel_sref_v1.yaml` — enabled. Will fire at iters 25, 30, 35, 40 (~4h overhead per burst).
 
 ~~**FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**~~ ✓ Done
 

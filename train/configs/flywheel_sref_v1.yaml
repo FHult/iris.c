@@ -11,7 +11,7 @@
 
 flywheel:
   name: "sref-v1"
-  max_iterations: 21             # trial 1: 15 + 6 wasted on warmup bug
+  max_iterations: 42             # trial 1: 21 iters; trial 2: +21 warm-start
   steps_per_iteration: 1000      # training steps per iteration (~63 min at 512px, 3.8s/step)
   n_shards: 20                   # shards selected per iteration
   poll_interval: 60              # seconds between training-window polls
@@ -63,6 +63,6 @@ flywheel:
   plateau_threshold:  0.02       # spread < 0.02 triggers pause (~half a typical cond_gap step)
 
   # Ablation integration — set ablation_every_n: 0 to disable
-  ablation_every_n: 0            # disabled for trial 1 — ablation steps_per_run (12000) >> flywheel steps (1000)
-  ablation_max_runs: 4           # trial 1: limit ablation overhead (2 bursts at iter 5 + 10)
+  ablation_every_n: 5            # trial 2: fire at iters 25, 30, 35, 40 (~4h overhead per burst at 4×1000 steps)
+  ablation_max_runs: 4           # 4 runs × ~63 min = ~4h per burst; proportional to flywheel step budget
   ablation_config: "train/configs/ablation_sref_v1.yaml"
