@@ -870,8 +870,20 @@ def train(config: dict) -> None:
     _mem_fwd_peak = _mem_bwd_peak = _mem_ema_peak = 0
 
     # QUALITY-1 / QUALITY-3 aug probabilities
-    _cross_ref_prob    = float(tcfg.get("cross_ref_prob", 0.0))
+    _cross_ref_prob     = float(tcfg.get("cross_ref_prob", 0.0))
     _patch_shuffle_prob = float(tcfg.get("patch_shuffle_prob", 0.0))
+
+    # Hoisted loop constants — avoid repeated dict lookups and mx.array() allocation
+    # inside the hot path. Saves a sys.modules + dict hit on every step.
+    _image_dropout_prob = float(tcfg["image_dropout_prob"])
+    _text_dropout_prob  = float(tcfg["text_dropout_prob"])
+    _grad_clip          = float(tcfg["grad_clip"])
+    _ema_update_every   = int(tcfg["ema_update_every"])
+    _ema_decay_factor   = float(tcfg["ema_decay"]) ** _ema_update_every
+    _n_grad_steps       = int(tcfg.get("n_grad_steps_per_fwd", 1))
+    # Precomputed scalar MLX bools — avoids mx.array(bool) allocation every step.
+    _MX_TRUE  = mx.array(True)
+    _MX_FALSE = mx.array(False)
 
     def loss_fn(siglip_feats, use_null_image: mx.array,
                 flux_state: dict, target: mx.array,
@@ -966,7 +978,7 @@ def train(config: dict) -> None:
                 mx.zeros((_nd,), dtype=grads["scale"].dtype),
                 grads["scale"][_nd:],
             ])
-        grads, grad_norm = optim.clip_grad_norm(grads, max_norm=tcfg["grad_clip"])
+        grads, grad_norm = optim.clip_grad_norm(grads, max_norm=_grad_clip)
         optimizer.update(adapter, grads)
         # Return all lazy. Eval is split into two fences in the caller AFTER
         # del flux_state — this keeps flux_state out of the peak window.
@@ -1145,6 +1157,12 @@ def train(config: dict) -> None:
 
     _boot_hb_stop.set()  # training loop starting — boot heartbeat thread no longer needed
 
+    # Hoist write_heartbeat once — avoids repeated sys.modules lookup inside the loop.
+    try:
+        from pipeline_lib import write_heartbeat as _write_hb
+    except ImportError:
+        _write_hb = None  # type: ignore[assignment]
+
     # Heartbeat is written every _heartbeat_every steps, independent of log_every.
     # Capped at 50: at 0.22 steps/s that is ~227 s, well inside the 900 s stale
     # threshold.  The old cap of 200 (≈909 s) was right at the limit — any small
@@ -1191,9 +1209,9 @@ def train(config: dict) -> None:
         # Null conditioning flags — decided OUTSIDE compiled region (§3.7)
         # Keep as Python bools for use in Python conditionals (no GPU sync).
         # Wrap in mx.array only for passing into the compiled loss fn (mx.where).
-        null_image = random.random() < tcfg["image_dropout_prob"]
-        null_text  = random.random() < tcfg["text_dropout_prob"]
-        use_null_image = mx.array(null_image)
+        null_image = random.random() < _image_dropout_prob
+        null_text  = random.random() < _text_dropout_prob
+        use_null_image = _MX_TRUE if null_image else _MX_FALSE
 
         # Encode frozen models — use pre-computed cache if available (§2.7)
         if vae_np is not None:
@@ -1231,7 +1249,7 @@ def train(config: dict) -> None:
             B_miss = images.shape[0]
             siglip_feats = mx.zeros((B_miss, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
             null_image = True
-            use_null_image = mx.array(True)
+            use_null_image = _MX_TRUE
             _siglip_miss_steps += 1  # T-10
 
         # QUALITY-3: patch-shuffle — shuffle 729 SigLIP token positions to destroy
@@ -1240,8 +1258,7 @@ def train(config: dict) -> None:
         # the model receives; only on conditioned (non-null) steps.
         if _patch_shuffle_prob > 0.0 and not null_image:
             if random.random() < _patch_shuffle_prob:
-                import numpy as _np
-                _perm_sf = mx.array(_np.random.permutation(siglip_feats.shape[1]))
+                _perm_sf = mx.argsort(mx.random.uniform(shape=(siglip_feats.shape[1],)))
                 siglip_feats = siglip_feats[:, _perm_sf, :]
 
         # QUALITY-1: cross-ref swap — replace current SigLIP features with the
@@ -1287,7 +1304,6 @@ def train(config: dict) -> None:
         # Adapter-only backward — repeated n_grad_steps_per_fwd times, reusing
         # flux_state (stop_gradient'd Q vectors). Each inner iteration is a full
         # gradient step with complete per-step accounting.
-        _n_grad_steps = tcfg.get("n_grad_steps_per_fwd", 1)
         for _grad_i in range(_n_grad_steps):
             if step >= _end_step:
                 break
@@ -1310,10 +1326,9 @@ def train(config: dict) -> None:
             # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
             # Built lazily here so it references the same lazy adapter.parameters()
             # that Fence 2 will concretize — Fence 3 then evaluates only the new EMA.
-            _do_ema = (step % tcfg["ema_update_every"] == 0)
+            _do_ema = (step % _ema_update_every == 0)
             if _do_ema:
-                ema_params = update_ema(ema_params, adapter,
-                                       decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
+                ema_params = update_ema(ema_params, adapter, decay=_ema_decay_factor)
 
             # Synchronous eval in two fences to bound peak Metal allocation.
             #
@@ -1359,7 +1374,7 @@ def train(config: dict) -> None:
                 print(f"  WARNING: grad norm spike step {step}: "
                       f"{_gn:.3f} vs smooth {grad_norm_smooth:.3f}", flush=True)
             # T-11: count steps where clipping actually fired
-            if _gn > tcfg["grad_clip"]:
+            if _gn > _grad_clip:
                 _grad_clip_steps += 1
 
             # T-02: per-bucket throughput
@@ -1538,7 +1553,7 @@ def train(config: dict) -> None:
                 if _grad_clip_steps > 0:
                     _clip_pct = round(100 * _grad_clip_steps / log_interval, 1)
                     print(f"  grad_clipped={_clip_pct:.0f}% ({_grad_clip_steps}/{log_interval} steps "
-                          f"had norm > {tcfg['grad_clip']})", flush=True)
+                          f"had norm > {_grad_clip})", flush=True)
                 _grad_clip_steps = 0
 
                 # T-12: conditioned vs unconditioned loss split (QUALITY-4)
@@ -1632,39 +1647,39 @@ def train(config: dict) -> None:
                 # orchestrator and pipeline_status.py can monitor liveness and anomalies.
                 total_elapsed = time.time() - t_start
                 try:
-                    from pipeline_lib import write_heartbeat as _write_hb
-                    _write_hb(
-                        "trainer", _pipeline_chunk,
-                        step=step,
-                        total_steps=_end_step,
-                        loss=round(loss_scalar, 6),
-                        loss_smooth=round(loss_smooth, 6),
-                        lr=lr_now,
-                        steps_per_sec=round(steps_per_sec, 4),
-                        eta_sec=int(eta_s),
-                        elapsed_seconds=int(total_elapsed),
-                        grad_norm=round(_gn, 4),
-                        grad_norm_smooth=round(grad_norm_smooth, 4),
-                        grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
-                        ema_drift=round(ema_drift, 5),
-                        val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
-                        siglip_coverage_pct=_siglip_cov,
-                        loader_wait_ms_avg=_loader_wait_ms,
-                        compute_ms_avg=_compute_ms,
-                        buckets=_bkt_summary,
-                        mem_used_gb=mem_used_gb,
-                        mem_available_gb=mem_available_gb,
-                        mlx_active_gb=mlx_active_gb,
-                        mlx_peak_gb=mlx_peak_gb,
-                        loss_cond=_loss_cond_avg,
-                        loss_null=_loss_null_avg,
-                        style_loss=_style_loss_avg,
-                        loss_self_ref=_loss_self_ref_avg,
-                        loss_cross_ref=_loss_cross_ref_avg,
-                        ip_scale_mean=_scale_all_mean,
-                        ip_scale_double=_scale_double_mean,
-                        ip_scale_single=_scale_single_mean,
-                    )
+                    if _write_hb is not None:
+                        _write_hb(
+                            "trainer", _pipeline_chunk,
+                            step=step,
+                            total_steps=_end_step,
+                            loss=round(loss_scalar, 6),
+                            loss_smooth=round(loss_smooth, 6),
+                            lr=lr_now,
+                            steps_per_sec=round(steps_per_sec, 4),
+                            eta_sec=int(eta_s),
+                            elapsed_seconds=int(total_elapsed),
+                            grad_norm=round(_gn, 4),
+                            grad_norm_smooth=round(grad_norm_smooth, 4),
+                            grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
+                            ema_drift=round(ema_drift, 5),
+                            val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
+                            siglip_coverage_pct=_siglip_cov,
+                            loader_wait_ms_avg=_loader_wait_ms,
+                            compute_ms_avg=_compute_ms,
+                            buckets=_bkt_summary,
+                            mem_used_gb=mem_used_gb,
+                            mem_available_gb=mem_available_gb,
+                            mlx_active_gb=mlx_active_gb,
+                            mlx_peak_gb=mlx_peak_gb,
+                            loss_cond=_loss_cond_avg,
+                            loss_null=_loss_null_avg,
+                            style_loss=_style_loss_avg,
+                            loss_self_ref=_loss_self_ref_avg,
+                            loss_cross_ref=_loss_cross_ref_avg,
+                            ip_scale_mean=_scale_all_mean,
+                            ip_scale_double=_scale_double_mean,
+                            ip_scale_single=_scale_single_mean,
+                        )
                 except Exception:
                     pass
                 # Reset rolling stats so per-interval averages don't drift over the
@@ -1689,22 +1704,22 @@ def train(config: dict) -> None:
                 _hb_loss_smooth = 0.98 * _hb_loss_smooth + 0.02 * _hb_loss
                 if step % log_interval != 0:
                     try:
-                        from pipeline_lib import write_heartbeat as _write_hb
-                        _write_hb(
-                            "trainer", _pipeline_chunk,
-                            step=step,
-                            total_steps=_end_step,
-                            loss=round(_hb_loss, 6),
-                            loss_smooth=round(_hb_loss_smooth, 6),
-                            lr=float(optimizer.learning_rate),
-                            steps_per_sec=round(_hb_sps, 4),
-                            eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0,
-                            elapsed_seconds=int(time.time() - t_start),
-                            grad_norm=round(_gn, 4),
-                            grad_norm_smooth=round(grad_norm_smooth, 4),
-                            siglip_coverage_pct=_hb_siglip_cov,
-                            loader_wait_pct=_hb_loader_pct,
-                        )
+                        if _write_hb is not None:
+                            _write_hb(
+                                "trainer", _pipeline_chunk,
+                                step=step,
+                                total_steps=_end_step,
+                                loss=round(_hb_loss, 6),
+                                loss_smooth=round(_hb_loss_smooth, 6),
+                                lr=float(optimizer.learning_rate),
+                                steps_per_sec=round(_hb_sps, 4),
+                                eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0,
+                                elapsed_seconds=int(time.time() - t_start),
+                                grad_norm=round(_gn, 4),
+                                grad_norm_smooth=round(grad_norm_smooth, 4),
+                                siglip_coverage_pct=_hb_siglip_cov,
+                                loader_wait_pct=_hb_loader_pct,
+                            )
                     except Exception:
                         pass
 
@@ -1718,12 +1733,12 @@ def train(config: dict) -> None:
                 # Write a heartbeat after the potentially slow checkpoint save so
                 # the orchestrator doesn't see a stale heartbeat and restart us.
                 try:
-                    from pipeline_lib import write_heartbeat as _write_hb
-                    _write_hb("trainer", _pipeline_chunk, step=step,
-                               total_steps=_end_step,
-                               loss=round(_hb_loss, 6),
-                               steps_per_sec=round(_hb_sps, 4),
-                               eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
+                    if _write_hb is not None:
+                        _write_hb("trainer", _pipeline_chunk, step=step,
+                                  total_steps=_end_step,
+                                  loss=round(_hb_loss, 6),
+                                  steps_per_sec=round(_hb_sps, 4),
+                                  eta_sec=int((_end_step - step) / _hb_sps) if _hb_sps > 0 else 0)
                 except Exception:
                     pass
 
