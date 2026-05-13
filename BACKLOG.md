@@ -40,6 +40,8 @@ Add `mx.get_peak_memory()` / `mx.reset_peak_memory()` instrumentation after each
 
 **Dependency:** Stage 3 is a hard prerequisite for TRAIN-6 on 32 GB. Stages 0–2 are independent improvements.
 
+**Current blocker:** Stage 0 profiling run (~1–2h) is the only thing needed to unblock Stages 1–3. This is not a large unknown — it is a short instrumentation task. All subsequent TRAIN-5/6/7 quality work gates on those numbers.
+
 **TRAIN-6: Retrain IP-adapter with block-by-block injection** (Medium priority, next major release)
 - Current training uses `_flux_forward_no_ip` + end-sum approximation: all IP contributions are summed and added to `h_final` after all 25 blocks. Q vectors are collected from a clean (no-IP) Flux forward, so earlier blocks cannot adapt their computation to the style signal. This limits quality; CLIP-I ~0.53 vs ~0.7–0.85 for canonical IP-Adapter.
 - Replace with `_flux_forward_with_ip` as the actual training forward pass (block-by-block injection matching inference). Each block's Q is computed from IP-conditioned hidden states, matching the canonical IP-Adapter approach.
@@ -54,11 +56,12 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 2. **Block-by-block injection (TRAIN-6)** — the highest-leverage architectural fix. Currently all style influence arrives at `h_final` after the transformer has committed to its content structure; earlier blocks that govern texture and composition never see the style signal. Moving to block-by-block injection lets every layer adapt to the style. Expected CLIP-I gain: +0.15–0.30, bringing scores into the 0.7–0.85 range typical of production IP-Adapters. **Prerequisite on 32 GB: implement gradient checkpointing (TRAIN-5) first** to bring peak memory under control before enabling gradient flow through 25 blocks.
 
-3. **Source data curation (PIPELINE-27)** — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Degenerate or low-contrast shards dilute the training signal without contributing to style diversity. Synergises with PIPELINE-25 (persistent raw pool) which is a hard prerequisite for shard-level selection.
+3. **Source data curation (PIPELINE-27)** ⛔ blocked on storage — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool) + a large-capacity storage volume (~37 TB for full JDB pool). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
 
-4. **QUALITY-10 ablation harness** — once the above are in place, systematic sweeps over `cross_ref_prob`, `style_loss_weight`, and freeze schedules will identify the best hyperparameter regime for the new scale.
+4. **QUALITY-10 ablation harness** ✓ Done — running as part of flywheel trial 2 (iters 25, 30, 35, 40).
 
-**References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite), QUALITY-10 (ablation harness).
+**References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite).
+**Dependency summary:** TRAIN-7 items 1–2 blocked on TRAIN-5 Stage 0 profiling (~1–2h to unblock). Item 3 blocked on storage hardware. Item 4 done.
 
 ---
 
@@ -80,9 +83,11 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
-**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging**
+**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** ⛔ blocked on storage
 
 Currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion. There is no persistent raw pool. Consequences: re-running any scale re-downloads all tgzs even if they were downloaded before; scale changes cause confusion about which tgzs belong to which chunk.
+
+**Storage constraint:** the full JDB dataset is ~25,000 tgzs × ~1.5 GB ≈ ~37 TB. The current 2 TB SSD has ~833 GB free — nowhere near sufficient for a persistent pool of meaningful scale. Implementation requires either a dedicated large-capacity volume (spinning disk, NAS, or additional SSD) or accepting a partial pool (e.g. keep the last N chunks' raw data). The `--pool-dir` override in the design is specifically to allow the pool to live on a separate volume. **This item should not be started until additional storage is available.**
 
 **Proposed layout:**
 ```
@@ -115,11 +120,12 @@ data_root/
 - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
 
 
-**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
+**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25 + storage
+
 - Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.
-- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool).** Without a persistent pool there is no candidate set to select from — each chunk's raw data is ephemeral and selection is impossible.
-- **Revised goal:** deliver higher style quality with fewer chunks by biasing shard selection toward underrepresented styles and away from shards where the current model already performs well.
-- Note: `mine_hard_examples.py` already provides adaptive selection at the record level post-chunk; shard-level scoring is an upstream complement, not a replacement. Marginal gain is modest while training on ~320 of ~50,000 JDB shards since random selection already provides wide diversity.
+- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool) + additional storage.** Without a persistent pool there is no stable candidate set to select from — each chunk's raw data is currently ephemeral. Both the engineering work (PIPELINE-25) and the physical storage it requires must be in place first.
+- **Partial mitigation already in place:** the flywheel's `shard_selector.py` already does performance-attributed shard selection within the fixed precomputed shard pool (scoring shards by cond_gap contribution, applying recency penalty, diversity slots). This operates on shards that have already been precomputed — it biases *which precomputed shards to train on*, not which raw data to download. PIPELINE-27 is the upstream complement: controlling which raw JDB tgzs are downloaded and precomputed in the first place.
+- **Realistic impact:** we are currently training on ~320 of ~50,000 JDB shards. Random selection from that pool already provides wide style diversity; the marginal gain from smarter upstream selection is modest until coverage increases significantly.
 - Output: `shard_scores.json` + weighted sampling logic with configurable quality vs diversity trade-off.
 
 ---
