@@ -96,3 +96,27 @@ are in git history.
 - **PIPELINE-26 (--ai mode)** — `--ai` mode added to all 7 remaining pipeline scripts: `pipeline_status.py`, `orchestrator.py` (read-only snapshot), `validator.py`, `validate_shards.py`, `validate_weights.py`, `mine_hard_examples.py`, `precompute_all.py`. Contract: JSON to stdout, all prose/progress to stderr, `ok`/`passed` as primary signal.
 
 - **PIPELINE-26 (profiler)** — `pipeline_profile.py`: per-stage wall-clock from orchestrator JSONL launch events + sentinel mtimes; cross-chunk summary; bottleneck flag; VAE note when precompute is slowest. `pipeline_status.py`: timing footer in human output; `stage_mean_hours` + `bottleneck_stage` in `--ai` JSON.
+
+---
+
+## Training Quality — Completed (continued)
+
+- **QUALITY-10** — Automated style feature ablation harness: `train/scripts/ablation_harness.py`. Bayesian optimisation (GP-UCB, Matern-5/2 kernel) over `cross_ref_prob`, `patch_shuffle_prob`, `freeze_double_stream_scales`, `style_loss_weight`. Pareto front tracking (3-objective), EarlyStopper (SIGTERM on persistent bad cond_gap), HTML report with trend/Pareto/heatmap charts, SQLite DB with schema v2.
+
+---
+
+## Flywheel Performance — Completed
+
+- **FLYWHEEL-BUG-1** — Restart used best-by-ref_gap checkpoint instead of latest. Fixed in `orchestrator.py`: prefer chronologically latest `step_*.safetensors` from CKPT_DIR; fall back to `get_best()` only if CKPT_DIR is empty, then to `base_checkpoint` from config.
+
+- **FLYWHEEL-TRIAL2** — Pre-trial-2 warm-start checklist. Resolved by choosing extend-not-restart: `max_iterations: 21 → 42`. Warm-start is automatic via checkpoint auto-discovery (FLYWHEEL-BUG-1 fix). DB history continuous; iteration numbering continues from 22.
+
+- **FLYWHEEL-METRIC-1** — Composite score and best-checkpoint criterion used wrong primary metric. Trial 1 showed `ref_gap` is consistently negative and noisy at 1000-step budgets. Fixed: `shard_selector.py` weights changed to `cond_gap=0.65 / ref_gap=0.20 / loss=0.15`; cond_gap normalisation tightened to `[-0.5, +0.5]`; `get_best` and mark-best trigger switched from `ref_gap` to `cond_gap`.
+
+- **FLYWHEEL-ATTR-1** — Attribution convergence too slow. `min_attribution_obs=3` meant only 2 of 42 shards activated after 12 iterations. Fixed: `min_attribution_obs: 3 → 2` in `flywheel_sref_v1.yaml`. Activates attribution ~2× faster while still requiring evidence on both sides.
+
+- **FLYWHEEL-RECENCY-1** — Performance slots had no recency penalty. Top-scoring shard selected every iteration despite `recency_penalty: 0.30` because the penalty only applied to random-fill slots. Fixed in `shard_selector.py`: step 1 (performance slots) now sorts by `_score_penalised()` using the same discount formula as step 4.
+
+- **FLYWHEEL-ABL-1** — Ablation harness integration broken for trial 2. Fixed: `steps_per_run: 1000` (was 12000, ~12.8h/run), ablation objective updated to `cond_gap=0.70` primary, `ablation_every_n: 0 → 5` in `flywheel_sref_v1.yaml`. Will fire at iters 25, 30, 35, 40 (~4h overhead per burst).
+
+- **FLYWHEEL-PERF-1** — Multiple adapter gradient steps per Flux forward. Implemented `n_grad_steps_per_fwd` in `train_ip_adapter.py`. Reuses frozen `flux_state` Q vectors across N adapter backward steps. At N=2: ~1.47× throughput (2.6 s/step vs 3.8 s/step baseline). Config: `stage1_512px.yaml` → `n_grad_steps_per_fwd: 1` default.

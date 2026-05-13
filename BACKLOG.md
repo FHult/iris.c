@@ -60,8 +60,6 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 **References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite), QUALITY-10 (ablation harness).
 
-~~**QUALITY-10: Automated style feature ablation harness**~~ ✓ Done — `train/scripts/ablation_harness.py`
-
 ---
 
 ## Pipeline Improvements
@@ -163,52 +161,6 @@ data_root/
 - **Feature 1: Negative Prompt** (~3–4h server+UI + 4h C backend) — blocked on B-003
 
 ---
-
-## Flywheel Performance
-
-~~**FLYWHEEL-BUG-1: Restart uses best-by-ref_gap checkpoint instead of latest**~~ ✓ Done
-
-Fixed in `orchestrator.py`: on restart, prefer the chronologically latest `step_*.safetensors` from CKPT_DIR. Falls back to `get_best()` only if CKPT_DIR is empty, then to `base_checkpoint` from config.
-
-~~**FLYWHEEL-TRIAL2: Pre-trial-2 warm-start checklist**~~ ✓ Resolved
-
-Checklist was written assuming a clean restart (rename, clear DB). We chose to extend trial 1 instead by bumping `max_iterations: 21 → 42`. The flywheel auto-discovers the latest checkpoint on startup (FLYWHEEL-BUG-1 fix), so warm-start is automatic. DB history is continuous; iteration numbering continues from 22. Items 1, 3, 4 are moot. Item 2 (FLYWHEEL-ABL-1) addressed separately below.
-
-**FLYWHEEL-METRIC-1: Composite score and best-checkpoint criterion use wrong primary metric** ✓ Done
-
-Trial 1 showed `ref_gap` is consistently negative and noisy at 1000-step iteration budgets (avg −0.016 across all shards; only iter 7 positive). `cond_gap` is the reliable signal: positive, monotonically growing (0.182→0.385 over clean iters 7–10), and has 2.6× spread across shards (0.15–0.38) vs ref_gap's near-zero spread.
-
-Fixed (same commit):
-- `shard_selector.py` `_compute_raw_composite`: weights changed to `cond_gap=0.65 / ref_gap=0.20 / loss=0.15`; cond_gap normalization tightened from `[-3, +0.5]` to `[-0.5, +0.5]` to give meaningful spread at observed values.
-- `flywheel_lib.py` `get_best`: `ORDER BY ref_gap DESC` → `ORDER BY cond_gap DESC`.
-- `orchestrator.py` mark-best trigger: comparison switched from `ref_gap` to `cond_gap`.
-
-**FLYWHEEL-ATTR-1: Attribution convergence too slow — min_attribution_obs=3 too conservative** ✓ Done
-
-After 12 flywheel iterations, only 2 of 42 scored shards had `attr_confidence > 0`. The `min_attribution_obs=3` gate requires ≥3 inclusions AND ≥3 exclusions before attribution activates. With 20 shards/iteration from a 42-shard pool, high-frequency shards (e.g. shard 000002, selected 5/6 iters) never accumulate enough exclusion observations.
-
-Fixed: `min_attribution_obs: 3 → 2` in `flywheel_sref_v1.yaml`. This activates attribution ~2× faster while still requiring evidence on both inclusion and exclusion sides.
-
-Note: `n_selected` (used in the recency formula) counts ALL selections including pre-flywheel pipeline runs, which inflates the penalty for long-running shards. A follow-up improvement would track per-shard selections within the last N flywheel iterations only.
-
-**FLYWHEEL-RECENCY-1: Performance slots had no recency penalty** ✓ Done
-
-Trial 1: shard 000002 was selected 5/6 clean iterations despite `recency_penalty: 0.30` because the penalty only applied to step 4 (random fill). Step 1 (performance slots, `performance_weight=0.60`) sorted by raw `_score()` with no discount, so the top-scoring shard was always selected.
-
-Fixed in `shard_selector.py`: step 1 now sorts by `_score_penalised()`, applying the same `recency_penalty × selection_rate` discount as step 4. The same `n_selected` / `(iteration / recency_window)` formula is used throughout, maintaining consistency.
-
-~~**FLYWHEEL-ABL-1: Fix ablation harness integration before enabling for trial 2**~~ ✓ Done
-
-All three items were already addressed in prior commits; only the enable switch remained:
-1. `steps_per_run: 1000` — already correct in `ablation_sref_v1.yaml` (matches flywheel `steps_per_iteration`).
-2. Ablation objective — `ablation_sref_v1.yaml` already weights `cond_gap` at 0.70 (primary) and `ref_gap` (`clip_i_weight`) at 0.15 (weak secondary).
-3. `ablation_every_n: 0 → 5` in `flywheel_sref_v1.yaml` — enabled. Will fire at iters 25, 30, 35, 40 (~4h overhead per burst).
-
-~~**FLYWHEEL-PERF-1: Multiple adapter gradient steps per Flux forward**~~ ✓ Done
-
-Implemented `n_grad_steps_per_fwd` in `train_ip_adapter.py`. The inner loop reuses `flux_state` (stop_gradient'd Q vectors) across N adapter backward steps. All per-step accounting (step counter, EMA, grad norm, loss splits, logging, heartbeat, checkpoint) runs inside the inner loop so `step % X == 0` triggers fire at the correct absolute step values.
-
-Config: `stage1_512px.yaml` → `n_grad_steps_per_fwd: 1` (default disabled). Set to 2 for ~1.47x throughput. At N=2: (2.4 + 2×1.4) / 2 = 2.6s/step vs 3.8s/step baseline. N=3 gives ~1.7x but increases peak memory by ~300 MB (flux_state kept alive across 2 extra eval fences; still well within 32 GB).
 
 ---
 
