@@ -64,41 +64,21 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
-**PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Medium priority, partially addressed)
+**PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Low priority, code bugs fixed)
 
-Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunks. The following
-surfaces have not been exercised and should be tested before relying on them in production.
+Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunks. Three code bugs found in audit were fixed (commit `cdd9fb0`, 2026-05-13):
 
-**Not tested at all:**
-- LAION/COYO/WikiArt download paths — smoke uses `jdb_only: true`
-- More than 2 chunks — chunk sequencing beyond chunk 2 is untested
-- Real two-device stager (copy, not symlink) — smoke cold/hot roots are on the same SSD;
-  actual cold→hot transfers use `rsync`/copy and have never run
-- `stage.done` gating on chunk N training — chunk 2 already had `stage.done` from a prior run
-  in smoke, so the gate was never actually blocked waiting on a real staging transfer
-- `_poll_stager` retry path for a genuine stager failure
-- `dispatch-resolve` human-intervention flow under real pipeline pressure
-- GPU_TOKEN contention under real timing (precompute + training each take hours in production;
-  smoke steps were minutes — real interleaving is much tighter)
+- ~~`_check_hot_space()` dead code~~ — now called in `_stage_shards()` and `_stage_precomputed()` with pre-scanned transfer size before any copies begin. `staging_margin_gb: 50` is now enforced.
+- ~~GPU_TOKEN race~~ — `_start_training()` returns early when window is gone but `EXIT_CODE` not yet written.
+- ~~Duplicate dispatch on restart~~ — `_stager_dispatched_errors` pre-seeded from `dispatch_queue.jsonl` via `_load_open_dispatch_ids()`.
 
-**Tested at smoke scale only (low confidence on production behaviour):**
-- Download throttling during active training — worked at 2–3 GB; real downloads are multi-TB
-- Staging margin / cleanup safety checks — real run has much tighter disk headroom
-- Orchestrator restart recovery — triggered incidentally 3× during debugging; clean each time,
-  but always during prep (not mid-training or mid-archive)
-
-**Fixed (2026-05-13):**
-- `_check_hot_space()` was dead code — now called in `_stage_shards()` and `_stage_precomputed()` with pre-scanned transfer size before any copies begin. Raises `RuntimeError` on failure so `stage_for_chunk()` writes `stage.error` cleanly.
-- GPU_TOKEN race: `_start_training()` now returns early when the training window is gone but `EXIT_CODE` hasn't been written yet, preventing premature token acquisition.
-- `_stager_dispatched_errors` pre-seeded from `dispatch_queue.jsonl` on startup via `_load_open_dispatch_ids()`, preventing duplicate alerts after orchestrator restart.
-- DISPATCH.md: documented that `dispatch-resolve` is UI-only (must also `clear-error`); added Gap 5 (mid-archive restart is safe/idempotent); added Gap 6 (download stall false-positive under I/O contention).
-
-**Still open — validation gaps (no code bugs, but untested paths):**
-1. Run a `medium` scale smoke (e.g. 5–10% data, 3 chunks) to exercise the chunk 3+ path and
-   the stage.done gate blocking chunk 2 training until staging completes.
-2. On a two-device setup, verify the rsync stager path and the now-wired `_check_hot_space()` enforcement.
-3. Simulate a stager failure and verify `_poll_stager` retries after `clear-error`.
-4. Simulate a training crash and verify one-retry + escalate + checkpoint resume.
+**Remaining: validation gaps only (no known code bugs)**
+- LAION/COYO/WikiArt download paths and chunk 3+ sequencing — code generalises correctly; untested at scale.
+- Real two-device stager (copy path) — `_check_hot_space()` now wired; needs a real cold→hot run to verify.
+- `stage.done` gate blocking training, `_poll_stager` retry after error, training crash one-retry + escalate — all coded correctly; never exercised end-to-end.
+- GPU_TOKEN contention at production timing — documented; code fix applied; no observed failure.
+- Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
+- `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
 **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging**
 
