@@ -36,11 +36,12 @@ Measured at step 108k, 512px, 4× stable intervals of 100 steps each:
 
 **TRAIN-5 complete. Next: TRAIN-6.**
 
-**TRAIN-6: Retrain IP-adapter with block-by-block injection** (Medium priority, next major release)
-- Current training uses `_flux_forward_no_ip` + end-sum approximation: all IP contributions are summed and added to `h_final` after all 25 blocks. Q vectors are collected from a clean (no-IP) Flux forward, so earlier blocks cannot adapt their computation to the style signal. This limits quality; CLIP-I ~0.53 vs ~0.7–0.85 for canonical IP-Adapter.
-- Replace with `_flux_forward_with_ip` as the actual training forward pass (block-by-block injection matching inference). Each block's Q is computed from IP-conditioned hidden states, matching the canonical IP-Adapter approach.
-- **Warm-start**: current checkpoint (`best.safetensors`, step 95000) gives a good init for perceiver and ip_scale; `to_k_ip_stacked`/`to_v_ip_stacked` will re-learn at the correct injection points.
-- **Memory cost (32 GB system)**: measured baseline is 20.44 GB (not the 25.93 GB estimated earlier). 25 blocks × ~75 MB activations ≈ +1.9 GB → expected TRAIN-6 peak ~22–23 GB, leaving ~9–10 GB headroom. Checkpointing (`block_gradient_checkpointing: true`) is available as a fallback if actual measurement is higher. TRAIN-5 Stage 3 is implemented and ready to enable if needed.
+**TRAIN-6: Retrain IP-adapter with block-by-block injection** ✓ Done (2026-05-13)
+- Implemented `loss_fn_with_ip` / `compiled_step_with_ip` calling `_flux_forward_with_ip` inside `nn.value_and_grad`. Eliminates the train/inference mismatch of the end-sum approximation.
+- Gated by `training.use_block_injection: true` in `stage1_512px.yaml` (enabled). Original split-forward path preserved under `false`.
+- `n_grad_steps_per_fwd` forced to 1 when enabled (Q vectors not reusable across steps).
+- Memory estimate: ~22–23 GB peak; `block_gradient_checkpointing: true` available as fallback.
+- **Next**: run 100-step smoke test to verify no NaN, peak memory in range, loss_cond falls. Monitor cond_gap for improvement toward 0.7–0.85 CLIP-I range.
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
