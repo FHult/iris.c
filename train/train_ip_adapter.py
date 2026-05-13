@@ -867,7 +867,7 @@ def train(config: dict) -> None:
     # Gate behind memory_profile: true in training config. Resets peak counter
     # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
     _mem_profile = bool(tcfg.get("memory_profile", False))
-    _mem_fwd_peak = _mem_bwd_peak = _mem_param_peak = _mem_ema_peak = 0
+    _mem_fwd_peak = _mem_bwd_peak = _mem_ema_peak = 0
 
     # QUALITY-1 / QUALITY-3 aug probabilities
     _cross_ref_prob    = float(tcfg.get("cross_ref_prob", 0.0))
@@ -1315,28 +1315,22 @@ def train(config: dict) -> None:
                 ema_params = update_ema(ema_params, adapter,
                                        decay=tcfg["ema_decay"] ** tcfg["ema_update_every"])
 
-            # Synchronous eval split into three fences to bound peak Metal allocation.
+            # Synchronous eval in two fences to bound peak Metal allocation.
             #
-            # Fence 1 — backward + optimizer state (m, v):
-            #   Peak = steady_state(17.73 GB) + grads(~2 GB) + new_m(~2 GB) + new_v(~2 GB)
-            #        ≈ 23.7 GB.  After this fence grads are freed (no remaining refs).
+            # Fence 1 — backward + optimizer state + new params (merged):
+            #   Grads keep optimizer state and new params live simultaneously, so
+            #   splitting into two evals gives the same peak (~20.4 GB measured).
+            #   Merging saves one eval round-trip and one clear_cache call.
+            #   Measured peak (step 108k, 512px): 20.44 GB.
             #
-            # Fence 2 — new params from concrete m/v (no backward re-run):
-            #   Peak = steady_state(17.73 GB) + new_params(~2 GB) ≈ 19.7 GB.
-            #
-            # Fence 3 — EMA (if due): old_ema + new_ema, isolated from param update.
+            # Fence 2 — EMA (if due): old_ema + new_ema, isolated from param update.
             _t0 = time.time()
             if _mem_profile:
                 mx.reset_peak_memory()
-            mx.eval(optimizer.state, loss_val, grad_norm_val)
+            mx.eval(optimizer.state, loss_val, grad_norm_val, adapter.parameters())
             mx.clear_cache()
             if _mem_profile:
                 _mem_bwd_peak = max(_mem_bwd_peak, mx.get_peak_memory())
-                mx.reset_peak_memory()
-            mx.eval(adapter.parameters())
-            mx.clear_cache()
-            if _mem_profile:
-                _mem_param_peak = max(_mem_param_peak, mx.get_peak_memory())
                 mx.reset_peak_memory()
             if _do_ema:
                 mx.eval(ema_params)
@@ -1517,13 +1511,12 @@ def train(config: dict) -> None:
                     _gb = 1 / 2**30
                     print(
                         f"  [mem/fence] fwd={_mem_fwd_peak*_gb:.2f} GB"
-                        f"  bwd={_mem_bwd_peak*_gb:.2f} GB"
-                        f"  param={_mem_param_peak*_gb:.2f} GB"
+                        f"  bwd+param={_mem_bwd_peak*_gb:.2f} GB"
                         f"  ema={_mem_ema_peak*_gb:.2f} GB"
                         f"  (peak-of-{log_interval}-steps per fence)",
                         flush=True,
                     )
-                    _mem_fwd_peak = _mem_bwd_peak = _mem_param_peak = _mem_ema_peak = 0
+                    _mem_fwd_peak = _mem_bwd_peak = _mem_ema_peak = 0
 
                 # T-06: EMA drift
                 if ema_drift > 0:
