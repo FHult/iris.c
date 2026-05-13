@@ -52,6 +52,7 @@ training:
   ema_update_every: 10                     # update EMA every N steps (saves ~23min total)
   n_grad_steps_per_fwd: 1                  # adapter backward steps per Flux forward (1=disabled; 2=~1.47x throughput)
   memory_profile: false                    # TRAIN-5 Stage 0: set true to log per-fence peak memory each log interval
+  use_block_injection: true               # TRAIN-6: block-by-block IP injection matching inference (false = legacy end-sum)
 
   # Null conditioning dropout for scale control at inference
   image_dropout_prob: 0.30                 # 30%: zero out ip_embeds

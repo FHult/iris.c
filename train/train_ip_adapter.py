@@ -892,6 +892,10 @@ def train(config: dict) -> None:
     _ema_update_every   = int(tcfg["ema_update_every"])
     _ema_decay_factor   = float(tcfg["ema_decay"]) ** _ema_update_every
     _n_grad_steps       = int(tcfg.get("n_grad_steps_per_fwd", 1))
+    _use_block_injection = bool(tcfg.get("use_block_injection", False))
+    if _use_block_injection and _n_grad_steps > 1:
+        print("  TRAIN-6: use_block_injection=true — n_grad_steps_per_fwd forced to 1")
+        _n_grad_steps = 1
     # Precomputed scalar MLX bools — avoids mx.array(bool) allocation every step.
     _MX_TRUE  = mx.array(True)
     _MX_FALSE = mx.array(False)
@@ -993,6 +997,55 @@ def train(config: dict) -> None:
         optimizer.update(adapter, grads)
         # Return all lazy. Eval is split into two fences in the caller AFTER
         # del flux_state — this keeps flux_state out of the peak window.
+        return loss_val, grad_norm
+
+    def loss_fn_with_ip(siglip_feats, use_null_image: mx.array,
+                        noisy: mx.array, text_embeds: mx.array, t_int: mx.array,
+                        target: mx.array,
+                        x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
+        """
+        TRAIN-6: full forward+backward with block-by-block IP injection.
+
+        Eliminates the train/inference mismatch of the end-sum approximation.
+        Each block's Q is computed from IP-conditioned hidden states, exactly
+        matching the inference path (_flux_forward_with_ip).
+
+        Gradient graph: adapter → k_ip/v_ip at each block → ip_out[i] →
+        hidden_states[i+1] → ... → pred → loss. Flux block weights are frozen;
+        backward traces through them but accumulates no gradient for them.
+        """
+        ip_embeds = adapter.get_image_embeds(siglip_feats)
+        zero_embeds = mx.zeros_like(ip_embeds)
+        ip_embeds = mx.where(use_null_image, zero_embeds, ip_embeds)
+        k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
+        pred = _flux_forward_with_ip(
+            flux, noisy, text_embeds, t_int,
+            k_ip_all, v_ip_all, adapter.scale,
+            ckpt_double, ckpt_single,
+        )
+        flow_loss = mx.mean((pred - target) ** 2)
+        if _style_weight > 0.0 and x0_ref is not None:
+            x0_pred = reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
+            style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
+            _style_loss_accum[0] = style_term
+            return flow_loss + _style_weight * style_term
+        return flow_loss
+
+    loss_and_grad_with_ip = nn.value_and_grad(adapter, loss_fn_with_ip)
+
+    def compiled_step_with_ip(siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
+                               x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
+        loss_val, grads = loss_and_grad_with_ip(
+            siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
+            x0_ref, noisy_in, alpha_in, sigma_in,
+        )
+        if _freeze_double_stream:
+            grads["scale"] = mx.concatenate([
+                mx.zeros((_nd,), dtype=grads["scale"].dtype),
+                grads["scale"][_nd:],
+            ])
+        grads, grad_norm = optim.clip_grad_norm(grads, max_norm=_grad_clip)
+        optimizer.update(adapter, grads)
         return loss_val, grad_norm
 
     # ── T-05: validation loss on held-out set ─────────────────────────────────
@@ -1152,9 +1205,13 @@ def train(config: dict) -> None:
             _dummy_siglip = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
             print(f"  [{_bH}x{_bW}] compiling...", flush=True)
             _t0_wu = time.time()
-            _fs = _flux_forward_no_ip(flux, _dummy_lat, _txt_wu, _t_wu)
-            mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"])
-            _loss_wu, _gnorm_wu = compiled_step(_dummy_siglip, mx.array(False), _fs, _dummy_tgt)
+            if _use_block_injection:
+                _loss_wu, _gnorm_wu = compiled_step_with_ip(
+                    _dummy_siglip, mx.array(False), _dummy_lat, _txt_wu, _t_wu, _dummy_tgt)
+            else:
+                _fs = _flux_forward_no_ip(flux, _dummy_lat, _txt_wu, _t_wu)
+                mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"])
+                _loss_wu, _gnorm_wu = compiled_step(_dummy_siglip, mx.array(False), _fs, _dummy_tgt)
             mx.eval(optimizer.state, _loss_wu, _gnorm_wu)
             mx.clear_cache()
             mx.eval(adapter.parameters())
@@ -1162,7 +1219,9 @@ def train(config: dict) -> None:
             _elapsed = time.time() - _t0_wu
             _label = "cold compile" if _elapsed > 5.0 else "warm cache"
             print(f"  [{_bH}x{_bW}] done ({_elapsed:.1f}s — {_label})", flush=True)
-            del _fs, _dummy_lat, _dummy_tgt, _dummy_siglip, _loss_wu, _gnorm_wu
+            if not _use_block_injection:
+                del _fs
+            del _dummy_lat, _dummy_tgt, _dummy_siglip, _loss_wu, _gnorm_wu
         print("IP Adapter training graphs ready.")
         sys.exit(0)
 
@@ -1286,10 +1345,7 @@ def train(config: dict) -> None:
 
         _t_prep += time.time() - _t0
 
-        # ── Split-forward: Flux no-grad forward, then tiny adapter backward ──
-        # Sample timestep + noise outside grad scope. fused_flow_noise is a pure
-        # kernel; target needs no grad. Flux forward is run here (no grad), only
-        # the adapter graph is traced by nn.value_and_grad.
+        # ── Forward pass + backward ───────────────────────────────────────────
         _t0 = time.time()
         B_lat = latents.shape[0]
         # Logit-normal timestep sampling: concentrates on mid-timesteps (t≈300–700)
@@ -1299,31 +1355,42 @@ def train(config: dict) -> None:
         alpha_t, sigma_t = get_schedule_values(t_int)
         noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)
 
-        if _mem_profile:
-            mx.reset_peak_memory()
-        flux_state = _flux_forward_no_ip(flux, noisy, text_embeds, t_int)
-        # Force-materialize all Flux tensors before entering autodiff graph.
-        # Without this, MLX defers Flux computation into the gradient trace,
-        # negating the entire split-forward optimization.
-        # target has no dependency on Flux; batching into one eval lets Metal
-        # schedule both concurrently rather than across two separate fences.
-        mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
-        if _mem_profile:
-            _mem_fwd_peak = max(_mem_fwd_peak, mx.get_peak_memory())
+        if _use_block_injection:
+            # TRAIN-6: fwd is inside loss_fn_with_ip; only target needs materialising now.
+            mx.eval(target)
+            flux_state = None
+        else:
+            if _mem_profile:
+                mx.reset_peak_memory()
+            flux_state = _flux_forward_no_ip(flux, noisy, text_embeds, t_int)
+            # Force-materialize all Flux tensors before entering autodiff graph.
+            # Without this, MLX defers Flux computation into the gradient trace,
+            # negating the entire split-forward optimization.
+            mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
+            if _mem_profile:
+                _mem_fwd_peak = max(_mem_fwd_peak, mx.get_peak_memory())
         _t_fwd += time.time() - _t0
 
-        # Adapter-only backward — repeated n_grad_steps_per_fwd times, reusing
-        # flux_state (stop_gradient'd Q vectors). Each inner iteration is a full
-        # gradient step with complete per-step accounting.
+        # Backward + optimizer update. With block injection (TRAIN-6) the full Flux
+        # forward is traced inside loss_fn_with_ip, so n_grad_steps_per_fwd=1.
         for _grad_i in range(_n_grad_steps):
             if step >= _end_step:
                 break
             _t_inner_start = time.time()
 
-            # Adapter-only backward + optimizer update + optimizer state eval (bulk of GPU work)
             _t0 = time.time()
             _do_style = _style_weight > 0.0 and not null_image and step % _style_every == 0
-            if _do_style:
+            if _use_block_injection:
+                if _do_style:
+                    loss_val, grad_norm_val = compiled_step_with_ip(
+                        siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
+                        latents, noisy, alpha_t, sigma_t,
+                    )
+                else:
+                    loss_val, grad_norm_val = compiled_step_with_ip(
+                        siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
+                    )
+            elif _do_style:
                 loss_val, grad_norm_val = compiled_step(
                     siglip_feats, use_null_image, flux_state, target,
                     latents, noisy, alpha_t, sigma_t,
@@ -1790,7 +1857,9 @@ def train(config: dict) -> None:
                 mx.reset_peak_memory()
 
         # Release flux_state (25 Q tensors ≈ 300 MB) after all gradient steps.
-        del flux_state, target
+        if flux_state is not None:
+            del flux_state
+        del target
 
 
     # Final checkpoint + EMA export
