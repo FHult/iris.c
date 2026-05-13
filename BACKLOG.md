@@ -24,32 +24,23 @@ Measured at step 108k, 512px, 4× stable intervals of 100 steps each:
 - Optimizer m/v alloc during backward: +~2.5 GB (brings bwd to 20.44 GB)
 - EMA update: +~0.6 GB above steady state
 
-**Stage 1 — Structural fixes (~2–4h, estimated ~1–2 GB saving):**
-- `flux_state` deletion before backward: fwd peak is only 16.97 GB so Q tensors are not the bottleneck; saving is smaller than estimated (~100–200 MB, not 280 MB). Still worth doing for clarity.
-- Lower `cache_limit_pct` from `0.06` to `0.03` in `stage1_512px.yaml`. MLX pool is ~2 GB (6% × 32 GB); halving it frees ~1 GB at cost of +1–3% slowdown. Gate behind `memory.cache_limit_pct` config key.
-- The `bwd`/`param` peak tie (both 20.44 GB) suggests the optimizer m/v tensors are not freed between Fence 1 and Fence 2. Investigate whether an explicit `del` of the old optimizer state ref between the two fences can reduce the Fence 2 peak.
+**Stage 1 — Parked** (low urgency given 11.5 GB headroom; revisit if memory becomes tight).
 
-**Stage 2 — Adapter graph checkpointing (~2–4h, ~200–400 MB saving):**
-- Add `gradient_checkpointing: false` config flag to `training:` section.
-- When enabled, wrap `adapter.get_image_embeds` with `mx.checkpoint(...)` inside `loss_fn`. Recomputes PerceiverResampler during backward instead of storing intermediates.
-- With 11.5 GB headroom this is low urgency for current training, but still worthwhile before TRAIN-6.
+**Stage 2 — Parked** (low urgency given 11.5 GB headroom; revisit if memory becomes tight).
 
-**Stage 3 — Block checkpoint infrastructure for TRAIN-6 (~4–8h, 3–5 GB saving when TRAIN-6 activates):**
-- Add `block_gradient_checkpointing: false` config flag.
-- When enabled, pre-build `ckpt_double` / `ckpt_single` lists by wrapping each Flux transformer block with `mx.checkpoint(block)`. Pass these into `_flux_forward_with_ip` (already has `ckpt_double`/`ckpt_single` parameters).
-- This does nothing in the current `_flux_forward_no_ip` path (no backward). It is the TRAIN-6 activation switch: when TRAIN-6 switches to `_flux_forward_with_ip`, enabling this flag keeps peak memory viable on 32 GB by recomputing one block at a time during backward.
-- Current measured headroom (11.5 GB) is insufficient for TRAIN-6 without this: 25 Flux blocks × ~200–300 MB each = 5–7.5 GB additional, pushing to ~26–28 GB. Stage 3 brings it back to ~21–22 GB.
-- Disable by default, test in isolation with a short `_flux_forward_with_ip` smoke run.
+**Stage 3 — Block checkpoint infrastructure ✓ Done (2026-05-13):**
+- `block_gradient_checkpointing: false` flag added to `adapter:` section of `stage1_512px.yaml`.
+- When enabled: pre-builds `ckpt_double` / `ckpt_single` by wrapping each Flux block with `mx.checkpoint(block)`. These are passed into `_flux_forward_with_ip` (already had the lookup wired).
+- Zero cost when disabled. Zero runtime cost with current `_flux_forward_no_ip` path even when enabled (lists built once at startup, never referenced). Recompute overhead only activates when TRAIN-6 switches to `_flux_forward_with_ip`.
+- Revised memory estimate for TRAIN-6 (based on measured 20.44 GB peak): 25 blocks × ~75 MB ≈ +1.9 GB → expected TRAIN-6 peak ~22–23 GB. Checkpointing likely not required on 32 GB but available as a fallback if actual measurement exceeds estimate.
 
-**Files to modify:** `train/train_ip_adapter.py`, `train/configs/stage1_512px.yaml`
-
-**Dependency:** Stage 3 is a hard prerequisite for TRAIN-6 on 32 GB. Stages 1–2 are independent improvements with lower urgency given the measured 11.5 GB headroom.
+**TRAIN-5 complete. Next: TRAIN-6.**
 
 **TRAIN-6: Retrain IP-adapter with block-by-block injection** (Medium priority, next major release)
 - Current training uses `_flux_forward_no_ip` + end-sum approximation: all IP contributions are summed and added to `h_final` after all 25 blocks. Q vectors are collected from a clean (no-IP) Flux forward, so earlier blocks cannot adapt their computation to the style signal. This limits quality; CLIP-I ~0.53 vs ~0.7–0.85 for canonical IP-Adapter.
 - Replace with `_flux_forward_with_ip` as the actual training forward pass (block-by-block injection matching inference). Each block's Q is computed from IP-conditioned hidden states, matching the canonical IP-Adapter approach.
 - **Warm-start**: current checkpoint (`best.safetensors`, step 95000) gives a good init for perceiver and ip_scale; `to_k_ip_stacked`/`to_v_ip_stacked` will re-learn at the correct injection points.
-- **Memory cost (32 GB system)**: the backward through 25 Flux blocks would store intermediate activations for all blocks simultaneously: ~200–300 MB per double block + ~100–200 MB per single block = estimated +3–5 GB above the current 25.93 GB peak, pushing to ~29–31 GB. This exceeds safe headroom without mitigation. The fix is TRAIN-5 Stage 3 (`block_gradient_checkpointing`), which applies `mx.checkpoint` to each Flux block so only one block's activations are live at a time during backward (~200–400 MB total instead of 3–5 GB). **TRAIN-5 Stage 3 is a hard prerequisite before attempting TRAIN-6 on 32 GB.**
+- **Memory cost (32 GB system)**: measured baseline is 20.44 GB (not the 25.93 GB estimated earlier). 25 blocks × ~75 MB activations ≈ +1.9 GB → expected TRAIN-6 peak ~22–23 GB, leaving ~9–10 GB headroom. Checkpointing (`block_gradient_checkpointing: true`) is available as a fallback if actual measurement is higher. TRAIN-5 Stage 3 is implemented and ready to enable if needed.
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
@@ -57,7 +48,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 1. **Larger resolution + more training steps** — the v1 run was a `--small` configuration. Higher resolution (1024px) exposes finer style features to the SigLIP encoder; more steps allow the PerceiverResampler and K/V projections to build a richer style space. Expected CLIP-I gain: +0.05–0.10. **Note (32 GB):** 1024px training on 4B Flux currently peaks at ~26 GB at 512px; 1024px roughly doubles the sequence length (256→1024 image tokens), which increases attention memory. Feasibility needs a short profiling run before committing to a full 1024px flywheel.
 
-2. **Block-by-block injection (TRAIN-6)** — the highest-leverage architectural fix. Currently all style influence arrives at `h_final` after the transformer has committed to its content structure; earlier blocks that govern texture and composition never see the style signal. Moving to block-by-block injection lets every layer adapt to the style. Expected CLIP-I gain: +0.15–0.30, bringing scores into the 0.7–0.85 range typical of production IP-Adapters. **Prerequisite on 32 GB: implement gradient checkpointing (TRAIN-5) first** to bring peak memory under control before enabling gradient flow through 25 blocks.
+2. **Block-by-block injection (TRAIN-6)** — the highest-leverage architectural fix. Currently all style influence arrives at `h_final` after the transformer has committed to its content structure; earlier blocks that govern texture and composition never see the style signal. Moving to block-by-block injection lets every layer adapt to the style. Expected CLIP-I gain: +0.15–0.30, bringing scores into the 0.7–0.85 range typical of production IP-Adapters. Memory: expected peak ~22–23 GB (9–10 GB headroom); `block_gradient_checkpointing` available as fallback if needed (TRAIN-5 Stage 3 done).
 
 3. **Source data curation (PIPELINE-27)** ⛔ blocked on storage — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool) + a large-capacity storage volume (~37 TB for full JDB pool). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
 

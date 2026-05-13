@@ -22,6 +22,10 @@ adapter:
   sref_strength: 1.0                       # global ip_scale multiplier (0.0–2.0 typical range)
   # Training: freeze double-stream scales at zero (QUALITY-2)
   freeze_double_stream_scales: true        # blocks 0–4 stay zero; style learnt via single-stream only
+  # TRAIN-5 Stage 3: block gradient checkpointing (prerequisite for TRAIN-6 if needed)
+  # Wraps each Flux block with mx.checkpoint — free with current no-IP path; enables
+  # memory-efficient backward through all 25 blocks when TRAIN-6 activates _flux_forward_with_ip.
+  block_gradient_checkpointing: false
 
 data:
   shard_path: "train/data/shards"

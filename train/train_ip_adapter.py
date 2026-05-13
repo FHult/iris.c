@@ -755,6 +755,17 @@ def train(config: dict) -> None:
 
     ckpt_double = None
     ckpt_single = None
+    # TRAIN-5 Stage 3: block gradient checkpointing infrastructure for TRAIN-6.
+    # Wraps each Flux transformer block with mx.checkpoint so activations are freed
+    # after forward and recomputed block-by-block during backward. Zero cost when
+    # disabled; zero runtime cost with current _flux_forward_no_ip path even when
+    # enabled. Only incurs recompute overhead when TRAIN-6 activates _flux_forward_with_ip.
+    if acfg.get("block_gradient_checkpointing", False):
+        _tr = flux.transformer
+        ckpt_double = [mx.checkpoint(b) for b in _tr.transformer_blocks]
+        ckpt_single = [mx.checkpoint(b) for b in _tr.single_transformer_blocks]
+        print(f"  Block gradient checkpointing enabled: "
+              f"{len(ckpt_double)} double + {len(ckpt_single)} single blocks")
 
     # ── Build IP-Adapter (trainable) ──────────────────────────────────────────
     print("Building IPAdapterKlein ...")
