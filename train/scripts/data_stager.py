@@ -238,6 +238,14 @@ class DataStager:
                 if not dst.exists() and not dst.is_symlink():
                     tasks.append((tar, dst))
 
+        if not self._use_symlinks and tasks:
+            estimated = sum(_safe_size(src) for src, _ in tasks)
+            if not self._check_hot_space(estimated):
+                raise RuntimeError(
+                    f"Insufficient hot-storage space to stage chunk {chunk} shards "
+                    f"(~{estimated / 1e9:.1f} GB needed, margin={self.staging_margin_gb:.0f} GB)"
+                )
+
         def _do(src_dst: tuple[Path, Path]) -> int:
             self._link_or_copy(*src_dst)
             return 1
@@ -263,6 +271,27 @@ class DataStager:
         """
         total_npz = 0
         total_bytes = 0
+
+        # Pre-scan total transfer size before starting any copies so we can
+        # enforce the hot-storage margin as a single upfront check.
+        if not self._use_symlinks:
+            estimated = 0
+            for encoder in _ENCODERS:
+                cold_cur = self._cold_precomp / encoder / "current"
+                if not cold_cur.exists() and not cold_cur.is_symlink():
+                    continue
+                ver = os.readlink(cold_cur) if cold_cur.is_symlink() else cold_cur.name
+                cold_ver_dir = self._cold_precomp / encoder / ver
+                hot_ver_dir  = self._hot_precomp  / encoder / ver
+                if cold_ver_dir.exists():
+                    for f in cold_ver_dir.iterdir():
+                        if not (hot_ver_dir / f.name).exists():
+                            estimated += _safe_size(f)
+            if estimated and not self._check_hot_space(estimated):
+                raise RuntimeError(
+                    f"Insufficient hot-storage space to stage chunk {chunk} precomputed caches "
+                    f"(~{estimated / 1e9:.1f} GB needed, margin={self.staging_margin_gb:.0f} GB)"
+                )
 
         for encoder in _ENCODERS:
             cold_enc = self._cold_precomp / encoder
@@ -476,15 +505,20 @@ class DataStager:
         """
         Return True if hot storage has at least staging_margin_gb free after
         the estimated transfer.  Logs a warning and returns False if not.
+
+        Called before any file copies begin so that an insufficiently-sized hot
+        volume is caught upfront rather than mid-transfer.  Callers raise
+        RuntimeError on False so stage_for_chunk() writes stage.error.
         """
         try:
-            free_gb = _free_gb(self.hot_root)
+            free_gb   = _free_gb(self.hot_root)
             needed_gb = estimated_bytes / (1024 ** 3)
             if free_gb - needed_gb < self.staging_margin_gb:
                 log.warning(
-                    "Staging skipped: hot storage has %.1f GB free, need %.1f GB "
-                    "+ %.0f GB safety margin",
+                    "Hot storage space check failed: %.1f GB free, need %.1f GB "
+                    "+ %.0f GB safety margin (%.1f GB available after transfer)",
                     free_gb, needed_gb, self.staging_margin_gb,
+                    free_gb - needed_gb,
                 )
                 return False
         except OSError:
@@ -498,6 +532,14 @@ class DataStager:
 
 def _free_gb(path: Path) -> float:
     return shutil.disk_usage(path).free / (1024 ** 3)
+
+
+def _safe_size(path: Path) -> int:
+    """Return file size in bytes, 0 on error (stat may fail for broken symlinks)."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _atomic_symlink(link_path: Path, target: str) -> None:

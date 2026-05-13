@@ -29,6 +29,7 @@ from typing import Optional
 
 from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, VENV_PYTHON,
+    DISPATCH_QUEUE,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
     CKPT_ARCHIVE_DIR, RUN_METADATA_FILE,
@@ -257,6 +258,29 @@ _REQUIRED_CONFIG_KEYS = [
 ]
 
 
+def _load_open_dispatch_ids() -> set[str]:
+    """Return IDs of unresolved dispatch issues from the queue file.
+
+    Used to pre-seed _stager_dispatched_errors on orchestrator restart so that
+    issues already in the queue are not re-dispatched with a new ID.
+    """
+    if not DISPATCH_QUEUE.exists():
+        return set()
+    by_id: dict[str, bool] = {}
+    try:
+        for line in DISPATCH_QUEUE.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            issue_id = entry.get("id")
+            if issue_id:
+                by_id[issue_id] = not entry.get("resolved", False)
+    except Exception:
+        return set()
+    return {iid for iid, open_ in by_id.items() if open_}
+
+
 def _validate_config(cfg: dict) -> None:
     """Abort early if the pipeline config is missing required keys."""
     missing = []
@@ -321,7 +345,8 @@ class Orchestrator:
 
         # Issue IDs that have been dispatched for stager errors.  Cleared when
         # the operator resolves the error sentinel so re-dispatch fires on recurrence.
-        self._stager_dispatched_errors: set[str] = set()
+        # Pre-seeded from the dispatch queue so restarts don't re-fire existing alerts.
+        self._stager_dispatched_errors: set[str] = _load_open_dispatch_ids()
 
         _validate_config(config)
 
@@ -1451,6 +1476,12 @@ class Orchestrator:
                     self.res.release("GPU_TOKEN")
                 notify("iris pipeline ERROR", f"Training chunk {chunk} failed")
                 return
+            # code is None: window closed but EXIT_CODE not yet written (narrow race
+            # between process exit and the shell appending EXIT_CODE= to the log).
+            # Wait for the next poll rather than acquiring GPU_TOKEN prematurely.
+            log_orch(f"Chunk {chunk}: training window gone, exit code not yet written — waiting",
+                     chunk=chunk)
+            return
 
         if not self.res.request("GPU_TOKEN", f"train chunk {chunk}"):
             return

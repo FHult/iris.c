@@ -64,7 +64,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
-**PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Medium priority)
+**PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Medium priority, partially addressed)
 
 Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunks. The following
 surfaces have not been exercised and should be tested before relying on them in production.
@@ -87,15 +87,18 @@ surfaces have not been exercised and should be tested before relying on them in 
 - Orchestrator restart recovery — triggered incidentally 3× during debugging; clean each time,
   but always during prep (not mid-training or mid-archive)
 
-**Recommended validation steps:**
+**Fixed (2026-05-13):**
+- `_check_hot_space()` was dead code — now called in `_stage_shards()` and `_stage_precomputed()` with pre-scanned transfer size before any copies begin. Raises `RuntimeError` on failure so `stage_for_chunk()` writes `stage.error` cleanly.
+- GPU_TOKEN race: `_start_training()` now returns early when the training window is gone but `EXIT_CODE` hasn't been written yet, preventing premature token acquisition.
+- `_stager_dispatched_errors` pre-seeded from `dispatch_queue.jsonl` on startup via `_load_open_dispatch_ids()`, preventing duplicate alerts after orchestrator restart.
+- DISPATCH.md: documented that `dispatch-resolve` is UI-only (must also `clear-error`); added Gap 5 (mid-archive restart is safe/idempotent); added Gap 6 (download stall false-positive under I/O contention).
+
+**Still open — validation gaps (no code bugs, but untested paths):**
 1. Run a `medium` scale smoke (e.g. 5–10% data, 3 chunks) to exercise the chunk 3+ path and
    the stage.done gate blocking chunk 2 training until staging completes.
-2. On a two-device setup, run with real cold/hot separation to exercise the rsync stager path
-   and verify staging margin checks don't false-positive on a nearly-full hot volume.
-3. Simulate a stager failure (kill iris-stage mid-transfer) and verify `_poll_stager` retries
-   cleanly and the dispatch queue surfaces the error.
-4. Simulate a training crash (kill iris-train) and verify the one-retry + escalate path works
-   and the checkpoint resume picks up from the correct step.
+2. On a two-device setup, verify the rsync stager path and the now-wired `_check_hot_space()` enforcement.
+3. Simulate a stager failure and verify `_poll_stager` retries after `clear-error`.
+4. Simulate a training crash and verify one-retry + escalate + checkpoint resume.
 
 **PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging**
 

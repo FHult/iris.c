@@ -438,6 +438,16 @@ To resolve an issue after intervention (removes it from status output):
 train/.venv/bin/python train/scripts/pipeline_ctl.py dispatch-resolve <issue_id>
 ```
 
+> **Important:** `dispatch-resolve` is a **UI-only operation** — it removes the issue from the status display but does NOT unblock the pipeline. You must also clear the underlying error sentinel so the orchestrator can retry:
+> ```bash
+> # After fixing the root cause:
+> pipeline_ctl.py clear-error --chunk N --step stage    # for staging failures
+> pipeline_ctl.py clear-error --chunk N --step archive  # for archive failures
+> # Then dispatch-resolve to clean up the status display:
+> pipeline_ctl.py dispatch-resolve <issue_id>
+> ```
+> If you run only `dispatch-resolve` without clearing the error sentinel, the orchestrator will re-dispatch a new alert ID on its next poll cycle.
+
 ### `orchestrator.jsonl`
 
 **Path**: `/Volumes/2TBSSD/logs/orchestrator.jsonl`
@@ -475,6 +485,16 @@ The orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of contin
 
 **Gap 4 — ~~SigLIP coverage not enforced at promotion~~ RESOLVED (2026-04-25)**
 `_promote_chunk()` now enforces ≥90% siglip coverage when `training.siglip: true` in the pipeline config. A partial siglip cache is rejected at promotion with a `promoted.error` sentinel.
+
+**Gap 5 — Orchestrator restart mid-archive is safe (idempotent)**
+If the orchestrator is restarted while iris-stage is archiving, `_poll_stager()` re-launches archive on the next poll because `mine.done` is set but `archive.done` is not. This is safe: `_atomic_copy()` skips files already present on cold (`if dst.exists(): return -1`), so duplicate archive runs produce no side effects. No operator action needed.
+
+**Gap 6 — Download stall watchdog may false-positive under training I/O contention**
+`_hf_download_file_guarded()` sends SIGTERM if a download shows no byte progress for 600 seconds. During active training, heavy random shard I/O can saturate the NVMe and briefly stall a large sequential HuggingFace download even with `taskpolicy -d throttle`. If you see a download failure with "no progress for 600s" during active training, retry manually:
+```bash
+pipeline_ctl.py retry N download
+```
+HuggingFace resumes from the partial `.incomplete` file. If the stall recurs, consider whether the I/O contention is severe enough to warrant pausing the download until training finishes.
 
 ---
 
