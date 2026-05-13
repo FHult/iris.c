@@ -8,39 +8,42 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 **TRAIN-5: Memory reduction + gradient checkpointing infrastructure** (Medium priority, prerequisite for TRAIN-6)
 
-**Background:** The original framing ("gradient checkpointing saves memory on frozen Flux blocks") is wrong. `mx.checkpoint` only affects backward passes, and Flux is frozen — there is no backward through it. The ~25.93 GB peak is dominated by model weights, optimizer state, and transient Flux forward allocations, not adapter activations. Checkpointing the small adapter graph saves only ~200–400 MB (~1.5% of peak). The real value of TRAIN-5 is (a) modest near-term savings via structural fixes, and (b) building the infrastructure that TRAIN-6 needs.
+**Background:** The original framing ("gradient checkpointing saves memory on frozen Flux blocks") is wrong. `mx.checkpoint` only affects backward passes, and Flux is frozen — there is no backward through it. The real value of TRAIN-5 is (a) modest near-term savings via structural fixes, and (b) building the infrastructure that TRAIN-6 needs.
 
-**Memory breakdown (32 GB system, 512px training):**
-- Flux 4B weights (frozen): ~8.0 GB
-- Adapter weights + EMA + AdamW state: ~4.2 GB
-- MLX cache pool (6% × 32 GB): ~2.0 GB
-- Metal/OS/framework: ~3.5 GB
-- Transient Flux forward allocations (single-block fused projections): ~2–5 GB peak window
-- ~5 GB unexplained — requires per-fence profiling to confirm source
+**Stage 0 — Per-fence profiling ✓ Done (2026-05-13):**
+Measured at step 108k, 512px, 4× stable intervals of 100 steps each:
+- fwd  (Flux forward + noisy/target): **16.97 GB** — below steady-state active; Flux streams blocks cleanly
+- bwd  (adapter backward + optimizer m/v state): **20.44 GB** — peak; +3.47 GB above steady state
+- param (adapter params from concrete m/v): **20.44 GB** — same as bwd; `mx.clear_cache()` between fences not releasing optimizer state before Fence 2
+- ema  (EMA update): **18.58 GB** — +1.61 GB above steady state
+- Steady-state active: 17.96 GB; system peak: **20.44 GB** (not the ~25.93 GB estimated earlier — 11.5 GB headroom on 32 GB)
 
-**Stage 0 — Per-fence profiling (1–2h, prerequisite):**
-Add `mx.get_peak_memory()` / `mx.reset_peak_memory()` instrumentation after each eval fence inside the training step (Fence 0: Flux forward, Fence 1: adapter backward + optimizer update, Fence 2: weight update). Gate behind `memory_profile: true` config flag. Run 500 steps to confirm where the actual peak occurs before writing any checkpointing code.
+**Revised memory breakdown (measured):**
+- Steady-state active: ~17.96 GB (Flux weights + adapter + optimizer state + MLX cache pool)
+- Flux forward transient: negligible (streams below steady state at 16.97 GB)
+- Optimizer m/v alloc during backward: +~2.5 GB (brings bwd to 20.44 GB)
+- EMA update: +~0.6 GB above steady state
 
-**Stage 1 — Structural fixes (~2–4h, ~1.2 GB saving):**
-- Delete `flux_state` before the adapter backward when `n_grad_steps_per_fwd=1` (current default). The Q tensors + h_final (~150–280 MB) are currently alive in Python during Fence 1 despite not being needed. For N>1 keep the existing behaviour.
-- Lower `cache_limit_pct` from `0.06` to `0.03` in `stage1_512px.yaml` (~1 GB saving, +1–3% slowdown from less buffer pooling). Gate behind `memory.cache_limit_pct` config key.
+**Stage 1 — Structural fixes (~2–4h, estimated ~1–2 GB saving):**
+- `flux_state` deletion before backward: fwd peak is only 16.97 GB so Q tensors are not the bottleneck; saving is smaller than estimated (~100–200 MB, not 280 MB). Still worth doing for clarity.
+- Lower `cache_limit_pct` from `0.06` to `0.03` in `stage1_512px.yaml`. MLX pool is ~2 GB (6% × 32 GB); halving it frees ~1 GB at cost of +1–3% slowdown. Gate behind `memory.cache_limit_pct` config key.
+- The `bwd`/`param` peak tie (both 20.44 GB) suggests the optimizer m/v tensors are not freed between Fence 1 and Fence 2. Investigate whether an explicit `del` of the old optimizer state ref between the two fences can reduce the Fence 2 peak.
 
 **Stage 2 — Adapter graph checkpointing (~2–4h, ~200–400 MB saving):**
 - Add `gradient_checkpointing: false` config flag to `training:` section.
-- When enabled, wrap `adapter.get_image_embeds` with `mx.checkpoint(...)` inside `loss_fn`. Recomputes PerceiverResampler during backward instead of storing intermediates. Overhead ~5–10ms/step (<0.2% at current 5–6s/step).
-- Combined with Stage 1: expected peak reduction ~1.4–1.7 GB → new peak ~24.2–24.5 GB.
+- When enabled, wrap `adapter.get_image_embeds` with `mx.checkpoint(...)` inside `loss_fn`. Recomputes PerceiverResampler during backward instead of storing intermediates.
+- With 11.5 GB headroom this is low urgency for current training, but still worthwhile before TRAIN-6.
 
 **Stage 3 — Block checkpoint infrastructure for TRAIN-6 (~4–8h, 3–5 GB saving when TRAIN-6 activates):**
 - Add `block_gradient_checkpointing: false` config flag.
 - When enabled, pre-build `ckpt_double` / `ckpt_single` lists by wrapping each Flux transformer block with `mx.checkpoint(block)`. Pass these into `_flux_forward_with_ip` (already has `ckpt_double`/`ckpt_single` parameters).
-- This does nothing in the current `_flux_forward_no_ip` path (no backward). It is the TRAIN-6 activation switch: when TRAIN-6 switches to `_flux_forward_with_ip`, enabling this flag keeps peak memory viable on 32 GB by recomputing one block at a time during backward (storing ~200–400 MB per block instead of ~3–5 GB for all 25 simultaneously).
+- This does nothing in the current `_flux_forward_no_ip` path (no backward). It is the TRAIN-6 activation switch: when TRAIN-6 switches to `_flux_forward_with_ip`, enabling this flag keeps peak memory viable on 32 GB by recomputing one block at a time during backward.
+- Current measured headroom (11.5 GB) is insufficient for TRAIN-6 without this: 25 Flux blocks × ~200–300 MB each = 5–7.5 GB additional, pushing to ~26–28 GB. Stage 3 brings it back to ~21–22 GB.
 - Disable by default, test in isolation with a short `_flux_forward_with_ip` smoke run.
 
 **Files to modify:** `train/train_ip_adapter.py`, `train/configs/stage1_512px.yaml`
 
-**Dependency:** Stage 3 is a hard prerequisite for TRAIN-6 on 32 GB. Stages 0–2 are independent improvements.
-
-**Current blocker:** Stage 0 profiling run (~1–2h) is the only thing needed to unblock Stages 1–3. This is not a large unknown — it is a short instrumentation task. All subsequent TRAIN-5/6/7 quality work gates on those numbers.
+**Dependency:** Stage 3 is a hard prerequisite for TRAIN-6 on 32 GB. Stages 1–2 are independent improvements with lower urgency given the measured 11.5 GB headroom.
 
 **TRAIN-6: Retrain IP-adapter with block-by-block injection** (Medium priority, next major release)
 - Current training uses `_flux_forward_no_ip` + end-sum approximation: all IP contributions are summed and added to `h_final` after all 25 blocks. Q vectors are collected from a clean (no-IP) Flux forward, so earlier blocks cannot adapt their computation to the style signal. This limits quality; CLIP-I ~0.53 vs ~0.7–0.85 for canonical IP-Adapter.
