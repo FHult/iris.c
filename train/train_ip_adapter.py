@@ -753,6 +753,31 @@ def train(config: dict) -> None:
     del _dummy_lat, _txt_warmup, _t_warmup
     print("Flux training graphs ready.")
 
+    if bool(tcfg.get("correct_forward_q", False)) and not bool(tcfg.get("use_block_injection", False)):
+        _txt_warmup_cq = mx.zeros(
+            (1, 64, flux.transformer.context_embedder.weight.shape[1]), dtype=mx.bfloat16)
+        _t_warmup_cq = mx.array([500], dtype=mx.int32)
+        _siglip_warmup_cq = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+        _ip_embs_wu = adapter.get_image_embeds(_siglip_warmup_cq)
+        _k_wu, _v_wu = adapter.get_kv_all(_ip_embs_wu)
+        mx.eval(_k_wu, _v_wu, adapter.scale)
+        print("Warming up correct-forward-Q graphs (all bucket shapes)...")
+        for _bH, _bW in BUCKETS:
+            _lat_H, _lat_W = _bH // 8, _bW // 8
+            _dummy_lat_cq = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
+            print(f"  [{_bH}x{_bW}] compiling...", flush=True)
+            _t0_wu = time.time()
+            _qs_wu = _flux_forward_with_ip_collect_q(
+                flux, _dummy_lat_cq, _txt_warmup_cq, _t_warmup_cq,
+                _k_wu, _v_wu, adapter.scale,
+            )
+            mx.eval(_qs_wu)
+            print(f"  [{_bH}x{_bW}] done ({time.time() - _t0_wu:.1f}s)", flush=True)
+            del _dummy_lat_cq, _qs_wu
+            mx.clear_cache()
+        del _txt_warmup_cq, _t_warmup_cq, _siglip_warmup_cq, _ip_embs_wu, _k_wu, _v_wu
+        print("Correct-forward-Q graphs ready.")
+
     ckpt_double = None
     ckpt_single = None
     # TRAIN-5 Stage 3: block gradient checkpointing infrastructure for TRAIN-6.
@@ -896,6 +921,11 @@ def train(config: dict) -> None:
     if _use_block_injection and _n_grad_steps > 1:
         print("  TRAIN-6: use_block_injection=true — n_grad_steps_per_fwd forced to 1")
         _n_grad_steps = 1
+    # Option C: correct-forward Q vectors (IP-injected forward for Q extraction,
+    # end-sum adapter-only backward). Ignored when use_block_injection=true.
+    _use_correct_forward_q = (
+        bool(tcfg.get("correct_forward_q", False)) and not _use_block_injection
+    )
     # Precomputed scalar MLX bools — avoids mx.array(bool) allocation every step.
     _MX_TRUE  = mx.array(True)
     _MX_FALSE = mx.array(False)
@@ -1372,6 +1402,17 @@ def train(config: dict) -> None:
             # Without this, MLX defers Flux computation into the gradient trace,
             # negating the entire split-forward optimization.
             mx.eval(flux_state["qs"], flux_state["h_final"], flux_state["temb"], target)
+            if _use_correct_forward_q and not null_image:
+                # Option C: replace Q vectors with IP-influenced versions.
+                # Skipped for null-image steps — IP is zeroed in the loss anyway,
+                # so IP-free Q is already correct for that case.
+                _ip_embs_cq = adapter.get_image_embeds(siglip_feats)
+                _k_cq, _v_cq = adapter.get_kv_all(_ip_embs_cq)
+                mx.eval(_k_cq, _v_cq, adapter.scale)
+                flux_state["qs"] = _flux_forward_with_ip_collect_q(
+                    flux, noisy, text_embeds, t_int, _k_cq, _v_cq, adapter.scale,
+                )
+                mx.eval(flux_state["qs"])
             if _mem_profile:
                 _mem_fwd_peak = max(_mem_fwd_peak, mx.get_peak_memory())
         _t_fwd += time.time() - _t0
@@ -2199,6 +2240,169 @@ def _flux_forward_no_ip(
         "seq_img": seq_img,
         "seq_txt": seq_txt,
     }
+
+
+def _flux_forward_with_ip_collect_q(
+    flux,
+    noisy_latents: mx.array,
+    text_embeds: mx.array,
+    t_int: mx.array,
+    k_ip_all: mx.array,
+    v_ip_all: mx.array,
+    ip_scale: mx.array,
+) -> list:
+    """
+    Flux forward WITH IP injection, returning only the corrected Q vectors.
+
+    Identical to _flux_forward_no_ip except that after each block the IP
+    contribution is injected into hidden_states, so each subsequent block
+    computes its Q from activations that already carry the IP influence from
+    earlier blocks.  This matches the inference-time Q distribution and
+    eliminates the train/inference mismatch present in _flux_forward_no_ip.
+
+    Called outside value_and_grad — k_ip_all / v_ip_all / ip_scale are
+    pre-computed from the current adapter params (no gradient needed here).
+    The returned Q vectors are stop_gradient'd and used to replace the
+    flux_state["qs"] produced by _flux_forward_no_ip before the backward pass.
+
+    Returns:
+        qs: list[num_blocks] of [B, H, seq_img, Hd]
+    """
+    tr = flux.transformer
+
+    B, C, Lh, Lw = noisy_latents.shape
+    pH, pW = Lh // 2, Lw // 2
+    h = noisy_latents.reshape(B, C, pH, 2, pW, 2)
+    h = h.transpose(0, 1, 3, 5, 2, 4)
+    h = h.reshape(B, C * 4, pH, pW)
+    hidden_states = h.reshape(B, 128, pH * pW).transpose(0, 2, 1)
+    seq_img = pH * pW
+
+    h_grid = mx.broadcast_to(mx.arange(pH, dtype=mx.int32)[:, None], (pH, pW)).reshape(-1)
+    w_grid = mx.broadcast_to(mx.arange(pW, dtype=mx.int32)[None, :], (pH, pW)).reshape(-1)
+    img_ids = mx.stack(
+        [mx.zeros(seq_img, dtype=mx.int32), h_grid, w_grid,
+         mx.zeros(seq_img, dtype=mx.int32)], axis=1,
+    )
+    seq_txt = text_embeds.shape[1]
+    txt_ids = mx.stack(
+        [mx.zeros(seq_txt, dtype=mx.int32), mx.zeros(seq_txt, dtype=mx.int32),
+         mx.zeros(seq_txt, dtype=mx.int32), mx.arange(seq_txt, dtype=mx.int32)],
+        axis=1,
+    )
+
+    if not isinstance(t_int, mx.array):
+        timestep = mx.array(t_int, dtype=hidden_states.dtype)
+    else:
+        timestep = t_int.astype(hidden_states.dtype)
+    if timestep.ndim == 0:
+        timestep = mx.full((B,), float(timestep.item()), dtype=hidden_states.dtype)
+    elif timestep.shape[0] == 1 and B > 1:
+        timestep = mx.broadcast_to(timestep, (B,))
+
+    temb = tr.time_guidance_embed(timestep, guidance=None)
+    temb = temb.astype(mx.bfloat16)
+
+    hidden_states = tr.x_embedder(hidden_states)
+    encoder_hidden_states = tr.context_embedder(text_embeds)
+
+    image_rotary_emb = tr.pos_embed(img_ids)
+    text_rotary_emb  = tr.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        mx.concatenate([text_rotary_emb[0], image_rotary_emb[0]], axis=0),
+        mx.concatenate([text_rotary_emb[1], image_rotary_emb[1]], axis=0),
+    )
+
+    temb_mod_params_img = tr.double_stream_modulation_img(temb)
+    temb_mod_params_txt = tr.double_stream_modulation_txt(temb)
+    (shift_msa_img, scale_msa_img, _), _ = temb_mod_params_img
+
+    qs: list[mx.array] = []
+
+    # Double-stream blocks: Q extracted from IP-influenced h_before, then IP injected
+    for i, block in enumerate(tr.transformer_blocks):
+        h_before = hidden_states  # includes IP contributions from blocks 0..i-1
+
+        encoder_hidden_states, hidden_states = block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb_mod_params_img=temb_mod_params_img,
+            temb_mod_params_txt=temb_mod_params_txt,
+            image_rotary_emb=concat_rotary_emb,
+        )
+
+        norm_h = block.norm1(h_before)
+        norm_h = (1 + scale_msa_img) * norm_h + shift_msa_img
+        q_ip = block.attn.to_q(norm_h)
+        bsz, s_img, d_inner = q_ip.shape
+        H  = block.attn.heads
+        Hd = block.attn.dim_head
+        q_ip = q_ip.reshape(bsz, s_img, H, Hd)
+        q_ip = block.attn.norm_q(q_ip.astype(mx.float32)).astype(mx.bfloat16)
+        q_ip_sg = mx.stop_gradient(q_ip.transpose(0, 2, 1, 3))  # [B, H, seq_img, Hd]
+        qs.append(q_ip_sg)
+
+        # Inject IP so next block's h_before carries this block's contribution
+        k_i = k_ip_all[:, i, :, :].reshape(bsz, -1, H, Hd).transpose(0, 2, 1, 3)
+        v_i = v_ip_all[:, i, :, :].reshape(bsz, -1, H, Hd).transpose(0, 2, 1, 3)
+        ip_out = mx.fast.scaled_dot_product_attention(q_ip_sg, k_i, v_i, scale=Hd ** -0.5)
+        ip_out = ip_out.transpose(0, 2, 1, 3).reshape(bsz, s_img, d_inner)
+        hidden_states = hidden_states + ip_scale[i] * ip_out
+
+    hidden_states = mx.concatenate([encoder_hidden_states, hidden_states], axis=1)
+
+    temb_mod_params_single = tr.single_stream_modulation(temb)[0]
+    mod_shift_s, mod_scale_s, mod_gate_s = temb_mod_params_single
+
+    n_double = len(tr.transformer_blocks)
+
+    # Single-stream blocks (inlined GEMM sharing, same as _flux_forward_no_ip)
+    for j, block in enumerate(tr.single_transformer_blocks):
+        bsz, seq_full, _ = hidden_states.shape
+        H_s  = block.attn.heads
+        Hd_s = block.attn.dim_head
+        block_ip_idx = n_double + j
+
+        norm_h = block.norm(hidden_states)
+        norm_h = (1 + mod_scale_s) * norm_h + mod_shift_s
+
+        proj = block.attn.to_qkv_mlp_proj(norm_h)
+        qkv, mlp_hidden = mx.split(proj, [block.attn.inner_dim * 3], axis=-1)
+        q, k, v = mx.split(qkv, 3, axis=-1)
+
+        q = q.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        k = k.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        v = v.reshape(bsz, seq_full, H_s, Hd_s).transpose(0, 2, 1, 3)
+        q = block.attn.norm_q(q.astype(mx.float32)).astype(mx.bfloat16)
+        k = block.attn.norm_k(k.astype(mx.float32)).astype(mx.bfloat16)
+
+        q_ip_sg = mx.stop_gradient(q[:, :, seq_txt:, :])  # [B, H, seq_img, Hd]
+        qs.append(q_ip_sg)
+
+        if concat_rotary_emb is not None:
+            cos, sin = concat_rotary_emb
+            q, k = _FluxAttentionUtils.apply_rope_bshd(q, k, cos, sin)
+
+        attn_out = _FluxAttentionUtils.compute_attention(
+            query=q, key=k, value=v,
+            batch_size=bsz, num_heads=H_s, head_dim=Hd_s,
+        )
+        mlp_hidden = block.attn.mlp_act(mlp_hidden)
+        attn_out = mx.concatenate([attn_out, mlp_hidden], axis=-1)
+        attn_out = block.attn.to_out(attn_out)
+        hidden_states = hidden_states + mod_gate_s * attn_out
+
+        # Inject IP into image portion so next block sees IP-influenced state
+        k_i = k_ip_all[:, block_ip_idx, :, :].reshape(bsz, -1, H_s, Hd_s).transpose(0, 2, 1, 3)
+        v_i = v_ip_all[:, block_ip_idx, :, :].reshape(bsz, -1, H_s, Hd_s).transpose(0, 2, 1, 3)
+        ip_out_s = mx.fast.scaled_dot_product_attention(q_ip_sg, k_i, v_i, scale=Hd_s ** -0.5)
+        ip_out_s = ip_out_s.transpose(0, 2, 1, 3).reshape(bsz, seq_img, H_s * Hd_s)
+        hidden_states = mx.concatenate([
+            hidden_states[:, :seq_txt, :],
+            hidden_states[:, seq_txt:, :] + ip_scale[block_ip_idx] * ip_out_s,
+        ], axis=1)
+
+    return qs
 
 
 def _flux_forward_with_ip(

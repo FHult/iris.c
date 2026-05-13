@@ -6,9 +6,9 @@
 
 ## What to Visualise
 
-An end-to-end machine learning training pipeline that runs on a single Apple M1 Max Mac with a 2 TB external NVMe SSD. The goal is to train an IP-Adapter that gives a Flux image-generation model the ability to match the visual style of a reference photo.
+An end-to-end machine learning training pipeline that runs on a single Apple M1 Max Mac with 32 GB unified memory and a 2 TB external NVMe SSD. The goal is to train an IP-Adapter that gives a Flux image-generation model the ability to match the visual style of a reference photo.
 
-The pipeline trains in **4 sequential chunks**, each adding a new batch of JourneyDB images. Chunk 1 builds the full infrastructure and base model. Chunks 2–4 fine-tune with progressively lower learning rates as more data is added.
+The pipeline trains in **4 sequential chunks**, each adding a new batch of JourneyDB images. Chunk 1 builds the full infrastructure and base model. Chunks 2–4 fine-tune with progressively lower learning rates as more data is added. An orchestrator process manages all pipeline steps via tmux windows, with health monitoring (`pipeline_doctor.py`) and live status (`pipeline_status.py`).
 
 ---
 
@@ -31,7 +31,7 @@ Each JourneyDB chunk is downloaded (~800 GB), converted to WebDataset (~42 GB WD
 
 ## Pipeline Topology
 
-### Phase 1 — Chunk 1: Build Base Dataset (~2–3 days)
+### Phase 1 — Chunk 1: Build Base Dataset (~3–4 days)
 
 ```
 INPUTS (pre-existing on disk)          AUTO-DOWNLOADED (chunk 1 only)
@@ -59,17 +59,24 @@ INPUTS (pre-existing on disk)          AUTO-DOWNLOADED (chunk 1 only)
                     Expected keep rate: ~95%  (~2M usable images)
                            |
                            ↓
-                    [7] Anchor Set              [8] Precompute Qwen3 + VAE
-                    10K images · 5 min          Single unified pass · ~14 h
+                    [7] Anchor Set              [8] Precompute Qwen3 + VAE + SigLIP
+                    10K images · 5 min          Single unified pass · ~16 h
                     LAION + WikiArt only         ├─ Qwen3 text embeddings
                     (no JourneyDB style bias)    │   4-bit quantised · ~143 GB
-                                                 └─ VAE image latents
-                                                     int8 quantised · ~198 GB
+                                                 ├─ VAE image latents
+                                                 │   int8 quantised · ~198 GB
+                                                 └─ SigLIP style embeddings
+                                                     4-bit quantised · ~8 GB
                            |
                            ↓
                     [9] CHUNK 1 TRAINING
-                    105,000 steps · LR = 1e-4 · ~44 h
-                    → checkpoints/step_105000.safetensors
+                    200,000 steps · LR = 1e-4 · ~84 h
+                    Block-by-block IP injection (TRAIN-6)
+                    → checkpoints/step_200000.safetensors
+
+                    After chunk 1: Hard Examples Mining
+                    Score all shards → mine top-N hard examples
+                    Reused in chunks 2–4 (5% of batches)
 ```
 
 ### Phase 2 — Chunks 2–4: Incremental Fine-tuning (per chunk, ~2 days each)
@@ -81,21 +88,21 @@ Each chunk follows the same pattern: download → convert → build new shards �
   │  Download JDB 050–099 (~800 GB)                                        │
   │  → Convert to WDS (~210 shards · ~1.05M images) → delete raw 800 GB   │
   │  → Build + filter chunk 2 shards                                       │
-  │  → Precompute Qwen3 + VAE for new shards (+~149 GB)                    │
+  │  → Precompute Qwen3 + VAE + SigLIP for new shards (+~157 GB)           │
   │  → Train 40,000 steps · LR = 3e-5 · ~17 h                             │
-  │  → checkpoints/step_145000.safetensors                                 │
+  │  → checkpoints/step_240000.safetensors                                 │
   └────────────────────────────────────────────────────────────────────────┘
          ↓
   ┌─ CHUNK 3 ──────────────────────────────────────────────────────────────┐
   │  Download JDB 100–149 (~800 GB) → Convert → Build + filter + precompute│
   │  → Train 40,000 steps · LR = 1e-5 · ~17 h                             │
-  │  → checkpoints/step_185000.safetensors                                 │
+  │  → checkpoints/step_280000.safetensors                                 │
   └────────────────────────────────────────────────────────────────────────┘
          ↓
   ┌─ CHUNK 4 ──────────────────────────────────────────────────────────────┐
   │  Download JDB 150–201 (~832 GB) → Convert → Build + filter + precompute│
   │  → Train 40,000 steps · LR = 1e-5 · ~17 h                             │
-  │  → checkpoints/step_225000.safetensors  ← FINAL MODEL                 │
+  │  → checkpoints/step_320000.safetensors  ← FINAL MODEL                 │
   └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -117,7 +124,47 @@ After chunk 4:  ~5.2M images  (+1.09M JDB 150–201)
               ╲ ╲
   1e-5 ────────╲──╲──────────────────────────
          Ch.1  Ch.2  Ch.3  Ch.4
-        105K   40K   40K   40K  steps
+        200K   40K   40K   40K  steps
+```
+
+---
+
+## Orchestrator — Managed Execution
+
+All pipeline steps run inside tmux windows, supervised by `orchestrator.py` (started via `./train/start_pipeline.sh`). The orchestrator:
+
+- Dispatches each step when prerequisites are complete (sentinel files)
+- Monitors step progress via heartbeat files (written every ~60s)
+- Retries failed steps once before escalating to `dispatch_queue.jsonl`
+- Enforces GPU token exclusivity (only one step holds the GPU at a time)
+- Promotes a chunk to training only when SigLIP coverage ≥ 90%
+
+**Observability commands**:
+```
+pipeline_doctor.py --ai    ← single JSON blob: status, top action, issues
+pipeline_status.py         ← live progress bar per step
+```
+
+---
+
+## Quality Improvement Loop (Flywheel)
+
+After chunk 1 training reaches sufficient steps, an automated **quality flywheel** runs in parallel with ongoing training:
+
+```
+  Ablation harness (QUALITY-10)
+  ├─ Runs 4 short training trials (25K, 30K, 35K, 40K steps each)
+  ├─ Evaluates CLIP-I, cond_gap, self/cross-ref gap per trial
+  └─ Feeds scores into shard_selector.py
+
+  Shard selector
+  ├─ Scores all precomputed shards by cond_gap contribution
+  ├─ Applies recency penalty + diversity slots
+  └─ Biases next chunk toward high-signal style shards
+
+  Hard examples set
+  ├─ Mined after chunk 1: shards where style loss is consistently high
+  └─ Mixed at 5% of batches in chunks 2–4 to reinforce hard cases
 ```
 
 ---
@@ -132,7 +179,8 @@ After chunk 4:  ~5.2M images  (+1.09M JDB 150–201)
 | Filter shards | 100% (6 cores) | 0% | Medium | CPU (JPEG header) |
 | Precompute Qwen3 | 30% | 60–80% | Low | GPU (text encode) |
 | Precompute VAE | 20% | 80–95% | Medium | GPU (image encode) |
-| Training | 15% | 95–100% | Low | GPU (transformer forward) |
+| Precompute SigLIP | 20% | 80–95% | Medium | GPU (style encode) |
+| Training | 15% | 95–100% | Low | GPU (transformer forward + IP backward) |
 
 ---
 
@@ -146,13 +194,14 @@ WDS sources:        ~490 GB (LAION+COYO+WA+JDB)  ~42 GB (JDB only)
 Unified shards:     ~100 GB  (~430 tars)          ~42 GB  (~210 tars added)
 Precomputed qwen3:  ~143 GB  (chunk 1 shards)     +~48 GB  per chunk
 Precomputed vae:    ~198 GB  (chunk 1 shards)     +~66 GB  per chunk
+Precomputed siglip:   ~8 GB  (chunk 1 shards)     +~3 GB   per chunk
 ─────────────────────────────────────────────────────────────────────
 Model weights:        16 GB  (Flux Klein 4B + Qwen3 4B, constant)
 Checkpoints:         ~20 GB  (periodic saves, all chunks)
 
-Peak disk (chunk 1): ~750 GB  (raw JDB + WDS + shards + precomputed)
-Peak disk (ch. 2–4): ~850 GB  (800 GB raw JDB + existing precomputed)
-Final state (done):  ~600 GB  (shards + all precomputed + checkpoints)
+Peak disk (chunk 1): ~760 GB  (raw JDB + WDS + shards + precomputed)
+Peak disk (ch. 2–4): ~860 GB  (800 GB raw JDB + existing precomputed)
+Final state (done):  ~610 GB  (shards + all precomputed + checkpoints)
 ```
 
 ---
@@ -163,12 +212,14 @@ Final state (done):  ~600 GB  (shards + all precomputed + checkpoints)
 |--------|-------|
 | Total unique images | ~5.3M |
 | Total JourneyDB images | ~4.24M (all 4 chunks) |
-| Total training steps | 225,000 |
-| Total GPU training time | ~95 h (~4 days) |
-| Total wall-clock (incl. data prep) | ~3 weeks |
+| Total training steps | ~320,000 (200K chunk 1 + 40K × 3) |
+| Total GPU training time | ~135 h (~5.6 days) |
+| Total wall-clock (incl. data prep) | ~3–4 weeks |
 | Adapter parameters | 522M (BF16, ~1.0 GB) |
-| Hardware | Single M1 Max, 64 GB unified memory |
+| Hardware | Single M1 Max, 32 GB unified memory |
 | Framework | MLX (Apple Silicon Metal — no CUDA) |
+| IP injection | Block-by-block (all 25 Flux blocks, TRAIN-6) |
+| Memory peak (training) | ~28–32 GB with gradient checkpointing |
 
 ---
 
@@ -180,7 +231,7 @@ Final state (done):  ~600 GB  (shards + all precomputed + checkpoints)
 
 2. **Concurrent background filter** — `filter_shards.py` runs in a polling loop while `build_shards.py` writes, validating shards as they arrive rather than in a separate sequential pass.
 
-3. **Unified precompute pass** — `precompute_all.py` reads each shard once and writes both Qwen3 embeddings and VAE latents, halving I/O vs sequential scripts.
+3. **Unified precompute pass** — `precompute_all.py` reads each shard once and writes Qwen3 embeddings, VAE latents, and SigLIP style embeddings together, minimising I/O vs sequential scripts.
 
 4. **Pool initialiser pattern** — ML models (Qwen3, VAE, SigLIP) are loaded once per worker process at startup, not reloaded per shard. Saves 310× model reload overhead over the full precompute run.
 
@@ -196,13 +247,20 @@ Final state (done):  ~600 GB  (shards + all precomputed + checkpoints)
 
 10. **Chunked training with anchor set** — A fixed 10K-image anchor set (LAION + WikiArt only, no JourneyDB) is mixed in at each chunk to prevent catastrophic forgetting as JourneyDB data is added incrementally.
 
+11. **Block-by-block IP injection (TRAIN-6)** — The adapter's K/V projections are injected at every one of 25 Flux transformer blocks (5 double-stream + 20 single-stream). The full Flux forward pass runs inside `nn.value_and_grad`, so every block's Q vectors see IP-conditioned hidden states — exactly matching inference. Block gradient checkpointing (`mx.checkpoint` per Flux block) frees per-block activations during forward and recomputes them during backward, keeping memory within the 32 GB budget.
+
+12. **Style-signal training objectives** — Three complementary objectives reinforce style learning without collapsing to content copying:
+    - **Cross-reference permutation** (50% of steps): swaps SigLIP style features across batch items so the model cannot cheat by copying the reference image verbatim. Tracked via `loss_self_ref` vs `loss_cross_ref`.
+    - **Patch shuffle** (50% of steps): randomises the 729-token SigLIP sequence, destroying spatial layout while preserving per-patch texture statistics. Forces the adapter to extract global style rather than local position.
+    - **Gram matrix style loss** (every step, weight 0.05): penalises mismatch between predicted and reference clean-latent channel correlations, providing a direct texture supervision signal.
+
 ---
 
 ## Suggested Infographic Layout
 
 **Format**: Two-section vertical layout
 
-### Section 1 — Chunk 1: Full Data Pipeline (top ~60% of poster)
+### Section 1 — Chunk 1: Full Data Pipeline (top ~55% of poster)
 
 Three swim lanes:
 
@@ -217,17 +275,19 @@ Three swim lanes:
 2. Build Unified Shards (6 workers, 3 GB/s I/O, ~430 shards)
 3. Filter Shards (background loop, CPU-parallel)
 4. Anchor Set (10K images, LAION+WikiArt only)
-5. Precompute: Qwen3 + VAE (14h, single unified pass)
-6. Chunk 1 Training (105K steps, LR=1e-4, ~44h)
+5. Precompute: Qwen3 + VAE + SigLIP (16h, single unified pass)
+6. Chunk 1 Training (200K steps, LR=1e-4, ~84h)
+7. Hard Examples Mining (post-training, feeds chunks 2–4)
 
 **Right lane — Outputs**:
 - `duplicate_ids.txt` (124K IDs)
 - `shards/` ~430 tars, ~2M images
 - `precomputed/qwen3/` 143 GB
 - `precomputed/vae/` 198 GB
-- `step_105000.safetensors`
+- `precomputed/siglip/` 8 GB
+- `step_200000.safetensors`
 
-### Section 2 — Chunks 2–4: Incremental Fine-tuning (bottom ~40%)
+### Section 2 — Chunks 2–4: Incremental Fine-tuning (bottom ~35%)
 
 Horizontal timeline showing 3 repeating blocks (chunks 2, 3, 4), each with:
 - Download bar (~800 GB, network-bound)
@@ -238,6 +298,14 @@ Horizontal timeline showing 3 repeating blocks (chunks 2, 3, 4), each with:
 Show the cumulative dataset size growing under each chunk:
 2.0M → 3.1M → 4.1M → 5.2M images
 
+### Quality Flywheel callout (right margin, spans all sections)
+
+Small vertical panel showing the feedback loop:
+- Ablation harness → CLIP-I / cond_gap scores
+- Shard selector (performance-attributed)
+- Hard examples pool
+- Arrow feeding back into training
+
 ### Bottom band — Hardware utilisation bar
 Colour-coded horizontal strip across the full width showing bottleneck type per step:
 - Blue = I/O-bound (build shards, download)
@@ -247,7 +315,8 @@ Colour-coded horizontal strip across the full width showing bottleneck type per 
 ### Key numbers to call out prominently (large text)
 - **5.3M** total training images
 - **4 JourneyDB chunks** (~1M images each)
-- **225,000** total training steps
-- **~3 weeks** total wall-clock
+- **~320,000** total training steps
+- **~4 weeks** total wall-clock
 - **522M** adapter parameters
+- **25 Flux blocks** — IP injected at every layer
 - **1 Mac** — no cloud, no CUDA

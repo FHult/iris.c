@@ -40,8 +40,47 @@ Measured at step 108k, 512px, 4× stable intervals of 100 steps each:
 - Implemented `loss_fn_with_ip` / `compiled_step_with_ip` calling `_flux_forward_with_ip` inside `nn.value_and_grad`. Eliminates the train/inference mismatch of the end-sum approximation.
 - Gated by `training.use_block_injection: true` in `stage1_512px.yaml` (enabled). Original split-forward path preserved under `false`.
 - `n_grad_steps_per_fwd` forced to 1 when enabled (Q vectors not reusable across steps).
-- Memory estimate: ~22–23 GB peak; `block_gradient_checkpointing: true` available as fallback.
-- **Next**: run 100-step smoke test to verify no NaN, peak memory in range, loss_cond falls. Monitor cond_gap for improvement toward 0.7–0.85 CLIP-I range.
+- `block_gradient_checkpointing: true` required on 32 GB (measured peak 45 GB without it; 21.54 GB with it).
+
+**TRAIN-6 smoke + profiling results (2026-05-13):**
+
+Memory (with `block_gradient_checkpointing: true`, 100-step smoke from step 108500):
+- `bwd+param` peak: **21.54 GB** — 10 GB headroom on 32 GB. Clean run, no NaN.
+- `fwd` peak: 0 GB (grad-free fence not used in block injection path).
+
+Step timing profiled via `/tmp/profile_train6.py` (512×512, synthetic batch, 5 reps):
+
+| Component | Time | % of step |
+|-----------|------|-----------|
+| Flux forward (no IP, old path) | 1.035s | — |
+| Old adapter backward (end-sum) | 0.372s | — |
+| **Old full step** | **1.78s** | baseline |
+| Flux forward (with IP) | 2.033s | 24% |
+| Backward (checkpoint recompute + Jacobians) | 5.973s | 71% |
+| Optimizer (AdamW) | 0.376s | 5% |
+| **TRAIN-6 full step (clean profiler)** | **8.38s** | **4.7× slower** |
+| Smoke measured (with style loss + EMA + overhead) | 14.2s | — |
+
+Root cause of 5.97s backward: Jacobian-vector products propagated backward through all 25 frozen Flux blocks (5 double + 20 single). With `mx.checkpoint`, each block is recomputed once during backward (+~2s recompute), then its Jacobian is applied (+~4s). Increasing to K blocks adds K/25 × 5.97s to the backward.
+
+**Speed at production scale:**
+- 200K steps (chunk 1) at profiler rate: **~466h ≈ 19.4 days**
+- 200K steps at smoke rate (14.2s/step): **~789h ≈ 32.9 days**
+- Old path (use_block_injection=false) at profiler rate: **~99h ≈ 4.1 days**
+
+**Key constraint**: the 5.97s backward is irreducible given the current architecture. Any approach that breaks the hidden_states chain (stop_gradient between blocks) reduces gradient to zero for all but the last block, because Q is already stop_gradient'd — the only path from loss to k_ip[i] is through the Flux block Jacobians.
+
+**TRAIN-6 gradient strategy comparison** ✓ Done (2026-05-13):
+- 500-step warmstart comparison from step 108500. Metric: cond_gap (loss_null − loss_cond) per 10-step window.
+
+| Path | n | mean_gap | positive% | first-half | last-half |
+|------|---|----------|-----------|------------|-----------|
+| Old (end-sum, `use_block_injection=false`) | 49 | **+0.334** | **82%** | +0.266 | +0.401 |
+| Full TRAIN-6 (`use_block_injection=true`) | 50 | +0.076 | 56% | +0.008 | +0.145 |
+
+- Old path: 4.4× higher mean cond_gap and 4.7× faster per step ≈ **~20× better wall-clock efficiency** at this warmstart.
+- Interpretation: the adapter was trained 108K steps under the old gradient path. Switching to block-injection creates a temporary distribution shift — gradients arriving from a different direction than all prior optimization. The 56% positive rate (barely above chance) and near-zero first-half mean (+0.008) are consistent with the adapter adjusting to the new gradient signal, not with a fundamentally weaker learning signal. A definitive comparison would require training from scratch (or a much longer continued run).
+- **Decision: continue production training with old path** (`use_block_injection=false`). TRAIN-6 block injection remains implemented and gated; re-evaluate if training is ever restarted from scratch, or after 50K+ more steps on the old path provide a stronger warmstart for the transition.
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
@@ -49,7 +88,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 1. **Larger resolution + more training steps** — the v1 run was a `--small` configuration. Higher resolution (1024px) exposes finer style features to the SigLIP encoder; more steps allow the PerceiverResampler and K/V projections to build a richer style space. Expected CLIP-I gain: +0.05–0.10. **Note (32 GB):** 1024px training on 4B Flux currently peaks at ~26 GB at 512px; 1024px roughly doubles the sequence length (256→1024 image tokens), which increases attention memory. Feasibility needs a short profiling run before committing to a full 1024px flywheel.
 
-2. **Block-by-block injection (TRAIN-6)** — the highest-leverage architectural fix. Currently all style influence arrives at `h_final` after the transformer has committed to its content structure; earlier blocks that govern texture and composition never see the style signal. Moving to block-by-block injection lets every layer adapt to the style. Expected CLIP-I gain: +0.15–0.30, bringing scores into the 0.7–0.85 range typical of production IP-Adapters. Memory: expected peak ~22–23 GB (9–10 GB headroom); `block_gradient_checkpointing` available as fallback if needed (TRAIN-5 Stage 3 done).
+2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see TRAIN-6 profiling results above. Measured cost: 4.7× slower than old path (8.38s vs 1.78s/step clean; 19 vs 4 days for 200K steps). Memory: 21.54 GB bwd peak with `block_gradient_checkpointing: true`. Quality comparison vs old path in progress; decision pending results.
 
 3. **Source data curation (PIPELINE-27)** ⛔ blocked on storage — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool) + a large-capacity storage volume (~37 TB for full JDB pool). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
 
