@@ -155,6 +155,45 @@ def _stager_heartbeat(chunk: int) -> dict:
     return {**hb, "age_secs": age, "stale": age is not None and age > 900}
 
 
+def _scan_direct_run_heartbeats() -> list[dict]:
+    """Return heartbeat dicts for named direct runs (trainer_{name}.json).
+
+    Excludes pipeline chunk heartbeats (trainer_chunk*.json) and the bare
+    trainer.json used by old standalone runs.  Only returns entries whose
+    heartbeat is ≤1800 s old so stale files from prior sessions don't clutter
+    the display indefinitely.
+    """
+    hb_dir = DATA_ROOT / ".heartbeat"
+    if not hb_dir.exists():
+        return []
+    results = []
+    for p in sorted(hb_dir.glob("trainer_*.json")):
+        name = p.stem  # e.g. "trainer_smoke"
+        if name.startswith("trainer_chunk"):
+            continue
+        run_name = name[len("trainer_"):]
+        try:
+            hb = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        raw = hb.get("ts") or hb.get("timestamp")
+        age: Optional[float] = None
+        if raw:
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromisoformat(raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - ts).total_seconds()
+            except ValueError:
+                pass
+        if age is not None and age > 1800:
+            continue  # suppress stale files from prior sessions
+        results.append({**hb, "run_name": run_name, "age_secs": age,
+                        "stale": age is not None and age > 300})
+    return results
+
+
 def _read_dispatch_issues(resolved: bool = False) -> list:
     """Read open (or all) issues from dispatch_queue.jsonl.
 
@@ -323,6 +362,7 @@ def build_status_dict(total_chunks: int = 4) -> dict:
         "orchestrator_hb": orch_hb,
         "orchestrator_age_secs": orch_age,
         "dispatch_issues": _read_dispatch_issues(),
+        "direct_runs": _scan_direct_run_heartbeats(),
     }
 
 
@@ -568,6 +608,26 @@ def print_human(status: dict, verbose: bool = False) -> None:
                     print(f"      {line}")
 
 
+    # Direct runs (smoke/dev — trainer_{name}.json heartbeats)
+    direct_runs = status.get("direct_runs", [])
+    if direct_runs:
+        print()
+        for dr in direct_runs:
+            rn      = dr.get("run_name", "?")
+            step_n  = dr.get("step", "?")
+            total_s = dr.get("total_steps", "?")
+            loss    = dr.get("loss")
+            age     = dr.get("age_secs")
+            stale   = dr.get("stale", False)
+            eta     = dr.get("eta_sec")
+            status_s = dr.get("status", "")
+            loss_str  = f"  loss={loss:.4f}" if loss is not None else ""
+            eta_str   = f"  ETA {_age_str(eta)}" if eta else ""
+            age_str   = f"  hb {_age_str(age)} ago" if age is not None else ""
+            stale_str = " ⚠️ STALE" if stale else ""
+            loading   = "  (loading)" if status_s == "loading" else ""
+            print(f"  Direct [{rn}]: step {step_n}/{total_s}{loading}{loss_str}{eta_str}{age_str}{stale_str}")
+
     # Open dispatch issues (from dispatch_queue.jsonl — the authoritative escalation log)
     open_issues = status.get("dispatch_issues", [])
     if open_issues:
@@ -733,6 +793,14 @@ def _ai_summary(status: dict) -> dict:
             out["bottleneck_stage"] = profile.get("bottleneck_stage")
         except Exception:
             pass
+    direct_runs = status.get("direct_runs", [])
+    if direct_runs:
+        out["direct_runs"] = [
+            {"run_name": dr["run_name"], "step": dr.get("step"),
+             "loss": dr.get("loss"), "age_secs": dr.get("age_secs"),
+             "stale": dr.get("stale")}
+            for dr in direct_runs
+        ]
     return out
 
 

@@ -165,7 +165,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
-**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** (Low priority)
+**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** ✅ done (2026-05-14)
 
 Smoke and dev runs launch `train_ip_adapter.py` directly — no pipeline sentinels, no heartbeat files, no orchestrator involvement. `pipeline_doctor` and `pipeline_status` are completely blind to them. To check progress you must `tail -f /tmp/dev_run.log` or attach to the tmux window manually.
 

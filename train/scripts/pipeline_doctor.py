@@ -706,6 +706,31 @@ def _check_process_liveness(chunks: list[int]) -> None:
              detail=str(GPU_LOCK_FILE),
              fix=f"rm {GPU_LOCK_FILE}")
 
+    # ── direct run (smoke/dev) heartbeat stale while iris-train window alive ──
+    hb_dir = DATA_ROOT / ".heartbeat"
+    train_win_alive = sess and tmux_window_exists(TMUX_TRAIN_WIN)
+    if hb_dir.exists():
+        for p in hb_dir.glob("trainer_*.json"):
+            if p.stem.startswith("trainer_chunk"):
+                continue
+            run_name = p.stem[len("trainer_"):]
+            try:
+                hb = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            age = heartbeat_age_secs(p.stem, None)
+            if age is None or age <= HEARTBEAT_STALE_SECS:
+                continue  # fresh or unreadable — no issue
+            if age > 1800:
+                continue  # suppress old files from prior sessions
+            if train_win_alive:
+                _add("WARNING", "liveness",
+                     f"Direct run '{run_name}' heartbeat stale ({_fmt_age(age)}) but iris-train window alive (hung?)",
+                     detail=(f"trainer_{run_name}.json last updated {_fmt_age(age)} ago. "
+                             f"stale threshold: {HEARTBEAT_STALE_SECS}s. "
+                             f"Attach with: tmux attach -t {TMUX_SESSION}"),
+                     ctx={"run_name": run_name, "hb_age_s": round(age)})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6a. Stager health checks

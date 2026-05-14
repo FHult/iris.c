@@ -609,13 +609,15 @@ def train(config: dict) -> None:
     # Write loading heartbeats every 60s while models initialise.
     # Without this, the orchestrator's 900s stale threshold kills the process
     # before model loading + graph compilation finish (~10-12 min total).
-    _boot_chunk   = config.get("_chunk")
-    _boot_hb_stop = __import__("threading").Event()
+    _boot_chunk      = config.get("_chunk")
+    _boot_run_name   = config.get("_run_name") if _boot_chunk is None else None
+    _boot_hb_process = f"trainer_{_boot_run_name}" if _boot_run_name else "trainer"
+    _boot_hb_stop    = __import__("threading").Event()
     def _boot_hb_thread():
         import time as _t
         from pipeline_lib import write_heartbeat as _wh
         while not _boot_hb_stop.wait(60):
-            _wh("trainer", _boot_chunk, status="loading", step=0)
+            _wh(_boot_hb_process, _boot_chunk, status="loading", step=0)
     __import__("threading").Thread(target=_boot_hb_thread, daemon=True).start()
 
     print("Loading Flux Klein 4B (frozen) ...")
@@ -1140,7 +1142,12 @@ def train(config: dict) -> None:
     log_interval = ocfg["log_every"]
     loss_history: list[float] = []  # rolling window for smoothed loss
     loss_smooth = 0.0
-    _pipeline_chunk = config.get("_chunk")  # set by --chunk arg; None when run standalone
+    _pipeline_chunk    = config.get("_chunk")    # set by --chunk arg; None when run standalone
+    _pipeline_run_name = config.get("_run_name") if _pipeline_chunk is None else None
+    # Heartbeat process key: 'trainer_{name}' for direct runs, 'trainer' for pipeline runs.
+    # Direct-run heartbeats land in .heartbeat/trainer_{name}.json — visible to
+    # pipeline_status.py and pipeline_doctor.py without polluting chunk-scoped files.
+    _hb_process = f"trainer_{_pipeline_run_name}" if _pipeline_run_name else "trainer"
 
     # Per-phase timing accumulators (TP-005). Printed at each log interval.
     # fwd = Flux forward + mx.eval(flux_state) (no grad, the heavy part)
@@ -1773,7 +1780,7 @@ def train(config: dict) -> None:
                 try:
                     if _write_hb is not None:
                         _write_hb(
-                            "trainer", _pipeline_chunk,
+                            _hb_process, _pipeline_chunk,
                             step=step,
                             total_steps=_end_step,
                             loss=round(loss_scalar, 6),
@@ -1830,7 +1837,7 @@ def train(config: dict) -> None:
                     try:
                         if _write_hb is not None:
                             _write_hb(
-                                "trainer", _pipeline_chunk,
+                                _hb_process, _pipeline_chunk,
                                 step=step,
                                 total_steps=_end_step,
                                 loss=round(_hb_loss, 6),
@@ -1858,7 +1865,7 @@ def train(config: dict) -> None:
                 # the orchestrator doesn't see a stale heartbeat and restart us.
                 try:
                     if _write_hb is not None:
-                        _write_hb("trainer", _pipeline_chunk, step=step,
+                        _write_hb(_hb_process, _pipeline_chunk, step=step,
                                   total_steps=_end_step,
                                   loss=round(_hb_loss, 6),
                                   steps_per_sec=round(_hb_sps, 4),
@@ -2642,6 +2649,11 @@ def main():
                         help="Pipeline chunk number (1-4). Used to write the trainer "
                              "heartbeat to the correct pipeline location so the orchestrator "
                              "can monitor liveness and anomalies.")
+    parser.add_argument("--run-name", default=None,
+                        help="Name for this direct run (e.g. 'smoke', 'dev'). Writes a named "
+                             "heartbeat (trainer_{name}.json) visible to pipeline_status.py "
+                             "and pipeline_doctor.py. Defaults to the config filename stem "
+                             "when running without --chunk.")
     parser.add_argument("--chunk-base-step", type=int, default=None,
                         help="Absolute global step at which this chunk's training begins "
                              "(sum of all previous chunks' steps). Used to compute the "
@@ -2725,6 +2737,15 @@ def main():
         config["_chunk"] = args.chunk
     if args.chunk_base_step is not None:
         config["_chunk_base_step"] = args.chunk_base_step
+
+    # Resolve run_name for direct (non-pipeline) runs.
+    # Priority: --run-name flag > config run_name key > config filename stem.
+    # Ignored when --chunk is set (pipeline runs use chunk-scoped heartbeats).
+    if config.get("_chunk") is None:
+        run_name = (args.run_name
+                    or config.get("run_name")
+                    or Path(args.config).stem)
+        config["_run_name"] = run_name
 
     # Store config directory so train() can locate sibling files (e.g. eval_prompts.txt).
     config["_config_dir"] = str(Path(args.config).parent)
