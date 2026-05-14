@@ -158,8 +158,8 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 4. **QUALITY-10 ablation harness** ✓ Done — see COMPLETED_BACKLOG.md.
 
-**References:** PIPELINE-27 (data curation, done), PIPELINE-25 (raw pool, still open).
-**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — done (see COMPLETED_BACKLOG.md); scoring activates after first pipeline run with provenance-enabled shards; upstream quality gains blocked on PIPELINE-25. Item 4 (QUALITY-10) — done.
+**References:** PIPELINE-27 (data curation, done), PIPELINE-25 (raw pool, done).
+**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — done; scoring activates after first pipeline run with provenance-enabled shards. Item 4 (QUALITY-10) — done.
 
 ---
 
@@ -187,70 +187,13 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 
 **Remaining: validation gaps only (no known code bugs)**
 - LAION/COYO/WikiArt download paths and chunk 3+ sequencing — code generalises correctly; untested at scale.
-- Real two-device stager (cold→hot copy path) — `_check_hot_space()` now wired; needs a real `/Volumes/16TBCold` → `/Volumes/2TBSSD` transfer to verify. Will be exercised naturally when PIPELINE-25 lands and the first cold-pool run is started.
+- Real two-device stager (cold→hot copy path) — `_check_hot_space()` now wired; needs a real `/Volumes/16TBCold` → `/Volumes/2TBSSD` transfer to verify. Will be exercised on the next pipeline run (PIPELINE-25 done, cold pool active).
 - `stage.done` gate blocking training, `_poll_stager` retry after error, training crash one-retry + escalate — all coded correctly; never exercised end-to-end.
 - GPU_TOKEN contention at production timing — documented; code fix applied; no observed failure.
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
-**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** (unblocked — 16 TB cold volume at `/Volumes/16TBCold`)
-
-First step of the cold storage migration. Currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion — no persistent pool, every re-run re-downloads everything.
-
-**Storage:** ~202 tgzs × ~2-3 GB ≈ ~500 GB. Well within `/Volumes/16TBCold` capacity.
-
-**Target layout (pool side, on cold volume):**
-```
-/Volumes/16TBCold/raw/journeydb/
-  000.tgz   ← persistent pool; never auto-deleted
-  001.tgz  …
-
-/Volumes/16TBCold/raw/journeydb_anno/
-  train_anno_realease_repath.jsonl.tgz  ← downloaded once, kept
-```
-
-**Hot-side staging (symlinks into cold pool):**
-```
-/Volumes/2TBSSD/staging/chunk{N}/raw/journeydb/
-  000.tgz → /Volumes/16TBCold/raw/journeydb/000.tgz  ← symlink (same FS: instant)
-```
-When cold and hot are on different filesystems, the stager copies rather than symlinks; `_check_hot_space()` enforces headroom before any copy begins.
-
-**Behaviour:**
-- If pool tgz already exists, skip HuggingFace fetch entirely.
-- After conversion: remove staging symlink/copy only, never the pool file.
-- `pipeline_setup.py` populates staging symlinks for the selected scale + chunk.
-- Purge logic: `full` reset removes staging but not pool; `--purge-pool` flag required to clear cold pool.
-
-**`--pool-dir` override:** `download.pool_dir` config key or CLI flag allows pool to live anywhere (default: `/Volumes/16TBCold/raw/journeydb`).
-
-**Implementation scope:**
-- `downloader.py`: `_hf_download_file_guarded()` — check pool first; download to pool.
-- `download_convert.py`: `run_jdb_download_convert()` — create staging symlinks before producer loop; remove symlink after conversion.
-- `pipeline_setup.py`: "populate staging symlinks" step; report pool coverage vs. scale requirement.
-- `pipeline_lib.py`: `RAW_POOL_DIR` constant pointing to cold pool dir.
-
-**Prerequisite for:** PIPELINE-26 (versioned precompute), PIPELINE-27 (smart shard selection), PIPELINE-28 (data explorer).
-
-
-**PIPELINE-25b: Stream-convert downloads — eliminate raw tgz disk writes** (Low priority, long-term)
-
-Currently `download_convert.py` downloads each JDB tgz to disk, then reads it back for conversion. Since downloads are sequential (one tgz at a time) and tgzs are small enough to hold in memory (~2-3 GB each, well within the 32 GB system RAM), the raw bytes could be streamed directly through `_convert_tgz()` without touching disk at all.
-
-**When applicable:** only when `raw_pool_root` is not configured (i.e. no persistent raw pool needed). If the raw pool is enabled, the tgz must land on disk anyway. This optimisation targets the no-pool path or cases where the caller explicitly opts out of raw storage.
-
-**How it would work:**
-- `hf_hub_download()` supports a streaming/file-object mode; alternatively, download to a `tempfile.SpooledTemporaryFile` in memory.
-- Pass the in-memory buffer directly to `tarfile.open(fileobj=buf, mode="r:gz")` inside `_convert_tgz()`.
-- WebDataset output tar is written to disk as today (it is the persistent artifact).
-- Eliminates one full disk write + one full disk read per tgz; saves ~2-3 GB × N tgzs of I/O.
-
-**Constraint:** HuggingFace's `hf_hub_download` API always writes to a local path; would need to switch to `huggingface_hub.file_download.http_get()` or `requests` + streaming response to avoid the intermediate file. Alternatively, download to a RAM-backed tmpfs (`/dev/shm` on Linux; macOS has no equivalent — would need to use `tempfile` with a memory-sized cap). Investigate feasibility before committing to this path.
-
-**Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
-
-
-**PIPELINE-26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
+**PIPELINE-25/25b/26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
 
 ---
 
