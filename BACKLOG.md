@@ -154,12 +154,12 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see COMPLETED_BACKLOG.md. Cost: 4.7× slower than old path (8.38s vs 1.78s/step clean), 21.54 GB bwd peak. Decision: gated off; re-evaluate for from-scratch runs. Option C (correct_forward_q) is the active production path.
 
-3. **Source data curation (PIPELINE-27)** ⛔ blocked on PIPELINE-25 — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool); full JDB pool is ~202 tgzs × ~2-3 GB ≈ ~500 GB (well within the 16 TB cold volume). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on.
+3. **Source data curation (PIPELINE-27)** ✓ Done — see COMPLETED_BACKLOG.md. Provenance sidecars + `shard_scorer.py` + scored download order in `pipeline_setup.py`. Requires `tgz_scores.json` to populate (needs one full pipeline run with provenance-enabled shards).
 
 4. **QUALITY-10 ablation harness** ✓ Done — see COMPLETED_BACKLOG.md.
 
-**References:** PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite).
-**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — unblocked on storage, blocked on PIPELINE-25 engineering. Item 4 (QUALITY-10) — done.
+**References:** PIPELINE-27 (data curation, done), PIPELINE-25 (raw pool, still open).
+**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — done (see COMPLETED_BACKLOG.md); scoring activates after first pipeline run with provenance-enabled shards; upstream quality gains blocked on PIPELINE-25. Item 4 (QUALITY-10) — done.
 
 ---
 
@@ -250,91 +250,7 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 **Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
 
 
-**PIPELINE-26: Versioned precompute cache — cold storage migration** ✅ done (2026-05-14)
-
-The precompute layer (Qwen3 embeddings, VAE latents, SigLIP features) is currently stored only on the hot SSD and has no versioning. If an encoder is updated, all downstream caches must be regenerated. This item migrates precompute to the cold volume under a versioned layout and adds a `cache_manager.py` tool to manage versions.
-
-**Target layout:**
-```
-/Volumes/16TBCold/precompute/
-  v1/  ← Qwen3-4B r1 + VAE flux-vae-v1 + SigLIP ViT-L/14
-  v2/  …
-  current/  ← symlink to active version
-  manifests/
-    v1_coverage.json   ← per-shard coverage map; drives precompute scheduling
-```
-
-**cache_manager.py** responsibilities:
-- Create new version on encoder update; symlink `current/` to new version.
-- Report coverage per shard (which embeddings exist, which are missing).
-- Garbage-collect old versions beyond a configurable `keep_versions` limit.
-- Support `--warm-start-precompute <old_version>` to copy a subset of the old cache into the new version for shards whose encoder did not change (avoids full recompute on partial encoder updates).
-
-**Implementation scope:**
-- `pipeline_lib.py`: `COLD_PRECOMPUTE_DIR`, `COLD_PRECOMPUTE_CURRENT` constants.
-- `precompute_step.py`: write outputs to versioned cold path; maintain hot symlinks for active training.
-- `cache_manager.py`: new script in `train/scripts/`.
-- `pipeline_status.py` / `pipeline_doctor.py`: report precompute version + coverage.
-
-**Prerequisite for:** PIPELINE-27, PIPELINE-28.
-
-**PIPELINE-27: Smart precompute shard selection v2** ✅ done (2026-05-14)
-
-This is the **meta flywheel** upstream layer: controlling which raw JDB tgzs are downloaded and precomputed, as opposed to which already-precomputed shards to train on (the latter is already done by `shard_selector.py`).
-
-- Use eval metrics persisted in `shard_scores.db` (CLIP-I, self/cross-ref gap, style loss per shard) to bias the next chunk download toward high-signal style examples.
-- **Hard prerequisite: PIPELINE-25.** Without a persistent raw pool there is no stable candidate set — each chunk's raw data is currently ephemeral.
-- **Partial mitigation already in place:** `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool (cond_gap scoring, recency penalty, diversity slots). PIPELINE-27 is the upstream complement.
-- **Realistic impact:** currently training on ~320 of ~50,000 JDB shards. Random selection already provides wide style diversity; upstream curation becomes valuable as coverage grows.
-- Output: `shard_scores.db` on cold volume + weighted download scheduling in `pipeline_setup.py`.
-
-**PIPELINE-28: Data Intelligence Layer — data_explorer.py** ✅ done (2026-05-14)
-
-As cold storage grows over months of campaigns, observability into the knowledge base becomes critical. Without `data_explorer.py`, the cold volume is a black box: operator has no way to know what's been learned, which weights to warm-start from, or which shards are driving quality. This tool is essential for long-term usability of the platform.
-
-**Subcommands:**
-
-`data_explorer status` — full cold storage overview: disk usage by category, precompute version + coverage summary, raw pool completeness vs. all-in scale, metadata DB sizes and row counts. Entry point for any session.
-
-`data_explorer shards [--top N] [--sort cond_gap|clip_i|style_loss] [--filter ...]` — browse `shard_scores.db`; show per-shard score history and trend across campaigns; highlight shards whose quality is improving vs. plateauing; filter by score range, diversity cluster, campaign, or date added.
-
-`data_explorer weights [--campaign YYYYMMDD]` — browse `weights/flywheel-*/`; show per-campaign summary metrics (CLIP-I, cond_gap, training steps, config hash); annotate with "best ever" markers per metric; list available checkpoint steps within a campaign.
-
-`data_explorer suggest-warmstart --config <yaml>` — key warm-start helper: given a target training config, query weight archive and ablation history to recommend the closest historical checkpoint + precompute version. Emits exact `--warmstart`, `--precompute-version`, and `--warm-start-from` flags ready to paste. Falls back to "train from scratch" with an explanation if nothing suitable exists.
-
-`data_explorer ablation [--campaign ...] [--pareto]` — query `ablation_history.db` across all campaigns; show Pareto-optimal configs (cond_gap vs. ref_gap); compare Pareto frontiers between campaigns to visualise how the search space has improved; emit `--warm-start-from <path>` command for the ablation harness.
-
-`data_explorer compare <campaign-A> <campaign-B>` — side-by-side campaign comparison: CLIP-I trend, cond_gap trend, shard overlap, config diff, step budget used. The primary tool for answering "is campaign N better than campaign N-1?"
-
-`data_explorer maintenance` — read-only audit by default: validates precompute coverage vs. current pool, checks `best/` symlinks are valid, reports orphaned files. With `--prune` flag: GC old precompute versions (respects `keep_versions`). With `--export <subset>`: copies a curated shard subset to a new cold sub-directory. Both mutation subcommands require explicit `--confirm`.
-
-**Implementation:** `train/scripts/data_explorer.py`, standalone CLI (no server). All reads are non-destructive. Mutation subcommands (`--prune`, `--export`) are gated behind `--confirm`. Output format: human-readable tables by default; `--json` flag for scripting.
-
-**PIPELINE-29: Hot→Cold archiving — closing the knowledge accumulation loop** ✅ done (2026-05-14)
-
-The staging direction (cold→hot) is partially wired. The archiving direction (hot→cold) is not. Without it, cold storage never grows and warm-starts can never improve — the knowledge accumulation loop is broken.
-
-**What needs archiving and when:**
-
-| Event | Archive target | Cold destination |
-|---|---|---|
-| Precompute step completes | Qwen3 / VAE / SigLIP embeddings | `precompute/v{N}/{shard_id}/` |
-| Training milestone (e.g. 50K steps) | Checkpoint + EMA + optimizer state | `weights/flywheel-{date}/{step}/` |
-| Training campaign ends | Final checkpoint + run summary JSON | `weights/flywheel-{date}/final/` |
-| Eval step completes | Per-shard metrics (cond_gap, CLIP-I) | `metadata/shard_scores.db` (append) |
-| Ablation run completes | Scored config + metrics | `metadata/ablation_history.db` (append) |
-
-**Archiving semantics:**
-- Archiving is always a copy (never a move) while the campaign is still active. The hot copy remains for fast access; the cold copy is the durable record.
-- After archiving precompute, the hot cache may be pruned at the operator's discretion (freeing SSD space).
-- Weights are never pruned automatically; `data_explorer.py maintenance --prune` handles GC with explicit confirmation.
-- `weights/best/` symlinks are updated atomically after each archival: if the new checkpoint improves on the current best for any tracked metric, the symlink is updated.
-
-**Implementation scope:**
-- `data_stager.py`: add `archive_precompute()`, `archive_checkpoint()`, `update_best_symlinks()`.
-- `orchestrator.py`: trigger archiving after `train.done` milestone and after `precompute.done`.
-- `pipeline_lib.py`: `COLD_WEIGHTS_DIR`, `COLD_METADATA_DIR` constants.
-- `pipeline_doctor.py`: warn if last archive is stale (>24h since last `train.done` without corresponding archive).
+**PIPELINE-26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
 
 ---
 
