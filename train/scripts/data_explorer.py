@@ -150,18 +150,31 @@ def collect_overview() -> dict:
         except Exception:
             pass
 
-    # Precompute versions
+    # Precompute versions — only attempt list_versions when the versioned layout exists.
+    # The flat layout (400K+ .npz files directly in enc_dir) causes list_versions to
+    # stat every file looking for subdirs; that takes minutes on a large precompute pool.
     out["precompute"] = {}
     if _HAS_CACHE_MGR:
         for enc in ENCODERS:
+            enc_dir = PRECOMP_DIR / enc
+            cur_link = enc_dir / "current"
+            # Versioned layout is indicated by the presence of a "current" symlink.
+            # Do NOT iterate enc_dir to check — it may contain 400K+ .npz files.
+            has_versioned = cur_link.is_symlink()
             try:
-                versions = PrecomputeCache.list_versions(PRECOMP_DIR, enc)
-                cur = PrecomputeCache.current_dir(PRECOMP_DIR, enc)
+                if has_versioned:
+                    versions = PrecomputeCache.list_versions(PRECOMP_DIR, enc)
+                    cur = PrecomputeCache.current_dir(PRECOMP_DIR, enc)
+                else:
+                    # Flat layout: count .npz files via manifest or fast stat
+                    versions = []
+                    cur = None
                 out["precompute"][enc] = {
-                    "versions":     versions,
-                    "current":      str(cur) if cur else None,
-                    "n_versions":   len(versions),
+                    "versions":        versions,
+                    "current":         str(cur) if cur else None,
+                    "n_versions":      len(versions),
                     "current_records": 0,
+                    "flat_layout":     not has_versioned,
                 }
                 for v in versions:
                     if v.get("current"):
