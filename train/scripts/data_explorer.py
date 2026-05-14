@@ -764,7 +764,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     try:
                         m = json.loads(mf_path.read_text())
                         entry["complete"] = m.get("complete", False)
-                        entry["records"]  = m.get("records",  0)
+                        entry["records"]  = m.get("record_count", m.get("records", 0))
                     except (ValueError, OSError):
                         pass
                 cold_precomp[enc] = entry

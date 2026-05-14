@@ -131,7 +131,7 @@ def main() -> None:
     shards_dir = Path(storage.get("shards_dir", SHARDS_DIR))
 
     # Use cold metadata DB first, fall back to hot
-    cold_db = COLD_METADATA_DIR / "shard_scores.db"
+    cold_db = cold_root / "metadata" / "shard_scores.db"
     db_path = cold_db if cold_db.exists() else SHARD_SCORES_DB_PATH
     if not db_path.exists():
         print("No shard_scores.db found — run flywheel first.")

@@ -470,13 +470,14 @@ class DataStager:
             dst.parent.mkdir(parents=True, exist_ok=True)
             return self._atomic_copy(src, dst)
 
-        # Chunk snapshot: archive/chunk{chunk}_final.* from orchestrator
+        # Chunk snapshot: archive/chunk{chunk}_final.{safetensors,json} from orchestrator.
+        # Explicitly enumerate suffixes (not glob) to avoid matching .ema.safetensors,
+        # which has the same .suffix and would map to the same dst_name.
         hot_archive = self._hot_ckpts / "archive"
         if hot_archive.exists():
-            for f in hot_archive.glob(f"chunk{chunk}_final.*"):
-                suffix = f.suffix  # .safetensors or .json
-                dst_name = f"chunk{chunk}_final{suffix}"
-                nb = _copy_if_new(f, campaign_dir / dst_name)
+            for suffix in (".safetensors", ".json"):
+                src = hot_archive / f"chunk{chunk}_final{suffix}"
+                nb = _copy_if_new(src, campaign_dir / src.name)
                 if nb:
                     total_files += 1
                     total_bytes += nb
