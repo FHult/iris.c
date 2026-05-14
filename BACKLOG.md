@@ -265,6 +265,18 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
+**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** (Low priority)
+
+Smoke and dev runs launch `train_ip_adapter.py` directly — no pipeline sentinels, no heartbeat files, no orchestrator involvement. `pipeline_doctor` and `pipeline_status` are completely blind to them. To check progress you must `tail -f /tmp/dev_run.log` or attach to the tmux window manually.
+
+**Fix:** wire direct runs into the trainer heartbeat system.
+- `train_ip_adapter.py`: when a `--run-name` flag is provided (or when config contains a `run_name` key), write a heartbeat to `/Volumes/2TBSSD/.heartbeat/trainer_{run_name}.json` at the normal `log_every` cadence. Same fields as the production trainer heartbeat (step, loss, cond_gap, mem peaks, eta_sec, etc.).
+- `pipeline_status.py`: scan for `trainer_*.json` heartbeats in addition to `trainer.json`; display each active direct run as a separate row with its run name.
+- `pipeline_doctor.py`: include direct-run heartbeats in the trainer health check; warn if a named run's heartbeat is stale (>5 min) but the tmux window still exists (likely hung).
+- Standard run names: `smoke` (100 steps), `dev` (1,000 steps). The config file name is a reasonable default if `--run-name` is not given.
+
+**Prerequisite for:** running dev/smoke tests with the same visibility as production runs.
+
 **PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Low priority, code bugs fixed)
 
 Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunks. Three code bugs found in audit were fixed (commit `cdd9fb0`, 2026-05-13):
