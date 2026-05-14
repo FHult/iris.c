@@ -25,6 +25,71 @@ The TRAIN-6 vs old-path 500-step comparison from step 108500 showed mean cond_ga
 
 ---
 
+## Platform Vision & Long-term Architecture
+
+**Goal:** evolve iris.c from a fast inference engine into a fully autonomous, self-improving `--sref` optimization platform — running continuous flywheel campaigns (days/weeks/months) that automatically improve both training data and hyperparameters, culminating in open-weight release of a high-quality IP-Adapter.
+
+### Dual Flywheel System
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Meta / Optimization Flywheel  (slower cadence)         │
+│  Smart Shard Selection  +  Ablation Harness             │
+│  → What data to train on  +  How to train               │
+└───────────────┬─────────────────────────────────────────┘
+                │ curated shards + best config
+                ▼
+┌─────────────────────────────────────────────────────────┐
+│  Main Training Flywheel  (frequent)                     │
+│  IP-Adapter training  →  eval metrics  →  shard scores  │
+│  → cond_gap / CLIP-I / style loss feed back to meta     │
+└─────────────────────────────────────────────────────────┘
+```
+
+The meta flywheel (shard selector + ablation harness) decides what to train on and with which hyperparameters. The main flywheel executes and feeds metrics back. Both layers must support warm-starts from historical checkpoints and precompute caches.
+
+### Storage Architecture
+
+Two-tier hot/cold split:
+
+- **Cold storage** (`/Volumes/16TBCold`, 16 TB spinning disk) — source of truth and long-term archive. Contains all raw data, every historical precompute version, all archived weights, and persistent metadata/telemetry. Never auto-deleted by pipeline operations.
+- **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only. Populated by the JIT stager from cold; archived back to cold after each successful run.
+
+**JIT Data Stager** is the bidirectional intelligence layer between them: stages cold→hot before a compute window, archives hot→cold after. Uses symlinks on the same filesystem (near-instant), atomic copies across filesystems. `_check_hot_space()` enforces the `staging_margin_gb` headroom budget before any transfer begins.
+
+### Proposed cold storage layout
+
+```
+/Volumes/16TBCold/
+├── raw/
+│   ├── journeydb/          # persistent tgz pool — never auto-deleted
+│   └── journeydb_anno/     # annotation index — downloaded once, kept
+├── precompute/             # versioned encoder caches (managed by cache_manager.py)
+│   ├── v1/
+│   ├── v2/ …
+│   ├── current/            # symlink → active version
+│   └── manifests/          # per-version coverage manifests
+├── weights/                # archived IP-Adapter weights + checkpoints
+│   ├── flywheel-YYYYMMDD/  # one dir per campaign
+│   └── best/               # symlinks → current best weights per metric
+├── metadata/               # persistent telemetry — never reset between campaigns
+│   ├── shard_scores.db     # scored shard history (feeds meta flywheel)
+│   ├── ablation_history.db # all ablation runs ever (feeds warm-start)
+│   └── flywheel_logs/      # structured per-campaign logs
+├── reports/                # all HTML reports (flywheel, ablation, shard selection)
+├── temp/                   # staging area for in-progress transfers
+└── logs/                   # operational logs (pipeline, orchestrator)
+```
+
+This layout is the target state. Current hot-storage paths under `/Volumes/2TBSSD/` remain unchanged during the transition; the stager will progressively migrate source-of-truth data to cold as PIPELINE-25/26 land.
+
+### Hardware scaling roadmap
+
+Current: M1 Max, 32 GB unified memory, 2 TB hot + 16 TB cold.
+Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically higher compute). The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change.
+
+---
+
 ## Training & Model Quality
 
 **TRAIN-5: Memory reduction + gradient checkpointing infrastructure** (Medium priority, prerequisite for TRAIN-6)
@@ -158,7 +223,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 4. **QUALITY-10 ablation harness** ✓ Done — running as part of flywheel trial 2 (iters 25, 30, 35, 40).
 
 **References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite).
-**Dependency summary:** TRAIN-7 items 1–2 blocked on TRAIN-5 Stage 0 profiling (~1–2h to unblock). Item 3 blocked on storage hardware. Item 4 done.
+**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — implemented, gated. Item 3 (PIPELINE-27) — unblocked on storage, blocked on PIPELINE-25 engineering. Item 4 (QUALITY-10) — done.
 
 ---
 
@@ -174,56 +239,104 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 
 **Remaining: validation gaps only (no known code bugs)**
 - LAION/COYO/WikiArt download paths and chunk 3+ sequencing — code generalises correctly; untested at scale.
-- Real two-device stager (copy path) — `_check_hot_space()` now wired; needs a real cold→hot run to verify.
+- Real two-device stager (cold→hot copy path) — `_check_hot_space()` now wired; needs a real `/Volumes/16TBCold` → `/Volumes/2TBSSD` transfer to verify. Will be exercised naturally when PIPELINE-25 lands and the first cold-pool run is started.
 - `stage.done` gate blocking training, `_poll_stager` retry after error, training crash one-retry + escalate — all coded correctly; never exercised end-to-end.
 - GPU_TOKEN contention at production timing — documented; code fix applied; no observed failure.
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
-**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** (unblocked — 16 TB cold volume available at `/Volumes/16TBCold`)
+**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** (unblocked — 16 TB cold volume at `/Volumes/16TBCold`)
 
-Currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion. There is no persistent raw pool. Consequences: re-running any scale re-downloads all tgzs even if they were downloaded before; scale changes cause confusion about which tgzs belong to which chunk.
+First step of the cold storage migration. Currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion — no persistent pool, every re-run re-downloads everything.
 
-**Storage:** the full JDB all-in dataset is ~202 tgzs × ~2-3 GB ≈ ~500 GB. `/Volumes/16TBCold` (16 TB spinning disk, mounted 2026-05-14) provides ample space for the full pool. Point `--pool-dir` at `/Volumes/16TBCold/raw/journeydb`.
+**Storage:** ~202 tgzs × ~2-3 GB ≈ ~500 GB. Well within `/Volumes/16TBCold` capacity.
 
-**Proposed layout:**
+**Target layout (pool side, on cold volume):**
 ```
-data_root/
-  raw/
-    journeydb/
-      000.tgz   ← persistent pool; never auto-deleted
-      001.tgz
-      …
-    journeydb_anno/
-      train_anno_realease_repath.jsonl.tgz  ← downloaded once, kept
-  staging/
-    chunk1/
-      raw/journeydb/
-        000.tgz → symlink to raw/journeydb/000.tgz
+/Volumes/16TBCold/raw/journeydb/
+  000.tgz   ← persistent pool; never auto-deleted
+  001.tgz  …
+
+/Volumes/16TBCold/raw/journeydb_anno/
+  train_anno_realease_repath.jsonl.tgz  ← downloaded once, kept
 ```
+
+**Hot-side staging (symlinks into cold pool):**
+```
+/Volumes/2TBSSD/staging/chunk{N}/raw/journeydb/
+  000.tgz → /Volumes/16TBCold/raw/journeydb/000.tgz  ← symlink (same FS: instant)
+```
+When cold and hot are on different filesystems, the stager copies rather than symlinks; `_check_hot_space()` enforces headroom before any copy begins.
 
 **Behaviour:**
-- If `raw/journeydb/{idx:03d}.tgz` already exists, skip HuggingFace fetch entirely.
-- After conversion: delete only the staging symlink, not the pool copy.
-- `pipeline_setup.py` populates `staging/chunk{N}/raw/journeydb/` with symlinks to the pool subset for the selected scale + chunk.
-- `PIPELINE-24` purge logic: `full` reset removes staging but not pool; only an explicit `--purge-pool` flag clears the pool.
+- If pool tgz already exists, skip HuggingFace fetch entirely.
+- After conversion: remove staging symlink/copy only, never the pool file.
+- `pipeline_setup.py` populates staging symlinks for the selected scale + chunk.
+- Purge logic: `full` reset removes staging but not pool; `--purge-pool` flag required to clear cold pool.
 
-**`--pool-dir` override:** allow the raw pool to live on a different volume from `data_root` (e.g. spinning disk or NAS) via `download.pool_dir` config key or CLI flag.
+**`--pool-dir` override:** `download.pool_dir` config key or CLI flag allows pool to live anywhere (default: `/Volumes/16TBCold/raw/journeydb`).
 
 **Implementation scope:**
-- `downloader.py`: `_hf_download_file_guarded()` — check pool first; download to pool, not staging.
-- `download_convert.py`: `run_jdb_download_convert()` — create staging symlinks before producer loop; remove symlink (not pool file) after conversion.
-- `pipeline_setup.py`: add "populate staging symlinks" step; report pool coverage vs. scale requirement.
-- `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
+- `downloader.py`: `_hf_download_file_guarded()` — check pool first; download to pool.
+- `download_convert.py`: `run_jdb_download_convert()` — create staging symlinks before producer loop; remove symlink after conversion.
+- `pipeline_setup.py`: "populate staging symlinks" step; report pool coverage vs. scale requirement.
+- `pipeline_lib.py`: `RAW_POOL_DIR` constant pointing to cold pool dir.
 
+**Prerequisite for:** PIPELINE-26 (versioned precompute), PIPELINE-27 (smart shard selection), PIPELINE-28 (data explorer).
+
+
+**PIPELINE-26: Versioned precompute cache — cold storage migration** ⛔ blocked on PIPELINE-25
+
+The precompute layer (Qwen3 embeddings, VAE latents, SigLIP features) is currently stored only on the hot SSD and has no versioning. If an encoder is updated, all downstream caches must be regenerated. This item migrates precompute to the cold volume under a versioned layout and adds a `cache_manager.py` tool to manage versions.
+
+**Target layout:**
+```
+/Volumes/16TBCold/precompute/
+  v1/  ← Qwen3-4B r1 + VAE flux-vae-v1 + SigLIP ViT-L/14
+  v2/  …
+  current/  ← symlink to active version
+  manifests/
+    v1_coverage.json   ← per-shard coverage map; drives precompute scheduling
+```
+
+**cache_manager.py** responsibilities:
+- Create new version on encoder update; symlink `current/` to new version.
+- Report coverage per shard (which embeddings exist, which are missing).
+- Garbage-collect old versions beyond a configurable `keep_versions` limit.
+- Support `--warm-start-precompute <old_version>` to copy a subset of the old cache into the new version for shards whose encoder did not change (avoids full recompute on partial encoder updates).
+
+**Implementation scope:**
+- `pipeline_lib.py`: `COLD_PRECOMPUTE_DIR`, `COLD_PRECOMPUTE_CURRENT` constants.
+- `precompute_step.py`: write outputs to versioned cold path; maintain hot symlinks for active training.
+- `cache_manager.py`: new script in `train/scripts/`.
+- `pipeline_status.py` / `pipeline_doctor.py`: report precompute version + coverage.
+
+**Prerequisite for:** PIPELINE-27, PIPELINE-28.
 
 **PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
 
-- Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.
-- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool).** Without a persistent pool there is no stable candidate set to select from — each chunk's raw data is currently ephemeral. Storage is now unblocked (16 TB cold volume); only the engineering work (PIPELINE-25) must be completed first.
-- **Partial mitigation already in place:** the flywheel's `shard_selector.py` already does performance-attributed shard selection within the fixed precomputed shard pool (scoring shards by cond_gap contribution, applying recency penalty, diversity slots). This operates on shards that have already been precomputed — it biases *which precomputed shards to train on*, not which raw data to download. PIPELINE-27 is the upstream complement: controlling which raw JDB tgzs are downloaded and precomputed in the first place.
-- **Realistic impact:** we are currently training on ~320 of ~50,000 JDB shards. Random selection from that pool already provides wide style diversity; the marginal gain from smarter upstream selection is modest until coverage increases significantly.
-- Output: `shard_scores.json` + weighted sampling logic with configurable quality vs diversity trade-off.
+This is the **meta flywheel** upstream layer: controlling which raw JDB tgzs are downloaded and precomputed, as opposed to which already-precomputed shards to train on (the latter is already done by `shard_selector.py`).
+
+- Use eval metrics persisted in `shard_scores.db` (CLIP-I, self/cross-ref gap, style loss per shard) to bias the next chunk download toward high-signal style examples.
+- **Hard prerequisite: PIPELINE-25.** Without a persistent raw pool there is no stable candidate set — each chunk's raw data is currently ephemeral.
+- **Partial mitigation already in place:** `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool (cond_gap scoring, recency penalty, diversity slots). PIPELINE-27 is the upstream complement.
+- **Realistic impact:** currently training on ~320 of ~50,000 JDB shards. Random selection already provides wide style diversity; upstream curation becomes valuable as coverage grows.
+- Output: `shard_scores.db` on cold volume + weighted download scheduling in `pipeline_setup.py`.
+
+**PIPELINE-28: Data Intelligence Layer — data_explorer.py** ⛔ blocked on PIPELINE-25 + PIPELINE-26
+
+As cold storage grows over months of campaigns, a CLI/TUI tool is needed to maintain visibility and support operational decisions. Without it, the cold volume becomes a black box.
+
+**Capabilities:**
+
+1. **Cold storage overview** — disk usage by category (raw, precompute, weights, metadata); precompute version summary; pool coverage vs. all-in scale.
+2. **Shard browser** — top N shards by score (cond_gap, CLIP-I, style loss) with trend history from `shard_scores.db`; filter by score range, diversity cluster, or date added.
+3. **Weight archive browser** — list flywheel campaigns with their summary metrics; show best weights per metric; support `pipeline_ctl warm-start <campaign>` command generation.
+4. **Warm-start helper** — given a target config, suggest the closest historical checkpoint + precompute version to warm-start from; emit the exact `--warmstart` + `--pool-dir` + `--precompute-version` flags.
+5. **Maintenance utilities** — validate precompute coverage vs. current pool; prune old precompute versions (respecting `keep_versions`); export a curated shard subset to a new cold sub-directory.
+6. **Ablation history view** — query `ablation_history.db`; show Pareto-optimal configs across all campaigns; support `--warm-start-from` path generation for the ablation harness.
+
+**Implementation:** `train/scripts/data_explorer.py`, standalone CLI (no server). Reads `shard_scores.db`, `ablation_history.db`, cold storage layout. No writes except `--prune` and `--export` subcommands (both require explicit confirmation).
 
 ---
 
