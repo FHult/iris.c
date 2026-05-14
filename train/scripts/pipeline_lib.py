@@ -41,6 +41,11 @@ RAW_POOL_DIR       = DATA_ROOT / "raw" / "journeydb"
 CONVERTED_POOL_DIR = DATA_ROOT / "converted" / "journeydb"
 # HuggingFace cache lives on cold storage; ~/.cache/huggingface symlinks here.
 HF_CACHE_DIR = Path("/Volumes/16TBCold/hf_cache")
+# Cold storage knowledge base (canonical volume; also readable from config storage.cold_root).
+COLD_ROOT           = Path("/Volumes/16TBCold")
+COLD_PRECOMPUTE_DIR = COLD_ROOT / "precomputed"
+COLD_WEIGHTS_DIR    = COLD_ROOT / "weights"
+COLD_METADATA_DIR   = COLD_ROOT / "metadata"
 GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 RUN_METADATA_FILE = DATA_ROOT / "run_metadata.json"
 

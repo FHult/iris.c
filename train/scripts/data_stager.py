@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, load_config, log_event,
     write_heartbeat, mark_done, mark_error, has_error, clear_error,
-    SHARD_BLOCK,
+    SHARD_BLOCK, RUN_METADATA_FILE,
 )
 
 log = logging.getLogger("data_stager")
@@ -111,9 +111,11 @@ class DataStager:
         self.max_parallel        = int(storage.get("max_parallel_transfers", 3))
 
         # Derived paths on cold storage.
-        self._cold_shards  = self.cold_root / "shards"
-        self._cold_precomp = self.cold_root / "precomputed"
-        self._cold_ckpts   = self.cold_root / "checkpoints" / "stage1"
+        self._cold_shards   = self.cold_root / "shards"
+        self._cold_precomp  = self.cold_root / "precomputed"
+        self._cold_ckpts    = self.cold_root / "checkpoints" / "stage1"
+        self._cold_weights  = self.cold_root / "weights"
+        self._cold_metadata = self.cold_root / "metadata"
 
         # Derived paths on hot storage (== DATA_ROOT paths when single-SSD).
         self._hot_shards  = self.hot_root / "shards"
@@ -201,6 +203,7 @@ class DataStager:
         try:
             npz_archived, nb_precomp = self._archive_precomputed(chunk)
             ckpt_archived, nb_ckpts  = self._archive_checkpoints(chunk)
+            self._archive_dbs()
             total_bytes = nb_precomp + nb_ckpts
 
             summary = {
@@ -428,45 +431,124 @@ class DataStager:
 
         return total_npz, total_bytes
 
+    def _campaign_date(self) -> str:
+        """Return campaign date string (YYYYMMDD) from run_metadata.json, or today."""
+        try:
+            meta = json.loads(RUN_METADATA_FILE.read_text())
+            started_at = meta.get("started_at", "")
+            if started_at:
+                return started_at[:10].replace("-", "")
+        except Exception:
+            pass
+        from datetime import date
+        return date.today().strftime("%Y%m%d")
+
     def _archive_checkpoints(self, chunk: int) -> tuple[int, int]:
         """
-        Archive chunk snapshot checkpoints and best weights from hot → cold.
+        Archive chunk snapshot checkpoints from hot → cold campaign-structured layout.
 
-        Only copies files that do not already exist in cold.
+        Cold layout:
+          cold_root/weights/flywheel-YYYYMMDD/
+            step_{N}.safetensors  ← from hot archive/chunk{chunk}_final.*
+            step_{N}.json
+            final.safetensors     ← copy of best.safetensors at chunk end
+            final.json
+
+        Also updates cold_root/weights/best/ per-metric symlinks.
         Returns (files_archived, bytes_transferred).
         """
         total_files = 0
         total_bytes = 0
 
+        campaign = f"flywheel-{self._campaign_date()}"
+        campaign_dir = self._cold_weights / campaign
+        campaign_dir.mkdir(parents=True, exist_ok=True)
+
         def _copy_if_new(src: Path, dst: Path) -> int:
             if not src.exists() or dst.exists():
                 return 0
             dst.parent.mkdir(parents=True, exist_ok=True)
-            nb = self._atomic_copy(src, dst)
-            return nb
+            return self._atomic_copy(src, dst)
 
-        # Chunk snapshot: archive/chunk{N}_final.* files written by
-        # orchestrator._archive_chunk_checkpoint().
-        hot_archive  = self._hot_ckpts  / "archive"
-        cold_archive = self._cold_ckpts / "archive"
+        # Chunk snapshot: archive/chunk{chunk}_final.* from orchestrator
+        hot_archive = self._hot_ckpts / "archive"
         if hot_archive.exists():
             for f in hot_archive.glob(f"chunk{chunk}_final.*"):
-                nb = _copy_if_new(f, cold_archive / f.name)
+                suffix = f.suffix  # .safetensors or .json
+                dst_name = f"chunk{chunk}_final{suffix}"
+                nb = _copy_if_new(f, campaign_dir / dst_name)
                 if nb:
                     total_files += 1
                     total_bytes += nb
 
-        # best.safetensors and best.json — always keep cold copy up to date.
-        for name in ("best.safetensors", "best.json"):
-            src = self._hot_ckpts / name
-            # Archive as chunk-suffixed so cold keeps one snapshot per chunk.
-            dst_name = f"chunk{chunk}_{name}"
-            nb = _copy_if_new(src, cold_archive / dst_name)
+        # best.* snapshot — copy as final.* in this campaign
+        for suffix in (".safetensors", ".json"):
+            src = self._hot_ckpts / f"best{suffix}"
+            nb = _copy_if_new(src, campaign_dir / f"final{suffix}")
             if nb:
                 total_files += 1
                 total_bytes += nb
 
+        # Update per-metric best symlinks from best.json
+        best_json_path = self._hot_ckpts / "best.json"
+        if best_json_path.exists():
+            try:
+                best_meta = json.loads(best_json_path.read_text())
+                final_ckpt = campaign_dir / "final.safetensors"
+                if final_ckpt.exists():
+                    self.update_best_symlinks(best_meta, final_ckpt)
+            except Exception as exc:
+                log.warning("update_best_symlinks failed: %s", exc)
+
         return total_files, total_bytes
+
+    def update_best_symlinks(self, metrics: dict, ckpt_path: Path) -> None:
+        """Update cold weights/best/{metric}.safetensors symlink if ckpt_path wins.
+
+        metrics: dict with float values (e.g. {"cond_gap": 0.42, "loss": 0.18}).
+        Higher is better for gap metrics, lower for loss.
+        """
+        best_dir = self._cold_weights / "best"
+        best_dir.mkdir(parents=True, exist_ok=True)
+        # Metrics where higher = better (all others treated as lower = better)
+        higher_is_better = {"cond_gap", "ref_gap", "clip_i", "clip_t"}
+        for metric, value in metrics.items():
+            if not isinstance(value, (int, float)):
+                continue
+            meta_path = best_dir / f"{metric}.json"
+            try:
+                current_best = json.loads(meta_path.read_text())["value"] if meta_path.exists() else None
+            except Exception:
+                current_best = None
+            is_better = (
+                current_best is None
+                or (metric in higher_is_better and value > current_best)
+                or (metric not in higher_is_better and value < current_best)
+            )
+            if is_better:
+                _atomic_symlink(best_dir / f"{metric}.safetensors",
+                                str(ckpt_path.resolve()))
+                meta_path.write_text(json.dumps(
+                    {"value": value, "path": str(ckpt_path)}, indent=2))
+                log.info("New best %s = %s → %s", metric, value, ckpt_path.name)
+
+    def _archive_dbs(self) -> None:
+        """Copy shard_scores.db and ablation_history.db from hot → cold metadata dir.
+
+        Full copy (not incremental). SQLite files may be briefly inconsistent if a
+        write transaction is in progress, but this is acceptable for disaster recovery.
+        """
+        self._cold_metadata.mkdir(parents=True, exist_ok=True)
+        for db_name in ("shard_scores.db", "ablation_history.db"):
+            src = self.hot_root / db_name
+            if not src.exists():
+                continue
+            dst = self._cold_metadata / db_name
+            try:
+                _atomic_copy_file(src, dst)
+                log.info("Archived %s → %s", db_name, dst)
+            except Exception as exc:
+                log.warning("Failed to archive %s: %s", db_name, exc)
 
     # ------------------------------------------------------------------
     # Transfer primitives

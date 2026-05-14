@@ -36,6 +36,7 @@ from pipeline_lib import (
     SENTINEL_DIR, LOG_DIR, SHARDS_DIR, PRECOMP_DIR,
     HARD_EX_DIR, STAGING_DIR, DEDUP_DIR, DISPATCH_QUEUE,
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
+    COLD_ROOT, COLD_PRECOMPUTE_DIR, COLD_WEIGHTS_DIR, COLD_METADATA_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     TMUX_ABLATION_WIN,
     read_state, load_config,
@@ -1358,6 +1359,58 @@ def _check_environment() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. Pool health
 
+def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
+    """PIPELINE-26/29: Check cold storage health — precompute versions and archive freshness."""
+    if not COLD_ROOT.exists():
+        return  # cold volume not mounted — skip silently
+
+    storage = cfg.get("storage", {})
+    cold_root = Path(storage.get("cold_root", str(COLD_ROOT)))
+
+    # PIPELINE-26: cold precompute version matches hot
+    for encoder in ("qwen3", "vae", "siglip"):
+        hot_cur  = PRECOMP_DIR / encoder / "current"
+        cold_cur = cold_root / "precomputed" / encoder / "current"
+        if hot_cur.is_symlink() and cold_cur.is_symlink():
+            hot_ver  = os.path.basename(os.readlink(str(hot_cur)))
+            cold_ver = os.path.basename(os.readlink(str(cold_cur)))
+            if hot_ver != cold_ver:
+                _add("WARNING", "cold_storage",
+                     f"Cold precompute {encoder} version mismatch: hot={hot_ver} cold={cold_ver}",
+                     detail="Run data_stager.py archive to sync.",
+                     fix="train/.venv/bin/python train/scripts/data_stager.py archive --chunk 0",
+                     ctx={"encoder": encoder, "hot_ver": hot_ver, "cold_ver": cold_ver})
+
+    # PIPELINE-29: stale weights archive (train.done exists but cold weights dir empty)
+    weights_dir = cold_root / "weights"
+    has_any_campaign = weights_dir.exists() and any(
+        d.is_dir() and d.name.startswith("flywheel-")
+        for d in weights_dir.iterdir()
+    ) if weights_dir.exists() else False
+
+    any_chunk_done = any(is_done(c, "train") for c in chunks)
+    if any_chunk_done and not has_any_campaign:
+        _add("WARNING", "cold_storage",
+             "Training chunks completed but no campaign weights on cold storage",
+             detail="Run data_stager.py archive to copy checkpoints to cold.",
+             fix="train/.venv/bin/python train/scripts/data_stager.py archive --chunk 0")
+
+    # PIPELINE-29: stale metadata DB archive
+    hot_shard_db = DATA_ROOT / "shard_scores.db"
+    cold_shard_db = cold_root / "metadata" / "shard_scores.db"
+    if hot_shard_db.exists() and cold_shard_db.exists():
+        try:
+            hot_mtime  = hot_shard_db.stat().st_mtime
+            cold_mtime = cold_shard_db.stat().st_mtime
+            if hot_mtime - cold_mtime > 48 * 3600:
+                _add("INFO", "cold_storage",
+                     "Cold shard_scores.db is >48h behind hot copy",
+                     detail="Run archive to sync.",
+                     ctx={"stale_h": round((hot_mtime - cold_mtime) / 3600, 1)})
+        except OSError:
+            pass
+
+
 def _check_pool_health(cfg: dict) -> None:
     storage = cfg.get("storage", {})
     for key, label, sentinel in [
@@ -1662,6 +1715,26 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         summary["ablation"] = ablation_info
     if pool_info is not None:
         summary["pool"] = pool_info
+
+    # Cold precompute version info (PIPELINE-26)
+    if COLD_ROOT.exists():
+        cold_precomp: dict = {}
+        for encoder in ("qwen3", "vae", "siglip"):
+            enc_dir = COLD_PRECOMPUTE_DIR / encoder
+            cur_link = enc_dir / "current"
+            if cur_link.is_symlink():
+                ver = os.path.basename(os.readlink(str(cur_link)))
+                manifest_path = enc_dir / ver / "manifest.json"
+                entry: dict = {"version": ver}
+                try:
+                    m = json.loads(manifest_path.read_text())
+                    entry["complete"] = m.get("complete", False)
+                    entry["records"]  = m.get("record_count", m.get("records"))
+                except Exception:
+                    pass
+                cold_precomp[encoder] = entry
+        if cold_precomp:
+            summary["cold_precompute"] = cold_precomp
 
     return summary
 
@@ -2016,6 +2089,7 @@ def main() -> None:
         _check_stale_logs(chunks)
         _check_ablation_health()
         _check_pool_health(cfg)
+        _check_cold_storage(cfg, chunks)
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
     def _issue_fingerprint() -> frozenset:
