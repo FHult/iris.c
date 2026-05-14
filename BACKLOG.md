@@ -232,7 +232,7 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 **Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
 
 
-**PIPELINE-26: Versioned precompute cache — cold storage migration** ⛔ blocked on PIPELINE-25
+**PIPELINE-26: Versioned precompute cache — cold storage migration** ✅ done (2026-05-14)
 
 The precompute layer (Qwen3 embeddings, VAE latents, SigLIP features) is currently stored only on the hot SSD and has no versioning. If an encoder is updated, all downstream caches must be regenerated. This item migrates precompute to the cold volume under a versioned layout and adds a `cache_manager.py` tool to manage versions.
 
@@ -260,7 +260,7 @@ The precompute layer (Qwen3 embeddings, VAE latents, SigLIP features) is current
 
 **Prerequisite for:** PIPELINE-27, PIPELINE-28.
 
-**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
+**PIPELINE-27: Smart precompute shard selection v2** ✅ done (2026-05-14)
 
 This is the **meta flywheel** upstream layer: controlling which raw JDB tgzs are downloaded and precomputed, as opposed to which already-precomputed shards to train on (the latter is already done by `shard_selector.py`).
 
@@ -270,7 +270,7 @@ This is the **meta flywheel** upstream layer: controlling which raw JDB tgzs are
 - **Realistic impact:** currently training on ~320 of ~50,000 JDB shards. Random selection already provides wide style diversity; upstream curation becomes valuable as coverage grows.
 - Output: `shard_scores.db` on cold volume + weighted download scheduling in `pipeline_setup.py`.
 
-**PIPELINE-28: Data Intelligence Layer — data_explorer.py** ⛔ blocked on PIPELINE-25 + PIPELINE-26
+**PIPELINE-28: Data Intelligence Layer — data_explorer.py** ✅ done (2026-05-14)
 
 As cold storage grows over months of campaigns, observability into the knowledge base becomes critical. Without `data_explorer.py`, the cold volume is a black box: operator has no way to know what's been learned, which weights to warm-start from, or which shards are driving quality. This tool is essential for long-term usability of the platform.
 
@@ -292,7 +292,7 @@ As cold storage grows over months of campaigns, observability into the knowledge
 
 **Implementation:** `train/scripts/data_explorer.py`, standalone CLI (no server). All reads are non-destructive. Mutation subcommands (`--prune`, `--export`) are gated behind `--confirm`. Output format: human-readable tables by default; `--json` flag for scripting.
 
-**PIPELINE-29: Hot→Cold archiving — closing the knowledge accumulation loop** ⛔ blocked on PIPELINE-25
+**PIPELINE-29: Hot→Cold archiving — closing the knowledge accumulation loop** ✅ done (2026-05-14)
 
 The staging direction (cold→hot) is partially wired. The archiving direction (hot→cold) is not. Without it, cold storage never grows and warm-starts can never improve — the knowledge accumulation loop is broken.
 
@@ -322,7 +322,7 @@ The staging direction (cold→hot) is partially wired. The archiving direction (
 
 ## Flywheel Management
 
-**FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** ⛔ blocked on PIPELINE-29
+**FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** (unblocked — PIPELINE-29 done)
 
 Individual campaigns are managed by the orchestrator. This item is the layer above: tracking how quality evolves across campaigns over weeks and months, detecting when a campaign strategy is played out, and deciding when to launch a new campaign vs. continue the current one.
 
