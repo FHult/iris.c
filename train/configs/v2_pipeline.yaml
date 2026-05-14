@@ -132,13 +132,16 @@ training:
 #   cold_root: "/Volumes/RawHDD"    # HDD or secondary SSD — source of truth
 #   hot_root:  "/Volumes/FastTB5"   # primary NVMe — active compute runs here
 storage:
-  cold_root: "/Volumes/2TBSSD"   # same as DATA_ROOT → single-SSD no-op
-  hot_root:  "/Volumes/2TBSSD"   # same as DATA_ROOT → single-SSD no-op
-  staging_margin_gb: 50          # abort staging if hot free space would drop below this
-  cleanup_safety_gb: 20          # minimum hot free space before any cleanup
-  archive_after_chunk: true      # archive precomputed + weights to cold after each chunk
-  background_staging: true       # stage next chunk in background while training runs
-  max_parallel_transfers: 3      # concurrent symlink/copy workers
+  cold_root: "/Volumes/16TBCold"  # 16 TB cold volume — source of truth + knowledge base
+  hot_root:  "/Volumes/2TBSSD"    # 2 TB NVMe — active compute working area
+  staging_margin_gb: 50           # abort staging if hot free space would drop below this
+  cleanup_safety_gb: 20           # minimum hot free space before any cleanup
+  archive_after_chunk: true       # archive precomputed + weights to cold after each chunk
+  background_staging: true        # stage next chunk in background while training runs
+  max_parallel_transfers: 3       # concurrent symlink/copy workers
+  # Persistent data pools on cold volume (enable by uncommenting):
+  # raw_pool_root: "/Volumes/16TBCold/raw/journeydb"           # tgz downloaded once, reused across chunks
+  # converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
 
 # Precompute shard cap per scale: large/all-in produce many more shards than needed
 # for training; cap precompute so disk and wall-clock stay bounded.

@@ -533,6 +533,29 @@ def _setup_dirs(data_root: Path, dry_run: bool = False) -> tuple[list, list]:
     return created, existing
 
 
+def _setup_pool_dirs(config: dict, dry_run: bool = False) -> list[str]:
+    """Create persistent cold pool dirs when configured.  Returns list of created dirs.
+
+    Pool dirs live on cold_root (potentially a different volume from data_root) so
+    they are not covered by REQUIRED_DIRS.  Never touched by any reset mode — pool
+    data must survive pipeline resets.
+    """
+    storage = config.get("storage", {})
+    created = []
+    for key, sentinel in [("raw_pool_root", ".downloaded"), ("converted_pool_root", ".converted")]:
+        root_str = storage.get(key)
+        if not root_str:
+            continue
+        root = Path(root_str)
+        sentinel_dir = root / sentinel
+        for d in (root, sentinel_dir):
+            if not d.exists():
+                if not dry_run:
+                    d.mkdir(parents=True, exist_ok=True)
+                created.append(str(d))
+    return created
+
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -899,6 +922,16 @@ def run_interactive(args) -> int:
         print(f"  {ok('+')}  Config generated: {config_path}")
     else:
         print(f"  {ok('✓')}  Using config: {config_path}")
+
+    # Pool dirs (cold volume; only created when pool keys are set in config)
+    try:
+        from pipeline_lib import load_config
+        _cfg = load_config(str(config_path))
+        pool_created = _setup_pool_dirs(_cfg)
+        for d in pool_created:
+            print(f"    {ok('+')} {d}  (cold pool)")
+    except Exception:
+        pass
     print()
 
     # ── Commands ───────────────────────────────────────────────────────────
@@ -1008,6 +1041,7 @@ def run_ai(args) -> int:
             archive_path, arc_bytes = _archive_checkpoints(data_root)
         deleted_bytes = _purge_pipeline_state(data_root, reset_mode)
         _setup_dirs(data_root)  # recreate required dirs that were just deleted
+        # Pool dirs on cold volume are never touched by any reset mode.
         print(json.dumps({
             "action": "purge",
             "mode": reset_mode,

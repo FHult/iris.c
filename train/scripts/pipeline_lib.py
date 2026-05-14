@@ -37,6 +37,8 @@ ANCHOR_SHARDS_DIR = DATA_ROOT / "anchor_shards"
 DEDUP_DIR         = DATA_ROOT / "dedup_ids"
 CKPT_DIR          = DATA_ROOT / "checkpoints" / "stage1"
 CKPT_ARCHIVE_DIR  = DATA_ROOT / "checkpoints" / "stage1" / "archive"
+RAW_POOL_DIR       = DATA_ROOT / "raw" / "journeydb"
+CONVERTED_POOL_DIR = DATA_ROOT / "converted" / "journeydb"
 GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 RUN_METADATA_FILE = DATA_ROOT / "run_metadata.json"
 

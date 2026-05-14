@@ -1356,7 +1356,35 @@ def _check_environment() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 13. Stale log detection
+# 13. Pool health
+
+def _check_pool_health(cfg: dict) -> None:
+    storage = cfg.get("storage", {})
+    for key, label, sentinel in [
+        ("raw_pool_root",       "raw tgz pool",       ".downloaded"),
+        ("converted_pool_root", "converted tar pool", ".converted"),
+    ]:
+        root_str = storage.get(key)
+        if not root_str:
+            continue
+        root = Path(root_str)
+        if not root.exists():
+            _add("WARNING", "pool",
+                 f"{label} configured but directory missing: {root}",
+                 detail=f"Set storage.{key} in config. Create dir: mkdir -p {root}/{sentinel}",
+                 fix=f"mkdir -p {root}/{sentinel}",
+                 ctx={"key": key, "path": str(root)})
+        else:
+            sentinel_dir = root / sentinel
+            if not sentinel_dir.exists():
+                _add("WARNING", "pool",
+                     f"{label} missing sentinel dir: {sentinel_dir}",
+                     fix=f"mkdir -p {sentinel_dir}",
+                     ctx={"key": key, "sentinel_dir": str(sentinel_dir)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Stale log detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Log filenames for each pipeline step (must match orchestrator.py)
@@ -1591,6 +1619,32 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
             "window":    tmux_window_exists(TMUX_ABLATION_WIN),
         }
 
+    # Pool coverage
+    storage = cfg.get("storage", {})
+    pool_info: Optional[dict] = None
+    raw_pool_root  = storage.get("raw_pool_root")
+    conv_pool_root = storage.get("converted_pool_root")
+    if raw_pool_root or conv_pool_root:
+        pool_info = {}
+        if raw_pool_root:
+            raw_sentinel_dir = Path(raw_pool_root) / ".downloaded"
+            try:
+                pool_info["raw_pool_n"] = sum(1 for _ in raw_sentinel_dir.iterdir()
+                                              if _.is_file()) if raw_sentinel_dir.exists() else 0
+                pool_info["raw_pool_exists"] = Path(raw_pool_root).exists()
+            except OSError:
+                pool_info["raw_pool_n"] = None
+                pool_info["raw_pool_exists"] = False
+        if conv_pool_root:
+            conv_sentinel_dir = Path(conv_pool_root) / ".converted"
+            try:
+                pool_info["converted_pool_n"] = sum(1 for _ in conv_sentinel_dir.iterdir()
+                                                    if _.is_file()) if conv_sentinel_dir.exists() else 0
+                pool_info["converted_pool_exists"] = Path(conv_pool_root).exists()
+            except OSError:
+                pool_info["converted_pool_n"] = None
+                pool_info["converted_pool_exists"] = False
+
     summary: dict = {
         "disk_gb": disk_gb,
         "chunks_done": chunks_done,
@@ -1606,6 +1660,8 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         summary["parallel_prep"] = parallel_prep
     if ablation_info is not None:
         summary["ablation"] = ablation_info
+    if pool_info is not None:
+        summary["pool"] = pool_info
 
     return summary
 
@@ -1959,6 +2015,7 @@ def main() -> None:
         _check_data_quality(chunks)
         _check_stale_logs(chunks)
         _check_ablation_health()
+        _check_pool_health(cfg)
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
     def _issue_fingerprint() -> frozenset:

@@ -56,6 +56,31 @@ log = logging.getLogger("data_stager")
 
 _ENCODERS = ("qwen3", "vae", "siglip")
 
+
+# ---------------------------------------------------------------------------
+# Module-level transfer primitives (usable without instantiating DataStager)
+# ---------------------------------------------------------------------------
+
+def _same_device(p1: Path, p2: Path) -> bool:
+    """True when p1 and p2 reside on the same filesystem device."""
+    try:
+        return os.stat(p1).st_dev == os.stat(p2).st_dev
+    except OSError:
+        return False
+
+
+def _atomic_copy_file(src: Path, dst: Path) -> int:
+    """Copy src to dst atomically (tmp + rename). Returns bytes written."""
+    tmp = dst.with_suffix(dst.suffix + f".stg{os.getpid()}")
+    try:
+        shutil.copy2(src, tmp)
+        size = tmp.stat().st_size
+        os.replace(tmp, dst)
+        return size
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
 # Write a heartbeat to the sentinel dir every this many file completions so the
 # orchestrator can detect a hung stager even during long multi-GB transfers.
 _HEARTBEAT_EVERY = 100
@@ -466,18 +491,7 @@ class DataStager:
         Copy src to dst atomically: write to a temp file, then rename.
         Returns bytes written.  Raises on failure (temp is cleaned up).
         """
-        tmp = dst.with_suffix(dst.suffix + f".stg{os.getpid()}")
-        try:
-            shutil.copy2(src, tmp)
-            size = tmp.stat().st_size
-            os.replace(tmp, dst)
-            return size
-        except Exception:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+        return _atomic_copy_file(src, dst)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -491,13 +505,8 @@ class DataStager:
         """
         if self.cold_root == self.hot_root:
             return True  # trivially same path
-        try:
-            cold_dev = os.stat(self.cold_root).st_dev if self.cold_root.exists() else None
-            hot_dev  = os.stat(self.hot_root).st_dev  if self.hot_root.exists()  else None
-            if cold_dev is not None and hot_dev is not None:
-                return cold_dev == hot_dev
-        except OSError:
-            pass
+        if self.cold_root.exists() and self.hot_root.exists():
+            return _same_device(self.cold_root, self.hot_root)
         # Default to copy if we cannot stat (paths don't exist yet).
         return False
 

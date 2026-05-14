@@ -34,6 +34,22 @@ from downloader import (
     run_wikiart_download, check_laion, check_coyo,
     JDB_REPO_ID, _hf_download_file_guarded as _hf_download_file,
 )
+from data_stager import _same_device, _atomic_copy_file
+
+
+# ---------------------------------------------------------------------------
+# Pool helpers
+# ---------------------------------------------------------------------------
+
+def _pool_link_or_copy(pool_file: Path, staging_file: Path, use_symlinks: bool) -> None:
+    """Create staging_file pointing at pool_file (symlink or copy). No-op if exists."""
+    if staging_file.exists() or staging_file.is_symlink():
+        return
+    staging_file.parent.mkdir(parents=True, exist_ok=True)
+    if use_symlinks:
+        os.symlink(pool_file.resolve(), staging_file)
+    else:
+        _atomic_copy_file(pool_file, staging_file)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +115,13 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
 
 
 def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") -> None:
-    """Producer-consumer: download one tgz, signal consumer, consumer converts and deletes."""
+    """Producer-consumer: download one tgz, signal consumer, consumer converts and deletes.
+
+    Three-level cache hierarchy when pool keys are configured in storage:
+      Level 0: converted pool hit  → symlink/copy .tar to staging; skip download+conversion
+      Level 1: raw pool hit        → symlink/copy .tgz to staging; convert; write to conv pool
+      Level 2: no pool hit         → download to raw pool (or staging); convert; write to conv pool
+    """
     ranges = jdb_tgz_ranges(config, scale)
     start, end = ranges[chunk]
     tgz_range = range(start, end + 1)
@@ -112,9 +134,57 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
     sentinel_dir = raw_dir / ".tgz_state"
     sentinel_dir.mkdir(exist_ok=True)
 
-    download_jdb_annotation(raw_dir)
+    # --- Pool configuration ---
+    storage = config.get("storage", {})
+    raw_pool_dir  = Path(storage["raw_pool_root"])       if "raw_pool_root"       in storage else None
+    conv_pool_dir = Path(storage["converted_pool_root"]) if "converted_pool_root" in storage else None
 
-    log_orch(f"JDB chunk {chunk} scale={scale}: download+convert {total} tgzs ({start:03d}–{end:03d})")
+    raw_pool_enabled  = raw_pool_dir is not None
+    conv_pool_enabled = conv_pool_dir is not None
+
+    if raw_pool_enabled:
+        raw_pool_sentinels = raw_pool_dir / ".downloaded"
+        raw_pool_sentinels.mkdir(parents=True, exist_ok=True)
+        # Determine transfer mode: symlink (same device) or copy (cross-device).
+        # raw_dir may not exist yet on first run; fall back to parent or DATA_ROOT.
+        _ref_raw = raw_dir if raw_dir.exists() else raw_dir.parent
+        use_symlinks_raw = _same_device(raw_pool_dir, _ref_raw) if raw_pool_dir.exists() and _ref_raw.exists() else False
+
+    if conv_pool_enabled:
+        conv_pool_sentinels = conv_pool_dir / ".converted"
+        conv_pool_sentinels.mkdir(parents=True, exist_ok=True)
+        _ref_out = out_dir if out_dir.exists() else out_dir.parent
+        use_symlinks_conv = _same_device(conv_pool_dir, _ref_out) if conv_pool_dir.exists() and _ref_out.exists() else False
+
+    # --- Level 0: resolve converted pool hits synchronously before threads start ---
+    already_done: set = set()
+    if conv_pool_enabled:
+        for i in tgz_range:
+            converted_sentinel = sentinel_dir / f"{i:03d}.converted"
+            if converted_sentinel.exists():
+                already_done.add(i)
+                continue
+            pool_tar      = conv_pool_dir / f"{i:03d}.tar"
+            pool_sentinel = conv_pool_sentinels / f"{i:03d}"
+            if pool_sentinel.exists() and pool_tar.exists():
+                staging_tar = out_dir / f"{i:03d}.tar"
+                _pool_link_or_copy(pool_tar, staging_tar, use_symlinks_conv)
+                converted_sentinel.touch()
+                already_done.add(i)
+                log_event("download_convert", "conv_pool_hit", chunk=chunk, tgz=i)
+
+    remaining = [i for i in tgz_range if i not in already_done]
+
+    # --- Annotation: download to raw pool (or staging), symlink into staging if needed ---
+    anno_target = raw_pool_dir if raw_pool_enabled else raw_dir
+    download_jdb_annotation(anno_target)
+    if raw_pool_enabled:
+        anno_pool    = raw_pool_dir / "data" / "train" / "train_anno_realease_repath.jsonl.tgz"
+        anno_staging = raw_dir     / "data" / "train" / "train_anno_realease_repath.jsonl.tgz"
+        _pool_link_or_copy(anno_pool, anno_staging, use_symlinks_raw)
+
+    log_orch(f"JDB chunk {chunk} scale={scale}: {len(already_done)} conv-pool hits; "
+             f"download+convert {len(remaining)} tgzs ({start:03d}–{end:03d})")
 
     ready_q: queue.Queue = queue.Queue()
     error_event = threading.Event()
@@ -123,31 +193,49 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
 
     def producer():
         try:
-            for i in tgz_range:
+            for i in remaining:
                 if error_event.is_set():
                     break
-                converted = sentinel_dir / f"{i:03d}.converted"
-                ready     = sentinel_dir / f"{i:03d}.ready"
-                if converted.exists():
-                    log_event("download_convert", "skip", chunk=chunk, tgz=i,
-                              reason="already_converted")
-                    continue
-                if not ready.exists():
-                    cur_tgz[0] = i
-                    log_event("download_convert", "download_start", chunk=chunk, tgz=i)
-                    t0 = time.time()
-                    try:
-                        _hf_download_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
-                        ready.touch()
-                        elapsed = time.time() - t0
-                        log_event("download_convert", "download_done", chunk=chunk, tgz=i,
-                                  elapsed_sec=round(elapsed, 1))
-                    except Exception as e:
-                        log_event("download_convert", "download_error", chunk=chunk, tgz=i,
-                                  error=str(e))
-                        error_event.set()
-                        raise
+                ready = sentinel_dir / f"{i:03d}.ready"
+
+                if raw_pool_enabled:
+                    pool_tgz     = raw_pool_dir / "data" / "train" / "imgs" / f"{i:03d}.tgz"
+                    pool_sentinel = raw_pool_sentinels / f"{i:03d}"
+                    if not pool_sentinel.exists():
+                        cur_tgz[0] = i
+                        log_event("download_convert", "download_start", chunk=chunk, tgz=i)
+                        t0 = time.time()
+                        try:
+                            _hf_download_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_pool_dir))
+                            pool_sentinel.touch()
+                            elapsed = time.time() - t0
+                            log_event("download_convert", "download_done", chunk=chunk, tgz=i,
+                                      elapsed_sec=round(elapsed, 1))
+                        except Exception as e:
+                            log_event("download_convert", "download_error", chunk=chunk, tgz=i,
+                                      error=str(e))
+                            error_event.set()
+                            raise
+                    tgz_staging = raw_dir / "data" / "train" / "imgs" / f"{i:03d}.tgz"
+                    _pool_link_or_copy(pool_tgz, tgz_staging, use_symlinks_raw)
+                else:
+                    if not ready.exists():
+                        cur_tgz[0] = i
+                        log_event("download_convert", "download_start", chunk=chunk, tgz=i)
+                        t0 = time.time()
+                        try:
+                            _hf_download_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
+                            elapsed = time.time() - t0
+                            log_event("download_convert", "download_done", chunk=chunk, tgz=i,
+                                      elapsed_sec=round(elapsed, 1))
+                        except Exception as e:
+                            log_event("download_convert", "download_error", chunk=chunk, tgz=i,
+                                      error=str(e))
+                            error_event.set()
+                            raise
+
                 cur_tgz[0] = None
+                ready.touch()
                 ready_q.put(i)
         finally:
             ready_q.put(None)  # sentinel to stop consumer
@@ -161,15 +249,34 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
                     break
                 if error_event.is_set():
                     continue
-                tgz_path = raw_dir / "data" / "train" / "imgs" / f"{idx:03d}.tgz"
-                converted = sentinel_dir / f"{idx:03d}.converted"
+                tgz_staging = raw_dir / "data" / "train" / "imgs" / f"{idx:03d}.tgz"
+                converted   = sentinel_dir / f"{idx:03d}.converted"
+                staging_tar = out_dir / f"{idx:03d}.tar"
                 try:
-                    _convert_tgz(tgz_path, out_dir, anno_path, chunk, idx)
+                    _convert_tgz(tgz_staging, out_dir, anno_path, chunk, idx)
                     converted.touch()
-                    # Delete raw tgz immediately to free disk
-                    if tgz_path.exists():
-                        tgz_path.unlink()
-                        log_event("download_convert", "raw_deleted", chunk=chunk, tgz=idx)
+
+                    # Write-through to converted pool
+                    if conv_pool_enabled:
+                        pool_tar     = conv_pool_dir / f"{idx:03d}.tar"
+                        conv_sentinel = conv_pool_sentinels / f"{idx:03d}"
+                        if not pool_tar.exists():
+                            pool_tar.parent.mkdir(parents=True, exist_ok=True)
+                            if use_symlinks_conv:
+                                # Same device: move tar to pool; replace staging with symlink
+                                os.replace(staging_tar, pool_tar)
+                                os.symlink(pool_tar.resolve(), staging_tar)
+                            else:
+                                _atomic_copy_file(staging_tar, pool_tar)
+                        conv_sentinel.touch()
+                        log_event("download_convert", "conv_pool_write", chunk=chunk, tgz=idx)
+
+                    # Remove raw tgz staging path; never delete pool file
+                    if tgz_staging.is_symlink() or tgz_staging.exists():
+                        tgz_staging.unlink()
+                        log_event("download_convert",
+                                  "staging_unlinked" if raw_pool_enabled else "raw_deleted",
+                                  chunk=chunk, tgz=idx)
                 except Exception as e:
                     log_event("download_convert", "convert_error", chunk=chunk, tgz=idx,
                               error=str(e))
@@ -180,17 +287,17 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
 
     def heartbeat_loop():
         from downloader import _incomplete_bytes
-        hf_cache   = raw_dir / ".cache" / "huggingface" / "download"
+        hf_cache   = (raw_pool_dir if raw_pool_enabled else raw_dir) / ".cache" / "huggingface" / "download"
         prev_bytes = 0
         prev_ts    = time.time()
         while not done_event.is_set():
-            done_count    = sum(1 for i in tgz_range
-                                if (sentinel_dir / f"{i:03d}.converted").exists())
-            now_bytes     = _incomplete_bytes(hf_cache)
-            now_ts        = time.time()
-            dt            = now_ts - prev_ts
-            delta         = now_bytes - prev_bytes
-            speed_mbps    = round(delta / 1e6 / dt, 1) if dt > 0 and delta > 0 else 0.0
+            done_count = sum(1 for i in tgz_range
+                             if (sentinel_dir / f"{i:03d}.converted").exists())
+            now_bytes  = _incomplete_bytes(hf_cache)
+            now_ts     = time.time()
+            dt         = now_ts - prev_ts
+            delta      = now_bytes - prev_bytes
+            speed_mbps = round(delta / 1e6 / dt, 1) if dt > 0 and delta > 0 else 0.0
             prev_bytes, prev_ts = now_bytes, now_ts
             write_heartbeat("download_convert", chunk=chunk,
                             done=done_count, total=total,
@@ -200,21 +307,22 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
                             dl_speed_mbps=speed_mbps)
             time.sleep(30)
 
-    prod_thread = threading.Thread(target=producer, daemon=True)
-    cons_thread = threading.Thread(target=consumer, daemon=True)
-    hb_thread   = threading.Thread(target=heartbeat_loop, daemon=True)
+    if remaining:
+        prod_thread = threading.Thread(target=producer, daemon=True)
+        cons_thread = threading.Thread(target=consumer, daemon=True)
+        hb_thread   = threading.Thread(target=heartbeat_loop, daemon=True)
 
-    hb_thread.start()
-    prod_thread.start()
-    cons_thread.start()
+        hb_thread.start()
+        prod_thread.start()
+        cons_thread.start()
 
-    prod_thread.join()
-    cons_thread.join()
-    done_event.set()
-    hb_thread.join(timeout=5)  # ensure heartbeat loop exits before final write
+        prod_thread.join()
+        cons_thread.join()
+        done_event.set()
+        hb_thread.join(timeout=5)
 
-    if error_event.is_set():
-        raise RuntimeError(f"JDB download+convert failed for chunk {chunk}")
+        if error_event.is_set():
+            raise RuntimeError(f"JDB download+convert failed for chunk {chunk}")
 
     done_count = sum(1 for i in tgz_range if (sentinel_dir / f"{i:03d}.converted").exists())
     write_heartbeat("download_convert", chunk=chunk, done=done_count, total=total, pct=100)
