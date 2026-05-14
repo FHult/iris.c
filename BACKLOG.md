@@ -111,7 +111,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see TRAIN-6 profiling results above. Measured cost: 4.7× slower than old path (8.38s vs 1.78s/step clean; 19 vs 4 days for 200K steps). Memory: 21.54 GB bwd peak with `block_gradient_checkpointing: true`. Quality comparison vs old path in progress; decision pending results.
 
-3. **Source data curation (PIPELINE-27)** ⛔ blocked on storage — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool) + a large-capacity storage volume (~37 TB for full JDB pool). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
+3. **Source data curation (PIPELINE-27)** ⛔ blocked on PIPELINE-25 — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool); full JDB pool is ~202 tgzs × ~2-3 GB ≈ ~500 GB (well within the 16 TB cold volume). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
 
 4. **QUALITY-10 ablation harness** ✓ Done — running as part of flywheel trial 2 (iters 25, 30, 35, 40).
 
@@ -138,11 +138,11 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
-**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** ⛔ blocked on storage
+**PIPELINE-25: Persistent raw-data pool — decouple download from chunk staging** (unblocked — 16 TB cold volume available at `/Volumes/16TBCold`)
 
 Currently `download_convert.py` downloads each JDB tgz directly into `staging/chunk{N}/raw/journeydb/` and deletes it immediately after conversion. There is no persistent raw pool. Consequences: re-running any scale re-downloads all tgzs even if they were downloaded before; scale changes cause confusion about which tgzs belong to which chunk.
 
-**Storage constraint:** the full JDB dataset is ~25,000 tgzs × ~1.5 GB ≈ ~37 TB. The current 2 TB SSD has ~833 GB free — nowhere near sufficient for a persistent pool of meaningful scale. Implementation requires either a dedicated large-capacity volume (spinning disk, NAS, or additional SSD) or accepting a partial pool (e.g. keep the last N chunks' raw data). The `--pool-dir` override in the design is specifically to allow the pool to live on a separate volume. **This item should not be started until additional storage is available.**
+**Storage:** the full JDB all-in dataset is ~202 tgzs × ~2-3 GB ≈ ~500 GB. `/Volumes/16TBCold` (16 TB spinning disk, mounted 2026-05-14) provides ample space for the full pool. Point `--pool-dir` at `/Volumes/16TBCold/raw/journeydb`.
 
 **Proposed layout:**
 ```
@@ -175,10 +175,10 @@ data_root/
 - `pipeline_lib.py`: add `RAW_POOL_DIR = DATA_ROOT / "raw" / "journeydb"` constant.
 
 
-**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25 + storage
+**PIPELINE-27: Smart precompute shard selection v2** (Low-Medium priority) ⛔ blocked on PIPELINE-25
 
 - Build a performance-aware shard selector that uses eval metrics (CLIP-I, self/cross-ref gap, style loss) to dynamically bias the next chunk toward high-value shards.
-- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool) + additional storage.** Without a persistent pool there is no stable candidate set to select from — each chunk's raw data is currently ephemeral. Both the engineering work (PIPELINE-25) and the physical storage it requires must be in place first.
+- **Hard prerequisite: PIPELINE-25 (persistent raw-data pool).** Without a persistent pool there is no stable candidate set to select from — each chunk's raw data is currently ephemeral. Storage is now unblocked (16 TB cold volume); only the engineering work (PIPELINE-25) must be completed first.
 - **Partial mitigation already in place:** the flywheel's `shard_selector.py` already does performance-attributed shard selection within the fixed precomputed shard pool (scoring shards by cond_gap contribution, applying recency penalty, diversity slots). This operates on shards that have already been precomputed — it biases *which precomputed shards to train on*, not which raw data to download. PIPELINE-27 is the upstream complement: controlling which raw JDB tgzs are downloaded and precomputed in the first place.
 - **Realistic impact:** we are currently training on ~320 of ~50,000 JDB shards. Random selection from that pool already provides wide style diversity; the marginal gain from smarter upstream selection is modest until coverage increases significantly.
 - Output: `shard_scores.json` + weighted sampling logic with configurable quality vs diversity trade-off.
