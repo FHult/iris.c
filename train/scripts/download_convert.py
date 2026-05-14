@@ -17,6 +17,7 @@ Usage:
 import argparse
 import io
 import json
+import os
 import queue
 import sys
 import tarfile
@@ -26,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, STAGING_DIR, TRAIN_DIR, LOG_DIR,
+    DATA_ROOT, STAGING_DIR, TRAIN_DIR, LOG_DIR, COLD_ROOT,
     write_heartbeat, log_event, log_orch, load_config, now_iso,
 )
 from downloader import (
@@ -50,6 +51,53 @@ def _pool_link_or_copy(pool_file: Path, staging_file: Path, use_symlinks: bool) 
         os.symlink(pool_file.resolve(), staging_file)
     else:
         _atomic_copy_file(pool_file, staging_file)
+
+
+# ---------------------------------------------------------------------------
+# Tgz priority ordering
+# ---------------------------------------------------------------------------
+
+def _prioritised_tgz_range(start: int, end: int, config: dict) -> list[int]:
+    """Return a download-priority-ordered list of tgz indices.
+
+    If cold_root/metadata/tgz_scores.json exists, sort tgzs with the highest
+    quality scores first so higher-signal data is available earliest.
+    Falls back to sequential order when no scores file is present (cold start).
+    """
+    sequential = list(range(start, end + 1))
+
+    storage  = config.get("storage", {})
+    cold_root = Path(storage.get("cold_root", COLD_ROOT))
+    scores_file = cold_root / "metadata" / "tgz_scores.json"
+    if not scores_file.exists():
+        return sequential
+
+    try:
+        data = json.loads(scores_file.read_text())
+        tgz_scores_raw = data.get("tgz_scores", {})
+        # tgz_scores keys are strings like "12" → {"score": 0.7, ...}
+        scores: dict[int, float] = {int(k): v["score"] for k, v in tgz_scores_raw.items()
+                                    if isinstance(v, dict) and "score" in v}
+    except (ValueError, OSError, KeyError):
+        return sequential
+
+    # Tgzs in range: sort scored ones desc by score, append unscored at end (sequential)
+    scored = [i for i in sequential if i in scores]
+    unscored = [i for i in sequential if i not in scores]
+    scored.sort(key=lambda i: scores[i], reverse=True)
+    prioritised = scored + unscored
+
+    if prioritised != sequential:
+        log_orch(
+            f"tgz priority: {len(scored)} scored (top={prioritised[0]:03d} "
+            f"score={scores.get(prioritised[0], 0):.4f}), {len(unscored)} unscored",
+            tgz_priority="scored",
+        )
+    else:
+        log_orch("tgz priority: sequential (all unscored or scores match range)",
+                 tgz_priority="sequential")
+
+    return prioritised
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +172,7 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
     """
     ranges = jdb_tgz_ranges(config, scale)
     start, end = ranges[chunk]
-    tgz_range = range(start, end + 1)
+    tgz_range = _prioritised_tgz_range(start, end, config)
     total = len(tgz_range)
 
     raw_dir = STAGING_DIR / f"chunk{chunk}" / "raw" / "journeydb"

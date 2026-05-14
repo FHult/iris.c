@@ -39,6 +39,7 @@ import collections
 import concurrent.futures
 import glob
 import io
+import json
 import math
 import multiprocessing
 import os
@@ -241,13 +242,20 @@ def _write_shard_range(args) -> dict:
             shard_plan[shard_id] = shard_recs
 
     if not shard_plan:
-        return {"written": 0, "skipped": skipped}
+        return {"written": 0, "skipped": skipped, "provenance": {}}
 
     # Build source-shard → [(output_shard_id, rec)] index.
     by_source = collections.defaultdict(list)
     for shard_id, recs in shard_plan.items():
         for rec in recs:
             by_source[rec["shard"]].append((shard_id, rec))
+
+    # Provenance index: output_shard_id → set of contributing source paths.
+    shard_sources: dict[int, set] = {sid: set() for sid in shard_plan}
+    for src_path, items in by_source.items():
+        for shard_id, _ in items:
+            if shard_id in shard_sources:
+                shard_sources[shard_id].add(src_path)
 
     # Stagger source shard order so workers read different files concurrently,
     # spreading I/O across the SSD instead of all hammering the same file.
@@ -380,7 +388,52 @@ def _write_shard_range(args) -> dict:
                     os.replace(tmp_path, final_path)
                     completed_count += 1
 
-    return {"written": total_written, "skipped": skipped}
+    return {"written": total_written, "skipped": skipped,
+            "provenance": {sid: list(paths) for sid, paths in shard_sources.items()}}
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar writing
+# ---------------------------------------------------------------------------
+
+def _classify_source(src_path: str) -> dict:
+    """Classify a source tar path into a provenance source entry."""
+    p = src_path.lower()
+    name = os.path.basename(src_path)
+    stem = os.path.splitext(name)[0]
+    if "journeydb" in p or "jdb" in p:
+        try:
+            tgz_idx = int(stem)
+            return {"type": "jdb", "tgz": tgz_idx, "path": src_path}
+        except ValueError:
+            return {"type": "jdb", "path": src_path}
+    if "wikiart" in p:
+        return {"type": "wikiart", "path": src_path}
+    if "laion" in p:
+        return {"type": "laion", "path": src_path}
+    if "coyo" in p:
+        return {"type": "coyo", "path": src_path}
+    return {"type": "unknown", "path": src_path}
+
+
+def _write_provenance_sidecars(output_dir: str, provenance: dict[int, list[str]]) -> None:
+    """Write shard-NNNNNN.provenance.json alongside each completed output shard."""
+    for shard_id, src_paths in provenance.items():
+        shard_file = os.path.join(output_dir, f"{shard_id:06d}.tar")
+        if not os.path.exists(shard_file):
+            continue  # shard was skipped (already existed on re-run)
+        prov_file = os.path.join(output_dir, f"{shard_id:06d}.provenance.json")
+        sources = [_classify_source(p) for p in sorted(set(src_paths))]
+        data = {
+            "shard_id": f"shard-{shard_id:06d}",
+            "sources":  sources,
+        }
+        try:
+            with open(prov_file, "w") as f:
+                json.dump(data, f)
+        except OSError as e:
+            print(f"Warning: failed to write provenance for shard {shard_id}: {e}",
+                  file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +586,15 @@ def main():
 
     total_written = sum(r["written"] for r in results)
     total_skipped = sum(r["skipped"] for r in results)
+
+    # Merge per-worker provenance dicts and write sidecars.
+    merged_prov: dict[int, list[str]] = {}
+    for r in results:
+        for sid, paths in r.get("provenance", {}).items():
+            merged_prov.setdefault(sid, []).extend(paths)
+    _write_provenance_sidecars(args.output, merged_prov)
+    print(f"  Provenance: wrote sidecars for {len(merged_prov)} shards")
+
     print(f"\nDone.")
     print(f"  Written: {total_written:,} images across {n_shards} shards")
     print(f"  Skipped: {total_skipped:,} (blocklist + invalid + corrupt)")

@@ -461,6 +461,7 @@ class Orchestrator:
             self._delete_staging_raw(chunk)
         if step == "mine":
             notify("iris pipeline", f"Chunk {chunk} hard example mining complete")
+            self._run_shard_scorer(chunk)
             if not is_done(chunk, "archive"):
                 # Archive now that shards are no longer needed for mining.
                 # Chain stage of next chunk so cold→hot transfer starts immediately.
@@ -474,6 +475,22 @@ class Orchestrator:
                 )
         if step in ("train", "mine"):
             update_state(**{"chunks": {str(chunk): {"completed_at": now_iso()}}})
+
+    def _run_shard_scorer(self, chunk: int) -> None:
+        """Run shard_scorer.py in a background subprocess after mine.done (no GPU, <1 min)."""
+        if self.dry_run:
+            return
+        import subprocess
+        cmd = [str(VENV_PYTHON), str(SCRIPTS_DIR / "shard_scorer.py"),
+               "--config", self._config_path()]
+        log_path = LOG_DIR / f"shard_scorer_chunk{chunk}.log"
+        try:
+            with open(log_path, "a") as lf:
+                subprocess.Popen(cmd, stdout=lf, stderr=lf, close_fds=True)
+            log_orch(f"Chunk {chunk}: launched shard_scorer in background", chunk=chunk)
+        except OSError as e:
+            log_orch(f"Chunk {chunk}: failed to launch shard_scorer: {e}", chunk=chunk,
+                     level="warning")
 
     def _delete_staging_raw(self, chunk: int) -> None:
         """Delete staging raw data once shards are built (V2 Section 6 lifecycle)."""

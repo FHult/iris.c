@@ -533,6 +533,54 @@ def _setup_dirs(data_root: Path, dry_run: bool = False) -> tuple[list, list]:
     return created, existing
 
 
+def suggest_tgz_priority(config: dict, chunk: int, scale: str) -> dict:
+    """
+    Read tgz_scores.json and return priority-ordered tgz indices for the given chunk/scale.
+
+    Returns:
+      {"strategy": "scored"|"sequential", "order": [int, ...],
+       "n_scored": int, "n_unscored": int, "top_tgz": int|None}
+    """
+    storage   = config.get("storage", {})
+    cold_root = Path(storage.get("cold_root", "/Volumes/16TBCold"))
+    scores_file = cold_root / "metadata" / "tgz_scores.json"
+
+    # Determine sequential range for this chunk/scale
+    try:
+        from downloader import jdb_tgz_ranges
+        ranges = jdb_tgz_ranges(config, scale)
+        start, end = ranges.get(chunk, (0, 49))
+    except Exception:
+        start, end = 0, 49
+    sequential = list(range(start, end + 1))
+
+    if not scores_file.exists():
+        return {"strategy": "sequential", "order": sequential,
+                "n_scored": 0, "n_unscored": len(sequential), "top_tgz": None}
+
+    try:
+        data = json.loads(scores_file.read_text())
+        raw  = data.get("tgz_scores", {})
+        scores: dict[int, float] = {int(k): v["score"] for k, v in raw.items()
+                                    if isinstance(v, dict) and "score" in v}
+    except (ValueError, OSError, KeyError):
+        return {"strategy": "sequential", "order": sequential,
+                "n_scored": 0, "n_unscored": len(sequential), "top_tgz": None}
+
+    scored   = sorted([i for i in sequential if i in scores],
+                      key=lambda i: scores[i], reverse=True)
+    unscored = [i for i in sequential if i not in scores]
+    order    = scored + unscored
+    return {
+        "strategy":   "scored" if scored else "sequential",
+        "order":      order,
+        "n_scored":   len(scored),
+        "n_unscored": len(unscored),
+        "top_tgz":    scored[0] if scored else None,
+        "top_score":  scores.get(scored[0]) if scored else None,
+    }
+
+
 def _setup_pool_dirs(config: dict, dry_run: bool = False) -> list[str]:
     """Create persistent cold pool dirs when configured.  Returns list of created dirs.
 
