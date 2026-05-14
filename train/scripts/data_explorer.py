@@ -45,12 +45,12 @@ from pipeline_lib import (
     SHARD_SCORES_DB_PATH,
     SHARDS_DIR,
     free_gb,
+    load_config,
     COLD_ROOT,
     COLD_PRECOMPUTE_DIR,
     COLD_WEIGHTS_DIR,
     COLD_METADATA_DIR,
     ABLATION_DB_PATH,
-    RUN_METADATA_FILE,
 )
 
 # Lazy imports — these modules may be absent in minimal environments
@@ -730,7 +730,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     cfg: dict = {}
     if args.config:
         try:
-            cfg = __import__("pipeline_lib").load_config(args.config)
+            cfg = load_config(args.config)
         except FileNotFoundError:
             pass
     storage  = cfg.get("storage", {})
@@ -927,7 +927,7 @@ def _cmd_weights(args: argparse.Namespace) -> int:
     cfg: dict = {}
     if args.config:
         try:
-            cfg = __import__("pipeline_lib").load_config(args.config)
+            cfg = load_config(args.config)
         except FileNotFoundError:
             pass
     cold_root   = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
@@ -1014,7 +1014,7 @@ def _cmd_weights(args: argparse.Namespace) -> int:
 
 def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
     try:
-        cfg = __import__("pipeline_lib").load_config(args.config)
+        cfg = load_config(args.config)
     except FileNotFoundError:
         if args.json:
             _json_print({"ok": False, "error": f"config not found: {args.config}"})
@@ -1157,7 +1157,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     cfg: dict = {}
     if args.config:
         try:
-            cfg = __import__("pipeline_lib").load_config(args.config)
+            cfg = load_config(args.config)
         except FileNotFoundError:
             pass
     cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
@@ -1229,7 +1229,7 @@ def _cmd_maintenance(args: argparse.Namespace) -> int:
     cfg: dict = {}
     if args.config:
         try:
-            cfg = __import__("pipeline_lib").load_config(args.config)
+            cfg = load_config(args.config)
         except FileNotFoundError:
             pass
     cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))

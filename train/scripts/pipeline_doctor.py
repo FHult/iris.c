@@ -1377,8 +1377,7 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
             if hot_ver != cold_ver:
                 _add("WARNING", "cold_storage",
                      f"Cold precompute {encoder} version mismatch: hot={hot_ver} cold={cold_ver}",
-                     detail="Run data_stager.py archive to sync.",
-                     fix="train/.venv/bin/python train/scripts/data_stager.py archive --chunk 0",
+                     detail="Run data_stager.py archive --chunk N (last completed chunk) to sync.",
                      ctx={"encoder": encoder, "hot_ver": hot_ver, "cold_ver": cold_ver})
 
     # PIPELINE-29: stale weights archive (train.done exists but cold weights dir empty)
@@ -1389,11 +1388,13 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
     ) if weights_dir.exists() else False
 
     any_chunk_done = any(is_done(c, "train") for c in chunks)
+    done_chunks = [c for c in chunks if is_done(c, "train")]
     if any_chunk_done and not has_any_campaign:
+        last_done = done_chunks[-1] if done_chunks else 1
         _add("WARNING", "cold_storage",
              "Training chunks completed but no campaign weights on cold storage",
              detail="Run data_stager.py archive to copy checkpoints to cold.",
-             fix="train/.venv/bin/python train/scripts/data_stager.py archive --chunk 0")
+             fix=f"train/.venv/bin/python train/scripts/data_stager.py archive --chunk {last_done}")
 
     # PIPELINE-29: stale metadata DB archive
     hot_shard_db = DATA_ROOT / "shard_scores.db"

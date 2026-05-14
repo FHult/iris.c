@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     DATA_ROOT, load_config, log_event,
     write_heartbeat, mark_done, mark_error, has_error, clear_error,
-    SHARD_BLOCK, RUN_METADATA_FILE,
+    SHARD_BLOCK, RUN_METADATA_FILE, SHARD_SCORES_DB_PATH, ABLATION_DB_PATH,
 )
 
 log = logging.getLogger("data_stager")
@@ -526,8 +526,9 @@ class DataStager:
                 or (metric not in higher_is_better and value < current_best)
             )
             if is_better:
-                _atomic_symlink(best_dir / f"{metric}.safetensors",
-                                str(ckpt_path.resolve()))
+                # Relative symlink so it survives volume remounts.
+                rel_target = os.path.relpath(ckpt_path.resolve(), best_dir)
+                _atomic_symlink(best_dir / f"{metric}.safetensors", rel_target)
                 meta_path.write_text(json.dumps(
                     {"value": value, "path": str(ckpt_path)}, indent=2))
                 log.info("New best %s = %s → %s", metric, value, ckpt_path.name)
@@ -539,8 +540,8 @@ class DataStager:
         write transaction is in progress, but this is acceptable for disaster recovery.
         """
         self._cold_metadata.mkdir(parents=True, exist_ok=True)
-        for db_name in ("shard_scores.db", "ablation_history.db"):
-            src = self.hot_root / db_name
+        for src in (SHARD_SCORES_DB_PATH, ABLATION_DB_PATH):
+            db_name = src.name
             if not src.exists():
                 continue
             dst = self._cold_metadata / db_name
