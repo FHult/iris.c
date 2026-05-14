@@ -193,7 +193,23 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
 
-**PIPELINE-25/25b/26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
+**PIPELINE-25/26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
+
+**PIPELINE-25b: Stream-convert downloads — eliminate raw tgz disk writes** (Low priority, long-term)
+
+Currently `download_convert.py` downloads each JDB tgz to disk, then reads it back for conversion. Since downloads are sequential (one tgz at a time) and tgzs are small enough to hold in memory (~2-3 GB each, well within the 32 GB system RAM), the raw bytes could be streamed directly through `_convert_tgz()` without touching disk at all.
+
+**When applicable:** only when `raw_pool_root` is not configured (i.e. no persistent raw pool needed). If the raw pool is enabled, the tgz must land on disk anyway. This optimisation targets the no-pool path or cases where the caller explicitly opts out of raw storage.
+
+**How it would work:**
+- `hf_hub_download()` supports a streaming/file-object mode; alternatively, download to a `tempfile.SpooledTemporaryFile` in memory.
+- Pass the in-memory buffer directly to `tarfile.open(fileobj=buf, mode="r:gz")` inside `_convert_tgz()`.
+- WebDataset output tar is written to disk as today (it is the persistent artifact).
+- Eliminates one full disk write + one full disk read per tgz; saves ~2-3 GB × N tgzs of I/O.
+
+**Constraint:** HuggingFace's `hf_hub_download` API always writes to a local path; would need to switch to `huggingface_hub.file_download.http_get()` or `requests` + streaming response to avoid the intermediate file. Alternatively, download to a RAM-backed tmpfs (`/dev/shm` on Linux; macOS has no equivalent — would need to use `tempfile` with a memory-sized cap). Investigate feasibility before committing to this path.
+
+**Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
 
 ---
 
