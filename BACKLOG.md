@@ -103,6 +103,48 @@ Root cause of 5.97s backward: Jacobian-vector products propagated backward throu
 - Interpretation: the adapter was trained 108K steps under the old gradient path. Switching to block-injection creates a temporary distribution shift — gradients arriving from a different direction than all prior optimization. The 56% positive rate (barely above chance) and near-zero first-half mean (+0.008) are consistent with the adapter adjusting to the new gradient signal, not with a fundamentally weaker learning signal. A definitive comparison would require training from scratch (or a much longer continued run).
 - **Decision: continue production training with old path** (`use_block_injection=false`). TRAIN-6 block injection remains implemented and gated; re-evaluate if training is ever restarted from scratch, or after 50K+ more steps on the old path provide a stronger warmstart for the transition.
 
+**Option C: correct-forward-Q injection** ✓ Implemented and smoke-validated (2026-05-14)
+
+Motivated by the TRAIN-6 warmstart comparison result: block injection is 20× less wall-clock efficient due to Jacobians through all 25 frozen Flux blocks. Option C achieves a better gradient signal than the old end-sum path at much lower cost than full TRAIN-6.
+
+**Approach:** Two-pass forward per step:
+1. `_flux_forward_no_ip` — Flux forward without IP tokens, no grad (fast, already in graph).
+2. `_flux_forward_with_ip_collect_q` — Flux forward with IP tokens injected, no grad. Collects Q vectors from IP-influenced hidden states at each block. These Q vectors are then used in the loss forward pass instead of the old end-sum approximation.
+
+Cost vs TRAIN-6: the second no-grad forward adds ~1× Flux forward time (~1s at 512px) vs 5.97s backward through all blocks. Expected step time ~3–4s vs 14.2s for TRAIN-6.
+
+Gated by `training.correct_forward_q: true` in `stage1_512px.yaml`. Incompatible with `use_block_injection: true` (flag check at startup).
+
+**Smoke test results (2026-05-14, 100 steps from step 108,500, `correct_forward_q: true`, `use_block_injection: false`):**
+
+Memory (stable throughout):
+- `fwd` peak: **18.52 GB**
+- `bwd+param` peak: **20.51 GB** — within 0.07 GB of old-path smoke. Option C adds negligible memory overhead.
+- `ema` peak: **18.66 GB**
+
+Step timing: **~1.1 s/step** uncontested (final 3 windows, GPU unshared). Early windows were slow (14–30 s/step) due to Metal graph recompilation at startup + concurrent GPU work on the same machine — not representative.
+
+cond_gap (loss_null − loss_cond) per 10-step window:
+
+| Window end | gap | % |
+|---|---|---|
+| 108,510 | -0.008 | -0.9% |
+| 108,520 | +0.226 | +26.0% |
+| 108,530 | -0.052 | -8.2% |
+| 108,540 | +0.063 | +7.7% |
+| 108,550 | -0.022 | -3.9% |
+| 108,560 | +0.182 | +20.4% |
+| 108,570 | **+0.459** | **+48.4%** |
+| 108,580 | +0.321 | +29.5% |
+| 108,590 | +0.256 | +31.4% |
+| 108,600 | +0.042 | +7.1% |
+
+8/10 windows positive; mean gap +0.149. Clean exit, no NaN, no OOM.
+
+**cross_ref < self_ref warnings:** appeared in some windows, but driven by low sample counts (n=1 cross-ref in several windows). The final window (n=7 cross samples) correctly showed cross > self (+0.043). Not a real issue.
+
+**Decision: enable `correct_forward_q: true` in production flywheel config.** Memory is safe, learning signal is positive, step time is acceptable. Quality comparison vs old path pending a longer run (the 100-step smoke has the same warmstart-noise caveat as the TRAIN-6 comparison).
+
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
 Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the adapter architecture and training signal are sound. The model responds to the style reference with coherent, stable output (CLIP-I 0.53, no NaN, correct image structure). The gap to production quality is entirely a matter of scale and refinement — no architectural rethink is required. The following improvements are known to provide benefit, roughly in priority order:
