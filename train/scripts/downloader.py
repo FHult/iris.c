@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, STAGING_DIR, TRAIN_DIR, LOG_DIR,
+    DATA_ROOT, STAGING_DIR, TRAIN_DIR, LOG_DIR, HF_CACHE_DIR,
     write_heartbeat, log_event, log_orch, load_config, now_iso,
 )
 
@@ -216,9 +216,9 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
         return
 
     log_orch(f"WikiArt chunk {chunk}: downloading from HuggingFace ({WIKIART_REPO})")
-    hf_cache_dir = STAGING_DIR / "hf_cache"
+    hf_cache_dir = HF_CACHE_DIR / "datasets"
     os.environ.setdefault("HF_DATASETS_CACHE", str(hf_cache_dir))
-    os.environ.setdefault("HF_HOME", str(STAGING_DIR / "hf_home"))
+    os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 
     # Pre-count total parquet files for progress tracking
     try:

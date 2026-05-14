@@ -39,6 +39,8 @@ CKPT_DIR          = DATA_ROOT / "checkpoints" / "stage1"
 CKPT_ARCHIVE_DIR  = DATA_ROOT / "checkpoints" / "stage1" / "archive"
 RAW_POOL_DIR       = DATA_ROOT / "raw" / "journeydb"
 CONVERTED_POOL_DIR = DATA_ROOT / "converted" / "journeydb"
+# HuggingFace cache lives on cold storage; ~/.cache/huggingface symlinks here.
+HF_CACHE_DIR = Path("/Volumes/16TBCold/hf_cache")
 GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 RUN_METADATA_FILE = DATA_ROOT / "run_metadata.json"
 
