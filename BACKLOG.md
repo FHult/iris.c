@@ -128,138 +128,20 @@ Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically 
 
 ## Training & Model Quality
 
-**TRAIN-5: Memory reduction + gradient checkpointing infrastructure** (Medium priority, prerequisite for TRAIN-6)
-
-**Background:** The original framing ("gradient checkpointing saves memory on frozen Flux blocks") is wrong. `mx.checkpoint` only affects backward passes, and Flux is frozen — there is no backward through it. The real value of TRAIN-5 is (a) modest near-term savings via structural fixes, and (b) building the infrastructure that TRAIN-6 needs.
-
-**Stage 0 — Per-fence profiling ✓ Done (2026-05-13):**
-Measured at step 108k, 512px, 4× stable intervals of 100 steps each:
-- fwd  (Flux forward + noisy/target): **16.97 GB** — below steady-state active; Flux streams blocks cleanly
-- bwd  (adapter backward + optimizer m/v state): **20.44 GB** — peak; +3.47 GB above steady state
-- param (adapter params from concrete m/v): **20.44 GB** — same as bwd; `mx.clear_cache()` between fences not releasing optimizer state before Fence 2
-- ema  (EMA update): **18.58 GB** — +1.61 GB above steady state
-- Steady-state active: 17.96 GB; system peak: **20.44 GB** (not the ~25.93 GB estimated earlier — 11.5 GB headroom on 32 GB)
-
-**Revised memory breakdown (measured):**
-- Steady-state active: ~17.96 GB (Flux weights + adapter + optimizer state + MLX cache pool)
-- Flux forward transient: negligible (streams below steady state at 16.97 GB)
-- Optimizer m/v alloc during backward: +~2.5 GB (brings bwd to 20.44 GB)
-- EMA update: +~0.6 GB above steady state
-
-**Stage 1 — Parked** (low urgency given 11.5 GB headroom; revisit if memory becomes tight).
-
-**Stage 2 — Parked** (low urgency given 11.5 GB headroom; revisit if memory becomes tight).
-
-**Stage 3 — Block checkpoint infrastructure ✓ Done (2026-05-13):**
-- `block_gradient_checkpointing: false` flag added to `adapter:` section of `stage1_512px.yaml`.
-- When enabled: pre-builds `ckpt_double` / `ckpt_single` by wrapping each Flux block with `mx.checkpoint(block)`. These are passed into `_flux_forward_with_ip` (already had the lookup wired).
-- Zero cost when disabled. Zero runtime cost with current `_flux_forward_no_ip` path even when enabled (lists built once at startup, never referenced). Recompute overhead only activates when TRAIN-6 switches to `_flux_forward_with_ip`.
-- Revised memory estimate for TRAIN-6 (based on measured 20.44 GB peak): 25 blocks × ~75 MB ≈ +1.9 GB → expected TRAIN-6 peak ~22–23 GB. Checkpointing likely not required on 32 GB but available as a fallback if actual measurement exceeds estimate.
-
-**TRAIN-5 complete. Next: TRAIN-6.**
-
-**TRAIN-6: Retrain IP-adapter with block-by-block injection** ✓ Done (2026-05-13)
-- Implemented `loss_fn_with_ip` / `compiled_step_with_ip` calling `_flux_forward_with_ip` inside `nn.value_and_grad`. Eliminates the train/inference mismatch of the end-sum approximation.
-- Gated by `training.use_block_injection: true` in `stage1_512px.yaml` (enabled). Original split-forward path preserved under `false`.
-- `n_grad_steps_per_fwd` forced to 1 when enabled (Q vectors not reusable across steps).
-- `block_gradient_checkpointing: true` required on 32 GB (measured peak 45 GB without it; 21.54 GB with it).
-
-**TRAIN-6 smoke + profiling results (2026-05-13):**
-
-Memory (with `block_gradient_checkpointing: true`, 100-step smoke from step 108500):
-- `bwd+param` peak: **21.54 GB** — 10 GB headroom on 32 GB. Clean run, no NaN.
-- `fwd` peak: 0 GB (grad-free fence not used in block injection path).
-
-Step timing profiled via `/tmp/profile_train6.py` (512×512, synthetic batch, 5 reps):
-
-| Component | Time | % of step |
-|-----------|------|-----------|
-| Flux forward (no IP, old path) | 1.035s | — |
-| Old adapter backward (end-sum) | 0.372s | — |
-| **Old full step** | **1.78s** | baseline |
-| Flux forward (with IP) | 2.033s | 24% |
-| Backward (checkpoint recompute + Jacobians) | 5.973s | 71% |
-| Optimizer (AdamW) | 0.376s | 5% |
-| **TRAIN-6 full step (clean profiler)** | **8.38s** | **4.7× slower** |
-| Smoke measured (with style loss + EMA + overhead) | 14.2s | — |
-
-Root cause of 5.97s backward: Jacobian-vector products propagated backward through all 25 frozen Flux blocks (5 double + 20 single). With `mx.checkpoint`, each block is recomputed once during backward (+~2s recompute), then its Jacobian is applied (+~4s). Increasing to K blocks adds K/25 × 5.97s to the backward.
-
-**Speed at production scale:**
-- 200K steps (chunk 1) at profiler rate: **~466h ≈ 19.4 days**
-- 200K steps at smoke rate (14.2s/step): **~789h ≈ 32.9 days**
-- Old path (use_block_injection=false) at profiler rate: **~99h ≈ 4.1 days**
-
-**Key constraint**: the 5.97s backward is irreducible given the current architecture. Any approach that breaks the hidden_states chain (stop_gradient between blocks) reduces gradient to zero for all but the last block, because Q is already stop_gradient'd — the only path from loss to k_ip[i] is through the Flux block Jacobians.
-
-**TRAIN-6 gradient strategy comparison** ✓ Done (2026-05-13):
-- 500-step warmstart comparison from step 108500. Metric: cond_gap (loss_null − loss_cond) per 10-step window.
-
-| Path | n | mean_gap | positive% | first-half | last-half |
-|------|---|----------|-----------|------------|-----------|
-| Old (end-sum, `use_block_injection=false`) | 49 | **+0.334** | **82%** | +0.266 | +0.401 |
-| Full TRAIN-6 (`use_block_injection=true`) | 50 | +0.076 | 56% | +0.008 | +0.145 |
-
-- Old path: 4.4× higher mean cond_gap and 4.7× faster per step ≈ **~20× better wall-clock efficiency** at this warmstart.
-- Interpretation: the adapter was trained 108K steps under the old gradient path. Switching to block-injection creates a temporary distribution shift — gradients arriving from a different direction than all prior optimization. The 56% positive rate (barely above chance) and near-zero first-half mean (+0.008) are consistent with the adapter adjusting to the new gradient signal, not with a fundamentally weaker learning signal. A definitive comparison would require training from scratch (or a much longer continued run).
-- **Decision: continue production training with old path** (`use_block_injection=false`). TRAIN-6 block injection remains implemented and gated; re-evaluate if training is ever restarted from scratch, or after 50K+ more steps on the old path provide a stronger warmstart for the transition.
-
-**Option C: correct-forward-Q injection** ✓ Implemented and smoke-validated (2026-05-14)
-
-Motivated by the TRAIN-6 warmstart comparison result: block injection is 20× less wall-clock efficient due to Jacobians through all 25 frozen Flux blocks. Option C achieves a better gradient signal than the old end-sum path at much lower cost than full TRAIN-6.
-
-**Approach:** Two-pass forward per step:
-1. `_flux_forward_no_ip` — Flux forward without IP tokens, no grad (fast, already in graph).
-2. `_flux_forward_with_ip_collect_q` — Flux forward with IP tokens injected, no grad. Collects Q vectors from IP-influenced hidden states at each block. These Q vectors are then used in the loss forward pass instead of the old end-sum approximation.
-
-Cost vs TRAIN-6: the second no-grad forward adds ~1× Flux forward time (~1s at 512px) vs 5.97s backward through all blocks. Expected step time ~3–4s vs 14.2s for TRAIN-6.
-
-Gated by `training.correct_forward_q: true` in `stage1_512px.yaml`. Incompatible with `use_block_injection: true` (flag check at startup).
-
-**Smoke test results (2026-05-14, 100 steps from step 108,500, `correct_forward_q: true`, `use_block_injection: false`):**
-
-Memory (stable throughout):
-- `fwd` peak: **18.52 GB**
-- `bwd+param` peak: **20.51 GB** — within 0.07 GB of old-path smoke. Option C adds negligible memory overhead.
-- `ema` peak: **18.66 GB**
-
-Step timing: **~1.1 s/step** uncontested (final 3 windows, GPU unshared). Early windows were slow (14–30 s/step) due to Metal graph recompilation at startup + concurrent GPU work on the same machine — not representative.
-
-cond_gap (loss_null − loss_cond) per 10-step window:
-
-| Window end | gap | % |
-|---|---|---|
-| 108,510 | -0.008 | -0.9% |
-| 108,520 | +0.226 | +26.0% |
-| 108,530 | -0.052 | -8.2% |
-| 108,540 | +0.063 | +7.7% |
-| 108,550 | -0.022 | -3.9% |
-| 108,560 | +0.182 | +20.4% |
-| 108,570 | **+0.459** | **+48.4%** |
-| 108,580 | +0.321 | +29.5% |
-| 108,590 | +0.256 | +31.4% |
-| 108,600 | +0.042 | +7.1% |
-
-8/10 windows positive; mean gap +0.149. Clean exit, no NaN, no OOM.
-
-**cross_ref < self_ref warnings:** appeared in some windows, but driven by low sample counts (n=1 cross-ref in several windows). The final window (n=7 cross samples) correctly showed cross > self (+0.043). Not a real issue.
-
-**Decision: enable `correct_forward_q: true` in production flywheel config.** Memory is safe, learning signal is positive, step time is acceptable. Quality comparison vs old path pending a longer run (the 100-step smoke has the same warmstart-noise caveat as the TRAIN-6 comparison).
-
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
 Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the adapter architecture and training signal are sound. The model responds to the style reference with coherent, stable output (CLIP-I 0.53, no NaN, correct image structure). The gap to production quality is entirely a matter of scale and refinement — no architectural rethink is required. The following improvements are known to provide benefit, roughly in priority order:
 
 1. **Larger resolution + more training steps** — the v1 run was a `--small` configuration. Higher resolution (1024px) exposes finer style features to the SigLIP encoder; more steps allow the PerceiverResampler and K/V projections to build a richer style space. Expected CLIP-I gain: +0.05–0.10. **Note (32 GB):** 1024px training on 4B Flux currently peaks at ~26 GB at 512px; 1024px roughly doubles the sequence length (256→1024 image tokens), which increases attention memory. Feasibility needs a short profiling run before committing to a full 1024px flywheel.
 
-2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see TRAIN-6 profiling results above. Measured cost: 4.7× slower than old path (8.38s vs 1.78s/step clean; 19 vs 4 days for 200K steps). Memory: 21.54 GB bwd peak with `block_gradient_checkpointing: true`. Quality comparison vs old path in progress; decision pending results.
+2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see COMPLETED_BACKLOG.md. Cost: 4.7× slower than old path (8.38s vs 1.78s/step clean), 21.54 GB bwd peak. Decision: gated off; re-evaluate for from-scratch runs. Option C (correct_forward_q) is the active production path.
 
-3. **Source data curation (PIPELINE-27)** ⛔ blocked on PIPELINE-25 — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool); full JDB pool is ~202 tgzs × ~2-3 GB ≈ ~500 GB (well within the 16 TB cold volume). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on. That distinction matters: the flywheel is already doing the tractable part of curation.
+3. **Source data curation (PIPELINE-27)** ⛔ blocked on PIPELINE-25 — over time, bias shard selection toward high-signal style examples (diverse, distinctive styles; high self/cross-ref gap; low redundancy). Requires PIPELINE-25 (persistent raw pool); full JDB pool is ~202 tgzs × ~2-3 GB ≈ ~500 GB (well within the 16 TB cold volume). **Note:** the flywheel's `shard_selector.py` already does performance-attributed selection within the fixed precomputed pool — this item is about upstream control of which raw data gets downloaded and precomputed, not which precomputed shards to train on.
 
-4. **QUALITY-10 ablation harness** ✓ Done — running as part of flywheel trial 2 (iters 25, 30, 35, 40).
+4. **QUALITY-10 ablation harness** ✓ Done — see COMPLETED_BACKLOG.md.
 
-**References:** TRAIN-6 (block-by-block injection), PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite).
-**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — implemented, gated. Item 3 (PIPELINE-27) — unblocked on storage, blocked on PIPELINE-25 engineering. Item 4 (QUALITY-10) — done.
+**References:** PIPELINE-27 (data curation), PIPELINE-25 (raw pool prerequisite).
+**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — unblocked on storage, blocked on PIPELINE-25 engineering. Item 4 (QUALITY-10) — done.
 
 ---
 
