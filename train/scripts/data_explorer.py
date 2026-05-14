@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Path constants (mirrors pipeline_lib)
@@ -42,6 +45,12 @@ from pipeline_lib import (
     SHARD_SCORES_DB_PATH,
     SHARDS_DIR,
     free_gb,
+    COLD_ROOT,
+    COLD_PRECOMPUTE_DIR,
+    COLD_WEIGHTS_DIR,
+    COLD_METADATA_DIR,
+    ABLATION_DB_PATH,
+    RUN_METADATA_FILE,
 )
 
 # Lazy imports — these modules may be absent in minimal environments
@@ -666,10 +675,746 @@ def render_html(ov: dict, top_shards: list[dict], weights: list[dict], cov: dict
 
 
 # ---------------------------------------------------------------------------
+# Cold storage subcommand interface (PIPELINE-28)
+# Subcommands: status, shards, weights, suggest-warmstart,
+#              ablation, compare, maintenance
+# ---------------------------------------------------------------------------
+
+def _free_gb_cold(path: Path) -> Optional[float]:
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / (1024 ** 3)
+    except OSError:
+        return None
+
+
+def _col_table(rows: list[list[str]], headers: list[str], min_width: int = 6) -> str:
+    """Simple fixed-width column formatter — no external deps."""
+    all_rows = [headers] + rows
+    widths = [max(len(str(cell)) for cell in col) for col in zip(*all_rows)]
+    widths = [max(w, min_width) for w in widths]
+    sep = "  ".join("-" * w for w in widths)
+    lines = []
+    for i, row in enumerate(all_rows):
+        lines.append("  ".join(str(cell).ljust(w) for cell, w in zip(row, widths)))
+        if i == 0:
+            lines.append(sep)
+    return "\n".join(lines)
+
+
+def _open_ro_db(path: Path) -> Optional[sqlite3.Connection]:
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _list_campaigns(weights_dir: Path) -> list[Path]:
+    if not weights_dir.exists():
+        return []
+    return sorted(p for p in weights_dir.iterdir()
+                  if p.is_dir() and p.name.startswith("flywheel-"))
+
+
+def _json_print(data: Any) -> None:
+    print(json.dumps(data, indent=2, default=str))
+
+
+# ── status ─────────────────────────────────────────────────────────────────
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    cfg: dict = {}
+    if args.config:
+        try:
+            cfg = __import__("pipeline_lib").load_config(args.config)
+        except FileNotFoundError:
+            pass
+    storage  = cfg.get("storage", {})
+    cold_root = Path(storage.get("cold_root", COLD_ROOT))
+    hot_root  = Path(storage.get("hot_root",  DATA_ROOT))
+
+    cold_free = _free_gb_cold(cold_root) if cold_root.exists() else None
+    hot_free  = _free_gb_cold(hot_root)  if hot_root.exists()  else None
+
+    # Pools
+    def _pool_count(root: Optional[str], sub: str) -> Optional[int]:
+        if not root:
+            return None
+        p = Path(root) / sub
+        return sum(1 for _ in p.iterdir()) if p.exists() else 0
+
+    raw_pool_root  = storage.get("raw_pool_root")
+    conv_pool_root = storage.get("converted_pool_root")
+
+    # Precompute (cold)
+    cold_precomp: dict = {}
+    cold_precomp_dir = cold_root / "precomputed"
+    if cold_root.exists():
+        for enc in ("qwen3", "vae", "siglip"):
+            cur = cold_precomp_dir / enc / "current"
+            if cur.is_symlink():
+                ver = os.path.basename(os.readlink(str(cur)))
+                mf_path = cold_precomp_dir / enc / ver / "manifest.json"
+                entry: dict[str, Any] = {"version": ver}
+                if mf_path.exists():
+                    try:
+                        m = json.loads(mf_path.read_text())
+                        entry["complete"] = m.get("complete", False)
+                        entry["records"]  = m.get("records",  0)
+                    except (ValueError, OSError):
+                        pass
+                cold_precomp[enc] = entry
+
+    # Weights
+    cold_weights = cold_root / "weights"
+    campaigns = _list_campaigns(cold_weights)
+    latest_steps = 0
+    if campaigns:
+        latest_steps = sum(
+            1 for f in campaigns[-1].iterdir()
+            if f.suffix == ".safetensors" and f.stem != "final"
+        )
+
+    # DBs
+    def _db_info(path: Path, table: str) -> dict:
+        if not path.exists():
+            return {"rows": None, "age_h": None}
+        conn = _open_ro_db(path)
+        rows = None
+        if conn:
+            try:
+                rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.Error:
+                pass
+            conn.close()
+        age = round((datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600, 1)
+        return {"rows": rows, "age_h": age}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "disk": {
+            "cold_free_gb": round(cold_free, 1) if cold_free is not None else None,
+            "hot_free_gb":  round(hot_free,  1) if hot_free  is not None else None,
+        },
+        "pools": {
+            "raw_pool":       {"root": raw_pool_root,  "downloaded": _pool_count(raw_pool_root,  ".downloaded")},
+            "converted_pool": {"root": conv_pool_root, "converted":  _pool_count(conv_pool_root, ".converted")},
+        },
+        "cold_precompute": cold_precomp,
+        "weights": {
+            "campaign_count":  len(campaigns),
+            "latest_campaign": campaigns[-1].name.replace("flywheel-", "") if campaigns else None,
+            "latest_steps":    latest_steps,
+        },
+        "databases": {
+            "shard_scores":     _db_info(COLD_METADATA_DIR / "shard_scores.db"     if (COLD_METADATA_DIR / "shard_scores.db").exists()     else SHARD_SCORES_DB_PATH, "shards"),
+            "ablation_history": _db_info(COLD_METADATA_DIR / "ablation_history.db" if (COLD_METADATA_DIR / "ablation_history.db").exists() else ABLATION_DB_PATH,      "experiments"),
+        },
+    }
+
+    if args.json:
+        _json_print(result)
+        return 0
+
+    print(f"\n{'─'*52}")
+    print(" data_explorer — pipeline cold storage status")
+    print(f"{'─'*52}")
+    d = result["disk"]
+    cold_str = f"{d['cold_free_gb']:.1f} GB free" if d["cold_free_gb"] is not None else "not mounted"
+    hot_str  = f"{d['hot_free_gb']:.1f} GB free"  if d["hot_free_gb"]  is not None else "unavailable"
+    print(f"\n  Disk       cold={cold_str}  hot={hot_str}")
+
+    rp = result["pools"]["raw_pool"]
+    cp = result["pools"]["converted_pool"]
+    rp_str = f"{rp['downloaded']} downloaded" if rp["downloaded"] is not None else "not configured"
+    cp_str = f"{cp['converted']} converted"   if cp["converted"]  is not None else "not configured"
+    print(f"  Pools      raw={rp_str}  converted={cp_str}")
+
+    if cold_precomp:
+        print(f"\n  Precompute (cold):")
+        for enc, info in cold_precomp.items():
+            ver  = info.get("version", "?")
+            comp = "complete" if info.get("complete") else "partial"
+            rec  = f"{info.get('records', 0):,}"
+            print(f"    {enc:<8}  {ver}  {comp}  {rec} records")
+    else:
+        print("\n  Precompute (cold): none archived yet")
+
+    w = result["weights"]
+    print(f"\n  Weights    {w['campaign_count']} campaign(s)", end="")
+    if w["latest_campaign"]:
+        print(f"  latest={w['latest_campaign']}  steps={w['latest_steps']}", end="")
+    print()
+
+    print(f"\n  Databases:")
+    for name, info in result["databases"].items():
+        rows = info["rows"]
+        age  = info["age_h"]
+        rs = f"{rows:,}" if rows is not None else "—"
+        ag = f"{age}h ago" if age is not None else "—"
+        print(f"    {name:<20}  {rs:>8} rows  updated {ag}")
+    print()
+    return 0
+
+
+# ── shards ──────────────────────────────────────────────────────────────────
+
+def _cmd_shards(args: argparse.Namespace) -> int:
+    cold_db = COLD_METADATA_DIR / "shard_scores.db"
+    db_path = cold_db if cold_db.exists() else SHARD_SCORES_DB_PATH
+    conn = _open_ro_db(db_path)
+    if conn is None:
+        if args.json:
+            _json_print({"ok": False, "error": "shard_scores.db not found", "shards": []})
+        else:
+            print("shard_scores.db not found — run flywheel first")
+        return 0
+
+    valid = {"effective_score", "composite_score", "n_scored"}
+    sort_col = args.sort if args.sort in valid else "effective_score"
+    top_n = args.top if args.top > 0 else 20
+
+    try:
+        rows = conn.execute(f"""
+            SELECT shard_id, effective_score, composite_score, n_scored,
+                   score_ckpt_iter, cond_gap_mean, ref_gap_mean
+            FROM shards
+            ORDER BY {sort_col} DESC NULLS LAST
+            LIMIT ?
+        """, (top_n,)).fetchall()
+    except sqlite3.Error as e:
+        conn.close()
+        if args.json:
+            _json_print({"ok": False, "error": str(e), "shards": []})
+        else:
+            print(f"DB error: {e}")
+        return 1
+    conn.close()
+
+    data = [dict(r) for r in rows]
+    if args.json:
+        _json_print({"ok": True, "sort": sort_col, "db": str(db_path), "shards": data})
+        return 0
+
+    if not data:
+        print("No shards in database.")
+        return 0
+
+    table_rows = []
+    for r in data:
+        eff   = f"{r['effective_score']:.4f}" if r["effective_score"] is not None else "—"
+        comp  = f"{r['composite_score']:.4f}" if r["composite_score"] is not None else "—"
+        n     = str(r["n_scored"] or 0)
+        ckpt  = str(r["score_ckpt_iter"]  or "—")
+        cg    = f"{r['cond_gap_mean']:.4f}" if r["cond_gap_mean"] is not None else "—"
+        rg    = f"{r['ref_gap_mean']:.4f}"  if r["ref_gap_mean"]  is not None else "—"
+        table_rows.append([r["shard_id"], eff, comp, cg, rg, n, ckpt])
+
+    print(f"\n  {db_path}  (sorted by {sort_col}, top {len(data)})\n")
+    print(_col_table(table_rows,
+                     ["shard_id", "eff_score", "comp_score", "cond_gap_mean", "ref_gap_mean", "n_scored", "ckpt_iter"]))
+    print()
+    return 0
+
+
+# ── weights ─────────────────────────────────────────────────────────────────
+
+def _cmd_weights(args: argparse.Namespace) -> int:
+    cfg: dict = {}
+    if args.config:
+        try:
+            cfg = __import__("pipeline_lib").load_config(args.config)
+        except FileNotFoundError:
+            pass
+    cold_root   = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
+    cold_weights = cold_root / "weights"
+    campaigns   = _list_campaigns(cold_weights)
+
+    if args.campaign:
+        campaigns = [c for c in campaigns if c.name == f"flywheel-{args.campaign}"]
+        if not campaigns:
+            if args.json:
+                _json_print({"ok": False, "error": f"campaign {args.campaign} not found"})
+            else:
+                print(f"Campaign flywheel-{args.campaign} not found.")
+            return 1
+
+    result_list = []
+    for camp in campaigns:
+        safetensors = sorted(f for f in camp.iterdir()
+                             if f.suffix == ".safetensors" and f.stem != "final")
+        steps = []
+        for sf in safetensors:
+            j = sf.with_suffix(".json")
+            meta: dict = {}
+            if j.exists():
+                try:
+                    meta = json.loads(j.read_text())
+                except (ValueError, OSError):
+                    pass
+            steps.append({"name": sf.name, **meta})
+
+        best_links: dict = {}
+        best_dir = cold_weights / "best"
+        if best_dir.exists():
+            for lnk in best_dir.iterdir():
+                if lnk.suffix == ".safetensors" and lnk.is_symlink():
+                    try:
+                        resolved = (best_dir / os.readlink(str(lnk))).resolve()
+                        if resolved.parent == camp.resolve():
+                            best_links[lnk.stem] = resolved.name
+                    except OSError:
+                        pass
+
+        result_list.append({
+            "campaign":   camp.name,
+            "date":       camp.name.replace("flywheel-", ""),
+            "step_count": len(steps),
+            "steps":      steps if args.campaign else [],
+            "best_for":   best_links,
+        })
+
+    if args.json:
+        _json_print({"ok": True, "campaigns": result_list})
+        return 0
+
+    if not result_list:
+        print("No weight campaigns found in cold storage.")
+        return 0
+
+    if args.campaign and result_list:
+        camp = result_list[0]
+        print(f"\n  Campaign: {camp['campaign']}  steps={camp['step_count']}")
+        if camp["best_for"]:
+            print(f"  Best-for: {', '.join(f'{k}={v}' for k,v in camp['best_for'].items())}")
+        if camp["steps"]:
+            rows = []
+            for s in camp["steps"]:
+                cg = f"{s['cond_gap']:.4f}" if "cond_gap" in s else "—"
+                rg = f"{s['ref_gap']:.4f}"  if "ref_gap"  in s else "—"
+                ci = f"{s['clip_i']:.4f}"   if "clip_i"   in s else "—"
+                rows.append([s["name"], cg, rg, ci])
+            print()
+            print(_col_table(rows, ["checkpoint", "cond_gap", "ref_gap", "clip_i"]))
+        print()
+    else:
+        rows = [[c["campaign"], str(c["step_count"]),
+                 ", ".join(c["best_for"].keys()) or "—"] for c in result_list]
+        print(f"\n  Weight archive — {cold_weights}\n")
+        print(_col_table(rows, ["campaign", "steps", "best_for"]))
+        print()
+    return 0
+
+
+# ── suggest-warmstart ────────────────────────────────────────────────────────
+
+def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
+    try:
+        cfg = __import__("pipeline_lib").load_config(args.config)
+    except FileNotFoundError:
+        if args.json:
+            _json_print({"ok": False, "error": f"config not found: {args.config}"})
+        else:
+            print(f"Config not found: {args.config}")
+        return 1
+
+    cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
+    cold_weights = cold_root / "weights"
+    campaigns    = _list_campaigns(cold_weights)
+
+    if not campaigns:
+        r = {"ok": True, "recommendation": "train_from_scratch",
+             "reason": "No archived weights found."}
+        _json_print(r) if args.json else print("Recommendation: train from scratch (no archived weights).")
+        return 0
+
+    best: Optional[dict] = None
+    for camp in reversed(campaigns):
+        for sf in sorted(camp.iterdir()):
+            if sf.suffix != ".safetensors" or sf.stem == "final":
+                continue
+            j = sf.with_suffix(".json")
+            if not j.exists():
+                continue
+            try:
+                meta = json.loads(j.read_text())
+            except (ValueError, OSError):
+                continue
+            cg = meta.get("cond_gap")
+            if cg is None:
+                continue
+            if best is None or cg > best["cond_gap"]:
+                best = {"cond_gap": cg, "path": str(sf),
+                        "campaign": camp.name, "meta": meta}
+
+    if best is None:
+        r = {"ok": True, "recommendation": "train_from_scratch",
+             "reason": "No checkpoints with cond_gap metrics found."}
+        _json_print(r) if args.json else print("Recommendation: train from scratch (no scored checkpoints).")
+        return 0
+
+    result = {
+        "ok":             True,
+        "recommendation": "warmstart",
+        "warmstart_path": best["path"],
+        "campaign":       best["campaign"],
+        "cond_gap":       best["cond_gap"],
+        "cli_flags":      f"--warmstart \"{best['path']}\"",
+    }
+    if args.json:
+        _json_print(result)
+        return 0
+
+    print(f"\n  Recommended warmstart:")
+    print(f"    campaign  : {best['campaign']}")
+    print(f"    checkpoint: {best['path']}")
+    print(f"    cond_gap  : {best['cond_gap']:.4f}")
+    print(f"\n  Use: {result['cli_flags']}\n")
+    return 0
+
+
+# ── ablation ────────────────────────────────────────────────────────────────
+
+def _cmd_ablation(args: argparse.Namespace) -> int:
+    cold_db = COLD_METADATA_DIR / "ablation_history.db"
+    db_path = cold_db if cold_db.exists() else ABLATION_DB_PATH
+    conn = _open_ro_db(db_path)
+    if conn is None:
+        if args.json:
+            _json_print({"ok": False, "error": "ablation_history.db not found", "experiments": []})
+        else:
+            print("ablation_history.db not found — run ablation harness first.")
+        return 0
+
+    try:
+        rows = conn.execute("""
+            SELECT id, params, score, verdict, ref_gap, cond_gap, final_loss, steps, ts
+            FROM experiments ORDER BY ts DESC
+        """).fetchall()
+    except sqlite3.Error as e:
+        conn.close()
+        if args.json:
+            _json_print({"ok": False, "error": str(e), "experiments": []})
+        else:
+            print(f"DB error: {e}")
+        return 1
+    conn.close()
+
+    experiments = [dict(r) for r in rows]
+    if args.campaign:
+        experiments = [e for e in experiments
+                       if args.campaign in str(e.get("ts", ""))]
+
+    if args.pareto:
+        dominated: set[int] = set()
+        for i, a in enumerate(experiments):
+            for j, b in enumerate(experiments):
+                if i == j or j in dominated:
+                    continue
+                a_cg = a.get("cond_gap") or 0.0
+                b_cg = b.get("cond_gap") or 0.0
+                a_rg = a.get("ref_gap")  or 0.0
+                b_rg = b.get("ref_gap")  or 0.0
+                if b_cg >= a_cg and b_rg >= a_rg and (b_cg > a_cg or b_rg > a_rg):
+                    dominated.add(i)
+                    break
+        experiments = [e for i, e in enumerate(experiments) if i not in dominated]
+
+    if args.json:
+        _json_print({"ok": True, "db": str(db_path), "count": len(experiments),
+                     "experiments": experiments})
+        return 0
+
+    if not experiments:
+        print("No experiments found.")
+        return 0
+
+    table_rows = []
+    for e in experiments:
+        cg   = f"{e['cond_gap']:.4f}"   if e["cond_gap"]   is not None else "—"
+        rg   = f"{e['ref_gap']:.4f}"    if e["ref_gap"]    is not None else "—"
+        sc   = f"{e['score']:.1f}"      if e["score"]      is not None else "—"
+        loss = f"{e['final_loss']:.4f}" if e["final_loss"] is not None else "—"
+        ns   = str(e["steps"] or "—")
+        vrd  = str(e["verdict"] or "—")[:12]
+        table_rows.append([str(e["id"]), cg, rg, sc, loss, ns, vrd])
+
+    label = "(pareto)" if args.pareto else f"({len(experiments)} total)"
+    print(f"\n  {db_path}  {label}\n")
+    print(_col_table(table_rows,
+                     ["id", "cond_gap", "ref_gap", "score", "loss", "n_steps", "verdict"]))
+    print()
+    return 0
+
+
+# ── compare ─────────────────────────────────────────────────────────────────
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    cfg: dict = {}
+    if args.config:
+        try:
+            cfg = __import__("pipeline_lib").load_config(args.config)
+        except FileNotFoundError:
+            pass
+    cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
+    cold_weights = cold_root / "weights"
+
+    def _load(date: str) -> Optional[dict]:
+        d = cold_weights / f"flywheel-{date}"
+        if not d.exists():
+            return None
+        steps: list[dict] = []
+        for sf in sorted(d.iterdir()):
+            if sf.suffix != ".safetensors" or sf.stem == "final":
+                continue
+            j = sf.with_suffix(".json")
+            if j.exists():
+                try:
+                    steps.append(json.loads(j.read_text()))
+                except (ValueError, OSError):
+                    pass
+        return {"name": d.name, "steps": steps}
+
+    a, b = _load(args.campaign_a), _load(args.campaign_b)
+    missing = [d for d, v in ((args.campaign_a, a), (args.campaign_b, b)) if v is None]
+    if missing:
+        msg = f"campaigns not found: {', '.join(missing)}"
+        if args.json:
+            _json_print({"ok": False, "error": msg})
+        else:
+            print(f"ERROR: {msg}")
+        return 1
+
+    def _ms(steps: list[dict], key: str) -> dict:
+        vals = [s[key] for s in steps if key in s and s[key] is not None]
+        if not vals:
+            return {"count": 0, "min": None, "max": None, "last": None}
+        return {"count": len(vals), "min": round(min(vals), 4),
+                "max": round(max(vals), 4), "last": round(vals[-1], 4)}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "campaign_a": args.campaign_a, "campaign_b": args.campaign_b,
+    }
+    for data, key in ((a, "a"), (b, "b")):
+        result[f"steps_{key}"]    = len(data["steps"])       # type: ignore[index]
+        for metric in ("cond_gap", "ref_gap", "clip_i"):
+            result[f"{metric}_{key}"] = _ms(data["steps"], metric)  # type: ignore[index]
+
+    if args.json:
+        _json_print(result)
+        return 0
+
+    def _fmt(s: dict) -> str:
+        return "—" if s["count"] == 0 else f"min={s['min']}  max={s['max']}  last={s['last']}"
+
+    w = 34
+    print(f"\n  Comparing: {args.campaign_a} vs {args.campaign_b}")
+    print(f"  {'metric':<14}  {'flywheel-' + args.campaign_a:<{w}}  {'flywheel-' + args.campaign_b:<{w}}")
+    print(f"  {'─'*14}  {'─'*w}  {'─'*w}")
+    for m in ("cond_gap", "ref_gap", "clip_i"):
+        print(f"  {m:<14}  {_fmt(result[f'{m}_a']):<{w}}  {_fmt(result[f'{m}_b']):<{w}}")
+    print(f"  {'steps':<14}  {result['steps_a']:<{w}}  {result['steps_b']:<{w}}")
+    print()
+    return 0
+
+
+# ── maintenance ──────────────────────────────────────────────────────────────
+
+def _cmd_maintenance(args: argparse.Namespace) -> int:
+    cfg: dict = {}
+    if args.config:
+        try:
+            cfg = __import__("pipeline_lib").load_config(args.config)
+        except FileNotFoundError:
+            pass
+    cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
+    hot_root     = Path(cfg.get("storage", {}).get("hot_root",  DATA_ROOT))
+    keep_vers    = int(cfg.get("storage", {}).get("keep_versions", 3))
+    cold_weights = cold_root / "weights"
+    cold_precomp = cold_root / "precomputed"
+    issues: list[str] = []
+
+    # 1. Broken best/ symlinks
+    broken_links: list[str] = []
+    best_dir = cold_weights / "best"
+    if best_dir.exists():
+        for lnk in best_dir.iterdir():
+            if lnk.is_symlink() and not lnk.exists():
+                broken_links.append(str(lnk))
+                issues.append(f"BROKEN symlink: {lnk}")
+
+    # 2. Orphaned .npz files not in manifest
+    orphaned_npz: list[str] = []
+    if cold_precomp.exists():
+        for enc_dir in cold_precomp.iterdir():
+            if not enc_dir.is_dir():
+                continue
+            for ver_dir in enc_dir.iterdir():
+                if not ver_dir.is_dir() or ver_dir.name == "current":
+                    continue
+                mf_p = ver_dir / "manifest.json"
+                try:
+                    referenced = set(json.loads(mf_p.read_text()).get("files", {}).keys()) if mf_p.exists() else set()
+                except (ValueError, OSError):
+                    referenced = set()
+                for npz in ver_dir.glob("*.npz"):
+                    if npz.name not in referenced:
+                        orphaned_npz.append(str(npz))
+                        issues.append(f"ORPHANED .npz: {npz}")
+
+    # 3. Precompute versions in cold-only (not in hot)
+    hot_precomp = hot_root / "precomputed"
+    cold_only: list[str] = []
+    if cold_precomp.exists() and hot_precomp.exists():
+        for enc_dir in cold_precomp.iterdir():
+            if not enc_dir.is_dir():
+                continue
+            for ver_dir in enc_dir.iterdir():
+                if ver_dir.is_dir() and not (hot_precomp / enc_dir.name / ver_dir.name).exists():
+                    cold_only.append(f"{enc_dir.name}/{ver_dir.name}")
+
+    # 4. Prunable versions beyond keep_versions
+    prunable: list[Path] = []
+    if cold_precomp.exists():
+        for enc_dir in cold_precomp.iterdir():
+            if not enc_dir.is_dir():
+                continue
+            cur_link = enc_dir / "current"
+            cur_ver = os.path.basename(os.readlink(str(cur_link))) if cur_link.is_symlink() else None
+            versions = sorted(v for v in enc_dir.iterdir() if v.is_dir() and v.name != "current")
+            for v in versions[:-keep_vers] if len(versions) > keep_vers else []:
+                if v.name != cur_ver:
+                    prunable.append(v)
+
+    result: dict[str, Any] = {
+        "ok":                 len(issues) == 0,
+        "broken_symlinks":    broken_links,
+        "orphaned_npz":       orphaned_npz,
+        "cold_only_versions": cold_only,
+        "prunable_versions":  [str(p) for p in prunable],
+        "issues":             issues,
+    }
+
+    if args.prune:
+        if not args.confirm:
+            print("ERROR: --prune requires --confirm", file=sys.stderr)
+            return 1
+        pruned = []
+        for p in prunable:
+            try:
+                shutil.rmtree(p)
+                pruned.append(str(p))
+            except OSError as e:
+                print(f"  WARNING: could not remove {p}: {e}", file=sys.stderr)
+        result["pruned"] = pruned
+
+    if args.json:
+        _json_print(result)
+        return 0
+
+    print(f"\n  maintenance — cold root: {cold_root}")
+    print()
+    if not issues and not cold_only and not prunable:
+        print("  Everything looks clean.\n")
+        return 0
+
+    if issues:
+        print(f"  ISSUES ({len(issues)}):")
+        for iss in issues:
+            print(f"    {iss}")
+        print()
+    if cold_only:
+        print(f"  Cold-only versions (safe to remove from hot if space needed):")
+        for v in cold_only:
+            print(f"    {v}")
+        print()
+    if prunable:
+        print(f"  Prunable (beyond keep_versions={keep_vers}):")
+        for p in prunable:
+            print(f"    {p}")
+        print(f"  Run with --prune --confirm to delete.\n")
+    return 0
+
+
+# ── subcommand router ────────────────────────────────────────────────────────
+
+_SUBCMDS = {"status", "shards", "weights", "suggest-warmstart",
+            "ablation", "compare", "maintenance"}
+
+
+def _main_subcmd() -> None:
+    ap = argparse.ArgumentParser(
+        description="Cold storage inspection CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--json",   action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def _sp(name: str, help: str, with_config: bool = True) -> argparse.ArgumentParser:
+        p = sub.add_parser(name, help=help)
+        p.add_argument("--json", action="store_true")
+        if with_config:
+            p.add_argument("--config", default=None)
+        return p
+
+    p_status = _sp("status", "Disk, pool, precompute, weights, DB overview")
+    p_status.set_defaults(func=_cmd_status)
+
+    p_shards = _sp("shards", "Shard quality scores")
+    p_shards.add_argument("--top",  type=int, default=20)
+    p_shards.add_argument("--sort", default="effective_score",
+                          choices=["effective_score", "composite_score", "n_scored"])
+    p_shards.set_defaults(func=_cmd_shards)
+
+    p_weights = _sp("weights", "Archived weight campaigns")
+    p_weights.add_argument("--campaign", default=None)
+    p_weights.set_defaults(func=_cmd_weights)
+
+    p_ws = _sp("suggest-warmstart", "Recommend warmstart checkpoint", with_config=False)
+    p_ws.add_argument("--config", required=True)
+    p_ws.set_defaults(func=_cmd_suggest_warmstart)
+
+    p_abl = _sp("ablation", "Ablation experiment history")
+    p_abl.add_argument("--campaign", default=None)
+    p_abl.add_argument("--pareto",   action="store_true")
+    p_abl.set_defaults(func=_cmd_ablation)
+
+    p_cmp = _sp("compare", "Side-by-side campaign metric comparison")
+    p_cmp.add_argument("campaign_a")
+    p_cmp.add_argument("campaign_b")
+    p_cmp.set_defaults(func=_cmd_compare)
+
+    p_maint = _sp("maintenance", "Validate cold storage, GC orphans")
+    p_maint.add_argument("--prune",   action="store_true")
+    p_maint.add_argument("--confirm", action="store_true")
+    p_maint.set_defaults(func=_cmd_maintenance)
+
+    args = ap.parse_args()
+    # Inherit top-level --json/--config when subparser doesn't override
+    if not hasattr(args, "json") or args.json is False:
+        args.json = ap.parse_known_args()[0].json
+    if not getattr(args, "config", None):
+        args.config = ap.parse_known_args()[0].config
+
+    sys.exit(args.func(args))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Route to cold-storage subcommand interface when first positional arg is a known subcommand.
+    if len(sys.argv) > 1 and sys.argv[1] in _SUBCMDS:
+        _main_subcmd()
+        return
+
     ap = argparse.ArgumentParser(
         description="Data intelligence layer for iris flywheel",
         formatter_class=argparse.RawDescriptionHelpFormatter,
