@@ -32,30 +32,66 @@ The TRAIN-6 vs old-path 500-step comparison from step 108500 showed mean cond_ga
 ### Dual Flywheel System
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Meta / Optimization Flywheel  (slower cadence)         │
-│  Smart Shard Selection  +  Ablation Harness             │
-│  → What data to train on  +  How to train               │
-└───────────────┬─────────────────────────────────────────┘
-                │ curated shards + best config
-                ▼
-┌─────────────────────────────────────────────────────────┐
-│  Main Training Flywheel  (frequent)                     │
-│  IP-Adapter training  →  eval metrics  →  shard scores  │
-│  → cond_gap / CLIP-I / style loss feed back to meta     │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Meta / Optimization Flywheel  (slower cadence)              │
+│  Smart Shard Selection  +  Ablation Harness                  │
+│  → Which data to train on  +  Which hyperparameters to use   │
+│  ← shard_scores.db + ablation_history.db (persistent)        │
+└────────────────────┬─────────────────────────────────────────┘
+                     │ curated shards + best config
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Main Training Flywheel  (frequent)                          │
+│  IP-Adapter training  →  eval metrics  →  shard scores       │
+│  → cond_gap / CLIP-I / style loss feed back to meta          │
+│  ← warm-started from best archived checkpoint                │
+└────────────────────┬─────────────────────────────────────────┘
+                     │ weights, embeddings, metrics
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Cold Storage — Long-term Knowledge Base                     │
+│  Weights archive  +  Versioned precompute  +  Shard scores   │
+│  +  Ablation history  +  Raw data pool                       │
+│  Every campaign leaves a richer foundation for the next.     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-The meta flywheel (shard selector + ablation harness) decides what to train on and with which hyperparameters. The main flywheel executes and feeds metrics back. Both layers must support warm-starts from historical checkpoints and precompute caches.
+The meta flywheel decides what to train on and with what config. The main flywheel executes and feeds metrics back. Cold storage accumulates the knowledge: each campaign extends shard score history, adds scored configs to ablation history, and archives weights. Every new campaign starts smarter than the last.
+
+### Warm-Start as a First-Class Principle
+
+Starting fresh is the expensive fallback, not the default. Every layer of the system must support warm-starting from prior state:
+
+- **Training:** new campaigns warm-start from the best archived checkpoint for the target config. `data_explorer.py --suggest-warmstart` emits the exact `--warmstart` + `--precompute-version` flags.
+- **Ablation harness:** on startup, loads `ablation_history.db` and pre-seeds the Optuna TPE study with all prior scored runs before suggesting new candidates. A new campaign instantly inherits the full Pareto frontier from prior work — no redundant exploration.
+- **Precompute:** `cache_manager.py --warm-start-precompute <old_version>` copies embeddings for shards whose encoder did not change, skipping full recompute on partial updates. 6-month-old embeddings remain valid if the encoder is unchanged.
+- **Shard selection:** `shard_scores.db` accumulates cond_gap and CLIP-I contributions across all campaigns; scores improve with each run. The meta flywheel never starts from zero.
+
+This compounds: the 10th campaign benefits from 9 campaigns of shard intelligence, hyperparameter Pareto history, and weight lineage — dramatically narrowing the search space and reducing time-to-quality.
+
+### Cold Storage as Long-term Knowledge Base
+
+Cold storage is not a backup or overflow — it is the primary accumulator of system intelligence:
+
+- **`metadata/shard_scores.db`** — never truncated; score history grows with every campaign. The meta flywheel scores shards from the full history, not just the most recent run.
+- **`metadata/ablation_history.db`** — every ablation run ever recorded, across all campaigns. The Optuna study is rebuilt from this on each new run; the Pareto frontier only improves.
+- **`weights/flywheel-*/`** — full checkpoint lineage. Enables warm-starting any future experiment, bisecting quality regressions, and comparing approaches tried months apart.
+- **`precompute/v*/`** — versioned encoder outputs that remain valid indefinitely for unchanged encoders.
+
+**Rule:** cold storage is append-only except for explicit operator-triggered garbage collection. Pipeline operations never touch the raw pool, weight archives, or metadata databases.
 
 ### Storage Architecture
 
 Two-tier hot/cold split:
 
-- **Cold storage** (`/Volumes/16TBCold`, 16 TB spinning disk) — source of truth and long-term archive. Contains all raw data, every historical precompute version, all archived weights, and persistent metadata/telemetry. Never auto-deleted by pipeline operations.
-- **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only. Populated by the JIT stager from cold; archived back to cold after each successful run.
+- **Cold storage** (`/Volumes/16TBCold`, 16 TB spinning disk) — source of truth and long-term knowledge base. Never auto-deleted by pipeline operations.
+- **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only.
 
-**JIT Data Stager** is the bidirectional intelligence layer between them: stages cold→hot before a compute window, archives hot→cold after. Uses symlinks on the same filesystem (near-instant), atomic copies across filesystems. `_check_hot_space()` enforces the `staging_margin_gb` headroom budget before any transfer begins.
+**JIT Data Stager** manages both directions with equal importance:
+- **Cold → Hot (staging):** before a compute window, stages raw data, precompute symlinks, and weights from cold to hot. Uses symlinks when on the same filesystem (near-instant); atomic copies across filesystems. `_check_hot_space()` enforces `staging_margin_gb` before any transfer.
+- **Hot → Cold (archiving):** after a successful run, archives newly generated precompute embeddings, weight checkpoints, and per-campaign telemetry to cold. This is the write path — without it, cold never grows and warm-starts never improve.
+
+Both directions are first-class operations. Staging populates the working set; archiving accumulates the knowledge. Neither is optional.
 
 ### Proposed cold storage layout
 
@@ -74,19 +110,19 @@ Two-tier hot/cold split:
 │   └── best/               # symlinks → current best weights per metric
 ├── metadata/               # persistent telemetry — never reset between campaigns
 │   ├── shard_scores.db     # scored shard history (feeds meta flywheel)
-│   ├── ablation_history.db # all ablation runs ever (feeds warm-start)
-│   └── flywheel_logs/      # structured per-campaign logs
+│   ├── ablation_history.db # all ablation runs ever (feeds Optuna warm-start)
+│   └── flywheel_logs/      # structured per-campaign JSON logs
 ├── reports/                # all HTML reports (flywheel, ablation, shard selection)
 ├── temp/                   # staging area for in-progress transfers
 └── logs/                   # operational logs (pipeline, orchestrator)
 ```
 
-This layout is the target state. Current hot-storage paths under `/Volumes/2TBSSD/` remain unchanged during the transition; the stager will progressively migrate source-of-truth data to cold as PIPELINE-25/26 land.
+This layout is the target state. Current hot-storage paths under `/Volumes/2TBSSD/` remain unchanged during the transition; the stager will progressively migrate source-of-truth data to cold as PIPELINE-25/26/29 land.
 
 ### Hardware scaling roadmap
 
 Current: M1 Max, 32 GB unified memory, 2 TB hot + 16 TB cold.
-Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically higher compute). The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change.
+Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically higher compute). The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change. The accumulated knowledge base (shard scores, ablation history, weight archive) carries forward directly to any new hardware.
 
 ---
 
@@ -325,18 +361,81 @@ This is the **meta flywheel** upstream layer: controlling which raw JDB tgzs are
 
 **PIPELINE-28: Data Intelligence Layer — data_explorer.py** ⛔ blocked on PIPELINE-25 + PIPELINE-26
 
-As cold storage grows over months of campaigns, a CLI/TUI tool is needed to maintain visibility and support operational decisions. Without it, the cold volume becomes a black box.
+As cold storage grows over months of campaigns, observability into the knowledge base becomes critical. Without `data_explorer.py`, the cold volume is a black box: operator has no way to know what's been learned, which weights to warm-start from, or which shards are driving quality. This tool is essential for long-term usability of the platform.
 
-**Capabilities:**
+**Subcommands:**
 
-1. **Cold storage overview** — disk usage by category (raw, precompute, weights, metadata); precompute version summary; pool coverage vs. all-in scale.
-2. **Shard browser** — top N shards by score (cond_gap, CLIP-I, style loss) with trend history from `shard_scores.db`; filter by score range, diversity cluster, or date added.
-3. **Weight archive browser** — list flywheel campaigns with their summary metrics; show best weights per metric; support `pipeline_ctl warm-start <campaign>` command generation.
-4. **Warm-start helper** — given a target config, suggest the closest historical checkpoint + precompute version to warm-start from; emit the exact `--warmstart` + `--pool-dir` + `--precompute-version` flags.
-5. **Maintenance utilities** — validate precompute coverage vs. current pool; prune old precompute versions (respecting `keep_versions`); export a curated shard subset to a new cold sub-directory.
-6. **Ablation history view** — query `ablation_history.db`; show Pareto-optimal configs across all campaigns; support `--warm-start-from` path generation for the ablation harness.
+`data_explorer status` — full cold storage overview: disk usage by category, precompute version + coverage summary, raw pool completeness vs. all-in scale, metadata DB sizes and row counts. Entry point for any session.
 
-**Implementation:** `train/scripts/data_explorer.py`, standalone CLI (no server). Reads `shard_scores.db`, `ablation_history.db`, cold storage layout. No writes except `--prune` and `--export` subcommands (both require explicit confirmation).
+`data_explorer shards [--top N] [--sort cond_gap|clip_i|style_loss] [--filter ...]` — browse `shard_scores.db`; show per-shard score history and trend across campaigns; highlight shards whose quality is improving vs. plateauing; filter by score range, diversity cluster, campaign, or date added.
+
+`data_explorer weights [--campaign YYYYMMDD]` — browse `weights/flywheel-*/`; show per-campaign summary metrics (CLIP-I, cond_gap, training steps, config hash); annotate with "best ever" markers per metric; list available checkpoint steps within a campaign.
+
+`data_explorer suggest-warmstart --config <yaml>` — key warm-start helper: given a target training config, query weight archive and ablation history to recommend the closest historical checkpoint + precompute version. Emits exact `--warmstart`, `--precompute-version`, and `--warm-start-from` flags ready to paste. Falls back to "train from scratch" with an explanation if nothing suitable exists.
+
+`data_explorer ablation [--campaign ...] [--pareto]` — query `ablation_history.db` across all campaigns; show Pareto-optimal configs (cond_gap vs. ref_gap); compare Pareto frontiers between campaigns to visualise how the search space has improved; emit `--warm-start-from <path>` command for the ablation harness.
+
+`data_explorer compare <campaign-A> <campaign-B>` — side-by-side campaign comparison: CLIP-I trend, cond_gap trend, shard overlap, config diff, step budget used. The primary tool for answering "is campaign N better than campaign N-1?"
+
+`data_explorer maintenance` — read-only audit by default: validates precompute coverage vs. current pool, checks `best/` symlinks are valid, reports orphaned files. With `--prune` flag: GC old precompute versions (respects `keep_versions`). With `--export <subset>`: copies a curated shard subset to a new cold sub-directory. Both mutation subcommands require explicit `--confirm`.
+
+**Implementation:** `train/scripts/data_explorer.py`, standalone CLI (no server). All reads are non-destructive. Mutation subcommands (`--prune`, `--export`) are gated behind `--confirm`. Output format: human-readable tables by default; `--json` flag for scripting.
+
+**PIPELINE-29: Hot→Cold archiving — closing the knowledge accumulation loop** ⛔ blocked on PIPELINE-25
+
+The staging direction (cold→hot) is partially wired. The archiving direction (hot→cold) is not. Without it, cold storage never grows and warm-starts can never improve — the knowledge accumulation loop is broken.
+
+**What needs archiving and when:**
+
+| Event | Archive target | Cold destination |
+|---|---|---|
+| Precompute step completes | Qwen3 / VAE / SigLIP embeddings | `precompute/v{N}/{shard_id}/` |
+| Training milestone (e.g. 50K steps) | Checkpoint + EMA + optimizer state | `weights/flywheel-{date}/{step}/` |
+| Training campaign ends | Final checkpoint + run summary JSON | `weights/flywheel-{date}/final/` |
+| Eval step completes | Per-shard metrics (cond_gap, CLIP-I) | `metadata/shard_scores.db` (append) |
+| Ablation run completes | Scored config + metrics | `metadata/ablation_history.db` (append) |
+
+**Archiving semantics:**
+- Archiving is always a copy (never a move) while the campaign is still active. The hot copy remains for fast access; the cold copy is the durable record.
+- After archiving precompute, the hot cache may be pruned at the operator's discretion (freeing SSD space).
+- Weights are never pruned automatically; `data_explorer.py maintenance --prune` handles GC with explicit confirmation.
+- `weights/best/` symlinks are updated atomically after each archival: if the new checkpoint improves on the current best for any tracked metric, the symlink is updated.
+
+**Implementation scope:**
+- `data_stager.py`: add `archive_precompute()`, `archive_checkpoint()`, `update_best_symlinks()`.
+- `orchestrator.py`: trigger archiving after `train.done` milestone and after `precompute.done`.
+- `pipeline_lib.py`: `COLD_WEIGHTS_DIR`, `COLD_METADATA_DIR` constants.
+- `pipeline_doctor.py`: warn if last archive is stale (>24h since last `train.done` without corresponding archive).
+
+---
+
+## Flywheel Management
+
+**FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** ⛔ blocked on PIPELINE-29
+
+Individual campaigns are managed by the orchestrator. This item is the layer above: tracking how quality evolves across campaigns over weeks and months, detecting when a campaign strategy is played out, and deciding when to launch a new campaign vs. continue the current one.
+
+**Campaign lifecycle states:**
+- **Active** — training flywheel running, metrics improving.
+- **Plateau** — campaign-level cond_gap trend flat for N flywheel iterations (distinct from step-level plateau in the ablation harness, which is per-run). Triggers a recommendation to either change strategy (new ablation config) or warm-start a new campaign.
+- **Completed** — operator-marked as done; weights archived; summary written to cold.
+- **Superseded** — a later campaign has exceeded this one on all metrics; annotated in weight archive.
+
+**Key capabilities:**
+
+1. **Campaign-level plateau detection** — track rolling mean cond_gap and CLIP-I over the last N flywheel iterations (e.g. N=5). If neither metric has improved by more than `min_delta` for N iterations, emit a WARNING to the doctor and recommend: (a) launch a new ablation run to find a better config, or (b) warm-start a new campaign from a different checkpoint.
+
+2. **Cross-campaign comparison** — powered by `data_explorer compare`. Answers: is campaign B better than campaign A? Are we regressing on CLIP-I while improving cond_gap? The flywheel logs in `metadata/flywheel_logs/` store per-iteration metrics to make this tractable.
+
+3. **Warm-start decision support** — when a plateau is detected, `data_explorer suggest-warmstart` queries the weight archive and ablation history to recommend the highest-leverage starting point for the next campaign. Considers: best historical CLIP-I, which ablation configs are Pareto-optimal, and what training steps have already been covered to avoid redundant work.
+
+4. **Campaign summary generation** — at the end of each campaign (or on demand), generate a structured summary: total steps, peak CLIP-I, cond_gap trajectory, ablation iterations run, shards consumed, wall-clock time. Written to `metadata/flywheel_logs/campaign-{date}.json` and to `weights/flywheel-{date}/summary.json`.
+
+**Implementation:**
+- `flywheel.py`: add `_campaign_plateau_check()`, `_write_campaign_summary()`.
+- `pipeline_doctor.py`: surface campaign-level plateau as a WARNING with suggested next action.
+- `data_explorer.py`: `compare` and `suggest-warmstart` subcommands (see PIPELINE-28).
+- `metadata/flywheel_logs/`: structured JSON per iteration, written by `flywheel.py`.
 
 ---
 
