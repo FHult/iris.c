@@ -753,31 +753,6 @@ def train(config: dict) -> None:
     del _dummy_lat, _txt_warmup, _t_warmup
     print("Flux training graphs ready.")
 
-    if bool(tcfg.get("correct_forward_q", False)) and not bool(tcfg.get("use_block_injection", False)):
-        _txt_warmup_cq = mx.zeros(
-            (1, 64, flux.transformer.context_embedder.weight.shape[1]), dtype=mx.bfloat16)
-        _t_warmup_cq = mx.array([500], dtype=mx.int32)
-        _siglip_warmup_cq = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
-        _ip_embs_wu = adapter.get_image_embeds(_siglip_warmup_cq)
-        _k_wu, _v_wu = adapter.get_kv_all(_ip_embs_wu)
-        mx.eval(_k_wu, _v_wu, adapter.scale)
-        print("Warming up correct-forward-Q graphs (all bucket shapes)...")
-        for _bH, _bW in BUCKETS:
-            _lat_H, _lat_W = _bH // 8, _bW // 8
-            _dummy_lat_cq = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
-            print(f"  [{_bH}x{_bW}] compiling...", flush=True)
-            _t0_wu = time.time()
-            _qs_wu = _flux_forward_with_ip_collect_q(
-                flux, _dummy_lat_cq, _txt_warmup_cq, _t_warmup_cq,
-                _k_wu, _v_wu, adapter.scale,
-            )
-            mx.eval(_qs_wu)
-            print(f"  [{_bH}x{_bW}] done ({time.time() - _t0_wu:.1f}s)", flush=True)
-            del _dummy_lat_cq, _qs_wu
-            mx.clear_cache()
-        del _txt_warmup_cq, _t_warmup_cq, _siglip_warmup_cq, _ip_embs_wu, _k_wu, _v_wu
-        print("Correct-forward-Q graphs ready.")
-
     ckpt_double = None
     ckpt_single = None
     # TRAIN-5 Stage 3: block gradient checkpointing infrastructure for TRAIN-6.
@@ -837,6 +812,31 @@ def train(config: dict) -> None:
             print(f"  Resuming from step {start_step:,}")
         if loaded_ema is not None:
             print(f"  Loaded EMA from checkpoint")
+
+    if bool(tcfg.get("correct_forward_q", False)) and not bool(tcfg.get("use_block_injection", False)):
+        _txt_warmup_cq = mx.zeros(
+            (1, 64, flux.transformer.context_embedder.weight.shape[1]), dtype=mx.bfloat16)
+        _t_warmup_cq = mx.array([500], dtype=mx.int32)
+        _siglip_warmup_cq = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+        _ip_embs_wu = adapter.get_image_embeds(_siglip_warmup_cq)
+        _k_wu, _v_wu = adapter.get_kv_all(_ip_embs_wu)
+        mx.eval(_k_wu, _v_wu, adapter.scale)
+        print("Warming up correct-forward-Q graphs (all bucket shapes)...")
+        for _bH, _bW in BUCKETS:
+            _lat_H, _lat_W = _bH // 8, _bW // 8
+            _dummy_lat_cq = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
+            print(f"  [{_bH}x{_bW}] compiling...", flush=True)
+            _t0_wu = time.time()
+            _qs_wu = _flux_forward_with_ip_collect_q(
+                flux, _dummy_lat_cq, _txt_warmup_cq, _t_warmup_cq,
+                _k_wu, _v_wu, adapter.scale,
+            )
+            mx.eval(_qs_wu)
+            print(f"  [{_bH}x{_bW}] done ({time.time() - _t0_wu:.1f}s)", flush=True)
+            del _dummy_lat_cq, _qs_wu
+            mx.clear_cache()
+        del _txt_warmup_cq, _t_warmup_cq, _siglip_warmup_cq, _ip_embs_wu, _k_wu, _v_wu
+        print("Correct-forward-Q graphs ready.")
 
     # chunk_base_step: the global step at which this chunk's training begins.
     # Equals sum of all prior chunks' steps.  Passed via --chunk-base-step.

@@ -100,6 +100,13 @@ try:
 except ImportError:
     _SKLEARN_OK = False
 
+try:
+    import optuna as _optuna
+    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+    _OPTUNA_OK = True
+except ImportError:
+    _OPTUNA_OK = False
+
 # ── Repo layout ───────────────────────────────────────────────────────────────
 _SCRIPT_DIR  = Path(__file__).resolve().parent
 _TRAIN_DIR   = _SCRIPT_DIR.parent
@@ -575,6 +582,82 @@ class BayesianSearch(SearchStrategy):
             return random.choice(remaining)
 
 
+class OptunaSearch(SearchStrategy):
+    """Optuna TPE Bayesian search over a discrete candidate grid.
+
+    Rebuilds the study from scored history on each call (stateless between calls).
+    CategoricalDistribution is used for all variables so booleans and float lists
+    work without encoding assumptions.
+
+    `candidates` is the conditions-filtered list (same as BayesianSearch receives).
+    `variables` is the raw dict used only for building Optuna distributions.
+
+    Falls back to random choice when optuna is not installed or when fewer than
+    n_initial scored results exist.
+    """
+
+    def __init__(self, variables: dict, candidates: list[dict],
+                 n_initial: int = 10) -> None:
+        self._variables  = variables
+        self._candidates = candidates   # conditions-filtered; used for remaining list
+        self._n_initial  = n_initial
+        self._dists: dict = {}
+        if _OPTUNA_OK:
+            for k, vals in variables.items():
+                self._dists[k] = _optuna.distributions.CategoricalDistribution(
+                    [str(v) for v in vals]
+                )
+
+    def _decode(self, optuna_params: dict) -> dict:
+        result = {}
+        for k, vals in self._variables.items():
+            sv = optuna_params.get(k, str(vals[0]))
+            for v in vals:
+                if str(v) == sv:
+                    result[k] = v
+                    break
+            else:
+                result[k] = vals[0]
+        return result
+
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        import random
+        tried_keys = {_params_key(t["params"]) for t in tried_results}
+        # Use the pre-filtered candidate list (respects conditions)
+        remaining = [c for c in self._candidates if _params_key(c) not in tried_keys]
+        if not remaining:
+            return None
+
+        scored = [r for r in tried_results if r.get("score") is not None]
+        if len(scored) < self._n_initial or not _OPTUNA_OK:
+            return random.choice(remaining)
+
+        sampler = _optuna.samplers.TPESampler(n_startup_trials=self._n_initial, seed=42)
+        study   = _optuna.create_study(direction="maximize", sampler=sampler)
+
+        for r in scored:
+            p = r["params"]
+            try:
+                t = _optuna.trial.create_trial(
+                    params={k: str(p.get(k, vals[0])) for k, vals in self._variables.items()},
+                    distributions=self._dists,
+                    value=float(r["score"]),
+                )
+                study.add_trial(t)
+            except Exception:
+                continue
+
+        try:
+            trial  = study.ask(fixed_distributions=self._dists)
+            params = self._decode(trial.params)
+            # If Optuna suggests a filtered-out or already-tried combo, fall back to random
+            if _params_key(params) in tried_keys or params not in remaining:
+                return random.choice(remaining)
+            return params
+        except Exception:
+            return random.choice(remaining)
+
+
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 class HeartbeatWriter:
@@ -916,6 +999,53 @@ class EarlyStopper:
         return False
 
 
+# ── Campaign-level plateau detection ─────────────────────────────────────────
+
+class CampaignPlateau:
+    """Stop the whole campaign when the best score has not improved for N runs.
+
+    Distinct from EarlyStopper (which kills a single bad run within that run).
+    This watches the *campaign-level* best score across completed experiments.
+    Activates only after min_runs to avoid reacting to noisy early exploration.
+    """
+
+    def __init__(self, patience: int, min_delta: float = 0.01, min_runs: int = 5) -> None:
+        self.patience  = patience
+        self.min_delta = min_delta
+        self.min_runs  = min_runs
+        self._best:  Optional[float] = None
+        self._stale  = 0
+        self._n_runs = 0
+
+    def update(self, score: Optional[float]) -> bool:
+        """Feed latest run score. Returns True when plateau is detected."""
+        self._n_runs += 1
+        if score is None:
+            return False
+        improved = self._best is None or score > self._best + self.min_delta
+        if improved:
+            self._best  = score
+            self._stale = 0
+        else:
+            self._stale += 1
+        if self._n_runs < self.min_runs:
+            return False
+        return self._stale >= self.patience
+
+    @property
+    def stale_count(self) -> int:
+        return self._stale
+
+    @property
+    def best_score(self) -> Optional[float]:
+        return self._best
+
+    def status(self) -> str:
+        if self._best is None:
+            return "no data"
+        return f"best={self._best:.3f}  stale={self._stale}/{self.patience}"
+
+
 # ── Single-run execution ──────────────────────────────────────────────────────
 
 def _run_one(
@@ -1083,11 +1213,17 @@ def _load_harness_config(path: Path) -> dict:
 def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
     strategy  = cfg.get("strategy", "random").lower()
     n_initial = int(cfg.get("n_initial", max(8, len(candidates) // 5)))
+    variables = cfg.get("variables", {})
     if strategy == "grid":
         return GridSearch(candidates)
     if strategy == "random":
         return RandomSearch(candidates, seed=cfg.get("seed"))
     if strategy == "bayesian":
+        # Prefer Optuna TPE (handles discrete/categorical better than GP)
+        if _OPTUNA_OK and variables:
+            print("  Bayesian backend: Optuna TPE", flush=True)
+            return OptunaSearch(variables, candidates=candidates, n_initial=n_initial)
+        # Fall back to GP-UCB
         if not _NUMPY_OK:
             print("WARNING: numpy not available — falling back to random search",
                   file=sys.stderr)
@@ -1099,9 +1235,49 @@ def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
         if not _SKLEARN_OK:
             print("INFO: scikit-learn not available — using pure numpy/scipy GP",
                   file=sys.stderr)
+        print("  Bayesian backend: GP-UCB (sklearn)", flush=True)
         return BayesianSearch(candidates, n_initial=n_initial)
     print(f"ERROR: unknown strategy '{strategy}'. Use: grid, random, bayesian", file=sys.stderr)
     sys.exit(1)
+
+
+# ── Warm-start helper ────────────────────────────────────────────────────────
+
+def _warm_start_candidate(warm_start_dir: Path, run_name: str,
+                           current_db: "AblationDB") -> Optional[dict]:
+    """Load the best params from a prior campaign's DB as a forced first candidate.
+
+    Searches `warm_start_dir/ablation_history.db` for the highest-scored experiment
+    matching `run_name`, or any run if no match.  Returns None if the params are
+    already in the current DB or the prior DB cannot be read.
+    """
+    db_path = warm_start_dir / "ablation_history.db"
+    if not db_path.exists():
+        print(f"WARNING: --warm-start-from DB not found: {db_path}", file=sys.stderr)
+        return None
+    try:
+        prior = AblationDB(db_path)
+        best_list = prior.get_best(run_name, 1)
+        if not best_list:
+            for name in prior.get_all_run_names():
+                best_list = prior.get_best(name, 1)
+                if best_list:
+                    break
+        prior.close()
+        if not best_list:
+            print("WARNING: --warm-start-from DB has no scored experiments", file=sys.stderr)
+            return None
+        exp    = best_list[0]
+        params = exp["params"]
+        if current_db.is_duplicate(run_name, params):
+            print(f"  Warm-start: best prior params already in current DB — skipping injection")
+            return None
+        print(f"  Warm-start: injecting best params from prior campaign "
+              f"(score={exp.get('score'):.3f}  run={exp.get('run_name')})")
+        return params
+    except Exception as exc:
+        print(f"WARNING: --warm-start-from failed: {exc}", file=sys.stderr)
+        return None
 
 
 # ── Long-term run loop ────────────────────────────────────────────────────────
@@ -1133,14 +1309,24 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
     searcher = _build_search_strategy(harness_cfg, candidates)
 
-    # Early stopping
+    # Per-run early stopping
     es_cfg = harness_cfg.get("early_stopping", {})
     early_stopper: Optional[EarlyStopper] = None
-    if es_cfg.get("enabled", False) and _NUMPY_OK:
+    if es_cfg.get("enabled", False):
         early_stopper = EarlyStopper(
             min_cond_gap=float(es_cfg.get("min_cond_gap", -0.3)),
             patience=int(es_cfg.get("patience", 4)),
             min_snapshots=int(es_cfg.get("min_snapshots", 5)),
+        )
+
+    # Campaign-level plateau detection
+    pd_cfg = harness_cfg.get("plateau_detection", {})
+    plateau: Optional[CampaignPlateau] = None
+    if pd_cfg.get("enabled", False):
+        plateau = CampaignPlateau(
+            patience=int(pd_cfg.get("patience", 8)),
+            min_delta=float(pd_cfg.get("min_delta", 0.01)),
+            min_runs=int(pd_cfg.get("min_runs", 5)),
         )
 
     hb = HeartbeatWriter(run_name)
@@ -1150,6 +1336,17 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     all_experiments = db.get_experiments(run_name)
     tried = list(all_experiments)
     n_done = len(all_experiments)
+
+    # Pre-feed existing scores into plateau detector so it resumes correctly
+    if plateau is not None:
+        for exp in all_experiments:
+            plateau.update(exp.get("score"))
+
+    # Warm-start: inject best params from a prior campaign as the first candidate
+    _ws_params: Optional[dict] = None
+    ws_dir = getattr(cli_args, "warm_start_from", None)
+    if ws_dir:
+        _ws_params = _warm_start_candidate(Path(ws_dir), run_name, db)
 
     print()
     print(_c("cyan", f"{'═'*64}"))
@@ -1163,17 +1360,28 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         print(f"  early_stopping: min_cond_gap={early_stopper.min_cond_gap}  "
               f"patience={early_stopper.patience}  "
               f"min_snapshots={early_stopper.min_snapshots}")
+    if plateau is not None:
+        print(f"  plateau_detection: patience={plateau.patience}  "
+              f"min_delta={plateau.min_delta}  min_runs={plateau.min_runs}")
+    if _ws_params is not None:
+        print(f"  warm_start: {_ws_params}")
     print(_c("cyan", f"{'═'*64}\n"))
 
     hb.update(status="running", strategy=strategy, n_candidates=len(candidates),
                n_done=n_done, n_max=max_runs)
+    force_continue = getattr(cli_args, "force_continue", False)
 
     while n_done < max_runs:
         if not _wait_if_paused(hb):
             print("\n  Stop signal received — exiting")
             break
 
-        params = searcher.next_candidate(tried)
+        # Warm-start injection: override searcher for the first untried candidate
+        if _ws_params is not None:
+            params     = _ws_params
+            _ws_params = None
+        else:
+            params = searcher.next_candidate(tried)
         if params is None:
             print("\n  Candidate pool exhausted — all combinations tried")
             break
@@ -1207,7 +1415,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb,
                           early_stopper=early_stopper)
 
-        # Re-score with configurable objective (_score_weighted handles tail-skip internally)
+        # Re-score with configurable objective
         weighted_score = _score_weighted(result.get("snapshots", []), result["exit_code"], objective)
         result["score"] = round(weighted_score, 4) if weighted_score != float("-inf") else None
 
@@ -1229,6 +1437,19 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
         _print_result_line(result)
 
+        # Campaign plateau check
+        if plateau is not None:
+            if plateau.update(result.get("score")) and not force_continue:
+                print(_c("yellow",
+                         f"\n  Campaign plateau detected — {plateau.status()}"))
+                print("  No improvement for the last "
+                      f"{plateau.patience} runs.  Use --force-continue to override.")
+                hb.update(status="plateau_stopped", plateau=plateau.status())
+                break
+            elif plateau.stale_count > 0:
+                print(_c("dim",
+                         f"  plateau: {plateau.status()}"), flush=True)
+
         # Regenerate report after every run
         all_experiments = db.get_experiments(run_name)
         _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
@@ -1246,7 +1467,11 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     if best_list:
         _export_best_config(best_list[0], output_dir, run_name)
 
-    hb.update(status="done", n_done=n_done)
+    _stop_reason = "done"
+    if plateau is not None and plateau.stale_count >= plateau.patience and not force_continue:
+        _stop_reason = f"plateau ({plateau.status()})"
+    hb.update(status=_stop_reason, n_done=n_done,
+              plateau=plateau.status() if plateau else None)
     hb.stop()
 
 
@@ -1392,9 +1617,10 @@ def _render_html(
             f"</tr>\n"
         )
 
-    # Best-config box
+    # Best-config box + YAML download
     best = ranked[0] if ranked else None
     best_html = ""
+    best_config_yaml = ""
     if best:
         p = best["params"]
         lines = [f"<b style='color:#7f7'>#{1}: {best['combo_id']}</b>  "
@@ -1405,8 +1631,35 @@ def _render_html(
         for k, v in p.items():
             lines.append(f"  <b>{k}</b>: {v}")
         lines.append("")
-        lines.append(f"  Config exported to: <code style='color:#7af'>best_config.yaml</code>")
+        lines.append(
+            "<button onclick=\"downloadBestConfig()\" "
+            "style='background:#1a3a1a;border:1px solid #2a5;color:#7f7;"
+            "padding:3px 10px;cursor:pointer;font-family:monospace;border-radius:3px'>"
+            "⬇ Download best_config.yaml</button>"
+        )
         best_html = "<br>".join(lines)
+        # Build YAML string for in-browser download
+        _yaml_lines = [
+            f"# Best config from ablation run: {matrix_name}",
+            f"# score={best['score']:.4f}  run={best['combo_id']}",
+            "training:",
+        ]
+        for k, v in p.items():
+            if k != "freeze_double_stream_scales":
+                _yaml_lines.append(f"  {k}: {v}")
+        _yaml_lines.append("adapter:")
+        if "freeze_double_stream_scales" in p:
+            _yaml_lines.append(f"  freeze_double_stream_scales: {str(p['freeze_double_stream_scales']).lower()}")
+        best_config_yaml = "\n".join(_yaml_lines)
+
+    # Summary stats for stats bar
+    n_pareto = sum(1 for r in results if r.get("is_pareto") == 1)
+    first_score = next((r["score"] for r in results if r.get("score") is not None), None)
+    best_score  = ranked[0]["score"] if ranked else None
+    if first_score is not None and best_score is not None and len(ranked) > 1:
+        improvement_rate = f"+{(best_score - first_score):.2f} over {len(ranked)} runs"
+    else:
+        improvement_rate = "—"
 
     # Objective display
     obj_str = ""
@@ -1491,6 +1744,10 @@ def _render_html(
         show_pareto="true" if len(pareto_data) >= 3 else "false",
         run_dir_name=run_dir_name,
         show_trend="true" if len(results) >= 5 else "false",
+        best_score_str=f"{best_score:.3f}" if best_score is not None else "—",
+        n_pareto=n_pareto,
+        improvement_rate=improvement_rate,
+        best_config_yaml=json.dumps(best_config_yaml),
     )
 
 
@@ -1505,9 +1762,14 @@ _HTML_TEMPLATE = """\
   h1 {{color:#7df;margin-bottom:4px}}
   h2 {{color:#adf;font-size:1em;margin-top:24px;margin-bottom:6px;
        border-bottom:1px solid #333;padding-bottom:3px}}
-  .meta {{color:#777;font-size:0.82em;margin-bottom:14px}}
+  .meta {{color:#777;font-size:0.82em;margin-bottom:10px}}
+  .stats-bar {{display:flex;gap:24px;background:#161e16;border:1px solid #2a3a2a;
+               border-radius:6px;padding:10px 16px;margin-bottom:14px;flex-wrap:wrap}}
+  .stat {{display:flex;flex-direction:column;min-width:100px}}
+  .stat-label {{color:#666;font-size:0.72em;text-transform:uppercase;letter-spacing:0.04em}}
+  .stat-value {{color:#aef;font-size:1.05em;font-weight:bold}}
   .best-box {{background:#0d1a0d;border:1px solid #2a5;border-radius:6px;
-              padding:12px 16px;margin-bottom:16px;font-size:0.88em;max-width:700px}}
+              padding:12px 16px;margin-bottom:16px;font-size:0.88em;max-width:780px}}
   table {{border-collapse:collapse;font-size:0.82em;margin-top:6px;width:100%}}
   th,td {{border:1px solid #333;padding:4px 8px;text-align:left}}
   th {{background:#1c1c1c;color:#adf}}
@@ -1525,6 +1787,25 @@ _HTML_TEMPLATE = """\
   {n_combos} experiments ({n_ranked} scored, {n_crashed} crashed) &nbsp;|&nbsp;
   total wall-clock: {total_elapsed} &nbsp;|&nbsp; {ts}<br>
   {obj_str}
+</div>
+
+<div class="stats-bar">
+  <div class="stat">
+    <span class="stat-label">Best Score</span>
+    <span class="stat-value" style="color:#7f7">{best_score_str}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Pareto Front</span>
+    <span class="stat-value" style="color:#7af">{n_pareto} exps</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Improvement</span>
+    <span class="stat-value">{improvement_rate}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Scored / Total</span>
+    <span class="stat-value">{n_ranked} / {n_combos}</span>
+  </div>
 </div>
 
 <h2>Recommended Config</h2>
@@ -1568,13 +1849,25 @@ _HTML_TEMPLATE = """\
 <p>Best config: <code>best_config.yaml</code></p>
 
 <script>
-const SERIES      = {js_series};
-const BAR         = {bar_data};
-const TREND       = {trend_data};
-const BEST_LINE   = {best_so_far};
-const PARETO      = {pareto_data};
-const SHOW_TREND  = {show_trend};
-const SHOW_PARETO = {show_pareto};
+const SERIES           = {js_series};
+const BAR              = {bar_data};
+const TREND            = {trend_data};
+const BEST_LINE        = {best_so_far};
+const PARETO           = {pareto_data};
+const SHOW_TREND       = {show_trend};
+const SHOW_PARETO      = {show_pareto};
+const BEST_CONFIG_YAML = {best_config_yaml};
+
+function downloadBestConfig() {{
+  if (!BEST_CONFIG_YAML) return;
+  const blob = new Blob([BEST_CONFIG_YAML], {{type: 'text/yaml'}});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'best_config.yaml';
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+}}
 
 function drawChart(id, key, zeroLine) {{
   const cv = document.getElementById(id); if (!cv) return;
@@ -1745,14 +2038,34 @@ function drawPareto(id) {{
   ctx.fillStyle='#666'; ctx.font='9px monospace';
   ctx.fillText('cond_gap ↑',2,pad.t+ch/2);
   ctx.fillText('ref_gap →',pad.l+cw/2-25,pad.t+ch+28);
+  // Find best-compromise: Pareto point closest to normalised utopia (1,1)
+  const paretoEff = pts.filter(p=>p.is_pareto===1);
+  let bestComp = null;
+  if (paretoEff.length > 1) {{
+    const prMax=Math.max(...paretoEff.map(p=>p.ref_gap));
+    const prMin=Math.min(...paretoEff.map(p=>p.ref_gap));
+    const pcMax=Math.max(...paretoEff.map(p=>p.cond_gap));
+    const pcMin=Math.min(...paretoEff.map(p=>p.cond_gap));
+    let bestD = Infinity;
+    for (const p of paretoEff) {{
+      const nr = prMax>prMin ? (p.ref_gap-prMin)/(prMax-prMin) : 0.5;
+      const nc = pcMax>pcMin ? (p.cond_gap-pcMin)/(pcMax-pcMin) : 0.5;
+      const d  = Math.sqrt((1-nr)**2+(1-nc)**2);
+      if (d<bestD) {{ bestD=d; bestComp=p; }}
+    }}
+  }} else if (paretoEff.length===1) {{ bestComp=paretoEff[0]; }}
+
   pts.forEach(p=>{{
     const x=sx(p.ref_gap), y=sy(p.cond_gap);
     const ip=p.is_pareto===1;
-    ctx.fillStyle=ip?p.color:'rgba(90,90,90,0.6)';
-    ctx.strokeStyle=ip?'rgba(255,255,255,0.8)':'transparent';
-    ctx.lineWidth=1.5;
-    ctx.beginPath(); ctx.arc(x,y,ip?6:3,0,2*Math.PI); ctx.fill();
-    if(ip){{ ctx.stroke(); ctx.fillStyle='#ccc'; ctx.font='8px monospace'; ctx.fillText('★ '+p.combo_id,x+8,y+3); }}
+    const bc=bestComp&&p.id===bestComp.id;
+    ctx.fillStyle=bc?'#ff7':ip?p.color:'rgba(90,90,90,0.6)';
+    ctx.strokeStyle=bc?'#fff':ip?'rgba(255,255,255,0.6)':'transparent';
+    ctx.lineWidth=bc?2:1.5;
+    ctx.beginPath(); ctx.arc(x,y,bc?8:ip?6:3,0,2*Math.PI); ctx.fill();
+    if(ip||bc){{ ctx.stroke(); }}
+    if(bc){{ ctx.fillStyle='#ff7'; ctx.font='bold 8px monospace'; ctx.fillText('⊕ '+p.combo_id+' (best)',x+10,y+3); }}
+    else if(ip){{ ctx.fillStyle='#ccc'; ctx.font='8px monospace'; ctx.fillText('★ '+p.combo_id,x+8,y+3); }}
   }});
 }}
 
@@ -1870,6 +2183,10 @@ def main() -> None:
                     help="SQLite DB path (long-term mode; default: output-dir/ablation_history.db)")
     ap.add_argument("--report-only", action="store_true",
                     help="Regenerate HTML report from existing DB without running new experiments")
+    ap.add_argument("--warm-start-from", default=None, metavar="DIR",
+                    help="Output dir of a prior campaign; injects its best params as first candidate")
+    ap.add_argument("--force-continue", action="store_true",
+                    help="Keep running even after campaign plateau is detected")
 
     # Batch mode
     ap.add_argument("--matrix", default="small", metavar="PRESET",

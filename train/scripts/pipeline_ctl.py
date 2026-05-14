@@ -369,9 +369,14 @@ def cmd_ablation_status(_args) -> None:
     if hb:
         age = heartbeat_age_secs("ablation")
         age_str = f"{int(age)}s ago" if age is not None else "unknown"
+        status = hb.get("status", "")
+        plateau_str = f"  plateau={hb['plateau']}" if hb.get("plateau") else ""
         print(f"  heartbeat: {age_str}  run={hb.get('run_name','')}  "
-              f"status={hb.get('status','')}  "
-              f"n_done={hb.get('n_done','?')}/{hb.get('n_max','?')}")
+              f"status={status}  "
+              f"n_done={hb.get('n_done','?')}/{hb.get('n_max','?')}"
+              f"{plateau_str}")
+        if "plateau" in status:
+            print(f"  ⚠  Campaign plateau detected — use --force-continue to keep exploring")
         if hb.get("current_combo"):
             print(f"  current:   {hb['current_combo']}  "
                   f"step={hb.get('current_step','?')}  "

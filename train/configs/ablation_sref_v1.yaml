@@ -36,11 +36,19 @@ ablation:
     # This removes 3×4 = 12 invalid combos, leaving 116 valid candidates.
     - "style_loss_weight == 0 or cross_ref_prob > 0"
 
-  # Early stopping — terminate individual runs where cond_gap is persistently bad.
-  # Only activates after min_snapshots to avoid killing warmup.
-  # patience consecutive snapshots with cond_gap < min_cond_gap triggers SIGTERM.
+  # Per-run early stopping — terminate a single bad run (cond_gap persistently low).
+  # Only activates after min_snapshots to avoid killing the warmup phase.
   early_stopping:
     enabled:        true
-    min_cond_gap:  -0.30   # below this for `patience` consecutive snapshots → stop
+    min_cond_gap:  -0.30   # below this for `patience` consecutive snapshots → SIGTERM
     patience:       4      # consecutive bad snapshots needed
-    min_snapshots:  5      # snapshots collected before early stopping can activate
+    min_snapshots:  5      # snapshots before early stopping can activate
+
+  # Campaign-level plateau detection — stop the whole campaign when search stalls.
+  # Distinct from early_stopping (which kills one run); this stops the campaign.
+  # Use --force-continue to override if you want to keep exploring anyway.
+  plateau_detection:
+    enabled:    true
+    patience:   10       # consecutive non-improving runs before stopping
+    min_delta:  0.01     # minimum score improvement to reset the counter
+    min_runs:   12       # don't activate before this many runs (exploration phase)

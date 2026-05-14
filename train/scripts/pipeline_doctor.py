@@ -37,6 +37,7 @@ from pipeline_lib import (
     HARD_EX_DIR, STAGING_DIR, DEDUP_DIR, DISPATCH_QUEUE,
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
+    TMUX_ABLATION_WIN,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -1447,6 +1448,29 @@ def _check_stale_logs(chunks: list[int]) -> None:
 # Summary helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _check_ablation_health() -> None:
+    """Warn if an ablation campaign is running but has hit a plateau."""
+    hb = read_heartbeat("ablation")
+    if hb is None:
+        return
+    status = hb.get("status", "")
+    if "plateau" in status:
+        _add("WARNING", "ablation",
+             f"Ablation campaign '{hb.get('run_name','')}' stopped: {status}",
+             detail=(f"n_done={hb.get('n_done')}/{hb.get('n_max')}. "
+                     f"Plateau info: {hb.get('plateau', '')}. "
+                     "Use --force-continue to keep exploring."),
+             fix="train/.venv/bin/python train/scripts/ablation_harness.py "
+                 "--config <your_config.yaml> --output-dir <dir> --force-continue")
+    elif tmux_window_exists(TMUX_ABLATION_WIN):
+        age = heartbeat_age_secs("ablation")
+        if age is not None and age > 7200:  # 2h stale while window alive
+            _add("WARNING", "ablation",
+                 f"Ablation window alive but heartbeat stale ({int(age//60)}m)",
+                 detail="The iris-ablation window may be hung or crashed.",
+                 fix=f"tmux attach -t {TMUX_SESSION}:{TMUX_ABLATION_WIN}")
+
+
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     """Build compact machine-readable pipeline health summary for --ai mode."""
     scale = cfg.get("scale", "small")
@@ -1552,6 +1576,21 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     except Exception:
         pass
 
+    # Ablation harness heartbeat (process="ablation", no chunk)
+    ablation_info: Optional[dict] = None
+    ablation_hb = read_heartbeat("ablation")
+    if ablation_hb is not None:
+        abl_age = heartbeat_age_secs("ablation")
+        ablation_info = {
+            "run_name":  ablation_hb.get("run_name"),
+            "status":    ablation_hb.get("status"),
+            "n_done":    ablation_hb.get("n_done"),
+            "n_max":     ablation_hb.get("n_max"),
+            "plateau":   ablation_hb.get("plateau"),
+            "hb_age_s":  round(abl_age) if abl_age is not None else None,
+            "window":    tmux_window_exists(TMUX_ABLATION_WIN),
+        }
+
     summary: dict = {
         "disk_gb": disk_gb,
         "chunks_done": chunks_done,
@@ -1565,6 +1604,8 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         summary["prep"] = active_prep
     if parallel_prep:
         summary["parallel_prep"] = parallel_prep
+    if ablation_info is not None:
+        summary["ablation"] = ablation_info
 
     return summary
 
@@ -1917,6 +1958,7 @@ def main() -> None:
         _check_ordering_sanity(cfg, chunks)
         _check_data_quality(chunks)
         _check_stale_logs(chunks)
+        _check_ablation_health()
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
     def _issue_fingerprint() -> frozenset:

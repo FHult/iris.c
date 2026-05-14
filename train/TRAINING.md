@@ -7,15 +7,19 @@ Empirical findings and strategic analysis for the precompute + training pipeline
 ## Ablation Harness (QUALITY-10+)
 
 `train/scripts/ablation_harness.py` — long-term autonomous style-feature ablation
-with SQLite-backed persistent memory, Bayesian/random/grid search, and fire-and-forget
-operation. Two modes: **batch** (run a fixed matrix once) and **long-term** (runs for
-days, never repeats a config, gets smarter over time).
+with SQLite-backed persistent memory, Bayesian search (Optuna TPE or GP-UCB fallback),
+campaign plateau detection, warm-start, and fire-and-forget operation.
+
+Two modes: **batch** (run a fixed matrix once) and **long-term** (runs for days,
+never repeats a config, gets smarter over time).
 
 ### When to use it
 
 - Before committing to a full production chunk: "What `cross_ref_prob` + `style_loss_weight`
   combination gives the best style separation at my current data scale?"
 - As a background daemon that keeps exploring while production training is between chunks.
+- When starting a new training phase: use `--warm-start-from` to seed from the best
+  configuration found in a prior campaign.
 
 All ranking is from training signal only — no inference pass needed:
 `ref_gap = mean(loss_cross_ref − loss_self_ref)` over the tail of each run.
@@ -31,17 +35,27 @@ pipeline_ctl start-ablation train/configs/ablation_sref_v1.yaml
 # Check status:
 pipeline_ctl ablation-status
 
-# Pause between runs:
+# Pause / resume / stop:
 pipeline_ctl pause-ablation
 pipeline_ctl resume-ablation
-
-# Stop after the current run completes:
 pipeline_ctl stop-ablation
 
-# Regenerate HTML report from existing DB without running new experiments:
+# Re-render HTML report from existing DB without running new experiments:
 train/.venv/bin/python train/scripts/ablation_harness.py \
     --config train/configs/ablation_sref_v1.yaml \
-    --output-dir /Volumes/2TBSSD/ablation_long --report-only
+    --output-dir /Volumes/2TBSSD/ablation_sref_v1 --report-only
+
+# Start a new campaign seeded from the best config of a prior run:
+train/.venv/bin/python train/scripts/ablation_harness.py \
+    --config train/configs/ablation_sref_v2.yaml \
+    --output-dir /Volumes/2TBSSD/ablation_sref_v2 \
+    --warm-start-from /Volumes/2TBSSD/ablation_sref_v1
+
+# Override plateau detection and keep exploring:
+train/.venv/bin/python train/scripts/ablation_harness.py \
+    --config train/configs/ablation_sref_v1.yaml \
+    --output-dir /Volumes/2TBSSD/ablation_sref_v1 \
+    --force-continue
 ```
 
 **Long-term harness config** (`train/configs/ablation_sref_v1.yaml`):
@@ -49,14 +63,14 @@ train/.venv/bin/python train/scripts/ablation_harness.py \
 ```yaml
 ablation:
   name: "sref-v1"
-  max_total_runs: 128        # full grid = 4×4×2×4 = 128; Bayesian picks the best order
-  steps_per_run: 12000
+  max_total_runs: 128        # full grid = 4×4×2×4 = 128 (minus filtered); Bayesian
+  steps_per_run: 1000        # ~63 min/run at 512px, 3.8s/step
   strategy: "bayesian"       # grid | random | bayesian
-  n_initial: 12              # random warm-up experiments before GP kicks in
+  n_initial: 12              # random warm-up before Optuna TPE (or GP) kicks in
 
   objective:
-    clip_i_weight: 0.55          # ref_gap proxy for CLIP-I style fidelity
-    cross_ref_gap_weight: 0.30   # cond_gap: adapter learning signal
+    clip_i_weight: 0.15          # ref_gap: weak signal at short step budgets
+    cross_ref_gap_weight: 0.70   # cond_gap: primary adapter learning signal
     stability_weight: 0.15       # stability: low final loss
 
   variables:
@@ -67,14 +81,36 @@ ablation:
 
   conditions:
     - "style_loss_weight == 0 or cross_ref_prob > 0"
+
+  # Per-run early stopping — kills a single run if cond_gap is persistently bad.
+  early_stopping:
+    enabled:        true
+    min_cond_gap:  -0.30
+    patience:       4
+    min_snapshots:  5
+
+  # Campaign-level plateau detection — stops the whole campaign when stalled.
+  plateau_detection:
+    enabled:    true
+    patience:   10      # consecutive non-improving runs
+    min_delta:  0.01    # minimum improvement to reset counter
+    min_runs:   12      # exploration grace period (don't activate until N runs)
 ```
 
-**Strategies:**
-- `grid` — exhaustive, fixed order, all candidates
-- `random` — shuffled grid, same coverage as grid but avoids correlated runs early on
-- `bayesian` — GP-UCB Bayesian optimisation (sklearn). Fits a Gaussian Process on
-  observed (params → score) pairs and selects the next candidate with highest Upper
-  Confidence Bound. Focuses exploration on promising regions automatically.
+**Bayesian backend selection** (automatic, no config needed):
+- If `optuna` is installed (`pip install optuna`): uses Optuna **TPE** (Tree-structured
+  Parzen Estimator). Better for discrete/categorical spaces; handles booleans naturally.
+- Otherwise: falls back to **GP-UCB** (sklearn Gaussian Process or pure numpy GP).
+- Install Optuna once: `train/.venv/bin/pip install optuna`
+
+**Campaign plateau detection:** after `min_runs` experiments, if the best score has not
+improved by at least `min_delta` for `patience` consecutive runs, the campaign stops
+gracefully and logs a reason. Use `--force-continue` to override and keep exploring.
+
+**Warm-start:** `--warm-start-from <dir>` reads the prior campaign's `ablation_history.db`,
+finds the highest-scored experiment, and injects those params as the first candidate of
+the new campaign (if not already in the current DB). Useful when starting a phase-2
+sweep with a refined variable set.
 
 **Long-term scoring** (configurable weights, normalised per component):
 ```
@@ -83,13 +119,20 @@ score = 100 × (clip_i_w × ref_norm + gap_w × cond_norm + stab_w × stab_norm)
 where `ref_norm ≈ mean_ref_gap × 2`, `cond_norm ≈ mean_cond_gap / 2.5`,
 `stab_norm ≈ -(final_loss − 1) / 4`.
 
-**Persistent memory:** all experiments are stored in `ablation_history.db` (SQLite).
-The harness never repeats a config (checked by SHA-256 hash of the param dict). After
-a reboot or restart, it resumes from where it left off.
+**Persistent memory:** all experiments stored in `ablation_history.db` (SQLite).
+The harness never repeats a config (SHA-256 hash). Resumes automatically after reboot.
+
+**HTML report** (regenerated after every run, open `index.html`):
+- Stats bar: best score, Pareto front count, improvement rate, scored/total
+- Ranked results table with score, ref_gap, cond_gap, final_loss, elapsed, verdict
+- Pareto scatter: ★ = Pareto-efficient, **⊕** = best compromise (closest to utopia)
+- Trend chart: score over time with rolling-best line
+- Line charts: ref_gap, cond_gap, loss, ip_scale per run
+- **⬇ Download best_config.yaml** button — exports best params as YAML in-browser
 
 **Long-term output:**
 ```
-/Volumes/2TBSSD/ablation_long/
+/Volumes/2TBSSD/ablation_sref_v1/
   index.html               — ranked report (regenerated after every run)
   best_config.yaml         — best params as ready-to-use training config
   ablation_history.db      — SQLite: every experiment ever run
@@ -145,13 +188,20 @@ score = 100 × mean_ref_gap + 200 × mean_cond_gap − 3 × final_loss
 | Comparative ranking | 8 000 | Standard; catches mid-run instabilities |
 | High-confidence ranking | 15 000 | Use before committing a full chunk |
 
-**Batch flags:**
+**Flags (long-term mode):**
 
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--config PATH` | — | Enable long-term mode (harness YAML) |
-| `--db PATH` | auto | SQLite DB path (long-term mode) |
+| `--db PATH` | auto | SQLite DB path |
 | `--report-only` | off | Re-render HTML from DB, no new runs |
+| `--warm-start-from DIR` | — | Seed first candidate from prior campaign's best |
+| `--force-continue` | off | Ignore plateau detection; keep exploring |
+
+**Flags (batch mode):**
+
+| Flag | Default | Notes |
+|------|---------|-------|
 | `--matrix` | `small` | Batch preset name |
 | `--matrix-file` | — | Custom matrix YAML (overrides `--matrix`) |
 | `--steps` | 8000 | Steps per combo |
