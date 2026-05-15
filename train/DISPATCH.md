@@ -541,3 +541,91 @@ HuggingFace resumes from the partial `.incomplete` file. If the stall recurs, co
 
 **"Training finished chunk N, start chunk N+1"**
 → Orchestrator advances automatically. Before chunk N+1 training starts, run `pipeline_doctor.py --ai` to confirm hard examples are fresh and checkpoint step matches expected end.
+
+---
+
+## Compatibility Validation
+
+`train/scripts/validate_full_compatibility.py` is a standalone suite that catches silent train/inference mismatches before they corrupt a precompute run or invalidate a training chunk.
+
+**Motivating bug (INFER-C-001):** precomputed Qwen3 embeddings were computed without `enable_thinking=False` in `apply_chat_template`, making them 7 tokens shorter than inference produces. IP-adapter weights trained from those embeddings were misaligned at inference time with no runtime error. The entire precomputed cache was silently invalid.
+
+### When to run
+
+Run before any of these events:
+- Any production precompute run (before launching `precompute_all.py` for a new chunk)
+- Any flywheel campaign launch
+- After any code change to `precompute_all.py`, `cache_manager.py`, `iris_qwen3.h`, or `iris_qwen3_tokenizer.c`
+- After updating the Qwen3 model or changing layer extraction config
+- After any suspected cache corruption
+
+### Quick reference
+
+**Standard run (fast, for CI / pre-precompute gate):**
+```bash
+train/.venv/bin/python train/scripts/validate_full_compatibility.py --fast
+```
+
+**AI-mode output (for pipeline_doctor integration):**
+```bash
+train/.venv/bin/python train/scripts/validate_full_compatibility.py --fast --ai
+```
+
+**Full run with reports written:**
+```bash
+train/.venv/bin/python train/scripts/validate_full_compatibility.py \
+  --data-root /Volumes/2TBSSD --report-dir /Volumes/2TBSSD/reports/compat
+```
+
+**Strict mode (WARN also causes non-zero exit, for automation):**
+```bash
+train/.venv/bin/python train/scripts/validate_full_compatibility.py --fast --strict
+```
+
+**Run specific checks only:**
+```bash
+train/.venv/bin/python train/scripts/validate_full_compatibility.py \
+  --checks qwen3_layers,think_tags,pad_alignment
+```
+
+### What it checks
+
+| ID | Check | What it catches |
+|----|-------|----------------|
+| `qwen3_layers` | CHECK-1: Qwen3 layer extraction consistency | `iris_qwen3.h` QWEN3_OUTPUT_LAYER_* vs `cache_manager.py` layers list — both must be [8, 17, 26] |
+| `think_tags` | CHECK-2: Chat template think-tag presence | `precompute_all.py` missing `enable_thinking=False` in `apply_chat_template` (INFER-C-001) |
+| `cache_version_hash` | CHECK-3: Cache version hash matches code | `current` symlink target vs freshly recomputed hash — detects stale caches |
+| `embedding_sanity` | CHECK-4: Embedding numerical sanity | Shape of cached NPZ files must be [seq, 7680]; skipped with --fast |
+| `vae_shape` | CHECK-5: VAE latent shape consistency | Cached VAE latents must have 32 channels |
+| `siglip_shape` | CHECK-6: SigLIP feature shape consistency | Cached SigLIP features must be [729, 1152] |
+| `pad_alignment` | CHECK-7: Pad alignment | `dataset.py _TEXT_PAD` must equal `iris_qwen3.h QWEN3_MAX_SEQ_LEN` (both 512) |
+| `ip_injection_coverage` | CHECK-8: IP-Adapter injection blocks | Reports training vs C inference injection sites; WARN if C inference lacks ip_scale |
+| `cache_manifest` | CHECK-9: Cache manifest completeness | All encoder manifests must have `complete: true` |
+| `mining_timestep` | CHECK-10: Mining timestep | WARN if `mine_hard_examples.py` uses fixed t=500 (PIPE-H-004) |
+
+### Interpreting the report
+
+- **PASS** — check is consistent; no action needed.
+- **WARN** — potential issue; training will likely still work but quality or correctness may be degraded. Always investigate WARNs before a production run.
+- **FAIL** — confirmed mismatch; training or inference will produce wrong results. Fix before proceeding.
+- **SKIP** — check could not run (missing files, no cache yet, or --fast). Not a problem unless all critical checks are skipped.
+
+Exit codes: 0 = all pass, 1 = any FAIL, 2 = any WARN (with --strict), 3 = config error.
+
+### Integration hook
+
+To call from orchestrator or precompute scripts:
+```python
+from validate_full_compatibility import validate_for_pipeline
+report = validate_for_pipeline(cfg, DATA_ROOT, strict=True)
+# Raises RuntimeError on FAIL (or WARN if strict=True)
+```
+
+### Config section (v2_pipeline_smoke.yaml example)
+```yaml
+validation:
+  report_dir: "reports/compat"
+  strict: false
+  cosine_threshold: 0.999
+  warn_threshold: 0.99
+```

@@ -223,6 +223,41 @@ For the small number of training shards already built from pool data (current an
 
 ---
 
+**PIPELINE-DATA-1: Dedicated LAION/COYO download script + pipeline_setup integration** (Medium priority)
+
+**Current state:** `download_convert.py` downloads JDB tgzs and WikiArt automatically. LAION and COYO are checked via `check_laion()` / `check_coyo()` in `downloader.py`, but these only verify that `raw/laion/` and `raw/coyo/` are non-empty — nothing is downloaded. If the directories are absent, a WARNING is logged and those sources are silently skipped for the chunk. Chunks built this way are JDB+WikiArt only, reducing data diversity.
+
+**New script: `train/scripts/download_laion_coyo.py`**
+
+A dedicated one-time setup script, separate from `download_convert.py` (which runs per-chunk). LAION/COYO are large, slow downloads that belong in the persistent cold pool — not the per-chunk pipeline loop.
+
+Responsibilities:
+1. Fetch LAION metadata subset (`laion/laion-aesthetics-v2-5plus` or similar) using the HF datasets API; filter to the configured `data_volume` fraction from [v2_pipeline.yaml:57-64](train/configs/v2_pipeline.yaml#L57-L64).
+2. Fetch COYO-700M metadata (`kakaobrain/coyo-700m`); same fraction.
+3. Use `img2dataset` (or a `requests`+`PIL` parallel fetcher) to download images → WDS `.tar` files, writing to `cold_root/raw/laion/` and `cold_root/raw/coyo/` (persistent cold pool, analogous to JDB converted pool).
+4. Write sentinel files `cold_root/raw/laion/.downloaded` and `cold_root/raw/coyo/.downloaded` for idempotent resume — re-running the script skips already-complete downloads.
+5. Emit a heartbeat during download (same `write_heartbeat` pattern as other workers) so `pipeline_status.py` shows progress.
+
+`download_convert.py` stays unchanged — `check_laion()` / `check_coyo()` promote from cold pool to hot `raw/` on each chunk run (analogous to how JDB tgzs are promoted from the cold raw pool today).
+
+**pipeline_setup.py integration:**
+
+`pipeline_setup.py` runs at the start of a new pipeline campaign. It should detect missing LAION/COYO pools and either:
+- **Prompt the user** (interactive mode): print a clear message explaining that LAION/COYO are not downloaded and offer to run `download_laion_coyo.py` now or skip and train on JDB+WikiArt only.
+- **Auto-run** (non-interactive / `--yes` mode): launch `download_laion_coyo.py` in a tmux window (same pattern as other long-running prep steps) so it runs in the background while the user works.
+
+Detection: check for `cold_root/raw/laion/.downloaded` and `cold_root/raw/coyo/.downloaded` sentinels. If absent, offer/trigger the download.
+
+Add a `data_sources.laion_coyo: auto | prompt | skip` config key to `v2_pipeline.yaml` so the behaviour is explicit and not hardcoded. Default: `prompt`.
+
+**Dependency:** `img2dataset` is not in `train/requirements.txt`. Add it, or implement a lighter parallel fetcher using `aiohttp` + `PIL` (avoids a heavy dep). `img2dataset` has a WebDataset output mode that produces `.tar` files directly — preferred if the dependency is acceptable.
+
+**Risk:** LAION/COYO image URLs have ~20-40% 404 rates depending on subset age. The downloader must handle failures gracefully and produce dense WDS shards from available records. `img2dataset` handles this automatically; a custom fetcher would need the same logic.
+
+**When to do:** after chunk 2 production run completes and pipeline is stable. Not blocking any current chunk.
+
+---
+
 ---
 
 ## Flywheel Management
