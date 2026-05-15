@@ -1536,11 +1536,23 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
 
 
 def _check_val_set(cfg: dict) -> None:
-    """Verify the held-out validation set exists on cold and is staged to hot."""
+    """Verify the held-out validation set exists on cold and is staged to the active prep tier."""
     storage   = cfg.get("storage", {})
     cold_root = Path(storage.get("cold_root", "/Volumes/16TBCold"))
     cold_val_sentinel = cold_root / "validation" / "held_out" / ".val_set_created"
-    hot_val_shards    = DATA_ROOT / "validation" / "held_out"
+
+    # Determine where the val set should be staged: ultrahot when configured.
+    from pipeline_lib import ULTRAHOT_ROOT as _UH_DEFAULT
+    prep_tier = storage.get("data_prep_tier", "hot")
+    if prep_tier == "ultrahot":
+        uh_root = Path(storage.get("ultrahot_root", str(_UH_DEFAULT)))
+        val_dest = uh_root if uh_root.exists() else DATA_ROOT
+        tier_label = "ultrahot" if val_dest != DATA_ROOT else "hot"
+    else:
+        val_dest = DATA_ROOT
+        tier_label = "hot"
+
+    staged_val_shards = val_dest / "validation" / "held_out"
 
     ctl = str(SCRIPTS_DIR / "pipeline_ctl.py")
 
@@ -1559,24 +1571,25 @@ def _check_val_set(cfg: dict) -> None:
              ctx={"sentinel": str(cold_val_sentinel)})
         return
 
-    # Cold val set exists — check it is staged to hot.
-    hot_shards = sorted(hot_val_shards.glob("*.tar")) if hot_val_shards.exists() else []
-    if not hot_shards:
+    # Cold val set exists — check it is staged to the active prep tier.
+    staged_shards = sorted(staged_val_shards.glob("*.tar")) if staged_val_shards.exists() else []
+    if not staged_shards:
         _add("WARNING", "val_set",
-             "Val set exists on cold but is not staged to hot — val loss disabled",
+             f"Val set exists on cold but is not staged to {tier_label} — val loss disabled",
              detail=(
-                 "pipeline_setup.py stages the val set automatically. "
+                 f"pipeline_setup.py stages the val set to {tier_label} automatically. "
                  "Re-run setup or stage manually."
              ),
              fix=f"train/.venv/bin/python train/scripts/pipeline_setup.py --check",
              ctx={"cold_sentinel": str(cold_val_sentinel),
-                  "hot_val_dir": str(hot_val_shards)})
+                  "staged_val_dir": str(staged_val_shards), "tier": tier_label})
     else:
-        hot_precomp = DATA_ROOT / "validation" / "precomputed"
-        enc_dirs = [d for d in hot_precomp.iterdir() if d.is_dir()] if hot_precomp.exists() else []
+        staged_precomp = val_dest / "validation" / "precomputed"
+        enc_dirs = [d for d in staged_precomp.iterdir() if d.is_dir()] if staged_precomp.exists() else []
         _add("INFO", "val_set",
-             f"Val set staged: {len(hot_shards)} shard(s), {len(enc_dirs)} encoder cache(s)",
-             ctx={"shards": len(hot_shards), "encoders": [d.name for d in enc_dirs]})
+             f"Val set staged ({tier_label}): {len(staged_shards)} shard(s), {len(enc_dirs)} encoder cache(s)",
+             ctx={"shards": len(staged_shards), "encoders": [d.name for d in enc_dirs],
+                  "tier": tier_label})
 
 
 def _check_pool_health(cfg: dict) -> None:

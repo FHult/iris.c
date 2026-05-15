@@ -718,8 +718,9 @@ def train(config: dict) -> None:
             print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_prefixes)} shards). OK.")
 
     blocklist_ids = None
-    if args.blocklist:
-        blocklist_ids = set(Path(args.blocklist).read_text().splitlines())
+    _blocklist_path = config.get("_blocklist")
+    if _blocklist_path:
+        blocklist_ids = set(Path(_blocklist_path).read_text().splitlines())
         print(f"Blocklist: {len(blocklist_ids):,} duplicate record IDs will be skipped", flush=True)
 
     loader = make_prefetch_loader(
@@ -1098,10 +1099,11 @@ def train(config: dict) -> None:
             return None
         from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed, _load_siglip_embed
         import pipeline_lib as _plib
-        # Val precomputed embeddings live in DATA_ROOT/validation/precomputed/{enc}/,
-        # staged there by pipeline_setup.py from cold/validation/precomputed/.
-        # Fall back to the training cache dirs if the val-specific dirs are absent.
-        _vbase      = Path(str(_plib.DATA_ROOT)) / "validation" / "precomputed"
+        # Val precomputed embeddings: check ultrahot tier first (staged there when
+        # data_prep_tier=ultrahot), fall back to hot DATA_ROOT, then to training caches.
+        _uh_vbase  = _plib.ULTRAHOT_ROOT / "validation" / "precomputed"
+        _hot_vbase = Path(str(_plib.DATA_ROOT)) / "validation" / "precomputed"
+        _vbase     = _uh_vbase if _uh_vbase.is_dir() else _hot_vbase
         _val_qwen3  = str(_vbase / "qwen3")  if (_vbase / "qwen3").is_dir()  else dcfg.get("qwen3_cache_dir")
         _val_vae    = str(_vbase / "vae")    if (_vbase / "vae").is_dir()    else dcfg.get("vae_cache_dir")
         _val_siglip = str(_vbase / "siglip") if (_vbase / "siglip").is_dir() else None
@@ -1201,7 +1203,11 @@ def train(config: dict) -> None:
     try:
         from pathlib import Path as _P
         import pipeline_lib as _plib
-        _held_out = _P(str(_plib.DATA_ROOT)) / "validation" / "held_out"
+        # Check ultrahot tier first (staged there when data_prep_tier=ultrahot),
+        # fall back to hot DATA_ROOT.
+        _uh_held_out  = _plib.ULTRAHOT_ROOT / "validation" / "held_out"
+        _hot_held_out = _P(str(_plib.DATA_ROOT)) / "validation" / "held_out"
+        _held_out = _uh_held_out if _uh_held_out.exists() else _hot_held_out
         if _held_out.exists():
             _val_shards = sorted(str(p) for p in _held_out.glob("*.tar"))
             print(f"Validation held-out: {len(_val_shards)} shards in {_held_out}")
@@ -2785,6 +2791,7 @@ def main():
     # Store config directory so train() can locate sibling files (e.g. eval_prompts.txt).
     config["_config_dir"] = str(Path(args.config).parent)
     config["_warmup_only"] = args.warmup_only
+    config["_blocklist"] = args.blocklist
 
     if args.dry_run:
         print("Config OK:")

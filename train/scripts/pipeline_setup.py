@@ -612,11 +612,14 @@ def suggest_tgz_priority(config: dict, chunk: int, scale: str) -> dict:
 
 def _stage_val_set(data_root: Path, config: dict) -> Optional[str]:
     """
-    Stage the permanent held-out val set from cold/validation/ to data_root/validation/.
+    Stage the permanent held-out val set from cold/validation/ to the active prep tier.
 
-    Symlinks val shards into data_root/validation/held_out/ and copies precomputed
-    NPZ files into data_root/validation/precomputed/{enc}/.  The trainer reads from
-    these paths; they are separate from the training precompute cache.
+    When storage.data_prep_tier == "ultrahot" and ultrahot_root is mounted, stages
+    to ultrahot_root/validation/ so the trainer reads val data from the same fast
+    tier as training data.  Falls back to data_root/validation/ otherwise.
+
+    Symlinks val shards and copies precomputed NPZ files.  The trainer checks
+    ultrahot_root/validation/held_out first, then DATA_ROOT/validation/held_out.
 
     Returns a human-readable status string, or None if the val set has not been
     created yet on cold (run pipeline_ctl.py create-val-set first).
@@ -629,8 +632,16 @@ def _stage_val_set(data_root: Path, config: dict) -> Optional[str]:
     if not sentinel.exists():
         return None
 
-    val_hot_shards  = data_root / "validation" / "held_out"
-    val_hot_precomp = data_root / "validation" / "precomputed"
+    # Determine staging destination: ultrahot when configured and mounted.
+    prep_tier = storage.get("data_prep_tier", "hot")
+    if prep_tier == "ultrahot":
+        uh_root = Path(storage.get("ultrahot_root", Path.home() / "ultrahot"))
+        val_dest = uh_root if uh_root.exists() else data_root
+    else:
+        val_dest = data_root
+
+    val_hot_shards  = val_dest / "validation" / "held_out"
+    val_hot_precomp = val_dest / "validation" / "precomputed"
     val_hot_shards.mkdir(parents=True, exist_ok=True)
 
     shards_staged = 0
@@ -655,8 +666,9 @@ def _stage_val_set(data_root: Path, config: dict) -> Optional[str]:
                     shutil.copy2(npz, dst)
                     npz_staged += 1
 
+    tier_label = "ultrahot" if val_dest != data_root else "hot"
     return (f"{shards_staged} val shard(s) staged → {val_hot_shards}"
-            f"  ({npz_staged} new NPZ files)")
+            f"  ({npz_staged} new NPZ files, tier={tier_label})")
 
 
 def _setup_pool_dirs(config: dict, dry_run: bool = False) -> list[str]:
