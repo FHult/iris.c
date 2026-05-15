@@ -532,12 +532,13 @@ class Orchestrator:
                      level="warning")
 
     def _delete_staging_raw(self, chunk: int) -> None:
-        """Delete staging raw data once shards are built (V2 Section 6 lifecycle)."""
-        raw = STAGING_DIR / f"chunk{chunk}" / "raw"
-        if raw.exists():
-            log_orch(f"Chunk {chunk}: freeing staging raw data ({raw})", chunk=chunk)
-            if not self.dry_run:
-                shutil.rmtree(raw, ignore_errors=True)
+        """Delete staging raw + converted data once shards are built."""
+        for subdir in ("raw", "converted"):
+            path = STAGING_DIR / f"chunk{chunk}" / subdir
+            if path.exists():
+                log_orch(f"Chunk {chunk}: freeing staging {subdir} data ({path})", chunk=chunk)
+                if not self.dry_run:
+                    shutil.rmtree(path, ignore_errors=True)
 
     _PREP_LOG_PATTERNS = [
         "download_chunk{c}.log",
