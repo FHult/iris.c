@@ -37,7 +37,7 @@ from pipeline_lib import (
     TMUX_SESSION, TMUX_ORCH_WIN, TMUX_TRAIN_WIN, TMUX_PREP_WIN,
     TMUX_ABLATION_WIN, TMUX_FLYWHEEL_WIN,
     SCRIPTS_DIR, TRAIN_DIR,
-    CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
+    HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
     ABLATION_CONTROL_FILE, ABLATION_DB_PATH,
     FLYWHEEL_CONTROL_FILE, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
     COLD_ROOT, COLD_WEIGHTS_DIR, COLD_VAL_SHARDS_DIR, COLD_VAL_PRECOMP_DIR,
@@ -197,6 +197,19 @@ def cmd_restart_from_chunk(args) -> None:
     import shutil
     chunk = args.chunk
 
+    # Derive checkpoint dirs from config so ultrahot mode routes correctly.
+    _cfg_path = getattr(args, "config", None) or str(TRAIN_DIR / "configs" / "v2_pipeline.yaml")
+    try:
+        _cfg = load_config(_cfg_path)
+        _storage = _cfg.get("storage", {})
+        from pipeline_lib import ULTRAHOT_ROOT as _UH_ROOT
+        _uh = Path(_storage.get("ultrahot_root", str(_UH_ROOT)))
+        _prep_root = _uh if _storage.get("data_prep_tier") == "ultrahot" else DATA_ROOT
+    except Exception:
+        _prep_root = DATA_ROOT
+    _ckpt_dir         = _prep_root / "checkpoints" / "stage1"
+    _ckpt_archive_dir = _ckpt_dir  / "archive"
+
     # Cold mount pre-flight
     if not COLD_ROOT.exists():
         print(f"WARNING: cold storage not mounted at {COLD_ROOT}")
@@ -221,13 +234,13 @@ def cmd_restart_from_chunk(args) -> None:
     ckpt_source = None
     ckpt_source_label = None
     if chunk > 1:
-        arch_st  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
-        arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.json"
-        arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.ema.safetensors"
+        arch_st  = _ckpt_archive_dir / f"chunk{chunk - 1}_final.safetensors"
+        arch_js  = _ckpt_archive_dir / f"chunk{chunk - 1}_final.json"
+        arch_ema = _ckpt_archive_dir / f"chunk{chunk - 1}_final.ema.safetensors"
         if arch_st.exists():
             ckpt_source = (arch_st, arch_js if arch_js.exists() else None,
                            arch_ema if arch_ema.exists() else None)
-            ckpt_source_label = f"hot archive ({arch_st})"
+            ckpt_source_label = f"archive ({arch_st})"
         else:
             cold_st, cold_js, cold_ema = _find_cold_checkpoint(chunk)
             if cold_st:
@@ -246,8 +259,8 @@ def cmd_restart_from_chunk(args) -> None:
         if ckpt_source:
             print(f"  - Restore chunk {chunk - 1} checkpoint from {ckpt_source_label}")
         else:
-            print(f"  - WARNING: no checkpoint found for chunk {chunk - 1} in hot archive or cold")
-            print(f"             Training will resume from whatever is currently in {CKPT_DIR}")
+            print(f"  - WARNING: no checkpoint found for chunk {chunk - 1} in archive or cold")
+            print(f"             Training will resume from whatever is currently in {_ckpt_dir}")
     confirm = input("Continue? (y/N): ").strip()
     if confirm.lower() != "y":
         print("Aborted.")
@@ -284,10 +297,10 @@ def cmd_restart_from_chunk(args) -> None:
                 step_name = f"step_{meta.get('step', 'restored'):07d}"
             except Exception:
                 pass
-        CKPT_DIR.mkdir(parents=True, exist_ok=True)
-        dst_st  = CKPT_DIR / f"{step_name}.safetensors"
-        dst_js  = CKPT_DIR / f"{step_name}.json"
-        dst_ema = CKPT_DIR / f"{step_name}.ema.safetensors"
+        _ckpt_dir.mkdir(parents=True, exist_ok=True)
+        dst_st  = _ckpt_dir / f"{step_name}.safetensors"
+        dst_js  = _ckpt_dir / f"{step_name}.json"
+        dst_ema = _ckpt_dir / f"{step_name}.ema.safetensors"
         shutil.copy2(src_st, dst_st)
         if src_js is not None:
             shutil.copy2(src_js, dst_js)
@@ -848,6 +861,8 @@ def main() -> None:
     p = sub.add_parser("restart-from-chunk",
                        help="Safely restart pipeline from chunk N (clears sentinels, restores checkpoint)")
     p.add_argument("chunk", type=int)
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config (default: train/configs/v2_pipeline.yaml)")
 
     p = sub.add_parser("clear-phantoms",
                    help="Find and remove phantom sentinels (step claims done but hot data is missing)")
