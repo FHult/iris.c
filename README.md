@@ -273,9 +273,9 @@ If no active config exists, it prompts to run the setup wizard first.
 ### Pipeline Steps (per chunk)
 
 ```
-download → convert → filter_shards → clip_embed → clip_index → clip_dups
-→ build_shards → precompute → promoted → validate_shards
-→ train → mine → validate
+download → convert → build_shards → filter_shards → clip_embed → clip_index → clip_dups
+→ precompute → promoted → validate_shards → training_warmup
+→ train → mine → validate → archive
 ```
 
 Each step writes a sentinel file under `{DATA_ROOT}/pipeline/chunk{N}/{step}.done`. The orchestrator is fully resumable — kill and restart at any time.

@@ -1812,12 +1812,12 @@ iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
         return NULL;
     }
     fseek(f_noise, 0, SEEK_END);
-    int noise_size = ftell(f_noise) / sizeof(float);
+    long noise_size = ftell(f_noise) / (long)sizeof(float);
     fseek(f_noise, 0, SEEK_SET);
     float *noise = (float *)malloc(noise_size * sizeof(float));
     fread(noise, sizeof(float), noise_size, f_noise);
     fclose(f_noise);
-    fprintf(stderr, "[DEBUG] Loaded noise: %d floats\n", noise_size);
+    fprintf(stderr, "[DEBUG] Loaded noise: %ld floats\n", noise_size);
 
     /* Load Python's ref_latent */
     FILE *f_ref = fopen("/tmp/py_ref_latent.bin", "rb");

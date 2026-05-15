@@ -303,6 +303,7 @@ def save_checkpoint_async(
     """
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, f"step_{step:07d}.safetensors")
+    ckpt_tmp  = ckpt_path + ".tmp"
 
     tensor_pairs = (
         list(_flatten(adapter.parameters()))
@@ -310,8 +311,9 @@ def save_checkpoint_async(
     )
 
     mx.clear_cache()
-    _save_safetensors_streaming(ckpt_path, tensor_pairs)
-    _purge_file_page_cache(ckpt_path)
+    _save_safetensors_streaming(ckpt_tmp, tensor_pairs)
+    _purge_file_page_cache(ckpt_tmp)
+    os.rename(ckpt_tmp, ckpt_path)
     mx.clear_cache()
 
     size_mb = os.path.getsize(ckpt_path) / 1e6
@@ -319,9 +321,11 @@ def save_checkpoint_async(
 
     if lineage is not None:
         sidecar_path = os.path.join(output_dir, f"step_{step:07d}.json")
+        sidecar_tmp  = sidecar_path + ".tmp"
         try:
-            with open(sidecar_path, "w") as _f:
+            with open(sidecar_tmp, "w") as _f:
                 json.dump(lineage, _f, indent=2)
+            os.rename(sidecar_tmp, sidecar_path)
         except OSError as e:
             print(f"  WARNING: could not write lineage sidecar: {e}")
 
@@ -665,12 +669,13 @@ def train(config: dict) -> None:
     # Shards missing siglip cache are kept (siglip falls back to zeros).
     qwen3_dir = dcfg.get("qwen3_cache_dir")
     vae_dir   = dcfg.get("vae_cache_dir")
-    if qwen3_dir and vae_dir:
-        def _internal_prefix(tar_path):
-            # Production shards keep their staging filename (e.g. "000000.tar" for
-            # chunk 1, "250000.tar" for chunk 2) so the stem IS the internal prefix.
-            return os.path.splitext(os.path.basename(tar_path))[0]
 
+    def _internal_prefix(tar_path):
+        # Production shards keep their staging filename (e.g. "000000.tar" for
+        # chunk 1, "250000.tar" for chunk 2) so the stem IS the internal prefix.
+        return os.path.splitext(os.path.basename(tar_path))[0]
+
+    if qwen3_dir and vae_dir:
         def _has_cache(tar_path):
             pfx = _internal_prefix(tar_path)
             # Check first and 50th record: if both exist, the shard is substantially
@@ -1115,14 +1120,17 @@ def train(config: dict) -> None:
                 _alpha, _sigma = get_schedule_values(_t)
                 _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
                 # No-grad forward: call loss function directly (not through value_and_grad).
+                # TODO: load real siglip features from val shard siglip_cache_dir
+                # (following the same pattern as the training loop) so val loss measures
+                # actual adapter conditioning quality rather than zero-image features.
                 _siglip_zero = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
                 if _use_block_injection:
                     mx.eval(_target)
-                    _loss = loss_fn_with_ip(_siglip_zero, mx.array(True), _noisy, _txt, _t, _target)
+                    _loss = loss_fn_with_ip(_siglip_zero, mx.array(False), _noisy, _txt, _t, _target)
                 else:
                     _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
                     mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
-                    _loss = loss_fn(_siglip_zero, mx.array(True), _fs, _target)
+                    _loss = loss_fn(_siglip_zero, mx.array(False), _fs, _target)
                     del _fs
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
@@ -1681,8 +1689,9 @@ def train(config: dict) -> None:
                 _hb_loader_pct = _loader_pct
 
                 # T-11: gradient clipping report
+                _grad_clip_pct_for_hb = round(100 * _grad_clip_steps / log_interval, 1)
                 if _grad_clip_steps > 0:
-                    _clip_pct = round(100 * _grad_clip_steps / log_interval, 1)
+                    _clip_pct = _grad_clip_pct_for_hb
                     print(f"  grad_clipped={_clip_pct:.0f}% ({_grad_clip_steps}/{log_interval} steps "
                           f"had norm > {_grad_clip})", flush=True)
                 _grad_clip_steps = 0
@@ -1791,7 +1800,7 @@ def train(config: dict) -> None:
                             elapsed_seconds=int(total_elapsed),
                             grad_norm=round(_gn, 4),
                             grad_norm_smooth=round(grad_norm_smooth, 4),
-                            grad_clip_pct=round(100 * _grad_clip_steps / log_interval, 1),
+                            grad_clip_pct=_grad_clip_pct_for_hb,
                             ema_drift=round(ema_drift, 5),
                             val_loss=round(val_loss_last, 6) if val_loss_last is not None else None,
                             siglip_coverage_pct=_siglip_cov,
@@ -1928,15 +1937,20 @@ def train(config: dict) -> None:
         # mx.save_safetensors staging buffer (~2 GB) is avoided.
         mx.eval(ema_params)
         _best_path = os.path.join(ocfg["checkpoint_dir"], "best.safetensors")
-        _save_safetensors_streaming(_best_path, list(_flatten(ema_params)))
-        _purge_file_page_cache(_best_path)
+        _best_tmp  = _best_path + ".tmp"
+        _save_safetensors_streaming(_best_tmp, list(_flatten(ema_params)))
+        _purge_file_page_cache(_best_tmp)
+        os.rename(_best_tmp, _best_path)
 
         # Write lineage sidecar so best.safetensors is self-documenting.
         _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
                       "chunk": _pipeline_chunk}
         try:
-            with open(_best_path.replace(".safetensors", ".json"), "w") as _f:
+            _best_json_path = _best_path.replace(".safetensors", ".json")
+            _best_json_tmp  = _best_json_path + ".tmp"
+            with open(_best_json_tmp, "w") as _f:
                 json.dump(_best_meta, _f, indent=2)
+            os.rename(_best_json_tmp, _best_json_path)
         except OSError:
             pass
         print(f"\nTraining complete. EMA weights: {ocfg['checkpoint_dir']}/best.safetensors")

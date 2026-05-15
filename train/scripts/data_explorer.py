@@ -24,9 +24,12 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -43,6 +46,7 @@ from pipeline_lib import (
     FLYWHEEL_DB_PATH,
     PRECOMP_DIR,
     SHARD_SCORES_DB_PATH,
+    SHARD_BLOCK,
     SHARDS_DIR,
     free_gb,
     load_config,
@@ -701,6 +705,42 @@ def _free_gb_cold(path: Path) -> Optional[float]:
         return None
 
 
+def _disk_stats(path: Path) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Returns (used_gb, total_gb, free_gb) or (None, None, None)."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize / 1e9
+        free  = st.f_bavail * st.f_frsize / 1e9
+        used  = (st.f_blocks - st.f_bfree) * st.f_frsize / 1e9
+        return used, total, free
+    except OSError:
+        return None, None, None
+
+
+def _du_kb(path: Path, timeout: float = 8.0) -> Optional[int]:
+    """Run du -sk on path, return kilobytes or None on timeout/error."""
+    try:
+        r = subprocess.run(["du", "-sk", str(path)],
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0 and r.stdout:
+            return int(r.stdout.split()[0])
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_kb(kb: Optional[int]) -> str:
+    if kb is None:
+        return "—"
+    gb = kb / 1024 / 1024
+    if gb >= 1.0:
+        return f"{gb:.1f} GB"
+    mb = kb / 1024
+    if mb >= 1.0:
+        return f"{mb:.0f} MB"
+    return f"{kb} KB"
+
+
 def _col_table(rows: list[list[str]], headers: list[str], min_width: int = 6) -> str:
     """Simple fixed-width column formatter — no external deps."""
     all_rows = [headers] + rows
@@ -738,6 +778,151 @@ def _json_print(data: Any) -> None:
 
 
 # ── status ─────────────────────────────────────────────────────────────────
+
+def _render_status_html(result: dict, sizes: dict[str, Optional[int]]) -> str:
+    import datetime as _dt
+
+    def _s(path_str: str) -> str:
+        return _fmt_kb(sizes.get(path_str))
+
+    ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    disk = result.get("disk", {})
+
+    def _disk_card(label: str, used: Optional[float], total: Optional[float],
+                   free: Optional[float]) -> str:
+        if total is None:
+            return _stat_card(label, "not mounted")
+        pct = 100.0 * (used or 0) / total
+        sub = f"{used:.0f} GB / {total:.0f} GB"
+        return _stat_card(label, f"{free:.0f} GB free", sub)
+
+    # Build cards from pre-computed disk info in result
+    # (statvfs values aren't in result, but sizes_gb has dir-level sizes)
+    cards_html = '<div class="grid">'
+    cards_html += _stat_card("Cold free",  f"{disk.get('cold_free_gb', '?')} GB",
+                             str(result.get("disk", {}).get("cold_free_gb", "")))
+    cards_html += _stat_card("Hot free",   f"{disk.get('hot_free_gb', '?')} GB",
+                             str(result.get("disk", {}).get("hot_free_gb", "")))
+    cards_html += _stat_card("Chunks ready",
+                             str(sum(1 for cn in result.get("hot_shards", {})
+                                     if result["hot_shards"].get(cn) or 0 > 0)),
+                             f"of {len(set(list(result.get('hot_shards',{}).keys()) + list(result.get('cold_shards',{}).keys())))} total")
+    cards_html += _stat_card("Precompute (cold)",
+                             str(len(result.get("cold_precompute", {}))),
+                             "encoders archived")
+    cards_html += _stat_card("Weights",
+                             str(result.get("weights", {}).get("campaign_count", 0)),
+                             "campaigns")
+    cards_html += "</div>"
+
+    # Cold table
+    cold_rows: list[list] = []
+    cp = result.get("cold_precompute", {})
+    conv_cnt = result.get("cold_converted_count", 0)
+    if conv_cnt:
+        cold_rows.append(["converted/journeydb", f"{conv_cnt} tars", "", ""])
+    cs = result.get("cold_shards", {})
+    if cs:
+        chunks_str = "  ".join(f"chunk{k}:{v}" for k, v in sorted(cs.items()))
+        cold_rows.append(["shards/", f"{sum(cs.values())} tars", chunks_str, ""])
+    for enc, info in cp.items():
+        ver  = info.get("version", "?")
+        rec  = f'{info.get("records", 0):,}'
+        comp = "complete" if info.get("complete") else "partial"
+        badge = f'<span class="badge {"ok" if comp == "complete" else "warn"}">{comp}</span>'
+        cold_rows.append([f"precomputed/{enc}", ver, f"{rec} records", badge])
+    w = result.get("weights", {})
+    if w.get("campaign_count"):
+        cold_rows.append(["weights/",
+                          f"{w['campaign_count']} campaign(s)",
+                          f"latest={w['latest_campaign']}  {w['latest_steps']} steps", ""])
+    for db_name, info in result.get("databases", {}).items():
+        rows = info.get("rows")
+        age  = info.get("age_h")
+        rs   = f"{rows:,} rows" if rows is not None else "—"
+        ag   = f"{age}h ago" if age is not None else ""
+        cold_rows.append([f"metadata/{db_name}.db", rs, ag, ""])
+
+    cold_section = (
+        '<div class="card-full"><h2>Cold storage — /Volumes/16TBCold</h2>'
+        + _table(["Path", "Detail", "Info", "Status"], cold_rows)
+        + "</div>"
+    )
+
+    # Hot table
+    hot_rows: list[list] = []
+    st = result.get("staging", {})
+    for cn_key, items in sorted(st.get("chunks", {}).items()):
+        hot_rows.append([f"staging/{cn_key}", f"{items} items", "", ""])
+    for name, items in sorted(st.get("other", {}).items()):
+        hot_rows.append([f"staging/{name}", f"{items} items", "", ""])
+    hs = result.get("hot_shards", {})
+    if hs:
+        chunks_str = "  ".join(f"chunk{k}:{v}" for k, v in sorted(hs.items()))
+        hot_rows.append(["shards/", f"{sum(hs.values())} tars", chunks_str, ""])
+    else:
+        hot_rows.append(["shards/", "none staged", "", '<span class="badge warn">unstaged</span>'])
+    staged = result.get("hot_precompute_staged", {})
+    all_cns = sorted(set(list(result.get("hot_shards", {}).keys()) +
+                         list(result.get("cold_shards", {}).keys())))
+    for enc in ("qwen3", "vae", "siglip"):
+        staged_chunks = staged.get(enc, [])
+        marks = "  ".join(
+            (f"chunk{cn} ✓" if f"chunk{cn}" in staged_chunks else f"chunk{cn} ✗")
+            for cn in all_cns
+        )
+        hot_rows.append([f"precomputed/{enc}", marks, "", ""])
+    hf = result.get("hot_hf_symlink")
+    hot_rows.append(["hf_cache/", f"→ {hf}" if hf else "present", "", ""])
+    ckpt = result.get("hot_checkpoints", 0)
+    if ckpt:
+        hot_rows.append(["checkpoints/", f"{ckpt} .safetensors", "", ""])
+    for label, key in [("anchor_shards/", "hot_anchor_exists"),
+                       ("weights/", "hot_weights_exists"),
+                       ("hard_examples/", "hot_hardex_exists")]:
+        if result.get(key):
+            hot_rows.append([label, "present", "", ""])
+    for db in result.get("hot_db_files", []):
+        hot_rows.append([db, "present", "", ""])
+
+    hot_section = (
+        '<div class="card-full"><h2>Hot storage — /Volumes/2TBSSD</h2>'
+        + _table(["Path", "Detail", "Info", "Status"], hot_rows)
+        + "</div>"
+    )
+
+    # Training readiness table
+    ready_rows: list[list] = []
+    for cn in all_cns:
+        cn_key = f"chunk{cn}"
+        shards_ok  = cn_key in hs and (hs.get(cn_key) or 0) > 0
+        enc_ok     = {enc: cn_key in staged.get(enc, []) for enc in ("qwen3", "vae", "siglip")}
+        all_ok     = shards_ok and all(enc_ok.values())
+        status_badge = '<span class="badge ok">ready</span>' if all_ok else '<span class="badge warn">not staged</span>'
+        marks = ("✓ " if shards_ok else "✗ ") + "  ".join(
+            f"{e} {'✓' if ok else '✗'}" for e, ok in enc_ok.items()
+        )
+        ready_rows.append([f"chunk {cn}", marks, status_badge])
+
+    ready_section = (
+        '<div class="card-full"><h2>Training Readiness</h2>'
+        + _table(["Chunk", "Components", "Status"], ready_rows)
+        + "</div>"
+    )
+
+    body = (
+        f'<div class="hdr"><h1>iris.c — Storage Status</h1>'
+        f'<span class="ts">{_h(ts)}</span></div>'
+        + cards_html + cold_section + hot_section + ready_section
+    )
+    return (
+        '<!DOCTYPE html><html lang="en"><head>'
+        '<meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<style>{_HTML_STYLE}</style>'
+        f'</head><body>{body}</body></html>'
+    )
+
 
 def _cmd_status(args: argparse.Namespace) -> int:
     cfg: dict = {}
@@ -782,6 +967,55 @@ def _cmd_status(args: argparse.Namespace) -> int:
                         pass
                 cold_precomp[enc] = entry
 
+    # Hot tier — shards per chunk
+    hot_shards: dict[int, int] = {}   # chunk_num → tar count on hot
+    cold_shards: dict[int, int] = {}  # chunk_num → tar count on cold
+    all_hot_shard_ids: list[int] = []
+
+    hot_shards_dir = hot_root / "shards"
+    if hot_shards_dir.exists():
+        for f in hot_shards_dir.iterdir():
+            if f.suffix == ".tar" and f.stem.isdigit():
+                sid = int(f.stem)
+                cn = sid // SHARD_BLOCK + 1
+                hot_shards[cn] = hot_shards.get(cn, 0) + 1
+                all_hot_shard_ids.append(sid)
+
+    cold_shards_dir = cold_root / "shards"
+    if cold_shards_dir.exists():
+        for f in cold_shards_dir.iterdir():
+            if f.suffix == ".tar" and f.stem.isdigit():
+                sid = int(f.stem)
+                cn = sid // SHARD_BLOCK + 1
+                cold_shards[cn] = cold_shards.get(cn, 0) + 1
+
+    # Hot tier — precompute per encoder per chunk (sampled, never iterates all npz files)
+    hot_precomp_staged: dict[str, set[int]] = {}  # encoder → set of staged chunk nums
+    hot_precomp_dir = hot_root / "precomputed"
+    shard_ids_by_chunk: dict[int, list[int]] = {}
+    for sid in all_hot_shard_ids:
+        cn = sid // SHARD_BLOCK + 1
+        shard_ids_by_chunk.setdefault(cn, []).append(sid)
+
+    if hot_precomp_dir.exists():
+        for enc in ("qwen3", "vae", "siglip"):
+            hot_enc_dir = hot_precomp_dir / enc
+            cur_lnk = hot_enc_dir / "current"
+            if not cur_lnk.is_symlink():
+                hot_precomp_staged[enc] = set()
+                continue
+            ver = os.path.basename(os.readlink(str(cur_lnk)))
+            hot_ver_dir = hot_enc_dir / ver
+            staged: set[int] = set()
+            for cn, sids in shard_ids_by_chunk.items():
+                for sid in sorted(sids)[:5]:
+                    if next(hot_ver_dir.glob(f"{sid:06d}_*.npz"), None) is not None:
+                        staged.add(cn)
+                        break
+            hot_precomp_staged[enc] = staged
+
+    all_chunks = sorted(set(cold_shards) | set(hot_shards))
+
     # Weights
     cold_weights = cold_root / "weights"
     campaigns = _list_campaigns(cold_weights)
@@ -807,6 +1041,112 @@ def _cmd_status(args: argparse.Namespace) -> int:
         age = round((datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600, 1)
         return {"rows": rows, "age_h": age}
 
+    # ── Cold extras ────────────────────────────────────────────────────────
+    cold_converted_dir = cold_root / "converted"
+    cold_converted_count = 0
+    cold_converted_label = "converted/"
+    if cold_converted_dir.exists():
+        jdb = cold_converted_dir / "journeydb"
+        scan_dir = jdb if jdb.exists() else cold_converted_dir
+        cold_converted_label = "converted/journeydb" if jdb.exists() else "converted/"
+        try:
+            cold_converted_count = sum(
+                1 for e in os.scandir(scan_dir)
+                if e.name.endswith(".tar") and not e.name.startswith(".")
+            )
+        except PermissionError:
+            pass
+    cold_anchor_exists = (cold_root / "anchor_shards").exists()
+    cold_hardex_exists = (cold_root / "hard_examples").exists()
+
+    # ── Hot extras ─────────────────────────────────────────────────────────
+    staging_dir = hot_root / "staging"
+    staging_chunks: dict[int, int] = {}
+    staging_other:  dict[str, int] = {}
+    if staging_dir.exists():
+        try:
+            for entry in os.scandir(staging_dir):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name.startswith("chunk"):
+                    try:
+                        cn = int(entry.name[5:])
+                        # Count all non-hidden entries (may be subdirs or tars)
+                        tc = sum(1 for e in os.scandir(entry.path)
+                                 if not e.name.startswith("."))
+                        staging_chunks[cn] = tc
+                    except (ValueError, PermissionError):
+                        pass
+                else:
+                    try:
+                        staging_other[entry.name] = sum(1 for _ in os.scandir(entry.path))
+                    except PermissionError:
+                        staging_other[entry.name] = -1
+        except PermissionError:
+            pass
+
+    hot_ckpt_dir = hot_root / "checkpoints" / "stage1"
+    hot_ckpt_count = 0
+    if hot_ckpt_dir.exists():
+        try:
+            hot_ckpt_count = sum(1 for e in os.scandir(hot_ckpt_dir)
+                                 if e.name.endswith(".safetensors"))
+        except PermissionError:
+            pass
+
+    hf_cache_path = hot_root / "hf_cache"
+    hot_hf_symlink_target: Optional[str] = None
+    if hf_cache_path.is_symlink():
+        try:
+            hot_hf_symlink_target = os.readlink(str(hf_cache_path))
+        except OSError:
+            pass
+
+    hot_anchor_exists  = (hot_root / "anchor_shards").exists()
+    hot_hardex_exists  = (hot_root / "hard_examples").exists()
+    hot_weights_exists = (hot_root / "weights").exists()
+    hot_db_files: list[str] = []
+    try:
+        hot_db_files = sorted(e.name for e in os.scandir(hot_root)
+                              if not e.is_dir() and e.name.endswith(".db"))
+    except PermissionError:
+        pass
+
+    # ── Parallel du for sizes ──────────────────────────────────────────────
+    _du_paths: list[Path] = []
+    for sub in ("shards", "precomputed", "checkpoints", "anchor_shards",
+                "weights", "hard_examples"):
+        p = hot_root / sub
+        if p.exists():
+            _du_paths.append(p)
+    if hf_cache_path.exists() or hf_cache_path.is_symlink():
+        _du_paths.append(hf_cache_path)
+    for cn in staging_chunks:
+        p = staging_dir / f"chunk{cn}"
+        if p.exists():
+            _du_paths.append(p)
+    for name in staging_other:
+        p = staging_dir / name
+        if p.exists():
+            _du_paths.append(p)
+    for sub in ("converted", "shards", "weights", "anchor_shards",
+                "hard_examples", "metadata"):
+        p = cold_root / sub
+        if p.exists():
+            _du_paths.append(p)
+
+    _sizes: dict[str, Optional[int]] = {}
+    with ThreadPoolExecutor(max_workers=10) as _pool:
+        _futs = {_pool.submit(_du_kb, p): p for p in _du_paths}
+        for _fut, _p in _futs.items():
+            try:
+                _sizes[str(_p)] = _fut.result()
+            except Exception:
+                _sizes[str(_p)] = None
+
+    def _sz(path: Path) -> str:
+        return _fmt_kb(_sizes.get(str(path)))
+
     result: dict[str, Any] = {
         "ok": True,
         "disk": {
@@ -818,6 +1158,24 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "converted_pool": {"root": conv_pool_root, "converted":  _pool_count(conv_pool_root, ".converted")},
         },
         "cold_precompute": cold_precomp,
+        "cold_converted_count": cold_converted_count,
+        "hot_shards":  {f"chunk{k}": v for k, v in hot_shards.items()},
+        "cold_shards": {f"chunk{k}": v for k, v in cold_shards.items()},
+        "hot_precompute_staged": {enc: [f"chunk{cn}" for cn in sorted(cns)]
+                                  for enc, cns in hot_precomp_staged.items()},
+        "staging": {
+            "chunks": {f"chunk{k}": v for k, v in staging_chunks.items()},
+            "other":  staging_other,
+        },
+        "hot_checkpoints": hot_ckpt_count,
+        "hot_hf_symlink":  hot_hf_symlink_target,
+        "hot_db_files":    hot_db_files,
+        "cold_anchor_exists": cold_anchor_exists,
+        "cold_hardex_exists": cold_hardex_exists,
+        "hot_anchor_exists":  hot_anchor_exists,
+        "hot_hardex_exists":  hot_hardex_exists,
+        "sizes_gb": {str(p): round(kb / 1024 / 1024, 2) if kb is not None else None
+                     for p, kb in _sizes.items()},
         "weights": {
             "campaign_count":  len(campaigns),
             "latest_campaign": campaigns[-1].name.replace("flywheel-", "") if campaigns else None,
@@ -829,47 +1187,159 @@ def _cmd_status(args: argparse.Namespace) -> int:
         },
     }
 
-    if args.json:
+    if args.json or getattr(args, "ai", False):
         _json_print(result)
         return 0
 
-    print(f"\n{'─'*52}")
-    print(" data_explorer — pipeline cold storage status")
-    print(f"{'─'*52}")
-    d = result["disk"]
-    cold_str = f"{d['cold_free_gb']:.1f} GB free" if d["cold_free_gb"] is not None else "not mounted"
-    hot_str  = f"{d['hot_free_gb']:.1f} GB free"  if d["hot_free_gb"]  is not None else "unavailable"
-    print(f"\n  Disk       cold={cold_str}  hot={hot_str}")
+    if getattr(args, "html", None):
+        html = _render_status_html(result, _sizes)
+        try:
+            Path(args.html).write_text(html)
+            print(f"HTML status written to {args.html}")
+        except Exception as e:
+            print(f"Error writing HTML: {e}", file=sys.stderr)
+            return 1
+        return 0
 
-    rp = result["pools"]["raw_pool"]
-    cp = result["pools"]["converted_pool"]
-    rp_str = f"{rp['downloaded']} downloaded" if rp["downloaded"] is not None else "not configured"
-    cp_str = f"{cp['converted']} converted"   if cp["converted"]  is not None else "not configured"
-    print(f"  Pools      raw={rp_str}  converted={cp_str}")
+    W = 54
+    print(f"\n{'─'*W}")
+    print(" data_explorer — pipeline storage status")
+    print(f"{'─'*W}")
 
-    if cold_precomp:
-        print(f"\n  Precompute (cold):")
-        for enc, info in cold_precomp.items():
-            ver  = info.get("version", "?")
-            comp = "complete" if info.get("complete") else "partial"
-            rec  = f"{info.get('records', 0):,}"
-            print(f"    {enc:<8}  {ver}  {comp}  {rec} records")
-    else:
-        print("\n  Precompute (cold): none archived yet")
+    def _disk_header(label: str, root: Path) -> None:
+        used, total, free = _disk_stats(root)
+        if total is not None:
+            print(f"\n  {label}  {root}")
+            print(f"  {'':>{len(label)}}  {used:.0f} GB used / {total:.0f} GB total  ({free:.0f} GB free)")
+        else:
+            print(f"\n  {label}  {root}  (not mounted)")
 
-    w = result["weights"]
-    print(f"\n  Weights    {w['campaign_count']} campaign(s)", end="")
-    if w["latest_campaign"]:
-        print(f"  latest={w['latest_campaign']}  steps={w['latest_steps']}", end="")
-    print()
+    # ── COLD ──────────────────────────────────────────────────────────────
+    _disk_header("COLD", cold_root)
 
-    print(f"\n  Databases:")
-    for name, info in result["databases"].items():
-        rows = info["rows"]
-        age  = info["age_h"]
-        rs = f"{rows:,}" if rows is not None else "—"
-        ag = f"{age}h ago" if age is not None else "—"
-        print(f"    {name:<20}  {rs:>8} rows  updated {ag}")
+    if cold_root.exists():
+        # Converted pool
+        if cold_converted_dir.exists():
+            print(f"    {cold_converted_label:<26} {_sz(cold_converted_dir):>7}   {cold_converted_count} tars")
+
+        # Cold shards per chunk
+        if cold_shards:
+            chunk_parts = "  ".join(f"chunk{cn}:{v}" for cn, v in sorted(cold_shards.items()))
+            print(f"    {'shards/':<26} {_sz(cold_root/'shards'):>7}   {sum(cold_shards.values())} tars    {chunk_parts}")
+
+        # Cold precompute
+        if cold_precomp:
+            print(f"    precomputed/")
+            for enc, info in cold_precomp.items():
+                ver  = info.get("version", "?")
+                rec  = f"{info.get('records', 0):,} records"
+                comp = "complete" if info.get("complete") else "partial"
+                print(f"      {enc:<8}  {ver:<14}  {rec}  {comp}")
+        else:
+            print(f"    precomputed/               (none archived)")
+
+        # Cold weights
+        cw = result["weights"]
+        if cw["campaign_count"]:
+            print(f"    {'weights/':<26} {_sz(cold_root/'weights'):>7}   "
+                  f"{cw['campaign_count']} campaign(s)  latest={cw['latest_campaign']}  {cw['latest_steps']} steps")
+        else:
+            print(f"    weights/                             (none)")
+
+        # Cold anchor / hard_examples
+        if cold_anchor_exists:
+            print(f"    {'anchor_shards/':<26} {_sz(cold_root/'anchor_shards'):>7}")
+        if cold_hardex_exists:
+            print(f"    {'hard_examples/':<26} {_sz(cold_root/'hard_examples'):>7}")
+
+        # Cold metadata / DBs
+        db_parts = []
+        for db_name, info in result["databases"].items():
+            rows = info["rows"]
+            age  = info["age_h"]
+            rs   = f"{rows:,} rows" if rows is not None else "—"
+            ag   = f"({age}h ago)" if age is not None else ""
+            db_parts.append(f"{db_name}: {rs} {ag}".strip())
+        print(f"    {'metadata/':<26} {_sz(cold_root/'metadata'):>7}   {'   '.join(db_parts) if db_parts else '—'}")
+
+    # ── HOT ───────────────────────────────────────────────────────────────
+    _disk_header("HOT ", hot_root)
+
+    if hot_root.exists():
+        # Staging
+        if staging_chunks or staging_other:
+            print(f"    staging/")
+            for cn in sorted(staging_chunks):
+                p = staging_dir / f"chunk{cn}"
+                n = staging_chunks[cn]
+                detail = f"{n} item{'s' if n != 1 else ''}"
+                print(f"      {'chunk' + str(cn):<12} {_sz(p):>7}   {detail}")
+            for name, count in sorted(staging_other.items()):
+                p = staging_dir / name
+                cc = f"{count} item{'s' if count != 1 else ''}" if count >= 0 else "?"
+                print(f"      {name:<12} {_sz(p):>7}   {cc}")
+
+        # Hot shards
+        if hot_shards:
+            chunk_parts = "  ".join(f"chunk{cn}:{v}" for cn, v in sorted(hot_shards.items()))
+            not_staged  = [cn for cn in all_chunks if cn not in hot_shards]
+            ns_str = f"   chunks {','.join(str(c) for c in not_staged)} not staged" if not_staged else ""
+            print(f"    {'shards/':<26} {_sz(hot_root/'shards'):>7}   {sum(hot_shards.values())} tars    {chunk_parts}{ns_str}")
+        else:
+            print(f"    shards/                              (none staged)")
+
+        # Hot precompute
+        hp = hot_root / "precomputed"
+        if hp.exists():
+            print(f"    {'precomputed/':<26} {_sz(hp):>7}")
+            for enc in ("qwen3", "vae", "siglip"):
+                staged_cns = hot_precomp_staged.get(enc, set())
+                marks = "  ".join(
+                    (f"chunk{cn} ✓" if cn in staged_cns else f"chunk{cn} ✗")
+                    for cn in all_chunks
+                )
+                print(f"      {enc:<8}  {marks}")
+        else:
+            print(f"    precomputed/                         (none staged)")
+
+        # hf_cache
+        if hf_cache_path.exists() or hf_cache_path.is_symlink():
+            symlink_note = f"→ {hot_hf_symlink_target}" if hot_hf_symlink_target else ""
+            print(f"    {'hf_cache/':<26} {_sz(hf_cache_path):>7}   {symlink_note}")
+
+        # checkpoints
+        if hot_ckpt_dir.exists():
+            detail = f"{hot_ckpt_count} .safetensors" if hot_ckpt_count else "empty"
+            print(f"    {'checkpoints/':<26} {_sz(hot_root/'checkpoints'):>7}   {detail}")
+
+        # anchor_shards / weights / hard_examples
+        for label, exists, path in [
+            ("anchor_shards/",  hot_anchor_exists,  hot_root / "anchor_shards"),
+            ("weights/",        hot_weights_exists,  hot_root / "weights"),
+            ("hard_examples/",  hot_hardex_exists,   hot_root / "hard_examples"),
+        ]:
+            if exists:
+                print(f"    {label:<26} {_sz(path):>7}")
+
+        # Loose DB / metadata files
+        if hot_db_files:
+            print(f"    " + "  ".join(hot_db_files))
+
+    # ── TRAINING READINESS ────────────────────────────────────────────────
+    if all_chunks:
+        print(f"\n  TRAINING READINESS")
+        for cn in all_chunks:
+            shards_ok   = cn in hot_shards and hot_shards[cn] > 0
+            enc_staged  = {enc: cn in hot_precomp_staged.get(enc, set())
+                           for enc in ("qwen3", "vae", "siglip")}
+            all_enc_ok  = all(enc_staged.values())
+            if shards_ok and all_enc_ok:
+                enc_marks = "  ".join(f"{e} ✓" for e in ("qwen3", "vae", "siglip"))
+                print(f"    chunk {cn}   shards ✓   {enc_marks}   ready")
+            else:
+                parts = (["shards ✗"] if not shards_ok else []) + \
+                        [f"{e} ✗" for e, ok in enc_staged.items() if not ok]
+                print(f"    chunk {cn}   {'  '.join(parts) if parts else 'not staged'}")
     print()
     return 0
 
@@ -1354,15 +1824,410 @@ def _cmd_maintenance(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── diagnose ─────────────────────────────────────────────────────────────────
+
+def _cmd_diagnose(args: argparse.Namespace) -> int:
+    cfg: dict = {}
+    if args.config:
+        try:
+            cfg = load_config(args.config)
+        except FileNotFoundError:
+            pass
+    storage   = cfg.get("storage", {})
+    cold_root = Path(storage.get("cold_root", COLD_ROOT))
+    hot_root  = Path(storage.get("hot_root",  DATA_ROOT))
+    keep_vers = int(storage.get("keep_versions", 3))
+
+    findings: list[dict] = []
+
+    def _add(kind: str, subject: str, detail: str,
+             fix_cmds: list[str] | None = None,
+             size_kb: Optional[int] = None) -> None:
+        findings.append({
+            "kind":    kind,
+            "subject": subject,
+            "detail":  detail,
+            "size_kb": size_kb,
+            "size_gb": round(size_kb / 1024 / 1024, 2) if size_kb else None,
+            "fix_cmds": fix_cmds or [],
+        })
+
+    # ── Stager command helpers ─────────────────────────────────────────────
+    _STAGER_MANAGED_DBS = {
+        SHARD_SCORES_DB_PATH.name,
+        ABLATION_DB_PATH.name,
+        FLYWHEEL_DB_PATH.name,
+    }
+    _python  = Path(__file__).parent.parent / ".venv" / "bin" / "python"
+    _stager  = Path(__file__).parent / "data_stager.py"
+
+    def _stager_archive_cmd(chunk: Optional[int]) -> Optional[str]:
+        if chunk is None:
+            return None
+        return f"{_python} {_stager} archive --chunk {chunk}"
+
+    def _detect_last_chunk() -> Optional[int]:
+        sentinel_dir = hot_root / "pipeline"
+        if not sentinel_dir.exists():
+            return None
+        best: Optional[int] = None
+        for chunk_dir in sentinel_dir.iterdir():
+            if not chunk_dir.is_dir() or not chunk_dir.name.startswith("chunk"):
+                continue
+            try:
+                cn = int(chunk_dir.name[5:])
+            except ValueError:
+                continue
+            for step in ("archive.done", "validate.done", "train.done"):
+                if (chunk_dir / step).exists():
+                    if best is None or cn > best:
+                        best = cn
+                    break
+        return best
+
+    last_chunk = _detect_last_chunk()
+
+    # ── Collect sizes upfront (parallel) ──────────────────────────────────
+    _du_targets: list[Path] = []
+    staging_dir      = hot_root / "staging"
+    cold_precomp_dir = cold_root / "precomputed"
+    cold_weights_dir = cold_root / "weights"
+
+    for p in (staging_dir, hot_root / "anchor_shards", hot_root / "hard_examples",
+              hot_root / "checkpoints", cold_root / "anchor_shards",
+              cold_root / "hard_examples"):
+        if p.exists():
+            _du_targets.append(p)
+    if staging_dir.exists():
+        for e in os.scandir(staging_dir):
+            if e.is_dir():
+                _du_targets.append(Path(e.path))
+    if cold_precomp_dir.exists():
+        for enc_dir in cold_precomp_dir.iterdir():
+            if enc_dir.is_dir():
+                for vd in enc_dir.iterdir():
+                    if vd.is_dir() and vd.name != "current":
+                        _du_targets.append(vd)
+
+    _sizes: dict[str, Optional[int]] = {}
+    with ThreadPoolExecutor(max_workers=10) as _pool:
+        _futs = {_pool.submit(_du_kb, p): p for p in _du_targets}
+        for _fut, _p in _futs.items():
+            try:
+                _sizes[str(_p)] = _fut.result()
+            except Exception:
+                _sizes[str(_p)] = None
+
+    def _kb(path: Path) -> Optional[int]:
+        return _sizes.get(str(path))
+
+    def _kb_sum(paths: list[Path]) -> Optional[int]:
+        vals = [_kb(p) for p in paths if _kb(p) is not None]
+        return sum(vals) if vals else None
+
+    # ── Check 1: Redundant staging/ (V1 artifact) ─────────────────────────
+    cold_conv_dir = cold_root / "converted"
+    if staging_dir.exists() and cold_conv_dir.exists():
+        chunk_dirs = [Path(e.path) for e in os.scandir(staging_dir)
+                      if e.is_dir() and e.name.startswith("chunk")]
+        jdb = cold_conv_dir / "journeydb"
+        cold_has_tars = False
+        try:
+            cold_has_tars = any(e.name.endswith(".tar")
+                                for e in os.scandir(jdb if jdb.exists() else cold_conv_dir))
+        except PermissionError:
+            pass
+        if chunk_dirs and cold_has_tars:
+            names = ", ".join(sorted(d.name for d in chunk_dirs))
+            _add("REDUNDANT",
+                 f"staging/ ({names})",
+                 "V1 pipeline artifact — converted tars duplicated in cold/converted/journeydb",
+                 fix_cmds=[f"rm -rf {staging_dir}"],
+                 size_kb=_kb(staging_dir))
+
+    # ── Check 2: Redundant / missing hot anchor_shards ────────────────────
+    hot_anchor  = hot_root  / "anchor_shards"
+    cold_anchor = cold_root / "anchor_shards"
+    if hot_anchor.exists() and cold_anchor.exists():
+        _add("REDUNDANT", "anchor_shards/ on hot",
+             "cold copy exists — hot copy is redundant (cold is source of truth)",
+             fix_cmds=[f"rm -rf {hot_anchor}"],
+             size_kb=_kb(hot_anchor))
+    elif hot_anchor.exists():
+        _add("MISSING", "anchor_shards/",
+             "exists only on hot — no cold backup, would be lost if hot fails")
+    elif cold_anchor.exists():
+        _add("OK", "anchor_shards/", "cold copy present, not duplicated on hot")
+
+    # ── Check 3: Redundant / missing hot hard_examples ───────────────────
+    hot_hardex  = hot_root  / "hard_examples"
+    cold_hardex = cold_root / "hard_examples"
+    if hot_hardex.exists() and cold_hardex.exists():
+        _add("REDUNDANT", "hard_examples/ on hot",
+             "cold copy exists — hot copy is redundant",
+             fix_cmds=[f"rm -rf {hot_hardex}"],
+             size_kb=_kb(hot_hardex))
+    elif hot_hardex.exists():
+        _add("MISSING", "hard_examples/",
+             "exists only on hot — no cold backup")
+    elif cold_hardex.exists():
+        _add("OK", "hard_examples/", "cold copy present, not duplicated on hot")
+
+    # ── Check 4: Stale hot precompute versions ────────────────────────────
+    hot_precomp_dir = hot_root / "precomputed"
+    for enc in ("qwen3", "vae", "siglip"):
+        cold_cur = cold_precomp_dir / enc / "current"
+        cold_ver = (os.path.basename(os.readlink(str(cold_cur)))
+                    if cold_cur.is_symlink() else None)
+
+        hot_enc = hot_precomp_dir / enc
+        if not hot_enc.exists():
+            continue
+
+        stale_vers = [vd for vd in hot_enc.iterdir()
+                      if vd.is_dir() and vd.name != "current" and vd.name != cold_ver]
+        if stale_vers:
+            names = ", ".join(vd.name for vd in stale_vers)
+            _add("STALE", f"precomputed/{enc}/{names} (hot)",
+                 f"hot version(s) do not match cold current ({cold_ver}) — safe to remove",
+                 fix_cmds=[f"rm -rf {vd}" for vd in stale_vers],
+                 size_kb=_kb_sum(stale_vers))
+        else:
+            _add("OK", f"precomputed/{enc} (hot)",
+                 f"matches cold current ({cold_ver})")
+
+    # ── Check 5: DB backup status ─────────────────────────────────────────
+    cold_meta_dir = cold_root / "metadata"
+    db_checks = [
+        ("shard_scores.db",
+         COLD_METADATA_DIR / "shard_scores.db"
+         if (COLD_METADATA_DIR / "shard_scores.db").exists()
+         else cold_meta_dir / "shard_scores.db"),
+        ("ablation_history.db",
+         COLD_METADATA_DIR / "ablation_history.db"
+         if (COLD_METADATA_DIR / "ablation_history.db").exists()
+         else cold_meta_dir / "ablation_history.db"),
+        ("flywheel_history.db", cold_meta_dir / "flywheel_history.db"),
+    ]
+    archive_cmd = _stager_archive_cmd(last_chunk)
+    for db_name, cold_db in db_checks:
+        hot_db = hot_root / db_name
+        if not hot_db.exists():
+            continue
+        managed = db_name in _STAGER_MANAGED_DBS
+        if not cold_db.exists():
+            if managed:
+                detail = (
+                    f"no cold backup — use stager to archive: {archive_cmd}"
+                    if archive_cmd else
+                    "no cold backup — run: data_stager.py archive --chunk <N>"
+                )
+                _add("MISSING", db_name, detail,
+                     fix_cmds=[archive_cmd] if archive_cmd else [])
+            else:
+                # Not managed by stager — flag the coverage gap explicitly
+                _add("MISSING", db_name,
+                     f"no cold backup and not managed by data_stager._archive_dbs() — "
+                     f"add '{db_name}' to stager coverage, or copy manually: "
+                     f"cp {hot_db} {cold_meta_dir / db_name}",
+                     fix_cmds=[f"cp {hot_db} {cold_meta_dir / db_name}"])
+        else:
+            try:
+                lag_h = (hot_db.stat().st_mtime - cold_db.stat().st_mtime) / 3600
+                if lag_h > 24:
+                    detail = (
+                        f"cold backup is {lag_h:.0f}h older than hot — "
+                        + (f"run stager: {archive_cmd}" if archive_cmd else "run stager archive")
+                    )
+                    _add("STALE", db_name, detail,
+                         fix_cmds=[archive_cmd] if (managed and archive_cmd) else [])
+                else:
+                    _add("OK", db_name, f"cold backup fresh (lag {lag_h:.1f}h)")
+            except OSError:
+                _add("OK", db_name, "cold backup present")
+
+    # ── Check 6: Trained checkpoint backup status ─────────────────────────
+    hot_ckpt_dir = hot_root / "checkpoints" / "stage1"
+    if hot_ckpt_dir.exists():
+        ckpts = [f for f in hot_ckpt_dir.iterdir()
+                 if f.suffix == ".safetensors"]
+        campaigns = list(_list_campaigns(cold_weights_dir)) if cold_weights_dir.exists() else []
+        if ckpts and not campaigns:
+            _add("MISSING", "checkpoints/stage1/",
+                 f"{len(ckpts)} .safetensors on hot with no cold campaign archive — run stager archive")
+        elif ckpts and campaigns:
+            _add("STALE", "checkpoints/stage1/",
+                 f"{len(ckpts)} .safetensors on hot; {len(campaigns)} campaign(s) archived to cold — "
+                 "hot copies likely redundant",
+                 fix_cmds=[f"rm -rf {hot_ckpt_dir}"],
+                 size_kb=_kb(hot_root / "checkpoints"))
+        elif campaigns:
+            _add("OK", "checkpoints/", f"{len(campaigns)} campaign(s) archived to cold")
+
+    # ── Check 7: Orphaned cold precompute versions ────────────────────────
+    if cold_precomp_dir.exists():
+        for enc_dir in cold_precomp_dir.iterdir():
+            if not enc_dir.is_dir():
+                continue
+            enc      = enc_dir.name
+            cur_link = enc_dir / "current"
+            cur_ver  = (os.path.basename(os.readlink(str(cur_link)))
+                        if cur_link.is_symlink() else None)
+            all_vers = sorted(vd for vd in enc_dir.iterdir()
+                              if vd.is_dir() and vd.name != "current")
+            non_cur  = [v for v in all_vers if v.name != cur_ver]
+            orphaned = non_cur[:-keep_vers] if len(non_cur) > keep_vers else []
+            for v in orphaned:
+                _add("STALE", f"cold precomputed/{enc}/{v.name}",
+                     f"non-current version beyond keep_versions={keep_vers}",
+                     fix_cmds=[f"rm -rf {v}"],
+                     size_kb=_kb(v))
+
+    # ── Check 8: Training gap (shards without precompute) ─────────────────
+    cold_shard_chunks: set[int] = set()
+    cold_shards_dir = cold_root / "shards"
+    if cold_shards_dir.exists():
+        try:
+            for e in os.scandir(cold_shards_dir):
+                if e.name.endswith(".tar") and e.name.split(".")[0].isdigit():
+                    sid = int(e.name.split(".")[0])
+                    cold_shard_chunks.add(sid // SHARD_BLOCK + 1)
+        except PermissionError:
+            pass
+
+    if cold_shard_chunks and cold_precomp_dir.exists():
+        for enc in ("qwen3", "vae", "siglip"):
+            cur_link = cold_precomp_dir / enc / "current"
+            complete = False
+            if cur_link.is_symlink():
+                ver = os.path.basename(os.readlink(str(cur_link)))
+                mf  = cold_precomp_dir / enc / ver / "manifest.json"
+                try:
+                    complete = json.loads(mf.read_text()).get("complete", False)
+                except (OSError, ValueError):
+                    pass
+            if not complete:
+                _add("GAP", f"precomputed/{enc} (cold)",
+                     f"cold has shards for {len(cold_shard_chunks)} chunk(s) but "
+                     "precompute incomplete — run iris-prep to fill gap")
+            else:
+                _add("OK", f"precomputed/{enc} coverage",
+                     "cold precompute complete for all archived shards")
+
+    # ── Output ─────────────────────────────────────────────────────────────
+    reclaimable_kb = sum(
+        f["size_kb"] for f in findings
+        if f["size_kb"] and f["kind"] in ("REDUNDANT", "STALE")
+    )
+    issue_count = sum(1 for f in findings if f["kind"] != "OK")
+
+    if args.json:
+        _json_print({
+            "ok":             issue_count == 0,
+            "reclaimable_gb": round(reclaimable_kb / 1024 / 1024, 2),
+            "issue_count":    issue_count,
+            "findings":       findings,
+        })
+        return 0 if issue_count == 0 else 1
+
+    W = 54
+    print(f"\n{'─'*W}")
+    print(" data_explorer — diagnose")
+    print(f"{'─'*W}")
+
+    if issue_count == 0:
+        print("\n  Everything looks clean — no anomalies detected.\n")
+        return 0
+
+    _ORDER = {"REDUNDANT": 0, "STALE": 1, "MISSING": 2, "GAP": 3, "OK": 4}
+    for f in sorted(findings, key=lambda x: _ORDER.get(x["kind"], 9)):
+        kind    = f["kind"]
+        subject = f["subject"]
+        detail  = f["detail"]
+        sz      = f"  {_fmt_kb(f['size_kb'])}" if f["size_kb"] else ""
+        if kind == "OK" and not args.verbose:
+            continue
+        print(f"\n  {kind:<10}  {subject}{sz}")
+        print(f"               {detail}")
+        for cmd in f["fix_cmds"]:
+            print(f"               → {cmd}")
+
+    print(f"\n  {'─'*48}")
+    print(f"  Reclaimable: {_fmt_kb(reclaimable_kb)}"
+          f"   Issues: {issue_count}"
+          f"   OK: {sum(1 for f in findings if f['kind'] == 'OK')}")
+    print()
+
+    if not args.fix:
+        return 0 if issue_count == 0 else 1
+
+    # ── Fix mode ───────────────────────────────────────────────────────────
+    if not sys.stdin.isatty():
+        print("ERROR: --fix requires an interactive terminal", file=sys.stderr)
+        return 1
+
+    print(f"  ── Fix mode {'─'*40}")
+    did_anything = False
+    for f in sorted(findings, key=lambda x: _ORDER.get(x["kind"], 9)):
+        kind = f["kind"]
+        if kind == "OK":
+            continue
+
+        sz_str = f" ({_fmt_kb(f['size_kb'])})" if f["size_kb"] else ""
+        print(f"\n  {kind}: {f['subject']}{sz_str}")
+        print(f"  {f['detail']}")
+
+        if not f["fix_cmds"]:
+            # GAP or MISSING with no automatable fix — inform, don't prompt
+            print("  (no automatic fix — manual action required)")
+            continue
+
+        for cmd in f["fix_cmds"]:
+            print(f"  → {cmd}")
+
+        # Choose prompt label based on what the fix does
+        first_cmd = f["fix_cmds"][0]
+        if first_cmd.startswith("rm"):
+            prompt = "  Delete? [y/N] "
+        elif first_cmd.startswith("cp"):
+            prompt = "  Copy to cold? [y/N] "
+        else:
+            prompt = "  Apply fix? [y/N] "
+
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Aborted.")
+            break
+        if answer == "y":
+            for cmd in f["fix_cmds"]:
+                try:
+                    r = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+                    if r.returncode == 0:
+                        print("  done")
+                    else:
+                        print(f"  ERROR: {r.stderr.strip()}")
+                except Exception as e:
+                    print(f"  ERROR: {e}")
+            did_anything = True
+        else:
+            print("  skipped")
+
+    if not did_anything:
+        print("\n  Nothing actioned.")
+    print()
+    return 0 if issue_count == 0 else 1
+
+
 # ── subcommand router ────────────────────────────────────────────────────────
 
 _SUBCMDS = {"status", "shards", "weights", "suggest-warmstart",
-            "ablation", "compare", "maintenance"}
+            "ablation", "compare", "maintenance", "diagnose"}
 
 
 def _main_subcmd() -> None:
     ap = argparse.ArgumentParser(
-        description="Cold storage inspection CLI",
+        description="Pipeline storage inspection CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--config", default=None)
@@ -1376,7 +2241,9 @@ def _main_subcmd() -> None:
             p.add_argument("--config", default=None)
         return p
 
-    p_status = _sp("status", "Disk, pool, precompute, weights, DB overview")
+    p_status = _sp("status", "Full storage overview: cold, hot, and staged data per chunk")
+    p_status.add_argument("--ai",   action="store_true", help="JSON output (alias for --json)")
+    p_status.add_argument("--html", metavar="PATH",      help="Write self-contained HTML status page")
     p_status.set_defaults(func=_cmd_status)
 
     p_shards = _sp("shards", "Shard quality scores")
@@ -1407,6 +2274,13 @@ def _main_subcmd() -> None:
     p_maint.add_argument("--prune",   action="store_true")
     p_maint.add_argument("--confirm", action="store_true")
     p_maint.set_defaults(func=_cmd_maintenance)
+
+    p_diag = _sp("diagnose", "Detect stale, redundant, and misplaced data across tiers")
+    p_diag.add_argument("--fix",     action="store_true",
+                        help="Interactively delete flagged items (prompts per item)")
+    p_diag.add_argument("--verbose", action="store_true",
+                        help="Also show OK findings")
+    p_diag.set_defaults(func=_cmd_diagnose)
 
     args = ap.parse_args()
     # Inherit top-level --json/--config when subparser doesn't override

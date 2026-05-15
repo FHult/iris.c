@@ -588,6 +588,12 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
         if (ff_in) {
             b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
+            if (!b->img_mlp_gate_weight || !b->img_mlp_up_weight) {
+                free(b->img_mlp_gate_weight);
+                free(b->img_mlp_up_weight);
+                free(ff_in);
+                return -1;
+            }
             memcpy(b->img_mlp_gate_weight, ff_in, mlp * h * sizeof(float));
             memcpy(b->img_mlp_up_weight, ff_in + mlp * h, mlp * h * sizeof(float));
             free(ff_in);
@@ -633,6 +639,12 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
         if (txt_ff_in) {
             b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
+            if (!b->txt_mlp_gate_weight || !b->txt_mlp_up_weight) {
+                free(b->txt_mlp_gate_weight);
+                free(b->txt_mlp_up_weight);
+                free(txt_ff_in);
+                return -1;
+            }
             memcpy(b->txt_mlp_gate_weight, txt_ff_in, mlp * h * sizeof(float));
             memcpy(b->txt_mlp_up_weight, txt_ff_in + mlp * h, mlp * h * sizeof(float));
             free(txt_ff_in);
@@ -1525,6 +1537,27 @@ static int ensure_work_buffers(iris_transformer_t *tf, int total_seq) {
         !tf->single_mlp_gate || !tf->single_mlp_up || !tf->single_attn_out ||
         !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
         !tf->double_img_attn_out || !tf->double_txt_attn_out) {
+        free(tf->img_hidden);        tf->img_hidden = NULL;
+        free(tf->txt_hidden);        tf->txt_hidden = NULL;
+        free(tf->work1);             tf->work1 = NULL;
+        free(tf->work2);             tf->work2 = NULL;
+        free(tf->attn_q_t);          tf->attn_q_t = NULL;
+        free(tf->attn_k_t);          tf->attn_k_t = NULL;
+        free(tf->attn_v_t);          tf->attn_v_t = NULL;
+        free(tf->attn_out_t);        tf->attn_out_t = NULL;
+        free(tf->attn_cat_k);        tf->attn_cat_k = NULL;
+        free(tf->attn_cat_v);        tf->attn_cat_v = NULL;
+        free(tf->single_q);          tf->single_q = NULL;
+        free(tf->single_k);          tf->single_k = NULL;
+        free(tf->single_v);          tf->single_v = NULL;
+        free(tf->single_mlp_gate);   tf->single_mlp_gate = NULL;
+        free(tf->single_mlp_up);     tf->single_mlp_up = NULL;
+        free(tf->single_attn_out);   tf->single_attn_out = NULL;
+        free(tf->single_concat);     tf->single_concat = NULL;
+        free(tf->ffn_gate);          tf->ffn_gate = NULL;
+        free(tf->ffn_up);            tf->ffn_up = NULL;
+        free(tf->double_img_attn_out); tf->double_img_attn_out = NULL;
+        free(tf->double_txt_attn_out); tf->double_txt_attn_out = NULL;
         tf->work_seq_alloc = 0;
         return -1;
     }
@@ -2219,7 +2252,6 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     apply_adaln(img_norm, img_hidden, img_shift1, img_scale1, img_seq, hidden, eps);
 
 #ifdef DEBUG_DOUBLE_BLOCK
-    static int block_idx = 0;
     if (block_idx == 0) {
         fprintf(stderr, "\n[DBL] img_mod[0,:10] (shift1): ");
         for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", img_shift1[i]);
@@ -2418,7 +2450,7 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     /* No free - using pre-allocated buffers */
 
 #ifdef DEBUG_DOUBLE_BLOCK
-    block_idx++;
+    (void)block_idx;  /* parameter used by debug prints above */
 #endif
 }
 

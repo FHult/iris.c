@@ -1037,9 +1037,19 @@ class Orchestrator:
             token = "DISK_WRITE_HIGH"
         if token:
             self.res.request(token, f"recovered: {step} chunk {chunk}")
+        # Estimate how long the prep window has been running by reading the
+        # heartbeat file mtime.  This preserves the elapsed time across restarts
+        # so _poll_prep_window() can fire the hung-prep alert correctly.
+        from pipeline_lib import heartbeat_path as _hb_path
+        _hb_file = _hb_path(f"prep_{step}", chunk)
+        try:
+            _started_at = _hb_file.stat().st_mtime
+        except OSError:
+            _started_at = time.time() - 3600  # conservative: assume 1h already elapsed
         self._active_prep = {
             "chunk": chunk, "step": step, "log": log,
             "token": token, "also_mark": [],
+            "started_at": _started_at,
         }
         log_orch(f"Startup: recovered iris-prep tracking ({step} chunk {chunk})",
                  chunk=chunk)

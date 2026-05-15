@@ -100,16 +100,18 @@ Cold storage is not a backup or overflow — it is the primary accumulator of sy
 
 ### Storage Architecture
 
-Two-tier hot/cold split:
+Three-tier design (target state — current system is hot + cold only):
 
+- **Inference tier** (internal NVMe SSD, ~2–8 TB) — lowest-latency path for the live inference server and web app. Holds only the active weights and embeddings needed to serve requests. Populated by the stager from hot; never written to by training.
+- **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only. Pipeline reads shards, precompute, and weights from here during training.
 - **Cold storage** (`/Volumes/16TBCold`, 16 TB spinning disk) — source of truth and long-term knowledge base. Never auto-deleted by pipeline operations.
-- **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only.
 
-**JIT Data Stager** manages both directions with equal importance:
-- **Cold → Hot (staging):** before a compute window, stages raw data, precompute symlinks, and weights from cold to hot. Uses symlinks when on the same filesystem (near-instant); atomic copies across filesystems. `_check_hot_space()` enforces `staging_margin_gb` before any transfer.
+**JIT Data Stager** manages all directions:
+- **Cold → Hot (staging):** before a compute window, stages raw data, precompute, and weights from cold to hot. Uses symlinks when on the same filesystem (near-instant); atomic copies across filesystems. `_check_hot_space()` enforces `staging_margin_gb` before any transfer.
 - **Hot → Cold (archiving):** after a successful run, archives newly generated precompute embeddings, weight checkpoints, and per-campaign telemetry to cold. This is the write path — without it, cold never grows and warm-starts never improve.
+- **Hot → Inference (promote):** after archiving, copies or symlinks the active checkpoint + its precompute version to the inference tier so the web app picks up new weights without restarting.
 
-Both directions are first-class operations. Staging populates the working set; archiving accumulates the knowledge. Neither is optional.
+All directions are first-class operations. Staging populates the working set; archiving accumulates the knowledge; promotion makes results live. See **PIPELINE-30** for implementation.
 
 ### Proposed cold storage layout
 
@@ -165,7 +167,7 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 ## Pipeline Improvements
 
-**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** ✅ done (2026-05-14)
+**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** ✅ done (confirmed 2026-05-15)
 
 Smoke and dev runs launch `train_ip_adapter.py` directly — no pipeline sentinels, no heartbeat files, no orchestrator involvement. `pipeline_doctor` and `pipeline_status` are completely blind to them. To check progress you must `tail -f /tmp/dev_run.log` or attach to the tmux window manually.
 
@@ -210,6 +212,103 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 **Constraint:** HuggingFace's `hf_hub_download` API always writes to a local path; would need to switch to `huggingface_hub.file_download.http_get()` or `requests` + streaming response to avoid the intermediate file. Alternatively, download to a RAM-backed tmpfs (`/dev/shm` on Linux; macOS has no equivalent — would need to use `tempfile` with a memory-sized cap). Investigate feasibility before committing to this path.
 
 **Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
+
+---
+
+**DATAMGMT-1: data_explorer diagnose — automated detection of stale, redundant, and misplaced data** ✅ done (2026-05-15)
+
+Add a `data_explorer.py diagnose` subcommand that surfaces the same insights a human would spot by running `du -sh` and comparing directories — without requiring manual analysis.
+
+**Checks to implement:**
+
+1. **Redundant staging/** — if `hot_root/staging/chunk*` exists AND `cold_root/converted/` has the same tars, flag staging as redundant copies. Report estimated reclaimable space. (`staging/` is the V1 pipeline artifact; V2 stager stages directly to `shards/` and `precomputed/`.)
+
+2. **Stale hot data** — dirs on hot that are not needed for the currently-staged chunks:
+   - `hot_root/anchor_shards/` if already present on cold
+   - `hot_root/hard_examples/` if already present on cold
+   - `hot_root/precomputed/` versions older than cold's `current` symlink
+   - `hot_root/checkpoints/` entries already archived to cold weights campaign
+
+3. **Misplaced source-of-truth data** — data that exists only on hot with no cold copy (would be lost if hot fails):
+   - `hot_root/shard_scores.db` without a corresponding `cold_root/metadata/shard_scores.db`
+   - `hot_root/flywheel_history.db` without cold backup
+   - Any `hot_root/weights/` checkpoint without a matching entry in `cold_root/weights/`
+
+4. **Cross-tier duplicate detection** — directories present at the same path on both hot and cold where hot is not a symlink to cold (data duplicated unnecessarily):
+   - `anchor_shards/`, `hard_examples/` — cold is source of truth; hot copy is redundant once cold has it
+
+5. **Orphaned precompute versions** — version dirs in `cold_root/precomputed/{enc}/` that are not pointed to by `current` symlink and exceed `keep_versions` (already partially covered by `maintenance --prune` but should also appear in diagnose output)
+
+6. **Training gap detection** — chunks in cold that have shards but no corresponding precompute coverage on cold (precompute was never run for that chunk range)
+
+**Output format:**
+
+```
+  DIAGNOSE — data anomalies detected
+  ────────────────────────────────────────────────────
+  REDUNDANT  staging/chunk1-4 (282 GB) — same tars in cold/converted/journeydb
+             → safe to delete: rm -rf /Volumes/2TBSSD/staging/
+  REDUNDANT  anchor_shards/ on hot (21 GB) — cold copy exists
+             → safe to delete: rm -rf /Volumes/2TBSSD/anchor_shards/
+  STALE      checkpoints/stage1/chunk1_final.* — archived to flywheel-20260507
+             → safe to delete: rm -rf /Volumes/2TBSSD/checkpoints/stage1/chunk1_final.*
+  OK         shard_scores.db — cold backup present (47h ago)
+  OK         weights/ — 2 campaigns archived to cold
+```
+
+**Implementation notes:**
+- Read-only by default; never deletes. Print `rm -rf` commands as suggestions only.
+- `--fix` flag: executes the suggested deletions with confirmation per item.
+- `--json` flag for scripting (includes `reclaimable_gb` field).
+- Runs after `du` sizes are collected (reuse parallel `_du_kb` infrastructure from `status`).
+- Should complete in <30 seconds on hot SSD; cold scans use the same timeout-bound `_du_kb` pattern.
+
+**PIPELINE-30: Inference tier — three-tier storage with internal NVMe as serving layer** (Medium priority, pre-web-app)
+
+Add a third storage tier for the inference server and web app. The internal NVMe SSD becomes the lowest-latency path; hot (external SSD) remains the training working area; cold (HDD) remains the knowledge base.
+
+**Motivation:** serving requests from the external SSD introduces USB-C bus latency and contention with pipeline I/O. The internal NVMe gives 2–3× lower latency for model weight reads and keeps inference bandwidth independent of training I/O.
+
+**Config changes** — add to `storage:` block:
+```yaml
+storage:
+  inference_root: /path/to/internal/nvme   # e.g. /Users/fredrikhult/inference
+  # existing keys unchanged
+  hot_root: /Volumes/2TBSSD
+  cold_root: /Volumes/16TBCold
+```
+
+**`train/scripts/pipeline_lib.py`** — add `INFERENCE_ROOT` constant alongside `COLD_ROOT`.
+
+**`train/scripts/data_stager.py`** — add `promote_to_inference(chunk)`:
+- Copies/symlinks active checkpoint (`cold_root/weights/best/*.safetensors`) to `inference_root/weights/current.safetensors`.
+- Copies/symlinks active precompute version dirs from hot to `inference_root/precomputed/{enc}/current` (symlinks if same filesystem, copies otherwise).
+- Writes `inference_root/manifest.json`: `{"checkpoint": "...", "precompute_version": "v_xxx", "promoted_at": "..."}` — lets the web app detect weight updates without polling the file directly.
+- Atomic: writes to a `inference_root/.staging/` dir, then renames into place so the web app never sees a partial state.
+- Called by `archive_chunk()` after `_archive_dbs()`.
+
+**`train/scripts/data_explorer.py status`** — add inference tier row showing:
+- Inference root path and free GB.
+- Active checkpoint name + promoted-at timestamp from `manifest.json`.
+- Precompute version per encoder (from `manifest.json`).
+- `stale` flag if `promoted_at` is >2 chunks old (new weights exist in cold but inference hasn't been updated).
+
+**`train/scripts/pipeline_doctor.py`** — add WARNING if `cold_root/weights/best/` symlink target is newer than `inference_root/manifest.json`'s `promoted_at` (i.e., stager archived a better checkpoint but never promoted it to inference).
+
+**Layout on inference tier:**
+```
+{inference_root}/
+  weights/
+    current.safetensors    ← active checkpoint (copy or symlink)
+    current.json           ← sidecar with metrics
+  precomputed/
+    qwen3/current/         ← symlink or copy of hot version dir
+    vae/current/
+    siglip/current/
+  manifest.json            ← atomic-updated on each promotion
+```
+
+**When to implement:** before the web app serves live inference. Not needed while inference runs from manually specified paths.
 
 ---
 
@@ -286,3 +385,110 @@ Individual campaigns are managed by the orchestrator. This item is the layer abo
 - **TB-008: Backend Parity MPS vs generic** (P3) — requires model
 - **TB-011: LoRA Integration load+apply in transformer** (P3) — requires model
 - **TB-009: 9B Model Regression** (P3) — requires model
+
+---
+
+## Known Bugs — Code Review 2026-05-15
+
+Discovered in a full four-layer code review (C core, Metal/GPU, pipeline scripts, trainer). Severity levels: **crash** > **wrong-result** > **leak** > **latent** > **minor**.
+
+### C Core
+
+**BUG-C-001: Transformer forward NULL not checked in samplers** — crash
+`iris_sample.c`. All Euler samplers (`iris_sample_euler`, `_euler_with_refs`, `_euler_with_multi_refs`, `_euler_zimage`, `_euler_cfg`) use the transformer return value immediately without a NULL check. The transformer returns NULL on OOM or GPU fallback failure; the sampler then dereferences NULL in the velocity update loop. In the CFG path both `v_uncond` and `v_cond` are unchecked. Fix: check return value and abort the step cleanly.
+
+**BUG-C-002: Stack buffer overflow in samplers via step_times array** — crash (latent)
+`iris_sample.c` (~lines 305, 392, 522, 600, 682, 764, 847). Every sampler declares `double step_times[IRIS_MAX_STEPS]` (256 entries) and writes `step_times[step]` up to `num_steps-1` with no in-function guard. CLI validates `steps <= 256` before calling, but the samplers carry no guard themselves — unsafe as a library API if the caller skips validation.
+
+**BUG-C-003: NULL dereference after unchecked malloc in load_double_block_weights** — crash
+`iris_transformer_flux.c` (~lines 589–639, f32 path). Two `malloc` calls for `img_mlp_gate_weight` / `img_mlp_up_weight` (and text FFN equivalents) have no NULL check; `memcpy` is called immediately on the return value. Under memory pressure during model load, this crashes.
+
+**BUG-C-004: Memory leak in ensure_work_buffers on partial allocation failure** — leak
+`iris_transformer_flux.c` (~lines 1468–1529). When any of the ~20 sequential allocations fails, the function returns -1 but does not free the already-allocated buffers from the same call. They are orphaned — `work_seq_alloc = 0` signals failure so the struct never owns them, but they are not freed.
+
+**BUG-C-005: Shadow variable in DEBUG build hides block_idx parameter** — wrong result (debug only)
+`iris_transformer_flux.c` (~line 2222, `#ifdef DEBUG_DOUBLE_BLOCK`). A `static int block_idx = 0` inside the debug block shadows the function parameter of the same name. All debug prints show a sequential counter 0,1,2,... instead of the actual block being executed.
+
+**BUG-C-006: Integer overflow in iris_image_create calloc size** — crash / heap corruption
+`iris_image.c` (~line 29). `calloc(width * height * channels, sizeof(uint8_t))` — all three operands are `int`. At 32768×32768×4 the product overflows int32, wraps to zero or negative, allocates a tiny buffer, and subsequent pixel writes corrupt the heap. Fix: cast to `(size_t)width * (size_t)height * (size_t)channels`.
+
+**BUG-C-007: Silent uninitialized output on malloc failure in iris_linear_nobias_bf16** — wrong result
+`iris_kernels.c` (~lines 322–332). If `malloc` fails, the function returns without writing to `y`. The caller receives garbage from whatever was in the output buffer; the void return gives no indication of failure.
+
+**BUG-C-008: NULL dereference in zi_final_forward on malloc failure** — crash
+`iris_transformer_zimage.c` (~line 1593). `float *normed = malloc(seq * dim * sizeof(float))` has no NULL check. The immediately following loop dereferences `normed + s * dim`, crashing under memory pressure during Z-Image generation.
+
+**BUG-C-009: Integer truncation of ftell() result in iris_img2img_debug_py** — minor
+`iris.c` (~line 1815). `int noise_size = ftell(f) / sizeof(float)` — `ftell` returns `long`. Silently truncates for files larger than ~2 GB. Correct type is `long` or `size_t`.
+
+---
+
+### Metal / GPU
+
+**BUG-M-001: NULL/nil check missing on MTLBuffer allocation at four sites** — crash
+`iris_metal.m` (~lines 301–308, 739, 1074, 1182). `[g_device newBufferWithBytes:weights length:size options:]` can return nil on OOM. All four locations pass the result immediately to MPSMatrix or a compute pass without a nil check, crashing when Metal is under memory pressure.
+
+**BUG-M-002: MTLBuffer leak in iris_gpu_tensor_alloc_persistent on struct malloc failure** — leak
+`iris_metal.m` (~line 2539–2542). When `malloc(sizeof(struct iris_gpu_tensor))` fails, the function returns NULL but the already-allocated persistent MTLBuffer (`buf`) is never released. Contrast with `iris_gpu_tensor_alloc` which correctly calls `pool_release_buffer(buf)` before returning NULL.
+
+**BUG-M-003: Pool buffer leak in iris_metal_sgemm_impl on bufferC allocation failure** — leak
+`iris_metal.m` (~lines 760–765). When `cache_B=0` and batch mode is active, `bufferB` is obtained from the pool. If the subsequent `bufferC` allocation fails, the error path releases `bufferA` and `bufferC` but has no corresponding release for `bufferB`. The pool slot leaks permanently, shrinking the 64-slot activation buffer pool over many calls.
+
+**BUG-M-004: Batch mode atomicity broken in iris_gpu_attention_mps_bf16** — wrong result
+`iris_metal.m` (~lines 3124–3128). Between Phase 2 (CPU softmax) and Phase 3 (scores @ V), the function unconditionally commits and resets `g_tensor_cmd` regardless of `g_tensor_batch_mode`. In batch mode this splits GPU work from the same logical batch across two separate command buffers, violating ordering guarantees for any caller that assumed atomic batch submission.
+
+**BUG-M-005: attention_fused_bf16 kernel: shared_q[128] has no kernel-level head_dim guard** — latent corruption
+`iris_shaders.metal`. `threadgroup float shared_q[128]` is written for `d` up to `head_dim - 1` with no assertion that `head_dim <= 128`. All current models use head_dim=128 so it is safe today, but any future model with head_dim > 128 would produce silent threadgroup memory corruption.
+
+**BUG-M-006: SDPA graph cache does not include scale in cache key** — latent wrong result
+`iris_metal.m` `get_sdpa_graph_cache` and `get_sdpa_graph_cache_f32`. Cache keys on `{seq_q, seq_k, num_heads, head_dim}` only. The `scale` parameter is baked into the MPSGraph at construction time as a constant but is not stored in the key. Two calls with the same shape but different scale values silently reuse the first graph's scale. Safe today (scale always derived from head_dim, which is in the key), but fragile if scale is ever caller-specified.
+
+**BUG-M-007: iris_gpu_linear unconditionally commits batch in the bias path** — wrong result
+`iris_metal.m` (~lines 2786–2796). When a bias vector is provided, the function commits and waits on the live command buffer unconditionally — including when `g_tensor_batch_mode=1`. This prematurely splits any in-progress batch across two command buffers, breaking batch atomicity for all callers using `iris_gpu_linear` with bias in batch mode.
+
+**BUG-M-008: causal_attention_fused shared_scores[512] guard is only in Obj-C caller, not in kernel** — latent corruption
+`iris_shaders.metal` (~line 675 and ~line 1956). Both `causal_attention_fused` and `causal_attention_fused_bf16` allocate `threadgroup float shared_scores[512]` and write `shared_scores[key_idx]` for `key_idx` in `[0, seq)`. The only protection against `seq > 512` is a check in the Obj-C caller. The kernel itself has no guard; a new call site without that check would silently corrupt threadgroup memory.
+
+**BUG-M-009: iris_metal_sgemm_batch allocates __strong id<MTLBuffer>* array with calloc** — ARC violation
+`iris_metal.m` (~line 1618). `calloc` is used to allocate a `__strong id<MTLBuffer>*` array, bypassing ARC initialization. Works because nil is bitwise zero on current Apple platforms, but is an ARC specification violation. Future toolchain changes or non-zero nil representations could cause incorrect retain/release behavior.
+
+---
+
+### Pipeline Scripts
+
+**BUG-P-001: _link_or_copy() creates absolute-path symlinks** — data loss on remount
+`data_stager.py` (~line 586). `os.symlink(src.resolve(), dst)` creates absolute symlinks. If the cold or hot volume remounts at a different path (e.g. macOS assigns `/Volumes/2TBSSD 1`), all staged symlinks become dangling and precomputed data becomes unreachable. `update_best_symlinks()` in the same file correctly uses `os.path.relpath()` — the two code paths are inconsistent. Fix: `os.symlink(os.path.relpath(src.resolve(), dst.parent), dst)`.
+
+**BUG-P-002: _atomic_symlink() uses hardcoded temp name — race condition under concurrency** — wrong result (latent)
+`data_stager.py` (~line 657) and `cache_manager.py` (~line 314). Both use a hardcoded temp name (`.current_stg_tmp` / `.current_tmp`) in the link's parent directory. Concurrent calls for the same encoder directory have the second process's `unlink()` delete the first process's temp symlink before `os.replace()` completes, leaving the symlink pointing to stale state. Currently serialized by the orchestrator; latent if parallelism is added. Fix: uuid-based or `tempfile.mkstemp()`-based temp names.
+
+**BUG-P-003: pipeline_doctor.py generates syntactically wrong stager remediation commands** — wrong operator guidance
+`pipeline_doctor.py` (~lines 766, 818). Fix commands suggest `data_stager.py --chunk N --phase archive` / `--phase stage`. The stager uses subcommand CLI: correct syntax is `data_stager.py archive --chunk N`. The suggested commands produce an argparse error; the doctor's fix advice actively misleads the operator.
+
+**BUG-P-004: _recover_prep_window() resets hung-prep timer to zero after orchestrator restart** — monitoring gap
+`orchestrator.py` (~line 1040). `_recover_prep_window()` rebuilds `_active_prep` without a `"started_at"` key. `_poll_prep_window()` falls back to `time.time()` on `.get("started_at", time.time())`, resetting the hung-prep elapsed timer to zero on every orchestrator restart. A prep step that ran for 5 hours before a restart needs another full `PREP_HUNG_HOURS` (6h) before the alert fires; a genuinely hung prep could run indefinitely through repeated restarts.
+
+**BUG-P-005: --fix mode in data_explorer.py uses cmd.split() — breaks on paths with spaces** — latent wrong result
+`data_explorer.py` (~line 2213). Repair commands are run via `subprocess.run(cmd.split(), ...)`. If any auto-generated fix command contains a path with a space, the arguments are mangled and the fix silently operates on the wrong target or does nothing. Current pipeline paths have no spaces; this is latent.
+
+**BUG-P-006: Dead self-import in _render_status_html() leaves disk stats permanently None** — dead code
+`data_explorer.py` (~lines 798–805). `from train.scripts.data_explorer import _disk_stats` inside a `try/except` always raises `ModuleNotFoundError`. `cold_used`, `cold_total`, `hot_used`, `hot_total` are initialized to None and never assigned. The function falls back to reading disk stats from `result["disk"]` so there is no visible crash, but the import block is dead code that should be removed.
+
+---
+
+### Trainer
+
+**BUG-T-001: NameError crash when siglip cache is configured without qwen3/vae** — crash
+`train/train_ip_adapter.py` (line 702). `_internal_prefix` is a nested function defined only inside `if qwen3_dir and vae_dir:` (lines 668–693) but referenced unconditionally at line 702 in the siglip cache path. If `qwen3_cache_dir` or `vae_cache_dir` is absent (e.g. live-inference mode with precomputed siglip only), the function is never defined and line 702 raises `NameError`, killing the process before training begins.
+
+**BUG-T-002: grad_clip_pct always 0.0 in machine-readable heartbeat** — wrong metric
+`train/train_ip_adapter.py` (lines 1688, 1794). `_grad_clip_steps` is reset to 0 at line 1688, then `grad_clip_pct` in `write_heartbeat` is computed from the already-zeroed counter at line 1794. The human-readable log print reads the counter before the reset (correct); the machine-readable heartbeat read by `pipeline_doctor` and `orchestrator` always shows 0% gradient clipping regardless of how many clipping events occurred.
+
+**BUG-T-003: _compute_val_loss measures null-image loss, not IP-adapter conditioning quality** — wrong metric
+`train/train_ip_adapter.py` (lines 1118–1125). `use_null_image = mx.array(True)` is hardcoded, so val_loss measures base flow-matching reconstruction with the adapter zeroed out — not image-conditioning quality. Checkpoint selection (`_purge_old_checkpoints`) keeps the "best 3" checkpoints ranked by val_loss; these are selected for the lowest null-image reconstruction loss, which has no relationship to IP-adapter performance. Fix: load siglip features from val shards and use `use_null_image = mx.array(False)`.
+
+**BUG-T-004: Checkpoint written directly to final filename — partial file visible on crash** — minor
+`train/train_ip_adapter.py` (lines 304–313). `_save_safetensors_streaming` writes directly to `step_NNNNNNN.safetensors`. If the process is killed mid-write (OOM, caffeinate failure), the corrupt partial file is picked up by `_purge_old_checkpoints` sorted listing and may displace a valid older checkpoint before the corruption is detected at load time. Fix: write to `.tmp` then `os.rename()` atomically.
+
+**BUG-T-005: ip_out reshape assumes uniform hidden dim across all blocks** — latent wrong result
+`train/train_ip_adapter.py` (lines 967, 982). `d_inner = h_final.shape[2]` is used to reshape `ip_out` from all blocks. This silently asserts `H_i * Hd_i == d_inner` for every double and single block. Safe for current Flux 4B and 9B (all blocks share the same `H*Hd`), but would crash with an opaque reshape error on any future variant with heterogeneous block dimensions.

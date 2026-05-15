@@ -320,7 +320,10 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
     /* Fallback: convert bf16 to f32 and use regular linear */
     float *W_f32 = (float *)malloc((size_t)out_dim * in_dim * sizeof(float));
-    if (!W_f32) return;
+    if (!W_f32) {
+        fprintf(stderr, "iris_linear_nobias_bf16: malloc failed, output undefined\n");
+        return;
+    }
 
     /* Convert bf16 to f32 */
     for (int i = 0; i < out_dim * in_dim; i++) {

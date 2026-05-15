@@ -6,9 +6,9 @@
   without `--start-idx`, all chunks started shard numbering from 000000. Staging shards for chunk 2
   produced the same internal record IDs (e.g. `000000_0000`) as chunk 1. On promotion, chunk 2's
   `precomputed/000000_0000.npz` overwrote chunk 1's file in the shared production `precomputed/`
-  directory, corrupting training cache. **Fix**: orchestrator now passes `--start-idx (chunk-1)*250000`
-  to `build_shards.py` so each chunk occupies a disjoint shard ID space (chunk 1: 0–249999,
-  chunk 2: 250000–499999, etc.), and shards are promoted without renaming to preserve the stem↔npz match.
+  directory, corrupting training cache. **Fix**: orchestrator now passes `--start-idx (chunk-1)*200000`
+  to `build_shards.py` so each chunk occupies a disjoint shard ID space (chunk 1: 0–199999,
+  chunk 2: 200000–399999, etc.), and shards are promoted without renaming to preserve the stem↔npz match.
 
 ## Training Anomalies (Chunk 1 — Observed, Not Actionable Now)
 

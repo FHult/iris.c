@@ -195,7 +195,7 @@ Chat template:
 
 ```
 
-Flux extraction: concatenate layers 9, 18, 27 (0-indexed):
+Flux extraction: concatenate layers 8, 17, 26 (0-indexed):
 - 4B: [seq, 7680]
 - 9B: [seq, 12288]
 
@@ -345,8 +345,8 @@ Important points:
 1. **MPS SGEMM B-cache misuse caused VAE decode corruption (hue/border artifacts).**
    - Root cause: generic SGEMM cached matrix B by pointer, but VAE attention K/V are dynamic temporaries.
    - Fix: split API paths:
-     - `flux_metal_sgemm`: generic path, no B-pointer cache
-     - `flux_metal_sgemm_cached`: explicit static-weight cached path
+     - `iris_metal_sgemm`: generic path, no B-pointer cache
+     - `iris_metal_sgemm_cached`: explicit static-weight cached path
    - Static weight call sites (for example linear layers) use cached variant only.
 
 2. **Scheduler parity bug with official Python implementation.**
@@ -408,7 +408,7 @@ Returns one compact JSON blob: `summary` (disk, active training step/loss/ETA, p
 - Orchestrator decisions: `/Volumes/2TBSSD/logs/orchestrator.jsonl` — structured JSON, one event per line.
 
 **Escalated alerts (check after any anomaly)**:
-- `/Volumes/2TBSSD/logs/dispatch_queue.jsonl` — written by orchestrator for unresolvable problems (step failed twice, NaN loss, restart limit exceeded). **NOT shown by pipeline_status.py** (known gap).
+- `/Volumes/2TBSSD/dispatch_queue.jsonl` — written by orchestrator for unresolvable problems (step failed twice, NaN loss, restart limit exceeded). Read by `pipeline_status.py` via `_read_dispatch_issues()` and shown at the bottom of status output.
 
 **Starting the orchestrator** — canonical command (handles tmux, caffeinate, config resolution):
 ```bash

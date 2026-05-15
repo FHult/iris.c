@@ -1,5 +1,7 @@
 # Plan: Split Flux Forward (no-grad) from Adapter Loss (differentiable)
 
+**Status: Superseded** — TRAIN-6 implemented Option C (`correct_forward_q` / `_flux_forward_with_ip_collect_q`) instead. This plan is retained for historical reference.
+
 **Goal:** Reduce MLX graph tracing cost so step 1 goes from ~25 min (single-core
 Python) to seconds, and `@mx.compile` cache makes steps 2+ GPU-bound.
 

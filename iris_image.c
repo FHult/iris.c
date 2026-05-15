@@ -26,7 +26,7 @@ iris_image *iris_image_create(int width, int height, int channels) {
     img->width = width;
     img->height = height;
     img->channels = channels;
-    img->data = (uint8_t *)calloc(width * height * channels, sizeof(uint8_t));
+    img->data = (uint8_t *)calloc((size_t)width * (size_t)height * (size_t)channels, sizeof(uint8_t));
 
     if (!img->data) {
         free(img);

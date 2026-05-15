@@ -1,6 +1,6 @@
 # Pipeline V2 Architecture
 
-**Status:** Design — not yet implemented  
+**Status:** Implemented — live as of 2026-04-20  
 **Scope:** --sref IP-Adapter training pipeline, extensible to other training recipes  
 **Target hardware:** Apple M1 Max 32 GB, 2 TB external SSD  
 **Date:** 2026-04-18

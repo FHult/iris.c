@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -310,7 +311,7 @@ class PrecomputeCache:
 def _atomic_symlink(link_path: Path, target: str) -> None:
     """Atomically create or replace a symlink (POSIX rename is atomic)."""
     link_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = link_path.parent / ".current_tmp"
+    tmp = link_path.parent / f".{link_path.name}_tmp_{uuid.uuid4().hex[:8]}"
     if tmp.exists() or tmp.is_symlink():
         tmp.unlink()
     os.symlink(target, tmp)

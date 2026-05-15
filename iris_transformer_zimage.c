@@ -1591,6 +1591,7 @@ static void zi_final_forward(float *out, const float *x, const zi_final_t *fl,
 
     /* LayerNorm (no affine) -> scale */
     float *normed = (float *)malloc(seq * dim * sizeof(float));
+    if (!normed) { free(scale); return; }
     for (int s = 0; s < seq; s++) {
         const float *xr = x + s * dim;
         float *nr = normed + s * dim;

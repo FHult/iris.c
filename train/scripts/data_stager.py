@@ -41,6 +41,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,7 @@ from pipeline_lib import (
     DATA_ROOT, load_config, log_event,
     write_heartbeat, mark_done, mark_error, has_error, clear_error,
     SHARD_BLOCK, RUN_METADATA_FILE, SHARD_SCORES_DB_PATH, ABLATION_DB_PATH,
+    FLYWHEEL_DB_PATH,
 )
 
 log = logging.getLogger("data_stager")
@@ -291,14 +293,28 @@ class DataStager:
         """
         Stage versioned precomputed .npz caches from cold → hot for all encoders.
 
-        For each encoder, reads cold's `current` symlink, resolves the version
-        dir, and links/copies any .npz files not already on hot.  Updates hot's
+        Only stages .npz files whose shard stem falls within the chunk's shard
+        range [(chunk-1)*SHARD_BLOCK, chunk*SHARD_BLOCK).  Non-.npz files
+        (manifest.json, etc.) are staged unconditionally.  Updates hot's
         `current` symlink to match cold's.
 
         Returns (npz_files_staged, bytes_transferred).
         """
         total_npz = 0
         total_bytes = 0
+
+        lo = (chunk - 1) * SHARD_BLOCK
+        hi =  chunk      * SHARD_BLOCK
+
+        def _in_chunk(f: Path) -> bool:
+            """Return True if f should be staged for this chunk."""
+            if f.suffix != ".npz":
+                return True  # manifest.json and other metadata always staged
+            try:
+                shard_id = int(f.name.split("_")[0])
+            except (ValueError, IndexError):
+                return True  # unparseable name — stage it unconditionally
+            return lo <= shard_id < hi
 
         # Pre-scan total transfer size before starting any copies so we can
         # enforce the hot-storage margin as a single upfront check.
@@ -313,7 +329,7 @@ class DataStager:
                 hot_ver_dir  = self._hot_precomp  / encoder / ver
                 if cold_ver_dir.exists():
                     for f in cold_ver_dir.iterdir():
-                        if not (hot_ver_dir / f.name).exists():
+                        if _in_chunk(f) and not (hot_ver_dir / f.name).exists():
                             estimated += _safe_size(f)
             if estimated and not self._check_hot_space(estimated):
                 raise RuntimeError(
@@ -341,6 +357,8 @@ class DataStager:
 
             tasks: list[tuple[Path, Path]] = []
             for f in cold_ver_dir.iterdir():
+                if not _in_chunk(f):
+                    continue
                 dst = hot_ver_dir / f.name
                 if not dst.exists() and not dst.is_symlink():
                     tasks.append((f, dst))
@@ -535,13 +553,13 @@ class DataStager:
                 log.info("New best %s = %s → %s", metric, value, ckpt_path.name)
 
     def _archive_dbs(self) -> None:
-        """Copy shard_scores.db and ablation_history.db from hot → cold metadata dir.
+        """Copy hot DBs to cold metadata dir.
 
         Full copy (not incremental). SQLite files may be briefly inconsistent if a
         write transaction is in progress, but this is acceptable for disaster recovery.
         """
         self._cold_metadata.mkdir(parents=True, exist_ok=True)
-        for src in (SHARD_SCORES_DB_PATH, ABLATION_DB_PATH):
+        for src in (SHARD_SCORES_DB_PATH, ABLATION_DB_PATH, FLYWHEEL_DB_PATH):
             db_name = src.name
             if not src.exists():
                 continue
@@ -566,7 +584,7 @@ class DataStager:
             return -1
         dst.parent.mkdir(parents=True, exist_ok=True)
         if self._use_symlinks:
-            os.symlink(src.resolve(), dst)
+            os.symlink(os.path.relpath(src.resolve(), dst.parent), dst)
             return 0
         return self._atomic_copy(src, dst)
 
@@ -638,7 +656,7 @@ def _safe_size(path: Path) -> int:
 def _atomic_symlink(link_path: Path, target: str) -> None:
     """Atomically create or replace a symlink (POSIX rename is atomic)."""
     link_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = link_path.parent / ".current_stg_tmp"
+    tmp = link_path.parent / f".{link_path.name}_tmp_{uuid.uuid4().hex[:8]}"
     if tmp.exists() or tmp.is_symlink():
         tmp.unlink()
     os.symlink(target, tmp)

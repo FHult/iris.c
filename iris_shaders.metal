@@ -1,5 +1,5 @@
 /*
- * flux_shaders.metal - Metal compute shaders for FLUX inference
+ * iris_shaders.metal - Metal compute shaders for FLUX inference
  *
  * These kernels accelerate operations that run on CPU otherwise:
  * - RMSNorm (used in QK normalization)
@@ -681,6 +681,7 @@ kernel void causal_attention_fused(
     uint tid = tid_pos.x;
     uint threads = tg_size.x;
 
+    if (seq > 512) return;  // guard: shared_scores is sized 512
     if (query_idx >= seq || head_idx >= num_q_heads) return;
 
     // GQA: map Q head to KV head
@@ -1832,6 +1833,7 @@ kernel void attention_fused_bf16(
     uint tid = tid_pos.x;
     uint threads = tg_size.x;
 
+    if (head_dim > 128) return;  // guard: shared_q is sized 128
     if (query_idx >= seq_q || head_idx >= num_heads) return;
 
     int hidden = num_heads * head_dim;
@@ -1963,6 +1965,8 @@ kernel void causal_attention_fused_bf16(
     uint tid = tid_pos.x;
     uint threads = tg_size.x;
 
+    if (seq > 512) return;  // guard: shared_scores is sized 512
+    if (head_dim > 128) return;  // guard: shared_q is sized 128
     if (query_idx >= seq || head_idx >= num_q_heads) return;
 
     // GQA: map Q head to KV head

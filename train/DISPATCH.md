@@ -17,7 +17,7 @@
 
 Training an IP-Adapter for **Flux Klein 4B** on an M1 Max Mac with a 2 TB NVMe SSD (`/Volumes/2TBSSD`). The adapter adds `--sref` (style reference) conditioning: given a reference image, the model generates images matching its visual style. Training is MLX-based (Apple Silicon GPU, no CUDA).
 
-Hardware: M1 Max (8 P-cores / 2 E-cores, 64 GB unified memory), 2 TB NVMe SSD.
+Hardware: M1 Max (8 P-cores / 2 E-cores, 32 GB unified memory), 2 TB NVMe SSD.
 
 ---
 
@@ -53,7 +53,8 @@ The orchestrator drives each chunk through these steps in sequence:
 ```
 IDLE → DOWNLOADING → CONVERTING → BUILDING → FILTERING
      → CLIP_EMBED → CLIP_INDEX → CLIP_DUPS
-     → PRECOMPUTING → READY → TRAINING → MINING → VALIDATING → DONE
+     → PRECOMPUTING → READY → VALIDATING_SHARDS → TRAINING_WARMUP
+     → TRAINING → MINING → VALIDATING → ARCHIVING → DONE
 ```
 
 Each step writes a `{step}.done` sentinel under `{DATA_ROOT}/pipeline/chunk{N}/` when complete.
@@ -310,7 +311,7 @@ dispatch_queue.jsonl              ← escalated alerts; shown at the bottom of p
 ```
 download, convert, build_shards, filter_shards,
 clip_embed, clip_index, clip_dups, precompute,
-promoted, train, mine, validate
+promoted, validate_shards, training_warmup, train, mine, validate, archive
 ```
 
 To list all sentinels for a chunk:
@@ -346,8 +347,12 @@ ls /Volumes/2TBSSD/pipeline/chunk1/
 | `build_shards_chunk{N}.json` | `build_shards.py` | `done`, `total`, `pct` |
 | `download_convert_chunk{N}.json` | `download_convert.py` | `done`, `total`, `pct`, `phase`, `current_tgz`, `dl_speed_mbps` |
 | `filter_shards_chunk{N}.json` | `filter_shards.py` | `done`, `total`, `pct` |
-| `clip_dedup_chunk{N}.json` | `clip_dedup.py` | `done`, `total`, `pct` |
+| `clip_dedup.json` | `clip_dedup.py` | `done`, `total`, `pct` (no chunk suffix in practice) |
 | `mine_hard_examples_chunk{N}.json` | `mine_hard_examples.py` | `done`, `total`, `pct` |
+| `stager_chunk{N}.json` | data stager | `done`, `total`, `pct`, `phase` (cold→hot staging, hot→cold archiving) |
+| `flywheel.json` | flywheel campaign | flywheel campaign progress |
+| `ablation.json` | ablation harness | ablation harness progress |
+| `trainer.json` | `train_ip_adapter.py` (direct run) | same fields as `trainer_chunk{N}.json`; named `trainer_{name}.json` for named direct runs, `trainer.json` for pipeline runs |
 
 **Conditioning health fields** (present from chunk 4 onwards; null in older heartbeats):
 - `loss_cond` / `loss_null` — average loss this log window for conditioned vs unconditioned batches. Gap = `loss_null - loss_cond`; should grow positive after ~1000 steps. Zero gap = adapter not learning.
@@ -422,7 +427,7 @@ rm -f /Volumes/2TBSSD/.heartbeat/*.json
 
 ### `dispatch_queue.jsonl`
 
-**Path**: `/Volumes/2TBSSD/logs/dispatch_queue.jsonl`
+**Path**: `/Volumes/2TBSSD/dispatch_queue.jsonl`
 
 **Written by**: `dispatch_issue()` in `pipeline_lib.py` — called by the orchestrator for problems it cannot auto-resolve: step failed too many times, trainer restart limit exceeded, loss NaN/Inf, sustained high grad norm, disk critical.
 
@@ -430,7 +435,7 @@ rm -f /Volumes/2TBSSD/.heartbeat/*.json
 
 To inspect directly:
 ```bash
-cat /Volumes/2TBSSD/logs/dispatch_queue.jsonl | python3 -m json.tool
+cat /Volumes/2TBSSD/dispatch_queue.jsonl | python3 -m json.tool
 ```
 
 To resolve an issue after intervention (removes it from status output):
@@ -473,12 +478,8 @@ Confirmed issues found in code review. Document here so they are not rediscovere
 **Gap 1 — ~~Escalated alerts are invisible~~ RESOLVED (2026-04-25)**
 `pipeline_status.py` now reads `dispatch_queue.jsonl` directly via `_read_dispatch_issues()` and shows open issues at the bottom of status output. Escalated alerts (retry limit exceeded, NaN loss, disk critical) are visible in normal `pipeline_status.py` output.
 
-**Gap 2 — Orchestrator restart orphans any in-flight prep step** *(still open)*
-`_active_prep` is in-memory only. If the orchestrator is killed while iris-prep is running, on restart `_active_prep` is None. `_poll_prep_window()` returns immediately. When the prep window eventually finishes (or was already finished), the exit code is never read and the step is never marked done. The chunk is stuck indefinitely. **Workaround**: after orchestrator restart, check if iris-prep window exists. If it does, wait for it to finish then manually mark the step done or check its EXIT_CODE in the log. If the step log already contains `EXIT_CODE=0`, mark it done manually:
-```bash
-# Example: precompute completed but orchestrator missed it
-touch /Volumes/2TBSSD/pipeline/chunk1/precompute.done
-```
+**Gap 2 — Orchestrator restart orphans any in-flight prep step** *(resolved)*
+`_active_prep` is in-memory only. If the orchestrator is killed while iris-prep is running, on restart the in-flight prep window could have been orphaned. **Resolution**: `_recover_prep_window()` is called at orchestrator startup (orchestrator.py ~line 364) — it scans for existing iris-prep tmux windows and re-attaches `_active_prep` so the completion is detected normally. Note: there is a separate related issue (BUG-P-004 in BACKLOG.md) where the hung-prep timer resets to zero after restart; that is distinct from the orphan detection fix and remains open.
 
 **Gap 3 — ~~Hung prep workers undetected~~ RESOLVED (2026-04-25)**
 The orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of continuous prep window activity. It also monitors prep worker heartbeats: if a worker's heartbeat goes stale for >30 min, the orchestrator dispatches an alert (visible in `pipeline_status.py`). If you see a prep-hung alert, check the log and kill the window manually if confirmed stuck.

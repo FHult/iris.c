@@ -763,7 +763,7 @@ def _check_stager_health(chunks: list[int]) -> None:
                      fix=(f"# If archive was already done manually, create the sentinel:\n"
                           f"touch {SENTINEL_DIR}/chunk{chunk}/archive.done\n"
                           f"# Or restart the stager to archive now:\n"
-                          f"python train/scripts/data_stager.py --chunk {chunk} --phase archive"),
+                          f"python train/scripts/data_stager.py archive --chunk {chunk}"),
                      chunk=chunk,
                      ctx={"stager_hb_age_s": round(shb_age) if shb_age is not None else None,
                           "stage_win_alive": stage_win_alive})
@@ -815,7 +815,7 @@ def _check_stager_health(chunks: list[int]) -> None:
                          fix=(f"# Verify hot-volume contents, then if staging was actually done:\n"
                               f"touch {SENTINEL_DIR}/chunk{prev}/stage.done\n"
                               f"# Or restart staging for chunk {prev}:\n"
-                              f"python train/scripts/data_stager.py --chunk {prev} --phase stage"),
+                              f"python train/scripts/data_stager.py stage --chunk {prev}"),
                          chunk=chunk,
                          ctx={"prev_chunk": prev, "stage_done_missing": True,
                               "stager_hb_age_s": round(prev_shb_age) if prev_shb_age is not None else None})

@@ -84,6 +84,7 @@ typedef struct {
     int seq_k;
     int num_heads;
     int head_dim;
+    float scale;
     __strong MPSGraph *graph;
     __strong MPSGraphTensor *qTensor;
     __strong MPSGraphTensor *kTensor;
@@ -310,6 +311,11 @@ static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size)
     id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
                                               length:size
                                              options:MTLResourceStorageModeShared];
+    if (!buf) {
+        NSLog(@"iris_metal: MTLBuffer allocation failed (OOM)");
+        pthread_mutex_unlock(&g_cache_mutex);
+        return nil;
+    }
     g_weight_cache[g_weight_cache_count].cpu_ptr = weights;
     g_weight_cache[g_weight_cache_count].gpu_buffer = buf;
     g_weight_cache[g_weight_cache_count].size = size;
@@ -727,13 +733,14 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
          * can be reallocated at the same CPU address, so stale cached GPU data
          * was reused. The generic path must not cache B by pointer. */
         id<MTLBuffer> bufferB = nil;
+        int bufferB_from_pool = 0;
         if (cache_B) {
             /* Static immutable weights: safe to cache by pointer. */
             bufferB = get_cached_weight_buffer(B, sizeB);
         } else if (g_in_batch) {
             /* Dynamic B in batch mode: keep data alive via pool, not pointer cache. */
             bufferB = pool_get_buffer(sizeB);
-            if (bufferB) memcpy([bufferB contents], B, sizeB);
+            if (bufferB) { memcpy([bufferB contents], B, sizeB); bufferB_from_pool = 1; }
         } else {
             /* Dynamic B outside batch: one-shot upload, no pointer-based cache. */
             bufferB = [g_device newBufferWithBytes:B
@@ -759,7 +766,9 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
 
         if (!bufferA || !bufferB || !bufferC) {
             /* Fallback if buffer creation fails */
+            NSLog(@"iris_metal: MTLBuffer allocation failed (OOM)");
             if (bufferA && !bufferA_from_cache) pool_release_buffer(bufferA);
+            if (bufferB && bufferB_from_pool) pool_release_buffer(bufferB);
             if (bufferC) pool_release_buffer(bufferC);
             return;
         }
@@ -1074,6 +1083,9 @@ static id<MTLBuffer> get_cached_bf16_buffer(const uint16_t *weights, size_t num_
         id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
                                                   length:size
                                                  options:MTLResourceStorageModeShared];
+        if (!buf) {
+            NSLog(@"iris_metal: MTLBuffer allocation failed (OOM)");
+        }
         pthread_mutex_unlock(&g_bf16_cache_mutex);
         return buf;
     }
@@ -1082,6 +1094,11 @@ static id<MTLBuffer> get_cached_bf16_buffer(const uint16_t *weights, size_t num_
     id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
                                               length:size
                                              options:MTLResourceStorageModeShared];
+    if (!buf) {
+        NSLog(@"iris_metal: MTLBuffer allocation failed (OOM)");
+        pthread_mutex_unlock(&g_bf16_cache_mutex);
+        return nil;
+    }
 
     g_bf16_cache[g_bf16_cache_count].cpu_ptr = weights;
     g_bf16_cache[g_bf16_cache_count].gpu_buffer = buf;
@@ -1183,6 +1200,11 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
                                     length:size
                                    options:MTLResourceStorageModeShared];
         free(f16_data);
+        if (!buf) {
+            NSLog(@"iris_metal: MTLBuffer allocation failed (OOM)");
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return nil;
+        }
     }
 
     /* Cache is full - return without caching */
@@ -1615,7 +1637,7 @@ void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
         size_t sizeC_elem = (size_t)M * ldc * sizeof(float);
 
         /* Store C buffers so we can copy results back after GPU completes */
-        __strong id<MTLBuffer> *cBuffers = (__strong id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
+        id<MTLBuffer> *cBuffers = (id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
         float **cPtrs = (float **)malloc(batch_count * sizeof(float *));
 
         for (int i = 0; i < batch_count; i++) {
@@ -2537,6 +2559,7 @@ iris_gpu_tensor_t iris_gpu_tensor_alloc_persistent(size_t num_elements) {
         /* Allocate tensor structure */
         iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
         if (!tensor) {
+            buf = nil;  /* Release MTLBuffer under ARC */
             return NULL;
         }
 
@@ -2781,29 +2804,31 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
                           rightMatrix:matW
                          resultMatrix:matOut];
 
-        /* Add bias if present */
-        if (b != NULL) {
-            /* For now, sync and add bias on CPU (can optimize later with compute shader) */
+        /* Add bias if present — GPU kernel preserves batch mode atomicity */
+        if (b != NULL && g_bias_add_pipeline) {
+            size_t bias_size = (size_t)out_dim * sizeof(float);
+            id<MTLBuffer> bufBias = get_cached_weight_buffer(b, bias_size);
+            if (bufBias) {
+                id<MTLComputeCommandEncoder> biasEnc = [cmdBuffer computeCommandEncoder];
+                [biasEnc setComputePipelineState:g_bias_add_pipeline];
+                [biasEnc setBuffer:out->buffer offset:0 atIndex:0];
+                [biasEnc setBuffer:bufBias    offset:0 atIndex:1];
+                [biasEnc setBytes:&out_dim length:sizeof(int) atIndex:2];
+                MTLSize tg   = MTLSizeMake(256, 1, 1);
+                MTLSize grid = MTLSizeMake(((NSUInteger)out_dim + 255) / 256,
+                                           (NSUInteger)seq_len, 1);
+                [biasEnc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                [biasEnc endEncoding];
+            }
+        }
+
+        /* Mark output as having pending work */
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
-
-            float *out_data = (float *)[out->buffer contents];
-            for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < out_dim; j++) {
-                    out_data[i * out_dim + j] += b[j];
-                }
-            }
             out->has_pending_work = 0;
-        } else {
-            /* Mark output as having pending work */
-            out->has_pending_work = 1;
-
-            if (!g_tensor_batch_mode) {
-                /* Not in batch mode - sync immediately */
-                [cmdBuffer commit];
-                [cmdBuffer waitUntilCompleted];
-                out->has_pending_work = 0;
-            }
         }
 
         /* Mark input as having pending work if in batch mode */
@@ -4755,7 +4780,8 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     for (int i = 0; i < g_sdpa_graph_count; i++) {
         sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[i];
         if (entry->seq_q == seq_q && entry->seq_k == seq_k &&
-            entry->num_heads == num_heads && entry->head_dim == head_dim) {
+            entry->num_heads == num_heads && entry->head_dim == head_dim &&
+            entry->scale == scale) {
             pthread_mutex_unlock(&g_sdpa_graph_mutex);
             return entry;
         }
@@ -4771,6 +4797,7 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     entry->seq_k = seq_k;
     entry->num_heads = num_heads;
     entry->head_dim = head_dim;
+    entry->scale = scale;
 
     @autoreleasepool {
         MPSGraph *graph = [[MPSGraph alloc] init];
@@ -4859,7 +4886,8 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache_f32(int seq_q, int seq_k, int nu
     for (int i = 0; i < g_sdpa_f32_graph_count; i++) {
         sdpa_graph_cache_t *entry = &g_sdpa_f32_graph_cache[i];
         if (entry->seq_q == seq_q && entry->seq_k == seq_k &&
-            entry->num_heads == num_heads && entry->head_dim == head_dim) {
+            entry->num_heads == num_heads && entry->head_dim == head_dim &&
+            entry->scale == scale) {
             pthread_mutex_unlock(&g_sdpa_f32_graph_mutex);
             return entry;
         }
@@ -4875,6 +4903,7 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache_f32(int seq_q, int seq_k, int nu
     entry->seq_k = seq_k;
     entry->num_heads = num_heads;
     entry->head_dim = head_dim;
+    entry->scale = scale;
 
     @autoreleasepool {
         MPSGraph *graph = [[MPSGraph alloc] init];

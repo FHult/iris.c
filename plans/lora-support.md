@@ -1,5 +1,7 @@
 # Plan: LoRA Support for flux2.c
 
+**Status: Implemented** — `iris_lora.c` is complete and listed in the active codebase.
+
 ## Overview
 
 Add support for loading and applying LoRA (Low-Rank Adaptation) weights to the
