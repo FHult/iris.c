@@ -52,7 +52,7 @@ from pipeline_lib import (
     DATA_ROOT, load_config, log_event,
     write_heartbeat, mark_done, mark_error, has_error, clear_error,
     SHARD_BLOCK, RUN_METADATA_FILE, SHARD_SCORES_DB_PATH, ABLATION_DB_PATH,
-    FLYWHEEL_DB_PATH,
+    FLYWHEEL_DB_PATH, DEDUP_DIR,
 )
 
 log = logging.getLogger("data_stager")
@@ -563,10 +563,10 @@ class DataStager:
                 log.info("New best %s = %s → %s", metric, value, ckpt_path.name)
 
     def _archive_dbs(self) -> None:
-        """Copy hot DBs to cold metadata dir using the sqlite3 backup API.
+        """Copy hot DBs and dedup state to cold metadata dir.
 
-        The backup API checkpoints the WAL and produces a consistent snapshot even
-        if a write transaction is in progress, unlike a raw file copy.
+        SQLite files use the backup API for a WAL-consistent snapshot.
+        Dedup files (FAISS index + blocklist) are plain files copied atomically.
         """
         self._cold_metadata.mkdir(parents=True, exist_ok=True)
         for src in (SHARD_SCORES_DB_PATH, ABLATION_DB_PATH, FLYWHEEL_DB_PATH):
@@ -584,6 +584,17 @@ class DataStager:
             except Exception as exc:
                 tmp.unlink(missing_ok=True)
                 log.warning("Failed to archive %s: %s", db_name, exc)
+
+        # Archive dedup state: FAISS index + sidecar + blocklist
+        for fname in ("dedup_index.faiss", "dedup_index.ids", "duplicate_ids.txt"):
+            src = DEDUP_DIR / fname
+            if not src.exists():
+                continue
+            try:
+                _atomic_copy_file(src, self._cold_metadata / fname)
+                log.info("Archived dedup %s → cold/metadata/", fname)
+            except Exception as exc:
+                log.warning("Failed to archive dedup %s: %s", fname, exc)
 
     def promote_to_ultrahot(self, chunk: int) -> dict:
         """Copy active checkpoint + precompute version to the Ultrahot tier.

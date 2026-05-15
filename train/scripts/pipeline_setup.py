@@ -519,6 +519,35 @@ def _dump_yaml(data: dict, path: Path) -> None:
 # Directory setup
 # ---------------------------------------------------------------------------
 
+_DEDUP_FILES = ("dedup_index.faiss", "dedup_index.ids", "duplicate_ids.txt")
+
+
+def _restore_dedup_state(data_root: Path, cold_root: Path, dry_run: bool = False) -> list[str]:
+    """Copy dedup state from cold/metadata/ → hot dedup_ids/ if hot is empty.
+
+    Only restores if hot has no blocklist (fresh campaign or wiped hot storage).
+    Returns list of restored filenames.
+    """
+    hot_dedup  = data_root / "dedup_ids"
+    cold_dedup = cold_root / "metadata"
+    blocklist  = hot_dedup / "duplicate_ids.txt"
+
+    if blocklist.exists():
+        return []  # hot already has dedup state — nothing to do
+
+    restored = []
+    for fname in _DEDUP_FILES:
+        src = cold_dedup / fname
+        if not src.exists():
+            continue
+        dst = hot_dedup / fname
+        if not dry_run:
+            hot_dedup.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        restored.append(fname)
+    return restored
+
+
 def _setup_dirs(data_root: Path, dry_run: bool = False) -> tuple[list, list]:
     """Create required directories.  Returns (created, existing)."""
     created, existing = [], []
@@ -1031,6 +1060,20 @@ def run_interactive(args) -> int:
     except Exception:
         pass
 
+    # Dedup state restore (cold → hot): if hot has no blocklist but cold does, restore it
+    if _cfg is not None:
+        try:
+            _cold_root = Path(_cfg.get("storage", {}).get("cold_root", "/Volumes/16TBCold"))
+            _restored = _restore_dedup_state(data_root, _cold_root)
+            if _restored:
+                print(f"  {ok('+')}  Restored dedup state from cold: {', '.join(_restored)}")
+            else:
+                _cold_bl = _cold_root / "metadata" / "duplicate_ids.txt"
+                if _cold_bl.exists():
+                    print(f"  {ok('✓')}  Dedup state already present on hot storage")
+        except Exception as _e:
+            print(f"  {warn('!')}  Dedup state restore skipped: {_e}")
+
     # Val set staging (cold → hot); offer to create it inline if missing
     if _cfg is not None:
         try:
@@ -1213,6 +1256,16 @@ def run_ai(args) -> int:
     if created:
         warnings.append(f"Directories not yet created ({len(created)} missing) — run pipeline_setup.py to create them")
 
+    # Dedup state presence check (informational only — no restore in --ai mode)
+    try:
+        from pipeline_lib import load_config as _lc
+        _ai_cfg = _lc(str(config_path)) if config_exists else {}
+        _ai_cold = Path(_ai_cfg.get("storage", {}).get("cold_root", "/Volumes/16TBCold"))
+        _dedup_hot_ok  = (data_root / "dedup_ids" / "duplicate_ids.txt").exists()
+        _dedup_cold_ok = (_ai_cold / "metadata" / "duplicate_ids.txt").exists()
+    except Exception:
+        _dedup_hot_ok = _dedup_cold_ok = False
+
     result.update({
         "ready":       not blockers and not issues,
         "scale":       scale,
@@ -1230,6 +1283,11 @@ def run_ai(args) -> int:
         "dirs": {
             "needs_creation": created,
             "existing_count": len(existing_dirs),
+        },
+        "dedup_state": {
+            "hot_present":  _dedup_hot_ok,
+            "cold_present": _dedup_cold_ok,
+            "restore_needed": _dedup_cold_ok and not _dedup_hot_ok,
         },
         "existing_pipeline_state": {
             "found":          state["found"],

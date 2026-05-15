@@ -194,6 +194,24 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ---
 
+**DEDUP-1: Pre-shard deduplication — build clean WebDataset shards with duplicates removed**
+
+Currently deduplication runs after shard building, resulting in ~10% overhead throughout the pipeline: duplicate records waste disk space in shards, I/O in precompute and training, and GPU time in mining. The downstream blocklist filtering (added 2026-05-15) is a workaround that catches duplicates at each consumer, but does not eliminate them from the shards themselves.
+
+**Goal:** move deduplication before shard building so shards contain only unique records, eliminating the need for blocklist filtering in precompute, training, and mining entirely (the blocklist would still be needed in `build_shards.py` to prevent cross-chunk contamination).
+
+**How it would work:**
+1. A new `clip_embed_raw` step runs CLIP embedding directly on the converted pool source files (parquet or image files) — before `build_shards.py` — producing the same `.npz` embedding files that the current `clip_embed` step produces from shards.
+2. `clip_index` and `clip_dedup find-dups` run on these raw embeddings as today, producing `duplicate_ids.txt`.
+3. `build_shards.py` is called with `--blocklist duplicate_ids.txt` (as today), ensuring shards are built without duplicates.
+4. Downstream steps (precompute, training, mining) receive clean shards and require no blocklist argument.
+
+**Blocker:** `clip_embed` currently reads from WebDataset shards (`.tar` files). A raw-source reader for the converted pool format must be written. The converted pool format needs to be determined (parquet files? individual image files? something else from the JDB conversion step).
+
+**Dependency:** requires understanding the exact output format of `download_convert.py`'s conversion step, which determines what a raw CLIP embedder must read.
+
+**When to do:** after the first full production run confirms the current blocklist workaround is stable. Not blocking anything today.
+
 ---
 
 ---
