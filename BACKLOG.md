@@ -194,23 +194,32 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ---
 
-**DEDUP-1: Pre-shard deduplication — build clean WebDataset shards with duplicates removed**
+**DEDUP-1: Clean the converted pool at source; one-off script for existing shards**
 
-Currently deduplication runs after shard building, resulting in ~10% overhead throughout the pipeline: duplicate records waste disk space in shards, I/O in precompute and training, and GPU time in mining. The downstream blocklist filtering (added 2026-05-15) is a workaround that catches duplicates at each consumer, but does not eliminate them from the shards themselves.
+**Architectural motivation:** data quality should be enforced at the point of production, not at the point of consumption. The current blocklist-propagation approach (added 2026-05-15) requires every consumer (precompute, training, mining, any future step) to implement filtering correctly and silently fails if any consumer omits it.
 
-**Goal:** move deduplication before shard building so shards contain only unique records, eliminating the need for blocklist filtering in precompute, training, and mining entirely (the blocklist would still be needed in `build_shards.py` to prevent cross-chunk contamination).
+**The right dedup point is the converted pool, not the training shards.** The converted pool (`cold_root/converted/journeydb/`) is the canonical source from which all training shards are built. If a pool WDS file is clean, every future shard build from it is automatically clean — across all chunks, campaigns, and scales — with no downstream filtering required. Since the vast majority of JDB data is still in the pool and has never been materialised into training shards, cleaning the pool addresses essentially all data at the right level.
 
-**How it would work:**
-1. A new `clip_embed_raw` step runs CLIP embedding directly on the converted pool source files (parquet or image files) — before `build_shards.py` — producing the same `.npz` embedding files that the current `clip_embed` step produces from shards.
-2. `clip_index` and `clip_dedup find-dups` run on these raw embeddings as today, producing `duplicate_ids.txt`.
-3. `build_shards.py` is called with `--blocklist duplicate_ids.txt` (as today), ensuring shards are built without duplicates.
-4. Downstream steps (precompute, training, mining) receive clean shards and require no blocklist argument.
+**Two-track implementation:**
 
-**Blocker:** `clip_embed` currently reads from WebDataset shards (`.tar` files). A raw-source reader for the converted pool format must be written. The converted pool format needs to be determined (parquet files? individual image files? something else from the JDB conversion step).
+*Track 1 — converted pool dedup (pipeline change):*
+After `download_convert.py` writes a new WDS file to the pool, run CLIP embedding on it directly, extend the cumulative FAISS index, find and remove any duplicate records (rewrite the pool WDS tar in place), and update the pool's record manifest. `build_shards.py` then always draws from clean source files; no shard-level filtering is ever needed.
 
-**Dependency:** requires understanding the exact output format of `download_convert.py`'s conversion step, which determines what a raw CLIP embedder must read.
+*Track 2 — existing shard + precompute cleanup (one-off script):*
+For the small number of training shards already built from pool data (current and past chunks): a `clean_existing_shards.py` script reads `duplicate_ids.txt`, rewrites each shard tar in place to remove duplicate records, and prunes the corresponding precomputed `.npz` files from each encoder cache dir + updates the manifest record count. Precompute cache entries are keyed by record ID so non-duplicate embeddings remain valid — no GPU recompute needed, only O(N_dups) file deletions and a manifest update.
 
-**When to do:** after the first full production run confirms the current blocklist workaround is stable. Not blocking anything today.
+**What becomes dead code once Track 1 is live:**
+- `--blocklist` args in `precompute_all.py`, `train_ip_adapter.py`, `mine_hard_examples.py`
+- `blocklist` param in `ip_adapter/dataset.py`
+- Dedup state archive/restore in `data_stager._archive_dbs()` and `pipeline_setup._restore_dedup_state()`
+- All `--blocklist` wiring in orchestrator launch commands for precompute, training, mining
+
+**What stays:**
+- Cumulative FAISS index (still needed for cross-chunk near-duplicate detection)
+- `duplicate_ids.txt` passed to `build_shards.py --blocklist` for the next chunk (cross-chunk contamination prevention at build time)
+- Cold archive of FAISS index + blocklist
+
+**When to do:** after the first full production run confirms the blocklist workaround is stable. Not blocking anything today.
 
 ---
 

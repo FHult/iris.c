@@ -70,7 +70,7 @@ training:
 # smoke root.  Adjust if running against a different DATA_ROOT.
 storage:
   cold_root: "/Volumes/2TBSSD/smoke/cold"
-  hot_root:  "/Volumes/2TBSSD/smoke"
+  hot_root:  "/Volumes/2TBSSD"           # must match PIPELINE_DATA_ROOT
   converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # shared with production
   staging_margin_gb: 2
   cleanup_safety_gb: 1
