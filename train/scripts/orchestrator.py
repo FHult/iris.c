@@ -31,8 +31,8 @@ from pipeline_lib import (
     DATA_ROOT, TRAIN_DIR, SCRIPTS_DIR, VENV_PYTHON,
     DISPATCH_QUEUE,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
-    SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR, CKPT_DIR,
-    CKPT_ARCHIVE_DIR, RUN_METADATA_FILE,
+    SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR,
+    RUN_METADATA_FILE,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS, SHARD_BLOCK,
     STATE_FILE,
@@ -316,6 +316,9 @@ class Orchestrator:
         self.prep_root: Path = (
             _uh if _storage.get("data_prep_tier") == "ultrahot" else DATA_ROOT
         )
+        # Checkpoint dirs derive from prep_root so ultrahot mode routes correctly.
+        self.ckpt_dir         = self.prep_root / "checkpoints" / "stage1"
+        self.ckpt_archive_dir = self.ckpt_dir  / "archive"
         self.issue_counter = 0
         self._restart_counts: dict[tuple, int] = {}
         # Retry backoff: {(chunk, step) → earliest epoch_sec to retry}
@@ -545,19 +548,19 @@ class Orchestrator:
         """Copy the latest checkpoint pair + EMA to archive/chunk{N}_final.* ."""
         if self.dry_run:
             return
-        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        ckpts = sorted(self.ckpt_dir.glob("step_*.safetensors"))
         if not ckpts:
             log_orch(f"Chunk {chunk}: no checkpoint to archive", chunk=chunk)
             return
         latest_st = ckpts[-1]
         step_stem = latest_st.stem  # e.g. "step_0050000"
-        CKPT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        self.ckpt_archive_dir.mkdir(parents=True, exist_ok=True)
         copied = []
         for suffix in [".safetensors", ".json", ".ema.safetensors"]:
-            src = CKPT_DIR / f"{step_stem}{suffix}"
+            src = self.ckpt_dir / f"{step_stem}{suffix}"
             if not src.exists():
                 continue
-            dst = CKPT_ARCHIVE_DIR / f"chunk{chunk}_final{suffix}"
+            dst = self.ckpt_archive_dir / f"chunk{chunk}_final{suffix}"
             try:
                 shutil.copy2(src, dst)
                 copied.append(dst.name)
@@ -566,7 +569,7 @@ class Orchestrator:
                          level="warning", chunk=chunk)
         if copied:
             log_orch(f"Chunk {chunk}: archived checkpoint {step_stem} → "
-                     f"{CKPT_ARCHIVE_DIR.relative_to(DATA_ROOT)} ({len(copied)} files)",
+                     f"{self.ckpt_archive_dir.relative_to(self.prep_root)} ({len(copied)} files)",
                      chunk=chunk)
 
     def _create_release_bundle(self, chunk: int) -> None:
@@ -580,8 +583,8 @@ class Orchestrator:
             return
         from datetime import datetime, timezone
 
-        best = CKPT_DIR / "best.safetensors"
-        best_meta = CKPT_DIR / "best.json"
+        best = self.ckpt_dir / "best.safetensors"
+        best_meta = self.ckpt_dir / "best.json"
         if not best.exists():
             log_orch(f"Chunk {chunk}: no best.safetensors — skipping release bundle",
                      level="warning", chunk=chunk)
@@ -600,8 +603,8 @@ class Orchestrator:
 
         date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
         bundle_name = f"release_{date_str}_step{step:07d}"
-        bundle_dir = CKPT_ARCHIVE_DIR / bundle_name
-        CKPT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        bundle_dir = self.ckpt_archive_dir / bundle_name
+        self.ckpt_archive_dir.mkdir(parents=True, exist_ok=True)
 
         if bundle_dir.exists():
             log_orch(f"Chunk {chunk}: release bundle already exists at {bundle_name}",
@@ -719,7 +722,7 @@ class Orchestrator:
         except (OSError, json.JSONDecodeError):
             meta = {}
         meta["completed_at"] = now_iso()
-        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        ckpts = sorted(self.ckpt_dir.glob("step_*.safetensors"))
         if ckpts:
             meta["final_checkpoint"] = str(ckpts[-1])
         if summary_path and summary_path.exists():
@@ -782,7 +785,7 @@ class Orchestrator:
                     out.append(f"Chunk {chunk}: incomplete")
 
             out.append("")
-            ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+            ckpts = sorted(self.ckpt_dir.glob("step_*.safetensors"))
             if ckpts:
                 out.append(f"Final checkpoint: {ckpts[-1].name}")
             hard_counts = {}
@@ -1553,11 +1556,11 @@ class Orchestrator:
         resume_arg = ""
         # Resume from the latest intermediate checkpoint if one exists.
         # This handles both mid-run restarts (any chunk) and chunk>1 warm-starts.
-        _ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+        _ckpts = sorted(self.ckpt_dir.glob("step_*.safetensors"))
         if _ckpts:
             resume_arg = f"--resume '{_ckpts[-1]}'"
         elif chunk > 1:
-            best = CKPT_DIR / "best.safetensors"
+            best = self.ckpt_dir / "best.safetensors"
             if best.exists():
                 resume_arg = f"--resume '{best}'"
 
@@ -1650,7 +1653,7 @@ class Orchestrator:
         if not self.res.request("GPU_TOKEN", f"mine chunk {chunk}"):
             return
 
-        best = CKPT_DIR / "best.safetensors"
+        best = self.ckpt_dir / "best.safetensors"
         if not best.exists():
             log_orch(f"Chunk {chunk}: no checkpoint — skipping mining", chunk=chunk)
             mark_done(chunk, "mine")
@@ -1710,7 +1713,7 @@ class Orchestrator:
             return
         if not self.res.request("GPU_TOKEN", f"validate chunk {chunk}"):
             return
-        best = CKPT_DIR / "best.safetensors"
+        best = self.ckpt_dir / "best.safetensors"
         if not best.exists():
             log_orch(f"Chunk {chunk}: no checkpoint — skipping validation", chunk=chunk)
             self.res.release("GPU_TOKEN")
@@ -2491,6 +2494,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     ablation_every = int(fw_cfg.get("ablation_every_n", 0))
     # data_root: optional fw_cfg key for Ultrahot-tier flywheel (PIPELINE-31).
     _fw_data_root = Path(fw_cfg.get("data_root", str(DATA_ROOT)))
+    _fw_ckpt_dir  = _fw_data_root / "checkpoints" / "stage1"
     shards_dir     = Path(fw_cfg.get("shards_dir", str(_fw_data_root / "shards")))
     manifest_path  = Path(fw_cfg["shard_manifest"]) if fw_cfg.get("shard_manifest") else None
 
@@ -2518,7 +2522,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
             except (IndexError, ValueError):
                 return 0
 
-        ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"), key=_step_num)
+        ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"), key=_step_num)
         if ckpts:
             resume_ckpt = str(ckpts[-1])
         else:
@@ -2671,7 +2675,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
 
             # Locate the checkpoint produced by this iteration
             ckpt_path: Optional[str] = None
-            ckpts = sorted(CKPT_DIR.glob("step_*.safetensors"))
+            ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"))
             if ckpts:
                 ckpt_path = str(ckpts[-1])
             new_ckpt_hash = _checkpoint_hash(ckpt_path)
