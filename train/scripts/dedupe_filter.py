@@ -11,9 +11,9 @@ Runs between convert and build_shards. Processes each converted WDS tar in-place
 Each tar gets a {tar}.deduped sentinel on completion so the step is idempotent.
 
 Usage:
-    python train/scripts/dedupe_filter.py \\
-        --chunk N [--config PATH] [--conv-dir PATH] \\
-        [--threshold FLOAT] [--clip-backend STR] \\
+    train/.venv/bin/python train/scripts/dedupe_filter.py \
+        --chunk N [--config PATH] [--conv-dir PATH] \
+        [--threshold FLOAT] [--clip-backend STR] \
         [--min-size INT] [--min-caption-words INT]
 """
 

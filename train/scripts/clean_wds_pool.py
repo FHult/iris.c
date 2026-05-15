@@ -8,8 +8,9 @@ in-place with duplicate records removed.  Idempotent: tars with a .deduped
 sentinel are skipped on re-run.
 
 Usage:
-    python clean_wds_pool.py [--pool-dir PATH] [--index PATH] [--blocklist PATH]
-                             [--threshold FLOAT] [--clip-backend STR] [--dry-run]
+    train/.venv/bin/python train/scripts/clean_wds_pool.py \
+        [--pool-dir PATH] [--index PATH] [--blocklist PATH] \
+        [--tgz-range START END] [--threshold FLOAT] [--clip-backend STR] [--dry-run]
 
 Defaults:
     --pool-dir   COLD_ROOT/converted/journeydb
