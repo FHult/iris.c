@@ -717,12 +717,6 @@ def train(config: dict) -> None:
         else:
             print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_prefixes)} shards). OK.")
 
-    blocklist_ids = None
-    _blocklist_path = config.get("_blocklist")
-    if _blocklist_path:
-        blocklist_ids = set(Path(_blocklist_path).read_text().splitlines())
-        print(f"Blocklist: {len(blocklist_ids):,} duplicate record IDs will be skipped", flush=True)
-
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -735,7 +729,6 @@ def train(config: dict) -> None:
         anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
         hard_example_dir=dcfg.get("hard_example_dir"),
         hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
-        blocklist=blocklist_ids,
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before
@@ -2748,10 +2741,6 @@ def main():
                         help="Root directory for shards and precomputed caches. "
                              "Relative paths in the config YAML are prefixed with this value. "
                              "Defaults to the current working directory.")
-    parser.add_argument("--blocklist", default=None, metavar="PATH",
-                        help="File of duplicate record IDs to skip during training (one per line). "
-                             "Produced by clip_dedup find-dups. Records in the shard whose ID "
-                             "appears in this file are dropped before batching.")
     parser.add_argument("--warmup-only", action="store_true",
                         help="Compile Metal PSO training graphs for all bucket shapes "
                              "and exit. Populates the Metal kernel cache so the first "
@@ -2839,7 +2828,6 @@ def main():
     # Store config directory so train() can locate sibling files (e.g. eval_prompts.txt).
     config["_config_dir"] = str(Path(args.config).parent)
     config["_warmup_only"] = args.warmup_only
-    config["_blocklist"] = args.blocklist
 
     if args.dry_run:
         print("Config OK:")

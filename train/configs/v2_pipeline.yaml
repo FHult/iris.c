@@ -150,6 +150,7 @@ storage:
   # Persistent data pools on cold volume:
   # raw_pool_root omitted — raw tgzs are re-downloadable; no value storing them long-term
   converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
+  dedup_pool: true          # run CLIP dedup on each pool tar after conversion (DEDUP-1)
 
 # Precompute shard cap per scale: large/all-in produce many more shards than needed
 # for training; cap precompute so disk and wall-clock stay bounded.

@@ -39,7 +39,7 @@ import tarfile
 import threading
 import time
 import warnings
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -298,7 +298,6 @@ def make_prefetch_loader(
     anchor_mix_ratio: float = 0.20,
     hard_example_dir: Optional[str] = None,
     hard_mix_ratio: float = 0.05,
-    blocklist: Optional[Set[str]] = None,
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -422,8 +421,6 @@ def make_prefetch_loader(
                 sample_q.put(None)
                 return
             records = _iter_shard_contents(contents)
-            if blocklist:
-                records = [r for r in records if r["id"] not in blocklist]
             rng.shuffle(records)
 
             # Pick bucket for this shard

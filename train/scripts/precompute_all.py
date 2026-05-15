@@ -202,7 +202,6 @@ def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
 
 _W: dict = {}
 _progress_q = None
-_BLOCKLIST: frozenset = frozenset()  # record IDs to skip; set by main() from --blocklist
 
 
 def _report_progress(shard: str, phase: str, done: int, total: int) -> None:
@@ -628,8 +627,6 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
 
     records_iter = pre_records if pre_records is not None else iter_shard(shard_path)
     for rec_id, jpg_bytes, caption in records_iter:
-        if rec_id in _BLOCKLIST:
-            continue
         need_q = bool(qwen3_out)   and rec_id not in existing_q
         need_v = bool(vae_out)     and rec_id not in existing_v
         need_s = bool(siglip_out)  and rec_id not in existing_s
@@ -786,8 +783,6 @@ def main():
                         help="List versioned cache versions under PRECOMP_ROOT and exit")
     parser.add_argument("--clear-stale", default=None, metavar="PRECOMP_ROOT",
                         help="Delete non-current cache versions under PRECOMP_ROOT and exit")
-    parser.add_argument("--blocklist", default=None, metavar="PATH",
-                        help="File of record IDs to skip (one per line); produced by clip_dedup find-dups")
     args = parser.parse_args()
 
     # Cache management shortcuts — these exit immediately without doing any precompute.
@@ -814,11 +809,6 @@ def main():
                           f"{_v.get('record_count', 0):,} records  "
                           f"{_v.get('config', {})}")
         return
-
-    global _BLOCKLIST
-    if args.blocklist:
-        _BLOCKLIST = frozenset(Path(args.blocklist).read_text().splitlines())
-        print(f"Blocklist: {len(_BLOCKLIST):,} record IDs will be skipped", flush=True)
 
     # Block manual runs when GPU is already in use by training or the pipeline.
     # Orchestrated runs (PIPELINE_ORCHESTRATED=1) skip this — the orchestrator

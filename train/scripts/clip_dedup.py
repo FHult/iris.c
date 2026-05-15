@@ -52,6 +52,9 @@ except Exception:
 
 DUP_THRESHOLD = 0.95
 
+# Module-level lock for FAISS index access in dedup_wds_tar.
+_faiss_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Device + CLIP loading
@@ -493,6 +496,157 @@ def cmd_find_dups(args) -> int:
         log_orch(f"find-dups: quality report → {report_path}")
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Pool-level dedup (Track 1 + clean_wds_pool)
+# ---------------------------------------------------------------------------
+
+def dedup_wds_tar(
+    tar_path: Path,
+    index_path: Path,
+    ids_path: Path,
+    blocklist_path: Path,
+    threshold: float = DUP_THRESHOLD,
+    backend: str = "auto",
+) -> tuple:
+    """
+    Embed all images in tar_path, search for near-duplicates in the existing
+    FAISS index, rewrite the tar keeping only non-duplicate records, and
+    extend the index with the new non-duplicate vectors.
+
+    Args:
+        tar_path:      Path to the WDS .tar file to dedup.
+        index_path:    Path to the cumulative FAISS IndexFlatIP (.faiss).
+        ids_path:      Path to the sidecar ID file (.ids) — one ID per line.
+        blocklist_path:Path to the duplicate-IDs blocklist (append-safe).
+        threshold:     Inner-product score >= this flags a record as duplicate.
+        backend:       CLIP backend ("auto" | "open_clip" | "mlx" | "transformers").
+
+    Returns:
+        (records_in, records_out) — record counts before and after dedup.
+
+    Thread-safety: acquires _faiss_lock around all index I/O so concurrent
+    calls from multiple threads are safe.
+    """
+    try:
+        import faiss
+        faiss.omp_set_num_threads(1)
+    except ImportError:
+        raise RuntimeError("dedup_wds_tar requires faiss-cpu: pip install faiss-cpu")
+
+    tar_path = Path(tar_path)
+    index_path = Path(index_path)
+    ids_path = Path(ids_path)
+    blocklist_path = Path(blocklist_path)
+
+    _load_clip(backend)
+    _decode_preprocess = (lambda img: img) if _clip_backend == "mlx" else _clip_preprocess
+
+    # Decode all images from the tar.
+    ids, images = _decode_shard(str(tar_path), _decode_preprocess)
+    if ids is None or len(ids) == 0:
+        return (0, 0)
+
+    records_in = len(ids)
+
+    # Compute CLIP embeddings.
+    all_embs: list = []
+    batch_size = 512
+    if _clip_backend == "mlx":
+        for i in range(0, len(images), batch_size):
+            e = _mlx_embedder.embed_batch(images[i:i + batch_size])
+            all_embs.append(e)
+    else:
+        import torch
+        device = next(_clip_model.parameters()).device
+        with torch.no_grad():
+            for i in range(0, len(images), batch_size):
+                b = torch.stack(images[i:i + batch_size]).to(device)
+                if _clip_backend == "open_clip":
+                    e = _clip_model.encode_image(b.half()).float()
+                else:
+                    e = _clip_model.get_image_features(pixel_values=b).float()
+                e = e / e.norm(dim=-1, keepdim=True)
+                all_embs.append(e.cpu().numpy())
+
+    if _clip_backend == "mlx":
+        import numpy as _np
+        emb_arr = _np.concatenate([_np.array(e) for e in all_embs], axis=0).astype(np.float32)
+        # L2-normalise for MLX path (open_clip/transformers paths already normalise above).
+        norms = np.linalg.norm(emb_arr, axis=-1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        emb_arr = (emb_arr / norms).astype(np.float32)
+    else:
+        emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
+
+    dim = emb_arr.shape[1]
+
+    with _faiss_lock:
+        # Load or create index.
+        if index_path.exists() and ids_path.exists():
+            index = faiss.read_index(str(index_path))
+            existing_ids = ids_path.read_text().splitlines()
+        else:
+            index = faiss.IndexFlatIP(dim)
+            existing_ids = []
+
+        # Search existing index only (before adding new vectors).
+        dup_stems: set = set()
+        if index.ntotal > 0:
+            D, _I = index.search(emb_arr, k=1)
+            for local_i in range(len(ids)):
+                if float(D[local_i, 0]) >= threshold:
+                    dup_stems.add(ids[local_i])
+
+        # Append dup IDs to blocklist.
+        if dup_stems:
+            blocklist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(blocklist_path, "a") as _bf:
+                for fid in sorted(dup_stems):
+                    _bf.write(fid + "\n")
+
+        # Add non-duplicate vectors to index.
+        keep_mask = [ids[i] not in dup_stems for i in range(len(ids))]
+        kept_ids = [ids[i] for i in range(len(ids)) if keep_mask[i]]
+        if kept_ids:
+            kept_vecs = emb_arr[[i for i in range(len(ids)) if keep_mask[i]]]
+            index.add(kept_vecs)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            faiss.write_index(index, str(index_path))
+            with open(ids_path, "a") as _idf:
+                for fid in kept_ids:
+                    _idf.write(fid + "\n")
+        elif not dup_stems:
+            # No vectors at all (edge case: all decoded images had errors upstream).
+            pass
+
+    records_out = records_in - len(dup_stems)
+
+    # Rewrite tar in place keeping only non-duplicate pairs.
+    if dup_stems:
+        tmp_path = tar_path.with_suffix(".tar.tmp")
+        try:
+            with tarfile.open(str(tar_path), "r") as src, \
+                 tarfile.open(str(tmp_path), "w") as dst:
+                for member in src.getmembers():
+                    if not member.isfile():
+                        continue
+                    stem, _, _ = member.name.rpartition(".")
+                    if stem in dup_stems:
+                        continue
+                    f = src.extractfile(member)
+                    if f is not None:
+                        dst.addfile(member, f)
+            os.replace(str(tmp_path), str(tar_path))
+        except Exception:
+            try:
+                os.unlink(str(tmp_path))
+            except OSError:
+                pass
+            raise
+
+    return (records_in, records_out)
 
 
 # ---------------------------------------------------------------------------

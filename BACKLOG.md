@@ -194,19 +194,33 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ---
 
-**DEDUP-1: Clean the converted pool at source; one-off script for existing shards**
+**DEDUP-1: Clean the converted pool at source + retroactive pool cleaning script**
 
 **Architectural motivation:** data quality should be enforced at the point of production, not at the point of consumption. The current blocklist-propagation approach (added 2026-05-15) requires every consumer (precompute, training, mining, any future step) to implement filtering correctly and silently fails if any consumer omits it.
 
-**The right dedup point is the converted pool, not the training shards.** The converted pool (`cold_root/converted/journeydb/`) is the canonical source from which all training shards are built. If a pool WDS file is clean, every future shard build from it is automatically clean — across all chunks, campaigns, and scales — with no downstream filtering required. Since the vast majority of JDB data is still in the pool and has never been materialised into training shards, cleaning the pool addresses essentially all data at the right level.
+**The right dedup point is the converted pool, not the training shards.** The converted pool (`cold_root/converted/journeydb/`) is the canonical source from which all training shards are built. If a pool WDS file is clean, every future shard build from it is automatically clean — across all chunks, campaigns, and scales — with no downstream filtering required.
 
-**Two-track implementation:**
-
-*Track 1 — converted pool dedup (pipeline change):*
+**Track 1 — converted pool dedup (pipeline change):**
 After `download_convert.py` writes a new WDS file to the pool, run CLIP embedding on it directly, extend the cumulative FAISS index, find and remove any duplicate records (rewrite the pool WDS tar in place), and update the pool's record manifest. `build_shards.py` then always draws from clean source files; no shard-level filtering is ever needed.
 
-*Track 2 — existing shard + precompute cleanup (one-off script):*
-For the small number of training shards already built from pool data (current and past chunks): a `clean_existing_shards.py` script reads `duplicate_ids.txt`, rewrites each shard tar in place to remove duplicate records, and prunes the corresponding precomputed `.npz` files from each encoder cache dir + updates the manifest record count. Precompute cache entries are keyed by record ID so non-duplicate embeddings remain valid — no GPU recompute needed, only O(N_dups) file deletions and a manifest update.
+**Track 2 — retroactive pool cleaning (one-off script `clean_wds_pool.py`):**
+
+~~The original Track 2 proposed pruning existing training shards and deleting duplicate records from the precomputed NPZ cache to avoid GPU recompute.~~ **This is no longer relevant.** The INFER-C-001 fix (wrong Qwen3 layer indices `[9,18,27]→[8,17,26]` + missing `enable_thinking=False`) invalidated the entire Qwen3 precomputed cache; a full GPU recompute is already required regardless. Pruning NPZ files from a cache that is being regenerated end-to-end would be pure churn.
+
+The correct approach for existing data is to clean at the same level Track 1 cleans: the converted pool WDS files. A dedicated `train/scripts/clean_wds_pool.py` script iterates over all existing WDS tars in `cold_root/converted/journeydb/`, runs the same CLIP-embedding dedup logic Track 1 uses for new downloads, and rewrites each tar in place with duplicate records removed. After running this script once, the subsequent natural precompute rerun (already required by INFER-C-001) will produce clean embeddings from clean source files — no separate NPZ pruning needed.
+
+`clean_wds_pool.py` responsibilities:
+1. Accept `--pool-dir` (default `cold_root/converted/journeydb/`) and `--faiss-index` path.
+2. For each `*.tar` in the pool dir (skipping those with a `*.deduped` sentinel beside them):
+   a. Load all records, compute CLIP embeddings in batches.
+   b. Query the cumulative FAISS index; flag near-duplicate records (L2 distance < threshold).
+   c. Add non-duplicate CLIP vectors to the index.
+   d. Rewrite the tar in place to a `.tmp` file, then `os.replace()` — keeping only non-duplicate records.
+   e. Write `{tarname}.deduped` sentinel so the script is idempotent on re-run.
+3. Report: total records in, duplicates removed, records out, per-tar summary.
+4. Update `cold_root/metadata/faiss_index.bin` and `duplicate_ids.txt` with the final state.
+
+**Existing training shards** — once `clean_wds_pool.py` has finished, all existing training shards will be deleted and rebuilt from the cleaned pool via `build_shards.py`. This ensures every shard in use is provably clean and derived from verified pool files, rather than carrying over any duplicate contamination from the original builds. The precompute rerun (already forced by INFER-C-001) then runs against the fresh shards. No action needed here — this is the intended operator sequence once the pool cleaning completes.
 
 **What becomes dead code once Track 1 is live:**
 - `--blocklist` args in `precompute_all.py`, `train_ip_adapter.py`, `mine_hard_examples.py`
@@ -216,10 +230,10 @@ For the small number of training shards already built from pool data (current an
 
 **What stays:**
 - Cumulative FAISS index (still needed for cross-chunk near-duplicate detection)
-- `duplicate_ids.txt` passed to `build_shards.py --blocklist` for the next chunk (cross-chunk contamination prevention at build time)
+- `duplicate_ids.txt` passed to `build_shards.py --blocklist` (cross-chunk contamination prevention at build time)
 - Cold archive of FAISS index + blocklist
 
-**When to do:** after the first full production run confirms the blocklist workaround is stable. Not blocking anything today.
+**Sequencing:** run `clean_wds_pool.py` once before the next chunk's precompute step. Then activate Track 1 in `download_convert.py` so all future pool writes are deduped at ingest. Not blocking any current chunk — blocklist workaround remains in place until then.
 
 ---
 

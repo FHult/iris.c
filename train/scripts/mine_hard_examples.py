@@ -303,8 +303,6 @@ def main():
                         help="Max records per output .tar (default 500)")
     parser.add_argument("--eval-batch",   type=int, default=8,
                         help="Flux forward batch size during eval (default 8; use 4 or 1 if OOM)")
-    parser.add_argument("--blocklist",     default=None, metavar="PATH",
-                        help="File of duplicate record IDs to exclude from mining (one per line)")
     parser.add_argument("--seed",          type=int, default=0)
     parser.add_argument("--ai",            action="store_true",
                         help="Emit compact JSON summary to stdout at completion; progress to stderr")
@@ -393,8 +391,7 @@ def main():
     print(f"Scanning cache dirs for precomputed candidates ({len(shard_paths)} shards)...")
     cached_q  = {f[:-4] for f in os.listdir(args.qwen3_cache) if f.endswith(".npz")}
     cached_v  = {f[:-4] for f in os.listdir(args.vae_cache)   if f.endswith(".npz")}
-    blocklist = {l.strip() for l in Path(args.blocklist).read_text().splitlines() if l.strip()} if args.blocklist else set()
-    eligible  = (cached_q & cached_v) - existing_ids - blocklist
+    eligible  = (cached_q & cached_v) - existing_ids
 
     candidates = []   # [(rec_id, shard_path)]
     for rec_id in eligible:

@@ -32,6 +32,7 @@ from pipeline_lib import (
     DISPATCH_QUEUE,
     CONTROL_FILE, SENTINEL_DIR, LOG_DIR, STAGING_DIR,
     SHARDS_DIR, PRECOMP_DIR, HARD_EX_DIR, ANCHOR_SHARDS_DIR, DEDUP_DIR,
+    COLD_ROOT,
     RUN_METADATA_FILE,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS, SHARD_BLOCK,
@@ -1203,9 +1204,10 @@ class Orchestrator:
         out      = STAGING_DIR / f"chunk{chunk}" / "shards"
         sources  = self._build_sources(chunk)
         blocklist_arg = ""
-        blocklist = DEDUP_DIR / "duplicate_ids.txt"
-        if blocklist.exists():
-            blocklist_arg = f"--blocklist '{blocklist}'"
+        _cold_root = Path(self.cfg.get("storage", {}).get("cold_root", str(COLD_ROOT)))
+        _cold_blocklist = _cold_root / "metadata" / "duplicate_ids.txt"
+        if _cold_blocklist.exists():
+            blocklist_arg = f"--blocklist '{_cold_blocklist}'"
         log_file = LOG_DIR / f"build_chunk{chunk}.log"
         # Reserve a non-overlapping shard ID space per chunk so that internal
         # record IDs (embedded in shard member names, e.g. "200000_0003") are
@@ -1319,8 +1321,6 @@ class Orchestrator:
         max_shards_arg = f"--max-shards {max_shards}" if max_shards else ""
         vae_batch      = precomp_cfg.get("vae_batch", None)
         vae_batch_arg  = f"--vae-batch {vae_batch}" if vae_batch is not None else ""
-        blocklist_path = DEDUP_DIR / "duplicate_ids.txt"
-        blocklist_arg  = f"--blocklist '{blocklist_path}'" if blocklist_path.exists() else ""
         log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
         log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
         cmd = self._python_cmd("precompute_all.py",
@@ -1332,8 +1332,7 @@ class Orchestrator:
                                f"{flux_model_arg} "
                                f"{max_shards_arg} "
                                f"{vae_batch_arg} "
-                               f"{siglip_flag} "
-                               f"{blocklist_arg}")
+                               f"{siglip_flag}")
         self._launch_prep(f"precompute chunk {chunk}", cmd, log_file,
                           chunk, "precompute", token="GPU_TOKEN")
 
@@ -1641,9 +1640,6 @@ class Orchestrator:
                 chunk=chunk)
             config_file = str(_tmp_cfg)
 
-        _blocklist_path = DEDUP_DIR / "duplicate_ids.txt"
-        _blocklist_arg  = f"--blocklist '{_blocklist_path}'" if _blocklist_path.exists() else ""
-
         cmd = (
             f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
             f"--config '{config_file}' "
@@ -1651,7 +1647,7 @@ class Orchestrator:
             f"--chunk-base-step {chunk_base_step} "
             f"--data-root '{self.prep_root}' "
             f"--chunk {chunk} "
-            f"{resume_arg} {hard_arg} {anchor_arg} {_blocklist_arg}"
+            f"{resume_arg} {hard_arg} {anchor_arg}"
         )
 
         if not self.dry_run:
@@ -1733,9 +1729,6 @@ class Orchestrator:
             _tk.get(self.scale, _tk.get("default", 2000)) if isinstance(_tk, dict) else int(_tk)
         )
 
-        _mine_blocklist_path = DEDUP_DIR / "duplicate_ids.txt"
-        _mine_blocklist_arg  = (f"--blocklist '{_mine_blocklist_path}'"
-                                if _mine_blocklist_path.exists() else "")
         cmd = self._python_cmd("mine_hard_examples.py",
                                f"--checkpoint '{best}' "
                                f"--shards '{SHARDS_DIR}' "
@@ -1746,7 +1739,6 @@ class Orchestrator:
                                f"--chunk {chunk} "
                                f"{use_ema_flag}"
                                f"--eval-records {eval_records} --top-k {top_k} "
-                               f"{_mine_blocklist_arg} "
                                f"--output '{out}'")
         self._launch_prep(f"mine chunk {chunk}", cmd, log_file,
                           chunk, "mine", token="GPU_TOKEN")
