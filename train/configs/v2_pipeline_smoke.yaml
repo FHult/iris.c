@@ -76,3 +76,10 @@ storage:
   cleanup_safety_gb: 1
   archive_after_chunk: true
   max_parallel_transfers: 2
+
+# Compatibility validation thresholds (validate_full_compatibility.py)
+validation:
+  report_dir: "reports/compat"   # relative to DATA_ROOT
+  strict: false                  # if true, WARN also causes non-zero exit
+  cosine_threshold: 0.999        # CHECK-4: min cosine similarity for PASS
+  warn_threshold: 0.99           # CHECK-4: min cosine similarity for WARN (below = FAIL)
