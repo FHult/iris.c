@@ -20,11 +20,13 @@ Usage:
 import argparse
 import io
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
@@ -40,6 +42,21 @@ try:
 except ImportError:
     _HAS_TURBOJPEG = False
     _tj = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    """Copy src → dst atomically (tmp on dst's filesystem, then os.replace)."""
+    tmp = dst.parent / (dst.name + ".copy_tmp")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +174,7 @@ def run_dedupe_filter(
     backend: str,
     min_size: int,
     min_words: int,
+    pool_dir: Optional[Path] = None,
 ) -> None:
     tars = sorted(conv_dir.glob("*.tar"))
     total = len(tars)
@@ -175,10 +193,24 @@ def run_dedupe_filter(
     t_hb = time.time()
 
     for tar_path in tars:
-        # Resolve symlink so we find the sentinel on the cold pool tar if already
-        # deduped by clean_wds_pool.py, rather than looking in staging.
         real_path = tar_path.resolve()
-        sentinel = Path(str(real_path) + ".deduped")
+
+        # Determine the canonical cold pool tar for this file (if any).
+        # Sentinel lives on the pool tar so future conv pool hits skip correctly.
+        # Three cases:
+        #   A) symlink  (same-device): real_path IS the pool tar
+        #   B) copy (diff-device): pool_dir known → pool_tar is pool_dir/name
+        #   C) no pool info: sentinel stays on staging
+        if real_path != tar_path:
+            # Case A: staging path is a symlink; real_path is the cold pool tar
+            pool_tar: Optional[Path] = real_path
+        elif pool_dir is not None and (pool_dir / tar_path.name).exists():
+            # Case B: staging path is a real copy; cold pool tar exists separately
+            pool_tar = pool_dir / tar_path.name
+        else:
+            pool_tar = None  # Case C
+
+        sentinel = Path(str(pool_tar if pool_tar is not None else real_path) + ".deduped")
         if sentinel.exists():
             done += 1
             write_heartbeat("dedupe_filter", chunk,
@@ -186,27 +218,30 @@ def run_dedupe_filter(
                             pct=round(done / total * 100, 1))
             continue
 
-        # Step 1: quality filter → tmp tar.
-        # Operate on real_path (resolved) so that if tar_path is a symlink to the
-        # cold pool, we write back to the cold file and the sentinel lands next to
-        # the real tar — not as a broken staging copy.
+        # work_path: the file we read/write in place.
+        # Case A: work on cold pool tar directly (via real_path).
+        # Cases B/C: work on staging copy.
+        work_path = real_path
         tmp_fd, tmp_str = tempfile.mkstemp(
-            dir=real_path.parent, suffix=".qf_tmp"
+            dir=work_path.parent, suffix=".qf_tmp"
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_str)
 
         try:
             quality_kept, quality_removed = _quality_filter_tar(
-                real_path, tmp_path, min_size, min_words
+                work_path, tmp_path, min_size, min_words
             )
             in_count = quality_kept + quality_removed
 
             if quality_kept == 0:
                 # All records were quality-rejected; replace tar with empty tar
                 tmp_path.unlink(missing_ok=True)
-                with tarfile.open(real_path, "w"):
+                with tarfile.open(work_path, "w"):
                     pass  # write empty tar
+                # Case B: write empty tar back to cold pool atomically
+                if pool_tar is not None and pool_tar != work_path:
+                    _atomic_copy(work_path, pool_tar)
                 sentinel.touch()
                 done += 1
                 total_in += in_count
@@ -217,16 +252,19 @@ def run_dedupe_filter(
                 )
                 continue
 
-            # Step 2: rename quality-filtered tmp → real_path so dedup_wds_tar
-            # reads the cleaned version
-            os.replace(tmp_path, real_path)
+            # Step 2: rename quality-filtered tmp → work_path
+            os.replace(tmp_path, work_path)
 
-            # Step 3: CLIP dedup rewrites real_path in-place
+            # Step 3: CLIP dedup rewrites work_path in-place
             records_in, records_out = dedup_wds_tar(
-                real_path, index_path, ids_path, blocklist_path,
+                work_path, index_path, ids_path, blocklist_path,
                 threshold=threshold, backend=backend,
             )
             dup_removed = records_in - records_out
+
+            # Case B: write deduped staging tar back to cold pool atomically
+            if pool_tar is not None and pool_tar != work_path:
+                _atomic_copy(work_path, pool_tar)
 
         except Exception as e:
             tmp_path.unlink(missing_ok=True)
@@ -234,7 +272,7 @@ def run_dedupe_filter(
                   file=sys.stderr, flush=True)
             raise
 
-        # Step 4: write sentinel
+        # Step 4: write sentinel on cold pool tar (or staging if no pool)
         sentinel.touch()
         done += 1
         total_in += in_count
@@ -297,20 +335,27 @@ def main() -> None:
     else:
         conv_dir = STAGING_DIR / f"chunk{chunk}" / "converted" / "journeydb"
 
-    # Resolve cold_root → FAISS index paths
+    # Resolve cold_root → FAISS index paths + cold pool dir
     if args.cold_root:
         cold_root = Path(args.cold_root)
     else:
         storage = config.get("storage", {})
         cold_root = Path(storage.get("cold_root", str(COLD_ROOT)))
 
-    index_path    = cold_root / "metadata" / "dedup_index.faiss"
-    ids_path      = cold_root / "metadata" / "dedup_index.ids"
+    storage = config.get("storage", {})
+    index_path     = cold_root / "metadata" / "dedup_index.faiss"
+    ids_path       = cold_root / "metadata" / "dedup_index.ids"
     blocklist_path = cold_root / "metadata" / "duplicate_ids.txt"
+
+    # Cold converted pool dir — used to write the deduped tar back to cold when
+    # staging holds a copy (different-device path) rather than a symlink.
+    _pool_root = storage.get("converted_pool_root")
+    pool_dir   = Path(_pool_root) if _pool_root else None
 
     log_orch(f"dedupe_filter starting for chunk {chunk}")
     log_orch(f"  conv_dir:   {conv_dir}")
     log_orch(f"  cold_root:  {cold_root}")
+    log_orch(f"  pool_dir:   {pool_dir}")
 
     if not conv_dir.exists():
         print(f"ERROR: conv_dir does not exist: {conv_dir}", file=sys.stderr)
@@ -326,6 +371,7 @@ def main() -> None:
         backend=args.clip_backend,
         min_size=args.min_size,
         min_words=args.min_caption_words,
+        pool_dir=pool_dir,
     )
     log_orch(f"dedupe_filter complete for chunk {chunk}")
 
