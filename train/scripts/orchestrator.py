@@ -66,6 +66,17 @@ PREP_HUNG_HOURS       = 6   # dispatch alert if a prep step runs longer than thi
 JETSAM_RETRY_DELAY_S  = 90  # seconds to wait before relaunching
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to path atomically via a tmp file + os.replace."""
+    tmp = path.with_suffix(path.suffix + f".stg{os.getpid()}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _parse_exit_code_from_msg(msg: str) -> int:
     """Extract numeric exit code from 'Training exited 137; ...' error message."""
     m = re.search(r"exited (\d+)", msg or "")
@@ -319,7 +330,7 @@ class Orchestrator:
         # Checkpoint dirs derive from prep_root so ultrahot mode routes correctly.
         self.ckpt_dir         = self.prep_root / "checkpoints" / "stage1"
         self.ckpt_archive_dir = self.ckpt_dir  / "archive"
-        self.issue_counter = 0
+        self.issue_counter = self._read_max_issue_counter()
         self._restart_counts: dict[tuple, int] = {}
         # Retry backoff: {(chunk, step) → earliest epoch_sec to retry}
         self._retry_after: dict[tuple, float] = {}
@@ -561,10 +572,13 @@ class Orchestrator:
             if not src.exists():
                 continue
             dst = self.ckpt_archive_dir / f"chunk{chunk}_final{suffix}"
+            tmp = dst.with_suffix(dst.suffix + f".stg{os.getpid()}")
             try:
-                shutil.copy2(src, dst)
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
                 copied.append(dst.name)
             except OSError as e:
+                tmp.unlink(missing_ok=True)
                 log_orch(f"Chunk {chunk}: archive copy failed for {src.name}: {e}",
                          level="warning", chunk=chunk)
         if copied:
@@ -711,7 +725,7 @@ class Orchestrator:
             "config":               {k: v for k, v in self.cfg.items() if k != "_config_path"},
         }
         try:
-            RUN_METADATA_FILE.write_text(json.dumps(meta, indent=2))
+            _atomic_write_text(RUN_METADATA_FILE, json.dumps(meta, indent=2))
         except OSError as e:
             log_orch(f"Could not write run metadata: {e}", level="warning")
 
@@ -728,7 +742,7 @@ class Orchestrator:
         if summary_path and summary_path.exists():
             meta["run_summary"] = str(summary_path)
         try:
-            RUN_METADATA_FILE.write_text(json.dumps(meta, indent=2))
+            _atomic_write_text(RUN_METADATA_FILE, json.dumps(meta, indent=2))
         except OSError as e:
             log_orch(f"Could not update run metadata: {e}", level="warning")
 
@@ -1402,11 +1416,11 @@ class Orchestrator:
             tar.rename(SHARDS_DIR / tar.name)
             count += 1
         log_orch(f"Chunk {chunk}: promoted {count} shards to production", chunk=chunk)
-        mark_done(chunk, "promoted")
-        self._cleanup_prep_logs(chunk)
 
         # Move precomputed files to versioned production dirs and update `current` symlink.
         # Version hash derived from the same config fields used by precompute_all.py.
+        # IMPORTANT: move precomputed data BEFORE writing the promoted.done sentinel so that
+        # a crash here leaves the chunk in a recoverable READY state (sentinel absent).
         _git_sha  = get_git_sha(Path(__file__).parent)
         for subdir in ["qwen3", "vae", "siglip"]:
             src = precomp_src / subdir
@@ -1431,6 +1445,9 @@ class Orchestrator:
                 f"{PRECOMP_DIR / subdir / _ver} (current → {_ver})",
                 chunk=chunk,
             )
+
+        mark_done(chunk, "promoted")
+        self._cleanup_prep_logs(chunk)
 
     def _start_shard_validation(self, chunk: int) -> None:
         """PIPELINE-8: fast tarfile header scan before training."""
@@ -1837,7 +1854,12 @@ class Orchestrator:
 
     def _sync_gpu_token(self) -> None:
         holder = self.res.holder("GPU_TOKEN")
-        if holder and "train" in holder and not tmux_window_exists(TMUX_TRAIN_WIN):
+        if not holder:
+            return
+        # Training runs in TMUX_TRAIN_WIN; all other GPU steps (precompute, clip_embed,
+        # training_warmup, mine, validate) run in TMUX_PREP_WIN via _launch_prep.
+        window = TMUX_TRAIN_WIN if holder.startswith("train chunk") else TMUX_PREP_WIN
+        if not tmux_window_exists(window):
             self.res.release("GPU_TOKEN")
 
     # -----------------------------------------------------------------------
@@ -2022,9 +2044,12 @@ class Orchestrator:
         if count > JETSAM_MAX_RETRIES:
             log_orch(f"Chunk {chunk}: trainer restart limit ({JETSAM_MAX_RETRIES}) exceeded — aborting",
                      level="error", chunk=chunk)
-            dispatch_issue(self._next_issue_id(), "critical",
-                           f"Trainer restart limit exceeded for chunk {chunk}",
-                           chunk=chunk, suggested_action="manual_intervention")
+            self._dispatch_once(
+                f"restart_limit_{chunk}", self._next_issue_id(), "critical",
+                f"Trainer restart limit exceeded for chunk {chunk}",
+                chunk=chunk, suggested_action="manual_intervention",
+                cooldown_secs=3600,
+            )
             return
         log_orch(f"Chunk {chunk}: killing iris-train window (restart #{count})", chunk=chunk)
         subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"],
@@ -2086,9 +2111,9 @@ class Orchestrator:
                                     stats[label] = int(ln.split(":")[1].strip().rstrip("."))
                                 except ValueError:
                                     pass
-                    page_kb = 16  # 16 KB pages on Apple Silicon
+                    page_bytes = 16384  # 16 KiB pages on Apple Silicon
                     def gb(pages: int) -> float:
-                        return pages * page_kb / 1e6
+                        return pages * page_bytes / 1e9
                     entry = (
                         f"{now_iso()}  "
                         f"free={gb(stats.get('free', 0)):.2f}GB  "
@@ -2149,8 +2174,16 @@ class Orchestrator:
                 ctrl = json.load(f)
             action = ctrl.get("action")
             if action == "pause":
-                log_orch("Operator: pause — sleeping 300s")
-                time.sleep(300)
+                log_orch("Operator: pause — sleeping up to 300s (re-checks every 5s)")
+                deadline = time.time() + 300
+                while time.time() < deadline:
+                    time.sleep(5)
+                    try:
+                        with open(CONTROL_FILE) as _f2:
+                            if json.load(_f2).get("action") != "pause":
+                                break
+                    except Exception:
+                        break  # file removed or replaced — exit pause immediately
             elif action == "abort":
                 log_orch("Operator: abort")
                 sys.exit(0)
@@ -2216,6 +2249,19 @@ class Orchestrator:
     def _all_done(self) -> bool:
         return all(derive_chunk_state(c) == ChunkState.DONE
                    for c in range(1, self.total_chunks + 1))
+
+    @staticmethod
+    def _read_max_issue_counter() -> int:
+        """Scan dispatch queue for the highest issue number so restarts don't reuse IDs."""
+        max_n = 0
+        try:
+            for line in DISPATCH_QUEUE.read_text().splitlines():
+                m = re.search(r'"id"\s*:\s*"I-(\d+)"', line)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+        except Exception:
+            pass
+        return max_n
 
     def _next_issue_id(self) -> str:
         self.issue_counter += 1

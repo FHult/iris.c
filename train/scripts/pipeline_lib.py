@@ -279,11 +279,18 @@ def is_heartbeat_stale(process: str, chunk: Optional[int] = None) -> bool:
 # Dispatch (Claude / CLI / web interface)
 # ---------------------------------------------------------------------------
 
+_DISPATCH_QUEUE_MAX_LINES = 500  # rotate when queue exceeds this many entries
+
+
 def dispatch_issue(issue_id: str, severity: str, message: str,
                    chunk: Optional[int] = None, process: str = "",
                    context: Optional[dict] = None,
                    suggested_action: str = "") -> None:
-    """Append an issue to dispatch_queue.jsonl for operator consumption."""
+    """Append an issue to dispatch_queue.jsonl for operator consumption.
+
+    Rotates the file when it exceeds _DISPATCH_QUEUE_MAX_LINES entries by
+    dropping the oldest resolved issues first.  Unresolved issues are always kept.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     entry = {
         "id": issue_id,
@@ -299,6 +306,25 @@ def dispatch_issue(issue_id: str, severity: str, message: str,
         entry["chunk"] = chunk
     with open(DISPATCH_QUEUE, "a") as f:
         f.write(json.dumps(entry) + "\n")
+    # Rotate: if the file is too large, keep all unresolved entries plus the most
+    # recent resolved ones (up to _DISPATCH_QUEUE_MAX_LINES total).
+    try:
+        lines = DISPATCH_QUEUE.read_text().splitlines()
+        if len(lines) > _DISPATCH_QUEUE_MAX_LINES:
+            parsed = []
+            for ln in lines:
+                try:
+                    parsed.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    pass
+            unresolved = [p for p in parsed if not p.get("resolved", False)]
+            resolved   = [p for p in parsed if p.get("resolved", False)]
+            keep = unresolved + resolved[-(max(0, _DISPATCH_QUEUE_MAX_LINES - len(unresolved))):]
+            tmp = DISPATCH_QUEUE.with_suffix(".jsonl.stg")
+            tmp.write_text("\n".join(json.dumps(k) for k in keep) + "\n")
+            os.replace(tmp, DISPATCH_QUEUE)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

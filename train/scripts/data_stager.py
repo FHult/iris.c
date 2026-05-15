@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -562,10 +563,10 @@ class DataStager:
                 log.info("New best %s = %s → %s", metric, value, ckpt_path.name)
 
     def _archive_dbs(self) -> None:
-        """Copy hot DBs to cold metadata dir.
+        """Copy hot DBs to cold metadata dir using the sqlite3 backup API.
 
-        Full copy (not incremental). SQLite files may be briefly inconsistent if a
-        write transaction is in progress, but this is acceptable for disaster recovery.
+        The backup API checkpoints the WAL and produces a consistent snapshot even
+        if a write transaction is in progress, unlike a raw file copy.
         """
         self._cold_metadata.mkdir(parents=True, exist_ok=True)
         for src in (SHARD_SCORES_DB_PATH, ABLATION_DB_PATH, FLYWHEEL_DB_PATH):
@@ -573,10 +574,15 @@ class DataStager:
             if not src.exists():
                 continue
             dst = self._cold_metadata / db_name
+            tmp = dst.with_suffix(dst.suffix + f".stg{os.getpid()}")
             try:
-                _atomic_copy_file(src, dst)
+                with sqlite3.connect(str(src)) as src_conn:
+                    with sqlite3.connect(str(tmp)) as dst_conn:
+                        src_conn.backup(dst_conn)
+                os.replace(tmp, dst)
                 log.info("Archived %s → %s", db_name, dst)
             except Exception as exc:
+                tmp.unlink(missing_ok=True)
                 log.warning("Failed to archive %s: %s", db_name, exc)
 
     def promote_to_ultrahot(self, chunk: int) -> dict:
