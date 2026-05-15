@@ -48,7 +48,9 @@ def _pool_link_or_copy(pool_file: Path, staging_file: Path, use_symlinks: bool) 
         return
     staging_file.parent.mkdir(parents=True, exist_ok=True)
     if use_symlinks:
-        os.symlink(pool_file.resolve(), staging_file)
+        # Relative symlink so it survives volume remounts at different mount points.
+        rel = os.path.relpath(pool_file.resolve(), staging_file.parent)
+        os.symlink(rel, staging_file)
     else:
         _atomic_copy_file(pool_file, staging_file)
 
@@ -162,25 +164,23 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
               elapsed_sec=round(elapsed, 1), written=written)
 
 
-def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") -> None:
+def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
+                             cold_only: bool = False) -> None:
     """Producer-consumer: download one tgz, signal consumer, consumer converts and deletes.
 
     Three-level cache hierarchy when pool keys are configured in storage:
       Level 0: converted pool hit  → symlink/copy .tar to staging; skip download+conversion
       Level 1: raw pool hit        → symlink/copy .tgz to staging; convert; write to conv pool
       Level 2: no pool hit         → download to raw pool (or staging); convert; write to conv pool
+
+    cold_only=True: write directly to cold converted pool, touch no SSD staging paths.
+      Requires converted_pool_root in config. Raw tgz is downloaded to a transient temp dir
+      inside the cold pool and deleted immediately after conversion.
     """
     ranges = jdb_tgz_ranges(config, scale)
     start, end = ranges[chunk]
     tgz_range = _prioritised_tgz_range(start, end, config)
     total = len(tgz_range)
-
-    raw_dir = STAGING_DIR / f"chunk{chunk}" / "raw" / "journeydb"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = STAGING_DIR / f"chunk{chunk}" / "converted" / "journeydb"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sentinel_dir = raw_dir / ".tgz_state"
-    sentinel_dir.mkdir(exist_ok=True)
 
     # --- Pool configuration ---
     storage = config.get("storage", {})
@@ -190,11 +190,25 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
     raw_pool_enabled  = raw_pool_dir is not None
     conv_pool_enabled = conv_pool_dir is not None
 
+    if cold_only:
+        if not conv_pool_enabled:
+            raise RuntimeError("--cold-only requires converted_pool_root in storage config")
+        # Write directly to cold pool; use a transient subdir for raw downloads.
+        out_dir      = conv_pool_dir
+        raw_dir      = conv_pool_dir / ".tmp_raw"
+        sentinel_dir = conv_pool_dir / ".tgz_state"
+    else:
+        raw_dir = STAGING_DIR / f"chunk{chunk}" / "raw" / "journeydb"
+        out_dir = STAGING_DIR / f"chunk{chunk}" / "converted" / "journeydb"
+        sentinel_dir = raw_dir / ".tgz_state"
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel_dir.mkdir(exist_ok=True)
+
     if raw_pool_enabled:
         raw_pool_sentinels = raw_pool_dir / ".downloaded"
         raw_pool_sentinels.mkdir(parents=True, exist_ok=True)
-        # Determine transfer mode: symlink (same device) or copy (cross-device).
-        # raw_dir may not exist yet on first run; fall back to parent or DATA_ROOT.
         _ref_raw = raw_dir if raw_dir.exists() else raw_dir.parent
         use_symlinks_raw = _same_device(raw_pool_dir, _ref_raw) if raw_pool_dir.exists() and _ref_raw.exists() else False
 
@@ -204,7 +218,7 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
         _ref_out = out_dir if out_dir.exists() else out_dir.parent
         use_symlinks_conv = _same_device(conv_pool_dir, _ref_out) if conv_pool_dir.exists() and _ref_out.exists() else False
 
-    # --- Level 0: resolve converted pool hits synchronously before threads start ---
+    # --- Level 0: resolve converted pool hits before threads start ---
     already_done: set = set()
     if conv_pool_enabled:
         for i in tgz_range:
@@ -215,23 +229,28 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
             pool_tar      = conv_pool_dir / f"{i:03d}.tar"
             pool_sentinel = conv_pool_sentinels / f"{i:03d}"
             if pool_sentinel.exists() and pool_tar.exists():
-                staging_tar = out_dir / f"{i:03d}.tar"
-                _pool_link_or_copy(pool_tar, staging_tar, use_symlinks_conv)
-                converted_sentinel.touch()
+                if cold_only:
+                    # Already in pool — nothing to stage, just mark done
+                    converted_sentinel.touch()
+                else:
+                    staging_tar = out_dir / f"{i:03d}.tar"
+                    _pool_link_or_copy(pool_tar, staging_tar, use_symlinks_conv)
+                    converted_sentinel.touch()
                 already_done.add(i)
                 log_event("download_convert", "conv_pool_hit", chunk=chunk, tgz=i)
 
     remaining = [i for i in tgz_range if i not in already_done]
 
-    # --- Annotation: download to raw pool (or staging), symlink into staging if needed ---
+    # --- Annotation file ---
     anno_target = raw_pool_dir if raw_pool_enabled else raw_dir
     download_jdb_annotation(anno_target)
-    if raw_pool_enabled:
+    if raw_pool_enabled and not cold_only:
         anno_pool    = raw_pool_dir / "data" / "train" / "train_anno_realease_repath.jsonl.tgz"
         anno_staging = raw_dir     / "data" / "train" / "train_anno_realease_repath.jsonl.tgz"
         _pool_link_or_copy(anno_pool, anno_staging, use_symlinks_raw)
 
-    log_orch(f"JDB chunk {chunk} scale={scale}: {len(already_done)} conv-pool hits; "
+    log_orch(f"JDB chunk {chunk} scale={scale} cold_only={cold_only}: "
+             f"{len(already_done)} conv-pool hits; "
              f"download+convert {len(remaining)} tgzs ({start:03d}–{end:03d})")
 
     ready_q: queue.Queue = queue.Queue()
@@ -244,10 +263,30 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
             for i in remaining:
                 if error_event.is_set():
                     break
+
+                if cold_only:
+                    # Download directly to transient temp dir in cold; no ready sentinel needed
+                    cur_tgz[0] = i
+                    log_event("download_convert", "download_start", chunk=chunk, tgz=i)
+                    t0 = time.time()
+                    try:
+                        _hf_download_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
+                        elapsed = time.time() - t0
+                        log_event("download_convert", "download_done", chunk=chunk, tgz=i,
+                                  elapsed_sec=round(elapsed, 1))
+                    except Exception as e:
+                        log_event("download_convert", "download_error", chunk=chunk, tgz=i,
+                                  error=str(e))
+                        error_event.set()
+                        raise
+                    cur_tgz[0] = None
+                    ready_q.put(i)
+                    continue
+
                 ready = sentinel_dir / f"{i:03d}.ready"
 
                 if raw_pool_enabled:
-                    pool_tgz     = raw_pool_dir / "data" / "train" / "imgs" / f"{i:03d}.tgz"
+                    pool_tgz      = raw_pool_dir / "data" / "train" / "imgs" / f"{i:03d}.tgz"
                     pool_sentinel = raw_pool_sentinels / f"{i:03d}"
                     if not pool_sentinel.exists():
                         cur_tgz[0] = i
@@ -297,34 +336,47 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in") ->
                     break
                 if error_event.is_set():
                     continue
-                tgz_staging = raw_dir / "data" / "train" / "imgs" / f"{idx:03d}.tgz"
-                converted   = sentinel_dir / f"{idx:03d}.converted"
-                staging_tar = out_dir / f"{idx:03d}.tar"
+                tgz_path  = raw_dir / "data" / "train" / "imgs" / f"{idx:03d}.tgz"
+                converted = sentinel_dir / f"{idx:03d}.converted"
                 try:
-                    _convert_tgz(tgz_staging, out_dir, anno_path, chunk, idx)
-                    converted.touch()
-
-                    # Write-through to converted pool
-                    if conv_pool_enabled:
-                        pool_tar     = conv_pool_dir / f"{idx:03d}.tar"
+                    if cold_only:
+                        # Convert directly into cold pool; no staging involved
+                        _convert_tgz(tgz_path, out_dir, anno_path, chunk, idx)
+                        converted.touch()
                         conv_sentinel = conv_pool_sentinels / f"{idx:03d}"
-                        if not pool_tar.exists():
-                            pool_tar.parent.mkdir(parents=True, exist_ok=True)
-                            if use_symlinks_conv:
-                                # Same device: move tar to pool; replace staging with symlink
-                                os.replace(staging_tar, pool_tar)
-                                os.symlink(pool_tar.resolve(), staging_tar)
-                            else:
-                                _atomic_copy_file(staging_tar, pool_tar)
                         conv_sentinel.touch()
-                        log_event("download_convert", "conv_pool_write", chunk=chunk, tgz=idx)
-
-                    # Remove raw tgz staging path; never delete pool file
-                    if tgz_staging.is_symlink() or tgz_staging.exists():
-                        tgz_staging.unlink()
-                        log_event("download_convert",
-                                  "staging_unlinked" if raw_pool_enabled else "raw_deleted",
+                        # Delete transient raw tgz immediately to keep cold temp dir clean
+                        if tgz_path.exists():
+                            tgz_path.unlink()
+                        log_event("download_convert", "conv_pool_write_cold_only",
                                   chunk=chunk, tgz=idx)
+                    else:
+                        staging_tar = out_dir / f"{idx:03d}.tar"
+                        _convert_tgz(tgz_path, out_dir, anno_path, chunk, idx)
+                        converted.touch()
+
+                        # Write-through to converted pool
+                        if conv_pool_enabled:
+                            pool_tar      = conv_pool_dir / f"{idx:03d}.tar"
+                            conv_sentinel = conv_pool_sentinels / f"{idx:03d}"
+                            if not pool_tar.exists():
+                                pool_tar.parent.mkdir(parents=True, exist_ok=True)
+                                if use_symlinks_conv:
+                                    # Same device: move tar to pool; replace staging with relative symlink
+                                    os.replace(staging_tar, pool_tar)
+                                    rel = os.path.relpath(pool_tar.resolve(), staging_tar.parent)
+                                    os.symlink(rel, staging_tar)
+                                else:
+                                    _atomic_copy_file(staging_tar, pool_tar)
+                            conv_sentinel.touch()
+                            log_event("download_convert", "conv_pool_write", chunk=chunk, tgz=idx)
+
+                        # Remove raw tgz staging path; never delete pool file
+                        if tgz_path.is_symlink() or tgz_path.exists():
+                            tgz_path.unlink()
+                            log_event("download_convert",
+                                      "staging_unlinked" if raw_pool_enabled else "raw_deleted",
+                                      chunk=chunk, tgz=idx)
                 except Exception as e:
                     log_event("download_convert", "convert_error", chunk=chunk, tgz=idx,
                               error=str(e))
@@ -387,8 +439,12 @@ def main() -> None:
     ap.add_argument("--config",   default=str(TRAIN_DIR / "configs" / "v2_pipeline.yaml"))
     ap.add_argument("--scale",    default="all-in",
                     choices=["smoke", "small", "medium", "large", "all-in"])
-    ap.add_argument("--jdb-only", action="store_true")
-    ap.add_argument("--no-jdb",   action="store_true")
+    ap.add_argument("--jdb-only",   action="store_true")
+    ap.add_argument("--no-jdb",     action="store_true")
+    ap.add_argument("--cold-only",  action="store_true",
+                    help="Write directly to cold converted pool; skip SSD staging entirely. "
+                         "Requires converted_pool_root in config. Use for pre-populating cold "
+                         "before a pipeline run.")
     args = ap.parse_args()
 
     try:
@@ -401,7 +457,7 @@ def main() -> None:
     log_orch(f"download_convert starting for chunk {chunk} scale={scale}")
 
     if not args.no_jdb:
-        run_jdb_download_convert(chunk, config, scale)
+        run_jdb_download_convert(chunk, config, scale, cold_only=args.cold_only)
 
     if not args.jdb_only:
         run_wikiart_download(chunk, config)

@@ -139,9 +139,9 @@ storage:
   archive_after_chunk: true       # archive precomputed + weights to cold after each chunk
   background_staging: true        # stage next chunk in background while training runs
   max_parallel_transfers: 3       # concurrent symlink/copy workers
-  # Persistent data pools on cold volume (enable by uncommenting):
-  # raw_pool_root: "/Volumes/16TBCold/raw/journeydb"           # tgz downloaded once, reused across chunks
-  # converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
+  # Persistent data pools on cold volume:
+  # raw_pool_root omitted — raw tgzs are re-downloadable; no value storing them long-term
+  converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
 
 # Precompute shard cap per scale: large/all-in produce many more shards than needed
 # for training; cap precompute so disk and wall-clock stay bounded.

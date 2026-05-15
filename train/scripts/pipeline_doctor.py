@@ -125,6 +125,13 @@ def _count_precomp_for_chunk(chunk: int, subdir: str = "qwen3") -> tuple[int, in
     lo, hi = _chunk_shard_range(chunk)
     clean = tmp = 0
     precomp_dir = PRECOMP_DIR / subdir
+    # Versioned layout: files live in a version subdir pointed to by 'current' symlink.
+    # Follow it when present so the count reflects the active version, not the parent.
+    current_link = precomp_dir / "current"
+    if current_link.is_symlink() or current_link.is_dir():
+        resolved = current_link.resolve()
+        if resolved.is_dir():
+            precomp_dir = resolved
     try:
         for f in os.listdir(precomp_dir):
             # Names like "200000_0012.npz"
@@ -280,7 +287,8 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                     _add("INFO", "phantom",
                          f"Chunk {chunk} final checkpoint (step {expected_end:,}) rotated by keep_last_n",
                          detail=(f"Chunk {next_chunk} already started training, confirming the "
-                                 f"transition was successful. Latest checkpoint: {latest:,}."),
+                                 f"transition was successful. Latest checkpoint: {latest:,}." if latest is not None else
+                                 f"Chunk {next_chunk} already started training, confirming the transition was successful."),
                          chunk=chunk,
                          ctx={"expected_end_step": expected_end, "latest_ckpt_step": latest})
                 else:

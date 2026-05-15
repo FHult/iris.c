@@ -14,6 +14,7 @@ Usage:
     python train/scripts/pipeline_ctl.py dispatch-read       # show open issues
     python train/scripts/pipeline_ctl.py dispatch-resolve I-001
     python train/scripts/pipeline_ctl.py restart-from-chunk 2  # restart from chunk 2
+    python train/scripts/pipeline_ctl.py clear-phantoms         # fix phantom sentinels
 
 Flywheel:
     python train/scripts/pipeline_ctl.py start-flywheel train/configs/flywheel_sref_v1.yaml
@@ -38,6 +39,7 @@ from pipeline_lib import (
     CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
     ABLATION_CONTROL_FILE, ABLATION_DB_PATH,
     FLYWHEEL_CONTROL_FILE, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
+    COLD_ROOT, COLD_WEIGHTS_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso, read_heartbeat, heartbeat_age_secs,
 )
@@ -163,18 +165,41 @@ def cmd_dispatch_resolve(args) -> None:
     print(f"Marked {issue_id} as resolved")
 
 
+def _find_cold_checkpoint(chunk: int):
+    """Return (safetensors, json, ema) paths from cold weights, or (None, None, None)."""
+    if not COLD_ROOT.exists():
+        return None, None, None
+    # Scan flywheel-YYYYMMDD campaign dirs, newest first
+    campaigns = sorted(COLD_WEIGHTS_DIR.glob("flywheel-*"), reverse=True)
+    for campaign in campaigns:
+        st  = campaign / "final.safetensors"
+        js  = campaign / "final.json"
+        ema = campaign / "final.ema.safetensors"
+        if st.exists():
+            return st, (js if js.exists() else None), (ema if ema.exists() else None)
+    return None, None, None
+
+
 def cmd_restart_from_chunk(args) -> None:
     """
     Safely restart the pipeline from chunk N:
-      1. Kill iris-train window if running (with confirmation)
-      2. Clear all sentinels for chunks N..total_chunks
-      3. Delete hard_examples/chunk{M}/ for M >= N so mining re-runs against
+      1. Pre-flight: warn if cold storage not mounted
+      2. Kill iris-train window if running (with confirmation)
+      3. Clear all sentinels for chunks N..total_chunks
+      4. Delete hard_examples/chunk{M}/ for M >= N so mining re-runs against
          the new checkpoint (stale manifests would otherwise cause a zero-op re-mine)
-      4. Restore chunk N-1 final checkpoint from archive if available
-      5. Restart orchestrator
+      5. Restore chunk N-1 final checkpoint — from hot archive, falling back to cold
+      6. Restart orchestrator
     """
     import shutil
     chunk = args.chunk
+
+    # Cold mount pre-flight
+    if not COLD_ROOT.exists():
+        print(f"WARNING: cold storage not mounted at {COLD_ROOT}")
+        print("         Checkpoint restore will use hot archive only.")
+        print("         Mount cold storage before restarting if hot archive is missing.")
+        print()
 
     # Detect total_chunks from sentinel dirs
     if SENTINEL_DIR.exists():
@@ -189,6 +214,23 @@ def cmd_restart_from_chunk(args) -> None:
         if (HARD_EX_DIR / f"chunk{c}").exists()
     ]
 
+    # Resolve checkpoint source
+    ckpt_source = None
+    ckpt_source_label = None
+    if chunk > 1:
+        arch_st  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
+        arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.json"
+        arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.ema.safetensors"
+        if arch_st.exists():
+            ckpt_source = (arch_st, arch_js if arch_js.exists() else None,
+                           arch_ema if arch_ema.exists() else None)
+            ckpt_source_label = f"hot archive ({arch_st})"
+        else:
+            cold_st, cold_js, cold_ema = _find_cold_checkpoint(chunk)
+            if cold_st:
+                ckpt_source = (cold_st, cold_js, cold_ema)
+                ckpt_source_label = f"cold storage ({cold_st})"
+
     print(f"Restarting pipeline from chunk {chunk} (total={total})")
     print(f"This will:")
     print(f"  - Kill iris-train if running")
@@ -198,11 +240,11 @@ def cmd_restart_from_chunk(args) -> None:
             tars = list(d.glob("*.tar"))
             print(f"  - Delete hard_examples/{d.name}/ ({len(tars)} tar(s)) — stale without re-training")
     if chunk > 1:
-        arch = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
-        if arch.exists():
-            print(f"  - Restore chunk {chunk - 1} final checkpoint from archive")
+        if ckpt_source:
+            print(f"  - Restore chunk {chunk - 1} checkpoint from {ckpt_source_label}")
         else:
-            print(f"  - WARNING: no archived checkpoint for chunk {chunk - 1} — training will resume from whatever is in {CKPT_DIR}")
+            print(f"  - WARNING: no checkpoint found for chunk {chunk - 1} in hot archive or cold")
+            print(f"             Training will resume from whatever is currently in {CKPT_DIR}")
     confirm = input("Continue? (y/N): ").strip()
     if confirm.lower() != "y":
         print("Aborted.")
@@ -229,33 +271,102 @@ def cmd_restart_from_chunk(args) -> None:
         shutil.rmtree(d)
         print(f"  Deleted hard_examples/{d.name}/ (will be re-mined after re-training)")
 
-    # Restore archived checkpoint if available
-    if chunk > 1:
-        arch_st  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.safetensors"
-        arch_js  = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.json"
-        arch_ema = CKPT_ARCHIVE_DIR / f"chunk{chunk - 1}_final.ema.safetensors"
-        if arch_st.exists():
-            # Find or infer the step number from the archive json
-            step_name = "restored"
-            if arch_js.exists():
-                try:
-                    meta = json.loads(arch_js.read_text())
-                    step_name = f"step_{meta.get('step', 'restored'):07d}"
-                except Exception:
-                    pass
-            CKPT_DIR.mkdir(parents=True, exist_ok=True)
-            dst_st  = CKPT_DIR / f"{step_name}.safetensors"
-            dst_js  = CKPT_DIR / f"{step_name}.json"
-            dst_ema = CKPT_DIR / f"{step_name}.ema.safetensors"
-            shutil.copy2(arch_st, dst_st)
-            if arch_js.exists():
-                shutil.copy2(arch_js, dst_js)
-            if arch_ema.exists():
-                shutil.copy2(arch_ema, dst_ema)
-            print(f"  Restored checkpoint → {dst_st.name}")
+    # Restore checkpoint from hot archive or cold fallback
+    if ckpt_source:
+        src_st, src_js, src_ema = ckpt_source
+        step_name = "restored"
+        if src_js is not None:
+            try:
+                meta = json.loads(src_js.read_text())
+                step_name = f"step_{meta.get('step', 'restored'):07d}"
+            except Exception:
+                pass
+        CKPT_DIR.mkdir(parents=True, exist_ok=True)
+        dst_st  = CKPT_DIR / f"{step_name}.safetensors"
+        dst_js  = CKPT_DIR / f"{step_name}.json"
+        dst_ema = CKPT_DIR / f"{step_name}.ema.safetensors"
+        shutil.copy2(src_st, dst_st)
+        if src_js is not None:
+            shutil.copy2(src_js, dst_js)
+        if src_ema is not None:
+            shutil.copy2(src_ema, dst_ema)
+        print(f"  Restored checkpoint → {dst_st.name}  (from {ckpt_source_label})")
 
     # Restart orchestrator
     cmd_restart_orchestrator(args)
+
+
+def cmd_clear_phantoms(_args) -> None:
+    """
+    Run pipeline_doctor --ai, find phantom sentinel issues, and execute their
+    fix commands with a single confirmation prompt.
+
+    A phantom sentinel is one where the sentinel file claims a step completed
+    but the underlying hot data no longer exists (e.g. after hot storage was
+    cleaned and cold wasn't yet staged back).
+    """
+    import shlex
+    venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    doctor_script = str(SCRIPTS_DIR / "pipeline_doctor.py")
+    result = subprocess.run(
+        [venv_python, doctor_script, "--ai"],
+        capture_output=True, text=True,
+    )
+    # Doctor exits 1 when there are CRITICAL issues — that's the normal case here.
+    # Only treat it as a hard failure if stdout is not valid JSON.
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        print("ERROR: pipeline_doctor --ai failed or returned non-JSON output")
+        print(result.stderr[-2000:] if result.stderr else result.stdout[:500])
+        return
+
+    issues = report.get("issues", [])
+    phantoms = [i for i in issues if i.get("category") == "phantom"]
+    if not phantoms:
+        print("No phantom sentinel issues found.")
+        return
+
+    print(f"Found {len(phantoms)} phantom sentinel(s):")
+    fix_commands = []
+    for issue in phantoms:
+        title = issue.get("title", "?")
+        chunk = issue.get("chunk", "?")
+        ctx   = issue.get("context", {})
+        step  = ctx.get("step", "")
+        fix   = issue.get("fix", "")
+        step_str = f" step={step}" if step else ""
+        print(f"  chunk={chunk}{step_str}: {title}")
+        if fix:
+            print(f"    fix: {fix}")
+            # A fix may be multi-line; treat each non-empty line as a command
+            for line in fix.splitlines():
+                line = line.strip()
+                if line:
+                    fix_commands.append(line)
+
+    if not fix_commands:
+        print("No fix commands available — clear sentinels manually.")
+        return
+
+    if getattr(_args, "yes", False):
+        confirm = "y"
+    else:
+        confirm = input(f"\nRun {len(fix_commands)} fix command(s)? (y/N): ").strip()
+    if confirm.lower() != "y":
+        print("Aborted.")
+        return
+
+    for cmd in fix_commands:
+        print(f"  Running: {cmd}")
+        try:
+            subprocess.run(shlex.split(cmd), check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  ERROR: command exited {e.returncode}")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+
+    print("Done. Run 'pipeline_ctl.py status' to verify.")
 
 
 def cmd_populate_anchor_shards(args) -> None:
@@ -606,6 +717,10 @@ def main() -> None:
                        help="Safely restart pipeline from chunk N (clears sentinels, restores checkpoint)")
     p.add_argument("chunk", type=int)
 
+    p = sub.add_parser("clear-phantoms",
+                   help="Find and remove phantom sentinels (step claims done but hot data is missing)")
+    p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
     sub.add_parser("pause",               help="Pause orchestrator")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
@@ -682,6 +797,7 @@ def main() -> None:
     handlers = {
         "status":                  cmd_status,
         "restart-from-chunk":      cmd_restart_from_chunk,
+        "clear-phantoms":          cmd_clear_phantoms,
         "pause":                   cmd_pause,
         "resume":                  cmd_resume,
         "abort":                   cmd_abort,
