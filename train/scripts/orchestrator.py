@@ -824,7 +824,7 @@ class Orchestrator:
             log_orch(f"DRY RUN: would launch {description}")
             return
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' PIPELINE_ORCHESTRATED=1 && "
+        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
                      f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_PREP_WIN, activated, log_file)
         self._active_prep = {
@@ -870,7 +870,7 @@ class Orchestrator:
         cmd = f"nice -n 10 taskpolicy -d throttle {inner}"
         log_file = LOG_DIR / f"{log_name}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' PIPELINE_ORCHESTRATED=1 && "
+        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
                      f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_STAGE_WIN, activated, log_file)
         log_orch(f"Launched: {description} → {log_file}", chunk=chunk)
@@ -1611,7 +1611,7 @@ class Orchestrator:
         )
 
         if not self.dry_run:
-            activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' && "
+            activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
                          f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)

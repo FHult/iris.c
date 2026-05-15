@@ -160,7 +160,7 @@ class DataStager:
 
         clear_error(chunk, "stage")
         write_heartbeat("stager", chunk, phase="stage", status="running")
-        log.info("Staging chunk %d: cold=%s → hot=%s", chunk, self.cold_root, self.hot_root)
+        log.info("Staging chunk %d: cold=%s → prep=%s", chunk, self.cold_root, self._prep_root)
         _log("stage_start", chunk)
 
         try:
@@ -205,7 +205,7 @@ class DataStager:
 
         clear_error(chunk, "archive")
         write_heartbeat("stager", chunk, phase="archive", status="running")
-        log.info("Archiving chunk %d: hot=%s → cold=%s", chunk, self.hot_root, self.cold_root)
+        log.info("Archiving chunk %d: prep=%s → cold=%s", chunk, self._prep_root, self.cold_root)
         _log("archive_start", chunk)
 
         try:
@@ -233,15 +233,18 @@ class DataStager:
 
     def status(self) -> dict:
         """Return a status snapshot for pipeline_status.py."""
-        hot_free  = _free_gb(self.hot_root)  if self.hot_root.exists()  else None
-        cold_free = _free_gb(self.cold_root) if self.cold_root.exists() else None
+        prep_free = _free_gb(self._prep_root) if self._prep_root.exists() else None
+        hot_free  = _free_gb(self.hot_root)   if self.hot_root.exists()   else None
+        cold_free = _free_gb(self.cold_root)  if self.cold_root.exists()  else None
         return {
-            "enabled":      self.enabled,
-            "use_symlinks": self._use_symlinks,
-            "cold_root":    str(self.cold_root),
-            "hot_root":     str(self.hot_root),
-            "hot_free_gb":  round(hot_free,  1) if hot_free  is not None else None,
-            "cold_free_gb": round(cold_free, 1) if cold_free is not None else None,
+            "enabled":       self.enabled,
+            "use_symlinks":  self._use_symlinks,
+            "cold_root":     str(self.cold_root),
+            "hot_root":      str(self.hot_root),
+            "prep_root":     str(self._prep_root),
+            "prep_free_gb":  round(prep_free, 1) if prep_free is not None else None,
+            "hot_free_gb":   round(hot_free,  1) if hot_free  is not None else None,
+            "cold_free_gb":  round(cold_free, 1) if cold_free is not None else None,
         }
 
     # ------------------------------------------------------------------
@@ -635,7 +638,7 @@ class DataStager:
 
         # Copy precompute current dirs per encoder (or symlink if same device).
         precomp_copied = 0
-        uh_same_dev = uh.exists() and self._hot_precomp.exists() and _same_device(uh, self.hot_root)
+        uh_same_dev = uh.exists() and self._prep_root.exists() and _same_device(uh, self._prep_root)
         for enc, ver in precomp_versions.items():
             src_ver = self._hot_precomp / enc / ver
             if not src_ver.exists():
@@ -736,14 +739,14 @@ class DataStager:
 
     def _detect_symlinks(self) -> bool:
         """
-        True when cold and hot share the same physical filesystem.
+        True when cold and the active prep root share the same physical filesystem.
         On same device symlinks are instant and zero-cost; on different
         devices we must copy.
         """
-        if self.cold_root == self.hot_root:
+        if self.cold_root == self._prep_root:
             return True  # trivially same path
-        if self.cold_root.exists() and self.hot_root.exists():
-            return _same_device(self.cold_root, self.hot_root)
+        if self.cold_root.exists() and self._prep_root.exists():
+            return _same_device(self.cold_root, self._prep_root)
         # Default to copy if we cannot stat (paths don't exist yet).
         return False
 

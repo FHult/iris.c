@@ -1341,7 +1341,7 @@ def _check_error_sentinels(chunks: list[int]) -> None:
 # 12. Environment and disk checks
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _check_environment() -> None:
+def _check_environment(cfg: dict = None) -> None:
     # ── disk space ────────────────────────────────────────────────────────
     try:
         gb = free_gb(DATA_ROOT)
@@ -1362,15 +1362,7 @@ def _check_environment() -> None:
     # ── Ultrahot tier space (only when data_prep_tier=ultrahot) ───────────
     try:
         from pipeline_lib import ULTRAHOT_ROOT as _UH_ROOT
-        _cfg_path = TRAIN_DIR / "configs" / "v2_pipeline.yaml"
-        _uh_cfg: dict = {}
-        if _cfg_path.exists():
-            try:
-                import yaml as _yaml
-                _uh_cfg = _yaml.safe_load(_cfg_path.read_text()) or {}
-            except Exception:
-                pass
-        _storage = _uh_cfg.get("storage", {})
+        _storage = (cfg or {}).get("storage", {})
         if _storage.get("data_prep_tier") == "ultrahot":
             _uh_root = Path(_storage.get("ultrahot_root", str(_UH_ROOT)))
             _margin  = float(_storage.get("staging_margin_gb", 50.0))
@@ -2220,7 +2212,7 @@ def main() -> None:
     def _run_checks() -> None:
         global _issues
         _issues = []
-        _check_environment()
+        _check_environment(cfg)
         _check_error_sentinels(chunks)
         _check_phantom_completions(cfg, chunks)
         _check_training_integrity(cfg, chunks)
