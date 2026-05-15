@@ -984,7 +984,7 @@ def train(config: dict) -> None:
             ip_out = mx.fast.scaled_dot_product_attention(
                 q_i, k_i, v_i, scale=Hd_i ** -0.5,
             )  # [B, H, seq_img, Hd]
-            ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, d_inner)
+            ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, H_i * Hd_i)
             ip_total = ip_total + adapter.scale[i] * ip_out
 
         h_with_ip = h_final + ip_total
@@ -1087,10 +1087,18 @@ def train(config: dict) -> None:
 
     # ── T-05: validation loss on held-out set ─────────────────────────────────
     def _compute_val_loss() -> Optional[float]:
-        """Run a no-grad forward on up to 16 held-out records. Returns mean loss or None."""
+        """Run a no-grad forward on up to 64 held-out records. Returns mean loss or None."""
         if not _val_shards:
             return None
-        from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed
+        from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed, _load_siglip_embed
+        import pipeline_lib as _plib
+        # Val precomputed embeddings live in DATA_ROOT/validation/precomputed/{enc}/,
+        # staged there by pipeline_setup.py from cold/validation/precomputed/.
+        # Fall back to the training cache dirs if the val-specific dirs are absent.
+        _vbase      = Path(str(_plib.DATA_ROOT)) / "validation" / "precomputed"
+        _val_qwen3  = str(_vbase / "qwen3")  if (_vbase / "qwen3").is_dir()  else dcfg.get("qwen3_cache_dir")
+        _val_vae    = str(_vbase / "vae")    if (_vbase / "vae").is_dir()    else dcfg.get("vae_cache_dir")
+        _val_siglip = str(_vbase / "siglip") if (_vbase / "siglip").is_dir() else None
         losses = []
         for _shard in _val_shards[:2]:
             try:
@@ -1103,41 +1111,44 @@ def train(config: dict) -> None:
             for _name in _member_names:
                 _stem, _, _ext = _name.rpartition(".")
                 _keys.setdefault(_stem, {})[_ext.lower()] = _name
-            for _stem in list(_keys)[:8]:
+            for _stem in list(_keys)[:32]:
                 _txt_key = _keys[_stem].get("txt") or _keys[_stem].get("caption")
                 if not _txt_key:
                     continue
-                _vae_np  = _load_vae_latent(_stem, dcfg.get("vae_cache_dir"),
-                                             expected_hw=None)
-                _text_np = _load_qwen3_embed(_stem, dcfg.get("qwen3_cache_dir"))
+                _vae_np  = _load_vae_latent(_stem, _val_vae, expected_hw=None)
+                _text_np = _load_qwen3_embed(_stem, _val_qwen3)
                 if _vae_np is None or _text_np is None:
                     continue
+                _siglip_np = _load_siglip_embed(_stem, _val_siglip)
                 _lat = mx.array(_vae_np[None], dtype=mx.bfloat16)
                 _txt = mx.array(_text_np[None], dtype=mx.bfloat16)
                 # Sample a random timestep so val loss reflects the full noise distribution.
-                _t   = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
+                _t     = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
                 _noise = mx.random.normal(_lat.shape, dtype=_lat.dtype)
                 _alpha, _sigma = get_schedule_values(_t)
                 _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
-                # No-grad forward: call loss function directly (not through value_and_grad).
-                # TODO: load real siglip features from val shard siglip_cache_dir
-                # (following the same pattern as the training loop) so val loss measures
-                # actual adapter conditioning quality rather than zero-image features.
-                _siglip_zero = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+                if _siglip_np is not None:
+                    _siglip   = mx.array(_siglip_np[None], dtype=mx.bfloat16)
+                    _use_null = mx.array(False)
+                else:
+                    _siglip   = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+                    _use_null = mx.array(True)
                 if _use_block_injection:
                     mx.eval(_target)
-                    _loss = loss_fn_with_ip(_siglip_zero, mx.array(False), _noisy, _txt, _t, _target)
+                    _loss = loss_fn_with_ip(_siglip, _use_null, _noisy, _txt, _t, _target)
                 else:
                     _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
                     mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
-                    _loss = loss_fn(_siglip_zero, mx.array(False), _fs, _target)
+                    _loss = loss_fn(_siglip, _use_null, _fs, _target)
                     del _fs
                 mx.eval(_loss)
                 losses.append(float(_loss.item()))
-                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip_zero, _loss, _noisy, _target
+                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip, _loss, _noisy, _target
                 mx.clear_cache()
-                if len(losses) >= 16:
+                if len(losses) >= 64:
                     break
+            if len(losses) >= 64:
+                break
         return sum(losses) / len(losses) if losses else None
 
     # ── Training loop ─────────────────────────────────────────────────────────

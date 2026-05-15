@@ -46,6 +46,12 @@ COLD_ROOT           = Path("/Volumes/16TBCold")
 COLD_PRECOMPUTE_DIR = COLD_ROOT / "precomputed"
 COLD_WEIGHTS_DIR    = COLD_ROOT / "weights"
 COLD_METADATA_DIR   = COLD_ROOT / "metadata"
+COLD_VAL_DIR        = COLD_ROOT / "validation"
+COLD_VAL_SHARDS_DIR = COLD_VAL_DIR / "held_out"
+COLD_VAL_PRECOMP_DIR = COLD_VAL_DIR / "precomputed"
+
+VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
+VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
 GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 RUN_METADATA_FILE = DATA_ROOT / "run_metadata.json"
 

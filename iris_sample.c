@@ -291,6 +291,10 @@ float *iris_sample_euler(void *transformer, void *text_encoder,
     (void)text_encoder;  /* Reserved for future use */
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     /* Working buffers */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
@@ -383,6 +387,10 @@ float *iris_sample_euler_zimage(void *transformer,
                                  void (*progress_callback)(int step, int total)) {
     zi_transformer_t *tf = (zi_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     if (!z_curr) return NULL;
@@ -512,6 +520,10 @@ float *iris_sample_euler_with_refs(void *transformer, void *text_encoder,
     (void)text_encoder;  /* Reserved for future use */
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     /* Working buffer */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
@@ -593,6 +605,10 @@ float *iris_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
     (void)text_encoder;
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     if (!z_curr) return NULL;
@@ -676,6 +692,10 @@ float *iris_sample_euler_cfg(void *transformer, void *text_encoder,
     (void)text_encoder;
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     if (!z_curr) return NULL;
@@ -760,6 +780,10 @@ float *iris_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
     (void)text_encoder;
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     if (!z_curr) return NULL;
@@ -845,6 +869,10 @@ float *iris_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
     (void)text_encoder;
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     if (!z_curr) return NULL;
@@ -929,6 +957,10 @@ float *iris_sample_euler_ancestral(void *transformer,
                                    void (*progress_callback)(int step, int total)) {
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *noise = (float *)malloc(latent_size * sizeof(float));
@@ -996,6 +1028,10 @@ float *iris_sample_heun(void *transformer,
                         void (*progress_callback)(int step, int total)) {
     iris_transformer_t *tf = (iris_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
+    if (num_steps > IRIS_MAX_STEPS) {
+        fprintf(stderr, "iris_sample: num_steps %d exceeds IRIS_MAX_STEPS %d\n", num_steps, IRIS_MAX_STEPS);
+        return NULL;
+    }
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *z_pred = (float *)malloc(latent_size * sizeof(float));

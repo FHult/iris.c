@@ -1445,6 +1445,50 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
             pass
 
 
+def _check_val_set(cfg: dict) -> None:
+    """Verify the held-out validation set exists on cold and is staged to hot."""
+    storage   = cfg.get("storage", {})
+    cold_root = Path(storage.get("cold_root", "/Volumes/16TBCold"))
+    cold_val_sentinel = cold_root / "validation" / "held_out" / ".val_set_created"
+    hot_val_shards    = DATA_ROOT / "validation" / "held_out"
+
+    ctl = str(SCRIPTS_DIR / "pipeline_ctl.py")
+
+    if not cold_root.exists():
+        # Cold not mounted — can't check. Other checks will surface the mount issue.
+        return
+
+    if not cold_val_sentinel.exists():
+        _add("WARNING", "val_set",
+             "Held-out validation set has not been created on cold storage",
+             detail=(
+                 "Checkpoint selection will fall back to recency-only (most recent N kept). "
+                 "Run create-val-set once before starting training."
+             ),
+             fix=f"train/.venv/bin/python {ctl} create-val-set",
+             ctx={"sentinel": str(cold_val_sentinel)})
+        return
+
+    # Cold val set exists — check it is staged to hot.
+    hot_shards = sorted(hot_val_shards.glob("*.tar")) if hot_val_shards.exists() else []
+    if not hot_shards:
+        _add("WARNING", "val_set",
+             "Val set exists on cold but is not staged to hot — val loss disabled",
+             detail=(
+                 "pipeline_setup.py stages the val set automatically. "
+                 "Re-run setup or stage manually."
+             ),
+             fix=f"train/.venv/bin/python train/scripts/pipeline_setup.py --check",
+             ctx={"cold_sentinel": str(cold_val_sentinel),
+                  "hot_val_dir": str(hot_val_shards)})
+    else:
+        hot_precomp = DATA_ROOT / "validation" / "precomputed"
+        enc_dirs = [d for d in hot_precomp.iterdir() if d.is_dir()] if hot_precomp.exists() else []
+        _add("INFO", "val_set",
+             f"Val set staged: {len(hot_shards)} shard(s), {len(enc_dirs)} encoder cache(s)",
+             ctx={"shards": len(hot_shards), "encoders": [d.name for d in enc_dirs]})
+
+
 def _check_pool_health(cfg: dict) -> None:
     storage = cfg.get("storage", {})
     for key, label, sentinel in [
@@ -2124,6 +2168,7 @@ def main() -> None:
         _check_ablation_health()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
+        _check_val_set(cfg)
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
 
     def _issue_fingerprint() -> frozenset:

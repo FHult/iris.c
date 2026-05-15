@@ -154,30 +154,110 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 
 1. **Larger resolution + more training steps** — the v1 run was a `--small` configuration. Higher resolution (1024px) exposes finer style features to the SigLIP encoder; more steps allow the PerceiverResampler and K/V projections to build a richer style space. Expected CLIP-I gain: +0.05–0.10. **Note (32 GB):** 1024px training on 4B Flux currently peaks at ~26 GB at 512px; 1024px roughly doubles the sequence length (256→1024 image tokens), which increases attention memory. Feasibility needs a short profiling run before committing to a full 1024px flywheel.
 
-2. **Block-by-block injection (TRAIN-6)** ✓ Implemented — see COMPLETED_BACKLOG.md. Cost: 4.7× slower than old path (8.38s vs 1.78s/step clean), 21.54 GB bwd peak. Decision: gated off; re-evaluate for from-scratch runs. Option C (correct_forward_q) is the active production path.
+**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Items 2–4 (TRAIN-6, PIPELINE-27, QUALITY-10) — done, see COMPLETED_BACKLOG.md.
 
-3. **Source data curation (PIPELINE-27)** ✓ Done — see COMPLETED_BACKLOG.md. Provenance sidecars + `shard_scorer.py` + scored download order in `pipeline_setup.py`. Requires `tgz_scores.json` to populate (needs one full pipeline run with provenance-enabled shards).
+---
 
-4. **QUALITY-10 ablation harness** ✓ Done — see COMPLETED_BACKLOG.md.
+**TRAIN-8: Fix held-out validation — BUG-T-003** (High priority — blocks honest checkpoint selection)
 
-**References:** PIPELINE-27 (data curation, done), PIPELINE-25 (raw pool, done).
-**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Item 2 (TRAIN-6) — done, gated. Item 3 (PIPELINE-27) — done; scoring activates after first pipeline run with provenance-enabled shards. Item 4 (QUALITY-10) — done.
+Validation is currently completely inert: the held-out directory does not exist so `_compute_val_loss()` always returns `None`, `val_loss.jsonl` is never written, and `_purge_old_checkpoints` falls back to recency-only checkpoint selection. This means we cannot tell whether training is genuinely improving on unseen data or just overfitting to the training shards, and the "best 3 checkpoints" protection in `_purge_old_checkpoints` is silently dead.
+
+**Architecture: permanent cold-level split, not per-session**
+
+The val set must live in cold storage permanently (`cold/validation/held_out/`). Re-picking different shards before each run would make val loss numbers incomparable across campaigns — you couldn't tell whether a lower val loss means the model improved or just that the new val set happened to be easier images. The exam questions must be the same every time.
+
+The cold pool (converted tars) is not modified — no records are deleted. A small reserved tgz range is permanently routed to cold/validation rather than to training shards. Everything else is untouched.
+
+There are three parts, all required.
+
+**Part A: Reserve a val tgz range in config**
+
+In `v2_pipeline.yaml`, shift all `tgz_ranges` to start from tgz `1` instead of `0`. Tgz `0` is permanently reserved for the validation set and excluded from all training scales:
+
+```yaml
+jdb:
+  validation_tgzs: [0, 0]   # reserved — never included in training ranges
+  tgz_ranges:
+    dev:
+      1: [1, 1]       # was [0, 0]
+    small:
+      1: [1, 5]       # was [0, 4]
+    ...
+```
+
+`pipeline_doctor.py` should warn if any configured training tgz range overlaps `validation_tgzs`.
+
+**Part B: `pipeline_ctl.py create-val-set` — one-time cold operation**
+
+New subcommand that runs once, before the first training run, and is idempotent (no-op if sentinel exists):
+
+1. Checks `cold/validation/held_out/.val_set_created` sentinel — exits immediately if present.
+2. Confirms `cold/converted/journeydb/` has the val tgz already converted (if not, runs `download_convert.py` for tgz 0 with `--cold-only`).
+3. Runs a mini `build_shards.py` on just the val tgz, writing 1–2 shards to `cold/validation/held_out/`.
+4. Runs precompute (qwen3 + vae + siglip) on those shards, writing NPZ files to `cold/validation/precomputed/`.
+5. Writes the sentinel.
+
+Cold storage layout after this operation:
+```
+/Volumes/16TBCold/
+  validation/
+    held_out/
+      shard-000000.tar
+      shard-000001.tar
+      .val_set_created      ← sentinel
+    precomputed/
+      qwen3/                ← val-set NPZ files (separate from training precompute)
+      vae/
+      siglip/
+```
+
+**Part C: per-session staging in `pipeline_setup.py`**
+
+Before each training run, `pipeline_setup.py` (or the orchestrator pre-training check) stages the val set from cold to hot:
+
+1. Symlinks/copies `cold/validation/held_out/*.tar` to `DATA_ROOT/validation/held_out/`.
+2. Symlinks/copies val precomputed NPZ files from `cold/validation/precomputed/{enc}/` into the active cache dirs (`DATA_ROOT/precomputed/{enc}/current/`) alongside the training NPZ files. The val record stems are different from training stems, so there is no collision.
+
+This is identical to the staging pattern for all other data — cold is source of truth, hot is the working copy.
+
+**Part D: load real SigLIP features in `_compute_val_loss()`**
+
+[train_ip_adapter.py:1123-1133](train/train_ip_adapter.py#L1123-L1133) — currently passes `_siglip_zero = mx.zeros((1, 729, siglip_dim))` to the forward pass. This measures base flow-matching reconstruction with a blank image embedding — not IP-adapter conditioning quality. The adapter's cross-attention learns nothing useful from zeros; the val loss produced has no relationship to style-following quality.
+
+Fix: replace the `_siglip_zero` block with the same pattern the training loop uses:
+
+```python
+from ip_adapter.dataset import _load_siglip_embed
+_siglip_np = _load_siglip_embed(_stem, dcfg.get("siglip_cache_dir"))
+if _siglip_np is None:
+    continue   # skip records without siglip precompute
+_siglip = mx.array(_siglip_np[None], dtype=mx.bfloat16)
+```
+
+Then pass `_siglip` and `use_null_image=mx.array(False)` to `loss_fn_with_ip` / `loss_fn`. This is a ~5-line change. With real SigLIP features, val loss measures exactly what we care about: how well the adapter conditions on a real held-out style reference at the current weight state.
+
+**Sizing — constant across all run scales**
+
+The val set size is fixed and does not scale with training run size (smoke, small, large, all-in). The val set is a trend detector — you watch whether val loss goes up, down, or flat, not what its absolute value is. Consistency across campaigns is the whole point: if the val set changes between runs, numbers from different campaigns become incomparable and the early-warning signal is lost.
+
+2 shards (~800 records at typical density) is the right target. The val loop currently caps at 16 records per call ([train_ip_adapter.py:1139](train/train_ip_adapter.py#L1139)), which is too low — 16 records gives a noisy estimate with high step-to-step variance. Increase the cap to 64 as part of this fix: 64 no-grad forwards at ~0.3s each adds ~20s every 1000 steps, which is acceptable overhead and produces a much more stable loss estimate. Beyond 64, diminishing returns.
+
+The external quality metrics (CLIP-I, cond_gap from flywheel eval) are measured on a broader representative set and naturally reflect run scale. Val loss is not a substitute for those — it is the in-training signal that decides whether to keep training or stop early.
+
+Cold storage cost: ~1 GB for shards + ~500 MB for precomputed embeddings. One-time, permanent.
+
+**What correct behaviour looks like after all parts:**
+
+- `pipeline_ctl.py create-val-set`: runs once, idempotent. Logs steps and writes sentinel.
+- At training startup: `Validation held-out: 2 shards in .../validation/held_out` (not "not found").
+- Every `val_every` steps (default 1000): `val_loss=X.XXXX (step N)` logged; appended to `val_loss.jsonl`.
+- `_purge_old_checkpoints`: protects the 3 lowest-val-loss checkpoints in addition to the most recent N. A checkpoint that was peak quality 20,000 steps ago survives.
+- Heartbeat `val_loss` field reflects true conditioning quality; `pipeline_doctor` and `pipeline_status` show it accurately.
+- Val loss numbers are directly comparable across all future campaigns (same held-out records, same cold source).
 
 ---
 
 ## Pipeline Improvements
-
-**PIPE-SMOKE-1: Smoke/dev runs invisible to pipeline_doctor and pipeline_status** ✅ done (confirmed 2026-05-15)
-
-Smoke and dev runs launch `train_ip_adapter.py` directly — no pipeline sentinels, no heartbeat files, no orchestrator involvement. `pipeline_doctor` and `pipeline_status` are completely blind to them. To check progress you must `tail -f /tmp/dev_run.log` or attach to the tmux window manually.
-
-**Fix:** wire direct runs into the trainer heartbeat system.
-- `train_ip_adapter.py`: when a `--run-name` flag is provided (or when config contains a `run_name` key), write a heartbeat to `/Volumes/2TBSSD/.heartbeat/trainer_{run_name}.json` at the normal `log_every` cadence. Same fields as the production trainer heartbeat (step, loss, cond_gap, mem peaks, eta_sec, etc.).
-- `pipeline_status.py`: scan for `trainer_*.json` heartbeats in addition to `trainer.json`; display each active direct run as a separate row with its run name.
-- `pipeline_doctor.py`: include direct-run heartbeats in the trainer health check; warn if a named run's heartbeat is stale (>5 min) but the tmux window still exists (likely hung).
-- Standard run names: `smoke` (100 steps), `dev` (1,000 steps). The config file name is a reasonable default if `--run-name` is not given.
-
-**Prerequisite for:** running dev/smoke tests with the same visibility as production runs.
 
 **PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Low priority, code bugs fixed)
 
@@ -194,8 +274,6 @@ Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunk
 - GPU_TOKEN contention at production timing — documented; code fix applied; no observed failure.
 - Download throttle stall false-positive — documented in DISPATCH.md Gap 6 as a known operator issue.
 - `dispatch-resolve` UI-only clarification — documented in DISPATCH.md.
-
-**PIPELINE-25/26/27/28/29** ✅ done (2026-05-14) — see COMPLETED_BACKLOG.md.
 
 **PIPELINE-25b: Stream-convert downloads — eliminate raw tgz disk writes** (Low priority, long-term)
 
@@ -214,54 +292,6 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 **Interaction with converted pool:** if `converted_pool_root` is set, the Level 0 hit (skip download+convert entirely) already makes this optimisation irrelevant for warm runs. This item only matters for the first-time conversion of each tgz.
 
 ---
-
-**DATAMGMT-1: data_explorer diagnose — automated detection of stale, redundant, and misplaced data** ✅ done (2026-05-15)
-
-Add a `data_explorer.py diagnose` subcommand that surfaces the same insights a human would spot by running `du -sh` and comparing directories — without requiring manual analysis.
-
-**Checks to implement:**
-
-1. **Redundant staging/** — if `hot_root/staging/chunk*` exists AND `cold_root/converted/` has the same tars, flag staging as redundant copies. Report estimated reclaimable space. (`staging/` is the V1 pipeline artifact; V2 stager stages directly to `shards/` and `precomputed/`.)
-
-2. **Stale hot data** — dirs on hot that are not needed for the currently-staged chunks:
-   - `hot_root/anchor_shards/` if already present on cold
-   - `hot_root/hard_examples/` if already present on cold
-   - `hot_root/precomputed/` versions older than cold's `current` symlink
-   - `hot_root/checkpoints/` entries already archived to cold weights campaign
-
-3. **Misplaced source-of-truth data** — data that exists only on hot with no cold copy (would be lost if hot fails):
-   - `hot_root/shard_scores.db` without a corresponding `cold_root/metadata/shard_scores.db`
-   - `hot_root/flywheel_history.db` without cold backup
-   - Any `hot_root/weights/` checkpoint without a matching entry in `cold_root/weights/`
-
-4. **Cross-tier duplicate detection** — directories present at the same path on both hot and cold where hot is not a symlink to cold (data duplicated unnecessarily):
-   - `anchor_shards/`, `hard_examples/` — cold is source of truth; hot copy is redundant once cold has it
-
-5. **Orphaned precompute versions** — version dirs in `cold_root/precomputed/{enc}/` that are not pointed to by `current` symlink and exceed `keep_versions` (already partially covered by `maintenance --prune` but should also appear in diagnose output)
-
-6. **Training gap detection** — chunks in cold that have shards but no corresponding precompute coverage on cold (precompute was never run for that chunk range)
-
-**Output format:**
-
-```
-  DIAGNOSE — data anomalies detected
-  ────────────────────────────────────────────────────
-  REDUNDANT  staging/chunk1-4 (282 GB) — same tars in cold/converted/journeydb
-             → safe to delete: rm -rf /Volumes/2TBSSD/staging/
-  REDUNDANT  anchor_shards/ on hot (21 GB) — cold copy exists
-             → safe to delete: rm -rf /Volumes/2TBSSD/anchor_shards/
-  STALE      checkpoints/stage1/chunk1_final.* — archived to flywheel-20260507
-             → safe to delete: rm -rf /Volumes/2TBSSD/checkpoints/stage1/chunk1_final.*
-  OK         shard_scores.db — cold backup present (47h ago)
-  OK         weights/ — 2 campaigns archived to cold
-```
-
-**Implementation notes:**
-- Read-only by default; never deletes. Print `rm -rf` commands as suggestions only.
-- `--fix` flag: executes the suggested deletions with confirmation per item.
-- `--json` flag for scripting (includes `reclaimable_gb` field).
-- Runs after `du` sizes are collected (reuse parallel `_du_kb` infrastructure from `status`).
-- Should complete in <30 seconds on hot SSD; cold scans use the same timeout-bound `_du_kb` pattern.
 
 **PIPELINE-30: Inference tier — three-tier storage with internal NVMe as serving layer** (Medium priority, pre-web-app)
 
@@ -309,6 +339,67 @@ storage:
 ```
 
 **When to implement:** before the web app serves live inference. Not needed while inference runs from manually specified paths.
+
+---
+
+**PIPELINE-31: Inference-tier data prep — use internal NVMe for speed-critical small/experimental runs** (Medium priority)
+
+The internal NVMe SSD (PIPELINE-30's inference tier) is 2–3× faster than the external hot SSD for random I/O. For disk-IO-bound steps — `download_convert`, `build_shards`, `filter_shards`, and `precompute` — running entirely on the internal NVMe can dramatically shorten the feedback loop for smoke and dev runs.
+
+**Motivation:** today the full data prep pipeline (convert → build_shards → filter_shards → precompute) always uses hot (`/Volumes/2TBSSD`). For a smoke run (100 steps, 1 chunk, 1 tgz) this pipeline is the bottleneck — precompute of ~7,000 records at 145ms/record is ~17 min. On the faster internal NVMe that same I/O runs proportionally faster. Inference/precompute are already on the critical path before every training run; shaving this matters more than training-loop speed for iteration cadence.
+
+**Disk space requirements per scale** (one chunk at a time, steady-state peak):
+
+| Scale | Converted tars | Shards | Precomputed | Peak total | Fits 460 GB NVMe? |
+|---|---|---|---|---|---|
+| dev (1 tgz) | ~15 GB | ~5 GB | ~10 GB | **~30 GB** | yes (needs ~30 GB free) |
+| smoke (1 tgz) | ~15 GB | ~5 GB | ~10 GB | **~30 GB** | yes |
+| small (5 tgzs/chunk) | ~75 GB | ~70 GB | ~70 GB | **~215 GB** | borderline |
+| medium (13 tgzs/chunk) | ~195 GB | ~180 GB | ~180 GB | **~555 GB** | no (exceeds 460 GB) |
+
+**Current constraint:** internal NVMe has only ~52 GB free (88% used by inference weights and web app assets). To use this path even at smoke scale, ~30 GB must first be cleared. `data_explorer.py diagnose` (DATAMGMT-1) is the right tool to identify what can be moved. The implementation should be forward-looking for when more space is available (or when larger internal NVMe hardware is added).
+
+**Practical target:** `inference` tier is viable for dev/smoke runs and single-chunk small experiments. Medium and above should remain on hot. The system should warn when the selected scale exceeds the tier's available space rather than failing mid-run.
+
+**Config changes** — add `data_prep_tier` key to `storage:` block:
+```yaml
+storage:
+  data_prep_tier: hot            # hot (default) | inference
+  # All existing keys unchanged
+  hot_root:  /Volumes/2TBSSD
+  cold_root: /Volumes/16TBCold
+  inference_root: /Users/fredrikhult/inference  # from PIPELINE-30
+```
+
+**CLI optionality** — all data prep scripts accept `--data-tier {hot,inference}` flag that overrides the config value. No flag = read from config = default to `hot`. This keeps default behavior completely unchanged.
+
+Scripts affected:
+- `download_convert.py`: `--data-tier` routes output to `hot_root` or `inference_root`
+- `build_shards.py`: `--data-tier` controls where shard output lands
+- `filter_shards.py` / `shard_scorer.py`: reads + writes from the active tier
+- `precompute.py` / `cache_manager.py`: version dirs land on the active tier
+- `data_stager.py stage`: when `data_prep_tier=inference`, staging reads from cold and writes to inference root instead of hot root (the existing stage flow, different destination)
+
+**Archiving** — after a successful inference-tier run, the standard archive flow copies results back to cold. PIPELINE-29's `archive_chunk()` already handles hot→cold; extend it with an `inference→cold` path that mirrors the same logic. Inference-tier data is treated as ephemeral working area (same as hot); cold is still the source of truth.
+
+**Space guard** — before any inference-tier prep begins, compute the expected peak disk usage from the pipeline config's tgz range and scale, compare against `shutil.disk_usage(inference_root).free`, and abort with a clear message if space is insufficient (margin configurable, default 20 GB).
+
+**Doctor integration** — when `data_prep_tier=inference`, `pipeline_doctor.py` includes inference-tier free space in its disk summary and warns if free space is below `staging_margin_gb`.
+
+**When to use inference tier:**
+- Dev / smoke sanity runs (30 min wall-clock or less end-to-end)
+- Ablation harness short runs (precompute already done, just need build_shards for new filter config)
+- Single-chunk experiments with non-standard data slices
+- Precompute re-runs after encoder update (CPU-bound, not I/O-bound — benefit smaller but still positive)
+
+**When NOT to use inference tier:**
+- Multi-chunk production runs at small scale or above
+- Runs where inference tier is actively serving web app traffic (I/O contention)
+- When inference_root free space < 50 GB (system-level guard enforces this)
+
+**Interaction with PIPELINE-30:** PIPELINE-30 defines the inference tier layout for serving weights. This item adds a *separate* working area on the same volume for data prep outputs. The two uses do not conflict — prep outputs live in `inference_root/prep/{chunk}/` during a run and are deleted or archived to cold afterwards, leaving the `inference_root/weights/` and `inference_root/precomputed/` serving paths untouched.
+
+**When to implement:** after PIPELINE-30 (inference tier established) and after internal NVMe has sufficient free space (use DATAMGMT-1 diagnose to identify reclaimable space first).
 
 ---
 
@@ -390,105 +481,9 @@ Individual campaigns are managed by the orchestrator. This item is the layer abo
 
 ## Known Bugs — Code Review 2026-05-15
 
-Discovered in a full four-layer code review (C core, Metal/GPU, pipeline scripts, trainer). Severity levels: **crash** > **wrong-result** > **leak** > **latent** > **minor**.
+32 of 33 bugs fixed — see COMPLETED_BACKLOG.md. One remains open:
 
-### C Core
+**BUG-M-004: Batch mode atomicity broken in iris_gpu_attention_mps_bf16** — latent (harmless at current call sites)
+`iris_metal.m` (~lines 3149–3151). Between Phase 2 (CPU softmax) and Phase 3 (scores @ V), the function unconditionally commits and resets `g_tensor_cmd` regardless of `g_tensor_batch_mode`. In batch mode this splits the attention's Phase 1 and Phase 3 across separate command buffers.
 
-**BUG-C-001: Transformer forward NULL not checked in samplers** — crash
-`iris_sample.c`. All Euler samplers (`iris_sample_euler`, `_euler_with_refs`, `_euler_with_multi_refs`, `_euler_zimage`, `_euler_cfg`) use the transformer return value immediately without a NULL check. The transformer returns NULL on OOM or GPU fallback failure; the sampler then dereferences NULL in the velocity update loop. In the CFG path both `v_uncond` and `v_cond` are unchecked. Fix: check return value and abort the step cleanly.
-
-**BUG-C-002: Stack buffer overflow in samplers via step_times array** — crash (latent)
-`iris_sample.c` (~lines 305, 392, 522, 600, 682, 764, 847). Every sampler declares `double step_times[IRIS_MAX_STEPS]` (256 entries) and writes `step_times[step]` up to `num_steps-1` with no in-function guard. CLI validates `steps <= 256` before calling, but the samplers carry no guard themselves — unsafe as a library API if the caller skips validation.
-
-**BUG-C-003: NULL dereference after unchecked malloc in load_double_block_weights** — crash
-`iris_transformer_flux.c` (~lines 589–639, f32 path). Two `malloc` calls for `img_mlp_gate_weight` / `img_mlp_up_weight` (and text FFN equivalents) have no NULL check; `memcpy` is called immediately on the return value. Under memory pressure during model load, this crashes.
-
-**BUG-C-004: Memory leak in ensure_work_buffers on partial allocation failure** — leak
-`iris_transformer_flux.c` (~lines 1468–1529). When any of the ~20 sequential allocations fails, the function returns -1 but does not free the already-allocated buffers from the same call. They are orphaned — `work_seq_alloc = 0` signals failure so the struct never owns them, but they are not freed.
-
-**BUG-C-005: Shadow variable in DEBUG build hides block_idx parameter** — wrong result (debug only)
-`iris_transformer_flux.c` (~line 2222, `#ifdef DEBUG_DOUBLE_BLOCK`). A `static int block_idx = 0` inside the debug block shadows the function parameter of the same name. All debug prints show a sequential counter 0,1,2,... instead of the actual block being executed.
-
-**BUG-C-006: Integer overflow in iris_image_create calloc size** — crash / heap corruption
-`iris_image.c` (~line 29). `calloc(width * height * channels, sizeof(uint8_t))` — all three operands are `int`. At 32768×32768×4 the product overflows int32, wraps to zero or negative, allocates a tiny buffer, and subsequent pixel writes corrupt the heap. Fix: cast to `(size_t)width * (size_t)height * (size_t)channels`.
-
-**BUG-C-007: Silent uninitialized output on malloc failure in iris_linear_nobias_bf16** — wrong result
-`iris_kernels.c` (~lines 322–332). If `malloc` fails, the function returns without writing to `y`. The caller receives garbage from whatever was in the output buffer; the void return gives no indication of failure.
-
-**BUG-C-008: NULL dereference in zi_final_forward on malloc failure** — crash
-`iris_transformer_zimage.c` (~line 1593). `float *normed = malloc(seq * dim * sizeof(float))` has no NULL check. The immediately following loop dereferences `normed + s * dim`, crashing under memory pressure during Z-Image generation.
-
-**BUG-C-009: Integer truncation of ftell() result in iris_img2img_debug_py** — minor
-`iris.c` (~line 1815). `int noise_size = ftell(f) / sizeof(float)` — `ftell` returns `long`. Silently truncates for files larger than ~2 GB. Correct type is `long` or `size_t`.
-
----
-
-### Metal / GPU
-
-**BUG-M-001: NULL/nil check missing on MTLBuffer allocation at four sites** — crash
-`iris_metal.m` (~lines 301–308, 739, 1074, 1182). `[g_device newBufferWithBytes:weights length:size options:]` can return nil on OOM. All four locations pass the result immediately to MPSMatrix or a compute pass without a nil check, crashing when Metal is under memory pressure.
-
-**BUG-M-002: MTLBuffer leak in iris_gpu_tensor_alloc_persistent on struct malloc failure** — leak
-`iris_metal.m` (~line 2539–2542). When `malloc(sizeof(struct iris_gpu_tensor))` fails, the function returns NULL but the already-allocated persistent MTLBuffer (`buf`) is never released. Contrast with `iris_gpu_tensor_alloc` which correctly calls `pool_release_buffer(buf)` before returning NULL.
-
-**BUG-M-003: Pool buffer leak in iris_metal_sgemm_impl on bufferC allocation failure** — leak
-`iris_metal.m` (~lines 760–765). When `cache_B=0` and batch mode is active, `bufferB` is obtained from the pool. If the subsequent `bufferC` allocation fails, the error path releases `bufferA` and `bufferC` but has no corresponding release for `bufferB`. The pool slot leaks permanently, shrinking the 64-slot activation buffer pool over many calls.
-
-**BUG-M-004: Batch mode atomicity broken in iris_gpu_attention_mps_bf16** — wrong result
-`iris_metal.m` (~lines 3124–3128). Between Phase 2 (CPU softmax) and Phase 3 (scores @ V), the function unconditionally commits and resets `g_tensor_cmd` regardless of `g_tensor_batch_mode`. In batch mode this splits GPU work from the same logical batch across two separate command buffers, violating ordering guarantees for any caller that assumed atomic batch submission.
-
-**BUG-M-005: attention_fused_bf16 kernel: shared_q[128] has no kernel-level head_dim guard** — latent corruption
-`iris_shaders.metal`. `threadgroup float shared_q[128]` is written for `d` up to `head_dim - 1` with no assertion that `head_dim <= 128`. All current models use head_dim=128 so it is safe today, but any future model with head_dim > 128 would produce silent threadgroup memory corruption.
-
-**BUG-M-006: SDPA graph cache does not include scale in cache key** — latent wrong result
-`iris_metal.m` `get_sdpa_graph_cache` and `get_sdpa_graph_cache_f32`. Cache keys on `{seq_q, seq_k, num_heads, head_dim}` only. The `scale` parameter is baked into the MPSGraph at construction time as a constant but is not stored in the key. Two calls with the same shape but different scale values silently reuse the first graph's scale. Safe today (scale always derived from head_dim, which is in the key), but fragile if scale is ever caller-specified.
-
-**BUG-M-007: iris_gpu_linear unconditionally commits batch in the bias path** — wrong result
-`iris_metal.m` (~lines 2786–2796). When a bias vector is provided, the function commits and waits on the live command buffer unconditionally — including when `g_tensor_batch_mode=1`. This prematurely splits any in-progress batch across two command buffers, breaking batch atomicity for all callers using `iris_gpu_linear` with bias in batch mode.
-
-**BUG-M-008: causal_attention_fused shared_scores[512] guard is only in Obj-C caller, not in kernel** — latent corruption
-`iris_shaders.metal` (~line 675 and ~line 1956). Both `causal_attention_fused` and `causal_attention_fused_bf16` allocate `threadgroup float shared_scores[512]` and write `shared_scores[key_idx]` for `key_idx` in `[0, seq)`. The only protection against `seq > 512` is a check in the Obj-C caller. The kernel itself has no guard; a new call site without that check would silently corrupt threadgroup memory.
-
-**BUG-M-009: iris_metal_sgemm_batch allocates __strong id<MTLBuffer>* array with calloc** — ARC violation
-`iris_metal.m` (~line 1618). `calloc` is used to allocate a `__strong id<MTLBuffer>*` array, bypassing ARC initialization. Works because nil is bitwise zero on current Apple platforms, but is an ARC specification violation. Future toolchain changes or non-zero nil representations could cause incorrect retain/release behavior.
-
----
-
-### Pipeline Scripts
-
-**BUG-P-001: _link_or_copy() creates absolute-path symlinks** — data loss on remount
-`data_stager.py` (~line 586). `os.symlink(src.resolve(), dst)` creates absolute symlinks. If the cold or hot volume remounts at a different path (e.g. macOS assigns `/Volumes/2TBSSD 1`), all staged symlinks become dangling and precomputed data becomes unreachable. `update_best_symlinks()` in the same file correctly uses `os.path.relpath()` — the two code paths are inconsistent. Fix: `os.symlink(os.path.relpath(src.resolve(), dst.parent), dst)`.
-
-**BUG-P-002: _atomic_symlink() uses hardcoded temp name — race condition under concurrency** — wrong result (latent)
-`data_stager.py` (~line 657) and `cache_manager.py` (~line 314). Both use a hardcoded temp name (`.current_stg_tmp` / `.current_tmp`) in the link's parent directory. Concurrent calls for the same encoder directory have the second process's `unlink()` delete the first process's temp symlink before `os.replace()` completes, leaving the symlink pointing to stale state. Currently serialized by the orchestrator; latent if parallelism is added. Fix: uuid-based or `tempfile.mkstemp()`-based temp names.
-
-**BUG-P-003: pipeline_doctor.py generates syntactically wrong stager remediation commands** — wrong operator guidance
-`pipeline_doctor.py` (~lines 766, 818). Fix commands suggest `data_stager.py --chunk N --phase archive` / `--phase stage`. The stager uses subcommand CLI: correct syntax is `data_stager.py archive --chunk N`. The suggested commands produce an argparse error; the doctor's fix advice actively misleads the operator.
-
-**BUG-P-004: _recover_prep_window() resets hung-prep timer to zero after orchestrator restart** — monitoring gap
-`orchestrator.py` (~line 1040). `_recover_prep_window()` rebuilds `_active_prep` without a `"started_at"` key. `_poll_prep_window()` falls back to `time.time()` on `.get("started_at", time.time())`, resetting the hung-prep elapsed timer to zero on every orchestrator restart. A prep step that ran for 5 hours before a restart needs another full `PREP_HUNG_HOURS` (6h) before the alert fires; a genuinely hung prep could run indefinitely through repeated restarts.
-
-**BUG-P-005: --fix mode in data_explorer.py uses cmd.split() — breaks on paths with spaces** — latent wrong result
-`data_explorer.py` (~line 2213). Repair commands are run via `subprocess.run(cmd.split(), ...)`. If any auto-generated fix command contains a path with a space, the arguments are mangled and the fix silently operates on the wrong target or does nothing. Current pipeline paths have no spaces; this is latent.
-
-**BUG-P-006: Dead self-import in _render_status_html() leaves disk stats permanently None** — dead code
-`data_explorer.py` (~lines 798–805). `from train.scripts.data_explorer import _disk_stats` inside a `try/except` always raises `ModuleNotFoundError`. `cold_used`, `cold_total`, `hot_used`, `hot_total` are initialized to None and never assigned. The function falls back to reading disk stats from `result["disk"]` so there is no visible crash, but the import block is dead code that should be removed.
-
----
-
-### Trainer
-
-**BUG-T-001: NameError crash when siglip cache is configured without qwen3/vae** — crash
-`train/train_ip_adapter.py` (line 702). `_internal_prefix` is a nested function defined only inside `if qwen3_dir and vae_dir:` (lines 668–693) but referenced unconditionally at line 702 in the siglip cache path. If `qwen3_cache_dir` or `vae_cache_dir` is absent (e.g. live-inference mode with precomputed siglip only), the function is never defined and line 702 raises `NameError`, killing the process before training begins.
-
-**BUG-T-002: grad_clip_pct always 0.0 in machine-readable heartbeat** — wrong metric
-`train/train_ip_adapter.py` (lines 1688, 1794). `_grad_clip_steps` is reset to 0 at line 1688, then `grad_clip_pct` in `write_heartbeat` is computed from the already-zeroed counter at line 1794. The human-readable log print reads the counter before the reset (correct); the machine-readable heartbeat read by `pipeline_doctor` and `orchestrator` always shows 0% gradient clipping regardless of how many clipping events occurred.
-
-**BUG-T-003: _compute_val_loss measures null-image loss, not IP-adapter conditioning quality** — wrong metric
-`train/train_ip_adapter.py` (lines 1118–1125). `use_null_image = mx.array(True)` is hardcoded, so val_loss measures base flow-matching reconstruction with the adapter zeroed out — not image-conditioning quality. Checkpoint selection (`_purge_old_checkpoints`) keeps the "best 3" checkpoints ranked by val_loss; these are selected for the lowest null-image reconstruction loss, which has no relationship to IP-adapter performance. Fix: load siglip features from val shards and use `use_null_image = mx.array(False)`.
-
-**BUG-T-004: Checkpoint written directly to final filename — partial file visible on crash** — minor
-`train/train_ip_adapter.py` (lines 304–313). `_save_safetensors_streaming` writes directly to `step_NNNNNNN.safetensors`. If the process is killed mid-write (OOM, caffeinate failure), the corrupt partial file is picked up by `_purge_old_checkpoints` sorted listing and may displace a valid older checkpoint before the corruption is detected at load time. Fix: write to `.tmp` then `os.rename()` atomically.
-
-**BUG-T-005: ip_out reshape assumes uniform hidden dim across all blocks** — latent wrong result
-`train/train_ip_adapter.py` (lines 967, 982). `d_inner = h_final.shape[2]` is used to reshape `ip_out` from all blocks. This silently asserts `H_i * Hd_i == d_inner` for every double and single block. Safe for current Flux 4B and 9B (all blocks share the same `H*Hd`), but would crash with an opaque reshape error on any future variant with heterogeneous block dimensions.
+**Investigation findings (2026-05-15):** The only call site is `iris_gpu_attention_bf16` (line 3293), which calls `iris_gpu_sync()` at line 3270 *before* entering, flushing any prior batch work. Phase 1 and Phase 3 being in separate command buffers is an inherent constraint of the CPU softmax — it cannot be avoided without a GPU softmax kernel. Ordering is fully maintained. Current risk: zero. Proper fix: implement GPU softmax to eliminate the CPU readback; medium effort, not needed until a future model requires true bf16 batch-mode attention across this path.

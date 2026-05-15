@@ -15,6 +15,7 @@ Usage:
     python train/scripts/pipeline_ctl.py dispatch-resolve I-001
     python train/scripts/pipeline_ctl.py restart-from-chunk 2  # restart from chunk 2
     python train/scripts/pipeline_ctl.py clear-phantoms         # fix phantom sentinels
+    python train/scripts/pipeline_ctl.py create-val-set         # one-time: build held-out val set
 
 Flywheel:
     python train/scripts/pipeline_ctl.py start-flywheel train/configs/flywheel_sref_v1.yaml
@@ -39,9 +40,11 @@ from pipeline_lib import (
     CKPT_ARCHIVE_DIR, CKPT_DIR, HARD_EX_DIR, SHARDS_DIR, ANCHOR_SHARDS_DIR,
     ABLATION_CONTROL_FILE, ABLATION_DB_PATH,
     FLYWHEEL_CONTROL_FILE, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
-    COLD_ROOT, COLD_WEIGHTS_DIR,
+    COLD_ROOT, COLD_WEIGHTS_DIR, COLD_VAL_SHARDS_DIR, COLD_VAL_PRECOMP_DIR,
+    VAL_SHARDS_DIR, VAL_PRECOMP_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso, read_heartbeat, heartbeat_age_secs,
+    load_config,
 )
 
 
@@ -367,6 +370,135 @@ def cmd_clear_phantoms(_args) -> None:
             print(f"  ERROR: {e}")
 
     print("Done. Run 'pipeline_ctl.py status' to verify.")
+
+
+def cmd_create_val_set(args) -> None:
+    """
+    One-time operation: build and precompute the permanent held-out validation set.
+
+    Reads tgz 0 (000.tar) from the cold converted pool, builds 2 shards (~1000 records),
+    and runs precompute (qwen3 + vae + siglip) — all stored in cold/validation/.
+    Idempotent: exits immediately if the sentinel already exists.
+    To rebuild: delete cold/validation/held_out/.val_set_created and re-run.
+
+    Run this ONCE before the first training run.  pipeline_setup.py stages the results
+    to hot before each training session automatically.
+    """
+    import os
+    import tempfile
+
+    config_path = getattr(args, "config", None) or (TRAIN_DIR / "configs" / "v2_pipeline.yaml")
+    try:
+        cfg = load_config(str(config_path))
+    except Exception as e:
+        print(f"ERROR: could not load config {config_path}: {e}")
+        return
+
+    storage    = cfg.get("storage", {})
+    cold_root  = Path(storage.get("cold_root", str(COLD_ROOT)))
+    val_shards = cold_root / "validation" / "held_out"
+    val_precomp= cold_root / "validation" / "precomputed"
+    sentinel   = val_shards / ".val_set_created"
+
+    if sentinel.exists():
+        print(f"Val set already created ({sentinel})")
+        print("  To rebuild: delete the sentinel and re-run.")
+        return
+
+    if not cold_root.exists():
+        print(f"ERROR: cold storage not mounted at {cold_root}")
+        return
+
+    conv_pool_str = storage.get("converted_pool_root")
+    if not conv_pool_str:
+        print("ERROR: converted_pool_root not set in config storage block.")
+        print("       Enable it and run download_convert.py --cold-only first.")
+        return
+    conv_pool = Path(conv_pool_str)
+
+    val_tgzs    = cfg.get("jdb", {}).get("validation_tgzs", [0, 0])
+    val_tgz_idx = val_tgzs[0]
+    val_tar     = conv_pool / f"{val_tgz_idx:03d}.tar"
+    pool_sent   = conv_pool / ".converted" / f"{val_tgz_idx:03d}.done"
+
+    if not pool_sent.exists() or not val_tar.exists():
+        print(f"Val tgz {val_tgz_idx:03d} not found in converted pool ({conv_pool}).")
+        if not getattr(args, "yes", False):
+            ans = input("  Download and convert now? (y/N): ").strip()
+            if ans.lower() != "y":
+                print("Aborted. Run: download_convert.py --cold-only to populate the pool first.")
+                return
+        venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+        print(f"  Downloading/converting tgz {val_tgz_idx:03d}...")
+        r = subprocess.run([
+            venv_python, str(SCRIPTS_DIR / "download_convert.py"),
+            "--config", str(config_path),
+            "--chunk", "1",
+            "--tgz-start", str(val_tgz_idx),
+            "--tgz-end",   str(val_tgz_idx),
+            "--cold-only",
+        ])
+        if r.returncode != 0:
+            print(f"ERROR: download_convert failed (exit {r.returncode})")
+            return
+        if not val_tar.exists():
+            print(f"ERROR: converted tar still not found at {val_tar}")
+            return
+
+    val_shards.mkdir(parents=True, exist_ok=True)
+    venv_python = str(TRAIN_DIR / ".venv" / "bin" / "python")
+
+    # Step 1: build val shards from just the val tgz via a temp source dir.
+    print(f"\nStep 1/2: building val shards from {val_tar.name} → {val_shards}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.symlink(val_tar.resolve(), Path(tmpdir) / val_tar.name)
+        r = subprocess.run([
+            venv_python, str(SCRIPTS_DIR / "build_shards.py"),
+            "--sources",    tmpdir,
+            "--output",     str(val_shards),
+            "--shard_size", "500",
+            "--max-shards", "2",
+            "--workers",    "1",
+            "--seed",       "999",
+        ])
+    if r.returncode != 0:
+        print(f"ERROR: build_shards failed (exit {r.returncode})")
+        return
+
+    built = sorted(val_shards.glob("*.tar"))
+    if not built:
+        print("ERROR: no shards produced — build_shards may have found no records in the source.")
+        return
+    print(f"  Built {len(built)} val shard(s): {', '.join(s.name for s in built)}")
+
+    # Step 2: precompute qwen3 + vae + (optionally) siglip for val shards.
+    print(f"\nStep 2/2: precomputing embeddings for val shards → {val_precomp}")
+    model_cfg  = cfg.get("model", {})
+    flux_model = model_cfg.get("flux_model", "flux-klein-model")
+    do_siglip  = cfg.get("training", {}).get("siglip", True)
+
+    precomp_cmd = [
+        venv_python, str(SCRIPTS_DIR / "precompute_all.py"),
+        "--shards",       str(val_shards),
+        "--qwen3-output", str(val_precomp / "qwen3"),
+        "--vae-output",   str(val_precomp / "vae"),
+        "--siglip-output",str(val_precomp / "siglip"),
+        "--flux-model",   flux_model,
+    ]
+    if do_siglip:
+        precomp_cmd.append("--siglip")
+
+    r = subprocess.run(precomp_cmd)
+    if r.returncode != 0:
+        print(f"ERROR: precompute_all failed (exit {r.returncode})")
+        return
+
+    sentinel.write_text(now_iso() + "\n")
+    print(f"\nVal set created:")
+    print(f"  shards:      {val_shards}  ({len(built)} shard(s))")
+    print(f"  precomputed: {val_precomp}")
+    print(f"  sentinel:    {sentinel}")
+    print(f"\nRun 'pipeline_setup.py' before training to stage the val set to hot.")
 
 
 def cmd_populate_anchor_shards(args) -> None:
@@ -721,6 +853,13 @@ def main() -> None:
                    help="Find and remove phantom sentinels (step claims done but hot data is missing)")
     p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
+    p = sub.add_parser("create-val-set",
+                       help="One-time: build and precompute the permanent held-out validation set from tgz 0")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config file (default: train/configs/v2_pipeline.yaml)")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Auto-confirm downloading the val tgz if not yet in pool")
+
     sub.add_parser("pause",               help="Pause orchestrator")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
@@ -798,6 +937,7 @@ def main() -> None:
         "status":                  cmd_status,
         "restart-from-chunk":      cmd_restart_from_chunk,
         "clear-phantoms":          cmd_clear_phantoms,
+        "create-val-set":          cmd_create_val_set,
         "pause":                   cmd_pause,
         "resume":                  cmd_resume,
         "abort":                   cmd_abort,

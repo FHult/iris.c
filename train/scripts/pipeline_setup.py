@@ -581,6 +581,55 @@ def suggest_tgz_priority(config: dict, chunk: int, scale: str) -> dict:
     }
 
 
+def _stage_val_set(data_root: Path, config: dict) -> Optional[str]:
+    """
+    Stage the permanent held-out val set from cold/validation/ to data_root/validation/.
+
+    Symlinks val shards into data_root/validation/held_out/ and copies precomputed
+    NPZ files into data_root/validation/precomputed/{enc}/.  The trainer reads from
+    these paths; they are separate from the training precompute cache.
+
+    Returns a human-readable status string, or None if the val set has not been
+    created yet on cold (run pipeline_ctl.py create-val-set first).
+    """
+    storage   = config.get("storage", {})
+    cold_root = Path(storage.get("cold_root", "/Volumes/16TBCold"))
+    val_cold  = cold_root / "validation"
+    sentinel  = val_cold / "held_out" / ".val_set_created"
+
+    if not sentinel.exists():
+        return None
+
+    val_hot_shards  = data_root / "validation" / "held_out"
+    val_hot_precomp = data_root / "validation" / "precomputed"
+    val_hot_shards.mkdir(parents=True, exist_ok=True)
+
+    shards_staged = 0
+    for shard in sorted((val_cold / "held_out").glob("*.tar")):
+        dst = val_hot_shards / shard.name
+        if not dst.exists():
+            rel = os.path.relpath(shard.resolve(), dst.parent)
+            os.symlink(rel, dst)
+        shards_staged += 1
+
+    npz_staged = 0
+    val_cold_precomp = val_cold / "precomputed"
+    if val_cold_precomp.is_dir():
+        for enc_dir in sorted(val_cold_precomp.iterdir()):
+            if not enc_dir.is_dir():
+                continue
+            hot_enc = val_hot_precomp / enc_dir.name
+            hot_enc.mkdir(parents=True, exist_ok=True)
+            for npz in enc_dir.glob("*.npz"):
+                dst = hot_enc / npz.name
+                if not dst.exists():
+                    shutil.copy2(npz, dst)
+                    npz_staged += 1
+
+    return (f"{shards_staged} val shard(s) staged → {val_hot_shards}"
+            f"  ({npz_staged} new NPZ files)")
+
+
 def _setup_pool_dirs(config: dict, dry_run: bool = False) -> list[str]:
     """Create persistent cold pool dirs when configured.  Returns list of created dirs.
 
@@ -972,6 +1021,7 @@ def run_interactive(args) -> int:
         print(f"  {ok('✓')}  Using config: {config_path}")
 
     # Pool dirs (cold volume; only created when pool keys are set in config)
+    _cfg = None
     try:
         from pipeline_lib import load_config
         _cfg = load_config(str(config_path))
@@ -980,6 +1030,38 @@ def run_interactive(args) -> int:
             print(f"    {ok('+')} {d}  (cold pool)")
     except Exception:
         pass
+
+    # Val set staging (cold → hot); offer to create it inline if missing
+    if _cfg is not None:
+        try:
+            val_status = _stage_val_set(data_root, _cfg)
+            if val_status:
+                print(f"  {ok('✓')}  Val set staged: {val_status}")
+            else:
+                print(f"  {warn('!')}  Val set not found on cold storage (one-time setup required).")
+                if not getattr(args, "check", False):
+                    do_create = _ask_bool(
+                        "       Create val set now? (downloads+converts tgz 0, ~5–10 min)", default=True)
+                    if do_create:
+                        result = subprocess.run([
+                            str(VENV_PYTHON),
+                            str(SCRIPTS_DIR / "pipeline_ctl.py"),
+                            "create-val-set",
+                            "--config", str(config_path),
+                            "--yes",
+                        ])
+                        if result.returncode == 0:
+                            val_status2 = _stage_val_set(data_root, _cfg)
+                            if val_status2:
+                                print(f"  {ok('✓')}  Val set staged: {val_status2}")
+                        else:
+                            print(f"  {warn('!')}  create-val-set exited {result.returncode} — "
+                                  f"check output above and re-run manually.")
+                    else:
+                        print(f"       Skipped. Run before training: "
+                              f"pipeline_ctl.py create-val-set")
+        except Exception as _e:
+            print(f"  {warn('!')}  Val set staging skipped: {_e}")
     print()
 
     # ── Commands ───────────────────────────────────────────────────────────

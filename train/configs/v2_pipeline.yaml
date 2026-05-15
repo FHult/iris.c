@@ -22,28 +22,34 @@ training_config: train/configs/stage1_512px.yaml
 
 # JourneyDB tgz ranges per chunk per scale (0-indexed tgz numbers)
 jdb:
+  # Tgz 0 (000.tar) is permanently reserved for the held-out validation set.
+  # Never include tgz 0 in any training range. Run:
+  #   pipeline_ctl.py create-val-set
+  # once before the first training run to build and precompute the val shards.
+  validation_tgzs: [0, 0]
+
   tgz_ranges:
     dev:
-      1: [0, 0]         # single tgz — minimum for a buildable checkpoint
+      1: [1, 1]         # single tgz — minimum for a buildable checkpoint
     smoke:
-      1: [0, 0]
+      1: [1, 1]
     small:
-      1: [0, 4]
+      1: [1, 5]
       2: [50, 54]
       3: [100, 104]
       4: [150, 154]
     medium:
-      1: [0, 12]
+      1: [1, 13]
       2: [50, 62]
       3: [100, 112]
       4: [150, 162]
     large:
-      1: [0, 24]
+      1: [1, 25]
       2: [50, 74]
       3: [100, 124]
       4: [150, 174]
     all-in:
-      1: [0, 49]
+      1: [1, 49]
       2: [50, 99]
       3: [100, 149]
       4: [150, 201]
