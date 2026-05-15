@@ -72,6 +72,14 @@ def main() -> None:
         help="CLIP backend (default: auto)",
     )
     ap.add_argument(
+        "--tgz-range",
+        nargs=2,
+        type=int,
+        metavar=("START", "END"),
+        default=None,
+        help="Process only tgz indices START..END inclusive (e.g. --tgz-range 0 49)",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be done but skip tar rewrite and sentinel creation",
@@ -88,6 +96,10 @@ def main() -> None:
         sys.exit(1)
 
     tars = sorted(pool_dir.glob("*.tar"))
+    if args.tgz_range is not None:
+        start, end = args.tgz_range
+        tars = [t for t in tars
+                if t.stem.isdigit() and start <= int(t.stem) <= end]
     if not tars:
         print(f"No *.tar files found in {pool_dir}")
         sys.exit(0)
