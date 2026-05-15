@@ -175,7 +175,10 @@ def run_dedupe_filter(
     t_hb = time.time()
 
     for tar_path in tars:
-        sentinel = Path(str(tar_path) + ".deduped")
+        # Resolve symlink so we find the sentinel on the cold pool tar if already
+        # deduped by clean_wds_pool.py, rather than looking in staging.
+        real_path = tar_path.resolve()
+        sentinel = Path(str(real_path) + ".deduped")
         if sentinel.exists():
             done += 1
             write_heartbeat("dedupe_filter", chunk,
@@ -183,23 +186,26 @@ def run_dedupe_filter(
                             pct=round(done / total * 100, 1))
             continue
 
-        # Step 1: quality filter → tmp tar
+        # Step 1: quality filter → tmp tar.
+        # Operate on real_path (resolved) so that if tar_path is a symlink to the
+        # cold pool, we write back to the cold file and the sentinel lands next to
+        # the real tar — not as a broken staging copy.
         tmp_fd, tmp_str = tempfile.mkstemp(
-            dir=tar_path.parent, suffix=".qf_tmp"
+            dir=real_path.parent, suffix=".qf_tmp"
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_str)
 
         try:
             quality_kept, quality_removed = _quality_filter_tar(
-                tar_path, tmp_path, min_size, min_words
+                real_path, tmp_path, min_size, min_words
             )
             in_count = quality_kept + quality_removed
 
             if quality_kept == 0:
                 # All records were quality-rejected; replace tar with empty tar
                 tmp_path.unlink(missing_ok=True)
-                with tarfile.open(tar_path, "w"):
+                with tarfile.open(real_path, "w"):
                     pass  # write empty tar
                 sentinel.touch()
                 done += 1
@@ -211,13 +217,13 @@ def run_dedupe_filter(
                 )
                 continue
 
-            # Step 2: rename quality-filtered tmp → tar_path so dedup_wds_tar
+            # Step 2: rename quality-filtered tmp → real_path so dedup_wds_tar
             # reads the cleaned version
-            os.replace(tmp_path, tar_path)
+            os.replace(tmp_path, real_path)
 
-            # Step 3: CLIP dedup rewrites tar_path in-place
+            # Step 3: CLIP dedup rewrites real_path in-place
             records_in, records_out = dedup_wds_tar(
-                tar_path, index_path, ids_path, blocklist_path,
+                real_path, index_path, ids_path, blocklist_path,
                 threshold=threshold, backend=backend,
             )
             dup_removed = records_in - records_out
