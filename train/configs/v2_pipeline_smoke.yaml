@@ -1,15 +1,15 @@
 # V2 pipeline smoke-test configuration
 # Exercises the full orchestrator state machine with minimal data and compute.
 # Run with:
-#   PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke \
-#     train/.venv/bin/python train/scripts/orchestrator.py \
+#   PIPELINE_DATA_ROOT='/Volumes/2TBSSD' \
+#     train/.venv/bin/python train/scripts/pipeline_ctl.py restart-orchestrator \
 #     --config train/configs/v2_pipeline_smoke.yaml
 #
-# Isolation: PIPELINE_DATA_ROOT keeps all output isolated from the production tree.
 # LAION/COYO will be absent and skipped gracefully.
-# JDB tgz 000 (~2-3 GB) is the only network download required.
+# JDB tgz 001 (~2-3 GB) is the only network download required.
+# Tgz 000 is permanently reserved for the held-out validation set — never used here.
 #
-# Two chunks are used so the full stager integration is exercised:
+# Two chunks exercise the full chunk-transition state machine:
 #   - Chunk 1 training start  → predictive stage chunk 2 (iris-stage window)
 #   - Chunk 1 training done   → archive chunk 1 + stage chunk 2 (iris-stage window)
 #   - Chunk 2 _check_ready    → gate on stage.done sentinel before training
@@ -32,10 +32,12 @@ download:
   jdb_only: true        # skip WikiArt (66 GB) and LAION/COYO checks in smoke
 
 jdb:
+  # Tgz 0 (000.tar) is permanently reserved for the held-out validation set.
+  validation_tgzs: [0, 0]
   tgz_ranges:
     smoke:
-      1: [0, 0]       # single tgz for chunk 1
-      2: [0, 0]       # reuse same tgz for chunk 2 (different shard ID space)
+      1: [1, 1]       # tgz 001 — smallest non-reserved tgz
+      2: [1, 1]       # reuse same tgz for chunk 2 (different shard ID space)
 
 data_volume:
   smoke: 0.005        # 0.5% — LAION/COYO absent, downloader warns and skips
