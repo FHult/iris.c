@@ -37,6 +37,7 @@ from pipeline_lib import (
     DISK_WARN_GB, DISK_ABORT_GB, HEARTBEAT_STALE_SECS, SHARD_BLOCK,
     STATE_FILE,
     ABLATION_DB_PATH, FLYWHEEL_CONTROL_FILE, FLYWHEEL_REPORTS_DIR,
+    ULTRAHOT_ROOT,
     read_state, write_state, update_state,
     is_done, mark_done, mark_error, has_error, read_error, clear_error,
     log_event, log_orch,
@@ -308,6 +309,13 @@ class Orchestrator:
         self.res          = ResourceManager()
         self.total_chunks = config.get("chunks", 4)
         self.scale        = config.get("scale", "small")
+
+        # Active prep root: ultrahot_root when data_prep_tier=ultrahot, else DATA_ROOT.
+        _storage = config.get("storage", {})
+        _uh = Path(_storage.get("ultrahot_root", str(ULTRAHOT_ROOT)))
+        self.prep_root: Path = (
+            _uh if _storage.get("data_prep_tier") == "ultrahot" else DATA_ROOT
+        )
         self.issue_counter = 0
         self._restart_counts: dict[tuple, int] = {}
         # Retry backoff: {(chunk, step) → earliest epoch_sec to retry}
@@ -816,7 +824,7 @@ class Orchestrator:
             log_orch(f"DRY RUN: would launch {description}")
             return
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
+        activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' PIPELINE_ORCHESTRATED=1 && "
                      f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_PREP_WIN, activated, log_file)
         self._active_prep = {
@@ -862,7 +870,7 @@ class Orchestrator:
         cmd = f"nice -n 10 taskpolicy -d throttle {inner}"
         log_file = LOG_DIR / f"{log_name}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' PIPELINE_ORCHESTRATED=1 && "
+        activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' PIPELINE_ORCHESTRATED=1 && "
                      f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
         tmux_new_window(TMUX_STAGE_WIN, activated, log_file)
         log_orch(f"Launched: {description} → {log_file}", chunk=chunk)
@@ -1463,7 +1471,7 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: warming up IP Adapter Metal training graphs", chunk=chunk)
         cfg_path = self.cfg.get("training_config", str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         log_file = LOG_DIR / f"training_warmup_chunk{chunk}.log"
-        cmd = f"python -u '{TRAIN_DIR}/train_ip_adapter.py' --config '{cfg_path}' --warmup-only --data-root '{DATA_ROOT}'"
+        cmd = f"python -u '{TRAIN_DIR}/train_ip_adapter.py' --config '{cfg_path}' --warmup-only --data-root '{self.prep_root}'"
         self._launch_prep(
             f"training_warmup chunk {chunk}", cmd, log_file,
             chunk, "training_warmup", token="GPU_TOKEN",
@@ -1597,13 +1605,13 @@ class Orchestrator:
             f"--config '{config_file}' "
             f"--max-steps {steps} --lr {lr} "
             f"--chunk-base-step {chunk_base_step} "
-            f"--data-root '{DATA_ROOT}' "
+            f"--data-root '{self.prep_root}' "
             f"--chunk {chunk} "
             f"{resume_arg} {hard_arg} {anchor_arg}"
         )
 
         if not self.dry_run:
-            activated = (f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+            activated = (f"export PIPELINE_DATA_ROOT='{self.prep_root}' && "
                          f"source '{TRAIN_DIR}/.venv/bin/activate' && {cmd}")
             log_file.parent.mkdir(parents=True, exist_ok=True)
             tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
@@ -2381,22 +2389,25 @@ def _run_flywheel_ablation(
     tmp_cfg = Path(f"/tmp/flywheel_{name}_ablation_{iteration:04d}.yaml")
     tmp_cfg.write_text(yaml.dump(abl_cfg, default_flow_style=False))
 
-    output_dir = DATA_ROOT / "ablation_long" / f"{name}_iter{iteration:04d}"
+    # data_root: optional fw_cfg key for Ultrahot-tier ablation (PIPELINE-31).
+    _fw_data_root = Path(fw_cfg.get("data_root", str(DATA_ROOT)))
+    output_dir = _fw_data_root / "ablation_long" / f"{name}_iter{iteration:04d}"
     log_file   = LOG_DIR / f"flywheel_{name}_ablation_iter{iteration:04d}.log"
-    shards_dir = fw_cfg.get("shards_dir", str(SHARDS_DIR))
+    shards_dir = fw_cfg.get("shards_dir", str(_fw_data_root / "shards"))
 
     log_orch(f"[flywheel:{name}] iter {iteration}: ablation burst ({max_runs} runs) → {log_file}")
 
     cmd = (
+        f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
         f"source '{TRAIN_DIR}/.venv/bin/activate' && "
         f"python -u '{SCRIPTS_DIR}/ablation_harness.py' "
         f"--config '{tmp_cfg}' "
         f"--output-dir '{output_dir}' "
         f"--db '{ABLATION_DB_PATH}' "
         f"--shards '{shards_dir}' "
-        f"--qwen3-cache '{PRECOMP_DIR / 'qwen3'}' "
-        f"--vae-cache '{PRECOMP_DIR / 'vae'}' "
-        f"--siglip-cache '{PRECOMP_DIR / 'siglip'}'"
+        f"--qwen3-cache '{_fw_data_root / 'precomputed' / 'qwen3'}' "
+        f"--vae-cache '{_fw_data_root / 'precomputed' / 'vae'}' "
+        f"--siglip-cache '{_fw_data_root / 'precomputed' / 'siglip'}'"
     )
     log_file.parent.mkdir(parents=True, exist_ok=True)
     full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
@@ -2478,7 +2489,9 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     n_shards       = int(fw_cfg.get("n_shards", 20))
     poll_interval  = int(fw_cfg.get("poll_interval", 60))
     ablation_every = int(fw_cfg.get("ablation_every_n", 0))
-    shards_dir     = Path(fw_cfg.get("shards_dir", str(SHARDS_DIR)))
+    # data_root: optional fw_cfg key for Ultrahot-tier flywheel (PIPELINE-31).
+    _fw_data_root = Path(fw_cfg.get("data_root", str(DATA_ROOT)))
+    shards_dir     = Path(fw_cfg.get("shards_dir", str(_fw_data_root / "shards")))
     manifest_path  = Path(fw_cfg["shard_manifest"]) if fw_cfg.get("shard_manifest") else None
 
     fw_db    = FlywheelDB()
@@ -2617,13 +2630,13 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                     f"caffeinate -dim python -u '{TRAIN_DIR}/train_ip_adapter.py' "
                     f"--config '{train_cfg_path}' "
                     f"--max-steps {steps_per_iter} "
-                    f"--data-root '{DATA_ROOT}'"
+                    f"--data-root '{_fw_data_root}'"
                 )
                 if resume_ckpt and Path(resume_ckpt).exists():
                     train_cmd += f" --resume '{resume_ckpt}'"
 
                 activated = (
-                    f"export PIPELINE_DATA_ROOT='{DATA_ROOT}' && "
+                    f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
                     f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
                 )
                 tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)

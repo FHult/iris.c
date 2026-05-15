@@ -113,6 +113,11 @@ class DataStager:
         self.archive_after_chunk = bool(storage.get("archive_after_chunk",  True))
         self.max_parallel        = int(storage.get("max_parallel_transfers", 3))
 
+        # Active prep tier: "hot" (default) or "ultrahot".
+        # When "ultrahot", staging writes to and archiving reads from ultrahot_root.
+        prep_tier = storage.get("data_prep_tier", "hot")
+        self._prep_root = self.ultrahot_root if prep_tier == "ultrahot" else self.hot_root
+
         # Derived paths on cold storage.
         self._cold_shards   = self.cold_root / "shards"
         self._cold_precomp  = self.cold_root / "precomputed"
@@ -120,10 +125,10 @@ class DataStager:
         self._cold_weights  = self.cold_root / "weights"
         self._cold_metadata = self.cold_root / "metadata"
 
-        # Derived paths on hot storage (== DATA_ROOT paths when single-SSD).
-        self._hot_shards  = self.hot_root / "shards"
-        self._hot_precomp = self.hot_root / "precomputed"
-        self._hot_ckpts   = self.hot_root / "checkpoints" / "stage1"
+        # Derived paths on the active prep tier (hot or ultrahot).
+        self._hot_shards  = self._prep_root / "shards"
+        self._hot_precomp = self._prep_root / "precomputed"
+        self._hot_ckpts   = self._prep_root / "checkpoints" / "stage1"
 
         # Detect same-device at init; cached for the lifetime of the process.
         self._use_symlinks: bool = self._detect_symlinks()
@@ -752,11 +757,11 @@ class DataStager:
         RuntimeError on False so stage_for_chunk() writes stage.error.
         """
         try:
-            free_gb   = _free_gb(self.hot_root)
+            free_gb   = _free_gb(self._prep_root)
             needed_gb = estimated_bytes / (1024 ** 3)
             if free_gb - needed_gb < self.staging_margin_gb:
                 log.warning(
-                    "Hot storage space check failed: %.1f GB free, need %.1f GB "
+                    "Prep-tier storage space check failed: %.1f GB free, need %.1f GB "
                     "+ %.0f GB safety margin (%.1f GB available after transfer)",
                     free_gb, needed_gb, self.staging_margin_gb,
                     free_gb - needed_gb,

@@ -141,6 +141,7 @@ storage:
   cold_root:      "/Volumes/16TBCold"          # 16 TB cold volume — source of truth + knowledge base
   hot_root:       "/Volumes/2TBSSD"            # 2 TB NVMe — active compute working area
   ultrahot_root:  "/Users/fredrikhult/ultrahot" # internal NVMe — lowest-latency serving path
+  data_prep_tier: hot             # hot (default) | ultrahot — where prep scripts write working data
   staging_margin_gb: 50           # abort staging if hot free space would drop below this
   cleanup_safety_gb: 20           # minimum hot free space before any cleanup
   archive_after_chunk: true       # archive precomputed + weights to cold after each chunk

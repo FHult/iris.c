@@ -1359,6 +1359,42 @@ def _check_environment() -> None:
              f"Could not read disk space for {DATA_ROOT}",
              detail="DATA_ROOT may not be mounted.")
 
+    # ── Ultrahot tier space (only when data_prep_tier=ultrahot) ───────────
+    try:
+        from pipeline_lib import ULTRAHOT_ROOT as _UH_ROOT
+        _cfg_path = TRAIN_DIR / "configs" / "v2_pipeline.yaml"
+        _uh_cfg: dict = {}
+        if _cfg_path.exists():
+            try:
+                import yaml as _yaml
+                _uh_cfg = _yaml.safe_load(_cfg_path.read_text()) or {}
+            except Exception:
+                pass
+        _storage = _uh_cfg.get("storage", {})
+        if _storage.get("data_prep_tier") == "ultrahot":
+            _uh_root = Path(_storage.get("ultrahot_root", str(_UH_ROOT)))
+            _margin  = float(_storage.get("staging_margin_gb", 50.0))
+            if _uh_root.exists():
+                try:
+                    _uh_free = free_gb(_uh_root)
+                    if _uh_free < 20:
+                        _add("CRITICAL", "environment",
+                             f"Ultrahot tier critically low: {_uh_free:.1f} GB free",
+                             detail=f"data_prep_tier=ultrahot but {_uh_root} has <20 GB free.",
+                             fix=f"du -sh {_uh_root}/* | sort -h")
+                    elif _uh_free < _margin:
+                        _add("WARNING", "environment",
+                             f"Ultrahot tier low: {_uh_free:.1f} GB free (margin={_margin:.0f} GB)",
+                             detail=f"staging_margin_gb={_margin:.0f} exceeds free space on {_uh_root}.")
+                except OSError:
+                    pass
+            else:
+                _add("WARNING", "environment",
+                     f"Ultrahot tier not mounted: {_uh_root}",
+                     detail="data_prep_tier=ultrahot but ultrahot_root does not exist.")
+    except Exception:
+        pass
+
     # ── venv ──────────────────────────────────────────────────────────────
     venv_python = TRAIN_DIR / ".venv" / "bin" / "python"
     if not venv_python.exists():
