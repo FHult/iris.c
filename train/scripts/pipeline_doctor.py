@@ -1814,11 +1814,16 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
             "hb_age_s": round(best_age) if best_age < float("inf") else None,
         }
 
-    # Active GPU-bound prep step: precompute / mine / validate
+    # Active GPU-bound prep step: dedupe_filter / precompute / mine / validate
     # These hold the GPU token and can't overlap with each other or with training.
     active_prep: Optional[dict] = None
     for c in chunks:
-        for step, process in [("precompute", "precompute"), ("mine", "mine_hard_examples"), ("validate", "validate")]:
+        for step, process in [
+            ("dedupe_filter", "dedupe_filter"),
+            ("precompute", "precompute"),
+            ("mine", "mine_hard_examples"),
+            ("validate", "validate"),
+        ]:
             if is_done(c, step) or has_error(c, step):
                 continue
             hb = read_heartbeat(process, c)

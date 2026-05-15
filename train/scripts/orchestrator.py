@@ -1248,7 +1248,6 @@ class Orchestrator:
                                f"--chunk {chunk} "
                                f"--conv-dir '{conv_dir}' "
                                f"--cold-root '{cold_root}'")
-        cmd = self._throttle_wrap(cmd)
         self._launch_prep(f"dedupe_filter chunk {chunk}", cmd, log_file,
                           chunk, "dedupe_filter", token="GPU_TOKEN")
 
