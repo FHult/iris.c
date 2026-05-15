@@ -309,3 +309,169 @@ Individual campaigns are managed by the orchestrator. This item is the layer abo
 `iris_metal.m` (~lines 3149–3151). Between Phase 2 (CPU softmax) and Phase 3 (scores @ V), the function unconditionally commits and resets `g_tensor_cmd` regardless of `g_tensor_batch_mode`. In batch mode this splits the attention's Phase 1 and Phase 3 across separate command buffers.
 
 **Investigation findings (2026-05-15):** The only call site is `iris_gpu_attention_bf16` (line 3293), which calls `iris_gpu_sync()` at line 3270 *before* entering, flushing any prior batch work. Phase 1 and Phase 3 being in separate command buffers is an inherent constraint of the CPU softmax — it cannot be avoided without a GPU softmax kernel. Ordering is fully maintained. Current risk: zero. Proper fix: implement GPU softmax to eliminate the CPU readback; medium effort, not needed until a future model requires true bf16 batch-mode attention across this path.
+
+---
+
+## Known Bugs — Pipeline Code Review 2026-05-15 (second pass)
+
+Found by full line-by-line agent review after the initial 32-bug pass. **0 of 14 fixed.**
+
+### CRITICAL
+
+**PIPE-C-001: GPU lock TOCTOU race — two GPU steps can run concurrently**
+`train/scripts/orchestrator.py` — `ResourceManager.request()`
+Calls `gpu_lock_holder() is None` then `acquire_gpu_lock(holder)` but ignores the return value. In the gap between check and call, another process can claim the lock. `self._holders[token]` is then set and `request()` returns `True` without the orchestrator actually holding the lock. Two GPU-intensive steps (precompute, training) run concurrently → OOM or model corruption.
+Fix: `if not acquire_gpu_lock(holder): return False` after the existing `gpu_lock_holder()` check.
+
+**PIPE-C-002: Post-training step error causes permanent pipeline deadlock**
+`train/scripts/orchestrator.py` — chunk prep gate
+`derive_chunk_state(N)` returns `ERROR` if ANY step for chunk N errors — including `mine`, `validate`, `archive` (post-training steps). The prep gate for chunk N+1 checks `derive_chunk_state(N) not in _training_or_later`; `ChunkState.ERROR` is not in `_training_or_later`, so chunk N+1 never starts prep. Once chunk N hits a permanent post-training error, the pipeline deadlocks silently — no doctor alert, no escalation.
+Fix: replace `derive_chunk_state(chunk-1) not in _training_or_later` with `not is_done(chunk-1, "train")`.
+
+**PIPE-C-003: Val set sentinel naming mismatch — unconditional re-download every invocation**
+`train/scripts/pipeline_ctl.py` line 435 vs `train/scripts/download_convert.py`
+`cmd_create_val_set` looks for `.converted/{idx:03d}.done` (with `.done` extension). `download_convert.py` writes `.converted/{idx:03d}` (no extension). The sentinel is never found → the val set triggers a fresh download and conversion on every `create-val-set` call, even when the pool already contains the converted tgz.
+Fix: remove `.done` suffix in `pipeline_ctl.py` line 435.
+
+**PIPE-C-004: Non-atomic CLIP embedding NPZ write — partial file silently skips dedup**
+`train/scripts/clip_dedup.py` line 325
+`np.savez(out_npz, ...)` writes directly to the output path. A crash mid-write leaves a partial `.npz`. On resume, the existence check passes → that shard is silently skipped in FAISS → its duplicates persist into training data.
+Fix: write to `{stem}.tmp`, call `np.savez(tmp_stem, ...)`, then `os.replace(tmp_stem + ".npz", out_npz)`.
+
+### HIGH
+
+**PIPE-H-001: Precompute manifest writes layers [9,18,27] but cache_manager uses [8,17,26]**
+`train/scripts/precompute_all.py` line 916 (manifest written to staging), `train/scripts/cache_manager.py` line 84 (`encoder_config_subset`)
+The manifest records `"layers": [9, 18, 27]` (1-indexed); the orchestrator's `_promote_chunk` computes the version hash using `"layers": [8, 17, 26]` (0-indexed). The hashes diverge → `pipeline_doctor` reports qwen3 cache as mismatched/incomplete on every run after precompute completes. False CRITICAL alerts degrade operator trust.
+Fix: change `"layers": [9, 18, 27]` to `"layers": [8, 17, 26]` in `precompute_all.py` line 916.
+
+**PIPE-H-002: `--new-shards-first` optimization always treats all shards as new**
+`train/scripts/precompute_all.py` — `_has_output` closure
+Checks for `{stem}.npz` but precomputed files are named `{stem}_{id:04d}.npz`. The checked file never exists → all shards always classified as "new" → `--max-shards` never skips already-covered shards → resume-after-crash re-processes the same shards instead of making forward progress.
+Fix: check for any file matching `{stem}_*.npz` pattern: `any(f.startswith(stem + "_") and f.endswith(".npz") for f in os.listdir(d))`.
+
+**PIPE-H-003: Cache-miss `continue` in training loop doesn't increment step counter**
+`train/train_ip_adapter.py` lines 1364–1378
+`continue` statements for VAE and text encoder cache misses skip the entire `for _grad_i in range(_n_grad_steps)` body. `step += 1` is inside that body. When precompute coverage is poor, `step` stagnates and the training loop never reaches `step >= _end_step` — it runs indefinitely, consuming GPU without making progress.
+Fix: add a skip counter; emit a warning after N consecutive skips; add a circuit breaker that exits with an error if skip rate exceeds 50% over 500 iterations.
+
+**PIPE-H-004: Mining uses fixed t=500 — biases hard-example selection**
+`train/scripts/mine_hard_examples.py` — `_eval_loss` and `_eval_loss_batch`
+Both use `t_int = mx.array([500], ...)`. Flow-matching loss is highly noise-level-dependent. Using only t=500 (the midpoint) ranks samples by difficulty at one timestep only — samples hard at low/high t but easy at t=500 (or vice versa) are systematically mis-ranked. The fixed t was introduced to make the single-record fallback consistent with the batch path; both are now wrong together.
+Fix: sample t from the logit-normal distribution matching training: `mx.clip((mx.sigmoid(mx.random.normal(shape=(B,))) * 1000).astype(mx.int32), 0, 999)`.
+
+**PIPE-H-005: Temp training config `/tmp/iris_train_chunk{N}_config.yaml` never cleaned up**
+`train/scripts/orchestrator.py` lines 1622–1628 (`_start_training`)
+The temp YAML is created but never stored as an instance attribute. No `finally` block or `_post_step` cleanup call. Files accumulate across chunks and reboots (until manual `/tmp` cleanup). Stale configs survive orchestrator restart — if chunk numbering is reused, a stale config could be overwritten in a timing gap.
+Fix: store the path as `self._active_train_tmp_cfg`; unlink in `_post_step` when `"train"` step completes or errors.
+
+**PIPE-H-006: Non-atomic converted tar write in download_convert.py**
+`train/scripts/download_convert.py` — `_convert_tgz`
+The output `.tar` is written directly to its final path. A crash mid-write leaves a partial file with no sentinel. If a concurrent `build_shards.py` running from the shared pool reads the partial file, it gets a truncated-archive error. A stale pool sentinel + partial tar causes the tgz to be silently skipped at Level 0, producing a corrupt converted file.
+Fix: write to `{idx:03d}.tar.tmp`, then `os.replace` to final path.
+
+### MEDIUM
+
+**PIPE-M-001: `filter_shards --start-idx` crashes on non-numeric shard stems**
+`train/scripts/filter_shards.py` line 293
+`int(os.path.splitext(os.path.basename(s))[0])` has no `try/except` around the `int()` conversion. Any non-numeric shard stem (WikiArt, LAION) causes a `ValueError` crash with no useful error message.
+Fix: wrap in a helper `_shard_idx(s) -> Optional[int]`; skip shards where it returns `None`.
+
+**PIPE-M-002: No existence check on cache dirs in mine_hard_examples**
+`train/scripts/mine_hard_examples.py` lines 390–391
+`os.listdir(args.qwen3_cache)` and `os.listdir(args.vae_cache)` called without checking the directories exist. Misconfiguration produces a generic `FileNotFoundError` with no indication of which argument is wrong.
+Fix: explicit check + `sys.exit(1)` with `"--qwen3-cache directory not found: {path}"` message.
+
+**PIPE-M-003: anchor_mix_ratio + hard_mix_ratio ≥ 1.0 produces nonsensical shard counts**
+`train/ip_adapter/dataset.py` lines 362–368
+`remaining_ratio = 1.0 - anchor_mix_ratio - hard_mix_ratio`. When sum ≥ 1.0, `remaining_ratio` ≤ 0; the `max(..., 0.01)` clamp makes `n_anchor` 20–100× the intended count. Training epoch is flooded with repeated anchor examples.
+Fix: validate at startup: `if anchor_mix_ratio + hard_mix_ratio >= 1.0: raise ValueError(...)`.
+
+**PIPE-M-004: Variable `max_seq` per batch triggers MLX graph retrace on long-caption batches**
+`train/ip_adapter/dataset.py` line 467
+`max_seq = max(max_actual, 512)`. If any caption exceeds 512 tokens, `max_seq > 512` for that batch. Rare long-caption batches produce a unique input shape → MLX retraces the graph (~5–15 seconds each) with no log indication. Warmed PSO graph cache does not cover these shapes.
+Fix: enforce a hard cap at tokenization time — truncate at 512 tokens and always pad to exactly 512.
+
+### LOW
+
+**PIPE-L-001: Mining docstring says "random t" but uses fixed t=500**
+`train/scripts/mine_hard_examples.py` — `_eval_loss` docstring
+Says "Random t for unbiased ranking" but implementation uses fixed t=500. Actively misleading.
+Fix: update docstring (or fix implementation per PIPE-H-004).
+
+**PIPE-L-002: Control file write is non-atomic — pause signal can be lost on a poll cycle**
+`train/scripts/orchestrator.py` line 2083
+`open(CONTROL_FILE, "w")` + `json.dump()` is not atomic. `_check_control_signals` catching `json.JSONDecodeError` on empty/partial read silently drops the pause signal for that cycle.
+Fix: write to `.tmp` + `os.replace`.
+
+**PIPE-L-003: EMA drift metric samples first-5 parameters by dict insertion order**
+`train/train_ip_adapter.py` lines 1564–1577
+`list(_flat_online)[:5]` — first 5 tensors by class definition order, which may be bias vectors rather than weight matrices. Drift signal is noisy and unrepresentative.
+Fix: sort by tensor size descending; sample top-5 largest.
+
+---
+
+## Known Bugs — Inference/Training Cross-Reference Review 2026-05-15
+
+Found by agent reviewing all C inference files against Python training/precompute code. **0 of 9 fixed.**
+
+### CRITICAL
+
+**INFER-C-001: Chat template mismatch — all precomputed Qwen3 embeddings are invalid**
+`train/scripts/precompute_all.py` lines 365–367
+`_encode_qwen3()` calls `tokenizer.apply_chat_template(..., add_generation_prompt=True)` **without** `enable_thinking=False`. The Jinja template only appends `<think>\n\n</think>\n\n` when `enable_thinking` is explicitly `False`; without the kwarg, the block is skipped.
+
+The C inference path (`iris_qwen3_tokenizer.c`, `qwen3_tokenize_chat`) always appends the think-tag tokens for Flux (when `skip_think_tags=0`). The live-encoding fallback in `train_ip_adapter.py` correctly passes `enable_thinking=False`.
+
+Result: precomputed `.npz` embeddings are computed from a token sequence 7 tokens shorter than what inference and live-training-encoding produce. All pad alignments are shifted. IP-adapter weights trained from the precomputed cache are misaligned with inference embeddings whenever the cache is used (the default fast path). **The entire existing precomputed cache must be regenerated after this fix.**
+
+Fix: add `enable_thinking=False` to `apply_chat_template` call in `precompute_all.py`; update the cache version hash in `cache_manager.py` to force regeneration.
+
+### HIGH
+
+**INFER-H-001: Strict aliasing UB in f32→f16 conversion in iris_metal.m**
+`iris_metal.m` line 932
+```c
+uint32_t bits = *(uint32_t *)&f32;
+```
+Type-puns `float *` to `uint32_t *` — undefined behavior under C strict aliasing rules. All BF16/F16 weight conversions at load time pass through this path. Silently miscompiles under LTO or aggressive auto-vectorization.
+Fix: `memcpy(&bits, &f32, sizeof(bits))`.
+
+### MEDIUM
+
+**INFER-M-001: Pad token embeddings differ between training (zeros) and inference (model output)**
+`train/scripts/precompute_all.py` line 404–405; `train/ip_adapter/dataset.py`
+Precompute saves only real tokens `h[j, :sl]`; dataloader zero-pads to 512. At inference, the full 512-token sequence runs through the model — pad positions produce non-zero hidden states (RMSNorm + attention + MLP still operate on them). Systematic discrepancy at every pad position beyond the real token count.
+Fix option A: save the full padded-to-512 embeddings from precompute (larger storage, exact inference match). Fix option B: zero out pad positions in the C inference path after the forward pass.
+
+**INFER-M-002: `iris_metal_sgemm_batch()` malloc not NULL-checked before use**
+`iris_metal.m` lines 1640–1657
+`cPtrs = malloc(batch_count * sizeof(...))` result is used immediately without a NULL check. Crash under memory pressure with no useful error message.
+Fix: add NULL check; return/abort with a descriptive error on failure.
+
+### LOW
+
+**INFER-L-001: Dead `len` mutation statements in `parse_json_string` second pass**
+`iris_qwen3_tokenizer.c` lines 227 and 232
+After `malloc(len + 1)` has been called, the second pass updates `len` on lines 227 and 232 but `len` is never read again. No overflow — just dead statements that mislead future readers.
+Fix: remove both dead `len` updates.
+
+**INFER-L-002: Dead f32 `apply_rope_2d` Metal kernel — PSO compiled but never dispatched**
+`iris_shaders.metal` lines 389–428; `iris_metal.m`
+The `apply_rope_2d` f32 kernel uses the half-split RoPE convention. Active code uses `apply_rope_2d_bf16` (consecutive-pair, correct). `g_rope_2d_pipeline` is compiled and allocated at shader init but never dispatched. Wastes Metal shader compile time and PSO memory.
+Fix: remove the kernel from `iris_shaders.metal` and associated init/dispatch code from `iris_metal.m`.
+
+**INFER-L-003: Dead `iris_apply_rope` and `iris_compute_rope_freqs` in iris_kernels.c**
+`iris_kernels.c` — `iris_apply_rope()` and `iris_compute_rope_freqs()`
+Implement the half-split RoPE convention. No callers anywhere in the codebase. Dead code that creates confusion about which RoPE convention is active (consecutive-pair is correct).
+Fix: remove both functions.
+
+**INFER-L-004: Dead low-level Metal functions in iris_metal.m**
+`iris_metal.m` / `iris_metal.h` — `iris_bf16_qk_rms_norm`, `iris_bf16_silu`, `iris_bf16_silu_mul`, `iris_metal_qk_rms_norm`
+Declared in `iris_metal.h`, defined in `iris_metal.m`, but have no callers internally or externally. The transformer uses the tensor-API wrappers instead.
+Fix: remove all four from `iris_metal.m` and their declarations from `iris_metal.h`.
+
+**INFER-L-005: iris_qwen3.h doc comment still says "layers 9, 18, 27"**
+`iris_qwen3.h` lines 100–101
+Comment says "Extracts hidden states from layers 9, 18, 27" but the constants are `QWEN3_OUTPUT_LAYER_1=8`, `_2=17`, `_3=26` and the code uses 0-indexed loop counters. Misleading to any reader cross-referencing with the HuggingFace convention.
+Fix: update comment to "Extracts hidden states at the output of loop iterations 8, 17, 26 (0-indexed, i.e. after `inner.layers[i]` runs)".
