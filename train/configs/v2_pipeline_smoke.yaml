@@ -72,7 +72,6 @@ storage:
   cold_root: "/Volumes/2TBSSD/smoke/cold"
   hot_root:  "/Volumes/2TBSSD"           # must match PIPELINE_DATA_ROOT
   converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # shared with production
-  dedup_pool: true          # run CLIP dedup on each pool tar after conversion (DEDUP-1)
   staging_margin_gb: 2
   cleanup_safety_gb: 1
   archive_after_chunk: true

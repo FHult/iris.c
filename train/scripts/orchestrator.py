@@ -158,8 +158,8 @@ class ChunkState(str):
     IDLE              = "IDLE"
     DOWNLOADING       = "DOWNLOADING"
     CONVERTING        = "CONVERTING"
+    DEDUP_FILTERING   = "DEDUP_FILTERING"
     BUILDING          = "BUILDING"
-    FILTERING         = "FILTERING"
     CLIP_EMBED        = "CLIP_EMBED"
     CLIP_INDEX        = "CLIP_INDEX"
     CLIP_DUPS         = "CLIP_DUPS"
@@ -178,8 +178,8 @@ class ChunkState(str):
 CHUNK_STEPS = [
     "download",
     "convert",
+    "dedupe_filter",
     "build_shards",
-    "filter_shards",
     "clip_embed",
     "clip_index",
     "clip_dups",
@@ -194,9 +194,9 @@ CHUNK_STEPS = [
 
 _STEP_TO_STATE = {
     "download":         ChunkState.CONVERTING,
-    "convert":          ChunkState.BUILDING,
-    "build_shards":     ChunkState.FILTERING,
-    "filter_shards":    ChunkState.CLIP_EMBED,
+    "convert":          ChunkState.DEDUP_FILTERING,
+    "dedupe_filter":    ChunkState.BUILDING,
+    "build_shards":     ChunkState.CLIP_EMBED,
     "clip_embed":       ChunkState.CLIP_INDEX,
     "clip_index":       ChunkState.CLIP_DUPS,
     "clip_dups":        ChunkState.PRECOMPUTING,
@@ -541,8 +541,8 @@ class Orchestrator:
 
     _PREP_LOG_PATTERNS = [
         "download_chunk{c}.log",
+        "dedupe_filter_chunk{c}.log",
         "build_chunk{c}.log",
-        "filter_chunk{c}.log",
         "clip_embed_chunk{c}.log",
         "clip_index_chunk{c}.log",
         "clip_dups_chunk{c}.log",
@@ -1029,8 +1029,8 @@ class Orchestrator:
         _state_to_step = {
             ChunkState.IDLE:             "download",
             ChunkState.CONVERTING:       "download",
+            ChunkState.DEDUP_FILTERING:  "dedupe_filter",
             ChunkState.BUILDING:         "build_shards",
-            ChunkState.FILTERING:        "filter_shards",
             ChunkState.CLIP_EMBED:       "clip_embed",
             ChunkState.CLIP_INDEX:       "clip_index",
             ChunkState.CLIP_DUPS:        "clip_dups",
@@ -1042,8 +1042,8 @@ class Orchestrator:
         }
         _step_log = {
             "download":         lambda c: LOG_DIR / f"download_chunk{c}.log",
+            "dedupe_filter":    lambda c: LOG_DIR / f"dedupe_filter_chunk{c}.log",
             "build_shards":     lambda c: LOG_DIR / f"build_chunk{c}.log",
-            "filter_shards":    lambda c: LOG_DIR / f"filter_chunk{c}.log",
             "clip_embed":       lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
             "clip_index":       lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
             "clip_dups":        lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
@@ -1053,7 +1053,7 @@ class Orchestrator:
             "mine":             lambda c: LOG_DIR / f"mine_chunk{c}.log",
             "validate":         lambda c: LOG_DIR / f"validate_chunk{c}.log",
         }
-        _GPU_STEPS  = {"precompute", "clip_embed", "training_warmup", "mine", "validate"}
+        _GPU_STEPS  = {"precompute", "clip_embed", "training_warmup", "mine", "validate", "dedupe_filter"}
         _DISK_STEPS = {"build_shards"}
         # Collect all chunks in a pending state, then pick the one whose log
         # file was most recently written — that is the step actually running.
@@ -1139,8 +1139,8 @@ class Orchestrator:
             ChunkState.IDLE:             self._start_download_convert,
             ChunkState.DOWNLOADING:      self._noop,  # wait for prep window
             ChunkState.CONVERTING:       self._noop,  # wait for prep window
+            ChunkState.DEDUP_FILTERING:  self._start_dedupe_filter,
             ChunkState.BUILDING:         self._start_build,
-            ChunkState.FILTERING:        self._start_filter,
             ChunkState.CLIP_EMBED:       self._start_clip_embed,
             ChunkState.CLIP_INDEX:       self._start_clip_index,
             ChunkState.CLIP_DUPS:        self._start_clip_dups,
@@ -1236,19 +1236,21 @@ class Orchestrator:
         self._launch_prep(f"build chunk {chunk}", cmd, log_file,
                           chunk, "build_shards", token="DISK_WRITE_HIGH")
 
-    def _start_filter(self, chunk: int) -> None:
-        if is_done(chunk, "filter_shards") or self._prep_busy():
-            return
-        training = self._training_active()
-        log_orch(f"Chunk {chunk}: filtering shards"
-                 + (" (throttled — training active)" if training else ""), chunk=chunk)
-        shard_dir = STAGING_DIR / f"chunk{chunk}" / "shards"
-        log_file  = LOG_DIR / f"filter_chunk{chunk}.log"
-        cmd = self._python_cmd("filter_shards.py",
-                               f"--shards '{shard_dir}' --chunk {chunk} --workers 1")
+    def _start_dedupe_filter(self, chunk: int) -> None:
+        if is_done(chunk, "dedupe_filter"): return
+        if not gpu_is_free() or self._prep_busy(): return
+        if not self.res.request("GPU_TOKEN", f"dedupe_filter chunk {chunk}"): return
+        log_orch(f"Chunk {chunk}: CLIP dedup-filter", chunk=chunk)
+        conv_dir  = STAGING_DIR / f"chunk{chunk}" / "converted" / "journeydb"
+        cold_root = Path(self.cfg.get("storage", {}).get("cold_root", str(COLD_ROOT)))
+        log_file  = LOG_DIR / f"dedupe_filter_chunk{chunk}.log"
+        cmd = self._python_cmd("dedupe_filter.py",
+                               f"--chunk {chunk} "
+                               f"--conv-dir '{conv_dir}' "
+                               f"--cold-root '{cold_root}'")
         cmd = self._throttle_wrap(cmd)
-        self._launch_prep(f"filter chunk {chunk}", cmd, log_file,
-                          chunk, "filter_shards")
+        self._launch_prep(f"dedupe_filter chunk {chunk}", cmd, log_file,
+                          chunk, "dedupe_filter", token="GPU_TOKEN")
 
     def _start_clip_embed(self, chunk: int) -> None:
         if is_done(chunk, "clip_embed"):
@@ -1906,9 +1908,9 @@ class Orchestrator:
         chunk = ap["chunk"]
         step  = ap["step"]
         _step_process = {
-            "download":     "download_convert",
-            "build_shards": "build_shards",
-            "filter_shards":"filter_shards",
+            "download":      "download_convert",
+            "dedupe_filter": "dedupe_filter",
+            "build_shards":  "build_shards",
             "clip_embed":      "clip_dedup",
             "clip_index":      "clip_dedup",
             "clip_dups":       "clip_dedup",

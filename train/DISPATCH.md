@@ -31,8 +31,9 @@ Active scripts (all in `train/scripts/`):
 | `orchestrator.py` | State machine — drives all pipeline steps end-to-end |
 | `download_convert.py` | Download + convert JDB tgzs (launched by orchestrator) |
 | `downloader.py` | Per-source download worker (imported by download_convert.py) |
+| `dedupe_filter.py` | Quality filter + CLIP dedup of converted tars (before build_shards) |
 | `build_shards.py` | Build unified WebDataset shards |
-| `filter_shards.py` | Quality filter shards (min size, caption length) |
+| `filter_shards.py` | Quality filter shards (standalone tool; not called by orchestrator) |
 | `clip_dedup.py` | CLIP embedding + FAISS dedup |
 | `precompute_all.py` | Qwen3 + VAE precompute in a single pass |
 | `mine_hard_examples.py` | Extract highest-loss records after each chunk |
@@ -51,7 +52,7 @@ Active scripts (all in `train/scripts/`):
 The orchestrator drives each chunk through these steps in sequence:
 
 ```
-IDLE → DOWNLOADING → CONVERTING → BUILDING → FILTERING
+IDLE → DOWNLOADING → CONVERTING → DEDUP_FILTERING → BUILDING
      → CLIP_EMBED → CLIP_INDEX → CLIP_DUPS
      → PRECOMPUTING → READY → VALIDATING_SHARDS → TRAINING_WARMUP
      → TRAINING → MINING → VALIDATING → ARCHIVING → DONE
@@ -185,7 +186,7 @@ For other steps, substitute the step name: `retry 1 precompute`, `retry 2 train`
 # Orchestrator:
 tail -f /Volumes/2TBSSD/logs/orchestrator.log
 
-# Current prep step (download, build, filter, precompute, etc.):
+# Current prep step (download, dedupe_filter, build, precompute, etc.):
 tail -f /Volumes/2TBSSD/logs/<step>_chunk1.log
 
 # Training:
@@ -309,7 +310,7 @@ dispatch_queue.jsonl              ← escalated alerts; shown at the bottom of p
 
 **Steps and their sentinel names** (in pipeline order):
 ```
-download, convert, build_shards, filter_shards,
+download, convert, dedupe_filter, build_shards,
 clip_embed, clip_index, clip_dups, precompute,
 promoted, validate_shards, training_warmup, train, mine, validate, archive
 ```
@@ -346,7 +347,7 @@ ls /Volumes/2TBSSD/pipeline/chunk1/
 | `trainer_chunk{N}.json` | `train_ip_adapter.py` | `step`, `total_steps`, `loss`, `grad_norm`, `eta_sec`, `siglip_coverage_pct`, `loss_cond`, `loss_null`, `ip_scale_mean`, `ip_scale_double`, `ip_scale_single` |
 | `build_shards_chunk{N}.json` | `build_shards.py` | `done`, `total`, `pct` |
 | `download_convert_chunk{N}.json` | `download_convert.py` | `done`, `total`, `pct`, `phase`, `current_tgz`, `dl_speed_mbps` |
-| `filter_shards_chunk{N}.json` | `filter_shards.py` | `done`, `total`, `pct` |
+| `dedupe_filter_chunk{N}.json` | `dedupe_filter.py` | `done`, `total`, `pct` |
 | `clip_dedup.json` | `clip_dedup.py` | `done`, `total`, `pct` (no chunk suffix in practice) |
 | `mine_hard_examples_chunk{N}.json` | `mine_hard_examples.py` | `done`, `total`, `pct` |
 | `stager_chunk{N}.json` | data stager | `done`, `total`, `pct`, `phase` (cold→hot staging, hot→cold archiving) |
@@ -392,8 +393,8 @@ print(f'{age:.0f}s ago — {d}')
 ```
 orchestrator.log              orchestrator main output
 download_chunk{N}.log         download + convert step
+dedupe_filter_chunk{N}.log    dedupe_filter step (quality filter + CLIP dedup of converted tars)
 build_chunk{N}.log            build_shards step
-filter_chunk{N}.log           filter_shards step
 clip_embed_chunk{N}.log       clip_dedup embed step
 clip_index_chunk{N}.log       clip_dedup build-index step
 clip_dups_chunk{N}.log        clip_dedup find-dups step
@@ -629,3 +630,30 @@ validation:
   cosine_threshold: 0.999
   warn_threshold: 0.99
 ```
+
+---
+
+## Pipeline Step Migration Notes
+
+### dedupe_filter replaces filter_shards (2026-05-16)
+
+**What changed:**
+- `dedupe_filter` step inserted between `convert` and `build_shards`.
+- `filter_shards` removed from the orchestrated pipeline (file kept for standalone use).
+- CLIP dedup removed from `download_convert.py` (was causing GPU contention with parallel training).
+
+**Why:** `download_convert` runs during training of the previous chunk. Running CLIP inside it caused GPU contention. `dedupe_filter` holds `GPU_TOKEN`, so it waits for training to finish before running.
+
+**What dedupe_filter does:**
+1. Quality filter (CPU): removes corrupt images, images < 256px, bad captions.
+2. CLIP dedup (GPU): embeds survivors, removes near-duplicates against cumulative FAISS index.
+3. Writes `{tar}.deduped` sentinel per tar (idempotent; resumes on restart).
+
+**Artifacts:**
+- Sentinel: `pipeline/chunk{N}/dedupe_filter.done`
+- Log: `dedupe_filter_chunk{N}.log`
+- Heartbeat: `dedupe_filter_chunk{N}.json` (fields: `done`, `total`, `pct`)
+
+**Resuming existing pipelines:** If a chunk already has `filter_shards.done` but not `dedupe_filter.done`, dedupe_filter will run on the converted tars. If `build_shards.done` already exists for that chunk, the chunk will proceed to `clip_embed` without needing `dedupe_filter.done` (since `build_shards` is the next step after `dedupe_filter` in the sequence; having `build_shards.done` means `dedupe_filter.done` is the implied prerequisite that was already satisfied by the old flow). To force a re-run of dedupe_filter, delete `build_shards.done` and `dedupe_filter.done` (if present) then let the orchestrator re-drive.
+
+**Blocklist wiring unchanged:** `build_shards.py --blocklist` still receives `cold_root/metadata/duplicate_ids.txt`. The `dedupe_filter` step writes duplicate IDs to the same blocklist path via `dedup_wds_tar()`, so the handoff is transparent.

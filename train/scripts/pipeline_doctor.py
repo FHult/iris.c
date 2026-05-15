@@ -1654,10 +1654,10 @@ def _check_pool_health(cfg: dict) -> None:
 
 # Log filenames for each pipeline step (must match orchestrator.py)
 _STEP_LOGS: dict[str, object] = {
-    "download":     lambda c: LOG_DIR / f"download_chunk{c}.log",
-    "build_shards": lambda c: LOG_DIR / f"build_chunk{c}.log",
-    "filter_shards":lambda c: LOG_DIR / f"filter_chunk{c}.log",
-    "clip_embed":   lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
+    "download":      lambda c: LOG_DIR / f"download_chunk{c}.log",
+    "dedupe_filter": lambda c: LOG_DIR / f"dedupe_filter_chunk{c}.log",
+    "build_shards":  lambda c: LOG_DIR / f"build_chunk{c}.log",
+    "clip_embed":    lambda c: LOG_DIR / f"clip_embed_chunk{c}.log",
     "clip_index":   lambda c: LOG_DIR / f"clip_index_chunk{c}.log",
     "clip_dups":    lambda c: LOG_DIR / f"clip_dups_chunk{c}.log",
     "precompute":      lambda c: LOG_DIR / f"precompute_chunk{c}.log",
@@ -1843,7 +1843,6 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         for step, process in [
             ("download", "download_convert"),
             ("build_shards", "build_shards"),
-            ("filter_shards", "filter_shards"),
         ]:
             hb = read_heartbeat(process, next_chunk)
             age = heartbeat_age_secs(process, next_chunk)

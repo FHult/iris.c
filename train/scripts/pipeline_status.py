@@ -39,7 +39,7 @@ try:
 except ImportError:
     _HAS_ORCH = False
     CHUNK_STEPS = [
-        "download", "convert", "build_shards", "filter_shards",
+        "download", "convert", "dedupe_filter", "build_shards",
         "clip_embed", "clip_index", "clip_dups", "precompute",
         "promoted", "validate_shards", "training_warmup",
         "train", "mine", "validate",
@@ -103,8 +103,8 @@ def _log_for_step(chunk: int, step: str) -> Path:
     mapping = {
         "download":     LOG_DIR / f"download_chunk{chunk}.log",
         "convert":      LOG_DIR / f"download_chunk{chunk}.log",
+        "dedupe_filter":LOG_DIR / f"dedupe_filter_chunk{chunk}.log",
         "build_shards": LOG_DIR / f"build_chunk{chunk}.log",
-        "filter_shards":LOG_DIR / f"filter_chunk{chunk}.log",
         "clip_embed":   LOG_DIR / f"clip_embed_chunk{chunk}.log",
         "clip_index":   LOG_DIR / f"clip_index_chunk{chunk}.log",
         "clip_dups":    LOG_DIR / f"clip_dups_chunk{chunk}.log",
@@ -321,10 +321,10 @@ def _step_is_executing(step: str, chunk: int, train_running: bool) -> bool:
 def _active_heartbeat_for(step: str, chunk: int) -> dict:
     if step in ("download", "convert"):
         return _worker_heartbeat("download_convert", chunk)
+    if step == "dedupe_filter":
+        return _worker_heartbeat("dedupe_filter", chunk)
     if step == "build_shards":
         return _worker_heartbeat("build_shards", chunk)
-    if step == "filter_shards":
-        return _worker_heartbeat("filter_shards", chunk)
     if step == "clip_embed":
         return _worker_heartbeat("clip_dedup", chunk)
     if step == "precompute":

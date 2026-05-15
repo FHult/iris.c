@@ -255,15 +255,6 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
              f"{len(already_done)} conv-pool hits; "
              f"download+convert {len(remaining)} tgzs ({start:03d}–{end:03d})")
 
-    # Pool-level dedup (DEDUP-1 Track 1): dedup each pool tar after conversion.
-    _dedup_pool = (conv_pool_enabled and
-                   config.get("storage", {}).get("dedup_pool", True))
-    if _dedup_pool:
-        _cold_root = Path(storage.get("cold_root", str(COLD_ROOT)))
-        _dedup_index    = _cold_root / "metadata" / "dedup_index.faiss"
-        _dedup_ids      = _cold_root / "metadata" / "dedup_index.ids"
-        _dedup_blocklist = _cold_root / "metadata" / "duplicate_ids.txt"
-
     ready_q: queue.Queue = queue.Queue()
     error_event = threading.Event()
     done_event  = threading.Event()
@@ -361,13 +352,6 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                             tgz_path.unlink()
                         log_event("download_convert", "conv_pool_write_cold_only",
                                   chunk=chunk, tgz=idx)
-                        if _dedup_pool:
-                            from clip_dedup import dedup_wds_tar as _dedup_wds_tar
-                            _pool_tar = out_dir / f"{idx:03d}.tar"
-                            _din, _dout = _dedup_wds_tar(
-                                _pool_tar, _dedup_index, _dedup_ids, _dedup_blocklist)
-                            log_orch(f"pool dedup tgz {idx:03d}: {_din} → {_dout} "
-                                     f"({_din-_dout} removed)")
                     else:
                         staging_tar = out_dir / f"{idx:03d}.tar"
                         _convert_tgz(tgz_path, out_dir, anno_path, chunk, idx)
@@ -388,12 +372,6 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                                     _atomic_copy_file(staging_tar, pool_tar)
                             conv_sentinel.touch()
                             log_event("download_convert", "conv_pool_write", chunk=chunk, tgz=idx)
-                            if _dedup_pool:
-                                from clip_dedup import dedup_wds_tar as _dedup_wds_tar
-                                _din, _dout = _dedup_wds_tar(
-                                    pool_tar, _dedup_index, _dedup_ids, _dedup_blocklist)
-                                log_orch(f"pool dedup tgz {idx:03d}: {_din} → {_dout} "
-                                         f"({_din-_dout} removed)")
 
                         # Remove raw tgz staging path; never delete pool file
                         if tgz_path.is_symlink() or tgz_path.exists():
