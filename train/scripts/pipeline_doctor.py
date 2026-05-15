@@ -245,15 +245,25 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
             if is_done(chunk, "precompute"):
                 siglip_on = cfg.get("training", {}).get("siglip", False)
                 subdirs = ["qwen3", "vae"] + (["siglip"] if siglip_on else [])
+                archived = is_done(chunk, "archive")
                 for subdir in subdirs:
                     clean, tmp = _count_precomp_for_chunk(chunk, subdir)
                     if clean == 0:
-                        _add("CRITICAL", "phantom",
-                             f"Chunk {chunk} precompute.done but 0 {subdir} NPZ files in production",
-                             detail=f"Expected NPZ files with chunk-{chunk} shard IDs in {PRECOMP_DIR}/{subdir}/",
-                             fix=f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done",
-                             chunk=chunk,
-                             ctx={"subdir": subdir, "clean_npz": 0, "tmp_npz": tmp})
+                        if archived:
+                            # NPZs moved to cold storage by stager archive — hot dir empty by design.
+                            _add("INFO", "phantom",
+                                 f"Chunk {chunk} {subdir} NPZs absent on hot (archived to cold)",
+                                 detail=f"archive.done present — NPZs were copied to cold storage "
+                                        f"and removed from {PRECOMP_DIR}/{subdir}/. This is expected.",
+                                 chunk=chunk,
+                                 ctx={"subdir": subdir, "clean_npz": 0, "archived": True})
+                        else:
+                            _add("CRITICAL", "phantom",
+                                 f"Chunk {chunk} precompute.done but 0 {subdir} NPZ files in production",
+                                 detail=f"Expected NPZ files with chunk-{chunk} shard IDs in {PRECOMP_DIR}/{subdir}/",
+                                 fix=f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done",
+                                 chunk=chunk,
+                                 ctx={"subdir": subdir, "clean_npz": 0, "tmp_npz": tmp})
                     elif tmp > 0:
                         _add("WARNING", "phantom",
                              f"Chunk {chunk} has {tmp} leftover .tmp.npz in precomputed/{subdir}",
@@ -312,6 +322,7 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                 next_chunk = chunk + 1
                 next_train_done    = is_done(next_chunk, "train")
                 next_train_active  = heartbeat_age_secs("trainer", next_chunk) is not None
+                is_last_chunk      = chunk == max(chunks)
                 if next_train_done or next_train_active:
                     _add("INFO", "phantom",
                          f"Chunk {chunk} mine.done but 0 hard-example files "
@@ -321,6 +332,14 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                                 f"This is expected after a restart-from-chunk or manual sentinel backfill.",
                          chunk=chunk,
                          ctx={"hard_ex_count": 0, "next_chunk_trained": True})
+                elif is_last_chunk:
+                    _add("INFO", "phantom",
+                         f"Chunk {chunk} mine.done but 0 hard-example files (last chunk — no consumer)",
+                         detail=f"Chunk {chunk} is the last configured chunk. "
+                                f"Hard examples from the final chunk have no next-chunk training run to "
+                                f"feed into, so an empty result is expected.",
+                         chunk=chunk,
+                         ctx={"hard_ex_count": 0, "next_chunk_trained": False, "is_last_chunk": True})
                 else:
                     _add("CRITICAL", "phantom",
                          f"Chunk {chunk} mine.done but 0 hard-example files",
@@ -422,10 +441,11 @@ def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
 
         lo, hi = _chunk_shard_range(chunk)
 
+        archived = is_done(chunk, "archive")
         for subdir in subdirs:
             clean, tmp = _count_precomp_for_chunk(chunk, subdir)
 
-            if is_done(chunk, "precompute") and clean < n_shards * 0.5:
+            if is_done(chunk, "precompute") and clean < n_shards * 0.5 and not archived:
                 pct = 100 * clean / n_shards if n_shards else 0
                 _add("WARNING", "precompute",
                      f"Chunk {chunk} {subdir} precompute coverage low: {clean} NPZ / {n_shards} shards ({pct:.0f}%)",
@@ -797,36 +817,34 @@ def _check_stager_health(chunks: list[int]) -> None:
                       "bytes_transferred": bytes_xfer, "stage_win_alive": True})
 
         # ── stage.done gate: chunk in TRAINING state but stage.done absent ──
-        # The orchestrator gates training for chunk N+1 on stage.done for chunk N.
-        # If a chunk has started training (train heartbeat is fresh) but the prior
-        # chunk's stage.done sentinel is missing, the gate was bypassed or the
-        # sentinel was deleted — and the stager may not be running.
+        # The orchestrator gates training for chunk N on chunk N's own stage.done
+        # (cold→hot staging of chunk N's precomputed data).  Chunk 1 is exempt
+        # (never gated on staging; its data is already on hot at pipeline start).
         if chunk > 1:
-            prev = chunk - 1
             thb_age = heartbeat_age_secs("trainer", chunk)
             training_active = (thb_age is not None and thb_age <= HEARTBEAT_STALE_SECS)
             if (training_active
-                    and not is_done(prev, "stage")
-                    and not has_error(prev, "stage")):
-                prev_shb = read_heartbeat("stager", prev)
-                prev_shb_age = heartbeat_age_secs("stager", prev)
-                stager_staging = (prev_shb is not None and prev_shb_age is not None
-                                  and prev_shb_age <= HEARTBEAT_STALE_SECS
-                                  and prev_shb.get("phase") == "stage")
+                    and not is_done(chunk, "stage")
+                    and not has_error(chunk, "stage")):
+                shb = read_heartbeat("stager", chunk)
+                shb_age = heartbeat_age_secs("stager", chunk)
+                stager_staging = (shb is not None and shb_age is not None
+                                  and shb_age <= HEARTBEAT_STALE_SECS
+                                  and shb.get("phase") == "stage")
                 if not stager_staging:
                     _add("CRITICAL", "stager",
-                         f"Chunk {chunk} training active but chunk {prev} stage.done is missing and stager not staging",
-                         detail=(f"The orchestrator should gate chunk {chunk} training on chunk {prev} "
-                                 f"stage.done. Either the gate was skipped or the stager crashed "
-                                 f"without writing the sentinel. Precomputed data for chunk {chunk} "
-                                 f"may not have been staged to the hot volume."),
+                         f"Chunk {chunk} training active but stage.done is missing and stager not staging",
+                         detail=(f"The orchestrator gates chunk {chunk} training on chunk {chunk}/stage.done "
+                                 f"(cold→hot staging of precomputed data). Either the gate was skipped or "
+                                 f"the stager crashed without writing the sentinel. Training data for "
+                                 f"chunk {chunk} may not have been staged to the hot volume."),
                          fix=(f"# Verify hot-volume contents, then if staging was actually done:\n"
-                              f"touch {SENTINEL_DIR}/chunk{prev}/stage.done\n"
-                              f"# Or restart staging for chunk {prev}:\n"
-                              f"python train/scripts/data_stager.py stage --chunk {prev}"),
+                              f"touch {SENTINEL_DIR}/chunk{chunk}/stage.done\n"
+                              f"# Or restart staging for chunk {chunk}:\n"
+                              f"python train/scripts/data_stager.py stage --chunk {chunk}"),
                          chunk=chunk,
-                         ctx={"prev_chunk": prev, "stage_done_missing": True,
-                              "stager_hb_age_s": round(prev_shb_age) if prev_shb_age is not None else None})
+                         ctx={"stage_done_missing": True,
+                              "stager_hb_age_s": round(shb_age) if shb_age is not None else None})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1120,9 +1138,18 @@ def _check_dispatch_queue() -> None:
     def _step_now_done(entry: dict) -> bool:
         chunk = entry.get("chunk")
         process = entry.get("process", "")
-        if chunk is None or not process:
+        eid    = entry.get("id", "")
+        if chunk is None:
             return False
-        return is_done(chunk, process)
+        # Standard sentinel check: is the flagged step's .done file present?
+        if process and is_done(chunk, process):
+            return True
+        # Stager stale alerts: suppress when archive.done or stage.done is present,
+        # since the stager completed even if the heartbeat went cold.
+        if eid.startswith("stager_stale_"):
+            if is_done(chunk, "archive") or is_done(chunk, "stage"):
+                return True
+        return False
 
     open_issues = [e for e in open_issues if not _step_now_done(e)]
 
