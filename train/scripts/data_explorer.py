@@ -55,6 +55,8 @@ from pipeline_lib import (
     COLD_WEIGHTS_DIR,
     COLD_METADATA_DIR,
     ABLATION_DB_PATH,
+    ULTRAHOT_ROOT,
+    ULTRAHOT_MANIFEST,
 )
 
 # Lazy imports — these modules may be absent in minimal environments
@@ -1112,6 +1114,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
     except PermissionError:
         pass
 
+    # ── Ultrahot tier ──────────────────────────────────────────────────────
+    ultrahot_root = Path(storage.get("ultrahot_root", ULTRAHOT_ROOT))
+    ultrahot_manifest: Optional[dict] = None
+    ultrahot_free: Optional[float] = None
+    if ultrahot_root.exists():
+        ultrahot_free = _free_gb_cold(ultrahot_root)
+        manifest_path = ultrahot_root / "manifest.json"
+        if manifest_path.exists():
+            try:
+                ultrahot_manifest = json.loads(manifest_path.read_text())
+            except (ValueError, OSError):
+                pass
+
     # ── Parallel du for sizes ──────────────────────────────────────────────
     _du_paths: list[Path] = []
     for sub in ("shards", "precomputed", "checkpoints", "anchor_shards",
@@ -1134,6 +1149,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
         p = cold_root / sub
         if p.exists():
             _du_paths.append(p)
+    for sub in ("weights", "precomputed", "curated_shards"):
+        p = ultrahot_root / sub
+        if p.exists():
+            _du_paths.append(p)
 
     _sizes: dict[str, Optional[int]] = {}
     with ThreadPoolExecutor(max_workers=10) as _pool:
@@ -1150,8 +1169,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
     result: dict[str, Any] = {
         "ok": True,
         "disk": {
-            "cold_free_gb": round(cold_free, 1) if cold_free is not None else None,
-            "hot_free_gb":  round(hot_free,  1) if hot_free  is not None else None,
+            "cold_free_gb":     round(cold_free,     1) if cold_free     is not None else None,
+            "hot_free_gb":      round(hot_free,       1) if hot_free      is not None else None,
+            "ultrahot_free_gb": round(ultrahot_free,  1) if ultrahot_free is not None else None,
+        },
+        "ultrahot": {
+            "root":           str(ultrahot_root),
+            "mounted":        ultrahot_root.exists(),
+            "manifest":       ultrahot_manifest,
         },
         "pools": {
             "raw_pool":       {"root": raw_pool_root,  "downloaded": _pool_count(raw_pool_root,  ".downloaded")},
@@ -1324,6 +1349,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # Loose DB / metadata files
         if hot_db_files:
             print(f"    " + "  ".join(hot_db_files))
+
+    # ── ULTRAHOT ──────────────────────────────────────────────────────────
+    if ultrahot_root.exists():
+        _disk_header("UHOT", ultrahot_root)
+        if ultrahot_manifest:
+            ckpt = Path(ultrahot_manifest.get("checkpoint", "")).name
+            promoted_at = ultrahot_manifest.get("promoted_at", "")[:19]
+            chunk_n     = ultrahot_manifest.get("chunk", "?")
+            ver_map     = ultrahot_manifest.get("precompute_version", {})
+            ver_str     = "  ".join(f"{e}={v}" for e, v in ver_map.items()) if ver_map else "—"
+            print(f"    checkpoint: {ckpt}  chunk={chunk_n}  promoted={promoted_at}")
+            print(f"    precompute: {ver_str}")
+            for sub in ("weights", "precomputed", "curated_shards"):
+                p = ultrahot_root / sub
+                if p.exists():
+                    print(f"    {sub + '/':<26} {_sz(p):>7}")
+        else:
+            print(f"    (not yet promoted — run: data_stager.py promote --chunk N)")
+    else:
+        print(f"\n  UHOT  {ultrahot_root}  (not present — will be created on first promote)")
 
     # ── TRAINING READINESS ────────────────────────────────────────────────
     if all_chunks:

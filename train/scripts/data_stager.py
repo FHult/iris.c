@@ -104,8 +104,9 @@ class DataStager:
     def __init__(self, cfg: dict) -> None:
         storage = cfg.get("storage", {})
 
-        self.cold_root = Path(storage.get("cold_root", DATA_ROOT)).resolve()
-        self.hot_root  = Path(storage.get("hot_root",  DATA_ROOT)).resolve()
+        self.cold_root     = Path(storage.get("cold_root",     DATA_ROOT)).resolve()
+        self.hot_root      = Path(storage.get("hot_root",      DATA_ROOT)).resolve()
+        self.ultrahot_root = Path(storage.get("ultrahot_root", Path.home() / "ultrahot")).resolve()
 
         self.staging_margin_gb   = float(storage.get("staging_margin_gb",   50.0))
         self.cleanup_safety_gb   = float(storage.get("cleanup_safety_gb",   20.0))
@@ -570,6 +571,135 @@ class DataStager:
             except Exception as exc:
                 log.warning("Failed to archive %s: %s", db_name, exc)
 
+    def promote_to_ultrahot(self, chunk: int) -> dict:
+        """Copy active checkpoint + precompute version to the Ultrahot tier.
+
+        Writes atomically: all files go to ultrahot_root/.staging/, then the
+        staging dir is renamed into place so the web app never sees partial state.
+        Updates ultrahot_root/manifest.json with checkpoint path and version.
+
+        Returns summary dict; raises on failure.
+        """
+        from datetime import datetime, timezone
+
+        # Find the active checkpoint: prefer cold best/, fall back to hot best.
+        best_cold = self._cold_weights / "best"
+        hot_best  = self._hot_ckpts / "best.safetensors"
+        ckpt_src: Optional[Path] = None
+        if best_cold.exists():
+            # Pick the cond_gap symlink if available, else any .safetensors.
+            for name in ("cond_gap.safetensors", "loss.safetensors"):
+                candidate = best_cold / name
+                if candidate.exists():
+                    ckpt_src = candidate.resolve()
+                    break
+            if ckpt_src is None:
+                for f in sorted(best_cold.glob("*.safetensors")):
+                    if f.exists():
+                        ckpt_src = f.resolve()
+                        break
+        if ckpt_src is None and hot_best.exists():
+            ckpt_src = hot_best.resolve()
+        if ckpt_src is None:
+            raise FileNotFoundError("No checkpoint found in cold best/ or hot best.safetensors")
+
+        # Determine active precompute version per encoder.
+        precomp_versions: dict[str, str] = {}
+        for enc in _ENCODERS:
+            cur = self._hot_precomp / enc / "current"
+            if cur.is_symlink():
+                precomp_versions[enc] = cur.resolve().name
+            else:
+                cold_cur = self._cold_precomp / enc / "current"
+                if cold_cur.is_symlink():
+                    precomp_versions[enc] = cold_cur.resolve().name
+
+        uh = self.ultrahot_root
+        staging = uh / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+
+        bytes_copied = 0
+
+        # Copy checkpoint and its JSON sidecar.
+        dst_ckpt = staging / "weights" / "current.safetensors"
+        dst_ckpt.parent.mkdir(parents=True, exist_ok=True)
+        bytes_copied += _atomic_copy_file(ckpt_src, dst_ckpt)
+        ckpt_json = ckpt_src.with_suffix(".json")
+        if ckpt_json.exists():
+            bytes_copied += _atomic_copy_file(ckpt_json, dst_ckpt.with_suffix(".json"))
+
+        # Copy precompute current dirs per encoder (or symlink if same device).
+        precomp_copied = 0
+        uh_same_dev = uh.exists() and self._hot_precomp.exists() and _same_device(uh, self.hot_root)
+        for enc, ver in precomp_versions.items():
+            src_ver = self._hot_precomp / enc / ver
+            if not src_ver.exists():
+                src_ver = self._cold_precomp / enc / ver
+            if not src_ver.exists():
+                continue
+            dst_enc = staging / "precomputed" / enc
+            dst_ver = dst_enc / ver
+            dst_ver.mkdir(parents=True, exist_ok=True)
+            if uh_same_dev:
+                _atomic_symlink(dst_enc / "current", ver)
+                for f in src_ver.glob("*"):
+                    lnk = dst_ver / f.name
+                    if not lnk.exists():
+                        os.symlink(os.path.relpath(f.resolve(), dst_ver), lnk)
+            else:
+                with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
+                    futs = {
+                        pool.submit(_atomic_copy_file, f, dst_ver / f.name): f
+                        for f in src_ver.glob("*") if f.is_file()
+                    }
+                    for fut in as_completed(futs):
+                        try:
+                            bytes_copied += fut.result()
+                            precomp_copied += 1
+                        except Exception as exc:
+                            log.warning("Precompute copy failed for %s: %s", futs[fut], exc)
+                _atomic_symlink(dst_enc / "current", ver)
+
+        # Write manifest.
+        manifest = {
+            "checkpoint":        str(ckpt_src),
+            "chunk":             chunk,
+            "precompute_version": precomp_versions,
+            "promoted_at":       datetime.now(timezone.utc).isoformat(),
+            "bytes_copied":      bytes_copied,
+        }
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+        # Atomic rename: .staging → live dirs.
+        # Move each subdir of staging into place; rename manifest last.
+        for subdir in ("weights", "precomputed"):
+            src_sub = staging / subdir
+            if not src_sub.exists():
+                continue
+            dst_sub = uh / subdir
+            if dst_sub.exists():
+                old = uh / f".old_{subdir}_{os.getpid()}"
+                os.rename(dst_sub, old)
+                shutil.rmtree(old, ignore_errors=True)
+            os.rename(src_sub, dst_sub)
+        manifest_dst = uh / "manifest.json"
+        os.replace(staging / "manifest.json", manifest_dst)
+        # Clean up empty staging dir.
+        try:
+            staging.rmdir()
+        except OSError:
+            pass
+
+        summary = {
+            "checkpoint": str(ckpt_src),
+            "precompute_versions": precomp_versions,
+            "bytes_copied": bytes_copied,
+            "precomp_files_copied": precomp_copied,
+        }
+        log.info("Promoted chunk %d to Ultrahot tier: %s", chunk, ckpt_src.name)
+        _log("promote_done", chunk, **summary)
+        return summary
+
     # ------------------------------------------------------------------
     # Transfer primitives
     # ------------------------------------------------------------------
@@ -711,6 +841,16 @@ def cmd_status(args) -> None:
     print(json.dumps(s.status(), indent=indent))
 
 
+def cmd_promote(args) -> None:
+    s = _build_stager(args)
+    try:
+        result = s.promote_to_ultrahot(args.chunk)
+        print(json.dumps(result, indent=2))
+    except Exception as exc:
+        log.error("Promote chunk %d to Ultrahot failed: %s", args.chunk, exc)
+        sys.exit(1)
+
+
 def main() -> None:
     import argparse
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -726,6 +866,10 @@ def main() -> None:
     p_arch = sub.add_parser("archive", help="Archive chunk data (hot → cold)")
     p_arch.add_argument("--chunk", type=int, required=True)
     p_arch.set_defaults(func=cmd_archive)
+
+    p_prom = sub.add_parser("promote", help="Promote best checkpoint to Ultrahot tier")
+    p_prom.add_argument("--chunk", type=int, required=True)
+    p_prom.set_defaults(func=cmd_promote)
 
     p_stat = sub.add_parser("status", help="Show stager status")
     p_stat.add_argument("--ai", action="store_true",

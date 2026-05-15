@@ -1444,6 +1444,41 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
         except OSError:
             pass
 
+    # PIPELINE-30: Ultrahot tier promotion staleness
+    from pipeline_lib import ULTRAHOT_ROOT
+    ultrahot_root = Path(storage.get("ultrahot_root", str(ULTRAHOT_ROOT)))
+    if not ultrahot_root.exists():
+        return  # Ultrahot not set up yet — skip
+    manifest_path = ultrahot_root / "manifest.json"
+    best_dir = cold_root / "weights" / "best"
+    if best_dir.exists():
+        # Find newest mtime among cold best/*.safetensors
+        cold_best_mtime: Optional[float] = None
+        try:
+            for f in best_dir.glob("*.safetensors"):
+                if f.exists():
+                    mt = f.stat().st_mtime
+                    if cold_best_mtime is None or mt > cold_best_mtime:
+                        cold_best_mtime = mt
+        except OSError:
+            cold_best_mtime = None
+
+        if cold_best_mtime is not None:
+            uh_mtime: Optional[float] = None
+            try:
+                uh_mtime = manifest_path.stat().st_mtime if manifest_path.exists() else None
+            except OSError:
+                pass
+            if uh_mtime is None or cold_best_mtime > uh_mtime:
+                stale_h = round((cold_best_mtime - (uh_mtime or 0)) / 3600, 1)
+                done_chunks = [c for c in chunks if is_done(c, "train")]
+                last_chunk = done_chunks[-1] if done_chunks else 1
+                _add("WARNING", "cold_storage",
+                     "Cold best checkpoint is newer than Ultrahot tier — promotion needed",
+                     detail="Run data_stager.py promote to push latest weights to Ultrahot tier.",
+                     fix=f"train/.venv/bin/python train/scripts/data_stager.py promote --chunk {last_chunk}",
+                     ctx={"stale_h": stale_h, "manifest_exists": manifest_path.exists()})
+
 
 def _check_val_set(cfg: dict) -> None:
     """Verify the held-out validation set exists on cold and is staged to hot."""

@@ -52,6 +52,14 @@ COLD_VAL_PRECOMP_DIR = COLD_VAL_DIR / "precomputed"
 
 VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
 VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
+# Ultrahot tier — internal NVMe, lowest-latency serving path for the web app.
+# Populated by data_stager.py promote_to_ultrahot(); never written by training.
+ULTRAHOT_ROOT      = Path("/Users/fredrikhult/ultrahot")
+ULTRAHOT_WEIGHTS   = ULTRAHOT_ROOT / "weights"
+ULTRAHOT_PRECOMP   = ULTRAHOT_ROOT / "precomputed"
+ULTRAHOT_CURATED   = ULTRAHOT_ROOT / "curated_shards"
+ULTRAHOT_PREP_DIR  = ULTRAHOT_ROOT / "prep"
+ULTRAHOT_MANIFEST  = ULTRAHOT_ROOT / "manifest.json"
 GPU_LOCK_FILE     = DATA_ROOT / ".gpu_lock"
 RUN_METADATA_FILE = DATA_ROOT / "run_metadata.json"
 
