@@ -102,14 +102,14 @@ Cold storage is not a backup or overflow — it is the primary accumulator of sy
 
 Three-tier design (target state — current system is hot + cold only):
 
-- **Inference tier** (internal NVMe SSD, ~2–8 TB) — lowest-latency path for the live inference server and web app. Holds only the active weights and embeddings needed to serve requests. Populated by the stager from hot; never written to by training.
+- **Ultrahot tier** (internal NVMe SSD, ~2–8 TB) — lowest-latency path for the live inference server and web app. Holds only the active weights and embeddings needed to serve requests. Populated by the stager from hot; never written to by training.
 - **Hot storage** (`/Volumes/2TBSSD`, 2 TB TB5 SSD) — fast working area for the active + next compute window only. Pipeline reads shards, precompute, and weights from here during training.
 - **Cold storage** (`/Volumes/16TBCold`, 16 TB spinning disk) — source of truth and long-term knowledge base. Never auto-deleted by pipeline operations.
 
 **JIT Data Stager** manages all directions:
 - **Cold → Hot (staging):** before a compute window, stages raw data, precompute, and weights from cold to hot. Uses symlinks when on the same filesystem (near-instant); atomic copies across filesystems. `_check_hot_space()` enforces `staging_margin_gb` before any transfer.
 - **Hot → Cold (archiving):** after a successful run, archives newly generated precompute embeddings, weight checkpoints, and per-campaign telemetry to cold. This is the write path — without it, cold never grows and warm-starts never improve.
-- **Hot → Inference (promote):** after archiving, copies or symlinks the active checkpoint + its precompute version to the inference tier so the web app picks up new weights without restarting.
+- **Hot → Inference (promote):** after archiving, copies or symlinks the active checkpoint + its precompute version to the Ultrahot tier so the web app picks up new weights without restarting.
 
 All directions are first-class operations. Staging populates the working set; archiving accumulates the knowledge; promotion makes results live. See **PIPELINE-30** for implementation.
 
@@ -293,41 +293,41 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ---
 
-**PIPELINE-30: Inference tier — three-tier storage with internal NVMe as serving layer** (Medium priority, pre-web-app)
+**PIPELINE-30: Ultrahot tier — three-tier storage with internal NVMe as serving layer** (Medium priority, pre-web-app)
 
 Add a third storage tier for the inference server and web app. The internal NVMe SSD becomes the lowest-latency path; hot (external SSD) remains the training working area; cold (HDD) remains the knowledge base.
 
-**Motivation:** serving requests from the external SSD introduces USB-C bus latency and contention with pipeline I/O. The internal NVMe gives 2–3× lower latency for model weight reads and keeps inference bandwidth independent of training I/O.
+**Motivation:** serving requests from the external SSD introduces USB-C bus latency and contention with pipeline I/O. The internal NVMe gives 2–3× lower latency for model weight reads and keeps Ultrahot bandwidth independent of training I/O.
 
 **Config changes** — add to `storage:` block:
 ```yaml
 storage:
-  inference_root: /path/to/internal/nvme   # e.g. /Users/fredrikhult/inference
+  ultrahot_root: /path/to/internal/nvme   # e.g. /Users/fredrikhult/ultrahot
   # existing keys unchanged
   hot_root: /Volumes/2TBSSD
   cold_root: /Volumes/16TBCold
 ```
 
-**`train/scripts/pipeline_lib.py`** — add `INFERENCE_ROOT` constant alongside `COLD_ROOT`.
+**`train/scripts/pipeline_lib.py`** — add `ULTRAHOT_ROOT` constant alongside `COLD_ROOT`.
 
-**`train/scripts/data_stager.py`** — add `promote_to_inference(chunk)`:
-- Copies/symlinks active checkpoint (`cold_root/weights/best/*.safetensors`) to `inference_root/weights/current.safetensors`.
-- Copies/symlinks active precompute version dirs from hot to `inference_root/precomputed/{enc}/current` (symlinks if same filesystem, copies otherwise).
-- Writes `inference_root/manifest.json`: `{"checkpoint": "...", "precompute_version": "v_xxx", "promoted_at": "..."}` — lets the web app detect weight updates without polling the file directly.
-- Atomic: writes to a `inference_root/.staging/` dir, then renames into place so the web app never sees a partial state.
+**`train/scripts/data_stager.py`** — add `promote_to_ultrahot(chunk)`:
+- Copies/symlinks active checkpoint (`cold_root/weights/best/*.safetensors`) to `ultrahot_root/weights/current.safetensors`.
+- Copies/symlinks active precompute version dirs from hot to `ultrahot_root/precomputed/{enc}/current` (symlinks if same filesystem, copies otherwise).
+- Writes `ultrahot_root/manifest.json`: `{"checkpoint": "...", "precompute_version": "v_xxx", "promoted_at": "..."}` — lets the web app detect weight updates without polling the file directly.
+- Atomic: writes to a `ultrahot_root/.staging/` dir, then renames into place so the web app never sees a partial state.
 - Called by `archive_chunk()` after `_archive_dbs()`.
 
-**`train/scripts/data_explorer.py status`** — add inference tier row showing:
+**`train/scripts/data_explorer.py status`** — add Ultrahot tier row showing:
 - Inference root path and free GB.
 - Active checkpoint name + promoted-at timestamp from `manifest.json`.
 - Precompute version per encoder (from `manifest.json`).
 - `stale` flag if `promoted_at` is >2 chunks old (new weights exist in cold but inference hasn't been updated).
 
-**`train/scripts/pipeline_doctor.py`** — add WARNING if `cold_root/weights/best/` symlink target is newer than `inference_root/manifest.json`'s `promoted_at` (i.e., stager archived a better checkpoint but never promoted it to inference).
+**`train/scripts/pipeline_doctor.py`** — add WARNING if `cold_root/weights/best/` symlink target is newer than `ultrahot_root/manifest.json`'s `promoted_at` (i.e., stager archived a better checkpoint but never promoted it to Ultrahot).
 
-**Layout on inference tier:**
+**Layout on Ultrahot tier:**
 ```
-{inference_root}/
+{ultrahot_root}/
   weights/
     current.safetensors    ← active checkpoint (copy or symlink)
     current.json           ← sidecar with metrics
@@ -342,9 +342,9 @@ storage:
 
 ---
 
-**PIPELINE-31: Inference-tier data prep — use internal NVMe for speed-critical small/experimental runs** (Medium priority)
+**PIPELINE-31: Ultrahot-tier data prep — use internal NVMe for speed-critical small/experimental runs** (Medium priority)
 
-The internal NVMe SSD (PIPELINE-30's inference tier) is 2–3× faster than the external hot SSD for random I/O. For disk-IO-bound steps — `download_convert`, `build_shards`, `filter_shards`, and `precompute` — running entirely on the internal NVMe can dramatically shorten the feedback loop for smoke and dev runs.
+The internal NVMe SSD (PIPELINE-30's Ultrahot tier) is 2–3× faster than the external hot SSD for random I/O. For disk-IO-bound steps — `download_convert`, `build_shards`, `filter_shards`, and `precompute` — running entirely on the internal NVMe can dramatically shorten the feedback loop for smoke and dev runs.
 
 **Motivation:** today the full data prep pipeline (convert → build_shards → filter_shards → precompute) always uses hot (`/Volumes/2TBSSD`). For a smoke run (100 steps, 1 chunk, 1 tgz) this pipeline is the bottleneck — precompute of ~7,000 records at 145ms/record is ~17 min. On the faster internal NVMe that same I/O runs proportionally faster. Inference/precompute are already on the critical path before every training run; shaving this matters more than training-loop speed for iteration cadence.
 
@@ -359,47 +359,47 @@ The internal NVMe SSD (PIPELINE-30's inference tier) is 2–3× faster than the 
 
 **Current constraint:** internal NVMe has only ~52 GB free (88% used by inference weights and web app assets). To use this path even at smoke scale, ~30 GB must first be cleared. `data_explorer.py diagnose` (DATAMGMT-1) is the right tool to identify what can be moved. The implementation should be forward-looking for when more space is available (or when larger internal NVMe hardware is added).
 
-**Practical target:** `inference` tier is viable for dev/smoke runs and single-chunk small experiments. Medium and above should remain on hot. The system should warn when the selected scale exceeds the tier's available space rather than failing mid-run.
+**Practical target:** `ultrahot` tier is viable for dev/smoke runs and single-chunk small experiments. Medium and above should remain on hot. The system should warn when the selected scale exceeds the tier's available space rather than failing mid-run.
 
 **Config changes** — add `data_prep_tier` key to `storage:` block:
 ```yaml
 storage:
-  data_prep_tier: hot            # hot (default) | inference
+  data_prep_tier: hot            # hot (default) | ultrahot
   # All existing keys unchanged
   hot_root:  /Volumes/2TBSSD
   cold_root: /Volumes/16TBCold
-  inference_root: /Users/fredrikhult/inference  # from PIPELINE-30
+  ultrahot_root: /Users/fredrikhult/ultrahot  # from PIPELINE-30
 ```
 
-**CLI optionality** — all data prep scripts accept `--data-tier {hot,inference}` flag that overrides the config value. No flag = read from config = default to `hot`. This keeps default behavior completely unchanged.
+**CLI optionality** — all data prep scripts accept `--data-tier {hot,ultrahot}` flag that overrides the config value. No flag = read from config = default to `hot`. This keeps default behavior completely unchanged.
 
 Scripts affected:
-- `download_convert.py`: `--data-tier` routes output to `hot_root` or `inference_root`
+- `download_convert.py`: `--data-tier` routes output to `hot_root` or `ultrahot_root`
 - `build_shards.py`: `--data-tier` controls where shard output lands
 - `filter_shards.py` / `shard_scorer.py`: reads + writes from the active tier
 - `precompute.py` / `cache_manager.py`: version dirs land on the active tier
-- `data_stager.py stage`: when `data_prep_tier=inference`, staging reads from cold and writes to inference root instead of hot root (the existing stage flow, different destination)
+- `data_stager.py stage`: when `data_prep_tier=ultrahot`, staging reads from cold and writes to Ultrahot root instead of hot root (the existing stage flow, different destination)
 
-**Archiving** — after a successful inference-tier run, the standard archive flow copies results back to cold. PIPELINE-29's `archive_chunk()` already handles hot→cold; extend it with an `inference→cold` path that mirrors the same logic. Inference-tier data is treated as ephemeral working area (same as hot); cold is still the source of truth.
+**Archiving** — after a successful Ultrahot-tier run, the standard archive flow copies results back to cold. PIPELINE-29's `archive_chunk()` already handles hot→cold; extend it with an `Ultrahot→cold` path that mirrors the same logic. Ultrahot-tier data is treated as ephemeral working area (same as hot); cold is still the source of truth.
 
-**Space guard** — before any inference-tier prep begins, compute the expected peak disk usage from the pipeline config's tgz range and scale, compare against `shutil.disk_usage(inference_root).free`, and abort with a clear message if space is insufficient (margin configurable, default 20 GB).
+**Space guard** — before any Ultrahot-tier prep begins, compute the expected peak disk usage from the pipeline config's tgz range and scale, compare against `shutil.disk_usage(ultrahot_root).free`, and abort with a clear message if space is insufficient (margin configurable, default 20 GB).
 
-**Doctor integration** — when `data_prep_tier=inference`, `pipeline_doctor.py` includes inference-tier free space in its disk summary and warns if free space is below `staging_margin_gb`.
+**Doctor integration** — when `data_prep_tier=ultrahot`, `pipeline_doctor.py` includes Ultrahot-tier free space in its disk summary and warns if free space is below `staging_margin_gb`.
 
-**When to use inference tier:**
+**When to use Ultrahot tier:**
 - Dev / smoke sanity runs (30 min wall-clock or less end-to-end)
 - Ablation harness short runs (precompute already done, just need build_shards for new filter config)
 - Single-chunk experiments with non-standard data slices
 - Precompute re-runs after encoder update (CPU-bound, not I/O-bound — benefit smaller but still positive)
 
-**When NOT to use inference tier:**
+**When NOT to use Ultrahot tier:**
 - Multi-chunk production runs at small scale or above
-- Runs where inference tier is actively serving web app traffic (I/O contention)
-- When inference_root free space < 50 GB (system-level guard enforces this)
+- Runs where Ultrahot tier is actively serving web app traffic (I/O contention)
+- When ultrahot_root free space < 50 GB (system-level guard enforces this)
 
-**Interaction with PIPELINE-30:** PIPELINE-30 defines the inference tier layout for serving weights. This item adds a *separate* working area on the same volume for data prep outputs. The two uses do not conflict — prep outputs live in `inference_root/prep/{chunk}/` during a run and are deleted or archived to cold afterwards, leaving the `inference_root/weights/` and `inference_root/precomputed/` serving paths untouched.
+**Interaction with PIPELINE-30:** PIPELINE-30 defines the Ultrahot tier layout for serving weights. This item adds a *separate* working area on the same volume for data prep outputs. The two uses do not conflict — prep outputs live in `ultrahot_root/prep/{chunk}/` during a run and are deleted or archived to cold afterwards, leaving the `ultrahot_root/weights/` and `ultrahot_root/precomputed/` serving paths untouched.
 
-**When to implement:** after PIPELINE-30 (inference tier established) and after internal NVMe has sufficient free space (use DATAMGMT-1 diagnose to identify reclaimable space first).
+**When to implement:** after PIPELINE-30 (Ultrahot tier established) and after internal NVMe has sufficient free space (use DATAMGMT-1 diagnose to identify reclaimable space first).
 
 ---
 
