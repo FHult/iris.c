@@ -363,7 +363,8 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
         try:
             chat = [{"role": "user", "content": caption}]
             text = tokenizer.apply_chat_template(
-                chat, tokenize=False, add_generation_prompt=True
+                chat, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False
             )
             ids = tokenizer.encode(text)
             tokenized.append((rec_id, caption, ids))
@@ -882,8 +883,12 @@ def main():
             def _has_output(shard_path: str) -> bool:
                 stem = os.path.splitext(os.path.basename(shard_path))[0]
                 return any(
-                    os.path.exists(os.path.join(d, f"{stem}.npz"))
+                    any(
+                        f.startswith(stem + "_") and f.endswith(".npz")
+                        for f in os.listdir(d)
+                    )
                     for d in out_dirs
+                    if os.path.isdir(d)
                 )
             new_shards = [s for s in shards if not _has_output(s)]
             old_shards = [s for s in shards if _has_output(s)]
@@ -913,7 +918,7 @@ def main():
         from cache_manager import PrecomputeCache, get_git_sha
         _git_sha = get_git_sha(Path(os.path.dirname(os.path.abspath(__file__))))
         _cache_configs = {
-            "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [9, 18, 27]},
+            "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [8, 17, 26]},
             "vae":    {"flux_model": Path(args.flux_model).name,
                        "image_size": args.image_size},
             "siglip": {"siglip_model": "google/siglip-so400m-patch14-384",

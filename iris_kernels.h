@@ -188,21 +188,6 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
 void iris_flash_attention(float *out, const float *Q, const float *K, const float *V,
                           int seq_q, int seq_k, int heads, int head_dim, float scale);
 
-/*
- * Apply rotary position embeddings (RoPE)
- * x: [batch, seq, heads, head_dim]
- * freqs: [seq, head_dim/2, 2] (cos, sin pairs)
- */
-void iris_apply_rope(float *x, const float *freqs,
-                     int batch, int seq, int heads, int head_dim);
-
-/*
- * Compute RoPE frequencies
- * pos: position indices [seq]
- * freqs: output [seq, dim/2, 2]
- */
-void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta);
-
 /* ========================================================================
  * Pooling and Reshape
  * ======================================================================== */

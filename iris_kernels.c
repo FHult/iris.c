@@ -1012,52 +1012,6 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
     free(tile_scores);
 }
 
-/* Apply precomputed RoPE (Rotary Position Embedding) in-place using the
- * split-half convention: dim d pairs with dim d+half for rotation. This is
- * the Flux convention (4-axis, split-half); Z-Image uses consecutive pairs
- * via a separate kernel. RoPE lets the transformer learn relative position
- * from the dot-product structure of Q and K. */
-void iris_apply_rope(float *x, const float *freqs,
-                     int batch, int seq, int heads, int head_dim) {
-    /* x: [batch, seq, heads, head_dim]
-     * freqs: [seq, head_dim/2, 2] (cos, sin)
-     * Apply rotary embedding to pairs of dimensions */
-
-    int half_dim = head_dim / 2;
-
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < seq; s++) {
-            for (int h = 0; h < heads; h++) {
-                float *vec = x + ((b * seq + s) * heads + h) * head_dim;
-
-                for (int d = 0; d < half_dim; d++) {
-                    float cos_val = freqs[s * half_dim * 2 + d * 2];
-                    float sin_val = freqs[s * half_dim * 2 + d * 2 + 1];
-
-                    float x0 = vec[d];
-                    float x1 = vec[d + half_dim];
-
-                    vec[d] = x0 * cos_val - x1 * sin_val;
-                    vec[d + half_dim] = x0 * sin_val + x1 * cos_val;
-                }
-            }
-        }
-    }
-}
-
-void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
-    int half_dim = dim / 2;
-
-    for (int s = 0; s < seq; s++) {
-        float p = (float)pos[s];
-        for (int d = 0; d < half_dim; d++) {
-            float freq = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
-            float angle = p * freq;
-            freqs[s * half_dim * 2 + d * 2] = cosf(angle);
-            freqs[s * half_dim * 2 + d * 2 + 1] = sinf(angle);
-        }
-    }
-}
 
 /* ========================================================================
  * Pooling and Reshape

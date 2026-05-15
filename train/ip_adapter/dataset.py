@@ -327,6 +327,13 @@ def make_prefetch_loader(
       siglip_feats:float16 numpy [B, 729, 1152] or None (if no SigLIP cache)
       bucket_hw:   (H, W) tuple for this batch
     """
+    if anchor_mix_ratio + hard_mix_ratio >= 1.0:
+        raise ValueError(
+            f"anchor_mix_ratio ({anchor_mix_ratio:.2f}) + hard_mix_ratio ({hard_mix_ratio:.2f}) "
+            f"must be < 1.0; they currently sum to {anchor_mix_ratio + hard_mix_ratio:.2f}, "
+            f"which leaves no capacity for main training shards."
+        )
+
     paths = list(shard_paths)
     anchor_paths: List[str] = []
     if anchor_shard_dir and os.path.isdir(anchor_shard_dir):
@@ -463,13 +470,16 @@ def make_prefetch_loader(
                     # Stack arrays; keep None for missing caches.
                     # Pad text embeddings to a fixed global max so mx.compile
                     # sees consistent input shapes and avoids re-tracing per batch.
-                    # 512 tokens covers all Qwen3 outputs at standard caption lengths.
+                    # Hard cap at 512 tokens: long-caption batches that exceed 512
+                    # would produce a unique input shape causing MLX graph retrace
+                    # (~5-15 s each).  Truncate before padding so the shape is always
+                    # exactly 512 regardless of caption length.
                     _TEXT_PAD = 512
                     if temb_buf[0] is not None:
-                        max_seq = max(max(t.shape[0] for t in temb_buf), _TEXT_PAD)
+                        max_seq = _TEXT_PAD
                         padded = [
-                            np.pad(t, ((0, max_seq - t.shape[0]), (0, 0)))
-                            if t.shape[0] < max_seq else t
+                            np.pad(t[:max_seq], ((0, max_seq - min(t.shape[0], max_seq)), (0, 0)))
+                            if t.shape[0] < max_seq else t[:max_seq]
                             for t in temb_buf
                         ]
                         t_arr = np.stack(padded)

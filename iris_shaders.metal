@@ -382,51 +382,6 @@ kernel void softmax(
  * RoPE (Rotary Position Embeddings)
  * ======================================================================== */
 
-/* Apply 2D RoPE to Q or K tensor
- * x: [seq, heads*head_dim]
- * cos, sin: [seq, head_dim]  (precomputed frequencies)
- */
-kernel void apply_rope_2d(
-    device float *x [[buffer(0)]],
-    device const float *cos_freq [[buffer(1)]],
-    device const float *sin_freq [[buffer(2)]],
-    constant int &seq [[buffer(3)]],
-    constant int &heads [[buffer(4)]],
-    constant int &head_dim [[buffer(5)]],
-    constant int &axis_dim [[buffer(6)]],  // 32 for FLUX
-    uint2 pos [[thread_position_in_grid]]  // (seq_idx, head_idx)
-) {
-    uint seq_idx = pos.x;
-    uint head_idx = pos.y;
-
-    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
-
-    uint hidden = heads * head_dim;
-    device float *vec = x + seq_idx * hidden + head_idx * head_dim;
-    device const float *cos_row = cos_freq + seq_idx * head_dim;
-    device const float *sin_row = sin_freq + seq_idx * head_dim;
-
-    // RoPE rotation for each axis (4 axes of 32 dims each = 128)
-    int half_axis = axis_dim / 2;  // 16
-
-    for (int axis = 0; axis < 4; axis++) {
-        int axis_offset = axis * axis_dim;
-        for (int d = 0; d < half_axis; d++) {
-            int i0 = axis_offset + d;
-            int i1 = axis_offset + half_axis + d;
-
-            float c = cos_row[i0];
-            float s = sin_row[i0];
-
-            float x0 = vec[i0];
-            float x1 = vec[i1];
-
-            vec[i0] = x0 * c - x1 * s;
-            vec[i1] = x0 * s + x1 * c;
-        }
-    }
-}
-
 /* Apply 2D RoPE to bf16 Q or K tensor
  * x: [seq, heads*head_dim] (bf16)
  * cos, sin: [seq, head_dim] (f32)

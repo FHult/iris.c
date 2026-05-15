@@ -432,7 +432,7 @@ def cmd_create_val_set(args) -> None:
     val_tgzs    = cfg.get("jdb", {}).get("validation_tgzs", [0, 0])
     val_tgz_idx = val_tgzs[0]
     val_tar     = conv_pool / f"{val_tgz_idx:03d}.tar"
-    pool_sent   = conv_pool / ".converted" / f"{val_tgz_idx:03d}.done"
+    pool_sent   = conv_pool / ".converted" / f"{val_tgz_idx:03d}"
 
     if not pool_sent.exists() or not val_tar.exists():
         print(f"Val tgz {val_tgz_idx:03d} not found in converted pool ({conv_pool}).")

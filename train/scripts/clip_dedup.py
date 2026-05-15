@@ -322,7 +322,9 @@ def cmd_embed(args) -> int:
                             all_embs.append(e.cpu().numpy())
 
                 emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
-                np.savez(out_npz, ids=np.array(ids), embeddings=emb_arr)
+                tmp_stem = str(out_npz)[:-4] + ".tmp"
+                np.savez(tmp_stem, ids=np.array(ids), embeddings=emb_arr)
+                os.replace(tmp_stem + ".npz", out_npz)
 
                 log_event("clip_dedup", "embed_shard",
                           shard=shard_path.name, n=len(ids))

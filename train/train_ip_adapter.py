@@ -1318,6 +1318,17 @@ def train(config: dict) -> None:
     _hb_siglip_cov = 100.0   # last known from log block; 100% until first log fires
     _hb_loader_pct = 0.0     # last known from log block
 
+    # PIPE-H-003: cache-miss skip tracking.
+    # Consecutive skips: warns after 20; resets to 0 on any successful step.
+    # Rolling window: if skip rate > 50% over 500 batches, exit with error so
+    # the orchestrator can escalate instead of spinning indefinitely.
+    _skip_consecutive = 0
+    _skip_window_total = 0   # batches seen in the rolling window
+    _skip_window_skips = 0   # cache-miss skips in the rolling window
+    _SKIP_WARN_AFTER   = 20
+    _SKIP_WINDOW       = 500
+    _SKIP_RATE_LIMIT   = 0.50
+
     for images_np, captions, text_np, vae_np, siglip_np, bucket_hw in loader:
         if step >= _end_step:
             break
@@ -1364,6 +1375,17 @@ def train(config: dict) -> None:
         else:
             # VAE not loaded (cache-only mode) but this batch has no cached latents.
             # Skip rather than crash — incomplete precompute coverage.
+            _skip_consecutive += 1
+            _skip_window_skips += 1
+            _skip_window_total += 1
+            if _skip_consecutive == _SKIP_WARN_AFTER:
+                print(f"  WARNING: {_skip_consecutive} consecutive cache-miss skips at step {step} "
+                      f"— check VAE precompute coverage.", flush=True)
+            if _skip_window_total >= _SKIP_WINDOW and _skip_window_skips / _skip_window_total > _SKIP_RATE_LIMIT:
+                print(f"ERROR: cache-miss skip rate {_skip_window_skips}/{_skip_window_total} "
+                      f"({100*_skip_window_skips/_skip_window_total:.0f}%) exceeds 50% over last "
+                      f"{_SKIP_WINDOW} batches — precompute coverage too low. Exiting.", flush=True)
+                sys.exit(1)
             continue
 
         if text_np is not None:
@@ -1375,6 +1397,17 @@ def train(config: dict) -> None:
             text_embeds = _encode_text(text_encoder, captions_in)
         else:
             # Text encoder not loaded (cache-only mode) but no cached embeddings.
+            _skip_consecutive += 1
+            _skip_window_skips += 1
+            _skip_window_total += 1
+            if _skip_consecutive == _SKIP_WARN_AFTER:
+                print(f"  WARNING: {_skip_consecutive} consecutive cache-miss skips at step {step} "
+                      f"— check text precompute coverage.", flush=True)
+            if _skip_window_total >= _SKIP_WINDOW and _skip_window_skips / _skip_window_total > _SKIP_RATE_LIMIT:
+                print(f"ERROR: cache-miss skip rate {_skip_window_skips}/{_skip_window_total} "
+                      f"({100*_skip_window_skips/_skip_window_total:.0f}%) exceeds 50% over last "
+                      f"{_SKIP_WINDOW} batches — precompute coverage too low. Exiting.", flush=True)
+                sys.exit(1)
             continue
 
         if siglip_np is not None:
@@ -1394,6 +1427,14 @@ def train(config: dict) -> None:
             null_image = True
             use_null_image = _MX_TRUE
             _siglip_miss_steps += 1  # T-10
+
+        # PIPE-H-003: successful batch — reset consecutive-skip counter and count
+        # this batch in the rolling window (slide window after _SKIP_WINDOW batches).
+        _skip_consecutive = 0
+        _skip_window_total += 1
+        if _skip_window_total >= _SKIP_WINDOW:
+            _skip_window_total = 0
+            _skip_window_skips = 0
 
         # QUALITY-3: patch-shuffle — shuffle 729 SigLIP token positions to destroy
         # spatial layout while preserving per-patch texture/color statistics.
@@ -1561,13 +1602,20 @@ def train(config: dict) -> None:
                     _self_ref_loss_sum   += _step_loss_val
                     _self_ref_loss_count += 1
 
-            # T-06: EMA drift (RMS diff between online and EMA weights, first 5 param tensors)
+            # T-06: EMA drift (RMS diff between online and EMA weights, top-5 by size)
+            # Sort by tensor element count descending so we sample weight matrices
+            # rather than bias vectors — gives a more representative drift signal.
             if step % 500 == 0:
                 try:
                     _flat_online = dict(_flatten(adapter.parameters()))
                     _flat_ema    = dict(_flatten(ema_params))
                     _drift_vals  = []
-                    for _k in list(_flat_online)[:5]:
+                    _sorted_keys = sorted(
+                        _flat_online.keys(),
+                        key=lambda _k: _flat_online[_k].size,
+                        reverse=True,
+                    )
+                    for _k in _sorted_keys[:5]:
                         if _k in _flat_ema:
                             _a = _flat_online[_k].astype(mx.float32)
                             _b = _flat_ema[_k].astype(mx.float32)

@@ -929,7 +929,8 @@ void iris_metal_sgemm_cached_bias(int transpose_a, int transpose_b,
 
 /* Convert f32 to f16 for MPS matmuls */
 static inline uint16_t f32_to_f16(float f32) {
-    uint32_t bits = *(uint32_t *)&f32;
+    uint32_t bits;
+    memcpy(&bits, &f32, sizeof(bits));
     uint32_t sign = (bits >> 16) & 0x8000;
     int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
     uint32_t mant = (bits >> 13) & 0x3FF;
@@ -1639,6 +1640,12 @@ void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
         /* Store C buffers so we can copy results back after GPU completes */
         id<MTLBuffer> *cBuffers = (id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
         float **cPtrs = (float **)malloc(batch_count * sizeof(float *));
+        if (!cBuffers || !cPtrs) {
+            free(cBuffers);
+            free(cPtrs);
+            fprintf(stderr, "iris_metal_sgemm_batch: out of memory (batch_count=%d)\n", batch_count);
+            return;
+        }
 
         for (int i = 0; i < batch_count; i++) {
             const float *Ai = A + i * stride_a;
@@ -2295,81 +2302,6 @@ void iris_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight
         NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
         [encoder dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [encoder endEncoding];
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-    }
-}
-
-/* QK RMSNorm on bf16 tensors (in-place) */
-void iris_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
-                            id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
-                            int seq, int heads, int head_dim, float eps) {
-    if (!g_shaders_initialized || !g_qk_rms_norm_bf16_pipeline) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_qk_rms_norm_bf16_pipeline];
-        [encoder setBuffer:q offset:0 atIndex:0];
-        [encoder setBuffer:k offset:0 atIndex:1];
-        [encoder setBuffer:q_weight offset:0 atIndex:2];
-        [encoder setBuffer:k_weight offset:0 atIndex:3];
-        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-        [encoder setBytes:&eps length:sizeof(float) atIndex:6];
-
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder endEncoding];
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-    }
-}
-
-/* SiLU on bf16 tensors (in-place) */
-void iris_bf16_silu(id<MTLBuffer> x, int n) {
-    if (!g_shaders_initialized || !g_silu_bf16_pipeline) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_silu_bf16_pipeline];
-        [encoder setBuffer:x offset:0 atIndex:0];
-        [encoder setBytes:&n length:sizeof(int) atIndex:1];
-
-        NSUInteger threads = 256;
-        NSUInteger groups = (n + threads - 1) / threads;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        [encoder endEncoding];
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-    }
-}
-
-/* SiLU with multiply on bf16 tensors: gate = silu(gate) * up */
-void iris_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n) {
-    if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_silu_mul_bf16_pipeline];
-        [encoder setBuffer:gate offset:0 atIndex:0];
-        [encoder setBuffer:up offset:0 atIndex:1];
-        [encoder setBytes:&n length:sizeof(int) atIndex:2];
-
-        NSUInteger threads = 256;
-        NSUInteger groups = (n + threads - 1) / threads;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -3329,7 +3261,6 @@ static id<MTLComputePipelineState> g_adaln_norm_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_pipeline = nil;
-static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_unified_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline = nil;
@@ -3442,15 +3373,6 @@ int iris_metal_init_shaders(void) {
             g_softmax_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_softmax_pipeline) {
                 fprintf(stderr, "Metal shaders: softmax pipeline failed: %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
-        }
-
-        func = [g_shader_library newFunctionWithName:@"apply_rope_2d"];
-        if (func) {
-            g_rope_2d_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
-            if (!g_rope_2d_pipeline) {
-                fprintf(stderr, "Metal shaders: apply_rope_2d pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -3774,59 +3696,6 @@ void iris_metal_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
-void iris_metal_qk_rms_norm(float *q, float *k,
-                            const float *q_weight, const float *k_weight,
-                            int seq, int heads, int head_dim, float eps) {
-    if (!g_shaders_initialized || !g_qk_rms_norm_pipeline) return;
-
-    @autoreleasepool {
-        size_t data_size = (size_t)seq * heads * head_dim * sizeof(float);
-        size_t weight_size = (size_t)head_dim * sizeof(float);
-
-        /* Create buffers - Q and K are modified in-place */
-        id<MTLBuffer> bufQ = pool_get_buffer(data_size);
-        id<MTLBuffer> bufK = pool_get_buffer(data_size);
-        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
-        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
-
-        if (!bufQ || !bufK || !bufQWeight || !bufKWeight) {
-            if (bufQ) pool_release_buffer(bufQ);
-            if (bufK) pool_release_buffer(bufK);
-            return;
-        }
-
-        memcpy([bufQ contents], q, data_size);
-        memcpy([bufK contents], k, data_size);
-
-        id<MTLCommandBuffer> cmdBuffer = encode_compute_shader();
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_qk_rms_norm_pipeline];
-        [encoder setBuffer:bufQ offset:0 atIndex:0];
-        [encoder setBuffer:bufK offset:0 atIndex:1];
-        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
-        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
-        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-        [encoder setBytes:&eps length:sizeof(float) atIndex:6];
-
-        /* One thread per (seq_idx, head_idx) pair */
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
-
-        [encoder endEncoding];
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-
-        memcpy(q, [bufQ contents], data_size);
-        memcpy(k, [bufK contents], data_size);
-
-        pool_release_buffer(bufQ);
-        pool_release_buffer(bufK);
-    }
-}
-
 void iris_metal_adaln_norm(float *out, const float *x,
                            const float *shift, const float *scale,
                            int seq_len, int hidden, float eps) {
@@ -4025,58 +3894,6 @@ void iris_metal_softmax(float *x, int rows, int cols) {
     }
 }
 
-void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
-                        int seq, int heads, int head_dim, int axis_dim) {
-    if (!g_shaders_initialized || !g_rope_2d_pipeline) return;
-
-    @autoreleasepool {
-        size_t data_size = (size_t)seq * heads * head_dim * sizeof(float);
-        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
-
-        id<MTLBuffer> bufX = pool_get_buffer(data_size);
-        id<MTLBuffer> bufCos = pool_get_buffer(freq_size);
-        id<MTLBuffer> bufSin = pool_get_buffer(freq_size);
-
-        if (!bufX || !bufCos || !bufSin) {
-            if (bufX) pool_release_buffer(bufX);
-            if (bufCos) pool_release_buffer(bufCos);
-            if (bufSin) pool_release_buffer(bufSin);
-            return;
-        }
-
-        memcpy([bufX contents], x, data_size);
-        memcpy([bufCos contents], cos_freq, freq_size);
-        memcpy([bufSin contents], sin_freq, freq_size);
-
-        id<MTLCommandBuffer> cmdBuffer = encode_compute_shader();
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_rope_2d_pipeline];
-        [encoder setBuffer:bufX offset:0 atIndex:0];
-        [encoder setBuffer:bufCos offset:0 atIndex:1];
-        [encoder setBuffer:bufSin offset:0 atIndex:2];
-        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
-        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-        [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
-
-        /* One thread per (seq, head) pair */
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
-
-        [encoder endEncoding];
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-
-        memcpy(x, [bufX contents], data_size);
-
-        pool_release_buffer(bufX);
-        pool_release_buffer(bufCos);
-        pool_release_buffer(bufSin);
-    }
-}
-
 /* ========================================================================
  * GPU Tensor Operations - Keep data on GPU between operations
  * These functions take GPU tensors and return GPU tensors.
@@ -4216,56 +4033,6 @@ void iris_gpu_rms_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
         }
 
         pool_release_buffer(bufWeight);
-    }
-}
-
-/* GPU tensor version of RoPE 2D */
-void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
-                      int seq, int heads, int head_dim, int axis_dim) {
-    if (!g_shaders_initialized || !g_rope_2d_pipeline || !x) return;
-
-    @autoreleasepool {
-        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
-
-        id<MTLBuffer> bufCos = pool_get_buffer(freq_size);
-        id<MTLBuffer> bufSin = pool_get_buffer(freq_size);
-
-        if (!bufCos || !bufSin) {
-            if (bufCos) pool_release_buffer(bufCos);
-            if (bufSin) pool_release_buffer(bufSin);
-            return;
-        }
-
-        memcpy([bufCos contents], cos_freq, freq_size);
-        memcpy([bufSin contents], sin_freq, freq_size);
-
-        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        [encoder setComputePipelineState:g_rope_2d_pipeline];
-        [encoder setBuffer:x->buffer offset:0 atIndex:0];
-        [encoder setBuffer:bufCos offset:0 atIndex:1];
-        [encoder setBuffer:bufSin offset:0 atIndex:2];
-        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
-        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-        [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
-
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
-
-        [encoder endEncoding];
-
-        x->has_pending_work = 1;
-
-        if (!g_tensor_batch_mode) {
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
-            x->has_pending_work = 0;
-        }
-
-        pool_release_buffer(bufCos);
-        pool_release_buffer(bufSin);
     }
 }
 

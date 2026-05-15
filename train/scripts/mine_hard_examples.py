@@ -182,7 +182,9 @@ def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
     ip_embeds = adapter.get_image_embeds(siglip_feats)
     k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-    t_int = mx.array([500], dtype=mx.int32)
+    t_int = mx.clip(
+        (mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999
+    )
     alpha_t, sigma_t = get_schedule_values(t_int)
 
     noise = mx.random.normal(latents.shape, dtype=latents.dtype)
@@ -234,7 +236,9 @@ def _eval_loss_batch(adapter, flux, text_list, vae_list, siglip_list, null_kv=No
         ip_embeds = adapter.get_image_embeds(siglip_feats)
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-    t_int = mx.array([500] * B, dtype=mx.int32)
+    t_int = mx.clip(
+        (mx.sigmoid(mx.random.normal(shape=(B,))) * 1000).astype(mx.int32), 0, 999
+    )
     alpha_t, sigma_t = get_schedule_values(t_int)
     noise = mx.random.normal(latents.shape, dtype=latents.dtype)
     noisy, target = fused_flow_noise(latents, noise, alpha_t, sigma_t)

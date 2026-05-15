@@ -137,8 +137,9 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
     captions = _load_annotation_index(anno_path)
 
     out_tar = out_dir / f"{idx:03d}.tar"
+    out_tar_tmp = out_dir / f"{idx:03d}.tar.tmp"
     written = 0
-    with tarfile.open(tgz_path, "r:gz") as src, tarfile.open(out_tar, "w") as dst:
+    with tarfile.open(tgz_path, "r:gz") as src, tarfile.open(out_tar_tmp, "w") as dst:
         for member in src.getmembers():
             if not member.isfile():
                 continue
@@ -158,6 +159,7 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
             dst.addfile(info_txt, io.BytesIO(txt_data))
             written += 1
 
+    os.replace(out_tar_tmp, out_tar)
     elapsed = time.time() - t0
     print(f"  JDB tgz {idx:03d}: {written} jpg+txt pairs → {out_tar}", flush=True)
     log_event("download_convert", "convert_done", chunk=chunk, tgz=idx,

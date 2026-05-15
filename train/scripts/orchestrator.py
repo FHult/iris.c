@@ -248,7 +248,9 @@ class ResourceManager:
             if lock_info is not None:
                 # External manual process holds the file lock — wait.
                 return False
-            acquire_gpu_lock(holder)
+            if not acquire_gpu_lock(holder):
+                # Another process claimed the lock between check and acquire.
+                return False
         self._holders[token] = holder
         return True
 
@@ -366,6 +368,10 @@ class Orchestrator:
         self._mem_log = LOG_DIR / "memory_pressure.log"
         self._mem_watchdog_stop = False
         self._start_memory_watchdog()
+
+        # Temp training config created by _start_training when hard_mix_ratio_by_chunk
+        # is set.  Stored here so _post_step can unlink it after the train step completes.
+        self._active_train_tmp_cfg: Optional[Path] = None
 
         self.stager = DataStager(self.cfg)
 
@@ -499,6 +505,12 @@ class Orchestrator:
                     chunk=chunk,
                     log_name=f"stager_archive_chunk{chunk}",
                 )
+        if step == "train" and self._active_train_tmp_cfg is not None:
+            try:
+                self._active_train_tmp_cfg.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._active_train_tmp_cfg = None
         if step in ("train", "mine"):
             update_state(**{"chunks": {str(chunk): {"completed_at": now_iso()}}})
 
@@ -1114,11 +1126,12 @@ class Orchestrator:
         # This enforces strict one-ahead pipelining: chunk 1 trains → chunk 2 preps,
         # chunk 2 trains → chunk 3 preps, etc.  Prevents disk pressure from multiple
         # future chunks building simultaneously.
-        _training_or_later = (
-            ChunkState.TRAINING, ChunkState.MINING,
-            ChunkState.VALIDATING, ChunkState.DONE,
-        )
-        if chunk > 1 and derive_chunk_state(chunk - 1) not in _training_or_later:
+        # Chunk N+1 prep is gated on chunk N reaching the training phase.
+        # Use is_done(chunk-1, "train") instead of derive_chunk_state so that a
+        # post-training error (mine, validate, archive) on chunk N does not prevent
+        # chunk N+1 from starting prep — ChunkState.ERROR would otherwise deadlock
+        # the pipeline permanently with no doctor alert.
+        if chunk > 1 and not is_done(chunk - 1, "train"):
             return
 
         handlers = {
@@ -1621,6 +1634,7 @@ class Orchestrator:
             _train_yaml["hard_mix_ratio"] = float(_override)
             _tmp_cfg = Path(f"/tmp/iris_train_chunk{chunk}_config.yaml")
             _tmp_cfg.write_text(_yaml.dump(_train_yaml, default_flow_style=False))
+            self._active_train_tmp_cfg = _tmp_cfg
             log_orch(
                 f"Chunk {chunk}: hard_mix_ratio override {_default} → {_override} "
                 f"(temp config: {_tmp_cfg})",
@@ -2080,8 +2094,10 @@ class Orchestrator:
     def _write_pause(self) -> None:
         """Write a pause control signal so the operator can investigate."""
         try:
-            with open(CONTROL_FILE, "w") as _f:
+            _tmp = str(CONTROL_FILE) + ".tmp"
+            with open(_tmp, "w") as _f:
                 json.dump({"action": "pause"}, _f)
+            os.replace(_tmp, CONTROL_FILE)
         except OSError:
             pass
         notify("iris pipeline WARNING", "Training paused by anomaly — check dispatch queue")

@@ -6,7 +6,6 @@
  *   - iris_rms_norm: per-row normalization with scale weights
  *   - iris_matmul / iris_matmul_t: small known-output matrix multiply
  *   - iris_silu / iris_silu_mul: activation correctness
- *   - iris_apply_rope / iris_compute_rope_freqs: rotation identity & orthogonality
  *   - iris_patchify / iris_unpatchify: roundtrip invertibility
  *   - iris_axpy / iris_add: element-wise operations
  *   - iris_rng_seed: seeded reproducibility
@@ -261,63 +260,6 @@ static void test_add(void) {
     iris_add(out, a, b, 2);
     check_f("add[0]", out[0], 4.0f, 1e-5f);
     check_f("add[1]", out[1], 6.0f, 1e-5f);
-}
-
-/* =========================================================================
- * RoPE
- * ========================================================================= */
-
-static void test_rope_zero_position(void) {
-    /* pos=0 -> cos=1, sin=0 -> rotation is identity */
-    int seq = 1, heads = 1, head_dim = 4;
-    float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float freqs[4];  /* [seq=1, head_dim/2=2, 2] */
-    int pos[] = {0};
-    iris_compute_rope_freqs(freqs, pos, seq, head_dim, 10000.0f);
-    /* cos(0)=1, sin(0)=0 for all dimensions */
-    check_f("rope freqs cos[0]", freqs[0], 1.0f, 1e-5f);
-    check_f("rope freqs sin[0]", freqs[1], 0.0f, 1e-5f);
-
-    /* Apply RoPE: with identity rotation, x unchanged */
-    float x_orig[4];
-    memcpy(x_orig, x, sizeof(x));
-    iris_apply_rope(x, freqs, 1, seq, heads, head_dim);
-    check_f("rope identity[0]", x[0], x_orig[0], 1e-4f);
-    check_f("rope identity[1]", x[1], x_orig[1], 1e-4f);
-    check_f("rope identity[2]", x[2], x_orig[2], 1e-4f);
-    check_f("rope identity[3]", x[3], x_orig[3], 1e-4f);
-}
-
-static void test_rope_preserves_norm(void) {
-    /* RoPE is a rotation, so it preserves vector norm */
-    int seq = 1, heads = 1, head_dim = 4;
-    float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float freqs[4];
-    int pos[] = {7};
-    iris_compute_rope_freqs(freqs, pos, seq, head_dim, 10000.0f);
-
-    float norm_before = 0.0f;
-    for (int i = 0; i < head_dim; i++) norm_before += x[i] * x[i];
-
-    iris_apply_rope(x, freqs, 1, seq, heads, head_dim);
-
-    float norm_after = 0.0f;
-    for (int i = 0; i < head_dim; i++) norm_after += x[i] * x[i];
-
-    check_f("rope preserves norm", norm_after, norm_before, 1e-4f);
-}
-
-static void test_rope_freqs_range(void) {
-    /* cos/sin values must be in [-1, 1] */
-    int seq = 4, head_dim = 8;
-    float freqs[4 * 4 * 2];
-    int pos[] = {0, 1, 10, 100};
-    iris_compute_rope_freqs(freqs, pos, seq, head_dim, 10000.0f);
-    int ok = 1;
-    for (int i = 0; i < seq * (head_dim / 2) * 2; i++) {
-        if (freqs[i] < -1.0f - 1e-5f || freqs[i] > 1.0f + 1e-5f) ok = 0;
-    }
-    check_true("rope freqs in [-1,1]", ok);
 }
 
 /* =========================================================================
@@ -614,11 +556,6 @@ int main(void) {
     printf("\n-- axpy / add --\n");
     test_axpy();
     test_add();
-
-    printf("\n-- rope --\n");
-    test_rope_zero_position();
-    test_rope_preserves_norm();
-    test_rope_freqs_range();
 
     printf("\n-- patchify --\n");
     test_patchify_roundtrip();

@@ -98,7 +98,8 @@ void qwen3_model_free(qwen3_model_t *model);
  * seq_len: Length of input sequences
  *
  * Returns: Embedding array [seq_len, 7680] (caller must free)
- * Extracts hidden states from layers 9, 18, 27 and concatenates them.
+ * Extracts hidden states at the output of loop iterations 8, 17, 26 (0-indexed,
+ * i.e. after inner.layers[i] runs) and concatenates them.
  */
 float *qwen3_forward(qwen3_model_t *model,
                      const int *input_ids,

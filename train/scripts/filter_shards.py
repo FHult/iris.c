@@ -287,10 +287,17 @@ def main():
             except OSError:
                 pass
 
+    def _shard_idx(path: str):
+        """Return the numeric index from a shard stem, or None if non-numeric."""
+        try:
+            return int(os.path.splitext(os.path.basename(path))[0])
+        except ValueError:
+            return None
+
     all_shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if args.start_idx > 0:
         all_shards = [s for s in all_shards
-                      if int(os.path.splitext(os.path.basename(s))[0]) >= args.start_idx]
+                      if (_shard_idx(s) is not None and _shard_idx(s) >= args.start_idx)]
         print(f"--start-idx {args.start_idx}: {len(all_shards)} shards in range")
 
     fingerprint = _criteria_fingerprint(args.min_size, args.min_words)

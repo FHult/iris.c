@@ -224,12 +224,10 @@ static char *parse_json_string(const char **pp) {
                         } else if (cp < 0x800) {
                             result[i++] = (char)(0xC0 | (cp >> 6));
                             result[i++] = (char)(0x80 | (cp & 0x3F));
-                            len++;  /* Need more space */
                         } else {
                             result[i++] = (char)(0xE0 | (cp >> 12));
                             result[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                             result[i++] = (char)(0x80 | (cp & 0x3F));
-                            len += 2;
                         }
                     }
                     break;

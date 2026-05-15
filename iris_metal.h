@@ -369,10 +369,6 @@ void iris_gpu_qk_rms_norm(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps);
 
-/* RoPE 2D on GPU: applies rotary position embeddings in-place (4-axis split-half, Flux style) */
-void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
-                      int seq, int heads, int head_dim, int axis_dim);
-
 /* Single-stream RoPE for f32 tensors (consecutive-pair rotation, Z-Image style).
  * cos_freq, sin_freq: [seq, head_dim] with values duplicated for pairs. */
 void iris_gpu_rope_single_f32(iris_gpu_tensor_t x,
@@ -685,16 +681,6 @@ void iris_metal_rms_norm(float *out, const float *x, const float *weight,
                          int seq_len, int hidden, float eps);
 
 /*
- * GPU-accelerated QK RMSNorm (in-place).
- * Normalizes Q and K separately for each head.
- * q, k: [seq, heads*head_dim] (modified in-place)
- * q_weight, k_weight: [head_dim]
- */
-void iris_metal_qk_rms_norm(float *q, float *k,
-                            const float *q_weight, const float *k_weight,
-                            int seq, int heads, int head_dim, float eps);
-
-/*
  * GPU-accelerated LayerNorm + AdaLN modulation.
  * out = (1 + scale) * layernorm(x) + shift
  * x: [seq_len, hidden], shift/scale: [hidden]
@@ -720,14 +706,6 @@ void iris_metal_silu_mul(float *gate, const float *up, int n);
  * x: [rows, cols], softmax applied to each row
  */
 void iris_metal_softmax(float *x, int rows, int cols);
-
-/*
- * GPU-accelerated 2D RoPE (in-place).
- * x: [seq, heads*head_dim]
- * cos_freq, sin_freq: [seq, head_dim]
- */
-void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
-                        int seq, int heads, int head_dim, int axis_dim);
 
 /*
  * Check if compute shaders are available.
@@ -805,17 +783,6 @@ void iris_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> outpu
 /* RMSNorm on bf16 buffers */
 void iris_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
                          int seq_len, int hidden, float eps);
-
-/* QK RMSNorm on bf16 buffers (in-place) */
-void iris_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
-                            id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
-                            int seq, int heads, int head_dim, float eps);
-
-/* SiLU on bf16 buffer (in-place) */
-void iris_bf16_silu(id<MTLBuffer> x, int n);
-
-/* SiLU with multiply on bf16 buffers: gate = silu(gate) * up */
-void iris_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n);
 
 /* RoPE on bf16 buffer (frequencies are f32) */
 void iris_bf16_rope_unified(id<MTLBuffer> x,
