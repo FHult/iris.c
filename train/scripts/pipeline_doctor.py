@@ -158,6 +158,31 @@ def _count_precomp_for_chunk(chunk: int, subdir: str = "qwen3") -> tuple[int, in
     return clean, tmp
 
 
+def _count_shards_with_precomp(chunk: int, subdir: str = "qwen3") -> int:
+    """Count distinct shard IDs that have at least one clean NPZ for this chunk."""
+    lo, hi = _chunk_shard_range(chunk)
+    precomp_dir = PRECOMP_DIR / subdir
+    current_link = precomp_dir / "current"
+    if current_link.is_symlink() or current_link.is_dir():
+        resolved = current_link.resolve()
+        if resolved.is_dir():
+            precomp_dir = resolved
+    shard_ids: set[int] = set()
+    try:
+        for f in os.listdir(precomp_dir):
+            if not f.endswith(".npz") or f.endswith(".tmp.npz"):
+                continue
+            try:
+                shard_id = int(f.split("_")[0])
+                if lo <= shard_id < hi:
+                    shard_ids.add(shard_id)
+            except (ValueError, IndexError):
+                pass
+    except OSError:
+        pass
+    return len(shard_ids)
+
+
 def _count_hard_examples_for_chunk(chunk: int) -> int:
     """Count hard-example .tar files in HARD_EX_DIR/chunk{N}/."""
     hard_dir = HARD_EX_DIR / f"chunk{chunk}"
@@ -444,17 +469,23 @@ def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
         archived = is_done(chunk, "archive")
         for subdir in subdirs:
             clean, tmp = _count_precomp_for_chunk(chunk, subdir)
+            # Coverage: count shards that have ≥1 clean NPZ (not raw NPZ count vs shard count,
+            # which would never fire since each shard produces thousands of NPZ files).
+            shards_with_precomp = _count_shards_with_precomp(chunk, subdir)
 
-            if is_done(chunk, "precompute") and clean < n_shards * 0.5 and not archived:
-                pct = 100 * clean / n_shards if n_shards else 0
+            if is_done(chunk, "precompute") and shards_with_precomp < n_shards * 0.5 and not archived:
+                pct = 100 * shards_with_precomp / n_shards if n_shards else 0
                 _add("WARNING", "precompute",
-                     f"Chunk {chunk} {subdir} precompute coverage low: {clean} NPZ / {n_shards} shards ({pct:.0f}%)",
-                     detail=(f"Expected roughly ≥1 NPZ per shard. Leftover .tmp files: {tmp}. "
-                             f"A partial run or sample-shard optimization bug could cause this."),
+                     f"Chunk {chunk} {subdir} precompute coverage low: "
+                     f"{shards_with_precomp}/{n_shards} shards have NPZ files ({pct:.0f}%)",
+                     detail=(f"Expected all shards to have precomputed embeddings. "
+                             f"Total NPZ files: {clean}. Leftover .tmp files: {tmp}. "
+                             f"A partial run or crash during precompute could cause this."),
                      fix=f"rm {SENTINEL_DIR}/chunk{chunk}/precompute.done",
                      chunk=chunk,
-                     ctx={"subdir": subdir, "clean_npz": clean, "n_shards": n_shards,
-                          "coverage_pct": round(pct, 1), "tmp_npz": tmp})
+                     ctx={"subdir": subdir, "shards_with_precomp": shards_with_precomp,
+                          "n_shards": n_shards, "coverage_pct": round(pct, 1),
+                          "clean_npz": clean, "tmp_npz": tmp})
 
             if tmp > 0:
                 _add("WARNING", "precompute",

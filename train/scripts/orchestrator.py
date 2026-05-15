@@ -123,8 +123,12 @@ def _diagnose_crash(log_file: Path, exit_code: int,
 def _parse_last_mem_from_log(log_file: Path) -> str:
     """Return the last 'X GB used  Y GB free' string from the training log."""
     try:
-        text = log_file.read_text(errors="replace")
-        matches = re.findall(r"mem:\s+([\d.]+ GB used\s+[\d.]+ GB free)", text)
+        with open(log_file, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode("utf-8", errors="replace")
+        matches = re.findall(r"mem:\s+([\d.]+ GB used\s+[\d.]+ GB free)", tail)
         return matches[-1] if matches else ""
     except OSError:
         return ""
@@ -1249,7 +1253,7 @@ class Orchestrator:
         embed_dir = STAGING_DIR / f"chunk{chunk}" / "embeddings"
         log_file  = LOG_DIR / f"clip_embed_chunk{chunk}.log"
         cmd = self._python_cmd("clip_dedup.py",
-                               f"embed --shards '{shard_dir}' --embeddings '{embed_dir}'")
+                               f"embed --shards '{shard_dir}' --embeddings '{embed_dir}' --chunk {chunk}")
         self._launch_prep(f"clip_embed chunk {chunk}", cmd, log_file,
                           chunk, "clip_embed", token="GPU_TOKEN")
 

@@ -182,7 +182,7 @@ def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
     ip_embeds = adapter.get_image_embeds(siglip_feats)
     k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
-    t_int = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
+    t_int = mx.array([500], dtype=mx.int32)
     alpha_t, sigma_t = get_schedule_values(t_int)
 
     noise = mx.random.normal(latents.shape, dtype=latents.dtype)
@@ -389,7 +389,7 @@ def main():
     print(f"Scanning cache dirs for precomputed candidates ({len(shard_paths)} shards)...")
     cached_q  = {f[:-4] for f in os.listdir(args.qwen3_cache) if f.endswith(".npz")}
     cached_v  = {f[:-4] for f in os.listdir(args.vae_cache)   if f.endswith(".npz")}
-    blocklist = set(Path(args.blocklist).read_text().splitlines()) if args.blocklist else set()
+    blocklist = {l.strip() for l in Path(args.blocklist).read_text().splitlines() if l.strip()} if args.blocklist else set()
     eligible  = (cached_q & cached_v) - existing_ids - blocklist
 
     candidates = []   # [(rec_id, shard_path)]
@@ -627,20 +627,23 @@ def main():
     # Write in output shard files
     out_idx = 0
     # Find next available shard index
-    existing_tars = sorted(f for f in os.listdir(args.output) if f.endswith(".tar"))
+    existing_tars = sorted((f for f in os.listdir(args.output) if f.endswith(".tar")),
+                           key=lambda f: int(f[:-4]))
     if existing_tars:
-        out_idx = int(existing_tars[-1].replace(".tar", "")) + 1
+        out_idx = int(existing_tars[-1][:-4]) + 1
 
     i = 0
     while i < len(records_to_write):
         batch = records_to_write[i:i + args.shard_size]
         out_path = os.path.join(args.output, f"{out_idx:06d}.tar")
-        with tarfile.open(out_path, "w") as out_tar:
+        tmp_path = out_path + ".tmp"
+        with tarfile.open(tmp_path, "w") as out_tar:
             for rec_id, jpg_bytes, txt_bytes in batch:
                 for data, ext in [(jpg_bytes, "jpg"), (txt_bytes, "txt")]:
                     info = tarfile.TarInfo(name=f"{rec_id}.{ext}")
                     info.size = len(data)
                     out_tar.addfile(info, io.BytesIO(data))
+        os.replace(tmp_path, out_path)
         print(f"  Wrote {out_path} ({len(batch)} records)")
         i += args.shard_size
         out_idx += 1

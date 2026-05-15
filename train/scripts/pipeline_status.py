@@ -41,7 +41,8 @@ except ImportError:
     CHUNK_STEPS = [
         "download", "convert", "build_shards", "filter_shards",
         "clip_embed", "clip_index", "clip_dups", "precompute",
-        "promoted", "train", "mine", "validate",
+        "promoted", "validate_shards", "training_warmup",
+        "train", "mine", "validate",
     ]
 
     def derive_chunk_state(chunk):
@@ -76,7 +77,15 @@ def _log_tail(log_file: Path, n: int = 5) -> list:
     if not log_file or not log_file.exists():
         return []
     try:
-        lines = log_file.read_text(errors="replace").splitlines()
+        with open(log_file, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 32768))
+            raw = fh.read().decode("utf-8", errors="replace")
+        lines = raw.splitlines()
+        # Drop partial first line if we seeked into the middle of the file
+        if size > 32768 and lines:
+            lines = lines[1:]
         tail = [
             l for l in lines
             if l.strip()
@@ -223,6 +232,8 @@ def _read_dispatch_issues(resolved: bool = False) -> list:
 
 
 _shard_count_cache: dict[Path, tuple] = {}  # path → (mtime, count)
+_precomp_count_cache: dict[Path, tuple] = {}  # path → (expire_monotonic, count)
+_PRECOMP_CACHE_TTL = 30.0  # seconds
 
 def _count_shards(directory: Path) -> int:
     if not directory.exists():
@@ -242,15 +253,34 @@ def _count_shards(directory: Path) -> int:
 def _count_precomputed(directory: Path) -> int:
     if not directory.exists():
         return 0
-    return sum(1 for f in directory.rglob("*.npz"))
+    import time as _time
+    now = _time.monotonic()
+    cached = _precomp_count_cache.get(directory)
+    if cached and cached[0] > now:
+        return cached[1]
+    count = sum(1 for f in directory.rglob("*.npz"))
+    _precomp_count_cache[directory] = (now + _PRECOMP_CACHE_TTL, count)
+    return count
+
+
+def _count_tars_recursive(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    import time as _time
+    now = _time.monotonic()
+    cached = _precomp_count_cache.get(directory)
+    if cached and cached[0] > now:
+        return cached[1]
+    count = sum(1 for f in directory.rglob("*.tar"))
+    _precomp_count_cache[directory] = (now + _PRECOMP_CACHE_TTL, count)
+    return count
 
 
 def _staging_detail(chunk: int) -> dict:
     staging = STAGING_DIR / f"chunk{chunk}"
     shards = _count_shards(staging / "shards")
     precomp = _count_precomputed(staging / "precomputed")
-    conv_dir = staging / "converted"
-    conv_tars = sum(1 for f in conv_dir.rglob("*.tar")) if conv_dir.exists() else 0
+    conv_tars = _count_tars_recursive(staging / "converted")
     return {"shards": shards, "precomputed": precomp, "converted_tars": conv_tars}
 
 
@@ -301,8 +331,10 @@ def _active_heartbeat_for(step: str, chunk: int) -> dict:
         return _worker_heartbeat("precompute", chunk)
     if step in ("train", "training"):
         return _trainer_heartbeat(chunk)
-    if step == "mine":
+    if step in ("mine", "mining"):
         return _worker_heartbeat("mine_hard_examples", chunk)
+    if step in ("validate", "validating"):
+        return _trainer_heartbeat(chunk)
     return {}
 
 

@@ -46,11 +46,9 @@ import numpy as np
 try:
     from turbojpeg import TurboJPEG as _TurboJPEG, TJPF_RGB as _TJPF_RGB
     _HAS_TURBOJPEG = True
-    print("[dataset] TurboJPEG available: using fast JPEG decode path.", flush=True)
 except ImportError:
     _HAS_TURBOJPEG = False
     _TJPF_RGB = None
-    print("[dataset] TurboJPEG not found: falling back to Pillow for JPEG decode (slower).", flush=True)
 
 _SHARD_MAX_RETRIES = 3
 
@@ -373,8 +371,6 @@ def make_prefetch_loader(
                 contents = None
                 for attempt in range(_SHARD_MAX_RETRIES + 1):
                     try:
-                        if attempt == 0:
-                            print(f"[dataset] shard {path}", flush=True)
                         with tarfile.open(path) as tar:
                             contents = {
                                 m.name: tar.extractfile(m).read()

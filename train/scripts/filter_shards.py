@@ -79,7 +79,8 @@ def _sentinel_valid(shard_path: str, fingerprint: str) -> bool:
     if not os.path.exists(p):
         return False
     try:
-        content = open(p).read().strip()
+        with open(p) as _f:
+            content = _f.read().strip()
         stored = content if content else _LEGACY_FINGERPRINT
         return stored == fingerprint
     except OSError:
@@ -198,7 +199,8 @@ def filter_shard(shard_path: str) -> dict:
 
     # Fast path: nothing dropped — write sentinel without any I/O
     if len(kept_records) == original_count:
-        open(done_path, "w").write(fingerprint + "\n")
+        with open(done_path, "w") as _f:
+            _f.write(fingerprint + "\n")
         return {"shard": shard_path, "kept": original_count, "dropped": 0, "error": False,
                 "source": source, "drop_reasons": drop_reasons,
                 "caption_len_sample": caption_len_sample}
@@ -218,7 +220,8 @@ def filter_shard(shard_path: str) -> dict:
                     info.size = len(data)
                     out_tar.addfile(info, io.BytesIO(data))
         os.replace(tmp_path, shard_path)
-        open(done_path, "w").write(fingerprint + "\n")  # mark done after successful replace
+        with open(done_path, "w") as _f:
+            _f.write(fingerprint + "\n")  # mark done after successful replace
     except Exception as e:
         print(f"Error rewriting {shard_path}: {e}", file=sys.stderr)
         try:

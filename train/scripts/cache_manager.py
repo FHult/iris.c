@@ -81,7 +81,7 @@ def encoder_config_subset(encoder: str, cfg: dict) -> dict:
     if encoder == "qwen3":
         return {
             "qwen3_model": model_cfg.get("qwen3_model", "Qwen/Qwen3-4B"),
-            "layers": [9, 18, 27],
+            "layers": [8, 17, 26],
         }
     if encoder == "siglip":
         return {

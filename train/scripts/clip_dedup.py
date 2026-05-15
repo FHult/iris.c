@@ -117,11 +117,11 @@ def _load_clip(backend: str = "auto") -> None:
         try:
             import torch
             from transformers import CLIPModel, CLIPProcessor
-            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
             model = model.to(device).eval()
-            proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            proc  = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
             _clip_model, _clip_preprocess, _clip_backend = model, proc, "transformers"
-            log_orch(f"CLIP: ViT-B-32 via transformers on {device}")
+            log_orch(f"CLIP: ViT-L-14 via transformers on {device}")
             return
         except ImportError:
             if backend == "transformers":
@@ -265,10 +265,11 @@ def cmd_embed(args) -> int:
     total = len(shards)
     done  = 0
     done_event = threading.Event()
+    _chunk = getattr(args, "chunk", None)
 
     def _heartbeat():
         while not done_event.is_set():
-            write_heartbeat("clip_dedup", phase="embed",
+            write_heartbeat("clip_dedup", _chunk, phase="embed",
                             done=done, total=total,
                             pct=round(done / total * 100, 1) if total else 100)
             time.sleep(30)
@@ -330,7 +331,7 @@ def cmd_embed(args) -> int:
     finally:
         done_event.set()
 
-    write_heartbeat("clip_dedup", phase="embed", done=total, total=total, pct=100)
+    write_heartbeat("clip_dedup", _chunk, phase="embed", done=total, total=total, pct=100)
     log_orch(f"embed: complete — embeddings in {embed_dir}")
     return 0
 
@@ -503,6 +504,8 @@ def main() -> None:
     p_emb = sub.add_parser("embed", help="Compute CLIP embeddings per shard")
     p_emb.add_argument("--shards",     required=True)
     p_emb.add_argument("--embeddings", required=True)
+    p_emb.add_argument("--chunk",      type=int, default=None,
+                       help="Chunk number (for heartbeat tracking by pipeline_status)")
     p_emb.add_argument("--batch-size", dest="batch_size", type=int, default=512)
     p_emb.add_argument("--clip-backend", dest="clip_backend",
                        choices=("auto", "mlx", "open_clip", "transformers"),

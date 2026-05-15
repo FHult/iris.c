@@ -24,9 +24,8 @@ extern "C" {
 #define QWEN3_RMS_NORM_EPS     1e-6f
 #define QWEN3_ROPE_THETA       1000000.0f
 
-/* Output layers to extract (0-indexed)
- * Python uses hidden_states[9,18,27] which are outputs AFTER layers 8,17,26
- * since hidden_states[0] is embedding and hidden_states[i] is output after layer i-1 */
+/* Output layers to extract (0-indexed loop counter in the layer array).
+ * Captures h after inner.layers[i] runs, i.e. the output of transformer layer i. */
 #define QWEN3_OUTPUT_LAYER_1   8
 #define QWEN3_OUTPUT_LAYER_2   17
 #define QWEN3_OUTPUT_LAYER_3   26

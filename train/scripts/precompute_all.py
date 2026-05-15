@@ -318,7 +318,7 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
 # Encode helpers (operate on records already filtered to missing-output only)
 # ---------------------------------------------------------------------------
 
-def _qwen3_hidden_states(model, tokens, target=(9, 18, 27)):
+def _qwen3_hidden_states(model, tokens, target=(8, 17, 26)):
     """
     Manual forward pass through Qwen3 that captures intermediate layer outputs.
 
@@ -391,10 +391,10 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
         t_b = _time.time()
         try:
             h = _qwen3_hidden_states(model, padded)
-            mx.eval(h[9], h[18], h[27])
-            h9_np  = np.array(h[9].astype(mx.float32))
-            h18_np = np.array(h[18].astype(mx.float32))
-            h27_np = np.array(h[27].astype(mx.float32))
+            mx.eval(h[8], h[17], h[26])
+            h8_np  = np.array(h[8].astype(mx.float32))
+            h17_np = np.array(h[17].astype(mx.float32))
+            h26_np = np.array(h[26].astype(mx.float32))
             t_b_end = _time.time()
             if batch_idx < 3 or batch_idx % 100 == 0:
                 print(f"  [qwen3 batch {batch_idx}] seq={max_len} dt={t_b_end-t_b:.2f}s",
@@ -402,7 +402,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
             for j, (rec_id, _, _) in enumerate(batch):
                 sl = seq_lens[j]
                 emb = np.concatenate(
-                    [h9_np[j, :sl], h18_np[j, :sl], h27_np[j, :sl]], axis=-1
+                    [h8_np[j, :sl], h17_np[j, :sl], h26_np[j, :sl]], axis=-1
                 )
                 q, scale = _quantize_4bit(emb)
                 _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
@@ -417,11 +417,11 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
                 try:
                     sl = len(ids)
                     h = _qwen3_hidden_states(model, mx.array([ids]))
-                    mx.eval(h[9], h[18], h[27])
+                    mx.eval(h[8], h[17], h[26])
                     emb = np.concatenate([
-                        np.array(h[9][0, :sl].astype(mx.float32)),
-                        np.array(h[18][0, :sl].astype(mx.float32)),
-                        np.array(h[27][0, :sl].astype(mx.float32)),
+                        np.array(h[8][0, :sl].astype(mx.float32)),
+                        np.array(h[17][0, :sl].astype(mx.float32)),
+                        np.array(h[26][0, :sl].astype(mx.float32)),
                     ], axis=-1)
                     q, scale = _quantize_4bit(emb)
                     _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
@@ -432,6 +432,7 @@ def _encode_qwen3(records: list, out_dir: str, batch_size: int, shard_name: str 
             if _batch_skipped:
                 print(f"  Qwen3 batch {i // batch_size}: {_batch_skipped}/{len(batch)} records skipped after single-record retry",
                       file=sys.stderr, flush=True)
+    mx.clear_cache()
     n_batches = len(tokenized) // batch_size + 1
     elapsed = _time.time() - t_q_start
     avg_dt = elapsed / max(n_batches, 1)
@@ -986,8 +987,9 @@ def main():
     # the tar-open and IO prefetch for already-done work.
     _resume_state_path = None
     _done_shards: set[str] = set()
-    if args.qwen3_output:
-        _resume_state_path = os.path.join(args.qwen3_output, ".precompute_done.json")
+    _state_dir = args.qwen3_output or args.vae_output or siglip_out
+    if _state_dir:
+        _resume_state_path = os.path.join(_state_dir, ".precompute_done.json")
         try:
             with open(_resume_state_path) as _rf:
                 _done_shards = set(json.load(_rf))

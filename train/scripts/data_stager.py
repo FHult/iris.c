@@ -166,9 +166,9 @@ class DataStager:
 
         try:
             total_bytes = 0
-            shards_staged = self._stage_shards(chunk)
+            shards_staged, nb_shards = self._stage_shards(chunk)
             npz_staged, nbytes = self._stage_precomputed(chunk)
-            total_bytes += nbytes
+            total_bytes += nb_shards + nbytes
 
             summary = {
                 "shards_staged": shards_staged,
@@ -286,18 +286,22 @@ class DataStager:
                     f"(~{estimated / 1e9:.1f} GB needed, margin={self.staging_margin_gb:.0f} GB)"
                 )
 
-        def _do(src_dst: tuple[Path, Path]) -> int:
-            self._link_or_copy(*src_dst)
-            return 1
+        total_bytes = 0
+
+        def _do(src_dst: tuple[Path, Path]) -> tuple[int, int]:
+            nbytes = self._link_or_copy(*src_dst)
+            return 1, max(0, nbytes)
 
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             for i, fut in enumerate(as_completed(pool.submit(_do, t) for t in tasks)):
-                staged += fut.result()
+                n, nb = fut.result()
+                staged += n
+                total_bytes += nb
                 if i % _HEARTBEAT_EVERY == 0:
                     write_heartbeat("stager", chunk, phase="stage", status="running",
                                     shards_staged=staged, shards_total=len(tasks))
 
-        return staged
+        return staged, total_bytes
 
     def _stage_precomputed(self, chunk: int) -> tuple[int, int]:
         """
@@ -641,6 +645,8 @@ class DataStager:
 
         uh = self.ultrahot_root
         staging = uh / ".staging"
+        if staging.exists():
+            shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
 
         bytes_copied = 0

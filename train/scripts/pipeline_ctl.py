@@ -168,7 +168,7 @@ def cmd_dispatch_resolve(args) -> None:
     print(f"Marked {issue_id} as resolved")
 
 
-def _find_cold_checkpoint(chunk: int):
+def _find_cold_checkpoint():
     """Return (safetensors, json, ema) paths from cold weights, or (None, None, None)."""
     if not COLD_ROOT.exists():
         return None, None, None
@@ -242,7 +242,7 @@ def cmd_restart_from_chunk(args) -> None:
                            arch_ema if arch_ema.exists() else None)
             ckpt_source_label = f"archive ({arch_st})"
         else:
-            cold_st, cold_js, cold_ema = _find_cold_checkpoint(chunk)
+            cold_st, cold_js, cold_ema = _find_cold_checkpoint()
             if cold_st:
                 ckpt_source = (cold_st, cold_js, cold_ema)
                 ckpt_source_label = f"cold storage ({cold_st})"

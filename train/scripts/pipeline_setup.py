@@ -352,7 +352,7 @@ def _interactive_reset_wizard(data_root: Path, existing: dict) -> str:
     print(bold("Existing pipeline state detected"))
     print()
     done_chunks = [k for k, steps in existing["chunks"].items()
-                   if "validate" in steps or len(steps) >= 12]
+                   if "validate" in steps or len(steps) >= 14]
     if done_chunks:
         print(f"  Completed chunks: {', '.join(str(c) for c in sorted(done_chunks))}")
     in_progress = {k: steps for k, steps in existing["chunks"].items()
@@ -454,7 +454,8 @@ def _run_yaml_load(path: Path) -> Optional[dict]:
     try:
         out = subprocess.check_output(
             [str(VENV_PYTHON), "-c",
-             f"import yaml, sys; print(__import__('json').dumps(yaml.safe_load(open('{path}'))))"],
+             "import yaml, sys, json; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))",
+             str(path)],
             stderr=subprocess.DEVNULL, text=True, timeout=10
         )
         return json.loads(out.strip())
@@ -1215,7 +1216,7 @@ def run_ai(args) -> int:
     # Existing state.
     state     = _detect_existing_state(data_root)
     done_chunks = [k for k, steps in state.get("chunks", {}).items()
-                   if "validate" in steps or len(steps) >= 12]
+                   if "validate" in steps or len(steps) >= 14]
 
     # Execute reset immediately in --ai mode when --reset is specified.
     if reset_mode and reset_mode in ("full", "partial") and not check_only:

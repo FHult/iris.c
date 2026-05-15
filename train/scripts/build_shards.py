@@ -244,6 +244,17 @@ def _write_shard_range(args) -> dict:
     if not shard_plan:
         return {"written": 0, "skipped": skipped, "provenance": {}}
 
+    # Skip shards already written on a previous run before building the source
+    # index — otherwise by_source contains records for already-completed shards,
+    # causing KeyErrors in out_counts and wasted source-shard I/O.
+    # Each shard is written to a .tar.tmp temp file and atomically renamed to .tar
+    # only when it reaches shard_size records.  A re-run skips any .tar that
+    # already exists on disk, preventing a restart from truncating finished shards.
+    shard_plan = {sid: recs for sid, recs in shard_plan.items()
+                  if not os.path.exists(os.path.join(output_dir, f"{sid:06d}.tar"))}
+    if not shard_plan:
+        return {"written": 0, "skipped": skipped, "provenance": {}}
+
     # Build source-shard → [(output_shard_id, rec)] index.
     by_source = collections.defaultdict(list)
     for shard_id, recs in shard_plan.items():
@@ -268,13 +279,6 @@ def _write_shard_range(args) -> dict:
     # overlapping disk reads with CPU encode/write of the current shard.
     # Output tars are opened lazily on first write so that a crash mid-run
     # does not leave empty stub files that would be mistaken for completed shards.
-    # Each shard is written to a .tar.tmp temp file and atomically renamed to .tar
-    # only when it reaches shard_size records.  A re-run skips any .tar that
-    # already exists on disk, preventing a restart from truncating finished shards.
-    shard_plan = {sid: recs for sid, recs in shard_plan.items()
-                  if not os.path.exists(os.path.join(output_dir, f"{sid:06d}.tar"))}
-    if not shard_plan:
-        return {"written": 0, "skipped": skipped}
     out_tars = {}
     out_counts = {shard_id: 0 for shard_id in shard_plan}
     completed_count = 0
@@ -545,11 +549,11 @@ def main():
     full_shard_ranges = [list(range(start_idx + i, total_shards, workers)) for i in range(workers)]
 
     # Give each worker a contiguous slice of the shuffled record list.
-    chunk = math.ceil(len(records) / workers)
+    worker_slice = math.ceil(len(records) / workers)
     work_items = [
         (
             full_shard_ranges[w],
-            records[w * chunk : (w + 1) * chunk],
+            records[w * worker_slice : (w + 1) * worker_slice],
             args.output,
             args.shard_size,
             blocklist,
