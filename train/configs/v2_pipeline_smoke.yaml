@@ -37,7 +37,7 @@ jdb:
   tgz_ranges:
     smoke:
       1: [1, 1]       # tgz 001 — smallest non-reserved tgz
-      2: [1, 1]       # reuse same tgz for chunk 2 (different shard ID space)
+      2: [2, 2]       # tgz 002 — distinct source data from chunk 1
 
 data_volume:
   smoke: 0.005        # 0.5% — LAION/COYO absent, downloader warns and skips
