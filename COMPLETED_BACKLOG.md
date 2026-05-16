@@ -166,3 +166,23 @@ are in git history.
 - **PIPELINE-30** — Ultrahot tier (internal NVMe as lowest-latency serving path). `pipeline_lib.py` gains `ULTRAHOT_ROOT`, `ULTRAHOT_WEIGHTS`, `ULTRAHOT_PRECOMP`, `ULTRAHOT_CURATED`, `ULTRAHOT_PREP_DIR`, `ULTRAHOT_MANIFEST` constants. `v2_pipeline.yaml` gains `storage.ultrahot_root`. `data_stager.py` gains `promote_to_ultrahot(chunk)`: atomically copies best checkpoint + active precompute versions to `ultrahot_root` via `.staging/` dir rename; writes `manifest.json` with checkpoint path, chunk, precompute versions, and `promoted_at` timestamp. `promote` CLI subcommand added. `data_explorer.py status` shows UHOT card with disk usage, active checkpoint, and precompute versions. `pipeline_doctor.py` warns if `cold/weights/best/` is newer than `ultrahot/manifest.json` (promotion needed).
 
 - **PIPELINE-31** — Ultrahot-tier data prep and ablation routing. `v2_pipeline.yaml` gains `storage.data_prep_tier: hot|ultrahot`. `data_stager.py` derives `_hot_shards/_hot_precomp/_hot_ckpts` from `_prep_root` (hot_root or ultrahot_root per config); space guard checks prep_root. `orchestrator.py` computes `self.prep_root` from config and threads it through `PIPELINE_DATA_ROOT` export and `--data-root` arg in all prep, training, warmup, and stager launch sites. Flywheel loop and ablation burst read `data_root` from `fw_cfg` (optional key, defaults to `DATA_ROOT`) for opt-in per-flywheel routing. `pipeline_doctor.py` warns CRITICAL/WARNING when `data_prep_tier=ultrahot` and ultrahot_root is missing or low on space. Use: set `data_prep_tier: ultrahot` in storage config for dev/smoke/ablation runs; `data_root: /Users/fredrikhult/ultrahot` in flywheel config for flywheel routing.
+
+---
+
+## Inference/Training Cross-Reference Review — Completed (2026-05-16)
+
+- **INFER-H-001** — Strict aliasing UB in `f16_to_f32()`: `return *(float *)&f32_bits` replaced with `memcpy(&result, &f32_bits, sizeof(result)); return result` in `iris_metal.m`. The `f32_to_f16` direction was already fixed (memcpy). Both conversion directions are now UB-free.
+
+- **INFER-M-001** — Pad token embedding mismatch (Option B). After `qwen3_forward` returns in `qwen3_encode_text_ex`, positions `num_tokens..511` are zeroed via `memset`. Matches the training convention where precompute saves only real-token rows and the dataloader zero-pads to 512.
+
+- **INFER-M-002** — `iris_metal_sgemm_batch()` malloc NULL-check added for both `cBuffers` and `cPtrs`; returns with error message on OOM.
+
+- **INFER-L-001** — Dead `len` mutation statements removed from `parse_json_string` second pass in `iris_qwen3_tokenizer.c`.
+
+- **INFER-L-002** — Dead f32 `apply_rope_2d` kernel and `g_rope_2d_pipeline` removed from `iris_shaders.metal` and `iris_metal.m`.
+
+- **INFER-L-003** — Dead `iris_apply_rope` and `iris_compute_rope_freqs` removed from `iris_kernels.c` and `iris_kernels.h`.
+
+- **INFER-L-004** — Dead `iris_bf16_qk_rms_norm`, `iris_bf16_silu`, `iris_bf16_silu_mul`, `iris_metal_qk_rms_norm` removed from `iris_metal.m` and `iris_metal.h`.
+
+- **INFER-L-005** — `iris_qwen3.h` doc comment updated from "layers 9, 18, 27" to "loop iterations 8, 17, 26 (0-indexed)".

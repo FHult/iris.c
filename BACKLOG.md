@@ -462,7 +462,7 @@ Fix: sort by tensor size descending; sample top-5 largest.
 
 ## Known Bugs — Inference/Training Cross-Reference Review 2026-05-15
 
-Found by agent reviewing all C inference files against Python training/precompute code. **0 of 9 fixed.**
+Found by agent reviewing all C inference files against Python training/precompute code. **8 of 9 fixed** (INFER-H-001, INFER-M-001, INFER-M-002, INFER-L-001–L-005 committed). One remains open.
 
 ### CRITICAL
 
@@ -475,52 +475,3 @@ The C inference path (`iris_qwen3_tokenizer.c`, `qwen3_tokenize_chat`) always ap
 Result: precomputed `.npz` embeddings are computed from a token sequence 7 tokens shorter than what inference and live-training-encoding produce. All pad alignments are shifted. IP-adapter weights trained from the precomputed cache are misaligned with inference embeddings whenever the cache is used (the default fast path). **The entire existing precomputed cache must be regenerated after this fix.**
 
 Fix: add `enable_thinking=False` to `apply_chat_template` call in `precompute_all.py`; update the cache version hash in `cache_manager.py` to force regeneration.
-
-### HIGH
-
-**INFER-H-001: Strict aliasing UB in f32→f16 conversion in iris_metal.m**
-`iris_metal.m` line 932
-```c
-uint32_t bits = *(uint32_t *)&f32;
-```
-Type-puns `float *` to `uint32_t *` — undefined behavior under C strict aliasing rules. All BF16/F16 weight conversions at load time pass through this path. Silently miscompiles under LTO or aggressive auto-vectorization.
-Fix: `memcpy(&bits, &f32, sizeof(bits))`.
-
-### MEDIUM
-
-**INFER-M-001: Pad token embeddings differ between training (zeros) and inference (model output)**
-`train/scripts/precompute_all.py` line 404–405; `train/ip_adapter/dataset.py`
-Precompute saves only real tokens `h[j, :sl]`; dataloader zero-pads to 512. At inference, the full 512-token sequence runs through the model — pad positions produce non-zero hidden states (RMSNorm + attention + MLP still operate on them). Systematic discrepancy at every pad position beyond the real token count.
-Fix option A: save the full padded-to-512 embeddings from precompute (larger storage, exact inference match). Fix option B: zero out pad positions in the C inference path after the forward pass.
-
-**INFER-M-002: `iris_metal_sgemm_batch()` malloc not NULL-checked before use**
-`iris_metal.m` lines 1640–1657
-`cPtrs = malloc(batch_count * sizeof(...))` result is used immediately without a NULL check. Crash under memory pressure with no useful error message.
-Fix: add NULL check; return/abort with a descriptive error on failure.
-
-### LOW
-
-**INFER-L-001: Dead `len` mutation statements in `parse_json_string` second pass**
-`iris_qwen3_tokenizer.c` lines 227 and 232
-After `malloc(len + 1)` has been called, the second pass updates `len` on lines 227 and 232 but `len` is never read again. No overflow — just dead statements that mislead future readers.
-Fix: remove both dead `len` updates.
-
-**INFER-L-002: Dead f32 `apply_rope_2d` Metal kernel — PSO compiled but never dispatched**
-`iris_shaders.metal` lines 389–428; `iris_metal.m`
-The `apply_rope_2d` f32 kernel uses the half-split RoPE convention. Active code uses `apply_rope_2d_bf16` (consecutive-pair, correct). `g_rope_2d_pipeline` is compiled and allocated at shader init but never dispatched. Wastes Metal shader compile time and PSO memory.
-Fix: remove the kernel from `iris_shaders.metal` and associated init/dispatch code from `iris_metal.m`.
-
-**INFER-L-003: Dead `iris_apply_rope` and `iris_compute_rope_freqs` in iris_kernels.c**
-`iris_kernels.c` — `iris_apply_rope()` and `iris_compute_rope_freqs()`
-Implement the half-split RoPE convention. No callers anywhere in the codebase. Dead code that creates confusion about which RoPE convention is active (consecutive-pair is correct).
-Fix: remove both functions.
-
-**INFER-L-004: Dead low-level Metal functions in iris_metal.m**
-`iris_metal.m` / `iris_metal.h` — `iris_bf16_qk_rms_norm`, `iris_bf16_silu`, `iris_bf16_silu_mul`, `iris_metal_qk_rms_norm`
-Declared in `iris_metal.h`, defined in `iris_metal.m`, but have no callers internally or externally. The transformer uses the tensor-API wrappers instead.
-Fix: remove all four from `iris_metal.m` and their declarations from `iris_metal.h`.
-
-**INFER-L-005: iris_qwen3.h doc comment still says "layers 9, 18, 27"**
-`iris_qwen3.h` lines 100–101
-Comment says "Extracts hidden states from layers 9, 18, 27" but the constants are `QWEN3_OUTPUT_LAYER_1=8`, `_2=17`, `_3=26` and the code uses 0-indexed loop counters. Misleading to any reader cross-referencing with the HuggingFace convention.
-Fix: update comment to "Extracts hidden states at the output of loop iterations 8, 17, 26 (0-indexed, i.e. after `inner.layers[i]` runs)".
