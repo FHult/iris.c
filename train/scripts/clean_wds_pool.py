@@ -28,6 +28,9 @@ import threading
 import time
 from pathlib import Path
 
+_RETRY_ATTEMPTS = 3
+_RETRY_DELAY    = 15  # seconds between retries on transient I/O errors
+
 # Must be set before numpy/FAISS import on macOS to prevent libOMP crash.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -143,18 +146,29 @@ def main() -> None:
         for tar_path in pending:
             sentinel = tar_path.with_suffix(".tar.deduped")
             print(f"Processing {tar_path.name} ...", end=" ", flush=True)
-            try:
-                rec_in, rec_out = dedup_wds_tar(
-                    tar_path=tar_path,
-                    index_path=index_path,
-                    ids_path=ids_path,
-                    blocklist_path=blocklist_path,
-                    threshold=args.threshold,
-                    backend=args.clip_backend,
-                )
-            except Exception as e:
-                print(f"ERROR: {e}", file=sys.stderr)
-                log_orch(f"clean_wds_pool: failed {tar_path.name}: {e}", level="error")
+            last_err = None
+            for attempt in range(1, _RETRY_ATTEMPTS + 1):
+                try:
+                    rec_in, rec_out = dedup_wds_tar(
+                        tar_path=tar_path,
+                        index_path=index_path,
+                        ids_path=ids_path,
+                        blocklist_path=blocklist_path,
+                        threshold=args.threshold,
+                        backend=args.clip_backend,
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < _RETRY_ATTEMPTS:
+                        print(f"transient error (attempt {attempt}/{_RETRY_ATTEMPTS}): {e} — retrying in {_RETRY_DELAY}s",
+                              flush=True)
+                        time.sleep(_RETRY_DELAY)
+                    else:
+                        print(f"ERROR (all {_RETRY_ATTEMPTS} attempts failed): {e}", file=sys.stderr)
+                        log_orch(f"clean_wds_pool: failed {tar_path.name}: {e}", level="error")
+            if last_err is not None:
                 _done[0] += 1
                 continue
 
