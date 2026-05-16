@@ -78,7 +78,11 @@ from typing import Optional
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pipeline_lib import ABLATION_CONTROL_FILE as _ABLATION_CONTROL  # noqa: E402
+from pipeline_lib import (  # noqa: E402
+    ABLATION_CONTROL_FILE as _ABLATION_CONTROL,
+    acquire_gpu_lock as _acquire_gpu_lock,
+    release_gpu_lock as _release_gpu_lock,
+)
 
 # ── Optional ML deps ─────────────────────────────────────────────────────────
 try:
@@ -149,6 +153,39 @@ MATRIX_PRESETS: dict[str, dict] = {
         },
     },
 }
+
+# ── Goal presets (objective weight templates) ─────────────────────────────────
+GOAL_PRESETS: dict[str, dict] = {
+    "style_fidelity":  {"clip_i_weight": 0.75, "cross_ref_gap_weight": 0.15, "stability_weight": 0.10},
+    "training_signal": {"clip_i_weight": 0.20, "cross_ref_gap_weight": 0.65, "stability_weight": 0.15},
+    "balanced":        {"clip_i_weight": 0.55, "cross_ref_gap_weight": 0.30, "stability_weight": 0.15},
+    "stability":       {"clip_i_weight": 0.20, "cross_ref_gap_weight": 0.20, "stability_weight": 0.60},
+}
+
+
+def _resolve_goal(goal: str, cfg: dict) -> dict:
+    """Merge a goal preset into the config's objective dict.
+
+    Explicit values already in cfg['objective'] override the preset.
+    Fuzzy match: 'maximize style fidelity' → 'style_fidelity'.
+    """
+    preset_key = goal.lower().replace(" ", "_").replace("-", "_")
+    matched = None
+    for k in GOAL_PRESETS:
+        if k in preset_key or preset_key in k:
+            matched = k
+            break
+    if matched is None:
+        print(f"WARNING: unknown --goal '{goal}' — known presets: {list(GOAL_PRESETS)}",
+              file=sys.stderr)
+        return cfg
+    weights = dict(GOAL_PRESETS[matched])
+    weights.update(cfg.get("objective", {}))  # explicit YAML values win
+    cfg = dict(cfg)
+    cfg["objective"] = weights
+    print(f"  goal preset '{matched}': {weights}")
+    return cfg
+
 
 # ── Metric log regexes ────────────────────────────────────────────────────────
 _RE_STEP  = re.compile(r"^step\s+([\d,]+)/([\d,]+)\s+loss\s+([\d.]+)\s+\(avg\s+([\d.]+)\)")
@@ -658,6 +695,82 @@ class OptunaSearch(SearchStrategy):
             return random.choice(remaining)
 
 
+class OptunaMultiObjectiveSearch(SearchStrategy):
+    """Optuna NSGA-II Pareto search over a discrete candidate grid.
+
+    Three objectives: maximise ref_gap, maximise cond_gap, minimise final_loss.
+    Requires all three raw metrics to be present; falls back to random until
+    n_initial fully-scored experiments exist.
+    """
+
+    def __init__(self, variables: dict, candidates: list[dict],
+                 n_initial: int = 10) -> None:
+        self._variables  = variables
+        self._candidates = candidates
+        self._n_initial  = n_initial
+        self._dists: dict = {}
+        if _OPTUNA_OK:
+            for k, vals in variables.items():
+                self._dists[k] = _optuna.distributions.CategoricalDistribution(
+                    [str(v) for v in vals]
+                )
+
+    def _decode(self, optuna_params: dict) -> dict:
+        result = {}
+        for k, vals in self._variables.items():
+            sv = optuna_params.get(k, str(vals[0]))
+            for v in vals:
+                if str(v) == sv:
+                    result[k] = v
+                    break
+            else:
+                result[k] = vals[0]
+        return result
+
+    def next_candidate(self, tried_results: list[dict]) -> Optional[dict]:
+        import random
+        tried_keys = {_params_key(t["params"]) for t in tried_results}
+        remaining  = [c for c in self._candidates if _params_key(c) not in tried_keys]
+        if not remaining:
+            return None
+
+        scored = [r for r in tried_results
+                  if r.get("ref_gap") is not None
+                  and r.get("cond_gap") is not None
+                  and r.get("final_loss") is not None]
+        if len(scored) < self._n_initial or not _OPTUNA_OK:
+            return random.choice(remaining)
+
+        sampler = _optuna.samplers.NSGAIISampler(seed=42)
+        study   = _optuna.create_study(
+            directions=["maximize", "maximize", "minimize"],
+            sampler=sampler,
+        )
+        for r in scored:
+            p = r["params"]
+            try:
+                t = _optuna.trial.create_trial(
+                    params={k: str(p.get(k, vals[0])) for k, vals in self._variables.items()},
+                    distributions=self._dists,
+                    values=[float(r["ref_gap"]), float(r["cond_gap"]), float(r["final_loss"])],
+                )
+                study.add_trial(t)
+            except Exception:
+                continue
+
+        if len(study.trials) < self._n_initial:
+            return random.choice(remaining)
+
+        try:
+            trial  = study.ask(fixed_distributions=self._dists)
+            params = self._decode(trial.params)
+            if _params_key(params) in tried_keys or params not in remaining:
+                return random.choice(remaining)
+            return params
+        except Exception:
+            return random.choice(remaining)
+
+
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 class HeartbeatWriter:
@@ -1046,6 +1159,31 @@ class CampaignPlateau:
         return f"best={self._best:.3f}  stale={self._stale}/{self.patience}"
 
 
+# ── GPU lock helpers ──────────────────────────────────────────────────────────
+
+def _wait_for_gpu_lock(max_wait_secs: int = 3600) -> bool:
+    """Spin-wait until the GPU lock is acquired. Returns True on success.
+
+    Returns False after max_wait_secs and proceeds unguarded (soft failure).
+    """
+    printed = False
+    t0 = time.time()
+    while True:
+        try:
+            if _acquire_gpu_lock("ablation"):
+                return True
+        except Exception:
+            return True  # lock system unavailable — proceed without guard
+        if not printed:
+            print("  [GPU busy — waiting for pipeline to release GPU lock]", flush=True)
+            printed = True
+        if time.time() - t0 > max_wait_secs:
+            print(f"  WARNING: GPU lock wait exceeded {max_wait_secs}s — proceeding unguarded",
+                  file=sys.stderr, flush=True)
+            return False
+        time.sleep(30)
+
+
 # ── Single-run execution ──────────────────────────────────────────────────────
 
 def _run_one(
@@ -1056,6 +1194,7 @@ def _run_one(
     quiet: bool = False,
     hb: Optional[HeartbeatWriter] = None,
     early_stopper: Optional[EarlyStopper] = None,
+    use_gpu_lock: bool = False,
 ) -> dict:
     combo_id = combo["combo_id"]
     params   = combo["params"]
@@ -1097,8 +1236,12 @@ def _run_one(
     collector = MetricCollector()
     t_start = time.time()
     exit_code = -1
+    _gpu_lock_held = False
 
     try:
+        if use_gpu_lock:
+            _gpu_lock_held = _wait_for_gpu_lock()
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1147,6 +1290,11 @@ def _run_one(
         print(f"  FATAL: failed to launch trainer: {exc}", file=sys.stderr)
         exit_code = -1
     finally:
+        if _gpu_lock_held:
+            try:
+                _release_gpu_lock()
+            except Exception:
+                pass
         try:
             os.unlink(tmp_cfg)
         except OSError:
@@ -1218,6 +1366,13 @@ def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
         return GridSearch(candidates)
     if strategy == "random":
         return RandomSearch(candidates, seed=cfg.get("seed"))
+    if strategy == "nsga2":
+        if _OPTUNA_OK and variables:
+            print("  Bayesian backend: Optuna NSGA-II (multi-objective Pareto)", flush=True)
+            return OptunaMultiObjectiveSearch(variables, candidates=candidates, n_initial=n_initial)
+        print("WARNING: optuna not available for NSGA-II — falling back to bayesian",
+              file=sys.stderr)
+        strategy = "bayesian"
     if strategy == "bayesian":
         # Prefer Optuna TPE (handles discrete/categorical better than GP)
         if _OPTUNA_OK and variables:
@@ -1284,15 +1439,19 @@ def _warm_start_candidate(warm_start_dir: Path, run_name: str,
 
 def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     """Fire-and-forget long-term loop.  Runs until max_total_runs or stop signal."""
-    run_name   = harness_cfg.get("name", "default")
-    max_runs   = int(harness_cfg.get("max_total_runs", 100))
-    steps      = int(harness_cfg.get("steps_per_run", 8000))
-    strategy   = harness_cfg.get("strategy", "random")
-    objective  = harness_cfg.get("objective", {})
-    variables  = harness_cfg.get("variables", {})
-    conditions = harness_cfg.get("conditions", [])
-    log_every  = max(50, steps // 80)
-    output_dir = Path(cli_args.output_dir)
+    run_name       = harness_cfg.get("name", "default")
+    max_runs       = int(harness_cfg.get("max_total_runs", 100))
+    steps          = int(harness_cfg.get("steps_per_run", 8000))
+    strategy       = harness_cfg.get("strategy", "random")
+    objective      = harness_cfg.get("objective", {})
+    variables      = harness_cfg.get("variables", {})
+    conditions     = harness_cfg.get("conditions", [])
+    max_days       = float(harness_cfg.get("max_days", 0))
+    use_gpu_lock   = bool(harness_cfg.get("gpu_coordination", True))
+    report_hours   = float(harness_cfg.get("report_interval_hours", 4.0))
+    log_every      = max(50, steps // 80)
+    output_dir     = Path(cli_args.output_dir)
+    campaign_start = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Build candidate pool
@@ -1354,6 +1513,9 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     print(_c("cyan", f"{'═'*64}"))
     print(f"  strategy={strategy}  steps={steps}  max_runs={max_runs}")
     print(f"  candidates={len(candidates)}  already_done={n_done}")
+    if max_days > 0:
+        print(f"  max_days={max_days:.1f}")
+    print(f"  gpu_coordination={use_gpu_lock}  report_interval={report_hours:.1f}h")
     print(f"  db: {db._db_path}")
     print(f"  output: {output_dir}")
     if early_stopper is not None:
@@ -1370,6 +1532,21 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     hb.update(status="running", strategy=strategy, n_candidates=len(candidates),
                n_done=n_done, n_max=max_runs)
     force_continue = getattr(cli_args, "force_continue", False)
+
+    # Periodic report background thread — regenerates HTML every report_hours
+    _report_stop = threading.Event()
+
+    def _auto_report_loop() -> None:
+        while not _report_stop.wait(report_hours * 3600):
+            try:
+                _exps = db.get_experiments(run_name)
+                if _exps:
+                    _generate_lt_report(_exps, output_dir, run_name, steps, objective)
+            except Exception:
+                pass
+
+    _report_thread = threading.Thread(target=_auto_report_loop, daemon=True)
+    _report_thread.start()
 
     while n_done < max_runs:
         if not _wait_if_paused(hb):
@@ -1413,7 +1590,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
         _print_combo_header(combo, n_done, max_runs, steps)
         result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb,
-                          early_stopper=early_stopper)
+                          early_stopper=early_stopper, use_gpu_lock=use_gpu_lock)
 
         # Re-score with configurable objective
         weighted_score = _score_weighted(result.get("snapshots", []), result["exit_code"], objective)
@@ -1458,7 +1635,16 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             print("\n  Interrupted — exiting")
             break
 
+        # Time-based campaign limit
+        if max_days > 0 and (time.time() - campaign_start) / 86400 >= max_days:
+            elapsed_d = (time.time() - campaign_start) / 86400
+            print(_c("yellow",
+                     f"\n  Campaign time limit reached ({elapsed_d:.2f}/{max_days:.1f} days)"))
+            hb.update(status="time_limit_reached", n_done=n_done)
+            break
+
     # Final
+    _report_stop.set()
     all_experiments = db.get_experiments(run_name)
     _print_final_ranking(all_experiments)
     _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
@@ -2187,6 +2373,11 @@ def main() -> None:
                     help="Output dir of a prior campaign; injects its best params as first candidate")
     ap.add_argument("--force-continue", action="store_true",
                     help="Keep running even after campaign plateau is detected")
+    ap.add_argument("--goal", default=None, metavar="PRESET",
+                    help=f"Optimization goal preset (overrides config objective weights): "
+                         f"{list(GOAL_PRESETS)}")
+    ap.add_argument("--max-days", type=float, default=None, dest="max_days",
+                    help="Stop campaign after N days (overrides config max_days)")
 
     # Batch mode
     ap.add_argument("--matrix", default="small", metavar="PRESET",
@@ -2227,6 +2418,10 @@ def main() -> None:
     # ── Long-term mode ────────────────────────────────────────────────────────
     if args.config:
         harness_cfg = _load_harness_config(Path(args.config))
+        if getattr(args, "goal", None):
+            harness_cfg = _resolve_goal(args.goal, harness_cfg)
+        if getattr(args, "max_days", None) is not None:
+            harness_cfg["max_days"] = args.max_days
         db_path = Path(args.db) if args.db else output_dir / "ablation_history.db"
         db = AblationDB(db_path)
         run_name = harness_cfg.get("name", "default")

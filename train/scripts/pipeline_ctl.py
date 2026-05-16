@@ -580,6 +580,9 @@ def cmd_start_ablation(args) -> None:
     vae_cache   = args.vae_cache   or str(PRECOMP_DIR / "vae")
     siglip_cache= args.siglip_cache or str(PRECOMP_DIR / "siglip")
 
+    goal_flag     = f" --goal '{args.goal}'" if getattr(args, "goal", None) else ""
+    max_days_flag = f" --max-days {args.max_days}" if getattr(args, "max_days", None) is not None else ""
+
     cmd = (
         f"source '{TRAIN_DIR}/.venv/bin/activate' && "
         f"caffeinate -dims python -u '{SCRIPTS_DIR}/ablation_harness.py' "
@@ -588,6 +591,7 @@ def cmd_start_ablation(args) -> None:
         f"--qwen3-cache '{qwen3_cache}' "
         f"--vae-cache '{vae_cache}' "
         f"--siglip-cache '{siglip_cache}'"
+        f"{goal_flag}{max_days_flag}"
     )
     tmux_new_window(TMUX_ABLATION_WIN, cmd, log_file)
     print(f"Ablation started → {TMUX_ABLATION_WIN} window")
@@ -926,6 +930,10 @@ def main() -> None:
                    help="VAE cache dir (default: DATA_ROOT/precomputed/vae)")
     p.add_argument("--siglip-cache",  default=None, metavar="PATH",
                    help="SigLIP cache dir (default: DATA_ROOT/precomputed/siglip)")
+    p.add_argument("--goal",          default=None, metavar="PRESET",
+                   help="Optimization goal preset (style_fidelity|training_signal|balanced|stability)")
+    p.add_argument("--max-days",      type=float, default=None, metavar="N",
+                   help="Stop campaign after N days (overrides config max_days)")
 
     sub.add_parser("stop-ablation",    help="Send stop signal to running ablation harness")
     sub.add_parser("pause-ablation",   help="Pause harness after current run")
