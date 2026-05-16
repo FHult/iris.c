@@ -186,3 +186,36 @@ are in git history.
 - **INFER-L-004** — Dead `iris_bf16_qk_rms_norm`, `iris_bf16_silu`, `iris_bf16_silu_mul`, `iris_metal_qk_rms_norm` removed from `iris_metal.m` and `iris_metal.h`.
 
 - **INFER-L-005** — `iris_qwen3.h` doc comment updated from "layers 9, 18, 27" to "loop iterations 8, 17, 26 (0-indexed)".
+
+- **INFER-C-001** — `enable_thinking=False` added to `apply_chat_template` call in `precompute_all.py`; cache version hash bumped in `cache_manager.py` to force full precompute regeneration. Fixes 7-token sequence length mismatch between precomputed embeddings and C inference path.
+
+---
+
+## Pipeline Code Review — Completed (2026-05-15, commit `76564f8`)
+
+All 14 second-pass pipeline bugs fixed:
+
+- **PIPE-C-001** — GPU lock TOCTOU race: `acquire_gpu_lock` return value now checked; `request()` returns `False` if lock was claimed between check and acquire.
+- **PIPE-C-002** — Post-training deadlock: prep gate now uses `not is_done(chunk-1, "train")` instead of `derive_chunk_state` which returned `ERROR` for post-training step failures.
+- **PIPE-C-003** — Val set sentinel mismatch: removed spurious `.done` suffix from sentinel path in `pipeline_ctl.py`.
+- **PIPE-C-004** — Non-atomic CLIP NPZ write: `np.savez` now writes to `.tmp` stem then `os.replace` to final path.
+- **PIPE-H-001** — Manifest layer indices aligned to 0-indexed `[8,17,26]` matching `cache_manager.py`.
+- **PIPE-H-002** — `_has_output` closure fixed to check `{stem}_*.npz` pattern instead of `{stem}.npz`.
+- **PIPE-H-003** — Cache-miss `continue` skip counter added with 50-skip warning and 50%-over-500 circuit breaker.
+- **PIPE-H-004** — Mining `t` sampled from logit-normal distribution matching training; fixed t=500 removed.
+- **PIPE-H-005** — Temp training config path stored as `_active_train_tmp_cfg`; unlinked in `_post_step`.
+- **PIPE-H-006** — Converted tar written to `.tar.tmp` then `os.replace` to final path in `download_convert.py`.
+- **PIPE-M-001** — `filter_shards` non-numeric stem crash fixed with `_shard_idx()` helper returning `None` on `ValueError`.
+- **PIPE-M-002** — `mine_hard_examples` cache dir existence checked before `os.listdir`; clear error message on failure.
+- **PIPE-M-003** — `anchor_mix_ratio + hard_mix_ratio >= 1.0` validated at startup in `dataset.py`.
+- **PIPE-M-004** — `max_seq` hard-capped at 512; captions truncated at tokenization time to prevent MLX graph retrace.
+- **PIPE-L-001** — Mining `_eval_loss` docstring updated to match logit-normal implementation.
+- **PIPE-L-002** — Control file write made atomic via `.tmp` + `os.replace`.
+- **PIPE-L-003** — EMA drift metric now samples top-5 tensors by size descending.
+
+---
+
+## DEDUP-1 — Completed (2026-05-15/16)
+
+- **Track 1** — Converted pool dedup at ingest implemented as the `dedupe_filter` pipeline step (`train/scripts/dedupe_filter.py`). Runs after convert, before build_shards; holds GPU_TOKEN; quality-filters (CPU) then CLIP-deduplicates each pool tar; writes back to cold pool atomically; writes `.deduped` sentinel for idempotency. Integrated into orchestrator between `convert` and `build_shards` states.
+- **Track 2** — Retroactive pool cleaning via `train/scripts/clean_wds_pool.py`; supports `--tgz-range`, 3x retry with 15s backoff, per-tar timing/index-size/cumulative logging. Currently running on tgz 1–49.
