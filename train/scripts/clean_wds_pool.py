@@ -141,11 +141,22 @@ def main() -> None:
     total_in = 0
     total_out = 0
     total_dups = 0
+    run_start = time.time()
+
+    def _index_size() -> int:
+        """Count vectors currently in the cumulative index (lines in .ids file)."""
+        try:
+            return sum(1 for _ in ids_path.open() if True) if ids_path.exists() else 0
+        except Exception:
+            return -1
 
     try:
-        for tar_path in pending:
+        for i, tar_path in enumerate(pending, 1):
             sentinel = tar_path.with_suffix(".tar.deduped")
-            print(f"Processing {tar_path.name} ...", end=" ", flush=True)
+            tar_size_mb = tar_path.stat().st_size / 1_048_576
+            print(f"[{i}/{_total}] {tar_path.name} ({tar_size_mb:.0f} MB) ...",
+                  end=" ", flush=True)
+            t0 = time.time()
             last_err = None
             for attempt in range(1, _RETRY_ATTEMPTS + 1):
                 try:
@@ -162,22 +173,41 @@ def main() -> None:
                 except Exception as e:
                     last_err = e
                     if attempt < _RETRY_ATTEMPTS:
-                        print(f"transient error (attempt {attempt}/{_RETRY_ATTEMPTS}): {e} — retrying in {_RETRY_DELAY}s",
-                              flush=True)
+                        print(f"\n  transient error (attempt {attempt}/{_RETRY_ATTEMPTS}): {e}"
+                              f" — retrying in {_RETRY_DELAY}s", flush=True)
                         time.sleep(_RETRY_DELAY)
                     else:
-                        print(f"ERROR (all {_RETRY_ATTEMPTS} attempts failed): {e}", file=sys.stderr)
+                        elapsed = time.time() - t0
+                        print(f"FAILED ({elapsed:.0f}s): {e}", file=sys.stderr, flush=True)
                         log_orch(f"clean_wds_pool: failed {tar_path.name}: {e}", level="error")
             if last_err is not None:
                 _done[0] += 1
                 continue
 
+            elapsed = time.time() - t0
             dups = rec_in - rec_out
+            dup_pct = 100 * dups / rec_in if rec_in else 0.0
             total_in += rec_in
             total_out += rec_out
             total_dups += dups
-            print(f"{rec_in} -> {rec_out} ({dups} removed)")
-            log_orch(f"clean_wds_pool: {tar_path.name}: {rec_in} -> {rec_out} ({dups} removed)")
+
+            idx_sz = _index_size()
+            cumulative_pct = 100 * total_dups / total_in if total_in else 0.0
+            print(
+                f"{rec_in:,} -> {rec_out:,}  ({dups:,} removed, {dup_pct:.1f}%)  "
+                f"{elapsed:.0f}s  index={idx_sz:,}",
+                flush=True,
+            )
+            print(
+                f"  cumulative: {total_in:,} in  {total_out:,} out  "
+                f"{total_dups:,} dups ({cumulative_pct:.1f}%)  "
+                f"elapsed={time.time()-run_start:.0f}s",
+                flush=True,
+            )
+            log_orch(
+                f"clean_wds_pool: {tar_path.name}: {rec_in} -> {rec_out}"
+                f" ({dups} removed, {dup_pct:.1f}%)  {elapsed:.0f}s  index={idx_sz}"
+            )
 
             # Write sentinel to mark this tar as deduped.
             sentinel.touch()
@@ -186,12 +216,16 @@ def main() -> None:
     finally:
         _stop.set()
 
-    print(f"\nDone: {_done[0]}/{_total} tars processed")
-    print(f"  Total records in:  {total_in:,}")
-    print(f"  Total records out: {total_out:,}")
+    total_elapsed = time.time() - run_start
+    print(f"\nDone: {_done[0]}/{_total} tars processed in {total_elapsed:.0f}s")
+    print(f"  Total records in:   {total_in:,}")
+    print(f"  Total records out:  {total_out:,}")
     print(f"  Duplicates removed: {total_dups:,}")
     if total_in > 0:
         print(f"  Dedup rate: {100*total_dups/total_in:.1f}%")
+    idx_sz = _index_size()
+    if idx_sz >= 0:
+        print(f"  Index size: {idx_sz:,} vectors")
 
     write_heartbeat("clean_wds_pool", None, done=_done[0], total=_total, pct=100)
 
