@@ -84,8 +84,22 @@ def _load_clip(backend: str = "auto") -> None:
         return
 
     # At sustained workloads (≥512 images, B=16), MLX and open_clip/MPS are at parity
-    # (~39 img/s on M1 Max).  Prefer open_clip in auto mode only because it's already
-    # installed; fall through to MLX when open_clip/torch are absent.
+    # (~39 img/s on M1 Max).  MLX is preferred in auto mode for lower memory pressure
+    # (no PyTorch overhead, unified Metal memory); fall back to open_clip if unavailable.
+    if backend in ("mlx", "auto"):
+        try:
+            from mlx_clip_embed import MLXCLIPEmbedder
+            embedder = MLXCLIPEmbedder()
+            embedder.load()
+            _mlx_embedder = embedder
+            _clip_backend = "mlx"
+            log_orch("CLIP: ViT-L-14 via MLX (native Apple Silicon)")
+            return
+        except Exception as e:
+            if backend == "mlx":
+                raise RuntimeError(f"MLX CLIP backend failed: {e}") from e
+            log_orch(f"CLIP: MLX unavailable ({e}), trying open_clip", level="warning")
+
     if backend in ("open_clip", "auto"):
         device = _clip_device()
         try:
@@ -100,20 +114,6 @@ def _load_clip(backend: str = "auto") -> None:
         except ImportError:
             if backend == "open_clip":
                 raise RuntimeError("open_clip not installed: pip install open-clip-torch")
-
-    if backend in ("mlx", "auto"):
-        try:
-            from mlx_clip_embed import MLXCLIPEmbedder
-            embedder = MLXCLIPEmbedder()
-            embedder.load()
-            _mlx_embedder = embedder
-            _clip_backend = "mlx"
-            log_orch("CLIP: ViT-L-14 via MLX (native Apple Silicon)")
-            return
-        except Exception as e:
-            if backend == "mlx":
-                raise RuntimeError(f"MLX CLIP backend failed: {e}") from e
-            log_orch(f"CLIP: MLX unavailable ({e}), trying transformers", level="warning")
 
     if backend in ("transformers", "auto"):
         device = _clip_device()
