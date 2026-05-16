@@ -1173,7 +1173,7 @@ def _wait_for_gpu_lock(max_wait_secs: int = 3600) -> bool:
             if _acquire_gpu_lock("ablation"):
                 return True
         except Exception:
-            return True  # lock system unavailable — proceed without guard
+            return False  # lock system unavailable — proceed unguarded
         if not printed:
             print("  [GPU busy — waiting for pipeline to release GPU lock]", flush=True)
             printed = True
@@ -1392,7 +1392,7 @@ def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
                   file=sys.stderr)
         print("  Bayesian backend: GP-UCB (sklearn)", flush=True)
         return BayesianSearch(candidates, n_initial=n_initial)
-    print(f"ERROR: unknown strategy '{strategy}'. Use: grid, random, bayesian", file=sys.stderr)
+    print(f"ERROR: unknown strategy '{strategy}'. Use: grid, random, bayesian, nsga2", file=sys.stderr)
     sys.exit(1)
 
 
@@ -1610,7 +1610,13 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         )
         db.update_pareto_front(run_name)
 
-        tried.append({"params": params, "score": result["score"]})
+        tried.append({
+            "params":     params,
+            "score":      result["score"],
+            "ref_gap":    result.get("mean_ref_gap"),
+            "cond_gap":   result.get("mean_cond_gap"),
+            "final_loss": result.get("final_loss"),
+        })
 
         _print_result_line(result)
 
