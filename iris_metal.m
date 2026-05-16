@@ -957,7 +957,9 @@ static inline float f16_to_f32(uint16_t f16) {
     } else {
         f32_bits = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
     }
-    return *(float *)&f32_bits;
+    float result;
+    memcpy(&result, &f32_bits, sizeof(result));
+    return result;
 }
 
 /* Convert bf16 to f16 for MPS compatibility

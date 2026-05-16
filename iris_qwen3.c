@@ -1898,6 +1898,16 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     free(padded_tokens);
     free(attention_mask);
 
+    /* Zero pad positions to match training convention.
+     * Precompute saves only real-token rows; training zero-pads to 512.
+     * Without this, pad positions carry non-zero RMSNorm/attention output
+     * and create a systematic mismatch at every position beyond num_tokens. */
+    if (embeddings && num_tokens < QWEN3_MAX_SEQ_LEN) {
+        int text_dim = enc->model->text_dim;
+        memset(embeddings + (size_t)num_tokens * text_dim, 0,
+               (size_t)(QWEN3_MAX_SEQ_LEN - num_tokens) * text_dim * sizeof(float));
+    }
+
     return embeddings;
 }
 
