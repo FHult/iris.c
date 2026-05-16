@@ -545,7 +545,9 @@ def dedup_wds_tar(
 
     # Decode all images from the tar.
     ids, images = _decode_shard(str(tar_path), _decode_preprocess)
-    if ids is None or len(ids) == 0:
+    if ids is None:
+        raise RuntimeError(f"embed failed for {tar_path.name} — I/O error reading tar")
+    if len(ids) == 0:
         return (0, 0)
 
     records_in = len(ids)
