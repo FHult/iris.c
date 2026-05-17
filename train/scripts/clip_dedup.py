@@ -419,9 +419,11 @@ def cmd_build_index(args) -> int:
     if index is None:
         index = faiss.IndexFlatIP(dim)
 
+    prior_n = index.ntotal  # record before this batch is added (for incremental find-dups)
     index.add(vecs)
     index_path.parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(index_path))
+    index_path.with_suffix(".prior_n").write_text(str(prior_n))
 
     with open(ids_path, "a") as f:
         for fid in new_ids:
@@ -461,42 +463,70 @@ def cmd_find_dups(args) -> int:
         log_orch("find-dups: empty index")
         return 0
 
-    # Reconstruct stored vectors from the flat index
-    d   = index.d
-    all_vecs = np.zeros((n, d), dtype=np.float32)
-    index.reconstruct_n(0, n, all_vecs)
+    # Incremental search: only examine vectors added since the last build-index call.
+    # prior_n is written by cmd_build_index so we reconstruct only the new chunk's
+    # vectors instead of the full corpus (saves O(n_prev) reconstruct + search work).
+    prior_n_path = index_path.with_suffix(".prior_n")
+    prior_n = int(prior_n_path.read_text().strip()) if prior_n_path.exists() else 0
+    n_new = n - prior_n
 
-    log_orch(f"find-dups: {n} vectors, threshold={threshold}")
+    if n_new <= 0:
+        log_orch("find-dups: no new vectors since last build-index — nothing to search")
+        return 0
+
+    d = index.d
+    new_vecs = np.zeros((n_new, d), dtype=np.float32)
+    index.reconstruct_n(prior_n, n_new, new_vecs)
+
+    log_orch(f"find-dups: searching {n_new} new vectors against {n} total "
+             f"(prior={prior_n}, threshold={threshold})")
 
     existing_dups: set = set()
     if out_path.exists():
         existing_dups = set(out_path.read_text().splitlines())
 
-    k         = min(5, n)
+    k          = min(5, n)
     new_dups: list = []
-    kept_set: set  = set()
+    kept_new: set  = set()   # local indices (within new_vecs) confirmed kept
     batch_size = 4096
 
-    for start in range(0, n, batch_size):
-        end   = min(start + batch_size, n)
-        chunk = all_vecs[start:end]
-        D, I  = index.search(chunk, k)
+    for start in range(0, n_new, batch_size):
+        end   = min(start + batch_size, n_new)
+        batch = new_vecs[start:end]
+        D, I  = index.search(batch, k)
 
         for local_i in range(end - start):
-            global_i = start + local_i
+            new_local = start + local_i
+            global_i  = prior_n + new_local
             fid = all_ids[global_i]
             if fid in existing_dups:
                 continue
-            kept_set.add(global_i)
+
+            # Determine if this new vector is a dup of any kept vector.
+            # Old vectors (index < prior_n) are implicitly kept if not in existing_dups.
+            # New vectors are kept if their local index is in kept_new.
+            is_dup = False
             for rank in range(1, k):
-                neighbor = int(I[local_i, rank])
-                if neighbor < 0:
+                nb_global = int(I[local_i, rank])
+                if nb_global < 0:
                     break
-                if float(D[local_i, rank]) >= threshold:
-                    nid = all_ids[neighbor]
-                    if nid not in existing_dups and neighbor not in kept_set:
-                        existing_dups.add(nid)
-                        new_dups.append(nid)
+                if float(D[local_i, rank]) < threshold:
+                    break
+                nb_id = all_ids[nb_global]
+                if nb_global < prior_n:
+                    if nb_id not in existing_dups:   # old kept vector → current is dup
+                        is_dup = True
+                        break
+                else:
+                    if (nb_global - prior_n) in kept_new:  # new kept vector → current is dup
+                        is_dup = True
+                        break
+
+            if is_dup:
+                existing_dups.add(fid)
+                new_dups.append(fid)
+            else:
+                kept_new.add(new_local)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if new_dups:

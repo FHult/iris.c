@@ -621,12 +621,14 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
     existing_s = _scan_existing(siglip_out)
 
     wq = wv = ws = 0
+    n_records = 0
     pending_q: list = []
     pending_v: list = []
     pending_s: list = []
 
     records_iter = pre_records if pre_records is not None else iter_shard(shard_path)
     for rec_id, jpg_bytes, caption in records_iter:
+        n_records += 1
         need_q = bool(qwen3_out)   and rec_id not in existing_q
         need_v = bool(vae_out)     and rec_id not in existing_v
         need_s = bool(siglip_out)  and rec_id not in existing_s
@@ -713,6 +715,7 @@ def _process_shard_inner(shard_path, qwen3_out, vae_out, siglip_out,
         "error": False,
         "skipped_q": n_pending_q - (wq - wq_before),
         "skipped_v": n_pending_v - (wv - wv_before),
+        "n_records": n_records,
     }
 
 
@@ -868,20 +871,19 @@ def main():
 
         if args.new_shards_first > 0:
             # Identify shards that have no precomputed output yet (new data).
-            # A shard is "new" if no .npz exists for it in any output directory.
+            # Pre-build a stem set from one os.listdir per output dir (O(n_files))
+            # instead of calling os.listdir per shard (O(n_shards × n_files)).
             out_dirs = [d for d in [args.qwen3_output, args.vae_output] if d]
-            def _has_output(shard_path: str) -> bool:
-                stem = os.path.splitext(os.path.basename(shard_path))[0]
-                return any(
-                    any(
-                        f.startswith(stem + "_") and f.endswith(".npz")
-                        for f in os.listdir(d)
-                    )
-                    for d in out_dirs
-                    if os.path.isdir(d)
-                )
-            new_shards = [s for s in shards if not _has_output(s)]
-            old_shards = [s for s in shards if _has_output(s)]
+            _existing_stems: set[str] = set()
+            for _d in out_dirs:
+                if os.path.isdir(_d):
+                    for _f in os.listdir(_d):
+                        if _f.endswith(".npz"):
+                            _existing_stems.add(_f.split("_")[0])
+            new_shards = [s for s in shards
+                          if os.path.splitext(os.path.basename(s))[0] not in _existing_stems]
+            old_shards = [s for s in shards
+                          if os.path.splitext(os.path.basename(s))[0] in _existing_stems]
             n_new = min(args.new_shards_first, len(new_shards), args.max_shards)
             n_old = args.max_shards - n_new
             selected  = _rng.sample(new_shards, n_new) if n_new > 0 else []
@@ -1135,19 +1137,26 @@ def main():
     if _check_dirs and work_items:
         print("\nVerifying per-shard .npz coverage ...",
               file=sys.stderr if args.ai else sys.stdout, flush=True)
+        # Build n_records lookup from Phase-1 counts already collected during encoding.
+        # Also build per-dir stem→count maps (one os.listdir call per dir, not per shard).
+        _nrec_by_shard = {r["shard"]: r.get("n_records", 0) for r in results}
+        _stem_counts: dict[str, dict[str, int]] = {}
+        for _od in _check_dirs:
+            _sc: dict[str, int] = {}
+            for _f in os.listdir(_od):
+                if _f.endswith(".npz"):
+                    _s = _f.split("_")[0]
+                    _sc[_s] = _sc.get(_s, 0) + 1
+            _stem_counts[_od] = _sc
+
         _short: list[str] = []
         for shard_path, *_ in work_items:
             stem = os.path.splitext(os.path.basename(shard_path))[0]
-            # Count records in the shard (fast header-only pass).
-            try:
-                expected = sum(1 for _ in iter_shard(shard_path))
-            except Exception:
-                continue
+            expected = _nrec_by_shard.get(shard_path, 0)
             if expected == 0:
                 continue
             for out_dir in _check_dirs:
-                actual = sum(1 for f in os.listdir(out_dir)
-                             if f.startswith(stem + "_") and f.endswith(".npz"))
+                actual = _stem_counts.get(out_dir, {}).get(stem, 0)
                 if actual < expected:
                     _short.append(
                         f"  {os.path.basename(out_dir)}/{stem}: {actual}/{expected} records"

@@ -501,6 +501,32 @@ def main():
     hb = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb.start()
 
+    # Pre-load SigLIP via grouped shard reads when no precomputed cache is available.
+    # Without this, each of the N sample records opens its source tar individually —
+    # potentially 5,000 sequential tarfile.open calls on large files.
+    _siglip_fallback: dict[str, object] = {}
+    if not args.null_siglip and not args.siglip_cache:
+        _by_shard_sg: dict[str, list[str]] = {}
+        for _rid, _sp in sample:
+            _by_shard_sg.setdefault(_sp, []).append(_rid)
+        print(f"  SigLIP fallback: reading from {len(_by_shard_sg)} source shard(s)...",
+              flush=True)
+        for _sp, _rids in _by_shard_sg.items():
+            _rid_set = set(_rids)
+            try:
+                with tarfile.open(_sp) as _t:
+                    for _m in _t.getmembers():
+                        if not _m.isfile():
+                            continue
+                        _stem2, _, _ext = _m.name.rpartition(".")
+                        if _stem2 in _rid_set and _ext.lower() in ("jpg", "jpeg"):
+                            _enc = _encode_siglip_jpg(_t.extractfile(_m).read(),
+                                                      args.siglip_model)
+                            if _enc is not None:
+                                _siglip_fallback[_stem2] = _enc
+            except Exception:
+                pass
+
     _buf_text: list = []
     _buf_vae:  list = []
     _buf_sg:   list = []
@@ -553,17 +579,21 @@ def main():
             siglip_np = _load_siglip(rec_id, args.siglip_cache)
 
         if siglip_np is None:
-            try:
-                with tarfile.open(shard_path) as t:
-                    members = {m.name: m for m in t.getmembers() if m.isfile()}
-                    for name, m in members.items():
-                        stem2, _, ext = name.rpartition(".")
-                        if stem2 == rec_id and ext.lower() in ("jpg", "jpeg"):
-                            jpg_bytes = t.extractfile(m).read()
-                            siglip_np = _encode_siglip_jpg(jpg_bytes, args.siglip_model)
-                            break
-            except Exception:
-                pass
+            # Try the pre-loaded fallback dict first; only do a per-record tar open
+            # when siglip_cache is set but has a gap for this record (rare).
+            siglip_np = _siglip_fallback.get(rec_id)
+            if siglip_np is None and not _siglip_fallback:
+                try:
+                    with tarfile.open(shard_path) as t:
+                        members = {m.name: m for m in t.getmembers() if m.isfile()}
+                        for name, m in members.items():
+                            stem2, _, ext = name.rpartition(".")
+                            if stem2 == rec_id and ext.lower() in ("jpg", "jpeg"):
+                                jpg_bytes = t.extractfile(m).read()
+                                siglip_np = _encode_siglip_jpg(jpg_bytes, args.siglip_model)
+                                break
+                except Exception:
+                    pass
 
         if text_np is None or vae_np is None or siglip_np is None:
             skipped += 1
