@@ -118,6 +118,15 @@ def _log_for_step(chunk: int, step: str) -> Path:
     return mapping.get(step, Path(""))
 
 
+def _read_val_metrics(chunk: int) -> dict:
+    """Return the most recent validation metrics for a chunk, or {}."""
+    try:
+        path = LOG_DIR / f"val_chunk{chunk}" / "metrics.json"
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
 def _chunk_status(chunk: int) -> dict:
     steps = {}
     errors = {}
@@ -354,6 +363,7 @@ def build_status_dict(total_chunks: int = 4) -> dict:
         cs = _chunk_status(c)
         cs["active_step"] = _active_step_for(cs, tmux["prep"], tmux["train"])
         cs["staging"] = _staging_detail(c)
+        cs["val_metrics"] = _read_val_metrics(c)
         chunks[c] = cs
 
     # Cross-reference trainer heartbeats.  The trainer may be running even
@@ -490,6 +500,20 @@ def print_human(status: dict, verbose: bool = False) -> None:
             active_mark = ""
         step_prog = f"  step {s_done_c}/{s_total_c}"
         print(f"  Chunk {c}: {state_str:<16}{step_prog}  last: {last}{active_mark}{err_mark}{stg_str}")
+        val = _read_val_metrics(c)
+        if val:
+            clip_i   = val.get("mean_clip_i")
+            delta    = val.get("clip_i_delta_vs_prev")
+            verdict  = val.get("verdict", "?")
+            _vparts  = []
+            if clip_i is not None:
+                _vparts.append(f"CLIP-I={clip_i:.4f}")
+            if delta is not None:
+                _sign = "+" if delta >= 0 else ""
+                _vparts.append(f"Δ={_sign}{delta:.4f}")
+            _vwarn = " !" if verdict == "FAIL" else ""
+            if _vparts:
+                print(f"           val: {' | '.join(_vparts)}  [{verdict}]{_vwarn}")
 
         # Stager status — show when iris-stage is running or heartbeat is recent (<5 min)
         shb = _stager_heartbeat(c)
@@ -597,6 +621,15 @@ def print_human(status: dict, verbose: bool = False) -> None:
                         _qparts.append(f"siglip={siglip_cov:.0f}%")
                     if _qparts:
                         print(f"           quality: {' | '.join(_qparts)}")
+                    buckets = hb.get("buckets")
+                    if buckets:
+                        _worst = max(buckets.items(), key=lambda kv: kv[1].get("loss_avg", 0))
+                        _blines = [
+                            f"{k}:{v['steps']}steps loss={v['loss_avg']:.4f} {v['secs_avg']:.1f}s/step"
+                            for k, v in sorted(buckets.items())
+                        ]
+                        _warn = " !" if _worst[1].get("loss_avg", 0) > 1.5 else ""
+                        print(f"           buckets: {' | '.join(_blines)}{_warn}")
                 else:
                     done    = hb.get("done", 0)
                     total_n = hb.get("total", 0)

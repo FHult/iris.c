@@ -238,11 +238,11 @@ Implemented: `train/scripts/download_laion_coyo.py` (new), `downloader.py` (cold
 Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 
 **Summary of dead telemetry (logged but never consumed):**
-- `validator_chunk{N}.jsonl` events — no reader in doctor or status
+- ~~`validator_chunk{N}.jsonl` events~~ — covered by T5 fix; metrics.json surfaces same signal
 - ~~`ema_drift` in trainer heartbeat~~ — now displayed in `pipeline_status.py` (QW-5 done)
 - ~~`siglip_coverage_pct` in trainer heartbeat~~ — now displayed in `pipeline_status.py` (QW-5 done)
-- `bucket_stats` in heartbeat/log — no parser in ablation harness or status
-- `logs/val_chunk{N}/metrics.json` (CLIP-I, adapter_delta) — not read by doctor, explorer, or status
+- ~~`bucket_stats` in heartbeat/log~~ — now displayed as `buckets:` line in trainer status (T4 done 2026-05-17)
+- ~~`logs/val_chunk{N}/metrics.json` (CLIP-I, adapter_delta)~~ — now shown per-chunk in pipeline_status.py (T5/QW-10 done 2026-05-17)
 - `selection_log` table in `shard_scores.db` — never queried (flywheel uses JSON column instead)
 
 **Quick wins (low effort, implement opportunistically):**
@@ -253,7 +253,7 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 - ~~**QW-6**: Add `stopped_early` + `stop_step` to ablation DB~~ — Done (2026-05-17)
 - ~~**QW-7**: Log `threshold_loss` and `skipped` count to `mine_hard_examples.jsonl` done event~~ — Done (2026-05-17)
 - ~~**QW-8**: Dispatch WARNING when trainer heartbeat `mem_available_gb < 3.0`~~ — Done (2026-05-17)
-- **QW-10**: Make `pipeline_status.py` read `logs/val_chunk{N}/metrics.json` — CLIP-I trend across chunks
+- ~~**QW-10**: Make `pipeline_status.py` read `logs/val_chunk{N}/metrics.json`~~ — Done (2026-05-17)
 
 **High-value deeper changes:**
 - **DA-6**: Write per-shard hard-example density into `shard_scores.db` after each mining run — closes the most important missing feedback loop
