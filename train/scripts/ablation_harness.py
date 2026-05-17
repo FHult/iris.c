@@ -1705,7 +1705,8 @@ def _pareto_efficient(experiments: list[dict]) -> set:
     valid = [e for e in experiments
              if e.get("ref_gap") is not None
              and e.get("cond_gap") is not None
-             and e.get("final_loss") is not None]
+             and e.get("final_loss") is not None
+             and not e.get("stopped_early")]
     if not valid:
         return set()
 

@@ -598,9 +598,9 @@ def main():
         return
 
     # ── Per-shard loss percentiles (DA-2) ────────────────────────────────────
+    _pcts: dict = {}
     if shard_losses:
         import json as _json_p
-        _pcts = {}
         for _sp, _ls in shard_losses.items():
             _a = np.array(_ls, dtype=np.float32)
             _pcts[Path(_sp).stem] = {
@@ -686,7 +686,7 @@ def main():
               skipped=skipped,
               threshold_loss=round(_threshold[0], 4) if _threshold[0] else None)
 
-    # Update shard_scores.db with hard-example density per source shard (DA-6)
+    # Update shard_scores.db with hard-example density + p95 loss per source shard
     if by_shard:
         try:
             from shard_selector import ShardScoreDB, SHARD_SCORES_DB_PATH
@@ -696,6 +696,9 @@ def main():
                 for _sp, _ids in by_shard.items():
                     _sid = Path(_sp).stem
                     _sdb.update_hard_example_count(_sid, len(_ids))
+                    _p95 = _pcts.get(_sid, {}).get("p95")
+                    if _p95 is not None:
+                        _sdb.update_loss_p95(_sid, _p95)
         except Exception as _e:
             print(f"  Warning: could not update shard_scores.db: {_e}", file=sys.stderr)
 

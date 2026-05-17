@@ -67,6 +67,15 @@ SIGLIP_SAMPLE_N = 50   # images to sample per shard when computing mean embeddin
 SIGLIP_DIM_PACKED = 576  # nibble-packed bytes per embedding
 SIGLIP_DIM = 1152        # unpacked float32 dimensions
 
+# Effective-score adjustments from hard-example and stability signals
+HARD_EXAMPLE_BOOST  = 0.05   # max additive boost from hard-example density
+HARD_CONF_SCALE     = 50     # hard_example_count at which boost reaches full strength
+STABILITY_PENALTY   = 0.05   # max penalty for high p95 loss (volatile shards)
+STABILITY_P95_LOW   = 1.5    # p95 below this → no penalty
+STABILITY_P95_HIGH  = 4.5    # p95 at this → full penalty
+EXPLORE_THRESH      = 0.30   # unscored fraction above which exploration is boosted
+EXPLORE_BOOSTED     = 0.30   # exploration_rate floor when EXPLORE_THRESH is exceeded
+
 
 # ---------------------------------------------------------------------------
 # Schema (v2)
@@ -165,6 +174,10 @@ INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
 """
 
 # Columns added in v2 (applied via ALTER TABLE on existing v1 DBs)
+_V4_MIGRATIONS = [
+    "ALTER TABLE shards ADD COLUMN loss_p95 REAL",
+]
+
 _V3_MIGRATIONS = [
     "ALTER TABLE shards ADD COLUMN hard_example_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE shards ADD COLUMN hard_example_ts TEXT",
@@ -211,7 +224,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass
-    conn.execute("INSERT OR REPLACE INTO _meta VALUES ('schema_version', '3')")
+    if cur_ver < 4:
+        for stmt in _V4_MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+    conn.execute("INSERT OR REPLACE INTO _meta VALUES ('schema_version', '4')")
     conn.commit()
 
 
@@ -404,7 +423,7 @@ class ShardScoreDB:
                     SELECT ref_gap_mean, cond_gap_mean, loss_mean,
                            ref_gap_excl_mean, cond_gap_excl_mean,
                            n_scored, n_excluded,
-                           composite_score
+                           composite_score, hard_example_count, loss_p95
                     FROM shards WHERE shard_id=?
                 """, (sid,)).fetchone()
                 if row is None:
@@ -452,6 +471,22 @@ class ShardScoreDB:
                     eff = max(0.0, min(1.0, eff))
                 else:
                     eff = raw_comp
+
+                if eff is not None:
+                    # Hard-example density boost: shards with more hard examples
+                    # get a small additive bonus, closing the selection→mining→quality loop.
+                    hard_count = row["hard_example_count"] or 0
+                    hard_conf = min(1.0, hard_count / HARD_CONF_SCALE)
+                    eff += HARD_EXAMPLE_BOOST * hard_conf
+
+                    # Stability penalty: high p95 loss → volatile shard → deprioritise.
+                    p95 = row["loss_p95"]
+                    if p95 is not None and p95 > STABILITY_P95_LOW:
+                        stab_pen = min(1.0, (p95 - STABILITY_P95_LOW) /
+                                       (STABILITY_P95_HIGH - STABILITY_P95_LOW))
+                        eff -= STABILITY_PENALTY * stab_pen
+
+                    eff = max(0.0, min(1.0, eff))
 
                 self._conn.execute("""
                     UPDATE shards SET
@@ -517,6 +552,18 @@ class ShardScoreDB:
                 (count, ts, shard_id),
             )
             self._conn.commit()
+        self._recompute_attributed([shard_id])
+
+    def update_loss_p95(self, shard_id: str, p95: float) -> None:
+        """Store the p95 training loss for a shard (from shard_loss_percentiles)."""
+        ts = now_iso()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE shards SET loss_p95=?, ts_updated=? WHERE shard_id=?",
+                (p95, ts, shard_id),
+            )
+            self._conn.commit()
+        self._recompute_attributed([shard_id])
 
     def get_selection_history(self, flywheel_name: str, limit: int = 20) -> list[dict]:
         """Return the last N selection events for a flywheel run."""
@@ -708,6 +755,13 @@ def select_shards(
     selected_ids: set[str] = set()
     selected_paths: list[str] = []
     selected_shards: list[dict] = []
+
+    # Adaptive exploration: if a large fraction of the pool is unscored,
+    # boost exploration_rate so unseen shards get sampled faster.
+    n_total_unscored = sum(1 for s in all_shards if s.get("n_scored", 0) == 0)
+    unscored_frac = n_total_unscored / len(all_shards)
+    if unscored_frac > EXPLORE_THRESH:
+        exploration_rate = max(exploration_rate, EXPLORE_BOOSTED)
 
     def _score(s: dict) -> float:
         return s.get("effective_score") or s.get("composite_score") or 0.3

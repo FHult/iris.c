@@ -351,6 +351,7 @@ class Orchestrator:
         # Consecutive polls with grad_norm above the warn threshold.  Resets to 0
         # after a pause is triggered so a new episode can be detected on resume.
         self._grad_spike_polls: dict[int, int] = {}           # chunk → consecutive high-grad polls
+        self._ema_drift_polls:  dict[int, int] = {}           # chunk → consecutive high-ema_drift polls
 
         # Crash diagnosis cache: avoid re-running `log show` (15 s subprocess) on
         # every poll while a step is in error state.  Keyed by (chunk, step, exit_code).
@@ -1428,6 +1429,31 @@ class Orchestrator:
                     mark_error(chunk, "promoted", msg)
                     return
 
+        # ── CLIP-I regression gate: warn (or block) if val metrics show regression ─
+        _val_metrics_path = LOG_DIR / f"val_chunk{chunk}" / "metrics.json"
+        _clip_thresh = self.cfg.get("training", {}).get("clip_i_promotion_min_delta", -0.03)
+        _clip_gate   = self.cfg.get("training", {}).get("clip_i_gate_promotion", False)
+        if _val_metrics_path.exists():
+            try:
+                _vm = json.loads(_val_metrics_path.read_text())
+                _delta = _vm.get("clip_i_delta_vs_prev")
+                if _delta is not None and _delta < _clip_thresh:
+                    _msg = (f"Chunk {chunk}: CLIP-I delta {_delta:.4f} < {_clip_thresh} "
+                            f"— quality regression vs prior checkpoint")
+                    log_orch(_msg, chunk=chunk, level="warning")
+                    self._dispatch_once(
+                        f"clip_regression_{chunk}", self._next_issue_id(), "warning",
+                        f"CLIP-I regression chunk {chunk}: delta={_delta:.4f} < {_clip_thresh}",
+                        chunk=chunk, suggested_action="review_val_metrics_before_promoting",
+                        cooldown_secs=3600,
+                    )
+                    if _clip_gate:
+                        mark_error(chunk, "promoted", _msg)
+                        return
+            except (ValueError, OSError) as _e:
+                log_orch(f"Chunk {chunk}: could not read val metrics for CLIP-I gate: {_e}",
+                         chunk=chunk)
+
         SHARDS_DIR.mkdir(parents=True, exist_ok=True)
         count = 0
         for tar in sorted(shard_src.glob("*.tar")):
@@ -2064,6 +2090,22 @@ class Orchestrator:
                                 f"Trainer mem_available_gb={mem_avail:.1f} < 3.0 — OOM risk",
                                 chunk=chunk, process="trainer",
                                 suggested_action="investigate_memory")
+
+        # ── EMA drift sustained high → dispatch instability warning ──────────
+        ema_drift = hb.get("ema_drift")
+        _drift_warn  = _a.get("ema_drift_warn",  0.05)
+        _drift_polls = _a.get("ema_drift_polls",  3)
+        if ema_drift is not None and ema_drift > _drift_warn:
+            self._ema_drift_polls[chunk] = self._ema_drift_polls.get(chunk, 0) + 1
+            if self._ema_drift_polls[chunk] >= _drift_polls:
+                self._dispatch_once(
+                    f"ema_drift_{chunk}", self._next_issue_id(), "warning",
+                    f"EMA drift {ema_drift:.4f} > {_drift_warn} for {_drift_polls}+ polls"
+                    f" — adapter weights drifting from EMA; check LR or gradient scale",
+                    chunk=chunk, suggested_action="inspect_training_stability",
+                )
+        else:
+            self._ema_drift_polls[chunk] = 0
 
     def _restart_trainer(self, chunk: int) -> None:
         """Kill and relaunch the training window for the given chunk."""
