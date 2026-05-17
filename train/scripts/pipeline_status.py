@@ -588,6 +588,15 @@ def print_human(status: dict, verbose: bool = False) -> None:
                         if ip_single is not None:
                             _scale_parts.append(f"single={ip_single:.4f}")
                         print(f"           adapter: {' | '.join(_scale_parts)}")
+                    ema_drift  = hb.get("ema_drift")
+                    siglip_cov = hb.get("siglip_coverage_pct")
+                    _qparts = []
+                    if ema_drift is not None:
+                        _qparts.append(f"ema_drift={ema_drift:.5f}")
+                    if siglip_cov is not None:
+                        _qparts.append(f"siglip={siglip_cov:.0f}%")
+                    if _qparts:
+                        print(f"           quality: {' | '.join(_qparts)}")
                 else:
                     done    = hb.get("done", 0)
                     total_n = hb.get("total", 0)

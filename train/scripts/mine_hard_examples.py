@@ -660,7 +660,9 @@ def main():
     print(f"\nDone: {total} hard examples in {args.output}/", file=_out)
     print(f"  Mix into training with:  hard_example_dir: {args.output}", file=_out)
     print(f"                           hard_mix_ratio: 0.05", file=_out)
-    log_event("mine_hard_examples", "done", total=total, output=args.output)
+    log_event("mine_hard_examples", "done", total=total, output=args.output,
+              skipped=skipped,
+              threshold_loss=round(_threshold[0], 4) if _threshold[0] else None)
 
     # Update manifest: append new IDs so future resumes skip re-scanning tars.
     new_ids = sorted({rec_id for rec_id, _, _ in records_to_write})

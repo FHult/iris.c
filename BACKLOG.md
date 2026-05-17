@@ -223,13 +223,7 @@ Note: trim must be done AFTER the 4-49 batch completes, as the 4-49 batch uses t
 
 ---
 
-**DEDUP-2: Re-dedupe 001.tar after redownload** (Tiny — blocked on download)
-
-`001.tar` in the cold pool is corrupt (0-byte content, 10 KB file). A fresh dedup run was started on the rest of the pool (002–154) with a clean index. Once `001.tgz` finishes downloading via `hf`:
-
-1. Convert: `train/.venv/bin/python /tmp/redownload_001.py --tgz /tmp/jdb001_dl/data/train/imgs/001.tgz`
-2. Remove the sentinel that the current clean run will write for the empty tar: `rm /Volumes/16TBCold/converted/journeydb/001.tar.deduped`
-3. Re-run dedup for just that tar: `train/.venv/bin/python train/scripts/clean_wds_pool.py --tgz-range 1 1`
+~~**DEDUP-2: Re-dedupe 001.tar after redownload** — Done (2026-05-17)~~
 
 ---
 
@@ -245,20 +239,20 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 
 **Summary of dead telemetry (logged but never consumed):**
 - `validator_chunk{N}.jsonl` events — no reader in doctor or status
-- `ema_drift` in trainer heartbeat — not displayed anywhere
-- `siglip_coverage_pct` in trainer heartbeat — not displayed in status
+- ~~`ema_drift` in trainer heartbeat~~ — now displayed in `pipeline_status.py` (QW-5 done)
+- ~~`siglip_coverage_pct` in trainer heartbeat~~ — now displayed in `pipeline_status.py` (QW-5 done)
 - `bucket_stats` in heartbeat/log — no parser in ablation harness or status
 - `logs/val_chunk{N}/metrics.json` (CLIP-I, adapter_delta) — not read by doctor, explorer, or status
 - `selection_log` table in `shard_scores.db` — never queried (flywheel uses JSON column instead)
 
 **Quick wins (low effort, implement opportunistically):**
-- **QW-1**: Add `grad_norm_final`, `ip_scale_final` indexed columns to `ablation_history.db` — enables stability-based Pareto filtering
-- **QW-3**: Add `steps_per_second` to trainer heartbeat — cross-campaign throughput comparison
-- **QW-4**: Persist `_restart_counts` to `pipeline_state.json` — correctness fix, retry limit resets on orchestrator restart
-- **QW-5**: Surface `ema_drift` in `pipeline_status.py` — 3 lines
-- **QW-6**: Add `stopped_early` + `stop_step` to ablation DB — distinguish crashes from early stops
-- **QW-7**: Log `threshold_loss` and `skipped` count to `mine_hard_examples.jsonl` done event
-- **QW-8**: Dispatch WARNING when trainer heartbeat `mem_available_gb < 3.0` — pre-OOM alert
+- ~~**QW-1**: Add `grad_norm_final`, `ip_scale_final` indexed columns to `ablation_history.db`~~ — Done (2026-05-17)
+- ~~**QW-3**: Add `steps_per_second` to trainer heartbeat~~ — Already done (was in heartbeat)
+- ~~**QW-4**: Persist `_restart_counts` to `pipeline_state.json`~~ — Done (2026-05-17)
+- ~~**QW-5**: Surface `ema_drift` and `siglip_coverage_pct` in `pipeline_status.py`~~ — Done (2026-05-17)
+- ~~**QW-6**: Add `stopped_early` + `stop_step` to ablation DB~~ — Done (2026-05-17)
+- ~~**QW-7**: Log `threshold_loss` and `skipped` count to `mine_hard_examples.jsonl` done event~~ — Done (2026-05-17)
+- ~~**QW-8**: Dispatch WARNING when trainer heartbeat `mem_available_gb < 3.0`~~ — Done (2026-05-17)
 - **QW-10**: Make `pipeline_status.py` read `logs/val_chunk{N}/metrics.json` — CLIP-I trend across chunks
 
 **High-value deeper changes:**

@@ -263,29 +263,33 @@ class AblationDB:
 
     SCHEMA = """
         CREATE TABLE IF NOT EXISTS experiments (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_name     TEXT    NOT NULL,
-            config_hash  TEXT    NOT NULL,
-            strategy     TEXT,
-            params       TEXT    NOT NULL,
-            score        REAL,
-            verdict      TEXT,
-            ref_gap      REAL,
-            cond_gap     REAL,
-            final_loss   REAL,
-            elapsed_secs INTEGER,
-            steps        INTEGER,
-            n_snapshots  INTEGER,
-            exit_code    INTEGER,
-            git_commit   TEXT,
-            ts           TEXT    NOT NULL,
-            snapshots    TEXT,
-            is_pareto    INTEGER NOT NULL DEFAULT 0
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_name        TEXT    NOT NULL,
+            config_hash     TEXT    NOT NULL,
+            strategy        TEXT,
+            params          TEXT    NOT NULL,
+            score           REAL,
+            verdict         TEXT,
+            ref_gap         REAL,
+            cond_gap        REAL,
+            final_loss      REAL,
+            elapsed_secs    INTEGER,
+            steps           INTEGER,
+            n_snapshots     INTEGER,
+            exit_code       INTEGER,
+            git_commit      TEXT,
+            ts              TEXT    NOT NULL,
+            snapshots       TEXT,
+            is_pareto       INTEGER NOT NULL DEFAULT 0,
+            grad_norm_final REAL,
+            ip_scale_final  REAL,
+            stopped_early   INTEGER NOT NULL DEFAULT 0,
+            stop_step       INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_run  ON experiments(run_name);
         CREATE INDEX IF NOT EXISTS idx_hash ON experiments(run_name, config_hash);
         CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
-        INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
+        INSERT OR IGNORE INTO _meta VALUES ('schema_version', '3');
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -295,13 +299,18 @@ class AblationDB:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.executescript(self.SCHEMA)
-        # v1 → v2: add is_pareto column
-        try:
-            self._conn.execute(
-                "ALTER TABLE experiments ADD COLUMN is_pareto INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            pass
+        # Migrate older schemas forward
+        for ddl in (
+            "ALTER TABLE experiments ADD COLUMN is_pareto       INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE experiments ADD COLUMN grad_norm_final REAL",
+            "ALTER TABLE experiments ADD COLUMN ip_scale_final  REAL",
+            "ALTER TABLE experiments ADD COLUMN stopped_early   INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE experiments ADD COLUMN stop_step       INTEGER",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except Exception:
+                pass
         self._conn.commit()
 
     @staticmethod
@@ -345,16 +354,24 @@ class AblationDB:
         n_snapshots: int,
         exit_code: int,
         snapshots: list,
+        grad_norm_final: Optional[float] = None,
+        ip_scale_final: Optional[float] = None,
+        stopped_early: bool = False,
+        stop_step: Optional[int] = None,
     ) -> None:
         snaps_json = json.dumps(snapshots)
         with self._lock:
             self._conn.execute(
                 """UPDATE experiments SET
                    score=?, verdict=?, ref_gap=?, cond_gap=?, final_loss=?,
-                   elapsed_secs=?, n_snapshots=?, exit_code=?, snapshots=?
+                   elapsed_secs=?, n_snapshots=?, exit_code=?, snapshots=?,
+                   grad_norm_final=?, ip_scale_final=?,
+                   stopped_early=?, stop_step=?
                    WHERE id=?""",
                 (score, verdict, ref_gap, cond_gap, final_loss,
-                 elapsed_secs, n_snapshots, exit_code, snaps_json, exp_id),
+                 elapsed_secs, n_snapshots, exit_code, snaps_json,
+                 grad_norm_final, ip_scale_final,
+                 int(stopped_early), stop_step, exp_id),
             )
             self._conn.commit()
 
@@ -1308,6 +1325,9 @@ def _run_one(
     tail = collector.snapshots[n_skip:] or collector.snapshots
     last = collector.snapshots[-1] if collector.snapshots else {}
 
+    _stopped_early = early_stopper._triggered if early_stopper is not None else False
+    _stop_step     = last.get("step") if _stopped_early else None
+
     result = {
         "combo_id":       combo_id,
         "params":         params,
@@ -1319,6 +1339,10 @@ def _run_one(
         "final_loss":     last.get("loss_smooth"),
         "final_ref_gap":  last.get("ref_gap"),
         "final_cond_gap": last.get("cond_gap"),
+        "grad_norm_final": last.get("grad_norm"),
+        "ip_scale_final":  last.get("ip_scale_mean"),
+        "stopped_early":   _stopped_early,
+        "stop_step":       _stop_step,
         "mean_ref_gap":   round(sum(s["ref_gap"] for s in tail if "ref_gap" in s) /
                                 max(1, sum(1 for s in tail if "ref_gap" in s)), 4)
                           if any("ref_gap" in s for s in tail) else None,
@@ -1607,6 +1631,10 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             n_snapshots=result.get("n_snapshots", 0),
             exit_code=result["exit_code"],
             snapshots=result.get("snapshots", []),
+            grad_norm_final=result.get("grad_norm_final"),
+            ip_scale_final=result.get("ip_scale_final"),
+            stopped_early=result.get("stopped_early", False),
+            stop_step=result.get("stop_step"),
         )
         db.update_pareto_front(run_name)
 

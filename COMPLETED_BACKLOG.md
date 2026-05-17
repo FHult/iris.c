@@ -219,3 +219,7 @@ All 14 second-pass pipeline bugs fixed:
 
 - **Track 1** — Converted pool dedup at ingest implemented as the `dedupe_filter` pipeline step (`train/scripts/dedupe_filter.py`). Runs after convert, before build_shards; holds GPU_TOKEN; quality-filters (CPU) then CLIP-deduplicates each pool tar; writes back to cold pool atomically; writes `.deduped` sentinel for idempotency. Integrated into orchestrator between `convert` and `build_shards` states.
 - **Track 2** — Retroactive pool cleaning via `train/scripts/clean_wds_pool.py`; supports `--tgz-range`, 3x retry with 15s backoff, per-tar timing/index-size/cumulative logging. Currently running on tgz 1–49.
+
+## DEDUP-2 — Completed (2026-05-17)
+
+- `001.tar` was corrupt (0-byte content) in the cold pool. `001.tgz` was redownloaded via curl (HF Python tooling stalled repeatedly at 13.5 GB), assembled from partial + range-request tail, verified with `gzip -t`. Converted to `001.tar` in the cold pool. Re-processed by the `clean_wds_pool.py --tgz-range 1 100` run, which wrote the `001.tar.deduped` sentinel (completed 2026-05-17 00:11 UTC).

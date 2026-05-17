@@ -338,7 +338,7 @@ class Orchestrator:
         self.ckpt_dir         = self.prep_root / "checkpoints" / "stage1"
         self.ckpt_archive_dir = self.ckpt_dir  / "archive"
         self.issue_counter = self._read_max_issue_counter()
-        self._restart_counts: dict[tuple, int] = {}
+        self._restart_counts: dict[tuple, int] = self._load_restart_counts()
         # Retry backoff: {(chunk, step) → earliest epoch_sec to retry}
         self._retry_after: dict[tuple, float] = {}
 
@@ -1809,6 +1809,7 @@ class Orchestrator:
                         chunk=chunk,
                     )
                     self._restart_counts[key] = restarts + 1
+                    self._persist_restart_counts()
                     if retry_delay > 0:
                         self._retry_after[key] = time.time() + retry_delay
                     clear_error(chunk, step)
@@ -1992,7 +1993,8 @@ class Orchestrator:
         # Successful boot means any previous restart budget from boot-phase kills
         # is no longer relevant; fresh budget for real mid-training hangs.
         if step > 0:
-            self._restart_counts.pop(("restart_trainer", chunk), None)
+            if self._restart_counts.pop(("restart_trainer", chunk), None) is not None:
+                self._persist_restart_counts()
 
         # ── Loss NaN/Inf → immediate pause ───────────────────────────────────
         if loss is not None and (math.isnan(loss) or math.isinf(loss)):
@@ -2055,6 +2057,14 @@ class Orchestrator:
             log_orch(f"Chunk {chunk}: SigLIP coverage {siglip_cov:.0f}% < {_siglip_min}%",
                      level="warning", chunk=chunk)
 
+        # ── Low system memory → pre-OOM dispatch warning ─────────────────────
+        mem_avail = hb.get("mem_available_gb")
+        if mem_avail is not None and mem_avail < 3.0:
+            self._dispatch_once(f"mem_low_{chunk}", self._next_issue_id(), "warning",
+                                f"Trainer mem_available_gb={mem_avail:.1f} < 3.0 — OOM risk",
+                                chunk=chunk, process="trainer",
+                                suggested_action="investigate_memory")
+
     def _restart_trainer(self, chunk: int) -> None:
         """Kill and relaunch the training window for the given chunk."""
         if self.dry_run:
@@ -2063,6 +2073,7 @@ class Orchestrator:
         key = ("restart_trainer", chunk)
         count = self._restart_counts.get(key, 0) + 1
         self._restart_counts[key] = count
+        self._persist_restart_counts()
         if count > JETSAM_MAX_RETRIES:
             log_orch(f"Chunk {chunk}: trainer restart limit ({JETSAM_MAX_RETRIES}) exceeded — aborting",
                      level="error", chunk=chunk)
@@ -2226,6 +2237,7 @@ class Orchestrator:
                     # intervention doesn't immediately hit the inherited limit.
                     if step == "train":
                         self._restart_counts.pop(("restart_trainer", chunk), None)
+                    self._persist_restart_counts()
                     # Clear cached crash diagnosis so next episode gets a fresh read.
                     for k in list(self._crash_diag):
                         if k[:2] == (chunk, step):
@@ -2286,6 +2298,24 @@ class Orchestrator:
         except Exception:
             pass
         return max_n
+
+    def _load_restart_counts(self) -> dict:
+        """Load _restart_counts from pipeline_state.json on startup."""
+        try:
+            raw = read_state().get("restart_counts", {})
+            return {tuple(k.split(":", 1)) if ":" in k else (k,): v
+                    for k, v in raw.items()}
+        except Exception:
+            return {}
+
+    def _persist_restart_counts(self) -> None:
+        """Write _restart_counts to pipeline_state.json so restarts survive."""
+        try:
+            serialised = {f"{k[0]}:{k[1]}" if len(k) == 2 else k[0]: v
+                          for k, v in self._restart_counts.items()}
+            update_state(restart_counts=serialised)
+        except Exception:
+            pass
 
     def _next_issue_id(self) -> str:
         self.issue_counter += 1
