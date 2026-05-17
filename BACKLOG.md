@@ -243,7 +243,7 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 - ~~`siglip_coverage_pct` in trainer heartbeat~~ — now displayed in `pipeline_status.py` (QW-5 done)
 - ~~`bucket_stats` in heartbeat/log~~ — now displayed as `buckets:` line in trainer status (T4 done 2026-05-17)
 - ~~`logs/val_chunk{N}/metrics.json` (CLIP-I, adapter_delta)~~ — now shown per-chunk in pipeline_status.py (T5/QW-10 done 2026-05-17)
-- `selection_log` table in `shard_scores.db` — never queried (flywheel uses JSON column instead)
+- ~~`selection_log` table in `shard_scores.db`~~ — now queryable via `data_explorer selection-history <campaign>` (T6 done 2026-05-17)
 
 **Quick wins (low effort, implement opportunistically):**
 - ~~**QW-1**: Add `grad_norm_final`, `ip_scale_final` indexed columns to `ablation_history.db`~~ — Done (2026-05-17)
@@ -256,10 +256,10 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 - ~~**QW-10**: Make `pipeline_status.py` read `logs/val_chunk{N}/metrics.json`~~ — Done (2026-05-17)
 
 **High-value deeper changes:**
-- **DA-6**: Write per-shard hard-example density into `shard_scores.db` after each mining run — closes the most important missing feedback loop
-- **DA-3**: Campaign-level summary table in persistent DB — enables cross-campaign warmstart decisions
-- **DA-2**: Per-shard loss percentile distribution in mining output — reveals uniform vs bimodal shards
-- **DA-7**: Link validation metrics back to `ablation_history.db` via `post_train_validation` table
+- ~~**DA-6**: Write per-shard hard-example density into `shard_scores.db`~~ — Done (2026-05-17): `hard_example_count` column added; updated after each mine run
+- ~~**DA-3**: Campaign-level summary table in persistent DB~~ — Done (2026-05-17): `campaign_summary` table in FlywheelDB; refreshed after each iteration; viewable via `data_explorer campaign-summary`
+- ~~**DA-2**: Per-shard loss percentile distribution in mining output~~ — Done (2026-05-17): writes `shard_loss_percentiles.json` (p50/p75/p95/p99 per shard) after each mine run
+- **DA-7**: Link validation metrics back to `ablation_history.db` via `post_train_validation` table — deferred (requires validator subprocess from ablation harness, ~1 day)
 
 ---
 

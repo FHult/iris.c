@@ -2797,6 +2797,8 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 checkpoint_hash=new_ckpt_hash,
             )
 
+            fw_db.refresh_campaign_summary(name)
+
             # Record checkpoint to checkpoint_log (successful iterations only)
             if status == "done" and ckpt_path:
                 fw_db.upsert_checkpoint(
@@ -2875,6 +2877,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                         checkpoint_hash=new_ckpt_hash,
                         ablation_run=ablation_run,
                     )
+                    fw_db.refresh_campaign_summary(name)
 
             # Plateau detection
             plateau_reason: Optional[str] = None

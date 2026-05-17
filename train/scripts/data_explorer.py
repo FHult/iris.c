@@ -2264,10 +2264,81 @@ def _cmd_diagnose(args: argparse.Namespace) -> int:
     return 0 if issue_count == 0 else 1
 
 
+# ── selection-history ────────────────────────────────────────────────────────
+
+def _cmd_selection_history(args: argparse.Namespace) -> int:
+    from shard_selector import ShardScoreDB, SHARD_SCORES_DB_PATH
+    db_path = Path(getattr(args, "db", None) or SHARD_SCORES_DB_PATH)
+    if not db_path.exists():
+        print(f"shard_scores.db not found: {db_path}", file=sys.stderr)
+        return 1
+    db = ShardScoreDB(db_path)
+    rows = db.get_selection_history(args.campaign, limit=args.limit)
+    if not rows:
+        print(f"No selection history for campaign: {args.campaign}")
+        return 0
+    if args.json:
+        _json_print({"campaign": args.campaign, "history": rows})
+        return 0
+    print(f"Selection history — {args.campaign} (last {len(rows)} iterations)")
+    print()
+    hdrs = ["iter", "n_shards", "mean_attr_score", "mean_raw_score", "diversity", "n_unscored", "ts"]
+    table = []
+    for r in reversed(rows):
+        table.append([
+            str(r.get("iteration", "?")),
+            str(r.get("n_shards", "?")),
+            f"{r['mean_attributed_score']:.4f}" if r.get("mean_attributed_score") is not None else "—",
+            f"{r['mean_raw_score']:.4f}"        if r.get("mean_raw_score")        is not None else "—",
+            r.get("diversity_method") or "—",
+            str(r.get("n_unscored", "?")),
+            (r.get("ts") or "")[:19],
+        ])
+    print(_col_table(table, hdrs))
+    return 0
+
+
+# ── campaign-summary ─────────────────────────────────────────────────────────
+
+def _cmd_campaign_summary(args: argparse.Namespace) -> int:
+    from flywheel_lib import FlywheelDB, FLYWHEEL_DB_PATH
+    db_path = FLYWHEEL_DB_PATH
+    if not db_path.exists():
+        print(f"flywheel DB not found: {db_path}", file=sys.stderr)
+        return 1
+    db = FlywheelDB(db_path)
+    rows = db.get_campaign_summaries()
+    if not rows:
+        print("No campaign summaries recorded yet.")
+        return 0
+    if args.json:
+        _json_print({"campaigns": rows})
+        return 0
+    print(f"Campaign summaries ({len(rows)} campaigns)")
+    print()
+    hdrs = ["campaign", "iters", "elapsed", "best_cond_gap", "best_ref_gap", "final_cond_gap", "ts_last"]
+    table = []
+    for r in rows:
+        elapsed = r.get("total_elapsed_secs")
+        elapsed_str = f"{elapsed // 3600}h{(elapsed % 3600) // 60}m" if elapsed else "—"
+        table.append([
+            r.get("flywheel_name", "?"),
+            str(r.get("n_iterations", 0)),
+            elapsed_str,
+            f"{r['best_cond_gap']:+.4f}"  if r.get("best_cond_gap")  is not None else "—",
+            f"{r['best_ref_gap']:+.4f}"   if r.get("best_ref_gap")   is not None else "—",
+            f"{r['final_cond_gap']:+.4f}" if r.get("final_cond_gap") is not None else "—",
+            (r.get("ts_last") or "")[:19],
+        ])
+    print(_col_table(table, hdrs))
+    return 0
+
+
 # ── subcommand router ────────────────────────────────────────────────────────
 
 _SUBCMDS = {"status", "shards", "weights", "suggest-warmstart",
-            "ablation", "compare", "maintenance", "diagnose"}
+            "ablation", "compare", "maintenance", "diagnose",
+            "selection-history", "campaign-summary"}
 
 
 def _main_subcmd() -> None:
@@ -2326,6 +2397,15 @@ def _main_subcmd() -> None:
     p_diag.add_argument("--verbose", action="store_true",
                         help="Also show OK findings")
     p_diag.set_defaults(func=_cmd_diagnose)
+
+    p_sel = _sp("selection-history", "Shard selection log per flywheel iteration", with_config=False)
+    p_sel.add_argument("campaign", help="Flywheel run name")
+    p_sel.add_argument("--limit",  type=int, default=20)
+    p_sel.add_argument("--db",     default=None, help="Path to shard_scores.db")
+    p_sel.set_defaults(func=_cmd_selection_history)
+
+    p_camp = _sp("campaign-summary", "Cross-campaign quality summary", with_config=False)
+    p_camp.set_defaults(func=_cmd_campaign_summary)
 
     args = ap.parse_args()
     # Inherit top-level --json/--config when subparser doesn't override

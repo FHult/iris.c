@@ -165,6 +165,11 @@ INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
 """
 
 # Columns added in v2 (applied via ALTER TABLE on existing v1 DBs)
+_V3_MIGRATIONS = [
+    "ALTER TABLE shards ADD COLUMN hard_example_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE shards ADD COLUMN hard_example_ts TEXT",
+]
+
 _V2_MIGRATIONS = [
     "ALTER TABLE shards ADD COLUMN manifest_source TEXT",
     "ALTER TABLE shards ADD COLUMN n_excluded INTEGER NOT NULL DEFAULT 0",
@@ -191,16 +196,22 @@ _V2_MIGRATIONS = [
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Apply v2 column additions to an existing v1 database. Idempotent."""
+    """Apply column additions to an existing database. Idempotent."""
     ver = conn.execute("SELECT v FROM _meta WHERE k='schema_version'").fetchone()
-    if ver and ver[0] == '2':
-        return
-    for stmt in _V2_MIGRATIONS:
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.execute("INSERT OR REPLACE INTO _meta VALUES ('schema_version', '2')")
+    cur_ver = int(ver[0]) if ver else 1
+    if cur_ver < 2:
+        for stmt in _V2_MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+    if cur_ver < 3:
+        for stmt in _V3_MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+    conn.execute("INSERT OR REPLACE INTO _meta VALUES ('schema_version', '3')")
     conn.commit()
 
 
@@ -495,6 +506,29 @@ class ShardScoreDB:
 
     # ------------------------------------------------------------------
     # Queries
+
+    def update_hard_example_count(self, shard_id: str, count: int) -> None:
+        """Record how many hard examples were mined from a shard in the last run."""
+        ts = now_iso()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE shards SET hard_example_count=?, hard_example_ts=?
+                   WHERE shard_id=?""",
+                (count, ts, shard_id),
+            )
+            self._conn.commit()
+
+    def get_selection_history(self, flywheel_name: str, limit: int = 20) -> list[dict]:
+        """Return the last N selection events for a flywheel run."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT iteration, n_shards, mean_attributed_score, mean_raw_score,
+                          diversity_method, n_unscored, ts
+                   FROM selection_log WHERE flywheel_name=?
+                   ORDER BY iteration DESC LIMIT ?""",
+                (flywheel_name, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_all_shards(self) -> list[dict]:
         with self._lock:

@@ -479,6 +479,7 @@ def main():
     # ── Eval pass — pass 1: compute loss per record ───────────────────────────
     print(f"\nPass 1: computing loss for {n_eval:,} records...")
     heap = []   # (-loss, rec_id, shard_path)  — max-heap of top-K
+    shard_losses: dict = {}   # shard_path → [loss, ...] for DA-2 percentiles
     done = 0
     skipped = 0
     eval_done_event = threading.Event()
@@ -531,6 +532,7 @@ def main():
                 heapq.heappush(heap, entry)
             elif entry > heap[0]:
                 heapq.heapreplace(heap, entry)
+            shard_losses.setdefault(s_path, []).append(loss)
             done += 1
             if done % 100 == 0:
                 threshold = -heap[0][0] if heap else 0.0
@@ -594,6 +596,26 @@ def main():
     if not heap:
         print("No hard examples found — check that precomputed caches are populated.")
         return
+
+    # ── Per-shard loss percentiles (DA-2) ────────────────────────────────────
+    if shard_losses:
+        import json as _json_p
+        _pcts = {}
+        for _sp, _ls in shard_losses.items():
+            _a = np.array(_ls, dtype=np.float32)
+            _pcts[Path(_sp).stem] = {
+                "n":   len(_a),
+                "p50": round(float(np.percentile(_a, 50)), 5),
+                "p75": round(float(np.percentile(_a, 75)), 5),
+                "p95": round(float(np.percentile(_a, 95)), 5),
+                "p99": round(float(np.percentile(_a, 99)), 5),
+            }
+        _perc_path = Path(args.output) / "shard_loss_percentiles.json"
+        try:
+            _perc_path.write_text(_json_p.dumps(_pcts, indent=2))
+            print(f"  Wrote shard loss percentiles → {_perc_path} ({len(_pcts)} shards)")
+        except OSError as _e:
+            print(f"  Warning: could not write percentiles: {_e}", file=sys.stderr)
 
     # ── Pass 2: extract JPEG + txt for top-K from source shards ──────────────
     print(f"\nPass 2: extracting {len(heap)} hard examples from source shards...")
@@ -663,6 +685,19 @@ def main():
     log_event("mine_hard_examples", "done", total=total, output=args.output,
               skipped=skipped,
               threshold_loss=round(_threshold[0], 4) if _threshold[0] else None)
+
+    # Update shard_scores.db with hard-example density per source shard (DA-6)
+    if by_shard:
+        try:
+            from shard_selector import ShardScoreDB, SHARD_SCORES_DB_PATH
+            _db_path = Path(getattr(args, "shard_scores_db", str(SHARD_SCORES_DB_PATH)))
+            if _db_path.exists():
+                _sdb = ShardScoreDB(_db_path)
+                for _sp, _ids in by_shard.items():
+                    _sid = Path(_sp).stem
+                    _sdb.update_hard_example_count(_sid, len(_ids))
+        except Exception as _e:
+            print(f"  Warning: could not update shard_scores.db: {_e}", file=sys.stderr)
 
     # Update manifest: append new IDs so future resumes skip re-scanning tars.
     new_ids = sorted({rec_id for rec_id, _, _ in records_to_write})

@@ -82,12 +82,41 @@ CREATE TABLE IF NOT EXISTS checkpoint_log (
 );
 CREATE INDEX IF NOT EXISTS idx_ckpt_fw ON checkpoint_log(flywheel_name, iteration);
 
+CREATE TABLE IF NOT EXISTS campaign_summary (
+    flywheel_name    TEXT PRIMARY KEY,
+    n_iterations     INTEGER NOT NULL DEFAULT 0,
+    total_elapsed_secs INTEGER,
+    best_cond_gap    REAL,
+    best_ref_gap     REAL,
+    best_checkpoint  TEXT,
+    final_cond_gap   REAL,
+    final_ref_gap    REAL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    ts_first         TEXT,
+    ts_last          TEXT
+);
+
 CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
-INSERT OR IGNORE INTO _meta VALUES ('schema_version', '2');
+INSERT OR IGNORE INTO _meta VALUES ('schema_version', '3');
 """
 
 # v1→v2: add checkpoint_hash to iterations
 _V2_MIGRATION = "ALTER TABLE iterations ADD COLUMN checkpoint_hash TEXT"
+_V3_MIGRATION = """
+CREATE TABLE IF NOT EXISTS campaign_summary (
+    flywheel_name    TEXT PRIMARY KEY,
+    n_iterations     INTEGER NOT NULL DEFAULT 0,
+    total_elapsed_secs INTEGER,
+    best_cond_gap    REAL,
+    best_ref_gap     REAL,
+    best_checkpoint  TEXT,
+    final_cond_gap   REAL,
+    final_ref_gap    REAL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    ts_first         TEXT,
+    ts_last          TEXT
+)
+"""
 
 
 def _checkpoint_hash(ckpt_path: Optional[str]) -> str:
@@ -106,11 +135,11 @@ class FlywheelDB:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.executescript(_SCHEMA)
-        # v1 → v2 migration
-        try:
-            self._conn.execute(_V2_MIGRATION)
-        except Exception:
-            pass
+        for _mig in (_V2_MIGRATION, _V3_MIGRATION):
+            try:
+                self._conn.executescript(_mig)
+            except Exception:
+                pass
         self._conn.commit()
 
     def insert_iteration(
@@ -233,6 +262,59 @@ class FlywheelDB:
                 "SELECT DISTINCT flywheel_name FROM iterations ORDER BY flywheel_name"
             ).fetchall()
         return [r[0] for r in rows]
+
+    def refresh_campaign_summary(self, name: str) -> None:
+        """Recompute and upsert the campaign_summary row from the iterations table."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM iterations WHERE flywheel_name=? ORDER BY iteration",
+                (name,),
+            ).fetchall()
+        if not rows:
+            return
+        iters = [dict(r) for r in rows]
+        total_elapsed = sum(r.get("elapsed_secs") or 0 for r in iters)
+        best = max(
+            (r for r in iters if r.get("cond_gap") is not None),
+            key=lambda r: r["cond_gap"],
+            default=None,
+        )
+        last = iters[-1]
+        ts_first = iters[0].get("ts_start")
+        ts_last  = last.get("ts_end") or last.get("ts_start")
+        with self._lock:
+            self._conn.execute("""
+                INSERT INTO campaign_summary
+                    (flywheel_name, n_iterations, total_elapsed_secs,
+                     best_cond_gap, best_ref_gap, best_checkpoint,
+                     final_cond_gap, final_ref_gap, ts_first, ts_last)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(flywheel_name) DO UPDATE SET
+                    n_iterations=excluded.n_iterations,
+                    total_elapsed_secs=excluded.total_elapsed_secs,
+                    best_cond_gap=excluded.best_cond_gap,
+                    best_ref_gap=excluded.best_ref_gap,
+                    best_checkpoint=excluded.best_checkpoint,
+                    final_cond_gap=excluded.final_cond_gap,
+                    final_ref_gap=excluded.final_ref_gap,
+                    ts_last=excluded.ts_last
+            """, (
+                name, len(iters), total_elapsed or None,
+                best["cond_gap"] if best else None,
+                best["ref_gap"]  if best else None,
+                best["checkpoint"] if best else None,
+                last.get("cond_gap"), last.get("ref_gap"),
+                ts_first, ts_last,
+            ))
+            self._conn.commit()
+
+    def get_campaign_summaries(self) -> list[dict]:
+        """Return all campaign summary rows, most-recently-updated first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM campaign_summary ORDER BY ts_last DESC NULLS LAST"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         self._conn.close()
