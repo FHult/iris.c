@@ -55,6 +55,25 @@ DUP_THRESHOLD = 0.95
 # Module-level lock for FAISS index access in dedup_wds_tar.
 _faiss_lock = threading.Lock()
 
+_CLIP_INPUT_SIZE = 224   # ViT-L-14 input resolution
+
+
+def _mlx_resize_224(img) -> object:
+    """Resize + centre-crop a PIL image to 224×224 at decode time.
+
+    Reduces per-image RAM from ~786 KB (512px) to ~147 KB before the image
+    list is accumulated, keeping 10k-record tars at ~1.5 GB instead of ~7.9 GB.
+    mlx_clip_embed._preprocess detects the correct size and skips redundant ops.
+    """
+    from PIL import Image as _PIL
+    w, h = img.size
+    scale = _CLIP_INPUT_SIZE / min(w, h)
+    new_w, new_h = round(w * scale), round(h * scale)
+    img = img.resize((new_w, new_h), _PIL.BICUBIC)
+    left = (new_w - _CLIP_INPUT_SIZE) // 2
+    top  = (new_h - _CLIP_INPUT_SIZE) // 2
+    return img.crop((left, top, left + _CLIP_INPUT_SIZE, top + _CLIP_INPUT_SIZE))
+
 
 # ---------------------------------------------------------------------------
 # Device + CLIP loading
@@ -262,8 +281,9 @@ def cmd_embed(args) -> int:
     _load_clip(backend)
     batch_size = args.batch_size
 
-    # MLX takes raw PIL images; PyTorch backends need preprocessed tensors.
-    _decode_preprocess = (lambda img: img) if _clip_backend == "mlx" else _clip_preprocess
+    # MLX takes PIL images; resize to 224×224 at decode time to cap per-image RAM.
+    # PyTorch backends run their own torchvision transform which already resizes.
+    _decode_preprocess = _mlx_resize_224 if _clip_backend == "mlx" else _clip_preprocess
 
     total = len(shards)
     done  = 0
@@ -328,6 +348,15 @@ def cmd_embed(args) -> int:
                 tmp_stem = str(out_npz)[:-4] + ".tmp"
                 np.savez(tmp_stem, ids=np.array(ids), embeddings=emb_arr)
                 os.replace(tmp_stem + ".npz", out_npz)
+
+                # Release MLX Metal buffer pool between shards so GPU memory
+                # accumulated across sub-batches doesn't compound over 80-120 shards.
+                if _clip_backend == "mlx":
+                    try:
+                        import mlx.core as _mx
+                        _mx.metal.clear_cache()
+                    except Exception:
+                        pass
 
                 log_event("clip_dedup", "embed_shard",
                           shard=shard_path.name, n=len(ids))
@@ -541,7 +570,10 @@ def dedup_wds_tar(
     blocklist_path = Path(blocklist_path)
 
     _load_clip(backend)
-    _decode_preprocess = (lambda img: img) if _clip_backend == "mlx" else _clip_preprocess
+    # Resize to 224×224 at decode time so the image list stays at ~147 KB/image
+    # rather than full-resolution (~786 KB/image at 512px), reducing per-tar RAM
+    # from ~7.9 GB to ~1.5 GB.  PyTorch backends already resize via their own transform.
+    _decode_preprocess = _mlx_resize_224 if _clip_backend == "mlx" else _clip_preprocess
 
     # Decode all images from the tar.
     ids, images = _decode_shard(str(tar_path), _decode_preprocess)
@@ -552,13 +584,13 @@ def dedup_wds_tar(
 
     records_in = len(ids)
 
-    # Compute CLIP embeddings.
+    # Compute CLIP embeddings.  embed_batch already L2-normalises and sub-batches
+    # internally, so both paths return float32 [N, 768] with unit norms.
     all_embs: list = []
     batch_size = 512
     if _clip_backend == "mlx":
         for i in range(0, len(images), batch_size):
-            e = _mlx_embedder.embed_batch(images[i:i + batch_size])
-            all_embs.append(e)
+            all_embs.append(_mlx_embedder.embed_batch(images[i:i + batch_size]))
     else:
         import torch
         device = next(_clip_model.parameters()).device
@@ -572,26 +604,32 @@ def dedup_wds_tar(
                 e = e / e.norm(dim=-1, keepdim=True)
                 all_embs.append(e.cpu().numpy())
 
+    emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
+
+    # Free image pixels and intermediate buffers before the FAISS index is loaded.
+    # The index grows to 1–4 GB after many tars; PIL images (even at 224px) are
+    # ~1.5 GB/tar; releasing both before the index allocation prevents the peak from
+    # compounding.  ids (just strings) is negligible and still needed below.
+    del images, all_embs
+
+    # Release the MLX Metal buffer pool so pinned GPU allocations accumulated across
+    # sub-batches are returned to the OS.  Without this, the pool grows unboundedly
+    # across tars and drives swap to tens of GB.
     if _clip_backend == "mlx":
-        import numpy as _np
-        emb_arr = _np.concatenate([_np.array(e) for e in all_embs], axis=0).astype(np.float32)
-        # L2-normalise for MLX path (open_clip/transformers paths already normalise above).
-        norms = np.linalg.norm(emb_arr, axis=-1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        emb_arr = (emb_arr / norms).astype(np.float32)
-    else:
-        emb_arr = np.concatenate(all_embs, axis=0).astype(np.float32)
+        try:
+            import mlx.core as _mx
+            _mx.metal.clear_cache()
+        except Exception:
+            pass
 
     dim = emb_arr.shape[1]
 
     with _faiss_lock:
         # Load or create index.
-        if index_path.exists() and ids_path.exists():
+        if index_path.exists():
             index = faiss.read_index(str(index_path))
-            existing_ids = ids_path.read_text().splitlines()
         else:
             index = faiss.IndexFlatIP(dim)
-            existing_ids = []
 
         # Search existing index only (before adding new vectors).
         dup_stems: set = set()
@@ -622,6 +660,10 @@ def dedup_wds_tar(
         elif not dup_stems:
             # No vectors at all (edge case: all decoded images had errors upstream).
             pass
+
+        # Explicitly release the index object so its RAM (grows to ~4 GB by tar 142)
+        # is freed before the next tar's index load, not held until Python GC decides.
+        del index
 
     records_out = records_in - len(dup_stems)
 

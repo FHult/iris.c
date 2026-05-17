@@ -33,7 +33,7 @@ from pipeline_lib import (
 from downloader import (
     jdb_tgz_ranges, jdb_tgz_filename, download_jdb_annotation,
     run_wikiart_download, check_laion, check_coyo,
-    JDB_REPO_ID, _hf_download_file_guarded as _hf_download_file,
+    JDB_REPO_ID, _curl_download_hf_file as _hf_download_file,
 )
 from data_stager import _same_device, _atomic_copy_file
 
@@ -388,14 +388,22 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
             done_event.set()
 
     def heartbeat_loop():
-        from downloader import _incomplete_bytes
-        hf_cache   = (raw_pool_dir if raw_pool_enabled else raw_dir) / ".cache" / "huggingface" / "download"
+        # curl writes directly to the output file (no .incomplete sidecar), so
+        # track download progress by reading the current tgz file size directly.
+        dl_base    = raw_pool_dir if raw_pool_enabled else raw_dir
         prev_bytes = 0
         prev_ts    = time.time()
         while not done_event.is_set():
             done_count = sum(1 for i in tgz_range
                              if (sentinel_dir / f"{i:03d}.converted").exists())
-            now_bytes  = _incomplete_bytes(hf_cache)
+            tgz_i      = cur_tgz[0]
+            now_bytes  = 0
+            if tgz_i is not None:
+                tgz_file = dl_base / "data" / "train" / "imgs" / f"{tgz_i:03d}.tgz"
+                try:
+                    now_bytes = tgz_file.stat().st_size
+                except OSError:
+                    pass
             now_ts     = time.time()
             dt         = now_ts - prev_ts
             delta      = now_bytes - prev_bytes
@@ -405,7 +413,7 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                             done=done_count, total=total,
                             pct=round(done_count / total * 100, 1),
                             in_flight_gb=round(now_bytes / 1e9, 2),
-                            current_tgz=cur_tgz[0],
+                            current_tgz=tgz_i,
                             dl_speed_mbps=speed_mbps)
             time.sleep(30)
 

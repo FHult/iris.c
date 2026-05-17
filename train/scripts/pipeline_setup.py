@@ -724,6 +724,70 @@ def _preflight(data_root: Path, disk_needed_gb: int, model_str: str) -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# LAION / COYO cold pool detection
+# ---------------------------------------------------------------------------
+
+def _check_laion_coyo_pools(config: dict, config_path: Path, args) -> None:
+    """Print a notice when LAION/COYO cold pools are absent; offer to download."""
+    sources   = config.get("data_sources", {})
+    mode      = sources.get("laion_coyo_mode", "auto")
+    if mode == "skip":
+        return
+
+    storage   = config.get("storage", {})
+    cold_root = Path(storage.get("cold_root", "/Volumes/16TBCold"))
+    if not cold_root.exists():
+        return  # cold volume not mounted — skip silently
+
+    missing = []
+    for ds in ("laion", "coyo"):
+        repo = sources.get(f"{ds}_hf_repo", "")
+        if not repo:
+            continue
+        sentinel = cold_root / "raw" / ds / ".downloaded"
+        if not sentinel.exists():
+            missing.append(ds)
+
+    if not missing:
+        for ds in ("laion", "coyo"):
+            repo = sources.get(f"{ds}_hf_repo", "")
+            if not repo:
+                continue
+            sentinel = cold_root / "raw" / ds / ".downloaded"
+            if sentinel.exists():
+                try:
+                    meta = json.loads(sentinel.read_text())
+                    count = meta.get("shards", "?")
+                    print(f"  {ok('✓')}  {ds.upper()} cold pool ready: {count} shards")
+                except Exception:
+                    print(f"  {ok('✓')}  {ds.upper()} cold pool ready")
+        return
+
+    ds_arg    = missing[0] if len(missing) == 1 else "all"
+    dl_script = str(SCRIPTS_DIR / "download_laion_coyo.py")
+    # Build both a printable command for the user and an arg list for Popen separately.
+    # Never pass through shlex.split — paths with spaces would be split incorrectly.
+    dl_args = [str(VENV_PYTHON), dl_script, "--dataset", ds_arg, "--config", str(config_path)]
+    dl_cmd_display = (f"caffeinate -i '{VENV_PYTHON}' '{dl_script}' "
+                      f"--dataset {ds_arg} --config '{config_path}'")
+    print(f"  {warn('!')}  {'/'.join(d.upper() for d in missing)} cold pool not downloaded.")
+    print(f"       Download command (one-time):")
+    print(f"         {dl_cmd_display}")
+    if not getattr(args, "check", False):
+        do_dl = _ask_bool("       Start download now in background?", default=False)
+        if do_dl:
+            subprocess.Popen(
+                ["caffeinate", "-i"] + dl_args,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            print(f"  {ok('+')}  Download started in background (monitor via heartbeat "
+                  f"or check cold pool .downloaded sentinel).")
+        else:
+            print(f"       Skipped. Run the command above before starting a medium/large run.")
+
+
+# ---------------------------------------------------------------------------
 # Command generation
 # ---------------------------------------------------------------------------
 
@@ -1075,6 +1139,14 @@ def run_interactive(args) -> int:
                               f"pipeline_ctl.py create-val-set")
         except Exception as _e:
             print(f"  {warn('!')}  Val set staging skipped: {_e}")
+
+    # LAION / COYO cold pool detection
+    if _cfg is not None:
+        try:
+            _check_laion_coyo_pools(_cfg, config_path, args)
+        except Exception as _e:
+            print(f"  {warn('!')}  LAION/COYO pool check skipped: {_e}")
+
     print()
 
     # ── Commands ───────────────────────────────────────────────────────────

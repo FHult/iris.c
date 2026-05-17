@@ -908,7 +908,7 @@ def main():
         from cache_manager import PrecomputeCache, get_git_sha
         _git_sha = get_git_sha(Path(os.path.dirname(os.path.abspath(__file__))))
         _cache_configs = {
-            "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [8, 17, 26]},
+            "qwen3":  {"qwen3_model": args.qwen3_model, "layers": [8, 17, 26], "think_tags": True},
             "vae":    {"flux_model": Path(args.flux_model).name,
                        "image_size": args.image_size},
             "siglip": {"siglip_model": "google/siglip-so400m-patch14-384",

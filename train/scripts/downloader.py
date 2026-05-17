@@ -57,24 +57,8 @@ def jdb_tgz_ranges(config: dict, scale: str = "all-in") -> dict[int, tuple[int, 
     return {int(k): tuple(v) for k, v in fallback.items()}
 
 
-_STALL_SECS = 600  # 10 min with no byte progress → abort
-
-
-def _incomplete_bytes(cache_dir: Path) -> int:
-    """Sum of sizes of all .incomplete files in cache_dir (HF in-progress downloads)."""
-    total = 0
-    try:
-        for p in cache_dir.rglob("*.incomplete"):
-            try:
-                total += p.stat().st_size
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return total
-
-
 def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:
+    """Download a small HF file via huggingface_hub (annotation files, etc.)."""
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(
         repo_id=repo_id,
@@ -85,41 +69,57 @@ def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:
     return Path(path)
 
 
-def _hf_download_file_guarded(repo_id: str, filename: str, local_dir: str) -> Path:
-    """Wraps _hf_download_file with a stall watchdog.
+def _curl_download_hf_file(repo_id: str, filename: str, local_dir: str) -> Path:
+    """Download a large HF dataset file using curl with auto-resume and retry.
 
-    If the HF .incomplete file stops growing for _STALL_SECS, sends SIGTERM to
-    the current process so the orchestrator detects failure and retries.
-    HF resumes from the partial file on next attempt.
+    Replaces the Python hf_hub_download + stall-watchdog pattern.  curl is
+    significantly more reliable for multi-GB files against HuggingFace's CDN:
+
+      -C -               auto-detect existing file size; issue Range: bytes=N-
+                         so interrupted downloads resume without any .incomplete
+                         file management.
+      --speed-limit /    abort and retry if throughput drops below 10 KB/s for
+      --speed-time       60 consecutive seconds — the stall case that the Python
+                         HTTP stack never detects.
+      --retry 15         reconnect and re-issue the range request automatically
+      --retry-delay 5    on any connection error or speed-limit abort.
+      -L                 follow HF → CDN redirect chain on every attempt.
     """
-    import os
-    import signal
+    import subprocess
+    from huggingface_hub import hf_hub_url, get_token
 
-    cache_dir = Path(local_dir) / ".cache" / "huggingface" / "download"
-    stop_ev   = threading.Event()
+    out_path = Path(local_dir) / filename
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _watchdog():
-        last_size   = -1
-        last_change = time.time()
-        while not stop_ev.wait(60):
-            size = _incomplete_bytes(cache_dir)
-            if size != last_size:
-                last_size   = size
-                last_change = time.time()
-            elif size > 0 and time.time() - last_change > _STALL_SECS:
-                log_orch(
-                    f"Download stall: {size / 1e9:.1f} GB downloaded, "
-                    f"no progress for {_STALL_SECS}s — aborting for retry"
-                )
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
+    url   = hf_hub_url(repo_id, filename, repo_type="dataset")
+    token = get_token()
 
-    t = threading.Thread(target=_watchdog, daemon=True)
-    t.start()
-    try:
-        return _hf_download_file(repo_id, filename, local_dir)
-    finally:
-        stop_ev.set()
+    cmd = [
+        "curl", "-L",
+        "--retry", "15",
+        "--retry-delay", "5",
+        "--retry-connrefused",
+        "--speed-limit", "10240",   # bytes/s — abort if below this...
+        "--speed-time",  "60",      # ...for this many consecutive seconds
+        "-C", "-",                  # resume from current file size
+        "-o", str(out_path),
+    ]
+    if token:
+        cmd += ["--header", f"Authorization: Bearer {token}"]
+    cmd.append(url)
+
+    log_orch(f"curl: downloading {filename} → {out_path}")
+    result = subprocess.run(cmd, check=False)
+    # Exit code 33 = HTTP 416 Range Not Satisfiable: the file was already fully
+    # downloaded on a previous run and -C - tried to resume past EOF.  Treat as
+    # success.  All other non-zero codes are genuine failures.
+    if result.returncode not in (0, 33):
+        raise RuntimeError(
+            f"curl download failed (exit {result.returncode}): {filename}"
+        )
+    if not out_path.exists():
+        raise RuntimeError(f"curl finished but output file missing: {out_path}")
+    return out_path
 
 
 def download_jdb_annotation(raw_dir: Path) -> None:
@@ -163,7 +163,7 @@ def run_jdb_download(chunk: int, config: dict, scale: str = "all-in") -> None:
                 log_event("downloader", "download_start", chunk=chunk, tgz=i)
                 t0 = time.time()
                 try:
-                    _hf_download_file_guarded(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
+                    _curl_download_hf_file(JDB_REPO_ID, jdb_tgz_filename(i), str(raw_dir))
                     ready.touch()
                     elapsed = time.time() - t0
                     log_event("downloader", "download_done", chunk=chunk, tgz=i,
@@ -291,13 +291,34 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# LAION / COYO — verify manifests exist (images fetched during build_shards)
+# LAION / COYO — verify cold pool and stage hot symlink on first use
 # ---------------------------------------------------------------------------
 
+def _stage_cold_pool_symlink(dataset: str, config: dict) -> Path:
+    """
+    Return the hot raw/{dataset}/ path, creating a symlink to the cold pool
+    if the hot path is absent and the cold pool sentinel exists.
+    """
+    hot  = DATA_ROOT / "raw" / dataset
+    cold_root_str = config.get("storage", {}).get("cold_root", "")
+    if cold_root_str:
+        cold = Path(cold_root_str) / "raw" / dataset
+        if not hot.exists() and (cold / ".downloaded").exists():
+            hot.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                hot.symlink_to(cold)
+                log_orch(f"{dataset.upper()}: staged cold pool symlink {hot} → {cold}")
+            except FileExistsError:
+                pass  # another process created it first
+    return hot
+
+
 def check_laion(config: dict) -> bool:
-    laion_dir = DATA_ROOT / "raw" / "laion"
-    if not laion_dir.exists() or not any(laion_dir.iterdir()):
-        log_orch("WARNING: raw/laion/ is empty — LAION source will be skipped", level="warning")
+    laion_dir = _stage_cold_pool_symlink("laion", config)
+    if not laion_dir.exists() or not any(laion_dir.glob("*.tar")):
+        log_orch("WARNING: raw/laion/ is empty — LAION source will be skipped. "
+                 "Run: train/.venv/bin/python train/scripts/download_laion_coyo.py --dataset laion",
+                 level="warning")
         return False
     count = sum(1 for _ in laion_dir.glob("*.tar"))
     log_orch(f"LAION: {count} source tars present in raw/laion/")
@@ -305,9 +326,11 @@ def check_laion(config: dict) -> bool:
 
 
 def check_coyo(config: dict) -> bool:
-    coyo_dir = DATA_ROOT / "raw" / "coyo"
-    if not coyo_dir.exists() or not any(coyo_dir.iterdir()):
-        log_orch("WARNING: raw/coyo/ is empty — COYO source will be skipped", level="warning")
+    coyo_dir = _stage_cold_pool_symlink("coyo", config)
+    if not coyo_dir.exists() or not any(coyo_dir.glob("*.tar")):
+        log_orch("WARNING: raw/coyo/ is empty — COYO source will be skipped. "
+                 "Run: train/.venv/bin/python train/scripts/download_laion_coyo.py --dataset coyo",
+                 level="warning")
         return False
     count = sum(1 for _ in coyo_dir.glob("*.tar"))
     log_orch(f"COYO: {count} source tars present in raw/coyo/")

@@ -171,7 +171,7 @@ def _encode_siglip_jpg(jpg_bytes: bytes, model_name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _eval_loss(adapter, flux, text_np, vae_np, siglip_np) -> float:
-    """Compute flow-matching loss for one sample. Random t for unbiased ranking."""
+    """Compute flow-matching loss for one sample. Logit-normal sampled t for unbiased ranking."""
     from ip_adapter.loss import fused_flow_noise, get_schedule_values
     from train_ip_adapter import _flux_forward_with_ip
 
@@ -389,6 +389,12 @@ def main():
     # derive the shard path directly without opening any tar files.
     # This replaces opening N tar files + N×5000×2 stat() calls with 2 directory scans.
     print(f"Scanning cache dirs for precomputed candidates ({len(shard_paths)} shards)...")
+    if not os.path.isdir(args.qwen3_cache):
+        print(f"--qwen3-cache directory not found: {args.qwen3_cache}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isdir(args.vae_cache):
+        print(f"--vae-cache directory not found: {args.vae_cache}", file=sys.stderr)
+        sys.exit(1)
     cached_q  = {f[:-4] for f in os.listdir(args.qwen3_cache) if f.endswith(".npz")}
     cached_v  = {f[:-4] for f in os.listdir(args.vae_cache)   if f.endswith(".npz")}
     eligible  = (cached_q & cached_v) - existing_ids

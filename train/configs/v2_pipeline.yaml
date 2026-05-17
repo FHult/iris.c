@@ -54,6 +54,20 @@ jdb:
       3: [100, 149]
       4: [150, 201]
 
+# External image-text datasets downloaded once to cold pool.
+# download_laion_coyo.py reads these and writes cold_root/raw/{dataset}/.downloaded
+# when complete. check_laion() / check_coyo() in downloader.py create hot symlinks on
+# first use so existing build_shards logic works unchanged.
+data_sources:
+  # HF repo with image+caption columns (parquet) or pre-built WDS tar files.
+  # laion/laion-art: ~8M aesthetic art images, PIL image column + caption column.
+  laion_hf_repo: "laion/laion-art"
+  # Set to a HF repo when ready; empty string disables COYO download entirely.
+  coyo_hf_repo: ""
+  # auto: pipeline_setup.py prints a download command when pools are absent.
+  # skip: never prompt or launch download_laion_coyo.py automatically.
+  laion_coyo_mode: "auto"
+
 # Fraction of LAION/COYO to use per scale (applied via effective chunk denominator)
 data_volume:
   dev:    0.005

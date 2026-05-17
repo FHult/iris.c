@@ -196,42 +196,76 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ~~**DEDUP-1: Clean the converted pool at source + retroactive pool cleaning script** — Done. See COMPLETED_BACKLOG.md.~~
 
----
+**DEDUP-3: clean_wds_pool self-dupe false positives on interrupted restart** (Medium — correctness)
 
-**PIPELINE-DATA-1: Dedicated LAION/COYO download script + pipeline_setup integration** (Medium priority)
+When `clean_wds_pool.py` is killed mid-tar (after FAISS index is written to disk but before the `.deduped` sentinel is written), the FAISS index on disk contains vectors from the partially-processed tar. On restart, that tar has no sentinel so it is reprocessed — its images search against the index and find themselves, scoring similarity ≈ 1.0 above the 0.95 threshold, causing false-positive duplicate removal.
 
-**Current state:** `download_convert.py` downloads JDB tgzs and WikiArt automatically. LAION and COYO are checked via `check_laion()` / `check_coyo()` in `downloader.py`, but these only verify that `raw/laion/` and `raw/coyo/` are non-empty — nothing is downloaded. If the directories are absent, a WARNING is logged and those sources are silently skipped for the chunk. Chunks built this way are JDB+WikiArt only, reducing data diversity.
+**Confirmed occurrence (2026-05-17):** 003.tar was partially indexed (23 vectors added, no sentinel written) before the process was killed due to swap pressure. The 4-49 batch was kicked off separately. 003.tar must be processed with a trimmed index to avoid false positives.
 
-**New script: `train/scripts/download_laion_coyo.py`**
+**Manual fix for 003.tar:**
+```python
+import faiss, numpy as np
+index = faiss.read_index('/Volumes/16TBCold/metadata/dedup_index.faiss')
+ids = open('/Volumes/16TBCold/metadata/dedup_index.ids').read().splitlines()
+n_clean = len(ids) - 23  # remove 003.tar partial vectors (last 23 in insertion order)
+vecs = np.zeros((n_clean, index.d), dtype=np.float32)
+index.reconstruct_n(0, n_clean, vecs)
+new_idx = faiss.IndexFlatIP(index.d)
+new_idx.add(vecs)
+faiss.write_index(new_idx, '/Volumes/16TBCold/metadata/dedup_index.faiss')
+open('/Volumes/16TBCold/metadata/dedup_index.ids', 'w').write('\n'.join(ids[:n_clean]) + '\n')
+```
+Then run: `train/.venv/bin/python train/scripts/clean_wds_pool.py --tgz-range 3 3`
 
-A dedicated one-time setup script, separate from `download_convert.py` (which runs per-chunk). LAION/COYO are large, slow downloads that belong in the persistent cold pool — not the per-chunk pipeline loop.
+Note: trim must be done AFTER the 4-49 batch completes, as the 4-49 batch uses the current index as its duplicate reference. Trimming during that run would break its dedup consistency.
 
-Responsibilities:
-1. Fetch LAION metadata subset (`laion/laion-aesthetics-v2-5plus` or similar) using the HF datasets API; filter to the configured `data_volume` fraction from [v2_pipeline.yaml:57-64](train/configs/v2_pipeline.yaml#L57-L64).
-2. Fetch COYO-700M metadata (`kakaobrain/coyo-700m`); same fraction.
-3. Use `img2dataset` (or a `requests`+`PIL` parallel fetcher) to download images → WDS `.tar` files, writing to `cold_root/raw/laion/` and `cold_root/raw/coyo/` (persistent cold pool, analogous to JDB converted pool).
-4. Write sentinel files `cold_root/raw/laion/.downloaded` and `cold_root/raw/coyo/.downloaded` for idempotent resume — re-running the script skips already-complete downloads.
-5. Emit a heartbeat during download (same `write_heartbeat` pattern as other workers) so `pipeline_status.py` shows progress.
-
-`download_convert.py` stays unchanged — `check_laion()` / `check_coyo()` promote from cold pool to hot `raw/` on each chunk run (analogous to how JDB tgzs are promoted from the cold raw pool today).
-
-**pipeline_setup.py integration:**
-
-`pipeline_setup.py` runs at the start of a new pipeline campaign. It should detect missing LAION/COYO pools and either:
-- **Prompt the user** (interactive mode): print a clear message explaining that LAION/COYO are not downloaded and offer to run `download_laion_coyo.py` now or skip and train on JDB+WikiArt only.
-- **Auto-run** (non-interactive / `--yes` mode): launch `download_laion_coyo.py` in a tmux window (same pattern as other long-running prep steps) so it runs in the background while the user works.
-
-Detection: check for `cold_root/raw/laion/.downloaded` and `cold_root/raw/coyo/.downloaded` sentinels. If absent, offer/trigger the download.
-
-Add a `data_sources.laion_coyo: auto | prompt | skip` config key to `v2_pipeline.yaml` so the behaviour is explicit and not hardcoded. Default: `prompt`.
-
-**Dependency:** `img2dataset` is not in `train/requirements.txt`. Add it, or implement a lighter parallel fetcher using `aiohttp` + `PIL` (avoids a heavy dep). `img2dataset` has a WebDataset output mode that produces `.tar` files directly — preferred if the dependency is acceptable.
-
-**Risk:** LAION/COYO image URLs have ~20-40% 404 rates depending on subset age. The downloader must handle failures gracefully and produce dense WDS shards from available records. `img2dataset` handles this automatically; a custom fetcher would need the same logic.
-
-**When to do:** after chunk 2 production run completes and pipeline is stable. Not blocking any current chunk.
+**Structural fix (future):** Before adding vectors for a new tar, write a `.processing` sentinel with the tar name and the current `index.ntotal`. On startup, if a `.processing` sentinel exists, truncate the index to the saved `ntotal` and remove the sentinel. This makes interrupted runs automatically safe to restart.
 
 ---
+
+**DEDUP-2: Re-dedupe 001.tar after redownload** (Tiny — blocked on download)
+
+`001.tar` in the cold pool is corrupt (0-byte content, 10 KB file). A fresh dedup run was started on the rest of the pool (002–154) with a clean index. Once `001.tgz` finishes downloading via `hf`:
+
+1. Convert: `train/.venv/bin/python /tmp/redownload_001.py --tgz /tmp/jdb001_dl/data/train/imgs/001.tgz`
+2. Remove the sentinel that the current clean run will write for the empty tar: `rm /Volumes/16TBCold/converted/journeydb/001.tar.deduped`
+3. Re-run dedup for just that tar: `train/.venv/bin/python train/scripts/clean_wds_pool.py --tgz-range 1 1`
+
+---
+
+~~**PIPELINE-DATA-1: Dedicated LAION/COYO download script + pipeline_setup integration** — Done (2026-05-17)~~
+
+Implemented: `train/scripts/download_laion_coyo.py` (new), `downloader.py` (cold-pool symlink staging in `check_laion`/`check_coyo`), `pipeline_setup.py` (`_check_laion_coyo_pools` detection), `v2_pipeline.yaml` (`data_sources` block). Uses HF-hosted repos (no URL staleness). Configure `laion_hf_repo` in `v2_pipeline.yaml` before first run.
+
+---
+
+**TELEMETRY-1: Pipeline telemetry gaps — audit findings** (Multiple priority levels — see report)
+
+Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
+
+**Summary of dead telemetry (logged but never consumed):**
+- `validator_chunk{N}.jsonl` events — no reader in doctor or status
+- `ema_drift` in trainer heartbeat — not displayed anywhere
+- `siglip_coverage_pct` in trainer heartbeat — not displayed in status
+- `bucket_stats` in heartbeat/log — no parser in ablation harness or status
+- `logs/val_chunk{N}/metrics.json` (CLIP-I, adapter_delta) — not read by doctor, explorer, or status
+- `selection_log` table in `shard_scores.db` — never queried (flywheel uses JSON column instead)
+
+**Quick wins (low effort, implement opportunistically):**
+- **QW-1**: Add `grad_norm_final`, `ip_scale_final` indexed columns to `ablation_history.db` — enables stability-based Pareto filtering
+- **QW-3**: Add `steps_per_second` to trainer heartbeat — cross-campaign throughput comparison
+- **QW-4**: Persist `_restart_counts` to `pipeline_state.json` — correctness fix, retry limit resets on orchestrator restart
+- **QW-5**: Surface `ema_drift` in `pipeline_status.py` — 3 lines
+- **QW-6**: Add `stopped_early` + `stop_step` to ablation DB — distinguish crashes from early stops
+- **QW-7**: Log `threshold_loss` and `skipped` count to `mine_hard_examples.jsonl` done event
+- **QW-8**: Dispatch WARNING when trainer heartbeat `mem_available_gb < 3.0` — pre-OOM alert
+- **QW-10**: Make `pipeline_status.py` read `logs/val_chunk{N}/metrics.json` — CLIP-I trend across chunks
+
+**High-value deeper changes:**
+- **DA-6**: Write per-shard hard-example density into `shard_scores.db` after each mining run — closes the most important missing feedback loop
+- **DA-3**: Campaign-level summary table in persistent DB — enables cross-campaign warmstart decisions
+- **DA-2**: Per-shard loss percentile distribution in mining output — reveals uniform vs bimodal shards
+- **DA-7**: Link validation metrics back to `ablation_history.db` via `post_train_validation` table
 
 ---
 

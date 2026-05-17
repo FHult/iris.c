@@ -258,12 +258,15 @@ class MLXCLIPEmbedder:
         """
         if self._model is None:
             self.load()
-        imgs  = _preprocess(pil_images)
-        N     = imgs.shape[0]
+        # Preprocess and infer _BATCH images at a time so the (B, 224, 224, 3)
+        # numpy array and the Metal input buffer are released each iteration
+        # rather than holding a single (N, 224, 224, 3) allocation for all N.
+        N     = len(pil_images)
         parts = []
         for i in range(0, N, _BATCH):
-            out = self._model(imgs[i:i + _BATCH])
-            mx.eval(out)                   # materialise each sub-batch; MLX is lazy
+            imgs = _preprocess(pil_images[i:i + _BATCH])
+            out  = self._model(imgs)
+            mx.eval(out)                   # materialise before converting to numpy
             parts.append(np.array(out, dtype=np.float32))
         arr   = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
