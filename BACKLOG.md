@@ -172,7 +172,17 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
    Requires adding `(1024, 1024)` to `BUCKETS` in `train/ip_adapter/dataset.py:62`.
    See `train7_plan.md` §4.
 
-**Dependency summary:** Profiling run (§1) unblocked; Stage 2 (§2) unblocked pending profiling; Stage 3 (§3) conditional on gate. TRAIN-6, PIPELINE-27, QUALITY-10 — done, see COMPLETED_BACKLOG.md.
+**Shard resolution — essential insight for 1024px:** Images are stored in shards at their
+**original JPEG resolution** — `build_shards.py:321` only filters images smaller than 256px on
+either dimension, no resizing. All resizing happens at training time in `dataset.py:444-445`
+(Pillow LANCZOS to bucket+32px, then GPU random-crop). This means no shard rebuild is needed for
+1024px training. However, any source image smaller than 1024px will be upscaled, which is poor
+style-learning signal at high resolution. **Before committing to a 1024px flywheel, run a shard
+sweep to measure what fraction of images are < 512px on their shortest side.** If that fraction
+is large, the effective training signal at 1024px will be weaker than at 512px. See `train7_plan.md`
+§5 for the sweep script and decision criteria.
+
+**Dependency summary:** Profiling run (§1) and shard resolution sweep (§5) both unblocked and should run together; Stage 2 (§2) unblocked pending profiling; Stage 3 (§3) conditional on gate + sweep results. TRAIN-6, PIPELINE-27, QUALITY-10 — done, see COMPLETED_BACKLOG.md.
 
 ---
 
