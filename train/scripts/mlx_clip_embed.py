@@ -261,13 +261,23 @@ class MLXCLIPEmbedder:
         # Preprocess and infer _BATCH images at a time so the (B, 224, 224, 3)
         # numpy array and the Metal input buffer are released each iteration
         # rather than holding a single (N, 224, 224, 3) allocation for all N.
+        # Pad the final partial sub-batch up to _BATCH so MLX does not compile a
+        # new Metal graph for every unique residual size across calls.
         N     = len(pil_images)
         parts = []
         for i in range(0, N, _BATCH):
-            imgs = _preprocess(pil_images[i:i + _BATCH])
-            out  = self._model(imgs)
+            chunk = pil_images[i:i + _BATCH]
+            orig = len(chunk)
+            imgs = _preprocess(chunk)
+            if orig < _BATCH:
+                pad = mx.zeros((_BATCH - orig, _SIZE, _SIZE, 3), dtype=mx.float16)
+                imgs = mx.concatenate([imgs, pad], axis=0)
+            out = self._model(imgs)
             mx.eval(out)                   # materialise before converting to numpy
-            parts.append(np.array(out, dtype=np.float32))
+            arr = np.array(out, dtype=np.float32)
+            if orig < _BATCH:
+                arr = arr[:orig]
+            parts.append(arr)
         arr   = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.where(norms < 1e-8, 1.0, norms)

@@ -203,9 +203,11 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     n_threads = min(_PERF_CORES, len(raw_items))
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         results = list(pool.map(_proc, raw_items))
+    del raw_items
 
     ids     = [k for k, t in results if k is not None]
     tensors = [t for k, t in results if t is not None]
+    del results
     return ids, tensors
 
 
@@ -568,6 +570,7 @@ def dedup_wds_tar(
     blocklist_path: Path,
     threshold: float = DUP_THRESHOLD,
     backend: str = "auto",
+    index=None,
 ) -> tuple:
     """
     Embed all images in tar_path, search for near-duplicates in the existing
@@ -581,9 +584,14 @@ def dedup_wds_tar(
         blocklist_path:Path to the duplicate-IDs blocklist (append-safe).
         threshold:     Inner-product score >= this flags a record as duplicate.
         backend:       CLIP backend ("auto" | "open_clip" | "mlx" | "transformers").
+        index:         Optional pre-loaded FAISS index. If provided, skips disk
+                       load AND skips disk write (caller is responsible for
+                       persisting). If None, loads from disk and writes to disk
+                       as before. The .ids sidecar is always appended.
 
     Returns:
-        (records_in, records_out) — record counts before and after dedup.
+        (records_in, records_out, index) — record counts before and after dedup,
+        plus the updated index object (so callers can keep it cached).
 
     Thread-safety: acquires _faiss_lock around all index I/O so concurrent
     calls from multiple threads are safe.
@@ -610,7 +618,7 @@ def dedup_wds_tar(
     if ids is None:
         raise RuntimeError(f"embed failed for {tar_path.name} — I/O error reading tar")
     if len(ids) == 0:
-        return (0, 0)
+        return (0, 0, index)
 
     records_in = len(ids)
 
@@ -653,13 +661,15 @@ def dedup_wds_tar(
             pass
 
     dim = emb_arr.shape[1]
+    caller_owns_index = index is not None
 
     with _faiss_lock:
-        # Load or create index.
-        if index_path.exists():
-            index = faiss.read_index(str(index_path))
-        else:
-            index = faiss.IndexFlatIP(dim)
+        # Load or create index (only when caller did not pass one in).
+        if index is None:
+            if index_path.exists():
+                index = faiss.read_index(str(index_path))
+            else:
+                index = faiss.IndexFlatIP(dim)
 
         # Search existing index only (before adding new vectors).
         dup_stems: set = set()
@@ -682,18 +692,13 @@ def dedup_wds_tar(
         if kept_ids:
             kept_vecs = emb_arr[[i for i in range(len(ids)) if keep_mask[i]]]
             index.add(kept_vecs)
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            faiss.write_index(index, str(index_path))
             with open(ids_path, "a") as _idf:
                 for fid in kept_ids:
                     _idf.write(fid + "\n")
-        elif not dup_stems:
-            # No vectors at all (edge case: all decoded images had errors upstream).
-            pass
-
-        # Explicitly release the index object so its RAM (grows to ~4 GB by tar 142)
-        # is freed before the next tar's index load, not held until Python GC decides.
-        del index
+            # When the caller owns the index, persistence is its responsibility.
+            if not caller_owns_index:
+                index_path.parent.mkdir(parents=True, exist_ok=True)
+                faiss.write_index(index, str(index_path))
 
     records_out = records_in - len(dup_stems)
 
@@ -703,7 +708,7 @@ def dedup_wds_tar(
         try:
             with tarfile.open(str(tar_path), "r") as src, \
                  tarfile.open(str(tmp_path), "w") as dst:
-                for member in src.getmembers():
+                for member in src:
                     if not member.isfile():
                         continue
                     stem, _, _ = member.name.rpartition(".")
@@ -720,7 +725,7 @@ def dedup_wds_tar(
                 pass
             raise
 
-    return (records_in, records_out)
+    return (records_in, records_out, index)
 
 
 # ---------------------------------------------------------------------------

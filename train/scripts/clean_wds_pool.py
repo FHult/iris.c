@@ -150,6 +150,26 @@ def main() -> None:
         except Exception:
             return -1
 
+    # Load FAISS index once and keep it resident across all tars; persist every
+    # _INDEX_FLUSH_EVERY tars and on exit. Avoids reloading multi-GB index per tar.
+    _INDEX_FLUSH_EVERY = 10
+    import faiss  # noqa: E402
+    faiss.omp_set_num_threads(1)
+    if index_path.exists():
+        print(f"Loading FAISS index from {index_path} ...", flush=True)
+        index = faiss.read_index(str(index_path))
+        print(f"  loaded: {index.ntotal:,} vectors", flush=True)
+    else:
+        index = None  # dedup_wds_tar will create IndexFlatIP on first call
+
+    def _flush_index() -> None:
+        if index is None:
+            return
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index_path.with_suffix(".faiss.tmp")
+        faiss.write_index(index, str(tmp))
+        os.replace(str(tmp), str(index_path))
+
     try:
         for i, tar_path in enumerate(pending, 1):
             sentinel = tar_path.with_suffix(".tar.deduped")
@@ -160,13 +180,14 @@ def main() -> None:
             last_err = None
             for attempt in range(1, _RETRY_ATTEMPTS + 1):
                 try:
-                    rec_in, rec_out = dedup_wds_tar(
+                    rec_in, rec_out, index = dedup_wds_tar(
                         tar_path=tar_path,
                         index_path=index_path,
                         ids_path=ids_path,
                         blocklist_path=blocklist_path,
                         threshold=args.threshold,
                         backend=args.clip_backend,
+                        index=index,
                     )
                     last_err = None
                     break
@@ -213,7 +234,16 @@ def main() -> None:
             sentinel.touch()
             _done[0] += 1
 
+            # Periodic FAISS index persistence (every _INDEX_FLUSH_EVERY tars).
+            if _done[0] % _INDEX_FLUSH_EVERY == 0:
+                _flush_index()
+                print(f"  [index flushed to {index_path.name}]", flush=True)
+
     finally:
+        try:
+            _flush_index()
+        except Exception as e:
+            print(f"WARNING: final index flush failed: {e}", file=sys.stderr, flush=True)
         _stop.set()
 
     total_elapsed = time.time() - run_start

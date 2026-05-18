@@ -192,105 +192,130 @@ def run_dedupe_filter(
     total_after_dedup = 0
     t_hb = time.time()
 
-    for tar_path in tars:
-        real_path = tar_path.resolve()
+    # Load FAISS index once before the loop and reuse across tars.
+    # Pass None if the index doesn't exist yet — dedup_wds_tar will create it
+    # with the correct embedding dim on first call and return it back to us.
+    import faiss as _faiss
+    faiss_index = _faiss.read_index(str(index_path)) if index_path.exists() else None
+    _flush_counter = 0
 
-        # Determine the canonical cold pool tar for this file (if any).
-        # Sentinel lives on the pool tar so future conv pool hits skip correctly.
-        # Three cases:
-        #   A) symlink  (same-device): real_path IS the pool tar
-        #   B) copy (diff-device): pool_dir known → pool_tar is pool_dir/name
-        #   C) no pool info: sentinel stays on staging
-        if real_path != tar_path:
-            # Case A: staging path is a symlink; real_path is the cold pool tar
-            pool_tar: Optional[Path] = real_path
-        elif pool_dir is not None and (pool_dir / tar_path.name).exists():
-            # Case B: staging path is a real copy; cold pool tar exists separately
-            pool_tar = pool_dir / tar_path.name
-        else:
-            pool_tar = None  # Case C
+    def _flush_faiss_index() -> None:
+        if faiss_index is None:
+            return
+        _tmp = str(index_path) + ".tmp"
+        _faiss.write_index(faiss_index, _tmp)
+        os.replace(_tmp, str(index_path))
 
-        sentinel = Path(str(pool_tar if pool_tar is not None else real_path) + ".deduped")
-        if sentinel.exists():
-            done += 1
-            write_heartbeat("dedupe_filter", chunk,
-                            done=done, total=total,
-                            pct=round(done / total * 100, 1))
-            continue
+    try:
+        for tar_path in tars:
+            real_path = tar_path.resolve()
 
-        # work_path: the file we read/write in place.
-        # Case A: work on cold pool tar directly (via real_path).
-        # Cases B/C: work on staging copy.
-        work_path = real_path
-        tmp_fd, tmp_str = tempfile.mkstemp(
-            dir=work_path.parent, suffix=".qf_tmp"
-        )
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_str)
+            # Determine the canonical cold pool tar for this file (if any).
+            # Sentinel lives on the pool tar so future conv pool hits skip correctly.
+            # Three cases:
+            #   A) symlink  (same-device): real_path IS the pool tar
+            #   B) copy (diff-device): pool_dir known → pool_tar is pool_dir/name
+            #   C) no pool info: sentinel stays on staging
+            if real_path != tar_path:
+                # Case A: staging path is a symlink; real_path is the cold pool tar
+                pool_tar: Optional[Path] = real_path
+            elif pool_dir is not None and (pool_dir / tar_path.name).exists():
+                # Case B: staging path is a real copy; cold pool tar exists separately
+                pool_tar = pool_dir / tar_path.name
+            else:
+                pool_tar = None  # Case C
 
-        try:
-            quality_kept, quality_removed = _quality_filter_tar(
-                work_path, tmp_path, min_size, min_words
-            )
-            in_count = quality_kept + quality_removed
-
-            if quality_kept == 0:
-                # All records were quality-rejected; replace tar with empty tar
-                tmp_path.unlink(missing_ok=True)
-                with tarfile.open(work_path, "w"):
-                    pass  # write empty tar
-                # Case B: write empty tar back to cold pool atomically
-                if pool_tar is not None and pool_tar != work_path:
-                    _atomic_copy(work_path, pool_tar)
-                sentinel.touch()
+            sentinel = Path(str(pool_tar if pool_tar is not None else real_path) + ".deduped")
+            if sentinel.exists():
                 done += 1
-                total_in += in_count
-                print(
-                    f"  {tar_path.name}: {in_count} → 0 → 0 "
-                    f"({quality_removed} quality-removed, all empty)",
-                    flush=True,
-                )
+                write_heartbeat("dedupe_filter", chunk,
+                                done=done, total=total,
+                                pct=round(done / total * 100, 1))
                 continue
 
-            # Step 2: rename quality-filtered tmp → work_path
-            os.replace(tmp_path, work_path)
-
-            # Step 3: CLIP dedup rewrites work_path in-place
-            records_in, records_out = dedup_wds_tar(
-                work_path, index_path, ids_path, blocklist_path,
-                threshold=threshold, backend=backend,
+            # work_path: the file we read/write in place.
+            # Case A: work on cold pool tar directly (via real_path).
+            # Cases B/C: work on staging copy.
+            work_path = real_path
+            tmp_fd, tmp_str = tempfile.mkstemp(
+                dir=work_path.parent, suffix=".qf_tmp"
             )
-            dup_removed = records_in - records_out
+            os.close(tmp_fd)
+            tmp_path = Path(tmp_str)
 
-            # Case B: write deduped staging tar back to cold pool atomically
-            if pool_tar is not None and pool_tar != work_path:
-                _atomic_copy(work_path, pool_tar)
+            try:
+                quality_kept, quality_removed = _quality_filter_tar(
+                    work_path, tmp_path, min_size, min_words
+                )
+                in_count = quality_kept + quality_removed
 
-        except Exception as e:
-            tmp_path.unlink(missing_ok=True)
-            print(f"  ERROR processing {tar_path.name}: {e}",
-                  file=sys.stderr, flush=True)
-            raise
+                if quality_kept == 0:
+                    # All records were quality-rejected; replace tar with empty tar
+                    tmp_path.unlink(missing_ok=True)
+                    with tarfile.open(work_path, "w"):
+                        pass  # write empty tar
+                    # Case B: write empty tar back to cold pool atomically
+                    if pool_tar is not None and pool_tar != work_path:
+                        _atomic_copy(work_path, pool_tar)
+                    sentinel.touch()
+                    done += 1
+                    total_in += in_count
+                    print(
+                        f"  {tar_path.name}: {in_count} → 0 → 0 "
+                        f"({quality_removed} quality-removed, all empty)",
+                        flush=True,
+                    )
+                    continue
 
-        # Step 4: write sentinel on cold pool tar (or staging if no pool)
-        sentinel.touch()
-        done += 1
-        total_in += in_count
-        total_quality_kept += quality_kept
-        total_after_dedup += records_out
+                # Step 2: rename quality-filtered tmp → work_path
+                os.replace(tmp_path, work_path)
 
-        print(
-            f"  {tar_path.name}: {in_count} → {quality_kept} → {records_out} "
-            f"({quality_removed} quality, {dup_removed} dups)",
-            flush=True,
-        )
+                # Step 3: CLIP dedup rewrites work_path in-place.
+                # Pass in the cached index and re-bind the returned one so the
+                # in-memory index lives across tars (we persist it ourselves).
+                records_in, records_out, faiss_index = dedup_wds_tar(
+                    work_path, index_path, ids_path, blocklist_path,
+                    threshold=threshold, backend=backend, index=faiss_index,
+                )
+                dup_removed = records_in - records_out
 
-        now = time.time()
-        if now - t_hb >= 30:
-            write_heartbeat("dedupe_filter", chunk,
-                            done=done, total=total,
-                            pct=round(done / total * 100, 1))
-            t_hb = now
+                # Case B: write deduped staging tar back to cold pool atomically
+                if pool_tar is not None and pool_tar != work_path:
+                    _atomic_copy(work_path, pool_tar)
+
+            except Exception as e:
+                tmp_path.unlink(missing_ok=True)
+                print(f"  ERROR processing {tar_path.name}: {e}",
+                      file=sys.stderr, flush=True)
+                raise
+
+            # Step 4: write sentinel on cold pool tar (or staging if no pool)
+            sentinel.touch()
+            done += 1
+            total_in += in_count
+            total_quality_kept += quality_kept
+            total_after_dedup += records_out
+
+            # Periodic durable flush of the cumulative FAISS index.
+            _flush_counter += 1
+            if _flush_counter % 10 == 0:
+                _flush_faiss_index()
+
+            print(
+                f"  {tar_path.name}: {in_count} → {quality_kept} → {records_out} "
+                f"({quality_removed} quality, {dup_removed} dups)",
+                flush=True,
+            )
+
+            now = time.time()
+            if now - t_hb >= 30:
+                write_heartbeat("dedupe_filter", chunk,
+                                done=done, total=total,
+                                pct=round(done / total * 100, 1))
+                t_hb = now
+    finally:
+        # Always persist the cumulative FAISS index, even on error/interrupt.
+        _flush_faiss_index()
 
     write_heartbeat("dedupe_filter", chunk, done=done, total=total, pct=100)
     log_orch(
