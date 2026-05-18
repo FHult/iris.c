@@ -1630,9 +1630,28 @@ def _cmd_ablation(args: argparse.Namespace) -> int:
         else:
             print(f"DB error: {e}")
         return 1
+
+    # Load post-training validation data if the table exists
+    val_map: dict[int, dict] = {}
+    try:
+        val_rows = conn.execute(
+            "SELECT exp_id, clip_i, adapter_delta, verdict AS val_verdict "
+            "FROM post_train_validation"
+        ).fetchall()
+        val_map = {r["exp_id"]: dict(r) for r in val_rows}
+    except sqlite3.Error:
+        pass  # table not yet created (older DB)
+
     conn.close()
 
     experiments = [dict(r) for r in rows]
+    for e in experiments:
+        v = val_map.get(e["id"])
+        if v:
+            e["val_clip_i"]      = v.get("clip_i")
+            e["val_verdict"]     = v.get("val_verdict")
+            e["val_adapter_delta"] = v.get("adapter_delta")
+
     if args.campaign:
         experiments = [e for e in experiments
                        if args.campaign in str(e.get("ts", ""))]
@@ -1661,6 +1680,7 @@ def _cmd_ablation(args: argparse.Namespace) -> int:
         print("No experiments found.")
         return 0
 
+    has_val = any(e.get("val_clip_i") is not None for e in experiments)
     table_rows = []
     for e in experiments:
         cg   = f"{e['cond_gap']:.4f}"   if e["cond_gap"]   is not None else "—"
@@ -1669,12 +1689,19 @@ def _cmd_ablation(args: argparse.Namespace) -> int:
         loss = f"{e['final_loss']:.4f}" if e["final_loss"] is not None else "—"
         ns   = str(e["steps"] or "—")
         vrd  = str(e["verdict"] or "—")[:12]
-        table_rows.append([str(e["id"]), cg, rg, sc, loss, ns, vrd])
+        row  = [str(e["id"]), cg, rg, sc, loss, ns, vrd]
+        if has_val:
+            ci = e.get("val_clip_i")
+            row.append(f"{ci:.4f}" if ci is not None else "—")
+        table_rows.append(row)
+
+    hdrs = ["id", "cond_gap", "ref_gap", "score", "loss", "n_steps", "verdict"]
+    if has_val:
+        hdrs.append("CLIP-I")
 
     label = "(pareto)" if args.pareto else f"({len(experiments)} total)"
     print(f"\n  {db_path}  {label}\n")
-    print(_col_table(table_rows,
-                     ["id", "cond_gap", "ref_gap", "score", "loss", "n_steps", "verdict"]))
+    print(_col_table(table_rows, hdrs))
     print()
     return 0
 

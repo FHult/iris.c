@@ -118,6 +118,7 @@ _REPO_ROOT   = _TRAIN_DIR.parent
 _VENV_PYTHON = _TRAIN_DIR / ".venv" / "bin" / "python"
 _BASE_CONFIG = _TRAIN_DIR / "configs" / "stage1_512px.yaml"
 _TRAINER     = _TRAIN_DIR / "train_ip_adapter.py"
+_VALIDATOR   = _TRAIN_DIR / "scripts" / "validator.py"
 _DATA_ROOT   = Path(os.environ.get("PIPELINE_DATA_ROOT", "/Volumes/2TBSSD"))
 _DEFAULT_SHARDS  = _DATA_ROOT / "shards"
 _DEFAULT_QWEN3   = _DATA_ROOT / "precomputed" / "qwen3"
@@ -288,6 +289,24 @@ class AblationDB:
         );
         CREATE INDEX IF NOT EXISTS idx_run  ON experiments(run_name);
         CREATE INDEX IF NOT EXISTS idx_hash ON experiments(run_name, config_hash);
+        CREATE TABLE IF NOT EXISTS post_train_validation (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            exp_id          INTEGER NOT NULL REFERENCES experiments(id),
+            run_name        TEXT    NOT NULL,
+            checkpoint_path TEXT,
+            weight_ok       INTEGER,
+            weight_errors   TEXT,
+            n_params        INTEGER,
+            clip_i          REAL,
+            adapter_delta   REAL,
+            clip_skipped    INTEGER NOT NULL DEFAULT 0,
+            skip_reason     TEXT,
+            verdict         TEXT,
+            elapsed_secs    REAL,
+            ts              TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_val_exp ON post_train_validation(exp_id);
+        CREATE INDEX IF NOT EXISTS idx_val_run ON post_train_validation(run_name);
         CREATE TABLE IF NOT EXISTS _meta (k TEXT PRIMARY KEY, v TEXT);
         INSERT OR IGNORE INTO _meta VALUES ('schema_version', '3');
     """
@@ -418,6 +437,45 @@ class AblationDB:
                 )
             self._conn.commit()
         return len(pareto_ids)
+
+    def insert_validation(self, exp_id: int, run_name: str, val: dict) -> None:
+        """Store post-training validation result for an experiment."""
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO post_train_validation
+                   (exp_id, run_name, checkpoint_path, weight_ok, weight_errors,
+                    n_params, clip_i, adapter_delta, clip_skipped, skip_reason,
+                    verdict, elapsed_secs, ts)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (exp_id, run_name,
+                 val.get("checkpoint_path"),
+                 int(bool(val.get("weight_ok"))) if val.get("weight_ok") is not None else None,
+                 json.dumps(val.get("weight_errors") or []),
+                 val.get("n_params"),
+                 val.get("clip_i"),
+                 val.get("adapter_delta"),
+                 int(bool(val.get("clip_skipped"))),
+                 val.get("skip_reason"),
+                 val.get("verdict", "SKIP"),
+                 val.get("elapsed_secs"),
+                 ts),
+            )
+            self._conn.commit()
+
+    def get_validations(self, run_name: str) -> dict:
+        """Return {exp_id: validation_row_dict} for all validated experiments in run_name."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM post_train_validation WHERE run_name=? ORDER BY id",
+                (run_name,),
+            ).fetchall()
+        result = {}
+        for row in rows:
+            r = dict(row)
+            r["weight_errors"] = json.loads(r.get("weight_errors") or "[]")
+            result[r["exp_id"]] = r
+        return result
 
     @staticmethod
     def _decode_row(row: sqlite3.Row) -> dict:
@@ -1201,6 +1259,72 @@ def _wait_for_gpu_lock(max_wait_secs: int = 3600) -> bool:
         time.sleep(30)
 
 
+# ── Post-training validation ──────────────────────────────────────────────────
+
+def _run_ablation_validation(
+    run_dir: Path,
+    checkpoint_path: Path,
+    base_config: str,
+) -> dict:
+    """
+    Invoke validator.py with --ai --no-pipeline-sentinel for an ablation checkpoint.
+    Returns a dict suitable for AblationDB.insert_validation().
+    """
+    val_dir = run_dir / "validation"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(_VENV_PYTHON), "-u", str(_VALIDATOR),
+        "--checkpoint", str(checkpoint_path),
+        "--config",    base_config,
+        "--val-dir",   str(val_dir),
+        "--no-pipeline-sentinel",
+        "--ai",
+    ]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600, cwd=str(_REPO_ROOT)
+        )
+        elapsed = round(time.time() - t0, 1)
+        # --ai prints one JSON line to stdout; last non-empty line is authoritative
+        last_line = next(
+            (l for l in reversed(proc.stdout.splitlines()) if l.strip()), ""
+        )
+        ai_out = json.loads(last_line)
+    except subprocess.TimeoutExpired:
+        return {"verdict": "SKIP", "clip_skipped": True,
+                "skip_reason": "timeout", "elapsed_secs": round(time.time() - t0, 1),
+                "checkpoint_path": str(checkpoint_path)}
+    except (json.JSONDecodeError, OSError, StopIteration) as exc:
+        return {"verdict": "SKIP", "clip_skipped": True,
+                "skip_reason": str(exc)[:120], "elapsed_secs": round(time.time() - t0, 1),
+                "checkpoint_path": str(checkpoint_path)}
+
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "weight_ok":       ai_out.get("weight_ok"),
+        "weight_errors":   ai_out.get("issues", []),
+        "n_params":        ai_out.get("n_params"),
+        "clip_i":          ai_out.get("clip_i_mean"),
+        "adapter_delta":   ai_out.get("adapter_delta"),
+        "clip_skipped":    ai_out.get("clip_i_mean") is None,
+        "skip_reason":     None,
+        "verdict":         ai_out.get("verdict", "SKIP"),
+        "elapsed_secs":    elapsed,
+    }
+
+
+def _print_val_result(v: dict) -> None:
+    verdict  = v.get("verdict", "SKIP")
+    clip_i   = v.get("clip_i")
+    delta    = v.get("adapter_delta")
+    elapsed  = v.get("elapsed_secs", 0)
+    col = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(verdict, "dim")
+    clip_str  = f"  CLIP-I={clip_i:.4f}" if clip_i is not None else "  CLIP-I=—"
+    delta_str = f"  delta={delta:+.4f}"  if delta is not None else ""
+    print(f"  val: {_c(col, verdict)}{clip_str}{delta_str}  ({elapsed:.0f}s)")
+
+
 # ── Single-run execution ──────────────────────────────────────────────────────
 
 def _run_one(
@@ -1463,16 +1587,17 @@ def _warm_start_candidate(warm_start_dir: Path, run_name: str,
 
 def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     """Fire-and-forget long-term loop.  Runs until max_total_runs or stop signal."""
-    run_name       = harness_cfg.get("name", "default")
-    max_runs       = int(harness_cfg.get("max_total_runs", 100))
-    steps          = int(harness_cfg.get("steps_per_run", 8000))
-    strategy       = harness_cfg.get("strategy", "random")
-    objective      = harness_cfg.get("objective", {})
-    variables      = harness_cfg.get("variables", {})
-    conditions     = harness_cfg.get("conditions", [])
-    max_days       = float(harness_cfg.get("max_days", 0))
-    use_gpu_lock   = bool(harness_cfg.get("gpu_coordination", True))
-    report_hours   = float(harness_cfg.get("report_interval_hours", 4.0))
+    run_name          = harness_cfg.get("name", "default")
+    max_runs          = int(harness_cfg.get("max_total_runs", 100))
+    steps             = int(harness_cfg.get("steps_per_run", 8000))
+    strategy          = harness_cfg.get("strategy", "random")
+    objective         = harness_cfg.get("objective", {})
+    variables         = harness_cfg.get("variables", {})
+    conditions        = harness_cfg.get("conditions", [])
+    max_days          = float(harness_cfg.get("max_days", 0))
+    use_gpu_lock      = bool(harness_cfg.get("gpu_coordination", True))
+    report_hours      = float(harness_cfg.get("report_interval_hours", 4.0))
+    validate_after_run = bool(harness_cfg.get("validate_after_run", False))
     log_every      = max(50, steps // 80)
     output_dir     = Path(cli_args.output_dir)
     campaign_start = time.time()
@@ -1540,6 +1665,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     if max_days > 0:
         print(f"  max_days={max_days:.1f}")
     print(f"  gpu_coordination={use_gpu_lock}  report_interval={report_hours:.1f}h")
+    print(f"  validate_after_run={validate_after_run}")
     print(f"  db: {db._db_path}")
     print(f"  output: {output_dir}")
     if early_stopper is not None:
@@ -1565,7 +1691,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             try:
                 _exps = db.get_experiments(run_name)
                 if _exps:
-                    _generate_lt_report(_exps, output_dir, run_name, steps, objective)
+                    _generate_lt_report(_exps, output_dir, run_name, steps, objective, db=db)
             except Exception:
                 pass
 
@@ -1609,7 +1735,9 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             vae_cache=getattr(cli_args, "vae_cache", None),
             siglip_cache=getattr(cli_args, "siglip_cache", None),
             steps=steps,
-            keep_checkpoints=False,
+            # Keep checkpoint alive when validation is enabled so we can run it
+            # before deletion. The harness deletes the dir below after validation.
+            keep_checkpoints=validate_after_run,
         )
 
         _print_combo_header(combo, n_done, max_runs, steps)
@@ -1638,6 +1766,31 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         )
         db.update_pareto_front(run_name)
 
+        # Post-training validation — runs after DB is updated, before checkpoint cleanup
+        if validate_after_run and result["exit_code"] == 0:
+            ckpt_path = run_dir / "checkpoints" / "best.safetensors"
+            if ckpt_path.exists():
+                print(_c("dim", "  Validating checkpoint..."), flush=True)
+                val_result = _run_ablation_validation(
+                    run_dir=run_dir,
+                    checkpoint_path=ckpt_path,
+                    base_config=getattr(cli_args, "base_config", str(_BASE_CONFIG)),
+                )
+                db.insert_validation(exp_id, run_name, val_result)
+                _print_val_result(val_result)
+            else:
+                db.insert_validation(exp_id, run_name, {
+                    "verdict": "SKIP", "clip_skipped": True,
+                    "skip_reason": "checkpoint not found",
+                })
+
+        # Checkpoint cleanup — always done here when validate_after_run is set
+        # (when False, _run_one already deleted it via keep_checkpoints=False)
+        if validate_after_run:
+            ckpt_dir = run_dir / "checkpoints"
+            if ckpt_dir.exists():
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
+
         tried.append({
             "params":     params,
             "score":      result["score"],
@@ -1663,7 +1816,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
         # Regenerate report after every run
         all_experiments = db.get_experiments(run_name)
-        _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
+        _generate_lt_report(all_experiments, output_dir, run_name, steps, objective, db=db)
 
         if result.get("exit_code") == -2:  # KeyboardInterrupt inside _run_one
             print("\n  Interrupted — exiting")
@@ -1681,7 +1834,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     _report_stop.set()
     all_experiments = db.get_experiments(run_name)
     _print_final_ranking(all_experiments)
-    _generate_lt_report(all_experiments, output_dir, run_name, steps, objective)
+    _generate_lt_report(all_experiments, output_dir, run_name, steps, objective, db=db)
 
     best_list = db.get_best(run_name, 1)
     if best_list:
@@ -1737,15 +1890,25 @@ def _generate_lt_report(
     run_name: str,
     steps: int,
     objective: dict,
+    db: "Optional[AblationDB]" = None,
 ) -> None:
     """Write index.html from DB experiments for the long-term run."""
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    ranked = sorted(
-        [e for e in experiments if e.get("score") is not None],
-        key=lambda e: e["score"],
-        reverse=True,
-    )
     total_elapsed = sum(e.get("elapsed_secs", 0) for e in experiments)
+
+    # Merge validation data when available
+    if db is not None:
+        try:
+            val_map = db.get_validations(run_name)
+            for e in experiments:
+                v = val_map.get(e.get("id"))
+                if v:
+                    e["val_clip_i"]      = v.get("clip_i")
+                    e["val_verdict"]     = v.get("verdict")
+                    e["val_adapter_delta"] = v.get("adapter_delta")
+        except Exception:
+            pass
+
     html = _render_html(
         results=experiments,
         matrix_name=run_name,
@@ -1809,6 +1972,8 @@ def _render_html(
                 "CRASH": "color:#f77", "UNSTABLE": "color:#f77",
                 "NO_DATA": "color:#888"}.get(v, "")
 
+    has_val = any(r.get("val_clip_i") is not None for r in results)
+
     rows_html = ""
     for rank_i, r in enumerate(all_sorted):
         rank_disp = rank_i + 1 if r.get("score") is not None else "—"
@@ -1823,6 +1988,15 @@ def _render_html(
         elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s" if elapsed else "—"
         vstyle = _verdict_style(r.get("verdict", ""))
         ts_str = str(r.get("ts", ""))[:16]
+        clip_i_cell = ""
+        if has_val:
+            ci = r.get("val_clip_i")
+            vv = r.get("val_verdict", "")
+            vstyle_v = {"PASS": "color:#7f7", "WARN": "color:#fa7",
+                        "FAIL": "color:#f77"}.get(vv, "color:#888")
+            clip_i_cell = (
+                f"<td style='{vstyle_v}'>{_fmt(ci)}</td>"
+            )
         rows_html += (
             f"<tr>"
             f"<td style='color:{col};font-weight:bold'>{rank_disp}</td>"
@@ -1832,6 +2006,7 @@ def _render_html(
             f"<td>{_fmt(r.get('mean_ref_gap'))}</td>"
             f"<td>{_fmt(r.get('mean_cond_gap'))}</td>"
             f"<td>{_fmt(r.get('final_loss'))}</td>"
+            f"{clip_i_cell}"
             f"<td>{elapsed_str}</td>"
             f"<td style='{vstyle}'>{r.get('verdict','?')}</td>"
             f"<td style='color:#666;font-size:0.78em'>{ts_str}</td>"
@@ -1969,6 +2144,7 @@ def _render_html(
         n_pareto=n_pareto,
         improvement_rate=improvement_rate,
         best_config_yaml=json.dumps(best_config_yaml),
+        clip_i_header="<th>CLIP-I</th>" if has_val else "",
     )
 
 
@@ -2037,7 +2213,7 @@ _HTML_TEMPLATE = """\
   <tr>
     <th>Rank</th><th>ID</th><th>Parameters</th>
     <th>Score ↓</th><th>ref_gap</th><th>cond_gap</th><th>final_loss</th>
-    <th>Elapsed</th><th>Verdict</th><th>Timestamp</th>
+    {clip_i_header}<th>Elapsed</th><th>Verdict</th><th>Timestamp</th>
   </tr>
   {rows_html}
 </table>
@@ -2468,7 +2644,7 @@ def main() -> None:
                 sys.exit(1)
             steps = harness_cfg.get("steps_per_run", args.steps)
             objective = harness_cfg.get("objective", {})
-            _generate_lt_report(exps, output_dir, run_name, steps, objective)
+            _generate_lt_report(exps, output_dir, run_name, steps, objective, db=db)
             best_list = db.get_best(run_name, 1)
             if best_list:
                 _export_best_config(best_list[0], output_dir, run_name)

@@ -237,11 +237,15 @@ def _write_report(val_dir: Path, summary: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Post-training validator (MLX-22)")
-    ap.add_argument("--chunk",        type=int, required=True)
+    ap.add_argument("--chunk",        type=int, default=None)
     ap.add_argument("--checkpoint",   required=True)
     ap.add_argument("--config",       default="train/configs/v2_pipeline.yaml")
     ap.add_argument("--prompts",      default="train/configs/eval_prompts.txt")
     ap.add_argument("--prev-val-dir", default=None)
+    ap.add_argument("--val-dir",      default=None, metavar="PATH",
+                    help="Override output directory (default: LOG_DIR/val_chunk{N}/)")
+    ap.add_argument("--no-pipeline-sentinel", action="store_true",
+                    help="Skip mark_done/mark_error/dispatch_issue (for ablation use)")
     ap.add_argument("--ai",           action="store_true",
                     help="Emit compact JSON to stdout only; all progress goes to stderr")
     args = ap.parse_args()
@@ -249,11 +253,16 @@ def main() -> None:
     chunk = args.chunk
     ckpt  = args.checkpoint
 
-    val_dir  = Path(LOG_DIR) / f"val_chunk{chunk}"
+    if args.val_dir:
+        val_dir = Path(args.val_dir)
+    elif chunk is not None:
+        val_dir = Path(LOG_DIR) / f"val_chunk{chunk}"
+    else:
+        ap.error("--val-dir or --chunk is required")
     prev_dir = Path(args.prev_val_dir) if args.prev_val_dir else None
 
-    log_orch(f"Validator starting for chunk {chunk}, checkpoint={ckpt}")
-    log_event("validator", "start", chunk=chunk, checkpoint=ckpt)
+    log_orch(f"Validator starting for chunk={chunk}, checkpoint={ckpt}")
+    log_event("validator", "start", chunk=chunk or 0, checkpoint=ckpt)
 
     t_start = time.time()
     summary: dict = {
@@ -307,8 +316,8 @@ def main() -> None:
     summary["elapsed_secs"] = round(time.time() - t_start, 1)
     _write_report(val_dir, summary)
 
-    log_event("validator", "done", chunk=chunk, verdict=verdict, reason=reason)
-    log_orch(f"Validator chunk {chunk}: {verdict} — {reason}")
+    log_event("validator", "done", chunk=chunk or 0, verdict=verdict, reason=reason)
+    log_orch(f"Validator chunk={chunk}: {verdict} — {reason}")
 
     if args.ai:
         v03 = summary.get("v03_04") or {}
@@ -317,28 +326,31 @@ def main() -> None:
         if not v03.get("ok", True) and v03.get("verdict"):
             issues.append(f"clip: {v03['verdict']}")
         ai_out = {
-            "passed": verdict != "FAIL",
-            "verdict": verdict,
-            "reason": reason,
-            "clip_i_mean": v03.get("mean_clip_i"),
-            "weight_ok": v01.get("ok", False),
-            "issues": issues,
-            "chunk": chunk,
-            "elapsed_secs": summary["elapsed_secs"],
+            "passed":        verdict != "FAIL",
+            "verdict":       verdict,
+            "reason":        reason,
+            "clip_i_mean":   v03.get("mean_clip_i"),
+            "adapter_delta": v03.get("mean_adapter_delta"),
+            "weight_ok":     v01.get("ok", False),
+            "n_params":      v01.get("n_params"),
+            "issues":        issues,
+            "chunk":         chunk,
+            "elapsed_secs":  summary["elapsed_secs"],
         }
         print(json.dumps(ai_out))
 
-    if verdict == "FAIL":
-        mark_error(chunk, "validate")
-        dispatch_issue(
-            f"val_fail_chunk{chunk}", "error",
-            f"Chunk {chunk} validation FAILED: {reason}",
-            chunk=chunk,
-        )
-        sys.exit(1)
-    else:
-        mark_done(chunk, "validate")
-        sys.exit(0)
+    if not args.no_pipeline_sentinel:
+        if verdict == "FAIL":
+            mark_error(chunk, "validate")
+            dispatch_issue(
+                f"val_fail_chunk{chunk}", "error",
+                f"Chunk {chunk} validation FAILED: {reason}",
+                chunk=chunk,
+            )
+            sys.exit(1)
+        else:
+            mark_done(chunk, "validate")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
