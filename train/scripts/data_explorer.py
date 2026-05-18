@@ -2334,6 +2334,49 @@ def _cmd_campaign_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── mobile checkout status ───────────────────────────────────────────────────
+
+def collect_checkout_status() -> Optional[dict]:
+    """Return mobile checkout summary from cold manifest files, or None."""
+    try:
+        from mobile_mode import mobile_summary_for_status
+        from pipeline_lib import COLD_ROOT
+        return mobile_summary_for_status(COLD_ROOT)
+    except Exception:
+        return None
+
+
+def print_checkout_status(info: dict) -> None:
+    """Print mobile checkout session table."""
+    active = info.get("active", [])
+    completed = info.get("completed_count", 0)
+    cold_root = info.get("cold_root", "?")
+    print(f"\n  Mobile Checkout  cold={cold_root}")
+    print(f"  {'─'*60}")
+    if active:
+        for s in active:
+            sid    = s.get("session_id", "?")
+            age    = s.get("age_str", "?")
+            chunks = ", ".join(str(c) for c in s.get("chunks", [])) or "all"
+            shards = s.get("shards_staged", 0)
+            npz    = s.get("npz_staged", 0)
+            root   = s.get("portable_root", "")
+            mnt    = "mounted" if s.get("portable_mounted") else "NOT mounted"
+            wts    = ", ".join(s.get("weights", [])) or "—"
+            print(f"  [active]  {sid}")
+            print(f"            checked out {age} ago  chunks: {chunks}")
+            print(f"            {shards} shards / {npz} NPZ  hot: {mnt}")
+            print(f"            portable_root: {root}")
+            print(f"            weights: {wts}")
+    else:
+        print("  No active checkout sessions.")
+    if completed:
+        last = info.get("last_checkin_at", "")
+        last_str = f"  last checkin: {last[:10]}" if last else ""
+        print(f"\n  {completed} completed session(s).{last_str}")
+    print()
+
+
 # ── subcommand router ────────────────────────────────────────────────────────
 
 _SUBCMDS = {"status", "shards", "weights", "suggest-warmstart",
@@ -2451,6 +2494,8 @@ def main() -> None:
                     help="Apply warm-start patch to this flywheel YAML config file")
     ap.add_argument("--validate-coverage", action="store_true",
                     help="Check precompute coverage vs. shard pool")
+    ap.add_argument("--checkout-status", action="store_true",
+                    help="Show mobile checkout sessions (active and recently checked in)")
     ap.add_argument("--html", metavar="PATH",
                     help="Write self-contained HTML dashboard to PATH")
     ap.add_argument("--ai", action="store_true",
@@ -2460,7 +2505,8 @@ def main() -> None:
 
     # Default: show overview if no command given
     if not any([args.overview, args.top_shards is not None, args.weights,
-                args.warm_start, args.validate_coverage, args.html, args.ai]):
+                args.warm_start, args.validate_coverage, args.html, args.ai,
+                args.checkout_status]):
         args.overview = True
 
     # Collect data
@@ -2520,6 +2566,13 @@ def main() -> None:
     if args.validate_coverage:
         print_validate(cov)
 
+    if args.checkout_status:
+        info = collect_checkout_status()
+        if info:
+            print_checkout_status(info)
+        else:
+            print("  Mobile checkout: cold not mounted or no sessions recorded.")
+
     if args.html:
         html = render_html(ov, top_shards, weights, cov)
         try:
@@ -2529,7 +2582,8 @@ def main() -> None:
             print(f"\nError writing HTML: {e}", file=sys.stderr)
 
     if not any([args.overview, args.top_shards is not None, args.weights,
-                args.warm_start, args.validate_coverage, args.html]):
+                args.warm_start, args.validate_coverage, args.html,
+                args.checkout_status]):
         ap.print_help()
 
 

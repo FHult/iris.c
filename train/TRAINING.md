@@ -610,6 +610,25 @@ it never deletes or overwrites anything in cold.**
 
 ### Checkout (before you leave)
 
+#### Size planning (estimate before staging)
+
+Before staging, check how much data will be transferred and whether hot has room:
+
+```bash
+# Estimate size, ETA, and hot free space — no files are written:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --estimate-only
+
+# Estimate for a subset of chunks:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --chunks 1 2 --estimate-only
+```
+
+Output shows a per-category breakdown (weights, precomputed, shards, validation, DBs),
+net transfer bytes (skipping already-on-hot files), ETA at ~100 MB/s, and hot free space
+after the transfer. Any warnings (insufficient space, active session conflict) are flagged
+as `ERROR:` or `WARN:` lines.
+
+#### Staging
+
 ```bash
 # Stage all available data from cold to hot, create session manifest:
 train/.venv/bin/python train/scripts/pipeline_ctl.py checkout
@@ -623,6 +642,10 @@ train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --label prague-tri
 # Preview what would be staged without writing anything:
 train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --dry-run
 ```
+
+Checkout performs pre-flight checks automatically: cold/hot mounted, hot free space
+≥ 5 GB margin over estimated transfer. Any blocking error prints a clear message and
+aborts before any file is written.
 
 What gets staged to hot:
 - Best checkpoint from `cold/weights/best/` (or latest campaign `final.safetensors`)
@@ -702,13 +725,31 @@ Your mobile work is safe. To proceed anyway: re-run with --force.
 With `--force`, mobile results are added as new files (prefixed `mobile_`) alongside
 whatever the base machine produced. No data is lost from either side.
 
+### Interrupted checkin
+
+If checkin is killed mid-run (power loss, Ctrl-C), re-run the same command. Checkin
+is fully idempotent: `_safe_copy` skips any file that already landed in cold, so
+only the remaining files are transferred. The manifest status stays `active` until
+every step completes — just re-run and it will finish.
+
 ### Checking session status
 
 ```bash
+# Dedicated mobile session view:
 train/.venv/bin/python train/scripts/pipeline_ctl.py mobile-status
+
+# Also shown automatically in pipeline_status.py when cold is mounted:
+train/.venv/bin/python train/scripts/pipeline_status.py
+
+# Or via data_explorer:
+train/.venv/bin/python train/scripts/data_explorer.py --checkout-status
 ```
 
-Output includes:
+`pipeline_status.py` shows a Mobile Checkout section at the bottom of the human-readable
+output whenever cold is mounted and at least one session (active or completed) exists.
+The HTML report (`--html`) also includes a Mobile Checkout card.
+
+`mobile-status` output includes:
 - Active sessions: session ID, age, chunks staged, whether portable SSD is mounted
 - Divergence warnings: whether cold changed since the most recent checkout
 - Completed sessions: last 5 check-ins with timestamps
@@ -746,3 +787,14 @@ out or pushed, read it directly.
 2. Run `pipeline_ctl checkin` (or `--dry-run` first to preview).
 3. Open the checkin HTML report to review what changed.
 4. Run `pipeline_status.py` to verify cold and hot are back in sync.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `checkout` errors "cold not mounted" | Cold drive not connected | Connect `/Volumes/16TBCold` |
+| `checkout` errors "not enough space" | Hot SSD nearly full | Free space or use `--chunks` to stage fewer chunks |
+| `checkout` errors "active session exists" | Prior checkout not checked in | Run `checkin` first, or `mobile-status` to inspect |
+| `checkin` fails mid-run | Network/power interruption | Re-run same `checkin` command; idempotent, resumes where it stopped |
+| `mobile-status` shows "cold not mounted" | Expected on the road | Cold not present; normal during travel |
+| `--estimate-only` shows unexpected files | Stale data from prior checkout | Run `mobile-status` to check active sessions |

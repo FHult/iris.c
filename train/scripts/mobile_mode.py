@@ -275,11 +275,26 @@ def checkout(cfg: dict,
     if not cold_root.exists():
         raise RuntimeError(f"Cold storage not mounted at {cold_root}")
 
-    session = _session_id(label)
+    session  = _session_id(label)
     same_dev = (
         cold_root.exists() and hot_root.exists()
         and _same_device(cold_root, hot_root)
     )
+
+    # Pre-flight safety checks (skip in dry_run — user is just exploring)
+    if not dry_run:
+        issues = _preflight_checks(cold_root, hot_root, estimated_bytes=0)
+        errors = [msg for sev, msg in issues if sev == "error"]
+        warns  = [msg for sev, msg in issues if sev == "warn"]
+        for w in warns:
+            print(f"  WARNING: {w}")
+        if errors:
+            for e in errors:
+                print(f"  ERROR: {e}")
+            raise RuntimeError(
+                "Pre-flight check failed — resolve the error(s) above before checking out.\n"
+                "Run 'checkout --estimate-only' to see a full size breakdown and space check."
+            )
 
     # Snapshot state before staging anything
     hot_snap  = _snapshot_hot_state(hot_root)
@@ -903,3 +918,351 @@ def _age_str(iso_ts: str) -> str:
         return f"{int(secs / 86400)}d ago"
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Size estimation (no file transfer)
+# ---------------------------------------------------------------------------
+
+def estimate_checkout(cfg: dict, chunks: Optional[list[int]] = None) -> dict:
+    """
+    Fast size estimate for a planned checkout — stat() calls only, no file reads.
+    Completes in 1–5 seconds even for large cold pools.
+
+    Returns a dict with:
+      by_category      — bytes per category (weights/precomputed/shards/validation/db_baselines)
+      total_bytes      — total cold data in scope
+      already_on_hot   — bytes already present on hot (will be skipped)
+      net_transfer_bytes — bytes that would be copied
+      hot_free_bytes   — free space on hot right now
+      eta_sec          — estimated transfer time at 100 MB/s
+      warnings         — list of human-readable warnings (space, conflicts, etc.)
+      file_counts      — {"precomputed_npz": N, "shards": N}
+    """
+    storage   = cfg.get("storage", {})
+    cold_root = Path(storage.get("cold_root", str(COLD_ROOT)))
+    hot_root  = Path(storage.get("hot_root",  str(DATA_ROOT)))
+
+    if not cold_root.exists():
+        raise RuntimeError(f"Cold storage not mounted at {cold_root}")
+
+    same_dev = hot_root.exists() and _same_device(cold_root, hot_root)
+
+    by_category: dict[str, int] = {}
+
+    # 1. Best checkpoint
+    ckpt_bytes = 0
+    cold_weights = cold_root / "weights"
+    ckpt_src: Optional[Path] = None
+    best_dir = cold_weights / "best"
+    if best_dir.exists():
+        for name in ("cond_gap.safetensors", "loss.safetensors"):
+            c = best_dir / name
+            if c.is_symlink() and c.exists():
+                ckpt_src = c.resolve()
+                break
+    if ckpt_src is None and cold_weights.exists():
+        for camp in sorted(cold_weights.glob("flywheel-*"), reverse=True):
+            c = camp / "final.safetensors"
+            if c.exists():
+                ckpt_src = c
+                break
+    if ckpt_src:
+        for suffix in (".safetensors", ".json", ".ema.safetensors"):
+            src = ckpt_src.parent / (ckpt_src.stem + suffix)
+            try:
+                ckpt_bytes += src.stat().st_size
+            except OSError:
+                pass
+    by_category["weights"] = ckpt_bytes
+
+    # 2. Precomputed caches (current version, chunk-filtered)
+    precomp_bytes = 0
+    precomp_files = 0
+    cold_precomp  = cold_root / "precomputed"
+    for enc in _ENCODERS:
+        cold_enc = cold_precomp / enc
+        cur_link = cold_enc / "current"
+        if not cur_link.exists() and not cur_link.is_symlink():
+            continue
+        ver = os.readlink(cur_link) if cur_link.is_symlink() else cur_link.name
+        cold_ver = cold_enc / ver
+        if not cold_ver.exists():
+            continue
+        for f in cold_ver.iterdir():
+            if f.suffix != ".npz":
+                continue
+            if chunks:
+                try:
+                    shard_id = int(f.name.split("_")[0])
+                    if not any(
+                        (c - 1) * SHARD_BLOCK <= shard_id < c * SHARD_BLOCK
+                        for c in chunks
+                    ):
+                        continue
+                except (ValueError, IndexError):
+                    pass
+            try:
+                precomp_bytes += f.stat().st_size
+                precomp_files += 1
+            except OSError:
+                pass
+    by_category["precomputed"] = precomp_bytes
+
+    # 3. Shards (chunk-filtered)
+    shard_bytes = 0
+    shard_count = 0
+    cold_shards = cold_root / "shards"
+    if cold_shards.exists():
+        for shard in cold_shards.glob("*.tar"):
+            if chunks:
+                try:
+                    sid = int(shard.stem)
+                    if not any(
+                        (c - 1) * SHARD_BLOCK <= sid < c * SHARD_BLOCK
+                        for c in chunks
+                    ):
+                        continue
+                except ValueError:
+                    continue
+            try:
+                shard_bytes += shard.stat().st_size
+                shard_count += 1
+            except OSError:
+                pass
+    by_category["shards"] = shard_bytes
+
+    # 4. Validation set
+    val_bytes = 0
+    cold_val = cold_root / "validation"
+    if cold_val.exists():
+        for f in cold_val.rglob("*"):
+            if f.is_file():
+                try:
+                    val_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    by_category["validation"] = val_bytes
+
+    # 5. DB baselines (small)
+    db_bytes = 0
+    for db_name in ("shard_scores.db", "flywheel_history.db", "ablation_history.db"):
+        try:
+            db_bytes += (cold_root / "metadata" / db_name).stat().st_size
+        except OSError:
+            pass
+    by_category["db_baselines"] = db_bytes
+
+    total_bytes = sum(by_category.values())
+
+    # Already-on-hot (check precomputed only — that's the bulk)
+    already_bytes = 0
+    if hot_root.exists() and cold_precomp.exists():
+        for enc in _ENCODERS:
+            cur_link = cold_precomp / enc / "current"
+            if not cur_link.exists() and not cur_link.is_symlink():
+                continue
+            ver = os.readlink(cur_link) if cur_link.is_symlink() else cur_link.name
+            hot_ver = hot_root / "precomputed" / enc / ver
+            if hot_ver.exists():
+                for f in hot_ver.iterdir():
+                    try:
+                        already_bytes += f.stat().st_size
+                    except OSError:
+                        pass
+
+    # Net transfer (same_dev → symlinks, no copy)
+    net_bytes = 0 if same_dev else max(0, total_bytes - already_bytes)
+
+    # Hot free space
+    hot_free_bytes: Optional[int] = None
+    if hot_root.exists():
+        try:
+            st = os.statvfs(hot_root)
+            hot_free_bytes = st.f_bavail * st.f_frsize
+        except OSError:
+            pass
+
+    # ETA at 100 MB/s (conservative portable-SSD write speed)
+    _MBPS = 100
+    eta_sec = int(net_bytes / (_MBPS * 1024 * 1024)) if net_bytes else 0
+
+    warnings: list[str] = []
+    if same_dev:
+        warnings.append(
+            "Cold and hot are on the same device — checkout uses symlinks, no data is physically copied."
+        )
+    elif net_bytes == 0 and total_bytes > 0:
+        warnings.append("All data already on hot — checkout will be very fast (skipping existing files).")
+    if hot_free_bytes is not None:
+        headroom = hot_free_bytes - net_bytes
+        if headroom < 0:
+            warnings.append(
+                f"INSUFFICIENT SPACE: hot has {hot_free_bytes/(1024**3):.1f} GB free but needs "
+                f"~{net_bytes/(1024**3):.1f} GB. Free up space before checking out."
+            )
+        elif headroom < 10 * 1024 ** 3:
+            warnings.append(
+                f"LOW SPACE: only {headroom/(1024**3):.1f} GB headroom after checkout on hot storage."
+            )
+
+    # Warn if an active session already exists
+    active_sessions: list[str] = []
+    checkouts_dir = _checkouts_dir(cold_root)
+    if checkouts_dir.exists():
+        for mpath in checkouts_dir.glob("*/manifest.json"):
+            try:
+                m = json.loads(mpath.read_text())
+                if m.get("status") == "active":
+                    active_sessions.append(m.get("session_id", "?"))
+            except Exception:
+                pass
+    if active_sessions:
+        warnings.append(
+            f"Active checkout already exists: {', '.join(active_sessions)}. "
+            "Run 'checkin' first, or proceed anyway with a new checkout."
+        )
+
+    return {
+        "cold_root":           str(cold_root),
+        "hot_root":            str(hot_root),
+        "chunks":              chunks or [],
+        "same_device":         same_dev,
+        "by_category":         by_category,
+        "total_bytes":         total_bytes,
+        "already_on_hot_bytes": already_bytes,
+        "net_transfer_bytes":  net_bytes,
+        "hot_free_bytes":      hot_free_bytes,
+        "file_counts":         {"precomputed_npz": precomp_files, "shards": shard_count},
+        "eta_sec":             eta_sec,
+        "assumed_mbps":        _MBPS,
+        "warnings":            warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight safety checks
+# ---------------------------------------------------------------------------
+
+def _preflight_checks(
+    cold_root: Path,
+    hot_root: Path,
+    estimated_bytes: int = 0,
+) -> list[tuple[str, str]]:
+    """
+    Run pre-checkout safety checks.
+    Returns [(severity, message), ...] where severity is 'error' or 'warn'.
+    'error' items block checkout; 'warn' items are printed but do not stop it.
+    """
+    issues: list[tuple[str, str]] = []
+
+    if not cold_root.exists():
+        issues.append(("error", f"Cold storage not mounted at {cold_root}"))
+        return issues
+
+    if not hot_root.exists():
+        issues.append(("error", f"Hot/portable storage not mounted at {hot_root}"))
+    elif estimated_bytes > 0 and not _same_device(cold_root, hot_root):
+        try:
+            st = os.statvfs(hot_root)
+            free = st.f_bavail * st.f_frsize
+            need = int(estimated_bytes * 1.05)  # 5 % buffer
+            if free < need:
+                issues.append((
+                    "error",
+                    f"Insufficient space on hot: {free/(1024**3):.1f} GB free, "
+                    f"need ~{need/(1024**3):.1f} GB (5% buffer)."
+                ))
+            elif free - need < 10 * 1024 ** 3:
+                issues.append((
+                    "warn",
+                    f"Low space on hot: only {(free-need)/(1024**3):.1f} GB headroom after checkout."
+                ))
+        except OSError:
+            issues.append(("warn", "Could not check free space on hot storage."))
+
+    # Warn if an active checkout already exists
+    checkouts_dir = _checkouts_dir(cold_root)
+    if checkouts_dir.exists():
+        active = []
+        for mpath in checkouts_dir.glob("*/manifest.json"):
+            try:
+                m = json.loads(mpath.read_text())
+                if m.get("status") == "active":
+                    active.append(m.get("session_id", "?"))
+            except Exception:
+                pass
+        if active:
+            issues.append((
+                "warn",
+                f"Active checkout already exists: {', '.join(active)}. "
+                "Consider checking in first."
+            ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Lightweight summary for embedding in pipeline_status / data_explorer
+# ---------------------------------------------------------------------------
+
+def mobile_summary_for_status(cold_root: Path) -> Optional[dict]:
+    """
+    Read active checkout sessions from manifest JSON files without importing
+    anything extra. Called by pipeline_status.py and data_explorer.py.
+    Returns None if cold is not mounted or no sessions exist.
+    """
+    if not cold_root.exists():
+        return None
+    checkouts_dir = _checkouts_dir(cold_root)
+    if not checkouts_dir.exists():
+        return None
+
+    active: list[dict] = []
+    completed_count = 0
+    last_checkin_at: Optional[str] = None
+
+    for mpath in sorted(
+        checkouts_dir.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            m = json.loads(mpath.read_text())
+        except Exception:
+            continue
+        status = m.get("status", "unknown")
+        staged = m.get("staged", {})
+        entry = {
+            "session_id":      m.get("session_id", "?"),
+            "status":          status,
+            "checked_out_at":  m.get("checked_out_at", ""),
+            "checked_in_at":   m.get("checked_in_at"),
+            "chunks":          m.get("chunks", []),
+            "portable_root":   m.get("portable_root", ""),
+            "shards_staged":   len(staged.get("shards", [])),
+            "npz_staged":      staged.get("npz_staged", 0),
+            "weights":         staged.get("weights", []),
+            "db_baseline":     staged.get("db_baseline", []),
+        }
+        if status == "active":
+            port = m.get("portable_root", "")
+            entry["portable_mounted"] = Path(port).exists() if port else False
+            entry["age_str"] = _age_str(m.get("checked_out_at", ""))
+            active.append(entry)
+        elif status == "checked-in":
+            completed_count += 1
+            ci = m.get("checked_in_at")
+            if ci and (last_checkin_at is None or ci > last_checkin_at):
+                last_checkin_at = ci
+
+    if not active and completed_count == 0:
+        return None
+
+    return {
+        "cold_mounted":     True,
+        "cold_root":        str(cold_root),
+        "active":           active,
+        "completed_count":  completed_count,
+        "last_checkin_at":  last_checkin_at,
+    }

@@ -800,6 +800,64 @@ def cmd_flywheel_status(_args) -> None:
             pass
 
 
+def _print_checkout_estimate(est: dict) -> None:
+    """Pretty-print the output of mobile_mode.estimate_checkout()."""
+    def _gb(b: int) -> str:
+        return f"{b / (1024**3):.2f} GB"
+
+    chunks_str = f"chunks {est['chunks']}" if est.get("chunks") else "all chunks"
+    print(f"\nCheckout size estimate  ({chunks_str})")
+    print(f"  Cold root:  {est['cold_root']}")
+    print(f"  Hot root:   {est['hot_root']}")
+    print()
+
+    by_cat = est.get("by_category", {})
+    label_w = max((len(k) for k in by_cat), default=12)
+    for cat, sz in sorted(by_cat.items(), key=lambda kv: -kv[1]):
+        print(f"  {cat:{label_w}}  {_gb(sz):>10}")
+    print(f"  {'─'*label_w}  {'─'*10}")
+    print(f"  {'TOTAL':{label_w}}  {_gb(est['total_bytes']):>10}")
+    print()
+
+    counts = est.get("file_counts", {})
+    if counts.get("precomputed_npz"):
+        print(f"  Precomputed files: {counts['precomputed_npz']:,}")
+    if counts.get("shards"):
+        print(f"  Shard files:       {counts['shards']:,}")
+    if counts.get("precomputed_npz") or counts.get("shards"):
+        print()
+
+    already = est.get("already_on_hot_bytes", 0)
+    if already:
+        print(f"  Already on hot:  {_gb(already)} (will be skipped)")
+    net = est.get("net_transfer_bytes", 0)
+    if est.get("same_device"):
+        print(f"  Net to transfer: {_gb(net)} (symlinks — no physical copy)")
+    else:
+        eta = est.get("eta_sec", 0)
+        if eta == 0:
+            eta_s = "< 1s"
+        elif eta < 60:
+            eta_s = f"{eta}s"
+        elif eta < 3600:
+            eta_s = f"{eta // 60}m {eta % 60:02d}s"
+        else:
+            eta_s = f"{eta // 3600}h {(eta % 3600) // 60:02d}m"
+        print(f"  Net to transfer: {_gb(net)}  (est. {eta_s} at {est.get('assumed_mbps', 100)} MB/s)")
+
+    if est.get("hot_free_bytes") is not None:
+        headroom = est["hot_free_bytes"] - net
+        free_after = max(0, headroom)
+        print(f"  Hot free after:  {_gb(free_after)}")
+
+    if est.get("warnings"):
+        print()
+        for w in est["warnings"]:
+            tag = "  ERROR:" if ("INSUFFICIENT" in w or "Cannot" in w) else "  WARN: "
+            print(f"{tag} {w}")
+    print()
+
+
 def cmd_checkout(args) -> None:
     """Stage active campaign data from cold → hot and record a checkout manifest."""
     import mobile_mode
@@ -809,13 +867,24 @@ def cmd_checkout(args) -> None:
         print(f"ERROR: could not load config: {e}")
         return
 
-    chunks   = args.chunks or []
-    dry_run  = args.dry_run
-    label    = args.label or ""
+    chunks          = args.chunks or []
+    dry_run         = args.dry_run
+    label           = args.label or ""
+    estimate_only   = getattr(args, "estimate_only", False)
 
-    storage  = cfg.get("storage", {})
-    hot_root = storage.get("hot_root", str(DATA_ROOT))
+    storage   = cfg.get("storage", {})
+    hot_root  = storage.get("hot_root",  str(DATA_ROOT))
     cold_root = storage.get("cold_root", str(COLD_ROOT))
+
+    # --estimate-only: print size breakdown and exit without staging anything
+    if estimate_only:
+        try:
+            est = mobile_mode.estimate_checkout(cfg, chunks=chunks or None)
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            return
+        _print_checkout_estimate(est)
+        return
 
     print(f"Checkout  cold → hot")
     print(f"  cold_root:  {cold_root}")
@@ -1165,6 +1234,8 @@ def main() -> None:
                    help="Short tag embedded in the session ID (e.g. 'prague-trip')")
     p.add_argument("--dry-run", action="store_true",
                    help="Show what would be staged without writing anything")
+    p.add_argument("--estimate-only", action="store_true",
+                   help="Estimate checkout size and transfer time without staging anything")
     p.add_argument("--config", default=None, metavar="PATH",
                    help="Pipeline config (default: train/configs/v2_pipeline.yaml)")
 

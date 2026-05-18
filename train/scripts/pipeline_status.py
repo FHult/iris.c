@@ -21,7 +21,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    DATA_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
+    DATA_ROOT, COLD_ROOT, SENTINEL_DIR, LOG_DIR, CKPT_DIR, SHARDS_DIR, PRECOMP_DIR, STAGING_DIR,
     STATE_FILE, CONTROL_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN, TMUX_STAGE_WIN,
     read_state, is_done, has_error, read_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
@@ -345,6 +345,45 @@ def _active_heartbeat_for(step: str, chunk: int) -> dict:
     if step in ("validate", "validating"):
         return _trainer_heartbeat(chunk)
     return {}
+
+
+def _mobile_checkout_info() -> Optional[dict]:
+    """Return mobile checkout summary from cold manifest files, or None."""
+    try:
+        from mobile_mode import mobile_summary_for_status
+        return mobile_summary_for_status(COLD_ROOT)
+    except Exception:
+        return None
+
+
+def _mobile_card_html(info: dict) -> str:
+    """Render a small HTML card summarising mobile checkout sessions."""
+    rows = ""
+    for s in info.get("active", []):
+        sid    = _h(s.get("session_id", "?")[:16])
+        age    = _h(s.get("age_str", "?"))
+        chunks = _h(", ".join(str(c) for c in s.get("chunks", [])) or "all")
+        shards = s.get("shards_staged", 0)
+        npz    = s.get("npz_staged", 0)
+        mnt    = "✅ mounted" if s.get("portable_mounted") else "⬜ not mounted"
+        rows += (
+            f"<tr><td><code>{sid}</code></td>"
+            f"<td><span class='badge warn'>ACTIVE</span></td>"
+            f"<td>{age} ago</td>"
+            f"<td>chunks {chunks}</td>"
+            f"<td>{shards} shards / {npz} NPZ</td>"
+            f"<td>{mnt}</td></tr>"
+        )
+    completed = info.get("completed_count", 0)
+    last = info.get("last_checkin_at", "")
+    last_str = f"last: {last[:10]}" if last else ""
+    footer = f'<div style="margin-top:6px;font-size:11px;color:#888">{completed} session(s) checked in. {last_str}</div>'
+    return (
+        f'<div class="card"><h2>Mobile Checkout</h2>'
+        f'<table><tr><th>Session</th><th>Status</th><th>Age</th>'
+        f'<th>Scope</th><th>Staged</th><th>Hot drive</th></tr>'
+        f'{rows}</table>{footer}</div>'
+    )
 
 
 def build_status_dict(total_chunks: int = 4) -> dict:
@@ -745,6 +784,27 @@ def print_human(status: dict, verbose: bool = False) -> None:
         except Exception:
             pass
 
+    # Mobile checkout sessions (shown only when cold is mounted and sessions exist)
+    mobile = _mobile_checkout_info()
+    if mobile:
+        active = mobile.get("active", [])
+        completed = mobile.get("completed_count", 0)
+        if active:
+            print()
+            print(f"  Mobile Checkout — {len(active)} active session(s):")
+            for s in active:
+                sid     = s.get("session_id", "?")[:20]
+                age     = s.get("age_str", "?")
+                chunks  = ", ".join(str(c) for c in s.get("chunks", [])) or "all"
+                shards  = s.get("shards_staged", 0)
+                npz     = s.get("npz_staged", 0)
+                mounted = "hot mounted" if s.get("portable_mounted") else "hot NOT mounted"
+                print(f"    [{sid}]  {age} ago  chunks {chunks}  {shards} shards / {npz} NPZ  {mounted}")
+        if completed:
+            last = mobile.get("last_checkin_at", "")
+            last_str = f"  last checkin: {last[:10]}" if last else ""
+            print(f"  Mobile: {completed} completed session(s).{last_str}")
+
     print(f"{'─'*64}\n")
 
 
@@ -1065,6 +1125,12 @@ def render_html_status(status: dict) -> str:
             f'{rows}</div>'
         )
 
+    # Mobile checkout card
+    mobile_card = ""
+    mobile_info = _mobile_checkout_info()
+    if mobile_info and (mobile_info.get("active") or mobile_info.get("completed_count", 0)):
+        mobile_card = _mobile_card_html(mobile_info)
+
     explorer_link = (
         '<div style="padding:8px 20px 0;font-size:11px;color:#888">'
         'Data: <code>pipeline_ctl data-explorer --overview</code> &nbsp;|&nbsp; '
@@ -1074,7 +1140,7 @@ def render_html_status(status: dict) -> str:
     body = (
         f'<div class="hdr"><h1>iris Pipeline Status</h1>'
         f'<span class="ts">{_h(ts)}</span></div>'
-        f'{overview}{chunks_card}{train_card}{issues_card}{explorer_link}'
+        f'{overview}{chunks_card}{train_card}{issues_card}{mobile_card}{explorer_link}'
     )
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
