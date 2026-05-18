@@ -176,11 +176,20 @@ Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the ada
 **original JPEG resolution** — `build_shards.py:321` only filters images smaller than 256px on
 either dimension, no resizing. All resizing happens at training time in `dataset.py:444-445`
 (Pillow LANCZOS to bucket+32px, then GPU random-crop). This means no shard rebuild is needed for
-1024px training. However, any source image smaller than 1024px will be upscaled, which is poor
-style-learning signal at high resolution. **Before committing to a 1024px flywheel, run a shard
-sweep to measure what fraction of images are < 512px on their shortest side.** If that fraction
-is large, the effective training signal at 1024px will be weaker than at 512px. See `train7_plan.md`
-§5 for the sweep script and decision criteria.
+1024px training. However, any source image smaller than 1024px will be upscaled, which degrades
+the VAE latent quality used for training (note: SigLIP is unaffected — it always resizes to
+384×384 regardless of source size). **Before committing to a 1024px flywheel, run a shard sweep
+to measure what fraction of images are < 512px on their shortest side.** See `train7_plan.md` §5.
+
+**Training-time small-image filter (proposed, needs experimentation):** Rather than accepting all
+upscaled images, add a `min_source_size` filter in `dataset.py` that skips images whose shortest
+side is below a threshold relative to the training bucket. A 2× max-upscale heuristic (source ≥
+50% of training resolution) is the natural starting point — e.g., 512px minimum for 1024px
+training, 256px minimum for 512px training (current effective floor). The optimal threshold is an
+open question: too aggressive a filter shrinks the effective dataset and risks domain bias; too
+permissive lets in degraded signal. The right answer comes from an ablation across thresholds
+(0, 384, 512, 768, native-only) measuring val CLIP-I alongside effective dataset size at each
+threshold. See `train7_plan.md` §5.4 for the implementation sketch and ablation design.
 
 **Dependency summary:** Profiling run (§1) and shard resolution sweep (§5) both unblocked and should run together; Stage 2 (§2) unblocked pending profiling; Stage 3 (§3) conditional on gate + sweep results. TRAIN-6, PIPELINE-27, QUALITY-10 — done, see COMPLETED_BACKLOG.md.
 
