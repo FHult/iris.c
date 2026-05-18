@@ -150,11 +150,29 @@ Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically 
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
 
-Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the adapter architecture and training signal are sound. The model responds to the style reference with coherent, stable output (CLIP-I 0.53, no NaN, correct image structure). The gap to production quality is entirely a matter of scale and refinement — no architectural rethink is required. The following improvements are known to provide benefit, roughly in priority order:
+Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the adapter architecture and training signal are sound. The model responds to the style reference with coherent, stable output (CLIP-I 0.53, no NaN, correct image structure). The gap to production quality is entirely a matter of scale and refinement — no architectural rethink is required.
 
-1. **Larger resolution + more training steps** — the v1 run was a `--small` configuration. Higher resolution (1024px) exposes finer style features to the SigLIP encoder; more steps allow the PerceiverResampler and K/V projections to build a richer style space. Expected CLIP-I gain: +0.05–0.10. **Note (32 GB):** 1024px training on 4B Flux currently peaks at ~26 GB at 512px; 1024px roughly doubles the sequence length (256→1024 image tokens), which increases attention memory. Feasibility needs a short profiling run before committing to a full 1024px flywheel.
+**Phased plan (full detail in memory file `train7_plan.md`):**
 
-**Dependency summary:** Item 1 (resolution/scale) — unblocked, needs 1024px memory profiling run. Items 2–4 (TRAIN-6, PIPELINE-27, QUALITY-10) — done, see COMPLETED_BACKLOG.md.
+1. **Memory profiling run** (gate, < 2 hours) — run 60 steps at 768px and 1024px with
+   `memory_profile: true` to measure actual per-fence peaks. The plans doc cited ~12 GB
+   activation at 1024px, but that estimate predates the split-forward architecture
+   (`train/train_ip_adapter.py:1476`) which materializes and frees all Flux intermediates
+   before backward. Corrected estimate: retained `flux_state` at 1024px is only ~654 MB
+   (Q vectors + h_final); estimated system peak ~21–22 GB vs 28 GB theoretical.
+   See `train7_plan.md` §2 for exact probe config, run commands, and decision thresholds.
+
+2. **Stage 2: 768px fine-tune** (20K steps, ~1 day) — `train/configs/stage2_768px.yaml`
+   exists but is missing quality signals from Stage 1: `correct_forward_q`, `cross_ref_prob`,
+   `patch_shuffle_prob`, `style_loss_weight`, `freeze_double_stream_scales`. Patch before
+   launching. Target CLIP-I > 0.62. See `train7_plan.md` §3.
+
+3. **Stage 3: 1024px fine-tune** (10K steps, conditional on profiling gate) — create
+   `train/configs/stage3_1024px.yaml`. Warmstart from Stage 2. Target CLIP-I > 0.68.
+   Requires adding `(1024, 1024)` to `BUCKETS` in `train/ip_adapter/dataset.py:62`.
+   See `train7_plan.md` §4.
+
+**Dependency summary:** Profiling run (§1) unblocked; Stage 2 (§2) unblocked pending profiling; Stage 3 (§3) conditional on gate. TRAIN-6, PIPELINE-27, QUALITY-10 — done, see COMPLETED_BACKLOG.md.
 
 ---
 
