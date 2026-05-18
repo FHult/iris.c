@@ -588,3 +588,161 @@ At `large` scale with `max_shards: 80`:
 Two chunks (current + next) requires ~40 GB on hot, well within a 500 GB NVMe.
 Cold storage accumulates all historical versions; at 4 chunks that is ~80 GB of
 precomputed data plus ~8 GB of weight snapshots.
+
+---
+
+## Mobile Mode (Checkout / Checkin)
+
+Travel with only the portable SSD (hot tier) while leaving the 16 TB cold
+storage at home. The pipeline runs identically on the road — cold storage is
+not required during mobile operation.
+
+### Concept
+
+| Phase | Where you are | What runs |
+|---|---|---|
+| **Checkout** | Home, all drives connected | Stage hot from cold; record manifest in cold |
+| **Mobile** | Travelling, cold at home | Normal pipeline on hot (no cold needed) |
+| **Checkin** | Home again, cold reconnected | Push new results from hot → cold |
+
+**Cold storage is never modified during checkout. Checkin only adds new files —
+it never deletes or overwrites anything in cold.**
+
+### Checkout (before you leave)
+
+```bash
+# Stage all available data from cold to hot, create session manifest:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout
+
+# Stage only specific chunks (smaller transfer for shorter trips):
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --chunks 1 2
+
+# Label the session for easy identification:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --label prague-trip
+
+# Preview what would be staged without writing anything:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkout --dry-run
+```
+
+What gets staged to hot:
+- Best checkpoint from `cold/weights/best/` (or latest campaign `final.safetensors`)
+- Precomputed caches for all encoders (qwen3 / vae / siglip), filtered to requested chunks
+- Training shards for requested chunks
+- Validation set (held-out shards + precomputed)
+- SQLite DB baseline snapshots to `hot/.mobile_dbs_baseline/` (for conflict detection at checkin)
+
+A manifest is written to `cold/metadata/checkouts/{session_id}/manifest.json` — this
+records exactly what was on hot at checkout time so checkin can compute the delta.
+A `.mobile_session.json` hint file is written on hot so checkin can locate the session
+automatically when you reconnect cold.
+
+### Mobile operation (on the road)
+
+No changes required. Run the pipeline exactly as normal with `PIPELINE_DATA_ROOT`
+pointing to the hot SSD. Cold storage being absent is fine — all pipeline steps
+read from and write to hot only.
+
+```bash
+# Normal pipeline operation — exactly the same as at home:
+./train/start_pipeline.sh
+
+# Or manually:
+PIPELINE_DATA_ROOT=/Volumes/2TBSSD \
+  train/.venv/bin/python train/scripts/orchestrator.py --resume
+```
+
+New data produced during mobile operation:
+- New precomputed version dirs → `hot/precomputed/{encoder}/{new_version}/`
+- New checkpoint snapshots → `hot/checkpoints/stage1/archive/`
+- Updated SQLite DBs → `hot/shard_scores.db`, `hot/flywheel_history.db`
+
+### Checkin (when you return)
+
+Reconnect cold storage, then:
+
+```bash
+# Automatic: finds the most recent active session via .mobile_session.json on hot:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkin
+
+# Explicit session ID (from checkout output):
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkin \
+  --session mobile-prague-trip-20260520-143000-abcdef
+
+# Explicit portable root path:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkin \
+  --from /Volumes/2TBSSD
+
+# Preview what would be pushed without writing anything:
+train/.venv/bin/python train/scripts/pipeline_ctl.py checkin --dry-run
+```
+
+What gets pushed to cold:
+- New precomputed version dirs created during mobile training (delta since checkout)
+- New checkpoint archive files not present at checkout time
+- Timestamped SQLite DB backups if the DBs changed (`cold/metadata/*.mobile_YYYYMMDD.db`)
+- An HTML checkin report at `cold/metadata/checkouts/{session_id}/checkin_report.html`
+
+What is **not** touched:
+- Existing cold files — checkin never overwrites or deletes anything in cold
+- The hot SSD — checkin is read-only from hot's perspective
+
+### Conflict detection
+
+If the base machine kept working after checkout (e.g. you left the orchestrator
+running), checkin warns before proceeding:
+
+```
+CONFLICTS DETECTED — base machine worked while you were away:
+  - Flywheel advanced on base machine: 42 → 47 iterations
+  - New campaign on base machine: flywheel-20260521
+
+Your mobile work is safe. To proceed anyway: re-run with --force.
+```
+
+With `--force`, mobile results are added as new files (prefixed `mobile_`) alongside
+whatever the base machine produced. No data is lost from either side.
+
+### Checking session status
+
+```bash
+train/.venv/bin/python train/scripts/pipeline_ctl.py mobile-status
+```
+
+Output includes:
+- Active sessions: session ID, age, chunks staged, whether portable SSD is mounted
+- Divergence warnings: whether cold changed since the most recent checkout
+- Completed sessions: last 5 check-ins with timestamps
+
+### Manifest location
+
+All session state is stored in cold storage under:
+
+```
+cold_root/
+  metadata/
+    checkouts/
+      mobile-{label}-{date}-{id}/
+        manifest.json          ← full session record (updated at checkin)
+        checkin_report.html    ← HTML summary (written at checkin)
+```
+
+The manifest is the authoritative record. If you need to audit what was checked
+out or pushed, read it directly.
+
+### Best practices
+
+**Before a trip:**
+1. Let the current training chunk finish and archive (so hot and cold are in sync).
+2. Run `pipeline_ctl checkout` — check the output for any warnings.
+3. Verify `mobile-status` shows the session as active with portable SSD mounted.
+4. Disconnect cold storage.
+
+**During travel:**
+- The pipeline runs normally. No special flags needed.
+- Check `mobile-status` works (it will say cold is not mounted — that's expected).
+
+**On return:**
+1. Connect cold storage.
+2. Run `pipeline_ctl checkin` (or `--dry-run` first to preview).
+3. Open the checkin HTML report to review what changed.
+4. Run `pipeline_status.py` to verify cold and hot are back in sync.

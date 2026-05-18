@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(train/.venv/bin/python train/scripts/pipeline_status.py *)",
+      "Bash(PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke train/.venv/bin/python train/scripts/pipeline_status.py *)",
+      "Bash(train/.venv/bin/python train/scripts/pipeline_doctor.py *)",
+      "Bash(tmux list-windows *)",
+      "Bash(tmux capture-pane *)",
+      "Bash(vm_stat *)",
+      "Bash(open train/reports/*)",
+      "Bash(awk *)",
+      "Bash(sed -n *)",
+      "Bash(train/.venv/bin/python train/scripts/data_explorer.py *)",
+      "Bash(PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke train/.venv/bin/python train/scripts/data_explorer.py *)",
+      "Bash(tmux list-sessions *)",
+      "Bash(tmux ls *)"
+    ]
+  }
+}

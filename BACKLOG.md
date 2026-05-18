@@ -227,6 +227,27 @@ Note: trim must be done AFTER the 4-49 batch completes, as the 4-49 batch uses t
 
 ---
 
+**DEDUP-4: Run clean_wds_pool on WikiArt and other datasets for cross-dataset dedup** (Medium — data quality)
+
+The FAISS index at `COLD_METADATA_DIR/dedup_index.faiss` is persistent and global — `clip_dedup.py build-index` extends it on each run rather than rebuilding from scratch. Running `clean_wds_pool.py` with a different `--pool-dir` pointing at another dataset's converted tars will deduplicate against the full accumulated index, catching cross-dataset duplicates (e.g. WikiArt paintings that appear in LAION as scraped web images).
+
+**Run order matters** — whichever dataset goes through first keeps its copy; later datasets lose their duplicates. Recommended order:
+
+1. WikiArt — small, curated; run first so curated entries are preserved
+2. JourneyDB — already running (tgz 1–100 current run)
+3. LAION / COYO — largest, most overlap with everything; run last so dupes are removed from scraped data
+
+**To run** (after WikiArt tars are converted and available on cold):
+```bash
+train/.venv/bin/python train/scripts/clean_wds_pool.py \
+  --pool-dir /Volumes/16TBCold/converted/wikiart \
+  # --index and --blocklist default to COLD_METADATA_DIR, same shared index
+```
+
+Repeat for each additional dataset. The `.deduped` sentinel per-tar makes runs idempotent.
+
+---
+
 ~~**PIPELINE-DATA-1: Dedicated LAION/COYO download script + pipeline_setup integration** — Done (2026-05-17)~~
 
 Implemented: `train/scripts/download_laion_coyo.py` (new), `downloader.py` (cold-pool symlink staging in `check_laion`/`check_coyo`), `pipeline_setup.py` (`_check_laion_coyo_pools` detection), `v2_pipeline.yaml` (`data_sources` block). Uses HF-hosted repos (no URL staleness). Configure `laion_hf_repo` in `v2_pipeline.yaml` before first run.

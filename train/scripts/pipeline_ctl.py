@@ -17,6 +17,15 @@ Usage:
     python train/scripts/pipeline_ctl.py clear-phantoms         # fix phantom sentinels
     python train/scripts/pipeline_ctl.py create-val-set         # one-time: build held-out val set
 
+Mobile Mode:
+    python train/scripts/pipeline_ctl.py checkout               # stage hot for travel
+    python train/scripts/pipeline_ctl.py checkout --chunks 1 2  # stage specific chunks only
+    python train/scripts/pipeline_ctl.py checkout --dry-run     # show what would be staged
+    python train/scripts/pipeline_ctl.py mobile-status          # show active sessions
+    python train/scripts/pipeline_ctl.py checkin                # push mobile results to cold
+    python train/scripts/pipeline_ctl.py checkin --from /Volumes/2TBSSD  # explicit portable root
+    python train/scripts/pipeline_ctl.py checkin --dry-run      # show what would be pushed
+
 Flywheel:
     python train/scripts/pipeline_ctl.py start-flywheel train/configs/flywheel_sref_v1.yaml
     python train/scripts/pipeline_ctl.py flywheel-status
@@ -791,6 +800,198 @@ def cmd_flywheel_status(_args) -> None:
             pass
 
 
+def cmd_checkout(args) -> None:
+    """Stage active campaign data from cold → hot and record a checkout manifest."""
+    import mobile_mode
+    try:
+        cfg = load_config(getattr(args, "config", None))
+    except Exception as e:
+        print(f"ERROR: could not load config: {e}")
+        return
+
+    chunks   = args.chunks or []
+    dry_run  = args.dry_run
+    label    = args.label or ""
+
+    storage  = cfg.get("storage", {})
+    hot_root = storage.get("hot_root", str(DATA_ROOT))
+    cold_root = storage.get("cold_root", str(COLD_ROOT))
+
+    print(f"Checkout  cold → hot")
+    print(f"  cold_root:  {cold_root}")
+    print(f"  hot_root:   {hot_root}")
+    if chunks:
+        print(f"  chunks:     {chunks}")
+    else:
+        print(f"  chunks:     all (use --chunks to limit)")
+    if dry_run:
+        print(f"  DRY RUN — no files will be written")
+    print()
+
+    if not dry_run:
+        confirm = input("Proceed with checkout? (y/N): ").strip()
+        if confirm.lower() != "y":
+            print("Aborted.")
+            return
+
+    try:
+        manifest = mobile_mode.checkout(cfg, chunks=chunks or None, label=label, dry_run=dry_run)
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return
+
+    staged = manifest.get("staged", {})
+    total_gb = manifest.get("total_bytes", 0) / (1024 ** 3)
+
+    print()
+    print(f"Checkout {'(dry run) ' if dry_run else ''}complete.")
+    print(f"  Session ID:   {manifest['session_id']}")
+    print(f"  Shards:       {len(staged.get('shards', []))} files")
+    print(f"  Precomputed:  {staged.get('npz_staged', 0)} files "
+          f"({', '.join(f'{k}:{v}' for k, v in staged.get('precomputed', {}).items())})")
+    print(f"  Validation:   {staged.get('validation_files', 0)} files")
+    print(f"  DB baselines: {', '.join(staged.get('db_baseline', [])) or 'none'}")
+    print(f"  Total staged: {total_gb:.2f} GB")
+    if not dry_run:
+        print()
+        print("Hot storage is ready for travel. Disconnect cold storage and go.")
+        print()
+        print("On return, run:")
+        print(f"  pipeline_ctl.py checkin --session {manifest['session_id']}")
+
+
+def cmd_checkin(args) -> None:
+    """Push new mobile data from hot back to cold storage."""
+    import mobile_mode
+    try:
+        cfg = load_config(getattr(args, "config", None))
+    except Exception as e:
+        print(f"ERROR: could not load config: {e}")
+        return
+
+    session_id    = args.session or None
+    portable_root = Path(args.from_root) if args.from_root else None
+    dry_run       = args.dry_run
+    force         = args.force
+
+    storage   = cfg.get("storage", {})
+    cold_root = storage.get("cold_root", str(COLD_ROOT))
+
+    print(f"Checkin  hot → cold")
+    print(f"  cold_root:  {cold_root}")
+    if portable_root:
+        print(f"  from:       {portable_root}")
+    if session_id:
+        print(f"  session:    {session_id}")
+    if dry_run:
+        print(f"  DRY RUN — no files will be written")
+    print()
+
+    try:
+        result = mobile_mode.checkin(
+            cfg,
+            session_id=session_id,
+            portable_root=portable_root,
+            dry_run=dry_run,
+            force=force,
+        )
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return
+
+    if result.get("status") == "conflicts":
+        return  # conflict message already printed by mobile_mode.checkin
+
+    print()
+    label = "(dry run) " if dry_run else ""
+    print(f"Checkin {label}complete.")
+    print(f"  Precomputed files pushed: {result.get('npz_pushed', 0)}")
+    print(f"  Checkpoint files pushed:  {result.get('ckpts_pushed', 0)}")
+    total_gb = result.get("bytes_transferred", 0) / (1024 ** 3)
+    print(f"  Total transferred:        {total_gb:.2f} GB")
+    dbs = result.get("dbs_backed_up", [])
+    if dbs:
+        print(f"  DB backups written:       {', '.join(dbs)}")
+    if result.get("report_path"):
+        print(f"  Report:                   {result['report_path']}")
+    if result.get("conflicts"):
+        print(f"\n  NOTE: {len(result['conflicts'])} conflict(s) were overridden with --force.")
+
+
+def cmd_mobile_status(args) -> None:
+    """Show active mobile sessions and divergence from base state."""
+    import mobile_mode
+    try:
+        cfg = load_config(getattr(args, "config", None))
+    except Exception as e:
+        print(f"ERROR: could not load config: {e}")
+        return
+
+    status = mobile_mode.mobile_status(cfg)
+
+    cold_mounted = status.get("cold_mounted", False)
+    print(f"Cold storage: {'mounted' if cold_mounted else 'NOT MOUNTED'} ({status.get('cold_root')})")
+    print(f"Hot root:     {status.get('hot_root')}")
+    print()
+
+    sessions = status.get("sessions", [])
+    if not sessions:
+        if cold_mounted:
+            print("No checkout sessions found.")
+        else:
+            print("Cold storage not mounted — cannot read session history.")
+        return
+
+    active = [s for s in sessions if s["status"] == "active"]
+    done   = [s for s in sessions if s["status"] == "checked-in"]
+
+    if active:
+        print(f"Active sessions ({len(active)}):")
+        for s in active:
+            port = s.get("portable_root", "")
+            mounted_str = " [MOUNTED]" if s.get("portable_mounted") else " [not mounted]"
+            chunks_str  = f"  chunks={s['chunks']}" if s.get("chunks") else ""
+            print(f"  {s['session_id']}  checked-out {s['age']}{chunks_str}")
+            print(f"    portable: {port}{mounted_str}")
+            print(f"    staged:   {s['shards_staged']} shards, {s['npz_staged']} npz files")
+        print()
+
+    divergence = status.get("base_divergence", [])
+    if divergence:
+        print("BASE DIVERGENCE (cold changed since checkout):")
+        for d in divergence:
+            print(f"  - {d}")
+        print()
+
+    if done:
+        print(f"Completed sessions ({len(done)}):")
+        for s in done[:5]:  # show last 5 only
+            print(f"  {s['session_id']}  checked-in {_age_str_from_status(s)}")
+
+    if not active and not divergence:
+        print("No active mobile sessions. Run 'checkout' before travel.")
+
+
+def _age_str_from_status(s: dict) -> str:
+    """Format checked-in age from a status dict."""
+    ts = s.get("checked_in_at", "")
+    if not ts:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        then = datetime.fromisoformat(ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        secs = (datetime.now(timezone.utc) - then).total_seconds()
+        if secs < 3600:
+            return f"{int(secs/60)}m ago"
+        if secs < 86400:
+            return f"{int(secs/3600)}h ago"
+        return f"{int(secs/86400)}d ago"
+    except Exception:
+        return ts
+
+
 def cmd_data_explorer(_args) -> None:
     """Passthrough to data_explorer.py — data intelligence layer."""
     import subprocess
@@ -955,6 +1156,36 @@ def main() -> None:
     sub.add_parser("data-explorer",
                    help="Data intelligence layer: shards, checkpoints, coverage, warm-start")
 
+    # --- Mobile Mode ---
+    p = sub.add_parser("checkout",
+                       help="Stage campaign data cold → hot for travel (creates checkout manifest in cold)")
+    p.add_argument("--chunks", type=int, nargs="*", metavar="N",
+                   help="Chunk numbers to stage (default: all available)")
+    p.add_argument("--label", default="", metavar="TAG",
+                   help="Short tag embedded in the session ID (e.g. 'prague-trip')")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would be staged without writing anything")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config (default: train/configs/v2_pipeline.yaml)")
+
+    p = sub.add_parser("checkin",
+                       help="Push new mobile data hot → cold and update checkout manifest")
+    p.add_argument("--session", default=None, metavar="SESSION_ID",
+                   help="Session ID from checkout (default: most recent active session)")
+    p.add_argument("--from", dest="from_root", default=None, metavar="PATH",
+                   help="Portable root path (default: hot_root from config)")
+    p.add_argument("--force", action="store_true",
+                   help="Proceed despite conflict warnings; re-run an already checked-in session")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would be pushed without writing anything")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config (default: train/configs/v2_pipeline.yaml)")
+
+    p = sub.add_parser("mobile-status",
+                       help="Show active mobile checkout sessions and base-machine divergence")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Pipeline config (default: train/configs/v2_pipeline.yaml)")
+
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
@@ -985,6 +1216,9 @@ def main() -> None:
         "force-continue-flywheel": cmd_force_continue_flywheel,
         "flywheel-status":         cmd_flywheel_status,
         "data-explorer":           cmd_data_explorer,
+        "checkout":                cmd_checkout,
+        "checkin":                 cmd_checkin,
+        "mobile-status":           cmd_mobile_status,
     }
     handlers[args.command](args)
 
