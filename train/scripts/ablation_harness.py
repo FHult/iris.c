@@ -1295,7 +1295,7 @@ def _run_ablation_validation(
         return {"verdict": "SKIP", "clip_skipped": True,
                 "skip_reason": "timeout", "elapsed_secs": round(time.time() - t0, 1),
                 "checkpoint_path": str(checkpoint_path)}
-    except (json.JSONDecodeError, OSError, StopIteration) as exc:
+    except (json.JSONDecodeError, OSError) as exc:
         return {"verdict": "SKIP", "clip_skipped": True,
                 "skip_reason": str(exc)[:120], "elapsed_secs": round(time.time() - t0, 1),
                 "checkpoint_path": str(checkpoint_path)}
@@ -1307,7 +1307,7 @@ def _run_ablation_validation(
         "n_params":        ai_out.get("n_params"),
         "clip_i":          ai_out.get("clip_i_mean"),
         "adapter_delta":   ai_out.get("adapter_delta"),
-        "clip_skipped":    ai_out.get("clip_i_mean") is None,
+        "clip_skipped":    ai_out.get("weight_ok", True) and ai_out.get("clip_i_mean") is None,
         "skip_reason":     None,
         "verdict":         ai_out.get("verdict", "SKIP"),
         "elapsed_secs":    elapsed,

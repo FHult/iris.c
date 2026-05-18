@@ -133,7 +133,7 @@ def run_inference_and_score(
         timeout=900,
     )
     if not infer_ok:
-        log_event("validator", "v02_failed", chunk=chunk, error=infer_err)
+        log_event("validator", "v02_failed", chunk=chunk or 0, error=infer_err)
         return {"ok": True, "skipped": True,
                 "reason": f"inference failed: {infer_err[:120]}"}
 
@@ -148,7 +148,7 @@ def run_inference_and_score(
         timeout=300,
     )
     if not score_ok:
-        log_event("validator", "v03_04_failed", chunk=chunk, error=score_err)
+        log_event("validator", "v03_04_failed", chunk=chunk or 0, error=score_err)
         return {"ok": True, "skipped": True,
                 "reason": f"CLIP scoring failed: {score_err[:120]}"}
 
@@ -340,7 +340,10 @@ def main() -> None:
         print(json.dumps(ai_out))
 
     if not args.no_pipeline_sentinel:
-        if verdict == "FAIL":
+        if chunk is None:
+            log_orch("--chunk not set and --no-pipeline-sentinel not set; skipping sentinels",
+                     level="warning")
+        elif verdict == "FAIL":
             mark_error(chunk, "validate")
             dispatch_issue(
                 f"val_fail_chunk{chunk}", "error",
