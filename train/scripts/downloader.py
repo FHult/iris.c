@@ -108,15 +108,50 @@ def _curl_download_hf_file(repo_id: str, filename: str, local_dir: str) -> Path:
         cmd += ["--header", f"Authorization: Bearer {token}"]
     cmd.append(url)
 
-    log_orch(f"curl: downloading {filename} → {out_path}")
-    result = subprocess.run(cmd, check=False)
-    # Exit code 33 = HTTP 416 Range Not Satisfiable: the file was already fully
-    # downloaded on a previous run and -C - tried to resume past EOF.  Treat as
-    # success.  All other non-zero codes are genuine failures.
-    if result.returncode not in (0, 33):
+    # cmd_fresh: same as cmd but without -C - so downloads start from byte 0.
+    cmd_fresh = [c for c in cmd if c != "-C" and c != "-"]
+
+    _MAX_FRESH_ATTEMPTS = 5
+    for attempt in range(1, _MAX_FRESH_ATTEMPTS + 1):
+        log_orch(f"curl: downloading {filename} → {out_path}"
+                 + (f" (attempt {attempt})" if attempt > 1 else ""))
+        # First attempt uses -C - to resume; subsequent attempts start fresh.
+        run_cmd = cmd if attempt == 1 else cmd_fresh
+        result = subprocess.run(run_cmd, check=False)
+
+        # Exit code 33 = HTTP 416 Range Not Satisfiable: file already fully
+        # downloaded, -C - tried to resume past EOF.  Treat as success.
+        if result.returncode == 33:
+            if not out_path.exists():
+                raise RuntimeError(f"curl finished but output file missing: {out_path}")
+            return out_path
+
+        if result.returncode == 0:
+            break
+
+        # Exit code 18 = CURLE_PARTIAL_FILE: HF dropped the connection before
+        # sending all bytes, or partial on disk is larger than the remote file.
+        # Delete partial and retry from scratch.
+        if result.returncode == 18:
+            log_orch(f"curl exit 18 for {filename} — deleting partial and retrying "
+                     f"({attempt}/{_MAX_FRESH_ATTEMPTS})", level="warning")
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+            import time as _time
+            _time.sleep(10)
+            continue
+
+        # Any other non-zero exit: give up immediately.
         raise RuntimeError(
             f"curl download failed (exit {result.returncode}): {filename}"
         )
+    else:
+        raise RuntimeError(
+            f"curl download failed after {_MAX_FRESH_ATTEMPTS} attempts (exit 18): {filename}"
+        )
+
     if not out_path.exists():
         raise RuntimeError(f"curl finished but output file missing: {out_path}")
     return out_path

@@ -193,10 +193,15 @@ def _decode_shard(tar_path: str, preprocess) -> tuple:
     if not raw_items:
         return [], []
 
+    _MIN_DIM = 256
+
     def _proc(item):
         stem, raw = item
         try:
-            return stem, preprocess(_decode(raw))
+            img = _decode(raw)
+            if img.width < _MIN_DIM or img.height < _MIN_DIM:
+                return None, None
+            return stem, preprocess(img)
         except Exception:
             return None, None
 

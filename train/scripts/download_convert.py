@@ -139,6 +139,9 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
     out_tar = out_dir / f"{idx:03d}.tar"
     out_tar_tmp = out_dir / f"{idx:03d}.tar.tmp"
     written = 0
+    from PIL import Image as _PIL
+    MIN_DIM = 256
+
     with tarfile.open(tgz_path, "r:gz") as src, tarfile.open(out_tar_tmp, "w") as dst:
         for member in src.getmembers():
             if not member.isfile():
@@ -150,6 +153,12 @@ def _convert_tgz(tgz_path: Path, out_dir: Path, anno_path: Path, chunk: int, idx
             if not caption:
                 continue
             img_data = src.extractfile(member).read()
+            try:
+                w, h = _PIL.open(io.BytesIO(img_data)).size
+            except Exception:
+                continue
+            if w < MIN_DIM or h < MIN_DIM:
+                continue
             info_jpg = tarfile.TarInfo(name=f"{stem}.jpg")
             info_jpg.size = len(img_data)
             dst.addfile(info_jpg, io.BytesIO(img_data))

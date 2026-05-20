@@ -24,8 +24,11 @@ paired {id}.jpg + {id}.txt entries, ready to be consumed by build_shards.py
 which already classifies any source dir containing "coyo" as type=coyo.
 
 Usage:
-    train/.venv/bin/python train/scripts/download_coyo.py            # full run
+    train/.venv/bin/python train/scripts/download_coyo.py            # full run (sequential)
+    train/.venv/bin/python train/scripts/download_coyo.py --parallel # metadata + download in parallel
     train/.venv/bin/python train/scripts/download_coyo.py --phase metadata
+    train/.venv/bin/python train/scripts/download_coyo.py --phase download          # one-shot
+    train/.venv/bin/python train/scripts/download_coyo.py --phase download --follow # poll until metadata_done
     train/.venv/bin/python train/scripts/download_coyo.py --phase pack
     train/.venv/bin/python train/scripts/download_coyo.py --detach   # daemonize
 
@@ -59,7 +62,7 @@ DEFAULT_HF_REPO    = "recastai/coyo-10m-aesthetic"
 DEFAULT_COLD_ROOT  = Path("/Volumes/16TBCold")
 HEARTBEAT_PATH     = Path("/Volumes/2TBSSD/.heartbeat/download_coyo.json")
 DAEMON_LOG_PATH    = Path("/tmp/download_coyo.log")
-DEFAULT_WORKERS    = 16
+DEFAULT_WORKERS    = 8
 DEFAULT_SHARD_SIZE = 10_000
 
 MIN_IMAGE_PX      = 256
@@ -67,6 +70,11 @@ MIN_CAPTION_WORDS = 5
 HTTP_TIMEOUT      = 20
 HTTP_UA           = "Mozilla/5.0 (Macintosh) iris-coyo-fetcher/1.0"
 COMMIT_BATCH      = 500
+SUBMIT_CHUNK      = 2_000   # futures submitted at a time; limits peak memory
+LOG_INTERVAL      = 500     # completions between progress log lines
+FAIL_RATE_WARN    = 0.40    # warn when sustained fail rate exceeds this fraction
+FOLLOW_BATCH      = 10_000  # max pending rows fetched per iteration in follow mode
+FOLLOW_POLL_S     = 30      # seconds to wait between polls when pending is empty
 
 URL_COLS    = ("url", "URL", "image_url", "img_url")
 CAP_COLS    = ("caption", "text", "TEXT", "long_caption", "description")
@@ -313,6 +321,11 @@ def phase_metadata(hf_repo: str, paths: dict,
     log(f"metadata: DB totals — total={final['total']:,} pending={final['pending']:,} "
         f"downloaded={final['downloaded']:,} failed={final['failed']:,}")
     conn.close()
+    # Signal that all parquet files have been scanned; follow-mode download uses this.
+    try:
+        (paths["base"] / "metadata_done").touch()
+    except OSError:
+        pass
 
 
 def _insert_metadata_batch(conn: sqlite3.Connection,
@@ -337,6 +350,16 @@ def _img2dataset_available() -> bool:
     return shutil.which("img2dataset") is not None
 
 
+def _mem_gb() -> str:
+    """Return a brief memory usage string, or '' if psutil unavailable."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return f" [RAM used={vm.used/1e9:.1f}GB avail={vm.available/1e9:.1f}GB]"
+    except Exception:
+        return ""
+
+
 def phase_download(paths: dict, workers: int) -> None:
     conn = open_db(paths["db"])
     pending = conn.execute(
@@ -348,30 +371,49 @@ def phase_download(paths: dict, workers: int) -> None:
         return
 
     total = db_counts(conn)["total"]
-    log(f"download: {len(pending):,} pending / {total:,} total")
+    log(f"download: {len(pending):,} pending / {total:,} total{_mem_gb()}")
+    if workers > 8:
+        log(f"download: WARNING — {workers} workers is aggressive; "
+            f"consider --workers 8 to reduce OOM risk")
 
     raw_dir = paths["raw_images"]
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     use_i2d = _img2dataset_available()
-    log(f"download: backend = {'img2dataset' if use_i2d else 'urllib threadpool'}")
+    log(f"download: backend = {'img2dataset' if use_i2d else 'urllib threadpool'} "
+        f"workers={workers} submit_chunk={SUBMIT_CHUNK}")
 
     state = {"done": 0, "ok": 0, "fail": 0, "t0": time.monotonic(),
              "total": len(pending)}
     stop_ev = threading.Event()
 
-    def _hb_loop():
-        while not stop_ev.wait(30):
+    def _hb_and_log():
+        while not stop_ev.wait(60):
             elapsed = max(time.monotonic() - state["t0"], 1e-3)
             rate = state["done"] / elapsed
             eta = (state["total"] - state["done"]) / rate if rate > 0 else 0
-            write_heartbeat(phase="download", backend="img2dataset" if use_i2d else "urllib",
-                            done=state["done"], total=state["total"],
-                            ok=state["ok"], fail=state["fail"],
-                            pct=round(state["done"] * 100.0 / max(state["total"], 1), 2),
-                            rate_per_sec=round(rate, 2),
-                            eta_sec=int(eta))
-    hb = threading.Thread(target=_hb_loop, daemon=True)
+            fail_rate = state["fail"] / max(state["done"], 1)
+            write_heartbeat(
+                phase="download", backend="img2dataset" if use_i2d else "urllib",
+                done=state["done"], total=state["total"],
+                ok=state["ok"], fail=state["fail"],
+                fail_rate=round(fail_rate, 3),
+                pct=round(state["done"] * 100.0 / max(state["total"], 1), 2),
+                rate_per_sec=round(rate, 2),
+                eta_sec=int(eta),
+            )
+            warn = f" *** FAIL RATE {fail_rate:.0%}" if fail_rate > FAIL_RATE_WARN else ""
+            log(f"download: heartbeat — {state['done']:,}/{state['total']:,} "
+                f"ok={state['ok']:,} fail={state['fail']:,} "
+                f"({rate:.1f}/s ETA {int(eta)//3600}h{(int(eta)%3600)//60}m)"
+                f"{warn}{_mem_gb()}")
+
+    # Write initial heartbeat immediately so pipeline_status shows the phase.
+    write_heartbeat(phase="download", backend="img2dataset" if use_i2d else "urllib",
+                    done=0, total=len(pending), ok=0, fail=0,
+                    pct=0.0, rate_per_sec=0.0, eta_sec=0)
+
+    hb = threading.Thread(target=_hb_and_log, daemon=True)
     hb.start()
 
     try:
@@ -379,6 +421,9 @@ def phase_download(paths: dict, workers: int) -> None:
             _download_img2dataset(conn, pending, raw_dir, workers, state)
         else:
             _download_urllib(conn, pending, raw_dir, workers, state)
+    except Exception as exc:
+        log(f"download: FATAL — phase_download raised: {exc}")
+        raise
     finally:
         stop_ev.set()
         conn.commit()
@@ -390,7 +435,7 @@ def phase_download(paths: dict, workers: int) -> None:
                     db_downloaded=final["downloaded"], db_failed=final["failed"],
                     db_pending=final["pending"])
     log(f"download: complete — ok={state['ok']:,} fail={state['fail']:,} "
-        f"(db_pending now {final['pending']:,})")
+        f"(db_pending now {final['pending']:,}){_mem_gb()}")
 
 
 def _update_row(conn: sqlite3.Connection, lock: threading.Lock,
@@ -418,9 +463,15 @@ def _save_jpeg(raw: bytes, dst: Path) -> Optional[str]:
     except ImportError:
         return "Pillow not installed"
     try:
+        import warnings
         img = Image.open(io.BytesIO(raw))
         img.load()
-        if img.mode != "RGB":
+        if img.mode not in ("RGB", "L", "RGBA"):
+            # Suppress the palette-transparency UserWarning: it's expected for P-mode images
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                img = img.convert("RGB")
+        elif img.mode != "RGB":
             img = img.convert("RGB")
         w, h = img.size
         if w < MIN_IMAGE_PX or h < MIN_IMAGE_PX:
@@ -454,6 +505,8 @@ def _download_urllib(conn: sqlite3.Connection,
                      state: dict) -> None:
     lock = threading.Lock()
     batch: list[tuple] = []
+    recent_errors: list[str] = []  # rolling window of recent error messages
+    last_log_done = 0
 
     def _flush(force: bool = False) -> None:
         if not batch:
@@ -469,18 +522,49 @@ def _download_urllib(conn: sqlite3.Connection,
                 )
         batch.clear()
 
+    # Submit in fixed-size chunks to keep peak Future/memory bounded.
+    # Submitting all 2M+ futures at once allocates hundreds of MB upfront
+    # and was the likely cause of prior OOM crashes.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_download_one, rid, url, raw_dir)
-                   for rid, url in pending]
-        for f in as_completed(futures):
-            rid, status, local_path, error = f.result()
-            batch.append((status, local_path, error, time.time(), rid))
-            state["done"] += 1
-            if status == "downloaded":
-                state["ok"] += 1
-            else:
-                state["fail"] += 1
-            _flush()
+        for chunk_start in range(0, len(pending), SUBMIT_CHUNK):
+            chunk = pending[chunk_start:chunk_start + SUBMIT_CHUNK]
+            futures = [pool.submit(_download_one, rid, url, raw_dir)
+                       for rid, url in chunk]
+            for f in as_completed(futures):
+                try:
+                    rid, status, local_path, error = f.result()
+                except Exception as exc:
+                    log(f"download: unhandled worker exception: {exc}")
+                    state["done"] += 1
+                    state["fail"] += 1
+                    continue
+                batch.append((status, local_path, error, time.time(), rid))
+                state["done"] += 1
+                if status == "downloaded":
+                    state["ok"] += 1
+                else:
+                    state["fail"] += 1
+                    if error:
+                        recent_errors.append(error)
+                        if len(recent_errors) > 30:
+                            recent_errors.pop(0)
+                _flush()
+
+                if state["done"] - last_log_done >= LOG_INTERVAL:
+                    elapsed = max(time.monotonic() - state["t0"], 1e-3)
+                    rate = state["done"] / elapsed
+                    eta_s = int((state["total"] - state["done"]) / rate) if rate > 0 else 0
+                    fail_rate = state["fail"] / max(state["done"], 1)
+                    warn = f" *** HIGH FAIL RATE {fail_rate:.0%}" if fail_rate > FAIL_RATE_WARN else ""
+                    log(f"download: {state['done']:,}/{state['total']:,} "
+                        f"ok={state['ok']:,} fail={state['fail']:,} "
+                        f"({rate:.0f}/s ETA {eta_s//3600}h{(eta_s%3600)//60}m)"
+                        f"{warn}")
+                    if fail_rate > FAIL_RATE_WARN and recent_errors:
+                        samples = list(dict.fromkeys(recent_errors[-5:]))[:3]
+                        log(f"download: recent error samples: "
+                            + " | ".join(samples))
+                    last_log_done = state["done"]
 
     _flush(force=True)
 
@@ -595,6 +679,146 @@ def _img2dataset_one_chunk(rows: list[tuple],
         for r in rows:
             results.setdefault(r[0], ("failed", None, "no img2dataset output"))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b — follow-mode download (for parallel / continuous operation)
+# ---------------------------------------------------------------------------
+
+def phase_download_follow(paths: dict, workers: int,
+                          meta_done_ev: Optional[threading.Event] = None) -> None:
+    """Download in follow mode: poll the DB for pending rows in batches.
+
+    Runs until the DB has no pending rows AND metadata is complete.
+    Metadata completion is detected via either a threading.Event (parallel mode)
+    or the sentinel file `paths["base"]/metadata_done` (standalone follow mode).
+    """
+    meta_sentinel = paths["base"] / "metadata_done"
+    conn = open_db(paths["db"])
+    raw_dir = paths["raw_images"]
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    use_i2d = _img2dataset_available()
+    log(f"download/follow: starting — backend={'img2dataset' if use_i2d else 'urllib'} "
+        f"workers={workers} batch={FOLLOW_BATCH:,}")
+
+    state = {"done": 0, "ok": 0, "fail": 0, "t0": time.monotonic(), "total": 0}
+    stop_ev = threading.Event()
+
+    def _hb_and_log():
+        while not stop_ev.wait(60):
+            elapsed = max(time.monotonic() - state["t0"], 1e-3)
+            rate = state["done"] / elapsed
+            fail_rate = state["fail"] / max(state["done"], 1)
+            write_heartbeat(
+                phase="download_follow",
+                backend="img2dataset" if use_i2d else "urllib",
+                done=state["done"], ok=state["ok"], fail=state["fail"],
+                fail_rate=round(fail_rate, 3),
+                rate_per_sec=round(rate, 2),
+            )
+            warn = f" *** FAIL RATE {fail_rate:.0%}" if fail_rate > FAIL_RATE_WARN else ""
+            log(f"download/follow: {state['done']:,} done "
+                f"ok={state['ok']:,} fail={state['fail']:,} "
+                f"({rate:.1f}/s){warn}{_mem_gb()}")
+
+    write_heartbeat(phase="download_follow", backend="img2dataset" if use_i2d else "urllib",
+                    done=0, ok=0, fail=0, rate_per_sec=0.0)
+    hb = threading.Thread(target=_hb_and_log, daemon=True)
+    hb.start()
+
+    try:
+        while True:
+            batch = conn.execute(
+                "SELECT id, url FROM images WHERE status='pending' LIMIT ?",
+                (FOLLOW_BATCH,)
+            ).fetchall()
+
+            if not batch:
+                meta_done = (
+                    meta_sentinel.exists()
+                    or (meta_done_ev is not None and meta_done_ev.is_set())
+                )
+                if not meta_done:
+                    log(f"download/follow: no pending rows yet; sleeping {FOLLOW_POLL_S}s ...")
+                    time.sleep(FOLLOW_POLL_S)
+                    continue
+                # Metadata finished — one final query to catch rows inserted between
+                # the empty fetch above and the done signal (race window).
+                batch = conn.execute(
+                    "SELECT id, url FROM images WHERE status='pending' LIMIT ?",
+                    (FOLLOW_BATCH,)
+                ).fetchall()
+                if not batch:
+                    log("download/follow: no pending rows and metadata complete — done")
+                    break
+                # Found rows in the drain pass; fall through to download them.
+
+            state["total"] += len(batch)
+            log(f"download/follow: got {len(batch):,} pending rows "
+                f"(cumulative total {state['total']:,}){_mem_gb()}")
+            if use_i2d:
+                _download_img2dataset(conn, batch, raw_dir, workers, state)
+            else:
+                _download_urllib(conn, batch, raw_dir, workers, state)
+    finally:
+        stop_ev.set()
+        conn.commit()
+        conn.close()
+
+    final = db_counts(open_db(paths["db"]))
+    write_heartbeat(phase="download_follow", done=True,
+                    ok=state["ok"], fail=state["fail"],
+                    db_downloaded=final["downloaded"], db_failed=final["failed"],
+                    db_pending=final["pending"])
+    log(f"download/follow: complete — ok={state['ok']:,} fail={state['fail']:,} "
+        f"(db_pending now {final['pending']:,}){_mem_gb()}")
+
+
+def phase_all_parallel(hf_repo: str, paths: dict, workers: int,
+                       max_parquets: Optional[int],
+                       min_aesthetic: Optional[float]) -> None:
+    """Run metadata and download concurrently.
+
+    Metadata thread streams HF parquet files and inserts pending rows.
+    Download thread polls the DB for pending rows in FOLLOW_BATCH-sized batches.
+    Both threads run to completion before returning.
+    """
+    meta_done_ev = threading.Event()
+    meta_exc: list[BaseException] = []
+    dl_exc: list[BaseException] = []
+
+    def _meta():
+        try:
+            phase_metadata(hf_repo, paths,
+                           max_parquets=max_parquets,
+                           min_aesthetic=min_aesthetic)
+        except BaseException as exc:
+            meta_exc.append(exc)
+        finally:
+            meta_done_ev.set()
+
+    def _download():
+        try:
+            phase_download_follow(paths, workers, meta_done_ev=meta_done_ev)
+        except BaseException as exc:
+            dl_exc.append(exc)
+
+    log("parallel: starting metadata + download threads concurrently")
+    meta_t = threading.Thread(target=_meta, name="metadata", daemon=False)
+    dl_t   = threading.Thread(target=_download, name="download", daemon=False)
+    meta_t.start()
+    dl_t.start()
+    meta_t.join()
+    dl_t.join()
+    log("parallel: both threads complete")
+
+    if meta_exc:
+        log(f"parallel: metadata thread raised: {meta_exc[0]}")
+        raise meta_exc[0]
+    if dl_exc:
+        log(f"parallel: download thread raised: {dl_exc[0]}")
+        raise dl_exc[0]
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +994,10 @@ def main() -> int:
                     help="Skip rows with aesthetic_score_laion_v2 below this threshold")
     ap.add_argument("--detach", action="store_true",
                     help=f"Double-fork into background, log to {DAEMON_LOG_PATH}")
+    ap.add_argument("--follow", action="store_true",
+                    help="download phase: poll DB continuously until metadata sentinel exists")
+    ap.add_argument("--parallel", action="store_true",
+                    help="all phase: run metadata and download in concurrent threads")
     args = ap.parse_args(sys.argv[1:])
 
     if args.detach:
@@ -787,16 +1015,24 @@ def main() -> int:
         f"cold={args.cold_root} workers={args.workers} "
         f"shard_size={args.shard_size}")
 
-    if args.phase in ("all", "metadata"):
-        phase_metadata(args.hf_repo, paths,
-                       max_parquets=args.max_parquets,
-                       min_aesthetic=args.min_aesthetic)
-
-    if args.phase in ("all", "download"):
-        phase_download(paths, args.workers)
-
-    if args.phase in ("all", "pack"):
+    if args.phase == "all" and args.parallel:
+        phase_all_parallel(args.hf_repo, paths, args.workers,
+                           args.max_parquets, args.min_aesthetic)
         phase_pack(paths, args.shard_size)
+    else:
+        if args.phase in ("all", "metadata"):
+            phase_metadata(args.hf_repo, paths,
+                           max_parquets=args.max_parquets,
+                           min_aesthetic=args.min_aesthetic)
+
+        if args.phase in ("all", "download"):
+            if args.follow:
+                phase_download_follow(paths, args.workers)
+            else:
+                phase_download(paths, args.workers)
+
+        if args.phase in ("all", "pack"):
+            phase_pack(paths, args.shard_size)
 
     return 0
 
