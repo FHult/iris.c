@@ -45,16 +45,15 @@ def jdb_tgz_filename(idx: int) -> str:
 
 
 def jdb_tgz_ranges(config: dict, scale: str = "all-in") -> dict[int, tuple[int, int]]:
-    """Return {chunk: (start_tgz, end_tgz)} for the given scale."""
+    """Return {chunk: (start_tgz, end_tgz)} for the given scale, read from config."""
     raw = config.get("jdb", {}).get("tgz_ranges", {})
-    # New format: nested by scale
-    if scale in raw:
-        return {int(k): tuple(v) for k, v in raw[scale].items()}
-    # Legacy flat format or all-in fallback
-    fallback = raw if raw and not any(isinstance(v, dict) for v in raw.values()) else {
-        1: [0, 49], 2: [50, 99], 3: [100, 149], 4: [150, 201]
-    }
-    return {int(k): tuple(v) for k, v in fallback.items()}
+    if scale not in raw:
+        available = list(raw.keys())
+        raise ValueError(
+            f"Scale '{scale}' not found in jdb.tgz_ranges. "
+            f"Available: {available}. Check your pipeline config."
+        )
+    return {int(k): tuple(v) for k, v in raw[scale].items()}
 
 
 def _hf_download_file(repo_id: str, filename: str, local_dir: str) -> Path:

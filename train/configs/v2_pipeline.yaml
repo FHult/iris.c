@@ -52,7 +52,7 @@ jdb:
       1: [1, 49]
       2: [50, 99]
       3: [100, 149]
-      4: [150, 201]
+      4: [150, 199]
 
 # External image-text datasets downloaded once to cold pool.
 # download_laion_coyo.py reads these and writes cold_root/raw/{dataset}/.downloaded

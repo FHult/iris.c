@@ -42,7 +42,7 @@ Every data source is split into 4 equal-volume slices; each training chunk draws
 Chunk 1:  LAION[0..25%]  + COYO[0..25%]  + WikiArt[0..25%]  + JDB[000-049]
 Chunk 2:  LAION[25..50%] + COYO[25..50%] + WikiArt[25..50%] + JDB[050-099]
 Chunk 3:  LAION[50..75%] + COYO[50..75%] + WikiArt[50..75%] + JDB[100-149]
-Chunk 4:  LAION[75..100%]+ COYO[75..100%]+ WikiArt[75..100%]+ JDB[150-201]
+Chunk 4:  LAION[75..100%]+ COYO[75..100%]+ WikiArt[75..100%]+ JDB[150-199]
 ```
 
 Benefits:
