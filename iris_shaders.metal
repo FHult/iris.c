@@ -126,45 +126,45 @@ kernel void adaln_norm(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float simd_sums[8];
-    threadgroup float simd_sqs[8];
 
     device const float *x_row = x + row * hidden;
     device float *out_row = out + row * hidden;
 
-    // Compute partial sums for mean and variance
-    float local_sum = 0.0f;
-    float local_sum_sq = 0.0f;
-    for (int i = tid; i < hidden; i += threads) {
-        float val = x_row[i];
-        local_sum += val;
-        local_sum_sq += val * val;
-    }
-    local_sum = simd_sum(local_sum);
-    local_sum_sq = simd_sum(local_sum_sq);
     uint simd_lane = tid & 31;
     uint simd_id   = tid >> 5;
-    if (simd_lane == 0) {
-        simd_sums[simd_id] = local_sum;
-        simd_sqs[simd_id] = local_sum_sq;
-    }
+    uint num_simds = (threads + 31) >> 5;
+
+    // Pass 1: compute mean
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads)
+        local_sum += x_row[i];
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         float total = 0.0f;
-        float total_sq = 0.0f;
-        uint num_simds = (threads + 31) >> 5;
-        for (uint s = 0; s < num_simds; s++) {
-            total += simd_sums[s];
-            total_sq += simd_sqs[s];
-        }
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
         simd_sums[0] = total;
-        simd_sqs[0] = total_sq;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Compute mean and std_inv
     float mean = simd_sums[0] / float(hidden);
-    float var = simd_sqs[0] / float(hidden) - mean * mean;
-    float std_inv = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
+
+    // Pass 2: compute variance (centered — numerically stable, no cancellation)
+    float local_sq = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float d = x_row[i] - mean;
+        local_sq += d * d;
+    }
+    local_sq = simd_sum(local_sq);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint s = 0; s < num_simds; s++) total += simd_sums[s];
+        simd_sums[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float std_inv = rsqrt(simd_sums[0] / float(hidden) + eps);
 
     // Apply LayerNorm + AdaLN modulation
     for (int i = tid; i < hidden; i += threads) {
@@ -1110,35 +1110,45 @@ kernel void adaln_norm_bf16(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float simd_sums[8];
-    threadgroup float simd_sqs[8];
 
     device const ushort *x_row = x + row * hidden;
     device ushort *out_row = out + row * hidden;
 
-    float local_sum = 0.0f;
-    float local_sum_sq = 0.0f;
-    for (int i = tid; i < hidden; i += threads) {
-        float val = bf16_to_f32(x_row[i]);
-        local_sum += val;
-        local_sum_sq += val * val;
-    }
-    local_sum = simd_sum(local_sum);
-    local_sum_sq = simd_sum(local_sum_sq);
     uint simd_lane = tid & 31;
     uint simd_id   = tid >> 5;
-    if (simd_lane == 0) { simd_sums[simd_id] = local_sum; simd_sqs[simd_id] = local_sum_sq; }
+    uint num_simds = (threads + 31) >> 5;
+
+    // Pass 1: compute mean
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads)
+        local_sum += bf16_to_f32(x_row[i]);
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
-        float ts = 0.0f, tsq = 0.0f;
-        uint num_simds = (threads + 31) >> 5;
-        for (uint s = 0; s < num_simds; s++) { ts += simd_sums[s]; tsq += simd_sqs[s]; }
-        simd_sums[0] = ts; simd_sqs[0] = tsq;
+        float ts = 0.0f;
+        for (uint s = 0; s < num_simds; s++) ts += simd_sums[s];
+        simd_sums[0] = ts;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
     float mean = simd_sums[0] / float(hidden);
-    float var = simd_sqs[0] / float(hidden) - mean * mean;
-    float std_inv = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
+
+    // Pass 2: compute variance (centered — numerically stable, no cancellation)
+    float local_sq = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float d = bf16_to_f32(x_row[i]) - mean;
+        local_sq += d * d;
+    }
+    local_sq = simd_sum(local_sq);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ts = 0.0f;
+        for (uint s = 0; s < num_simds; s++) ts += simd_sums[s];
+        simd_sums[0] = ts;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float std_inv = rsqrt(simd_sums[0] / float(hidden) + eps);
 
     for (int i = tid; i < hidden; i += threads) {
         float val = bf16_to_f32(x_row[i]);
@@ -2121,7 +2131,6 @@ kernel void group_norm_f32(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float simd_sums[8];
-    threadgroup float simd_sqs[8];
 
     /* group_id encodes (batch, group) */
     int num_groups = channels / channels_per_group;
@@ -2135,35 +2144,46 @@ kernel void group_norm_f32(
     device const float *x_batch = x + batch_idx * channels * spatial;
     device float *out_batch = out + batch_idx * channels * spatial;
 
-    /* Compute partial sums for mean and variance */
+    uint simd_lane = tid & 31;
+    uint simd_id   = tid >> 5;
+    uint num_simds = (threads + 31) >> 5;
+
+    /* Pass 1: compute mean */
     float local_sum = 0.0f;
-    float local_sum2 = 0.0f;
     for (int i = tid; i < group_size; i += threads) {
         int c = c_start + i / spatial;
         int s = i % spatial;
-        float val = x_batch[c * spatial + s];
-        local_sum += val;
-        local_sum2 += val * val;
+        local_sum += x_batch[c * spatial + s];
     }
     local_sum = simd_sum(local_sum);
-    local_sum2 = simd_sum(local_sum2);
-    uint simd_lane = tid & 31;
-    uint simd_id   = tid >> 5;
-    if (simd_lane == 0) { simd_sums[simd_id] = local_sum; simd_sqs[simd_id] = local_sum2; }
+    if (simd_lane == 0) simd_sums[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    /* Parallel reduction */
     if (tid == 0) {
-        float ts = 0.0f, tsq = 0.0f;
-        uint num_simds = (threads + 31) >> 5;
-        for (uint s = 0; s < num_simds; s++) { ts += simd_sums[s]; tsq += simd_sqs[s]; }
-        simd_sums[0] = ts; simd_sqs[0] = tsq;
+        float ts = 0.0f;
+        for (uint s = 0; s < num_simds; s++) ts += simd_sums[s];
+        simd_sums[0] = ts;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
     float mean = simd_sums[0] / float(group_size);
-    float var = simd_sqs[0] / float(group_size) - mean * mean;
-    float inv_std = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
+
+    /* Pass 2: compute variance (centered — numerically stable, no cancellation) */
+    float local_sq = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float d = x_batch[c * spatial + s] - mean;
+        local_sq += d * d;
+    }
+    local_sq = simd_sum(local_sq);
+    if (simd_lane == 0) simd_sums[simd_id] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ts = 0.0f;
+        for (uint s = 0; s < num_simds; s++) ts += simd_sums[s];
+        simd_sums[0] = ts;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_std = rsqrt(simd_sums[0] / float(group_size) + eps);
 
     /* Apply normalization with gamma/beta per channel */
     for (int i = tid; i < group_size; i += threads) {

@@ -186,18 +186,3 @@ def get_schedule_values(t_int: mx.array):
     """
     t_frac = t_int.astype(mx.float32) / 1000.0
     return 1.0 - t_frac, t_frac
-
-
-def flow_matching_loss(
-    model_velocity: mx.array,
-    latent: mx.array,
-    noise: mx.array,
-    alpha_t: mx.array,
-    sigma_t: mx.array,
-) -> mx.array:
-    """
-    Scalar MSE loss between predicted velocity and v-prediction target.
-    """
-    _, target = fused_flow_noise(latent, noise, alpha_t, sigma_t)
-    diff = model_velocity - target
-    return mx.mean(diff * diff)

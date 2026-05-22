@@ -733,10 +733,13 @@ def main():
             print(f"  Warning: could not update shard_scores.db: {_e}", file=sys.stderr)
 
     # Update manifest: append new IDs so future resumes skip re-scanning tars.
+    # fsync ensures the appended lines reach disk before we continue.
     new_ids = sorted({rec_id for rec_id, _, _ in records_to_write})
     if new_ids:
         with open(manifest_path, "a") as _mf:
             _mf.write("\n".join(new_ids) + "\n")
+            _mf.flush()
+            os.fsync(_mf.fileno())
 
     if args.ai:
         import json as _json

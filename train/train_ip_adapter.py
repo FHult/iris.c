@@ -50,6 +50,7 @@ from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import fused_flow_noise, get_schedule_values, gram_style_loss, reconstruct_x0
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
+from ip_adapter.constants import SIGLIP_IMAGE_SIZE
 
 # ── mflux: Flux Klein 4B MLX inference ───────────────────────────────────────
 try:
@@ -280,7 +281,7 @@ def _purge_file_page_cache(path: str) -> None:
         pass  # non-critical; pages reclaim naturally under pressure
 
 
-def save_checkpoint_async(
+def save_checkpoint(
     adapter: IPAdapterKlein,
     ema_params: dict,
     step: int,
@@ -395,7 +396,7 @@ def _purge_old_checkpoints(directory: str, keep_last_n: int) -> None:
             os.remove(f)
         except FileNotFoundError:
             pass  # already removed by a concurrent thread
-        sidecar = f.replace(".safetensors", ".json")
+        sidecar = os.path.splitext(f)[0] + ".json"
         try:
             os.remove(sidecar)
         except FileNotFoundError:
@@ -418,7 +419,7 @@ def load_checkpoint(adapter: IPAdapterKlein, path: str) -> None:
 def load_ema_from_checkpoint(path: str) -> Optional[dict]:
     """
     Load EMA parameters from a checkpoint file. Handles two formats:
-      - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint_async)
+      - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint)
       - best.safetensors:   bare keys, no prefix (written by save_ema)
     Returns a nested dict matching adapter.parameters() structure, or None if
     the file contains no recognisable EMA or adapter keys.
@@ -1173,6 +1174,7 @@ def train(config: dict) -> None:
     log_interval = ocfg["log_every"]
     loss_history: list[float] = []  # rolling window for smoothed loss
     loss_smooth = 0.0
+    target: Optional[mx.array] = None  # J-5: init before loop so del target is safe if loop runs 0 iterations
     _pipeline_chunk    = config.get("_chunk")    # set by --chunk arg; None when run standalone
     _pipeline_run_name = config.get("_run_name") if _pipeline_chunk is None else None
     # Heartbeat process key: 'trainer_{name}' for direct runs, 'trainer' for pipeline runs.
@@ -1946,7 +1948,7 @@ def train(config: dict) -> None:
             if step % ocfg["checkpoint_every"] == 0:
                 _lineage = {**_lineage_base, "step": step,
                             "loss": round(loss_smooth, 6)}
-                save_checkpoint_async(adapter, ema_params, step,
+                save_checkpoint(adapter, ema_params, step,
                                       ocfg["checkpoint_dir"], ocfg["keep_last_n"],
                                       lineage=_lineage)
                 # Write a heartbeat after the potentially slow checkpoint save so
@@ -2008,7 +2010,7 @@ def train(config: dict) -> None:
     # to avoid writing ~8 GB per short run that would be deleted immediately).
     if not ocfg.get("skip_checkpoint_save", False):
         _lineage = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6)}
-        save_checkpoint_async(adapter, ema_params, step,
+        save_checkpoint(adapter, ema_params, step,
                               ocfg["checkpoint_dir"], keep_last_n=999,
                               lineage=_lineage)
 
@@ -2025,7 +2027,7 @@ def train(config: dict) -> None:
         _best_meta = {**_lineage_base, "step": step, "loss": round(loss_smooth, 6),
                       "chunk": _pipeline_chunk}
         try:
-            _best_json_path = _best_path.replace(".safetensors", ".json")
+            _best_json_path = os.path.splitext(_best_path)[0] + ".json"
             _best_json_tmp  = _best_json_path + ".tmp"
             with open(_best_json_tmp, "w") as _f:
                 json.dump(_best_meta, _f, indent=2)
@@ -2094,19 +2096,20 @@ class _TextEncoderBundle:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resize_images_for_siglip(images: "mx.array") -> "mx.array":
-    """Resize [B, 3, H, W] bf16 in [-1,1] → [B, 3, 384, 384] bf16 in [-1,1].
+    """Resize [B, 3, H, W] bf16 in [-1,1] → [B, 3, SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE] bf16 in [-1,1].
 
     SigLIP SO400M was pretrained on 384×384 inputs. This helper ensures the
     live-encode path matches the precompute path, which explicitly resizes to
-    384 before encoding. Only called when siglip_cache_dir is None.
+    SIGLIP_IMAGE_SIZE before encoding. Only called when siglip_cache_dir is None.
+    Normalisation: pixel/127.5 - 1.0  ==  (pixel/255 - SIGLIP_MEAN) / SIGLIP_STD.
     """
     from PIL import Image as _PilImage
     imgs_np = np.array(images.astype(mx.float32))  # [B, 3, H, W]
-    out = np.empty((imgs_np.shape[0], 3, 384, 384), dtype=np.float32)
+    out = np.empty((imgs_np.shape[0], 3, SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE), dtype=np.float32)
     for i in range(imgs_np.shape[0]):
         img = imgs_np[i].transpose(1, 2, 0)                              # [H, W, 3]
         img = ((img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-        img = np.array(_PilImage.fromarray(img).resize((384, 384), _PilImage.LANCZOS))
+        img = np.array(_PilImage.fromarray(img).resize((SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE), _PilImage.LANCZOS))
         out[i] = img.astype(np.float32) / 127.5 - 1.0                   # back to [-1,1]
     return mx.array(out, dtype=mx.bfloat16)
 

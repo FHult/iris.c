@@ -38,7 +38,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from pipeline_lib import write_heartbeat
+from ip_adapter.constants import SIGLIP_IMAGE_SIZE, SIGLIP_MEAN, SIGLIP_STD
 
 import numpy as np
 
@@ -140,8 +142,8 @@ def iter_shard(shard_path: str):
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-_SIGLIP_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-_SIGLIP_STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+_SIGLIP_MEAN = SIGLIP_MEAN
+_SIGLIP_STD  = SIGLIP_STD
 
 
 def _decode_jpg(jpg_bytes: bytes, tj=None) -> np.ndarray:
@@ -174,8 +176,8 @@ def _preprocess_vae(jpg_bytes: bytes, image_size: int, tj=None) -> np.ndarray:
 
 
 def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
-    """Returns float32 [1, 3, 384, 384] normalised for SigLIP."""
-    img = _resize(_decode_jpg(jpg_bytes, tj), 384)
+    """Returns float32 [1, 3, SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE] normalised for SigLIP."""
+    img = _resize(_decode_jpg(jpg_bytes, tj), SIGLIP_IMAGE_SIZE)
     img_f = (img.astype(np.float32) / 255.0 - _SIGLIP_MEAN) / _SIGLIP_STD
     return img_f.transpose(2, 0, 1)[np.newaxis]
 

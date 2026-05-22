@@ -30,12 +30,6 @@ def update_ema(
     )
 
 
-def save_ema(ema_params: dict, path: str) -> None:
-    """Save EMA parameter dict as safetensors."""
-    mx.eval(ema_params)
-    mx.save_safetensors(path, dict(_flatten(ema_params)))
-
-
 def load_ema(path: str) -> dict:
     """Load EMA parameters from safetensors into a flat dict."""
     from safetensors import safe_open

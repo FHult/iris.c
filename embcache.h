@@ -11,6 +11,10 @@
  * Used to skip the expensive Qwen3 forward pass on repeated prompts
  * (server mode style-preset cycling, CLI iterative workflows, etc.).
  *
+ * Thread safety: NOT thread-safe. All functions access global state
+ * (g_cache, g_cache_clock) without locking. Must be called from a
+ * single thread only. Do not add background prefetch without adding a lock.
+ *
  * 4-bit quantization uses block-wise min/max scaling:
  * - Divide embedding into blocks of 32 values
  * - Store min/max (scale) per block
