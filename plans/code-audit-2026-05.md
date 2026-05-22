@@ -15,7 +15,7 @@ Severity scale:
 
 ## CRITICAL
 
-### INFER-1: C inference not implemented — `--sref` rejected at runtime
+### INFER-1: C inference not implemented — `--sref` rejected at runtime — **CONFIRMED REAL (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -61,17 +61,24 @@ would be a real regression — it would extract layers 7, 16, 25 instead.
 
 ---
 
-### SIGNAL-2: SigLIP receives bucket-resolution image, not 384×384
+### SIGNAL-2: SigLIP receives bucket-resolution image, not 384×384 — **CONFIRMED REAL (mitigated, 2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/scripts/precompute_all.py:194`, `train/train_ip_adapter.py:1409` |
 | Agent | 1 (signal alignment) |
 
-Precompute resizes images to 384×384 before SigLIP encoding. At training time with live SigLIP
-(no cache), images are at the training bucket resolution (512px, 640px, 768px…) and passed
-directly to SigLIP without resize. SigLIP was pretrained on 384×384; receiving off-size inputs
-shifts the feature distribution.
+**Confirmed real bug, but never fires in current setup.**
+
+Precompute (`_preprocess_siglip`) explicitly resizes to 384×384 before encoding. Training live
+path (`train_ip_adapter.py:1409`) calls `siglip(images)` where `images` is `[B, 3, bH, bW]`
+at bucket resolution after `augment_mlx` — no resize. The model docstring at line 2086
+explicitly states "Input: [B, 3, 384, 384]".
+
+Mitigating factor: the live SigLIP path (`elif siglip is not None`) only runs when
+`siglip_cache_dir` is `None`. Current training always runs with 100% precomputed SigLIP
+coverage, so this path is never reached. Fix remains important for any training run without
+a precomputed cache.
 
 **Fix:** Before `siglip(images)` at line 1409, resize to 384×384:
 ```python
@@ -84,46 +91,71 @@ siglip_feats = siglip(images_384)
 
 ---
 
-### EXPORT-1: `perceiver_heads` mismatch — trained as 16, exported as 24
+### EXPORT-1: `perceiver_heads` mismatch — trained as 16, exported as 24 — **CONFIRMED REAL (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
-| Files | `train/scripts/export_ip_adapter.py`, `train/ip_adapter/model.py:86` |
+| Files | `train/export/export_adapter.py:267`, `train/ip_adapter/model.py:86` |
 | Agent | 1 (signal alignment), 3 (Python↔C crosswalk) |
 
-Config `adapter.perceiver_heads=16` at training time. Export script defaults to 24 (the Flux
-transformer head count) if `--perceiver-heads` is not explicitly passed. Exported weights have
-wrong head-dimension layout and are silently incompatible with any correct inference
-implementation.
+**Confirmed real bug.**
+
+Training config `stage1_512px.yaml` has `perceiver_heads: 16`. This controls the
+`PerceiverResampler`'s internal cross-attention (how 128 query tokens attend to 729 SigLIP
+tokens).
+
+`_infer_dims()` at line 267 cannot recover `perceiver_heads` from weight shapes — all
+projection matrices are `[3072, 3072]` regardless of head count. It falls back to
+`num_heads = 24 if hidden_dim == 3072 else ...` (the Flux transformer head count).
+`export()` then writes `"perceiver_heads": dims["num_heads"]` = 24 when `--perceiver-heads`
+is not passed.
+
+The test script (`test_ip_adapter_inference.py:142`) uses this metadata field to reconstruct
+`IPAdapterKlein(perceiver_heads=24)`. Since `nn.MultiHeadAttention` weights are `[D, D]`
+regardless of num_heads, the load succeeds silently, but the Perceiver now computes
+cross-attention with head_dim=128 (24-head split) instead of the trained head_dim=192
+(16-head split) — silent quality regression in any Python inference test.
 
 **Fix:**
-1. Store `perceiver_heads` in checkpoint metadata at training time (write into `_meta` dict).
-2. In export script, read from checkpoint metadata; fail explicitly if missing.
-3. Add assertion: `assert exported_heads == config_heads`.
+1. At training time, write `perceiver_heads` into checkpoint `_meta` dict alongside other
+   adapter config (e.g. in `save_checkpoint`).
+2. In export script, read `perceiver_heads` from checkpoint `_meta`; fail explicitly if absent.
+3. Add assertion: `assert meta["perceiver_heads"] == config_perceiver_heads`.
 
 ---
 
-### CROSS-1: `inject()` hardcodes `head_dim = hidden_dim // 24`, ignores `perceiver_heads`
+### CROSS-1: `inject()` hardcodes `head_dim = hidden_dim // 24` — **MISLEADING CHARACTERISATION (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/ip_adapter/model.py:199`, `train/ip_adapter/model.py:86, 93` |
 | Agent | 3 (Python↔C crosswalk) |
 
-`IPAdapterKlein.__init__` accepts `perceiver_heads` parameter but never stores it.
-`inject()` at line 199 hardcodes `head_dim = self.hidden_dim // 24`. When
-`perceiver_heads=16` is set in config, the Perceiver trains with 16 heads but `inject()`
-reshapes attention as if there were 24 — producing silently wrong K/V tensors during any
-Python inference test.
+**The specific bug described is wrong; a related latent bug exists for 9B.**
 
-**Fix:**
+`inject()` performs cross-attention between Flux Q (from the Flux transformer block,
+`[B, flux_heads, img_seq, flux_head_dim]`) and IP K/V. The K/V tensors are `[B, 128, 3072]`
+reshaped to `[B, flux_heads, 128, flux_head_dim]`. For Flux 4B: flux_heads=24,
+flux_head_dim=128. The hardcoded `self.hidden_dim // 24 = 3072 // 24 = 128` is correct.
+
+`perceiver_heads=16` controls a **separate** attention inside `PerceiverResampler.__call__`
+(how 128 query tokens attend to 729 SigLIP tokens). These two head counts are independent.
+The inject cross-attention always uses Flux model head dimensions, not Perceiver heads.
+
+The real training forward pass (`_flux_forward_with_ip`) uses `H_s` and `Hd_s` from the
+actual Flux block rather than a hardcoded constant — consistent with the analysis above.
+
+**Actual latent bug:** The hardcoded 24 would be wrong for Flux 9B (32 heads,
+head_dim = 4096 // 32 = 128, but `4096 // 24 = 170`). Currently 9B adapter is unsupported
+so there is no impact.
+
+**Fix (correct framing):** Replace the hardcoded constant with the Flux head count read from
+the model config or the Q tensor shape, to make the code correct for any Flux variant:
 ```python
-# in __init__:
-self.perceiver_heads = perceiver_heads   # add this line
-
 # in inject():
-head_dim = self.hidden_dim // self.perceiver_heads   # was // 24
+_, flux_heads, _, head_dim = img_q.shape   # derive from actual Q, not hardcoded
 ```
+Do NOT change to `self.hidden_dim // self.perceiver_heads` — that would be wrong.
 
 ---
 
@@ -991,15 +1023,16 @@ ever added.
 
 **Fix before next training run:**
 1. ~~SIGNAL-1~~ FALSE POSITIVE — `(9,18,27)` is correct; do not change
-2. CROSS-1 (perceiver_heads in inject() — two-line fix)
+2. ~~CROSS-1~~ MISLEADING — `inject()` hardcodes Flux head count (correct for 4B); real fix is derive from Q shape for 9B safety
 3. F-1 (preflight isfile → isfile or isdir)
 4. A-1 (stale Q guard)
 
 **Fix before Stage 2 launch:**
-5. SIGNAL-2 (SigLIP 384px resize)
+5. SIGNAL-2 (SigLIP 384px resize — mitigated by cache, fix anyway for correctness)
 6. SIGNAL-3 (null image conditioning gate)
-7. EXPORT-1 + EXPORT-2 (perceiver_heads metadata + bias audit)
-8. C-1 (Perceiver residual — verify against InstantX reference first)
+7. EXPORT-1 (store perceiver_heads in checkpoint _meta; export reads from there — CONFIRMED REAL)
+8. EXPORT-2 (post-export param count check)
+9. C-1 (Perceiver residual — verify against InstantX reference first)
 
 **Fix in a dedicated cleanup PR:**
 9. ADALN-1 + CM-1/2/3 (Welford variance across all norm kernels)
