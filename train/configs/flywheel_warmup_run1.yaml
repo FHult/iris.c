@@ -34,7 +34,7 @@ flywheel:
   shard_selection:
     performance_weight: 0.30   # low — few shards have reliable scores yet
     min_diversity_pct:  0.30   # high — maximize visual diversity
-    exploration_rate:   0.40   # high — aggressively discover unscored shards
+    exploration_rate:   0.40   # fallback if no schedule entry matches (schedule covers all iters)
     recency_penalty:    0.20   # light — discourage returning to same 40 every iter
     recency_window_iters: 2
 

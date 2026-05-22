@@ -437,7 +437,8 @@ class FlywheelDB:
                 VALUES (?, 'active', ?, ?)
             """, (name, ts, ts))
             self._conn.execute("""
-                UPDATE campaign_summary SET base_checkpoint=? WHERE flywheel_name=?
+                UPDATE campaign_summary SET base_checkpoint=?
+                WHERE flywheel_name=? AND base_checkpoint IS NULL
             """, (checkpoint_path, name))
             self._conn.commit()
 

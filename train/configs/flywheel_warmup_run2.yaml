@@ -39,7 +39,7 @@ flywheel:
   shard_selection:
     performance_weight: 0.45   # increase — more shards have scores now
     min_diversity_pct:  0.25
-    exploration_rate:   0.30   # moderate — still covering new shards
+    exploration_rate:   0.30   # fallback if no schedule entry matches (schedule covers all iters)
     recency_penalty:    0.25
     recency_window_iters: 3
 

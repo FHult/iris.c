@@ -38,7 +38,7 @@ flywheel:
   shard_selection:
     performance_weight: 0.60   # shift to exploit — attribution reliable for top shards
     min_diversity_pct:  0.20
-    exploration_rate:   0.20   # lower — most shards scored, fill remaining gaps
+    exploration_rate:   0.20   # fallback if no schedule entry matches (schedule covers all iters)
     recency_penalty:    0.30
     recency_window_iters: 4
 
