@@ -144,13 +144,16 @@ actual Flux block rather than a hardcoded constant — consistent with the analy
 head_dim = 4096 // 32 = 128, but `4096 // 24 = 170`). Currently 9B adapter is unsupported
 so there is no impact.
 
-**Fix (correct framing):** Replace the hardcoded constant with the Flux head count read from
-the model config or the Q tensor shape, to make the code correct for any Flux variant:
+**Fix (applied 2026-05-22):** Replace the hardcoded constant with the Flux head count read from
+the Q tensor shape, correct for any Flux variant:
 ```python
-# in inject():
-_, flux_heads, _, head_dim = img_q.shape   # derive from actual Q, not hardcoded
+_, _, _, head_dim = img_q.shape   # derive from actual Q, not hardcoded
 ```
 Do NOT change to `self.hidden_dim // self.perceiver_heads` — that would be wrong.
+
+Note: `inject()` is only called from `tests/test_model.py`, not from the main training loop.
+`_flux_forward_with_ip` derives H and Hd from `block.attn.heads` / `block.attn.dim_head`
+directly — the training path was never affected by this bug.
 
 ---
 

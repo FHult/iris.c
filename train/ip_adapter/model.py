@@ -29,7 +29,7 @@ class PerceiverResampler(nn.Module):
 
     Architecture (plans/ip-adapter-training.md §3.1):
       query_tokens: learnable [128, 3072] initialised to small normal
-      cross_attn:   nn.MultiHeadAttention(3072, heads=24, key_input_dims=1152)
+      cross_attn:   nn.MultiHeadAttention(3072, heads=perceiver_heads, key_input_dims=1152)
       norm:         LayerNorm(3072)
     """
 
@@ -197,7 +197,7 @@ class IPAdapterKlein(nn.Module):
         Returns:
           ip_contribution: [B, img_seq, 3072] scaled by self.scale[block_idx]
         """
-        head_dim = self.hidden_dim // 24  # 3072 / 24 = 128
+        _, _, _, head_dim = img_q.shape  # derive from Q: correct for any Flux variant
         scale = float(head_dim ** -0.5)
 
         # Reshape K/V to [B, num_heads, 128, head_dim] for batched SDPA
