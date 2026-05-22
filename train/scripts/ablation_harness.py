@@ -1039,7 +1039,7 @@ def _build_run_config(
 
 def _score(snapshots: list[dict], exit_code: int) -> float:
     """Batch-mode fixed scoring: 100*ref_gap + 200*cond_gap - 3*final_loss."""
-    if exit_code not in (0,) or not snapshots:
+    if exit_code != 0 or not snapshots:
         return float("-inf")
     n_skip = max(0, len(snapshots) * 2 // 5)
     tail = snapshots[n_skip:] or snapshots
@@ -1060,7 +1060,7 @@ def _score_weighted(snapshots: list[dict], exit_code: int, objective: dict) -> f
       gap_w       → mean_cond_gap (adapter learning; typical [-2, 0.5] → /2.5)
       stability_w → -(final_loss - 1) / 4  (stability; typical 0.5–5.0)
     """
-    if exit_code not in (0,) or not snapshots:
+    if exit_code != 0 or not snapshots:
         return float("-inf")
 
     clip_i_w    = float(objective.get("clip_i_weight", 0.55))
@@ -1251,7 +1251,8 @@ class EarlyStopper:
         self._n_snapshots += 1
 
         # Instant kill: loss explosion / NaN (no warmup guard — always active)
-        loss = snap.get("loss_smooth") or snap.get("loss", 0.0)
+        loss_smooth = snap.get("loss_smooth")
+        loss = loss_smooth if loss_smooth is not None else snap.get("loss", 0.0)
         if loss is not None and loss > self.nan_loss_threshold:
             return self._trigger(f"loss={loss:.3f} > {self.nan_loss_threshold}")
 
@@ -1538,8 +1539,6 @@ def _run_one(
                                  f"  ↳ early stopping triggered at step {snap['step']} "
                                  f"({reason})"), flush=True)
         proc.wait()
-        if trial_timer is not None:
-            trial_timer.cancel()
         exit_code = proc.returncode
         if trial_timer is not None and trial_timer.timed_out:
             exit_code = -3  # distinguish timeout from crash
@@ -1554,6 +1553,8 @@ def _run_one(
         print(f"  FATAL: failed to launch trainer: {exc}", file=sys.stderr)
         exit_code = -1
     finally:
+        if trial_timer is not None:
+            trial_timer.cancel()
         if _gpu_lock_held:
             try:
                 _release_gpu_lock()
@@ -1725,21 +1726,26 @@ def _warm_start_pareto(warm_start_dir: Path, run_name: str,
         return []
     try:
         prior = AblationDB(db_path)
-        # Try the matching run name first, then any run
-        exps = prior.get_experiments(run_name, scored_only=True)
-        pareto_ids = _pareto_efficient(exps) if exps else set()
-        pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
-        if not pareto_exps:
-            for name in prior.get_all_run_names():
-                exps = prior.get_experiments(name, scored_only=True)
-                pareto_ids = _pareto_efficient(exps)
-                pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
-                if pareto_exps:
-                    break
-        # Fall back to top-K scored if no Pareto experiments found
-        if not pareto_exps:
-            pareto_exps = prior.get_best(run_name, top_k) or []
-        prior.close()
+        try:
+            # Try the matching run name first, then any run
+            exps = prior.get_experiments(run_name, scored_only=True)
+            pareto_ids = _pareto_efficient(exps) if exps else set()
+            pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
+            if not pareto_exps:
+                for name in prior.get_all_run_names():
+                    exps = prior.get_experiments(name, scored_only=True)
+                    pareto_ids = _pareto_efficient(exps)
+                    pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
+                    if pareto_exps:
+                        break
+            # Fall back to top-K scored across all run names
+            if not pareto_exps:
+                for name in prior.get_all_run_names():
+                    pareto_exps = prior.get_best(name, top_k) or []
+                    if pareto_exps:
+                        break
+        finally:
+            prior.close()
         # Sort by score desc, deduplicate params, exclude already-tried
         pareto_exps.sort(key=lambda e: e.get("score") or 0, reverse=True)
         result: list[dict] = []
