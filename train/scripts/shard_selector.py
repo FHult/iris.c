@@ -892,33 +892,13 @@ def select_shards(
                 _add_shard(s)
 
     # ------------------------------------------------------------------
-    # Step 4: fill remainder with recency-penalised weighted random
-    needed = n_shards - len(selected_paths)
-    if needed > 0:
-        remaining = [s for s in all_shards if s["shard_id"] not in selected_ids]
-        if remaining:
-            weights = []
-            for s in remaining:
-                w = _score(s) if _score(s) > 0 else 0.3
-                n_sel = s.get("n_selected", 0)
-                if n_sel > 0 and recency_window > 0:
-                    penalty = min(1.0, n_sel / max(1, iteration / max(1, recency_window)))
-                    w = w * (1.0 - recency_penalty * penalty)
-                weights.append(max(0.001, w))
-            total_w = sum(weights)
-            probs = [w / total_w for w in weights]
-            picks_idx = _weighted_sample_no_replace(probs, min(needed, len(remaining)))
-            for i in picks_idx:
-                _add_shard(remaining[i])
-
-    # ------------------------------------------------------------------
-    # Step 5: per-source minimum guarantee
-    # For each source with a configured minimum, add the best-scoring unselected
-    # shards from that source until the minimum is met (or the source is exhausted).
-    # Does not displace existing selections; may increase total above n_shards only
-    # if every slot is already filled — in that case we respect n_shards cap.
+    # Step 4: per-source minimum guarantee
+    # Runs before fill-remainder so it can claim free slots for source quotas.
+    # If steps 1-3 already filled all n_shards slots, the inner guard fires
+    # immediately and the source minimum cannot be met without displacement
+    # (which we don't do); this is logged via n_unscored below.
     per_source_min = cfg.get("per_source_min", {})
-    if per_source_min and len(selected_ids) < n_shards:
+    if per_source_min:
         for src, min_count in per_source_min.items():
             current_count = sum(
                 1 for s in selected_shards
@@ -936,6 +916,26 @@ def select_shards(
                         break
                     _add_shard(s)
                     current_count += 1
+
+    # ------------------------------------------------------------------
+    # Step 5: fill remainder with recency-penalised weighted random
+    needed = n_shards - len(selected_paths)
+    if needed > 0:
+        remaining = [s for s in all_shards if s["shard_id"] not in selected_ids]
+        if remaining:
+            weights = []
+            for s in remaining:
+                w = _score(s) if _score(s) > 0 else 0.3
+                n_sel = s.get("n_selected", 0)
+                if n_sel > 0 and recency_window > 0:
+                    penalty = min(1.0, n_sel / max(1, iteration / max(1, recency_window)))
+                    w = w * (1.0 - recency_penalty * penalty)
+                weights.append(max(0.001, w))
+            total_w = sum(weights)
+            probs = [w / total_w for w in weights]
+            picks_idx = _weighted_sample_no_replace(probs, min(needed, len(remaining)))
+            for i in picks_idx:
+                _add_shard(remaining[i])
 
     # ------------------------------------------------------------------
     # Logging and bookkeeping
