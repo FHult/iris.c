@@ -38,23 +38,26 @@ weights are unreachable from the C binary.
 
 ---
 
-### SIGNAL-1: Qwen3 layer extraction off-by-one — precompute vs training mismatch
+### ~~SIGNAL-1: Qwen3 layer extraction off-by-one~~ — **FALSE POSITIVE (verified 2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/scripts/precompute_all.py:320`, `train/train_ip_adapter.py:2146` |
 | Agent | 1 (signal alignment) |
 
-Precompute extracts Qwen3 hidden layers at indices 8, 17, 26 (0-indexed, matching CLAUDE.md).
-Training encodes with `hidden_state_layers=(9, 18, 27)`. When using the precomputed cache this
-is masked (the precomputed embeddings are correct); when running live text encoding the wrong
-layers are used, corrupting the training signal. Any training run without a precomputed Qwen3
-cache silently trains on the wrong text representations.
+**The two indexing schemes are equivalent — do not change either.**
 
-**Fix:** Change `train/train_ip_adapter.py:2146`:
-```python
-hidden_state_layers=(8, 17, 26)   # was (9, 18, 27) — 0-indexed, matches precompute
-```
+Precompute (`_qwen3_hidden_states`) uses a manual loop `for i, layer in enumerate(layers)` and
+collects the output **after** layer `i`. `target=(8, 17, 26)` therefore captures transformer
+layers 8, 17, 26 (0-indexed).
+
+Training uses mflux's `hidden_states_list` which is initialised with `embed_tokens` output at
+index 0, then each layer's output appended in order. `hidden_states_list[9]` = output of
+transformer layer 8, `[18]` = layer 17, `[27]` = layer 26. So `hidden_state_layers=(9, 18, 27)`
+extracts exactly the same three tensors.
+
+The mflux reference implementation also defaults to `(9, 18, 27)`. Changing to `(8, 17, 26)`
+would be a real regression — it would extract layers 7, 16, 25 instead.
 
 ---
 
@@ -987,7 +990,7 @@ ever added.
 ## Priority Order for Implementation
 
 **Fix before next training run:**
-1. SIGNAL-1 (Qwen3 layer indices — one-line fix)
+1. ~~SIGNAL-1~~ FALSE POSITIVE — `(9,18,27)` is correct; do not change
 2. CROSS-1 (perceiver_heads in inject() — two-line fix)
 3. F-1 (preflight isfile → isfile or isdir)
 4. A-1 (stale Q guard)
