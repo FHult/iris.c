@@ -3,7 +3,7 @@ train/scripts/precompute_all.py — Unified single-pass precompute.
 
 Reads each shard once and writes all requested outputs:
   - Qwen3 4-bit quantised text embeddings  → {qwen3_output}/{id}.npz
-  - VAE int8 quantised latents             → {vae_output}/{id}.npz
+  - VAE float32 latents                    → {vae_output}/{id}.npz
   - SigLIP 4-bit quantised features        → {siglip_output}/{id}.npz  (--siglip)
 
 Saves ~10-12h vs running the three scripts sequentially (~22h total):

@@ -25,7 +25,7 @@ GPU augmentation (§3.10):
 
 Pre-computed embed loading:
   If data/qwen3_q4/{id}.npz exists → dequantise and return (no Qwen3 forward pass).
-  If data/vae_int8/{id}.npz exists → dequantise and return (no VAE encode).
+  If data/vae_int8/{id}.npz exists → load and return as float32 (no VAE encode).
   If data/siglip_q4/{id}.npz exists → dequantise and return (no SigLIP forward pass).
   Falls back to None for each encoder when pre-computed cache is absent.
 """
@@ -321,7 +321,7 @@ def make_prefetch_loader(
     sample_buffer:        max batches in the level-2 queue (default 6)
     bucket:               (H, W) training resolution; if None, randomly selects from BUCKETS
     qwen3_cache_dir:      path to pre-computed Qwen3 .npz files (data/qwen3_q4/)
-    vae_cache_dir:        path to pre-computed VAE .npz files (data/vae_int8/)
+    vae_cache_dir:        path to pre-computed VAE .npz files (data/vae_int8/ or newer float32 path)
     siglip_cache_dir:     path to pre-computed SigLIP .npz files (data/siglip_q4/)
 
     Yields batches of:

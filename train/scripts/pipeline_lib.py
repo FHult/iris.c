@@ -458,7 +458,7 @@ def faiss_read_index_retry(path, retries: int = 5, base_delay: float = 0.5):
                 delay = base_delay * (2 ** attempt)
                 log_orch(
                     f"faiss_read_index retry {attempt + 1}/{retries} "
-                    f"after {delay:.1f}s ({path.name}): {exc}",
+                    f"after {delay:.1f}s ({os.path.basename(str(path))}): {exc}",
                     level="warning",
                 )
                 _time.sleep(delay)
