@@ -31,7 +31,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     STAGING_DIR, COLD_ROOT, TRAIN_DIR,
-    write_heartbeat, log_orch, load_config,
+    write_heartbeat, log_orch, load_config, faiss_read_index_retry,
 )
 from clip_dedup import dedup_wds_tar, DUP_THRESHOLD
 
@@ -196,7 +196,7 @@ def run_dedupe_filter(
     # Pass None if the index doesn't exist yet — dedup_wds_tar will create it
     # with the correct embedding dim on first call and return it back to us.
     import faiss as _faiss
-    faiss_index = _faiss.read_index(str(index_path)) if index_path.exists() else None
+    faiss_index = faiss_read_index_retry(index_path) if index_path.exists() else None
     _flush_counter = 0
 
     def _flush_faiss_index() -> None:

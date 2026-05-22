@@ -25,6 +25,7 @@ from pipeline_lib import (
     STATE_FILE, CONTROL_FILE, DISPATCH_QUEUE, TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_ORCH_WIN, TMUX_STAGE_WIN,
     read_state, is_done, has_error, read_error, read_heartbeat, heartbeat_age_secs,
     tmux_session_exists, tmux_window_exists, free_gb, now_iso,
+    read_dispatch_issues,
 )
 
 try:
@@ -214,30 +215,7 @@ def _scan_direct_run_heartbeats() -> list[dict]:
 
 
 def _read_dispatch_issues(resolved: bool = False) -> list:
-    """Read open (or all) issues from dispatch_queue.jsonl.
-
-    The file is append-only: dispatch_issue() appends new issues and
-    cmd_dispatch_resolve() appends a resolve marker.  Last entry per ID wins,
-    so we collect all entries and keep only the final state for each ID.
-    """
-    if not DISPATCH_QUEUE.exists():
-        return []
-    by_id: dict = {}
-    try:
-        for line in DISPATCH_QUEUE.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                iid = entry.get("id")
-                if iid:
-                    by_id[iid] = entry  # last write wins
-            except json.JSONDecodeError:
-                pass
-    except OSError:
-        pass
-    return [e for e in by_id.values() if resolved or not e.get("resolved", False)]
+    return read_dispatch_issues(include_resolved=resolved)
 
 
 _shard_count_cache: dict[Path, tuple] = {}  # path → (mtime, count)

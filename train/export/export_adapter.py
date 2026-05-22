@@ -616,6 +616,21 @@ def export(
     print(f"Applying quantisation: {quant}")
     weights_q = apply_quant(weights_f32, quant)
 
+    # EXPORT-2: Param count sanity — exported (non-scale) tensors must sum to
+    # the same element count as the source weights.  A mismatch means a key was
+    # silently dropped or duplicated during apply_quant.
+    source_params   = sum(arr.size for arr in weights_f32.values())
+    exported_params = sum(arr.size for name, arr in weights_q.items()
+                         if not name.endswith(".scale"))
+    if exported_params != source_params:
+        raise ValueError(
+            f"Parameter count mismatch after quantisation: "
+            f"source {source_params:,} elements, exported {exported_params:,} elements.\n"
+            f"  Source keys:   {sorted(weights_f32)}\n"
+            f"  Exported keys: {sorted(k for k in weights_q if not k.endswith('.scale'))}"
+        )
+    print(f"  Param count check: {source_params:,} elements OK")
+
     # 6. Build metadata
     meta: dict[str, Any] = {
         "version":            EXPORT_VERSION,

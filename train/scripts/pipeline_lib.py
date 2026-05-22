@@ -328,6 +328,39 @@ def dispatch_issue(issue_id: str, severity: str, message: str,
         traceback.print_exc(file=sys.stderr)
 
 
+def read_dispatch_issues(include_resolved: bool = False) -> list:
+    """
+    Read issues from dispatch_queue.jsonl with last-write-wins deduplication.
+
+    The queue is append-only: new issues are appended by dispatch_issue() and
+    resolve markers are appended by pipeline_ctl resolve. Keeping the last
+    entry per ID gives the current state of each issue.
+
+    include_resolved=False (default): return only open issues.
+    include_resolved=True: return all issues regardless of resolved state.
+    """
+    if not DISPATCH_QUEUE.exists():
+        return []
+    by_id: dict = {}
+    try:
+        for line in DISPATCH_QUEUE.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                iid = entry.get("id")
+                if iid:
+                    by_id[iid] = entry  # last write wins
+            except json.JSONDecodeError:
+                pass
+    except OSError:
+        pass
+    if include_resolved:
+        return list(by_id.values())
+    return [e for e in by_id.values() if not e.get("resolved", False)]
+
+
 # ---------------------------------------------------------------------------
 # tmux helpers
 # ---------------------------------------------------------------------------
@@ -361,7 +394,10 @@ def tmux_new_window(window_name: str, cmd: str, log_file: Path,
                     session: str = TMUX_SESSION) -> None:
     """Launch cmd in a new tmux window, logging stdout+stderr to log_file."""
     import subprocess
-    full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
+    # Use > (overwrite) so each new run starts with a clean log. Append (>>) would
+    # leave the previous run's EXIT_CODE line in the file, causing last_exit_code()
+    # to read stale success/failure status (PIPE-2).
+    full_cmd = f"({cmd}) > '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
     try:
         subprocess.run([
             "tmux", "new-window", "-t", f"{session}:", "-n", window_name,
@@ -396,6 +432,39 @@ def last_exit_code(log_file: Path) -> Optional[int]:
     except (ValueError, OSError):
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# FAISS helpers
+# ---------------------------------------------------------------------------
+
+def faiss_read_index_retry(path, retries: int = 5, base_delay: float = 0.5):
+    """
+    Read a FAISS index with exponential backoff retry.
+
+    If another process is mid-write (tmp→final replace still in flight), the
+    read can fail with a corrupt-file error.  Retrying with short delays handles
+    this race without aborting the pipeline step.
+    """
+    import time as _time
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(retries):
+        try:
+            import faiss as _faiss
+            return _faiss.read_index(str(path))
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log_orch(
+                    f"faiss_read_index retry {attempt + 1}/{retries} "
+                    f"after {delay:.1f}s ({path.name}): {exc}",
+                    level="warning",
+                )
+                _time.sleep(delay)
+    raise RuntimeError(
+        f"faiss.read_index failed after {retries} attempts on {path}: {last_exc}"
+    ) from last_exc
 
 
 # ---------------------------------------------------------------------------

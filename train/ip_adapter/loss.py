@@ -31,7 +31,10 @@ def gram_matrix(x: mx.array) -> mx.array:
     B, C, H, W = x.shape
     f = x.reshape(B, C, H * W)
     f = f - f.mean(axis=-1, keepdims=True)   # centre each channel over spatial dim
-    return mx.matmul(f, f.transpose(0, 2, 1)) / (C * H * W)
+    # Normalise by H*W only (not C*H*W) so magnitude is bucket-resolution-invariant.
+    # C is fixed in latent space; dividing by C would make the Gram entry scale 1/C²
+    # smaller than the MSE term, requiring a ~C²× style_loss_weight adjustment.
+    return mx.matmul(f, f.transpose(0, 2, 1)) / (H * W)
 
 
 def gram_style_loss(x0_pred: mx.array, x0_ref: mx.array) -> mx.array:

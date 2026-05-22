@@ -49,7 +49,8 @@ sys.path.insert(0, str(_TRAIN_DIR))
 
 try:
     from ip_adapter.model import IPAdapterKlein
-    from train_ip_adapter import _flux_forward_no_ip
+    from train_ip_adapter import _flux_forward_no_ip, _flux_forward_with_ip
+    from export.export_adapter import _KEY_MAP as _TRAIN_TO_EXPORT_MAP
 except ImportError as e:
     print(f"Error: cannot import training code: {e}", file=sys.stderr)
     print("  Ensure this script is run with train/.venv active.", file=sys.stderr)
@@ -63,19 +64,9 @@ except ImportError:
 
 
 # ── Export bundle key map ─────────────────────────────────────────────────────
-# export_adapter.py writes "export" key names; IPAdapterKlein uses "training" names.
-_EXPORT_TO_TRAIN: dict[str, str] = {
-    "perceiver.query_tokens":  "image_proj.query_tokens",
-    "perceiver.query_proj":    "image_proj.cross_attn.query_proj.weight",
-    "perceiver.key_proj":      "image_proj.cross_attn.key_proj.weight",
-    "perceiver.value_proj":    "image_proj.cross_attn.value_proj.weight",
-    "perceiver.out_proj":      "image_proj.cross_attn.out_proj.weight",
-    "perceiver.norm_weight":   "image_proj.norm.weight",
-    "perceiver.norm_bias":     "image_proj.norm.bias",
-    "ip_k_stacked":            "to_k_ip_stacked",
-    "ip_v_stacked":            "to_v_ip_stacked",
-    "ip_scale":                "scale",
-}
+# Derived from export_adapter._KEY_MAP (training name → export name) by inversion.
+# Do NOT hand-edit here; update export_adapter._KEY_MAP instead.
+_EXPORT_TO_TRAIN: dict[str, str] = {v: k for k, v in _TRAIN_TO_EXPORT_MAP.items()}
 
 _INT8_QUANT_KEYS = frozenset({
     "perceiver.query_proj", "perceiver.key_proj",
@@ -326,7 +317,6 @@ def _euler_step(
 
 def _ip_forward(
     flux,
-    adapter: IPAdapterKlein,
     noisy_latents: mx.array,
     text_embeds: mx.array,
     t_int: mx.array,
@@ -335,47 +325,15 @@ def _ip_forward(
     ip_scale: mx.array,
 ) -> mx.array:
     """
-    Inference forward pass matching the training computation exactly.
+    Inference forward pass using the same per-block injection as training.
 
-    Training uses _flux_forward_no_ip (runs Flux fully, collects Q at each block)
-    then sums all IP contributions and adds to h_final before norm_out/proj_out.
-    This function replicates that computation for correct inference.
+    Delegates to _flux_forward_with_ip which injects IP contributions into
+    hidden states after each block's native attention, exactly as during
+    training.  IP from block i influences block i+1's Q vectors.
     """
-    flux_state = _flux_forward_no_ip(flux, noisy_latents, text_embeds, t_int)
-
-    qs      = flux_state["qs"]
-    h_final = flux_state["h_final"]
-    temb    = flux_state["temb"]
-    B       = flux_state["B"]
-    C       = flux_state["C"]
-    Lh      = flux_state["Lh"]
-    Lw      = flux_state["Lw"]
-    pH      = flux_state["pH"]
-    pW      = flux_state["pW"]
-    seq_img = flux_state["seq_img"]
-    d_inner = h_final.shape[2]
-
-    ip_total = mx.zeros((B, seq_img, d_inner), dtype=h_final.dtype)
-    for i, q_i in enumerate(qs):
-        H_i  = q_i.shape[1]
-        Hd_i = q_i.shape[3]
-        k_i  = k_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
-        v_i  = v_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
-        ip_out = mx.fast.scaled_dot_product_attention(
-            q_i, k_i, v_i, scale=Hd_i ** -0.5,
-        )
-        ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, d_inner)
-        ip_total = ip_total + ip_scale[i] * ip_out
-
-    tr = flux.transformer
-    h_with_ip = tr.norm_out(h_final + ip_total, temb)
-    pred_seq  = tr.proj_out(h_with_ip)
-
-    pred = pred_seq.transpose(0, 2, 1).reshape(B, C * 4, pH, pW)
-    pred = pred.reshape(B, C, 2, 2, pH, pW)
-    pred = pred.transpose(0, 1, 4, 2, 5, 3)
-    pred = pred.reshape(B, C, Lh, Lw)
-    return pred
+    return _flux_forward_with_ip(
+        flux, noisy_latents, text_embeds, t_int, k_ip_all, v_ip_all, ip_scale,
+    )
 
 
 def _generate(
@@ -409,7 +367,7 @@ def _generate(
     timesteps = [int(1000 * (1 - i / n_steps)) for i in range(n_steps + 1)]
     for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
         t_arr  = mx.array([t_curr], dtype=mx.int32)
-        v_pred = _ip_forward(flux, adapter, x, text_embeds, t_arr, k_ip, v_ip, ip_scale)
+        v_pred = _ip_forward(flux, x, text_embeds, t_arr, k_ip, v_ip, ip_scale)
         mx.eval(v_pred)
         x = _euler_step(x, t_curr, t_next, v_pred)
         mx.eval(x)

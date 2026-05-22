@@ -112,13 +112,17 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
             [remaining_warmup],
         )
     else:
-        # Already in cosine decay phase
+        # Already in cosine decay phase.
+        # Use a step-offset closure so the resumed curve is a continuation of the
+        # original cosine rather than a fresh cosine starting flat from current_lr.
+        # optim.cosine_decay(current_lr, ...) would treat current_lr as a new peak,
+        # making the slope ~2× steeper than the original schedule at mid-decay.
         decay_done = start_step - warmup_steps
         decay_total = max(1, total_steps - warmup_steps)
-        progress = min(1.0, decay_done / decay_total)
-        current_lr = eta_min + 0.5 * (lr_max - eta_min) * (1.0 + math.cos(math.pi * progress))
-        remaining_decay = max(1, decay_total - decay_done)
-        return optim.cosine_decay(current_lr, decay_steps=remaining_decay, end=eta_min)
+        def _resumed_cosine(step: int) -> float:
+            t = min(step + decay_done, decay_total)
+            return eta_min + 0.5 * (lr_max - eta_min) * (1.0 + math.cos(math.pi * t / decay_total))
+        return _resumed_cosine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -783,6 +787,7 @@ def train(config: dict) -> None:
         adapter = IPAdapterKlein.from_pretrained_warmstart(
             instantx_path=warmstart,
             num_blocks=acfg["num_blocks"],
+            num_double_blocks=acfg.get("num_double_blocks", 5),
             hidden_dim=acfg["hidden_dim"],
             num_image_tokens=acfg["num_image_tokens"],
             siglip_dim=acfg["siglip_dim"],
@@ -924,6 +929,9 @@ def train(config: dict) -> None:
     _grad_clip          = float(tcfg["grad_clip"])
     _ema_update_every   = int(tcfg["ema_update_every"])
     _ema_decay_factor   = float(tcfg["ema_decay"]) ** _ema_update_every
+    # n_grad_steps_per_fwd>1 runs N optimizer updates on the SAME forward pass
+    # result (same noise, latent, text embeds). This is NOT gradient accumulation —
+    # effective LR is multiplied by N. Only useful without block-injection.
     _n_grad_steps       = int(tcfg.get("n_grad_steps_per_fwd", 1))
     _use_block_injection = bool(tcfg.get("use_block_injection", False))
     if _use_block_injection and _n_grad_steps > 1:
@@ -1414,16 +1422,19 @@ def train(config: dict) -> None:
         else:
             # Cache miss with no live encoder — force null image conditioning so
             # the adapter sees exact zeros after mx.where, not Perceiver(zeros).
-            if not _siglip_first_miss_logged:
-                print(f"  WARNING: SigLIP cache miss at step {step} — "
-                      f"forcing null-image conditioning. Check siglip precompute coverage.",
-                      flush=True)
-                _siglip_first_miss_logged = True
+            if not null_image:
+                # Only warn and count when this was NOT already a dropout step;
+                # otherwise we'd double-count and inflate the apparent miss rate.
+                if not _siglip_first_miss_logged:
+                    print(f"  WARNING: SigLIP cache miss at step {step} — "
+                          f"forcing null-image conditioning. Check siglip precompute coverage.",
+                          flush=True)
+                    _siglip_first_miss_logged = True
+                _siglip_miss_steps += 1  # T-10: counts forced-null only, not intended dropout
             B_miss = images.shape[0]
             siglip_feats = mx.zeros((B_miss, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
             null_image = True
             use_null_image = _MX_TRUE
-            _siglip_miss_steps += 1  # T-10
 
         # PIPE-H-003: successful batch — reset consecutive-skip counter and count
         # this batch in the rolling window (slide window after _SKIP_WINDOW batches).
@@ -2483,6 +2494,11 @@ def _flux_forward_with_ip_collect_q(
         q = block.attn.norm_q(q.astype(mx.float32)).astype(mx.bfloat16)
         k = block.attn.norm_k(k.astype(mx.float32)).astype(mx.bfloat16)
 
+        # Approximation: Q is extracted before IP is injected into hidden_states for
+        # this block, so single-stream Qs are conditioned only on double-stream IP
+        # output, not on the previous single-stream block's IP contribution.
+        # Full fix would require injecting from the previous block before computing Q
+        # here. Acceptable for current training; document to avoid confusion.
         q_ip_sg = mx.stop_gradient(q[:, :, seq_txt:, :])  # [B, H, seq_img, Hd]
         qs.append(q_ip_sg)
 

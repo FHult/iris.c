@@ -205,8 +205,11 @@ def _load_vae_latent(
     expected_hw: Optional[Tuple[int, int]] = None,
 ) -> Optional[np.ndarray]:
     """
-    Load int8 quantised VAE latent.
-    Returns float16 [32, H/8, W/8] or None if not available.
+    Load precomputed VAE latent. Returns float32 [32, H/8, W/8] or None.
+
+    Handles two formats (backward-compatible):
+      New format (key "latent"): float32 stored directly — matches live VAE encode dtype.
+      Legacy format (keys "q"/"scale"): int8 + float16 scale; dequantised to float32.
 
     expected_hw: (H//8, W//8) of the current training bucket.  If the stored
     latent has a different spatial shape the cache entry is from a different
@@ -219,7 +222,10 @@ def _load_vae_latent(
         return None
     try:
         d = np.load(path)
-        latent = (d["q"].astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
+        if "latent" in d:
+            latent = d["latent"].astype(np.float32)
+        else:
+            latent = (d["q"].astype(np.float32) * d["scale"].astype(np.float32))
         if expected_hw is not None:
             if latent.shape[1] != expected_hw[0] or latent.shape[2] != expected_hw[1]:
                 return None

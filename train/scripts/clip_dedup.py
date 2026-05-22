@@ -40,7 +40,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    LOG_DIR, write_heartbeat, log_event, log_orch, now_iso,
+    LOG_DIR, write_heartbeat, log_event, log_orch, now_iso, faiss_read_index_retry,
 )
 
 try:
@@ -400,7 +400,7 @@ def cmd_build_index(args) -> int:
     # Load existing state — cumulative across chunks
     if index_path.exists() and ids_path.exists():
         log_orch(f"build-index: extending existing index ({index_path.name})")
-        index       = faiss.read_index(str(index_path))
+        index       = faiss_read_index_retry(index_path)
         indexed_ids = set(ids_path.read_text().splitlines())
     else:
         index       = None
@@ -429,7 +429,11 @@ def cmd_build_index(args) -> int:
     prior_n = index.ntotal  # record before this batch is added (for incremental find-dups)
     index.add(vecs)
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(index_path))
+    _tmp = Path(str(index_path) + ".tmp")
+    faiss.write_index(index, str(_tmp))
+    with open(_tmp, "rb") as _f:
+        os.fsync(_f.fileno())
+    os.replace(_tmp, str(index_path))
     index_path.with_suffix(".prior_n").write_text(str(prior_n))
 
     with open(ids_path, "a") as f:
@@ -458,11 +462,19 @@ def cmd_find_dups(args) -> int:
     out_path   = Path(args.out)
     threshold  = args.threshold
 
+    if threshold != DUP_THRESHOLD:
+        log_orch(
+            f"find-dups: threshold={threshold} (non-default; DUP_THRESHOLD={DUP_THRESHOLD})",
+            level="warning",
+        )
+    else:
+        log_orch(f"find-dups: threshold={threshold}")
+
     if not index_path.exists():
         log_orch(f"find-dups: index not found ({index_path}) — skipping", level="warning")
         return 0
 
-    index   = faiss.read_index(str(index_path))
+    index   = faiss_read_index_retry(index_path)
     all_ids = ids_path.read_text().splitlines()
     n       = index.ntotal
 
@@ -672,7 +684,7 @@ def dedup_wds_tar(
         # Load or create index (only when caller did not pass one in).
         if index is None:
             if index_path.exists():
-                index = faiss.read_index(str(index_path))
+                index = faiss_read_index_retry(index_path)
             else:
                 index = faiss.IndexFlatIP(dim)
 

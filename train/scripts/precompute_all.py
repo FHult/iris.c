@@ -512,9 +512,9 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
             print(f"  [vae batch {_n}] n={len(batch_ids)} dt={_dt:.2f}s ({_dt/len(batch_ids):.3f}s/img)",
                   file=sys.stderr, flush=True)
         latents_np = np.array(latents.astype(mx.float32))
-        q_batch, scale_batch = _quantize_int8_batch(latents_np)
         for k, rec_id in enumerate(batch_ids):
-            _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q_batch[k], scale=scale_batch[k])
+            _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"),
+                             latent=latents_np[k].astype(np.float32))
         return len(batch_ids)
     except Exception as e:
         print(f"  VAE batch failed ({e}), retrying single", file=sys.stderr)
@@ -523,8 +523,8 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
             try:
                 latent = vae.encode(mx.array(img_np))
                 mx.eval(latent)
-                q, scale = _quantize_int8(np.array(latent[0].astype(mx.float32)))
-                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"), q=q, scale=scale)
+                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"),
+                                 latent=np.array(latent[0].astype(mx.float32)))
                 saved += 1
             except Exception as e2:
                 print(f"  Skipping {rec_id}: {e2}", file=sys.stderr)

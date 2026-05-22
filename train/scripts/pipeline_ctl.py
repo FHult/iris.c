@@ -53,7 +53,7 @@ from pipeline_lib import (
     VAL_SHARDS_DIR, VAL_PRECOMP_DIR,
     clear_error, mark_done, tmux_session_exists, tmux_window_exists,
     tmux_new_window, now_iso, read_heartbeat, heartbeat_age_secs,
-    load_config,
+    load_config, read_dispatch_issues,
 )
 
 
@@ -135,12 +135,7 @@ def cmd_mark_done(args) -> None:
 
 
 def cmd_dispatch_read(_args) -> None:
-    if not DISPATCH_QUEUE.exists():
-        print("No dispatch queue found")
-        return
-    lines = DISPATCH_QUEUE.read_text().strip().splitlines()
-    issues = [json.loads(l) for l in lines if l.strip()]
-    open_issues = [i for i in issues if not i.get("resolved")]
+    open_issues = read_dispatch_issues()
     if not open_issues:
         print("No open issues")
         return
@@ -164,9 +159,8 @@ def cmd_dispatch_resolve(args) -> None:
     if not DISPATCH_QUEUE.exists():
         print("No dispatch queue")
         return
-    # Verify the issue exists before appending a resolve marker.
-    lines = DISPATCH_QUEUE.read_text().strip().splitlines()
-    ids = {json.loads(l).get("id") for l in lines if l.strip()}
+    # Verify the issue exists (any state) before appending a resolve marker.
+    ids = {e.get("id") for e in read_dispatch_issues(include_resolved=True)}
     if issue_id not in ids:
         print(f"Issue {issue_id} not found")
         return

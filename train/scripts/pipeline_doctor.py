@@ -44,6 +44,7 @@ from pipeline_lib import (
     read_heartbeat, heartbeat_age_secs,
     last_exit_code, free_gb, now_iso,
     tmux_session_exists, tmux_window_exists, gpu_lock_holder,
+    read_dispatch_issues,
 )
 
 # ── colour codes ─────────────────────────────────────────────────────────────
@@ -1144,24 +1145,7 @@ def _check_orchestrator_log() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_dispatch_queue() -> None:
-    if not DISPATCH_QUEUE.exists():
-        return
-
-    try:
-        lines = DISPATCH_QUEUE.read_text(errors="replace").splitlines()
-    except OSError:
-        return
-
-    by_id: dict[str, dict] = {}
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        eid = entry.get("id", "unknown")
-        by_id[eid] = entry  # keep latest per id
-
-    open_issues = [e for e in by_id.values() if not e.get("resolved", False)]
+    open_issues = read_dispatch_issues()
     if not open_issues:
         return
 

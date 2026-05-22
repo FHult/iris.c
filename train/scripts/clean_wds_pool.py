@@ -38,7 +38,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     COLD_ROOT, COLD_METADATA_DIR,
-    write_heartbeat, log_orch,
+    write_heartbeat, log_orch, faiss_read_index_retry,
 )
 from clip_dedup import dedup_wds_tar, DUP_THRESHOLD
 
@@ -157,7 +157,7 @@ def main() -> None:
     faiss.omp_set_num_threads(1)
     if index_path.exists():
         print(f"Loading FAISS index from {index_path} ...", flush=True)
-        index = faiss.read_index(str(index_path))
+        index = faiss_read_index_retry(index_path)
         print(f"  loaded: {index.ntotal:,} vectors", flush=True)
     else:
         index = None  # dedup_wds_tar will create IndexFlatIP on first call
@@ -168,6 +168,8 @@ def main() -> None:
         index_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = index_path.with_suffix(".faiss.tmp")
         faiss.write_index(index, str(tmp))
+        with open(tmp, "rb") as _f:
+            os.fsync(_f.fileno())
         os.replace(str(tmp), str(index_path))
 
     try:

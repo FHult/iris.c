@@ -186,6 +186,12 @@ void iris_ip_adapter_get_kv(
 /*
  * iris_ip_adapter_inject — compute IP cross-attention and accumulate into img_hidden.
  *
+ * Q pre-normalisation contract:
+ *   img_q must be passed in ALREADY normalised (QK RMSNorm applied by the Flux
+ *   block before calling this function).  Do NOT re-normalise inside ip_inject().
+ *   The training path applies QK norm on the native self-attention Q/K, and the
+ *   same Q (post-norm) is reused for IP cross-attention.
+ *
  * Computes:
  *   attn = scaled_dot_product_attention(img_q, k_ip, v_ip)   // [img_seq, hidden_dim]
  *   img_hidden += ip_scale[block_idx] * attn
