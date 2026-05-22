@@ -57,10 +57,15 @@ flywheel:
 
   # Plateau detection — pause flywheel when cond_gap improvement stalls.
   # Set plateau_patience: 0 to disable.
-  # A plateau is declared when max(cond_gap) - min(cond_gap) over the last
-  # plateau_patience done iterations is < plateau_threshold.
+  # A plateau is declared when max(cond_gap over last N iters) - cond_gap[N iters ago]
+  # is below plateau_threshold (i.e. net improvement over the window is negligible).
+  # A secondary regression signal fires when the final value is below the window start.
   plateau_patience:   5          # require 5 consecutive done iters before declaring plateau
-  plateau_threshold:  0.02       # spread < 0.02 triggers pause (~half a typical cond_gap step)
+  plateau_threshold:  0.02       # net improvement < 0.02 triggers pause
+
+  # When plateau fires, run this many ablation trials before pausing so the
+  # operator resumes with fresh hyperparameter tuning. Set to 0 to disable.
+  plateau_ablation_runs: 4       # 4 targeted runs before the pause
 
   # Ablation integration — set ablation_every_n: 0 to disable
   ablation_every_n: 5            # trial 2: fire at iters 25, 30, 35, 40 (~4h overhead per burst at 4×1000 steps)

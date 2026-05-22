@@ -1595,7 +1595,7 @@ def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
                         db_best["db_ref_gap"]   = top.get("best_ref_gap")
                         db_best["clip_i_best"]  = top.get("clip_i_best")
                         db_best["total_steps"]  = top.get("total_steps")
-                        db_best["iters"]        = top.get("iterations_done")
+                        db_best["iters"]        = top.get("n_iterations")
                         db_best["status"]       = top.get("status")
             # Collect ablation context: any ablation runs tied to best campaign
             if db_best:
@@ -1827,7 +1827,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             "clip_i_best":   row.get("clip_i_best"),
             "clip_i_final":  row.get("clip_i_final"),
             "total_steps":   row.get("total_steps"),
-            "iterations_done": row.get("iterations_done"),
+            "n_iterations": row.get("n_iterations"),
             "superseded_by": row.get("superseded_by"),
         }
 
@@ -1852,7 +1852,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             rg     = r.get("best_ref_gap")
             ci     = r.get("clip_i_best")
             st     = r.get("total_steps") or 0
-            it     = r.get("iterations_done") or 0
+            it     = r.get("n_iterations") or 0
             status = r.get("status", "?")
             flag   = " *" if idx == 0 else ""
             cg_s = f"{cg:.4f}" if cg is not None else "—"
@@ -1914,8 +1914,8 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print(f"  {label:<16}  {_fv(ka):<{w+8}}  {_fv(kb):<{w+8}}")
     print(f"  {'total_steps':<16}  {sa['total_steps'] or '—'!s:<{w+8}}  "  # type: ignore[index]
           f"{sb['total_steps'] or '—'!s:<{w+8}}")                          # type: ignore[index]
-    print(f"  {'iterations':<16}  {sa['iterations_done'] or '—'!s:<{w+8}}  "  # type: ignore[index]
-          f"{sb['iterations_done'] or '—'!s:<{w+8}}")                          # type: ignore[index]
+    print(f"  {'iterations':<16}  {sa['n_iterations'] or '—'!s:<{w+8}}  "  # type: ignore[index]
+          f"{sb['n_iterations'] or '—'!s:<{w+8}}")                          # type: ignore[index]
     print(f"  {'status':<16}  {sa['status']!s:<{w+8}}  {sb['status']!s:<{w+8}}")  # type: ignore[index]
     if regressions:
         print(f"\n  Regressions (b worse than a):")

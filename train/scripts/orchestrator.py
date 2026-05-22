@@ -2611,7 +2611,7 @@ def _flywheel_report_only(fw_cfg: dict) -> None:
     score_db.close()
 
 
-def _run_flywheel_loop(fw_cfg: dict) -> None:
+def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     """
     Self-improving sref optimization flywheel.
 
@@ -2627,6 +2627,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         FlywheelDB, collect_metrics_from_log, render_flywheel_index,
         _checkpoint_hash, check_plateau, write_campaign_summary_json,
     )
+
     from shard_selector import (
         ShardScoreDB, scan_shard_pool, select_shards,
         stage_shards_for_iteration, render_shard_report,
@@ -2651,10 +2652,22 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         reports_dir = FLYWHEEL_REPORTS_DIR / name
         reports_dir.mkdir(parents=True, exist_ok=True)
 
+        # Record config path once so the doctor can find ablation_config without
+        # parsing logs.
+        if fw_cfg_path:
+            fw_db.set_config_path(name, fw_cfg_path)
+
         # Resume: start after the last recorded iteration
         prior     = fw_db.get_iterations(name)
         iteration = (max(r["iteration"] for r in prior) + 1) if prior else 1
         hyperparams = dict(fw_cfg.get("hyperparams", {}))
+
+        # On restart, merge previously persisted ablation-tuned hyperparams so we
+        # don't regress back to config defaults after a pause/resume cycle.
+        saved_hp = fw_db.get_best_hyperparams(name)
+        if saved_hp:
+            hyperparams.update(saved_hp)
+            log_orch(f"[flywheel:{name}] restored ablation hyperparams on restart: {saved_hp}")
 
         # Determine starting checkpoint.
         # Prefer the chronologically latest step_*.safetensors from CKPT_DIR so that
@@ -2684,8 +2697,12 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                  f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
                  f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
 
-        plateau_patience  = int(fw_cfg.get("plateau_patience",  0))
-        plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
+        plateau_patience         = int(fw_cfg.get("plateau_patience",       0))
+        plateau_threshold        = float(fw_cfg.get("plateau_threshold",    0.02))
+        # Max ablation runs to fire when plateau is detected. 0 = disabled.
+        # Allows one targeted hyperparameter search before the campaign pauses,
+        # so the operator resumes with fresh tuning rather than stale config defaults.
+        plateau_ablation_runs    = int(fw_cfg.get("plateau_ablation_runs",  0))
 
         while iteration <= max_iters:
             _check_flywheel_control(name, fw_db)
@@ -2912,6 +2929,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                     if new_hp:
                         hyperparams.update(new_hp)
                         log_orch(f"[flywheel:{name}] hyperparams updated → {hyperparams}")
+                        fw_db.set_best_hyperparams(name, hyperparams)
                     fw_db.update_iteration(
                         row_id=row_id, status=status,
                         exit_code=exit_code if exit_code is not None else -1,
@@ -2933,6 +2951,41 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 if plateau_reason:
                     log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
                              level="warning")
+
+                    # Fire an ablation burst before pausing so the operator resumes
+                    # with fresh hyperparameter tuning rather than stale config defaults.
+                    # Only fires when plateau_ablation_runs > 0 and ablation_config is set,
+                    # and only if this iteration hasn't already run a scheduled ablation.
+                    if plateau_ablation_runs > 0 and not ablation_run:
+                        # Temporarily override max_runs for this targeted burst
+                        _saved_max = fw_cfg.get("ablation_max_runs")
+                        fw_cfg["ablation_max_runs"] = plateau_ablation_runs
+                        plateau_abl_run = _run_flywheel_ablation(fw_cfg, name, iteration)
+                        if _saved_max is None:
+                            fw_cfg.pop("ablation_max_runs", None)
+                        else:
+                            fw_cfg["ablation_max_runs"] = _saved_max
+                        if plateau_abl_run:
+                            new_hp = _read_ablation_best(plateau_abl_run)
+                            if new_hp:
+                                hyperparams.update(new_hp)
+                                fw_db.set_best_hyperparams(name, hyperparams)
+                                log_orch(f"[flywheel:{name}] plateau ablation updated hyperparams "
+                                         f"→ {hyperparams}")
+                            # Record the plateau ablation on the current iteration row
+                            fw_db.update_iteration(
+                                row_id=row_id, status=status,
+                                exit_code=exit_code if exit_code is not None else -1,
+                                elapsed_secs=elapsed,
+                                train_loss=metrics.get("loss_smooth"),
+                                ref_gap=metrics.get("ref_gap"),
+                                cond_gap=metrics.get("cond_gap"),
+                                checkpoint=ckpt_path,
+                                checkpoint_hash=new_ckpt_hash,
+                                ablation_run=plateau_abl_run,
+                            )
+                            fw_db.refresh_campaign_summary(name)
+
                     fw_db.set_campaign_status(name, "plateau")
                     try:
                         FLYWHEEL_CONTROL_FILE.write_text(
@@ -3060,7 +3113,7 @@ def main() -> None:
         if args.report_only:
             _flywheel_report_only(fw_cfg)
         else:
-            _run_flywheel_loop(fw_cfg)
+            _run_flywheel_loop(fw_cfg, str(Path(args.flywheel_config).resolve()))
         sys.exit(0)
 
     try:

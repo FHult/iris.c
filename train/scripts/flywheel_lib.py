@@ -126,6 +126,17 @@ _V4_MIGRATIONS = [
     "INSERT OR IGNORE INTO _meta VALUES ('schema_version', '4')",
 ]
 
+_V5_MIGRATIONS = [
+    # Ablation-tuned hyperparams serialised as JSON; written after each successful
+    # ablation burst and read back on orchestrator restart so restarts inherit tuning.
+    "ALTER TABLE campaign_summary ADD COLUMN best_hyperparams TEXT",
+    # Absolute path to the flywheel YAML config used to launch this campaign.
+    # Written once at campaign start; lets the doctor find ablation_config without
+    # parsing logs.
+    "ALTER TABLE campaign_summary ADD COLUMN config_path TEXT",
+    "INSERT OR REPLACE INTO _meta VALUES ('schema_version', '5')",
+]
+
 
 def _checkpoint_hash(ckpt_path: Optional[str]) -> str:
     """Stable 12-char version tag derived from the checkpoint filename."""
@@ -149,6 +160,11 @@ class FlywheelDB:
             except Exception:
                 pass
         for _mig in _V4_MIGRATIONS:
+            try:
+                self._conn.execute(_mig)
+            except Exception:
+                pass
+        for _mig in _V5_MIGRATIONS:
             try:
                 self._conn.execute(_mig)
             except Exception:
@@ -352,6 +368,49 @@ class FlywheelDB:
                 """, (status, ts, name))
             self._conn.commit()
 
+    def set_best_hyperparams(self, name: str, hyperparams: dict) -> None:
+        """Persist ablation-tuned hyperparams so orchestrator restarts inherit them."""
+        import json as _json
+        ts = now_iso()
+        encoded = _json.dumps(hyperparams, sort_keys=True)
+        with self._lock:
+            self._conn.execute("""
+                INSERT OR IGNORE INTO campaign_summary (flywheel_name, status, ts_first, ts_last)
+                VALUES (?, 'active', ?, ?)
+            """, (name, ts, ts))
+            self._conn.execute("""
+                UPDATE campaign_summary SET best_hyperparams=?, ts_last=? WHERE flywheel_name=?
+            """, (encoded, ts, name))
+            self._conn.commit()
+
+    def get_best_hyperparams(self, name: str) -> Optional[dict]:
+        """Return persisted ablation-tuned hyperparams, or None if none recorded."""
+        import json as _json
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT best_hyperparams FROM campaign_summary WHERE flywheel_name=?",
+                (name,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return _json.loads(row[0])
+        except Exception:
+            return None
+
+    def set_config_path(self, name: str, config_path: str) -> None:
+        """Record the absolute path of the flywheel YAML used to launch this campaign."""
+        ts = now_iso()
+        with self._lock:
+            self._conn.execute("""
+                INSERT OR IGNORE INTO campaign_summary (flywheel_name, status, ts_first, ts_last)
+                VALUES (?, 'active', ?, ?)
+            """, (name, ts, ts))
+            self._conn.execute("""
+                UPDATE campaign_summary SET config_path=? WHERE flywheel_name=?
+            """, (config_path, name))
+            self._conn.commit()
+
     def get_non_superseded_campaigns(self) -> list[dict]:
         """Return campaign summaries excluding superseded ones, best cond_gap first."""
         with self._lock:
@@ -534,9 +593,16 @@ def collect_metrics_from_log(log_path: Path) -> dict:
 def check_plateau(done_iters: list[dict], patience: int, threshold: float) -> Optional[str]:
     """Return a reason string if cond_gap has plateaued over the last `patience` iterations.
 
-    A plateau is detected when the spread (max − min) of cond_gap across the
-    last `patience` done iterations is smaller than `threshold`.  Returns None
-    when there is insufficient data or no plateau.
+    Plateau is declared when the net improvement over the window is below `threshold`:
+        max(window) - window[0] < threshold
+
+    This asks "did we make meaningful progress from where the window started?"
+    A rising trend with low noise correctly passes; a flat or regressing run fails.
+
+    A secondary regression signal fires when the final value is strictly below
+    the window-start value, regardless of threshold.
+
+    Returns None when there is insufficient data or no plateau.
     """
     if patience <= 0 or len(done_iters) < patience:
         return None
@@ -544,12 +610,23 @@ def check_plateau(done_iters: list[dict], patience: int, threshold: float) -> Op
     vals   = [i.get("cond_gap") for i in recent if i.get("cond_gap") is not None]
     if len(vals) < patience:
         return None
-    spread = max(vals) - min(vals)
-    if spread < threshold:
+
+    window_start = vals[0]
+    window_max   = max(vals)
+    window_mean  = sum(vals) / len(vals)
+    improvement  = window_max - window_start
+
+    if vals[-1] < window_start:
+        return (
+            f"cond_gap regression over last {patience} iterations "
+            f"(final={vals[-1]:.4f} < start={window_start:.4f}, "
+            f"mean={window_mean:.4f})"
+        )
+    if improvement < threshold:
         return (
             f"cond_gap plateau over last {patience} iterations "
-            f"(spread={spread:.4f} < threshold={threshold:.4f}, "
-            f"mean={sum(vals)/len(vals):.4f})"
+            f"(improvement={improvement:.4f} < threshold={threshold:.4f}, "
+            f"mean={window_mean:.4f})"
         )
     return None
 

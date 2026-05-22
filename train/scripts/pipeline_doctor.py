@@ -1776,27 +1776,65 @@ def _check_campaign_state() -> None:
     except Exception:
         return
 
+    venv_py = str(Path("train/.venv/bin/python").resolve())
+    scripts  = str(Path("train/scripts").resolve())
     now = time.time()
+
     for c in campaigns:
-        name   = c.get("flywheel_name", "?")
-        status = c.get("status", "active")
-        ts     = c.get("ts_last")
-        iters  = c.get("iterations_done", 0) or 0
-        best   = c.get("best_cond_gap")
+        name        = c.get("flywheel_name", "?")
+        status      = c.get("status", "active")
+        ts          = c.get("ts_last")
+        iters       = c.get("n_iterations", 0) or 0
+        best        = c.get("best_cond_gap")
+        config_path = c.get("config_path")
 
         if status == "plateau":
-            detail = (
-                f"best_cond_gap={best:.4f}. "
-                f"Resume or mark completed: pipeline_ctl.py mark-campaign-completed {name}"
-                if best is not None else
-                f"No quality signal yet. "
-                f"Resume or mark completed: pipeline_ctl.py mark-campaign-completed {name}"
+            best_s = f"{best:.4f}" if best is not None else "—"
+
+            # Try to load flywheel config to find ablation settings
+            abl_config: Optional[str] = None
+            plateau_abl_runs = 0
+            if config_path and Path(config_path).exists():
+                try:
+                    import yaml as _yaml
+                    with open(config_path) as _f:
+                        _raw = _yaml.safe_load(_f)
+                    _fw = _raw.get("flywheel", _raw)
+                    abl_config        = _fw.get("ablation_config")
+                    plateau_abl_runs  = int(_fw.get("plateau_ablation_runs", 0))
+                except Exception:
+                    pass
+
+            # Build the action list for detail text
+            actions: list[str] = []
+            if abl_config and plateau_abl_runs == 0:
+                # Ablation config present but plateau_ablation_runs disabled — suggest manual burst
+                actions.append(
+                    f"Run targeted ablation: {venv_py} {scripts}/ablation_harness.py "
+                    f"--config {abl_config} --max-runs 4"
+                )
+            elif abl_config and plateau_abl_runs > 0:
+                actions.append(
+                    f"Ablation will auto-fire on next resume ({plateau_abl_runs} runs); "
+                    f"or run manually: {venv_py} {scripts}/ablation_harness.py "
+                    f"--config {abl_config} --max-runs {plateau_abl_runs}"
+                )
+            actions.append(
+                f"Warmstart new campaign: {venv_py} {scripts}/data_explorer.py "
+                f"suggest-warmstart --config {config_path}" if config_path else
+                "Warmstart new campaign: data_explorer.py suggest-warmstart --config <cfg>"
             )
-            _add("INFO", "flywheel",
-                 f"Campaign '{name}' is on plateau after {iters} iteration(s)",
-                 detail=detail,
-                 fix=f"train/.venv/bin/python train/scripts/pipeline_ctl.py "
-                     f"mark-campaign-completed {name}")
+            actions.append(
+                f"Mark completed: {venv_py} {scripts}/pipeline_ctl.py "
+                f"mark-campaign-completed {name}"
+            )
+
+            _add("WARNING", "flywheel",
+                 f"Campaign '{name}' on plateau — best_cond_gap={best_s} after {iters} iter(s)",
+                 detail=" | ".join(actions),
+                 fix=f"{venv_py} {scripts}/pipeline_ctl.py resume-flywheel",
+                 ctx={"campaign": name, "best_cond_gap": best, "n_iterations": iters,
+                      "config_path": config_path, "ablation_config": abl_config})
             continue
 
         if status != "active":
@@ -1809,7 +1847,7 @@ def _check_campaign_state() -> None:
                  f"Campaign '{name}' active but last DB update {age_h}h ago",
                  detail="Orchestrator may have stopped without updating campaign status. "
                         "Check orchestrator log or run pipeline_ctl.py status.",
-                 fix="train/.venv/bin/python train/scripts/pipeline_ctl.py status",
+                 fix=f"{venv_py} {scripts}/pipeline_ctl.py status",
                  ctx={"campaign": name, "age_h": age_h})
 
         if iters >= 3 and best is None:
@@ -1817,8 +1855,8 @@ def _check_campaign_state() -> None:
                  f"Campaign '{name}' has {iters} iterations but no quality signal",
                  detail="best_cond_gap is NULL — validation may not be running or "
                         "refresh_campaign_summary has not been called.",
-                 fix="train/.venv/bin/python train/scripts/pipeline_ctl.py status",
-                 ctx={"campaign": name, "iterations_done": iters})
+                 fix=f"{venv_py} {scripts}/pipeline_ctl.py status",
+                 ctx={"campaign": name, "n_iterations": iters})
 
 
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
