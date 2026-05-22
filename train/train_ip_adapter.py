@@ -420,7 +420,7 @@ def load_ema_from_checkpoint(path: str) -> Optional[dict]:
     """
     Load EMA parameters from a checkpoint file. Handles two formats:
       - step_*.safetensors: keys prefixed with "ema." (written by save_checkpoint)
-      - best.safetensors:   bare keys, no prefix (written by save_ema)
+      - best.safetensors:   bare keys, no prefix (legacy format)
     Returns a nested dict matching adapter.parameters() structure, or None if
     the file contains no recognisable EMA or adapter keys.
     """
@@ -434,7 +434,7 @@ def load_ema_from_checkpoint(path: str) -> Optional[dict]:
                 if k.startswith("ema."):
                     flat[k[4:]] = mx.array(f.get_tensor(k))
             else:
-                # bare keys — save_ema() export (e.g. best.safetensors)
+                # bare keys — legacy format (e.g. best.safetensors)
                 flat[k] = mx.array(f.get_tensor(k))
     if not flat:
         return None

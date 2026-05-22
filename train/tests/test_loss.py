@@ -4,7 +4,6 @@ train/tests/test_loss.py — Unit tests for flow matching loss functions.
 Tests correctness of:
   - get_schedule_values: linear schedule boundary and midpoint values
   - fused_flow_noise: v-prediction formula (noisy, target)
-  - flow_matching_loss: MSE scalar, zero when velocity == target
   - per-sample timestep broadcast over [B, C, H, W]
   - gram_matrix / gram_style_loss: shape, symmetry, zero-input, gradient
   - Metal kernel path vs MLX fallback: parity within bf16 tolerance
@@ -21,7 +20,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ip_adapter.loss import (
     get_schedule_values,
     fused_flow_noise,
-    flow_matching_loss,
     gram_matrix,
     gram_style_loss,
     reconstruct_x0,
@@ -169,71 +167,6 @@ class TestFusedFlowNoise:
         assert target.shape == (B, C, H, W)
 
 
-# ---------------------------------------------------------------------------
-# flow_matching_loss
-# ---------------------------------------------------------------------------
-
-class TestFlowMatchingLoss:
-    def test_scalar_output(self):
-        """Loss is a scalar."""
-        rng = np.random.default_rng(1)
-        vel    = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        latent = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        noise  = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        alpha, sigma = get_schedule_values(mx.array([500, 500]))
-        loss = flow_matching_loss(vel, latent, noise, alpha, sigma)
-        mx.eval(loss)
-        assert loss.shape == ()
-        assert float(loss.item()) >= 0.0
-
-    def test_zero_when_velocity_equals_target(self):
-        """Loss = 0 when model predicts the exact v-prediction target."""
-        rng = np.random.default_rng(2)
-        latent = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        noise  = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        alpha, sigma = get_schedule_values(mx.array([300, 700]))
-        _, target = fused_flow_noise(latent, noise, alpha, sigma)
-        # Perfect prediction
-        loss = flow_matching_loss(target, latent, noise, alpha, sigma)
-        mx.eval(loss)
-        assert float(loss.item()) < 1e-8
-
-    def test_loss_increases_with_error(self):
-        """Loss increases when the prediction is further from target."""
-        rng = np.random.default_rng(3)
-        latent = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        noise  = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32))
-        alpha, sigma = get_schedule_values(mx.array([500, 500]))
-        _, target = fused_flow_noise(latent, noise, alpha, sigma)
-
-        small_err = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32)) * 0.01
-        large_err = mx.array(rng.standard_normal((2, 32, 4, 4)).astype(np.float32)) * 10.0
-
-        loss_small = flow_matching_loss(target + small_err, latent, noise, alpha, sigma)
-        loss_large = flow_matching_loss(target + large_err, latent, noise, alpha, sigma)
-        mx.eval(loss_small, loss_large)
-        assert float(loss_large.item()) > float(loss_small.item())
-
-    def test_gradient_computable(self):
-        """Loss.backward() does not crash — gradient flows through."""
-        import mlx.core as mx
-
-        rng = np.random.default_rng(4)
-        vel    = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
-        latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
-        noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
-        alpha, sigma = get_schedule_values(mx.array([500]))
-
-        def loss_fn(v):
-            return flow_matching_loss(v, latent, noise, alpha, sigma)
-
-        grad_fn = mx.grad(loss_fn)
-        grad = grad_fn(vel)
-        mx.eval(grad)
-        assert grad.shape == vel.shape
-        # Gradient should not be all zeros
-        assert float(mx.max(mx.abs(grad)).item()) > 0
-
 
 # ---------------------------------------------------------------------------
 # gram_matrix
@@ -273,16 +206,16 @@ class TestGramMatrix:
         assert float(mx.max(mx.abs(g)).item()) < 1e-7
 
     def test_normalization_scale(self):
-        """gram_matrix centres channels then divides by C*H*W."""
+        """gram_matrix centres channels then divides by H*W (not C*H*W)."""
         rng = np.random.default_rng(12)
         B, C, H, W = 1, 4, 3, 3
         x = mx.array(rng.standard_normal((B, C, H, W)).astype(np.float32))
         g = gram_matrix(x)
-        # Manual: centre per-channel, then G = f_c @ f_c.T / (C*H*W)
+        # Manual: centre per-channel, then G = f_c @ f_c.T / (H*W)
         x_np = np.array(x)
         f = x_np.reshape(B, C, H * W)
         f_c = f - f.mean(axis=-1, keepdims=True)
-        expected = np.matmul(f_c, f_c.transpose(0, 2, 1)) / (C * H * W)
+        expected = np.matmul(f_c, f_c.transpose(0, 2, 1)) / (H * W)
         mx.eval(g)
         assert np.allclose(np.array(g), expected, atol=1e-5)
 
@@ -588,14 +521,15 @@ class TestLossNumericalStability:
         assert np.all(np.isfinite(np.array(target.astype(mx.float32))))
 
     def test_flow_loss_gradient_finite_at_t0(self):
-        """Gradient through loss is finite even at t=0 (sigma=0, pure signal)."""
+        """Gradient through MSE loss is finite even at t=0 (sigma=0, pure signal)."""
         rng = np.random.default_rng(44)
         vel    = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
         latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
         noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
         alpha  = mx.array([1.0])
         sigma  = mx.array([0.0])
-        grad = mx.grad(lambda v: flow_matching_loss(v, latent, noise, alpha, sigma))(vel)
+        _, target = fused_flow_noise(latent, noise, alpha, sigma)
+        grad = mx.grad(lambda v: mx.mean((v - target) ** 2))(vel)
         mx.eval(grad)
         assert np.all(np.isfinite(np.array(grad)))
 

@@ -30,17 +30,6 @@ def update_ema(
     )
 
 
-def load_ema(path: str) -> dict:
-    """Load EMA parameters from safetensors into a flat dict."""
-    from safetensors import safe_open
-
-    params = {}
-    with safe_open(path, framework="numpy") as f:
-        for k in f.keys():
-            params[k] = mx.array(f.get_tensor(k))
-    return params
-
-
 def _flatten(params, prefix=""):
     """Flatten nested dict to [(key, mx.array)] pairs."""
     items = []
