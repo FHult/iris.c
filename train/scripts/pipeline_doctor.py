@@ -1776,8 +1776,9 @@ def _check_campaign_state() -> None:
     except Exception:
         return
 
-    venv_py = str(Path("train/.venv/bin/python").resolve())
-    scripts  = str(Path("train/scripts").resolve())
+    venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    scripts  = str(SCRIPTS_DIR)
+    ctl      = str(SCRIPTS_DIR / "pipeline_ctl.py")
     now = time.time()
 
     for c in campaigns:
@@ -1807,32 +1808,37 @@ def _check_campaign_state() -> None:
 
             # Build the action list for detail text
             actions: list[str] = []
-            if abl_config and plateau_abl_runs == 0:
-                # Ablation config present but plateau_ablation_runs disabled — suggest manual burst
+            if abl_config and plateau_abl_runs > 0:
+                # Plateau ablation fires at detection time (before pause), not on resume.
+                # If it already ran, best_hyperparams are persisted in the DB and will be
+                # restored automatically on the next orchestrator start.
+                actions.append(
+                    f"Ablation burst fired at plateau ({plateau_abl_runs} runs); "
+                    f"persisted hyperparams will be restored on resume. "
+                    f"Or run manually: {venv_py} {scripts}/ablation_harness.py "
+                    f"--config '{abl_config}' --max-runs {plateau_abl_runs}"
+                )
+            elif abl_config:
+                # plateau_ablation_runs disabled — suggest a manual burst
                 actions.append(
                     f"Run targeted ablation: {venv_py} {scripts}/ablation_harness.py "
-                    f"--config {abl_config} --max-runs 4"
+                    f"--config '{abl_config}' --max-runs 4"
                 )
-            elif abl_config and plateau_abl_runs > 0:
-                actions.append(
-                    f"Ablation will auto-fire on next resume ({plateau_abl_runs} runs); "
-                    f"or run manually: {venv_py} {scripts}/ablation_harness.py "
-                    f"--config {abl_config} --max-runs {plateau_abl_runs}"
-                )
+            # suggest-warmstart requires a pipeline config (not the flywheel config);
+            # give the command form without guessing the path.
             actions.append(
-                f"Warmstart new campaign: {venv_py} {scripts}/data_explorer.py "
-                f"suggest-warmstart --config {config_path}" if config_path else
-                "Warmstart new campaign: data_explorer.py suggest-warmstart --config <cfg>"
+                "Warmstart new campaign: "
+                f"{venv_py} {scripts}/data_explorer.py "
+                "suggest-warmstart --config <pipeline_config.yaml>"
             )
             actions.append(
-                f"Mark completed: {venv_py} {scripts}/pipeline_ctl.py "
-                f"mark-campaign-completed {name}"
+                f"Mark completed: {venv_py} {ctl} mark-campaign-completed {name}"
             )
 
             _add("WARNING", "flywheel",
                  f"Campaign '{name}' on plateau — best_cond_gap={best_s} after {iters} iter(s)",
                  detail=" | ".join(actions),
-                 fix=f"{venv_py} {scripts}/pipeline_ctl.py resume-flywheel",
+                 fix=f"{venv_py} {ctl} resume-flywheel",
                  ctx={"campaign": name, "best_cond_gap": best, "n_iterations": iters,
                       "config_path": config_path, "ablation_config": abl_config})
             continue
@@ -1847,7 +1853,7 @@ def _check_campaign_state() -> None:
                  f"Campaign '{name}' active but last DB update {age_h}h ago",
                  detail="Orchestrator may have stopped without updating campaign status. "
                         "Check orchestrator log or run pipeline_ctl.py status.",
-                 fix=f"{venv_py} {scripts}/pipeline_ctl.py status",
+                 fix=f"{venv_py} {ctl} status",
                  ctx={"campaign": name, "age_h": age_h})
 
         if iters >= 3 and best is None:
@@ -1855,7 +1861,7 @@ def _check_campaign_state() -> None:
                  f"Campaign '{name}' has {iters} iterations but no quality signal",
                  detail="best_cond_gap is NULL — validation may not be running or "
                         "refresh_campaign_summary has not been called.",
-                 fix=f"{venv_py} {scripts}/pipeline_ctl.py status",
+                 fix=f"{venv_py} {ctl} status",
                  ctx={"campaign": name, "n_iterations": iters})
 
 
