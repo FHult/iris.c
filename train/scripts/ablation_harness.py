@@ -1687,13 +1687,15 @@ def _warm_start_candidate(warm_start_dir: Path, run_name: str,
         return None
     try:
         prior = AblationDB(db_path)
-        best_list = prior.get_best(run_name, 1)
-        if not best_list:
-            for name in prior.get_all_run_names():
-                best_list = prior.get_best(name, 1)
-                if best_list:
-                    break
-        prior.close()
+        try:
+            best_list = prior.get_best(run_name, 1)
+            if not best_list:
+                for name in prior.get_all_run_names():
+                    best_list = prior.get_best(name, 1)
+                    if best_list:
+                        break
+        finally:
+            prior.close()
         if not best_list:
             print("WARNING: --warm-start-from DB has no scored experiments", file=sys.stderr)
             return None
@@ -1776,7 +1778,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     run_name          = harness_cfg.get("name", "default")
     max_runs          = int(harness_cfg.get("max_total_runs", 100))
     steps             = int(harness_cfg.get("steps_per_run", 8000))
-    strategy          = harness_cfg.get("strategy", "random")
+    strategy          = harness_cfg.get("strategy", "random").lower()
     objective         = harness_cfg.get("objective", {})
     variables         = harness_cfg.get("variables", {})
     conditions        = harness_cfg.get("conditions", [])

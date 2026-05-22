@@ -376,7 +376,7 @@ The ablation HTML report shows a sortable table with an `is_pareto` flag column.
 
 `shard_selector.py score_update()` computes a cumulative running mean: older iterations count equally with recent ones. After 20+ flywheel iterations a shard's score is dominated by its earliest runs, which may have been under a very different hyperparam regime (before ablation tuning). Add exponential moving average (EMA) weighting in `score_update` with a configurable `temporal_decay` (default 0.85 — each new iteration counts as 85% new, 15% history). The existing `n_scored` counter is preserved for confidence estimation. Add `temporal_decay` as a top-level config option in `shard_selector.yaml` / flywheel YAML.
 
-**Success criteria:** After 10 simulated score updates, the EMA-weighted mean responds to a regime change (scores flip from 0.3→0.7) in 3 iterations vs 10+ for the flat mean. Old campaigns unaffected (temporal_decay=1.0 is equivalent to flat mean).
+**Success criteria:** After 10 simulated score updates, the EMA-weighted mean responds to a regime change (scores flip from 0.3→0.7) in 3 iterations vs 10+ for the flat mean. Old campaigns unaffected (omitting `temporal_decay` keeps the existing equal-weight cumulative mean; temporal_decay=1.0 gives last-value, not flat mean).
 
 ---
 
