@@ -1552,40 +1552,103 @@ def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
 
     cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
     cold_weights = cold_root / "weights"
-    campaigns    = _list_campaigns(cold_weights)
 
-    if not campaigns:
-        r = {"ok": True, "recommendation": "train_from_scratch",
-             "reason": "No archived weights found."}
-        _json_print(r) if args.json else print("Recommendation: train from scratch (no archived weights).")
-        return 0
+    # ── Phase 1: find best checkpoint via FlywheelDB ──────────────────────────
+    db_best: Optional[dict] = None
+    ablation_context: list[dict] = []
+    if _HAS_FLYWHEEL_DB and FLYWHEEL_DB_PATH.exists():
+        try:
+            fw = FlywheelDB(FLYWHEEL_DB_PATH)
+            summaries = fw.get_campaign_summaries()
+            fw.close()
+            # Filter to completed/plateau (not active/superseded) with quality signal
+            scored = [s for s in summaries
+                      if s.get("status") in ("completed", "plateau")
+                      and s.get("best_cond_gap") is not None]
+            scored.sort(key=lambda s: s["best_cond_gap"], reverse=True)
+            if scored:
+                top = scored[0]
+                camp_name = top["flywheel_name"]
+                camp_dir  = cold_weights / f"flywheel-{camp_name}"
+                if camp_dir.exists():
+                    # Find the checkpoint file with the highest cond_gap in that campaign
+                    fs_best: Optional[dict] = None
+                    for sf in sorted(camp_dir.iterdir()):
+                        if sf.suffix != ".safetensors" or sf.stem == "final":
+                            continue
+                        j = sf.with_suffix(".json")
+                        if not j.exists():
+                            continue
+                        try:
+                            meta = json.loads(j.read_text())
+                        except (ValueError, OSError):
+                            continue
+                        cg = meta.get("cond_gap")
+                        if cg is None:
+                            continue
+                        if fs_best is None or cg > fs_best["cond_gap"]:
+                            fs_best = {"cond_gap": cg, "path": str(sf),
+                                       "campaign": camp_name, "meta": meta}
+                    if fs_best:
+                        db_best = fs_best
+                        db_best["db_cond_gap"]  = top.get("best_cond_gap")
+                        db_best["db_ref_gap"]   = top.get("best_ref_gap")
+                        db_best["clip_i_best"]  = top.get("clip_i_best")
+                        db_best["total_steps"]  = top.get("total_steps")
+                        db_best["iters"]        = top.get("iterations_done")
+                        db_best["status"]       = top.get("status")
+            # Collect ablation context: any ablation runs tied to best campaign
+            if db_best:
+                try:
+                    from ablation_lib import AblationDB
+                    abl_db_path = COLD_METADATA_DIR / "ablation_history.db"
+                    if not abl_db_path.exists():
+                        from pipeline_lib import DATA_ROOT as _DR
+                        abl_db_path = _DR / "ablation_history.db"
+                    if abl_db_path.exists():
+                        adb = AblationDB(abl_db_path)
+                        runs = adb.get_runs(campaign=db_best["campaign"])
+                        adb.close()
+                        ablation_context = [{"run_id": r.get("run_id"),
+                                             "cond_gap": r.get("cond_gap"),
+                                             "config_delta": r.get("config_delta")}
+                                            for r in (runs or [])]
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    best: Optional[dict] = None
-    for camp in reversed(campaigns):
-        for sf in sorted(camp.iterdir()):
-            if sf.suffix != ".safetensors" or sf.stem == "final":
-                continue
-            j = sf.with_suffix(".json")
-            if not j.exists():
-                continue
-            try:
-                meta = json.loads(j.read_text())
-            except (ValueError, OSError):
-                continue
-            cg = meta.get("cond_gap")
-            if cg is None:
-                continue
-            if best is None or cg > best["cond_gap"]:
-                best = {"cond_gap": cg, "path": str(sf),
-                        "campaign": camp.name, "meta": meta}
+    best = db_best
+
+    # ── Phase 2: filesystem fallback if DB gave nothing ───────────────────────
+    if best is None:
+        campaigns = _list_campaigns(cold_weights)
+        for camp in reversed(campaigns):
+            for sf in sorted(camp.iterdir()):
+                if sf.suffix != ".safetensors" or sf.stem == "final":
+                    continue
+                j = sf.with_suffix(".json")
+                if not j.exists():
+                    continue
+                try:
+                    meta = json.loads(j.read_text())
+                except (ValueError, OSError):
+                    continue
+                cg = meta.get("cond_gap")
+                if cg is None:
+                    continue
+                if best is None or cg > best["cond_gap"]:
+                    best = {"cond_gap": cg, "path": str(sf),
+                            "campaign": camp.name, "meta": meta}
 
     if best is None:
-        r = {"ok": True, "recommendation": "train_from_scratch",
-             "reason": "No checkpoints with cond_gap metrics found."}
-        _json_print(r) if args.json else print("Recommendation: train from scratch (no scored checkpoints).")
+        r: dict = {"ok": True, "recommendation": "train_from_scratch",
+                   "reason": "No scored checkpoints found in DB or cold storage."}
+        _json_print(r) if args.json else print(
+            "Recommendation: train from scratch (no scored checkpoints).")
         return 0
 
-    result = {
+    result: dict = {
         "ok":             True,
         "recommendation": "warmstart",
         "warmstart_path": best["path"],
@@ -1593,14 +1656,38 @@ def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
         "cond_gap":       best["cond_gap"],
         "cli_flags":      f"--warmstart \"{best['path']}\"",
     }
+    if ablation_context:
+        result["ablation_runs"] = len(ablation_context)
+        best_abl = max(ablation_context, key=lambda r: r.get("cond_gap") or 0.0,
+                       default=None)
+        if best_abl and best_abl.get("cond_gap"):
+            result["best_ablation_cond_gap"] = best_abl["cond_gap"]
+    for k in ("db_cond_gap", "db_ref_gap", "clip_i_best", "total_steps", "iters", "status"):
+        if k in best:
+            result[k] = best[k]
     if args.json:
         _json_print(result)
         return 0
 
     print(f"\n  Recommended warmstart:")
-    print(f"    campaign  : {best['campaign']}")
-    print(f"    checkpoint: {best['path']}")
-    print(f"    cond_gap  : {best['cond_gap']:.4f}")
+    print(f"    campaign   : {best['campaign']}")
+    print(f"    checkpoint : {best['path']}")
+    print(f"    cond_gap   : {best['cond_gap']:.4f}")
+    if best.get("db_ref_gap") is not None:
+        print(f"    ref_gap    : {best['db_ref_gap']:.4f}")
+    if best.get("clip_i_best") is not None:
+        print(f"    clip_i     : {best['clip_i_best']:.4f}")
+    if best.get("total_steps"):
+        print(f"    total steps: {best['total_steps']}")
+    if best.get("iters"):
+        print(f"    iterations : {best['iters']}")
+    if best.get("status"):
+        print(f"    status     : {best['status']}")
+    if ablation_context:
+        print(f"    ablation runs in this campaign: {len(ablation_context)}")
+        ba = max(ablation_context, key=lambda r: r.get("cond_gap") or 0.0, default=None)
+        if ba and ba.get("cond_gap"):
+            print(f"    best ablation cond_gap: {ba['cond_gap']:.4f}")
     print(f"\n  Use: {result['cli_flags']}\n")
     return 0
 
@@ -1715,65 +1802,125 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             cfg = load_config(args.config)
         except FileNotFoundError:
             pass
-    cold_root    = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
-    cold_weights = cold_root / "weights"
+    cold_root = Path(cfg.get("storage", {}).get("cold_root", COLD_ROOT))
 
-    def _load(date: str) -> Optional[dict]:
-        d = cold_weights / f"flywheel-{date}"
-        if not d.exists():
+    # ── collect summaries from FlywheelDB ────────────────────────────────────
+    db_rows: dict[str, dict] = {}
+    if _HAS_FLYWHEEL_DB and FLYWHEEL_DB_PATH.exists():
+        try:
+            fw = FlywheelDB(FLYWHEEL_DB_PATH)
+            for row in fw.get_campaign_summaries():
+                db_rows[row["flywheel_name"]] = row
+            fw.close()
+        except Exception:
+            pass
+
+    def _row_to_summary(name: str) -> Optional[dict]:
+        row = db_rows.get(name)
+        if row is None:
             return None
-        steps: list[dict] = []
-        for sf in sorted(d.iterdir()):
-            if sf.suffix != ".safetensors" or sf.stem == "final":
-                continue
-            j = sf.with_suffix(".json")
-            if j.exists():
-                try:
-                    steps.append(json.loads(j.read_text()))
-                except (ValueError, OSError):
-                    pass
-        return {"name": d.name, "steps": steps}
+        return {
+            "name":        name,
+            "status":      row.get("status", "unknown"),
+            "best_cond_gap": row.get("best_cond_gap"),
+            "best_ref_gap":  row.get("best_ref_gap"),
+            "clip_i_best":   row.get("clip_i_best"),
+            "clip_i_final":  row.get("clip_i_final"),
+            "total_steps":   row.get("total_steps"),
+            "iterations_done": row.get("iterations_done"),
+            "superseded_by": row.get("superseded_by"),
+        }
 
-    a, b = _load(args.campaign_a), _load(args.campaign_b)
-    missing = [d for d, v in ((args.campaign_a, a), (args.campaign_b, b)) if v is None]
-    if missing:
-        msg = f"campaigns not found: {', '.join(missing)}"
+    # ── --all mode: rank every non-superseded campaign ────────────────────────
+    if getattr(args, "all", False):
+        rows = [r for r in db_rows.values() if r.get("status") != "superseded"]
+        rows.sort(key=lambda r: (r.get("best_cond_gap") or 0.0), reverse=True)
+        if not rows:
+            msg = "No campaigns in FlywheelDB."
+            _json_print({"ok": True, "campaigns": []}) if args.json else print(msg)
+            return 0
         if args.json:
-            _json_print({"ok": False, "error": msg})
-        else:
-            print(f"ERROR: {msg}")
+            _json_print({"ok": True, "campaigns": [_row_to_summary(r["flywheel_name"]) for r in rows]})
+            return 0
+        w = 10
+        print(f"\n  {'name':<24}  {'status':<12}  {'cond_gap':>{w}}  {'ref_gap':>{w}}  "
+              f"{'clip_i':>{w}}  {'steps':>8}  {'iters':>5}")
+        print(f"  {'─'*24}  {'─'*12}  {'─'*w}  {'─'*w}  {'─'*w}  {'─'*8}  {'─'*5}")
+        for idx, r in enumerate(rows):
+            name   = r.get("flywheel_name", "?")
+            cg     = r.get("best_cond_gap")
+            rg     = r.get("best_ref_gap")
+            ci     = r.get("clip_i_best")
+            st     = r.get("total_steps") or 0
+            it     = r.get("iterations_done") or 0
+            status = r.get("status", "?")
+            flag   = " *" if idx == 0 else ""
+            cg_s = f"{cg:.4f}" if cg is not None else "—"
+            rg_s = f"{rg:.4f}" if rg is not None else "—"
+            ci_s = f"{ci:.4f}" if ci is not None else "—"
+            print(f"  {name:<24}  {status:<12}  {cg_s:>{w}}  {rg_s:>{w}}  "
+                  f"{ci_s:>{w}}  {st:>8}  {it:>5}{flag}")
+        print()
+        return 0
+
+    # ── two-campaign comparison ───────────────────────────────────────────────
+    if not hasattr(args, "campaign_a") or not args.campaign_a or not args.campaign_b:
+        print("ERROR: provide campaign_a and campaign_b, or use --all")
         return 1
 
-    def _ms(steps: list[dict], key: str) -> dict:
-        vals = [s[key] for s in steps if key in s and s[key] is not None]
-        if not vals:
-            return {"count": 0, "min": None, "max": None, "last": None}
-        return {"count": len(vals), "min": round(min(vals), 4),
-                "max": round(max(vals), 4), "last": round(vals[-1], 4)}
+    sa = _row_to_summary(args.campaign_a)
+    sb = _row_to_summary(args.campaign_b)
+    missing = [n for n, s in ((args.campaign_a, sa), (args.campaign_b, sb)) if s is None]
+    if missing:
+        msg = f"campaigns not found in FlywheelDB: {', '.join(missing)}"
+        _json_print({"ok": False, "error": msg}) if args.json else print(f"ERROR: {msg}")
+        return 1
+
+    # Regression detection: flag if b is worse than a on any metric
+    regressions: list[str] = []
+    for metric, key_a, key_b in [
+        ("cond_gap", sa["best_cond_gap"], sb["best_cond_gap"]),  # type: ignore[index]
+        ("ref_gap",  sa["best_ref_gap"],  sb["best_ref_gap"]),   # type: ignore[index]
+        ("clip_i",   sa["clip_i_best"],   sb["clip_i_best"]),    # type: ignore[index]
+    ]:
+        if key_a is not None and key_b is not None and key_b < key_a:
+            regressions.append(f"{metric}: {key_b:.4f} < {key_a:.4f}")
 
     result: dict[str, Any] = {
-        "ok": True,
-        "campaign_a": args.campaign_a, "campaign_b": args.campaign_b,
+        "ok":           True,
+        "campaign_a":   args.campaign_a,
+        "campaign_b":   args.campaign_b,
+        "summary_a":    sa,
+        "summary_b":    sb,
+        "regressions":  regressions,
     }
-    for data, key in ((a, "a"), (b, "b")):
-        result[f"steps_{key}"]    = len(data["steps"])       # type: ignore[index]
-        for metric in ("cond_gap", "ref_gap", "clip_i"):
-            result[f"{metric}_{key}"] = _ms(data["steps"], metric)  # type: ignore[index]
-
     if args.json:
         _json_print(result)
         return 0
 
-    def _fmt(s: dict) -> str:
-        return "—" if s["count"] == 0 else f"min={s['min']}  max={s['max']}  last={s['last']}"
+    def _fv(v: Optional[float]) -> str:
+        return f"{v:.4f}" if v is not None else "—"
 
-    w = 34
-    print(f"\n  Comparing: {args.campaign_a} vs {args.campaign_b}")
-    print(f"  {'metric':<14}  {'flywheel-' + args.campaign_a:<{w}}  {'flywheel-' + args.campaign_b:<{w}}")
-    print(f"  {'─'*14}  {'─'*w}  {'─'*w}")
-    for m in ("cond_gap", "ref_gap", "clip_i"):
-        print(f"  {m:<14}  {_fmt(result[f'{m}_a']):<{w}}  {_fmt(result[f'{m}_b']):<{w}}")
-    print(f"  {'steps':<14}  {result['steps_a']:<{w}}  {result['steps_b']:<{w}}")
+    w = 12
+    print(f"\n  Comparing campaigns:")
+    print(f"  {'metric':<16}  {args.campaign_a:<{w+8}}  {args.campaign_b:<{w+8}}")
+    print(f"  {'─'*16}  {'─'*(w+8)}  {'─'*(w+8)}")
+    for label, ka, kb in [
+        ("cond_gap (best)", sa["best_cond_gap"], sb["best_cond_gap"]),     # type: ignore[index]
+        ("ref_gap (best)",  sa["best_ref_gap"],  sb["best_ref_gap"]),      # type: ignore[index]
+        ("clip_i (best)",   sa["clip_i_best"],   sb["clip_i_best"]),       # type: ignore[index]
+        ("clip_i (final)",  sa["clip_i_final"],  sb["clip_i_final"]),      # type: ignore[index]
+    ]:
+        print(f"  {label:<16}  {_fv(ka):<{w+8}}  {_fv(kb):<{w+8}}")
+    print(f"  {'total_steps':<16}  {sa['total_steps'] or '—'!s:<{w+8}}  "  # type: ignore[index]
+          f"{sb['total_steps'] or '—'!s:<{w+8}}")                          # type: ignore[index]
+    print(f"  {'iterations':<16}  {sa['iterations_done'] or '—'!s:<{w+8}}  "  # type: ignore[index]
+          f"{sb['iterations_done'] or '—'!s:<{w+8}}")                          # type: ignore[index]
+    print(f"  {'status':<16}  {sa['status']!s:<{w+8}}  {sb['status']!s:<{w+8}}")  # type: ignore[index]
+    if regressions:
+        print(f"\n  Regressions (b worse than a):")
+        for r in regressions:
+            print(f"    {r}")
     print()
     return 0
 
@@ -2452,8 +2599,10 @@ def _main_subcmd() -> None:
     p_abl.set_defaults(func=_cmd_ablation)
 
     p_cmp = _sp("compare", "Side-by-side campaign metric comparison")
-    p_cmp.add_argument("campaign_a")
-    p_cmp.add_argument("campaign_b")
+    p_cmp.add_argument("campaign_a", nargs="?", default=None)
+    p_cmp.add_argument("campaign_b", nargs="?", default=None)
+    p_cmp.add_argument("--all", action="store_true",
+                       help="Rank all non-superseded campaigns by cond_gap")
     p_cmp.set_defaults(func=_cmd_compare)
 
     p_maint = _sp("maintenance", "Validate cold storage, GC orphans")

@@ -2430,7 +2430,7 @@ def _git_sha() -> str:
         return ""
 
 
-def _check_flywheel_control(name: str) -> None:
+def _check_flywheel_control(name: str, fw_db: Optional[object] = None) -> None:
     """Handle pause/stop signals from FLYWHEEL_CONTROL_FILE."""
     if not FLYWHEEL_CONTROL_FILE.exists():
         return
@@ -2448,6 +2448,8 @@ def _check_flywheel_control(name: str) -> None:
                 time.sleep(30)
                 if not FLYWHEEL_CONTROL_FILE.exists():
                     log_orch(f"[flywheel:{name}] resumed (control file removed)")
+                    if fw_db is not None:
+                        fw_db.set_campaign_status(name, "active")
                     break
                 ctrl2 = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
                 if ctrl2.get("action") == "stop":
@@ -2458,6 +2460,8 @@ def _check_flywheel_control(name: str) -> None:
                 if ctrl2.get("action") in ("run", "resume"):
                     FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
                     log_orch(f"[flywheel:{name}] resumed")
+                    if fw_db is not None:
+                        fw_db.set_campaign_status(name, "active")
                     break
         else:
             FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
@@ -2621,7 +2625,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
     sys.path.insert(0, str(SCRIPTS_DIR))
     from flywheel_lib import (
         FlywheelDB, collect_metrics_from_log, render_flywheel_index,
-        _checkpoint_hash, check_plateau,
+        _checkpoint_hash, check_plateau, write_campaign_summary_json,
     )
     from shard_selector import (
         ShardScoreDB, scan_shard_pool, select_shards,
@@ -2684,7 +2688,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
         plateau_threshold = float(fw_cfg.get("plateau_threshold", 0.02))
 
         while iteration <= max_iters:
-            _check_flywheel_control(name)
+            _check_flywheel_control(name, fw_db)
 
             # Disk guard
             gb     = free_gb()
@@ -2756,7 +2760,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 log_orch(f"[flywheel:{name}] {TMUX_TRAIN_WIN} already running — waiting",
                          level="warning")
                 while tmux_window_exists(TMUX_TRAIN_WIN):
-                    _check_flywheel_control(name)
+                    _check_flywheel_control(name, fw_db)
                     time.sleep(poll_interval)
 
             # Wait until GPU lock is successfully acquired
@@ -2766,7 +2770,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 holder = gpu_lock_holder()
                 log_orch(f"[flywheel:{name}] GPU busy (holder={holder}), waiting 30s",
                          level="warning")
-                _check_flywheel_control(name)
+                _check_flywheel_control(name, fw_db)
                 time.sleep(30)
 
             try:
@@ -2794,7 +2798,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 # Monitor training window
                 while True:
                     time.sleep(poll_interval)
-                    _check_flywheel_control(name)
+                    _check_flywheel_control(name, fw_db)
                     write_heartbeat("flywheel", status="training",
                                     flywheel_name=name, iteration=iteration)
                     if not tmux_window_exists(TMUX_TRAIN_WIN):
@@ -2929,6 +2933,7 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
                 if plateau_reason:
                     log_orch(f"[flywheel:{name}] plateau detected — pausing: {plateau_reason}",
                              level="warning")
+                    fw_db.set_campaign_status(name, "plateau")
                     try:
                         FLYWHEEL_CONTROL_FILE.write_text(
                             json.dumps({"action": "pause",
@@ -2953,6 +2958,17 @@ def _run_flywheel_loop(fw_cfg: dict) -> None:
             iteration += 1
 
         log_orch(f"[flywheel:{name}] loop complete — {max_iters} iterations done")
+        fw_db.refresh_campaign_summary(name)
+        fw_db.set_campaign_status(name, "completed")
+        superseded = fw_db.mark_superseded_by(name)
+        if superseded:
+            log_orch(f"[flywheel:{name}] superseded campaigns: {superseded}")
+        cold_root = Path(fw_cfg.get("storage", {}).get("cold_root", str(
+            __import__("pipeline_lib").COLD_ROOT
+        )))
+        written = write_campaign_summary_json(name, fw_db, cold_root)
+        if written:
+            log_orch(f"[flywheel:{name}] summary written: {written}")
         notify("iris flywheel", f"{name} complete ({max_iters} iterations)")
     finally:
         fw_db.close()

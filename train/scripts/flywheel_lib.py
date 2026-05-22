@@ -118,6 +118,14 @@ CREATE TABLE IF NOT EXISTS campaign_summary (
 )
 """
 
+_V4_MIGRATIONS = [
+    "ALTER TABLE campaign_summary ADD COLUMN clip_i_best REAL",
+    "ALTER TABLE campaign_summary ADD COLUMN clip_i_final REAL",
+    "ALTER TABLE campaign_summary ADD COLUMN total_steps INTEGER",
+    "ALTER TABLE campaign_summary ADD COLUMN superseded_by TEXT",
+    "INSERT OR IGNORE INTO _meta VALUES ('schema_version', '4')",
+]
+
 
 def _checkpoint_hash(ckpt_path: Optional[str]) -> str:
     """Stable 12-char version tag derived from the checkpoint filename."""
@@ -138,6 +146,11 @@ class FlywheelDB:
         for _mig in (_V2_MIGRATION, _V3_MIGRATION):
             try:
                 self._conn.executescript(_mig)
+            except Exception:
+                pass
+        for _mig in _V4_MIGRATIONS:
+            try:
+                self._conn.execute(_mig)
             except Exception:
                 pass
         self._conn.commit()
@@ -274,6 +287,7 @@ class FlywheelDB:
             return
         iters = [dict(r) for r in rows]
         total_elapsed = sum(r.get("elapsed_secs") or 0 for r in iters)
+        total_steps   = sum(r.get("steps") or 0 for r in iters if r.get("status") == "done")
         best = max(
             (r for r in iters if r.get("cond_gap") is not None),
             key=lambda r: r["cond_gap"],
@@ -285,13 +299,14 @@ class FlywheelDB:
         with self._lock:
             self._conn.execute("""
                 INSERT INTO campaign_summary
-                    (flywheel_name, n_iterations, total_elapsed_secs,
+                    (flywheel_name, n_iterations, total_elapsed_secs, total_steps,
                      best_cond_gap, best_ref_gap, best_checkpoint,
                      final_cond_gap, final_ref_gap, ts_first, ts_last)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(flywheel_name) DO UPDATE SET
                     n_iterations=excluded.n_iterations,
                     total_elapsed_secs=excluded.total_elapsed_secs,
+                    total_steps=excluded.total_steps,
                     best_cond_gap=excluded.best_cond_gap,
                     best_ref_gap=excluded.best_ref_gap,
                     best_checkpoint=excluded.best_checkpoint,
@@ -299,7 +314,7 @@ class FlywheelDB:
                     final_ref_gap=excluded.final_ref_gap,
                     ts_last=excluded.ts_last
             """, (
-                name, len(iters), total_elapsed or None,
+                name, len(iters), total_elapsed or None, total_steps or None,
                 best["cond_gap"] if best else None,
                 best["ref_gap"]  if best else None,
                 best["checkpoint"] if best else None,
@@ -316,8 +331,154 @@ class FlywheelDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def set_campaign_status(self, name: str, status: str,
+                            superseded_by: Optional[str] = None) -> None:
+        """Write lifecycle status (active/plateau/completed/superseded) to campaign_summary."""
+        ts = now_iso()
+        with self._lock:
+            # Ensure the row exists first (upsert with minimal fields if absent)
+            self._conn.execute("""
+                INSERT OR IGNORE INTO campaign_summary (flywheel_name, status, ts_first, ts_last)
+                VALUES (?, ?, ?, ?)
+            """, (name, status, ts, ts))
+            if superseded_by:
+                self._conn.execute("""
+                    UPDATE campaign_summary SET status=?, superseded_by=?, ts_last=?
+                    WHERE flywheel_name=?
+                """, (status, superseded_by, ts, name))
+            else:
+                self._conn.execute("""
+                    UPDATE campaign_summary SET status=?, ts_last=? WHERE flywheel_name=?
+                """, (status, ts, name))
+            self._conn.commit()
+
+    def get_non_superseded_campaigns(self) -> list[dict]:
+        """Return campaign summaries excluding superseded ones, best cond_gap first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM campaign_summary WHERE status != 'superseded' "
+                "ORDER BY best_cond_gap DESC NULLS LAST"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_superseded_by(self, new_name: str) -> list[str]:
+        """Mark older completed campaigns as superseded if new_name exceeds them on all metrics.
+
+        A campaign is superseded when new_name has strictly higher best_cond_gap AND
+        best_ref_gap (both non-null). Returns names of campaigns that were superseded.
+        """
+        new_row = None
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT best_cond_gap, best_ref_gap FROM campaign_summary WHERE flywheel_name=?",
+                (new_name,),
+            ).fetchone()
+        if r is None:
+            return []
+        new_cg, new_rg = r[0], r[1]
+        if new_cg is None:
+            return []
+
+        superseded = []
+        with self._lock:
+            candidates = self._conn.execute(
+                "SELECT flywheel_name, best_cond_gap, best_ref_gap FROM campaign_summary "
+                "WHERE flywheel_name != ? AND status IN ('completed', 'plateau')",
+                (new_name,),
+            ).fetchall()
+        for row in candidates:
+            old_name, old_cg, old_rg = row[0], row[1], row[2]
+            if old_cg is None:
+                continue
+            cg_better = new_cg > old_cg
+            rg_better = (new_rg is None or old_rg is None) or new_rg > old_rg
+            if cg_better and rg_better:
+                self.set_campaign_status(old_name, "superseded", superseded_by=new_name)
+                superseded.append(old_name)
+        return superseded
+
     def close(self) -> None:
         self._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Campaign summary export
+# ---------------------------------------------------------------------------
+
+def write_campaign_summary_json(name: str, db: "FlywheelDB", cold_root: "Path") -> list[str]:
+    """Write campaign summary JSON to cold metadata + weight dir. Returns paths written."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    iters = db.get_iterations(name)
+    summaries = {r["flywheel_name"]: r for r in db.get_campaign_summaries()}
+    summary_row = summaries.get(name, {})
+
+    done_iters = [r for r in iters if r.get("status") == "done"]
+    cond_gap_trajectory = [r.get("cond_gap") for r in done_iters if r.get("cond_gap") is not None]
+    ablation_runs = sorted({r["ablation_run"] for r in iters if r.get("ablation_run")})
+
+    shards_consumed: list[str] = []
+    seen: set = set()
+    for r in iters:
+        raw = r.get("selected_shards")
+        try:
+            sel = _json.loads(raw) if isinstance(raw, str) else (raw or [])
+        except Exception:
+            sel = []
+        for sid in sel:
+            if sid not in seen:
+                seen.add(sid)
+                shards_consumed.append(sid)
+
+    git_commit = next((r.get("git_commit") for r in reversed(iters) if r.get("git_commit")), None)
+
+    data = {
+        "name":                name,
+        "status":              summary_row.get("status", "active"),
+        "n_iterations":        len(iters),
+        "total_steps":         summary_row.get("total_steps"),
+        "total_elapsed_secs":  summary_row.get("total_elapsed_secs"),
+        "best_cond_gap":       summary_row.get("best_cond_gap"),
+        "best_ref_gap":        summary_row.get("best_ref_gap"),
+        "best_clip_i":         summary_row.get("clip_i_best"),
+        "best_checkpoint":     summary_row.get("best_checkpoint"),
+        "final_cond_gap":      summary_row.get("final_cond_gap"),
+        "final_ref_gap":       summary_row.get("final_ref_gap"),
+        "cond_gap_trajectory": cond_gap_trajectory,
+        "ablation_runs":       ablation_runs,
+        "shards_consumed":     shards_consumed,
+        "ts_start":            summary_row.get("ts_first"),
+        "ts_end":              summary_row.get("ts_last"),
+        "git_commit":          git_commit,
+    }
+
+    written: list[str] = []
+    cold = _Path(cold_root)
+
+    # 1. cold/metadata/flywheel_logs/campaign-{name}.json
+    logs_dir = cold / "metadata" / "flywheel_logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        dest = logs_dir / f"campaign-{name}.json"
+        dest.write_text(_json.dumps(data, indent=2))
+        written.append(str(dest))
+    except OSError as e:
+        print(f"[flywheel] WARNING: could not write campaign log: {e}", file=sys.stderr)
+
+    # 2. cold/weights/flywheel-{date}/summary.json (most recent campaign dir)
+    weights_dir = cold / "weights"
+    if weights_dir.exists():
+        campaigns = sorted(weights_dir.glob("flywheel-*"), reverse=True)
+        if campaigns:
+            try:
+                dest2 = campaigns[0] / "summary.json"
+                dest2.write_text(_json.dumps(data, indent=2))
+                written.append(str(dest2))
+            except OSError as e:
+                print(f"[flywheel] WARNING: could not write weight summary: {e}", file=sys.stderr)
+
+    return written
 
 
 # ---------------------------------------------------------------------------

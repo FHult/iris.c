@@ -38,7 +38,7 @@ from pipeline_lib import (
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
     COLD_ROOT, COLD_PRECOMPUTE_DIR, COLD_WEIGHTS_DIR, COLD_METADATA_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
-    TMUX_ABLATION_WIN,
+    TMUX_ABLATION_WIN, FLYWHEEL_DB_PATH,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -1764,6 +1764,63 @@ def _check_ablation_health() -> None:
                  fix=f"tmux attach -t {TMUX_SESSION}:{TMUX_ABLATION_WIN}")
 
 
+def _check_campaign_state() -> None:
+    """Warn on unhealthy flywheel campaign states visible in the FlywheelDB."""
+    if not FLYWHEEL_DB_PATH.exists():
+        return
+    try:
+        from flywheel_lib import FlywheelDB
+        db = FlywheelDB(FLYWHEEL_DB_PATH)
+        campaigns = db.get_non_superseded_campaigns()
+        db.close()
+    except Exception:
+        return
+
+    now = time.time()
+    for c in campaigns:
+        name   = c.get("flywheel_name", "?")
+        status = c.get("status", "active")
+        ts     = c.get("ts_last")
+        iters  = c.get("iterations_done", 0) or 0
+        best   = c.get("best_cond_gap")
+
+        if status == "plateau":
+            detail = (
+                f"best_cond_gap={best:.4f}. "
+                f"Resume or mark completed: pipeline_ctl.py mark-campaign-completed {name}"
+                if best is not None else
+                f"No quality signal yet. "
+                f"Resume or mark completed: pipeline_ctl.py mark-campaign-completed {name}"
+            )
+            _add("INFO", "flywheel",
+                 f"Campaign '{name}' is on plateau after {iters} iteration(s)",
+                 detail=detail,
+                 fix=f"train/.venv/bin/python train/scripts/pipeline_ctl.py "
+                     f"mark-campaign-completed {name}")
+            continue
+
+        if status != "active":
+            continue
+
+        # Active campaign: warn if DB not updated recently (orchestrator may have died)
+        age_h = round((now - ts) / 3600, 1) if ts else None
+        if age_h is not None and age_h > 4:
+            _add("WARNING", "flywheel",
+                 f"Campaign '{name}' active but last DB update {age_h}h ago",
+                 detail="Orchestrator may have stopped without updating campaign status. "
+                        "Check orchestrator log or run pipeline_ctl.py status.",
+                 fix="train/.venv/bin/python train/scripts/pipeline_ctl.py status",
+                 ctx={"campaign": name, "age_h": age_h})
+
+        if iters >= 3 and best is None:
+            _add("WARNING", "flywheel",
+                 f"Campaign '{name}' has {iters} iterations but no quality signal",
+                 detail="best_cond_gap is NULL — validation may not be running or "
+                        "refresh_campaign_summary has not been called.",
+                 fix="train/.venv/bin/python train/scripts/pipeline_ctl.py status",
+                 ctx={"campaign": name, "iterations_done": iters})
+
+
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     """Build compact machine-readable pipeline health summary for --ai mode."""
     scale = cfg.get("scale", "small")
@@ -2304,6 +2361,7 @@ def main() -> None:
         _check_data_quality(chunks)
         _check_stale_logs(chunks)
         _check_ablation_health()
+        _check_campaign_state()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)

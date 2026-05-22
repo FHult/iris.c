@@ -684,6 +684,43 @@ def cmd_ablation_status(_args) -> None:
         print(f"  DB: not found ({ABLATION_DB_PATH})")
 
 
+def cmd_mark_campaign_completed(args) -> None:
+    """Mark a flywheel campaign as completed, write cold summary JSON, check superseded."""
+    from flywheel_lib import FlywheelDB, write_campaign_summary_json
+    name = args.campaign_name
+    if not FLYWHEEL_DB_PATH.exists():
+        print(f"ERROR: flywheel DB not found: {FLYWHEEL_DB_PATH}")
+        return
+    db = FlywheelDB(FLYWHEEL_DB_PATH)
+    db.refresh_campaign_summary(name)
+    db.set_campaign_status(name, "completed")
+    superseded = db.mark_superseded_by(name)
+    cold_root = COLD_ROOT
+    written = write_campaign_summary_json(name, db, cold_root)
+    db.close()
+    print(f"Campaign '{name}' marked completed.")
+    if superseded:
+        print(f"Superseded: {', '.join(superseded)}")
+    if written:
+        print(f"Summary written to:")
+        for p in written:
+            print(f"  {p}")
+
+
+def cmd_mark_campaign_superseded(args) -> None:
+    """Manually mark a campaign as superseded by a newer one."""
+    from flywheel_lib import FlywheelDB
+    name = args.campaign_name
+    by   = args.by
+    if not FLYWHEEL_DB_PATH.exists():
+        print(f"ERROR: flywheel DB not found: {FLYWHEEL_DB_PATH}")
+        return
+    db = FlywheelDB(FLYWHEEL_DB_PATH)
+    db.set_campaign_status(name, "superseded", superseded_by=by)
+    db.close()
+    print(f"Campaign '{name}' marked superseded by '{by}'.")
+
+
 def cmd_start_flywheel(args) -> None:
     """Launch the flywheel loop via orchestrator.py in a dedicated tmux window."""
     config = Path(args.flywheel_config)
@@ -1209,6 +1246,17 @@ def main() -> None:
     sub.add_parser("pause-ablation",   help="Pause harness after current run")
     sub.add_parser("resume-ablation",  help="Clear pause/stop signal")
     sub.add_parser("ablation-status",  help="Show ablation heartbeat and DB summary")
+
+    p = sub.add_parser("mark-campaign-completed",
+                       help="Mark a flywheel campaign as completed and write cold summary JSON")
+    p.add_argument("campaign_name", metavar="NAME",
+                   help="Flywheel campaign name (flywheel_name in DB)")
+
+    p = sub.add_parser("mark-campaign-superseded",
+                       help="Manually mark a campaign as superseded by a newer one")
+    p.add_argument("campaign_name", metavar="NAME")
+    p.add_argument("--by", required=True, metavar="NEW_NAME",
+                   help="Name of the campaign that supersedes this one")
 
     p = sub.add_parser("start-flywheel",
                        help="Launch self-improving sref flywheel in iris-flywheel tmux window")
