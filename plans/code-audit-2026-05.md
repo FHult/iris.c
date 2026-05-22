@@ -390,7 +390,7 @@ header that `last_exit_code()` validates matches.
 
 ---
 
-### PIPE-3: Bare except blocks silently swallow critical errors
+### PIPE-3: Bare except blocks silently swallow critical errors — **PARTIALLY FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -400,8 +400,12 @@ header that `last_exit_code()` validates matches.
 Multiple bare `except:` or `except Exception:` blocks that log nothing and continue, hiding
 I/O errors, data corruption, and subprocess failures.
 
-**Fix:** Replace every bare `except:` with specific exception types. Log every exception
-via `log_orch(..., level="error")`. Never silently pass on I/O or data integrity errors.
+**Fix (applied):**
+- `pipeline_lib.py:dispatch_issue` rotation: `except Exception: pass` → prints traceback to stderr.
+- `pipeline_status.py:_read_val_metrics`: `except Exception` → `except (FileNotFoundError, json.JSONDecodeError)`.
+
+**Remaining:** `pipeline_status.py:97` (`_log_tail` `except OSError`) is fine — already specific.
+`build_shards.py:120,162` already logs via `print(..., file=sys.stderr)` — defensible. `download_convert.py` inner excepts already log and set `error_event`.
 
 ---
 
@@ -672,32 +676,39 @@ and import in all four scripts.
 
 ---
 
-### PIPE-4: Race in `download_convert.py` — exit code may be 0 despite download error
+### PIPE-4: Race in `download_convert.py` — exit code may be 0 despite download error — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
-| Files | `download_convert.py:434-435` |
+| Files | `download_convert.py:344-348`, `download_convert.py:405-409` |
 | Agent | 4 (pipeline scripts) |
 
-If producer or consumer thread crashes between `error_event.set()` and the `raise
-RuntimeError(...)` at line 435, the exit code will be 0 despite the error.
+If producer or consumer thread crashed with an unexpected exception (e.g., `ready.touch()`
+failing, `_pool_link_or_copy` failing) outside the per-download inner `try/except`,
+`error_event` would not be set and exit code 0 was returned despite the failure.
 
-**Fix:** Return error status from both producer and consumer threads; verify error state
-before returning from `phase_download`.
+**Fix:** Added outer `except Exception: error_event.set(); raise` in both `producer()` and
+`consumer()`, between the inner body and the `finally` clause. Any uncaught exception in
+either thread now sets `error_event` before propagating, ensuring the main thread's
+`if error_event.is_set(): raise RuntimeError(...)` fires correctly.
 
 ---
 
-### PIPE-8: Heartbeat path collisions — `download_convert` and `dedupe_filter` race
+### PIPE-8: Heartbeat path collisions — `download_convert` and `dedupe_filter` race — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
-| Files | `pipeline_lib.py:228-253` |
+| Files | `pipeline_lib.py:240` |
 | Agent | 4 (pipeline scripts) |
 
-Multiple processes write to heartbeat paths with overlapping filenames, causing atomic rename
-races.
+`write_heartbeat` used a fixed `.json.tmp` suffix for the atomic rename temp file. When
+`heartbeat_loop` thread and the post-join main thread both call `write_heartbeat` for the
+same process+chunk within the same process, they wrote to the same `.json.tmp` path — last
+write wins on rename, potentially corrupting or losing a heartbeat write.
 
-**Fix:** Use per-process heartbeat files with process IDs or sequence numbers.
+**Fix:** Temp file now uses PID: `p.with_name(p.stem + f".{os.getpid()}.tmp")`. Each
+process gets its own tmp path, eliminating the collision. Cross-process races on the final
+`.json` path are safe: `os.rename` is atomic on POSIX.
 
 ---
 
@@ -777,17 +788,19 @@ failure mode.
 
 ---
 
-### PIPE-11: Heartbeat loop in `download_convert.py` reads `cur_tgz[0]` without lock
+### PIPE-11: Heartbeat loop in `download_convert.py` reads `cur_tgz[0]` without lock — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
-| Files | `download_convert.py:390-418` |
+| Files | `download_convert.py:271`, all `cur_tgz[0]` sites |
 | Agent | 4 (pipeline scripts) |
 
-Heartbeat loop reads `cur_tgz[0]` (written by producer thread) without a lock. Can see
-partial updates or stale state.
+Heartbeat loop reads `cur_tgz[0]` (written by producer thread) without a lock. CPython GIL
+makes individual `cur_tgz[0] = x` assignments atomic in practice, but this relies on
+undefined behaviour from the memory model perspective.
 
-**Fix:** Guard `cur_tgz[0]` reads/writes with `threading.Lock()`.
+**Fix:** Added `cur_tgz_lock = threading.Lock()` alongside `cur_tgz = [None]`. All five
+producer write sites and the single heartbeat_loop read site now use `with cur_tgz_lock:`.
 
 ---
 

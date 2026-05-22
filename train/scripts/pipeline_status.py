@@ -123,7 +123,7 @@ def _read_val_metrics(chunk: int) -> dict:
     try:
         path = LOG_DIR / f"val_chunk{chunk}" / "metrics.json"
         return json.loads(path.read_text())
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 

@@ -267,7 +267,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
     ready_q: queue.Queue = queue.Queue()
     error_event = threading.Event()
     done_event  = threading.Event()
-    cur_tgz     = [None]  # shared: producer writes, heartbeat reads
+    cur_tgz      = [None]  # shared: producer writes, heartbeat reads
+    cur_tgz_lock = threading.Lock()
 
     def producer():
         try:
@@ -277,7 +278,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
 
                 if cold_only:
                     # Download directly to transient temp dir in cold; no ready sentinel needed
-                    cur_tgz[0] = i
+                    with cur_tgz_lock:
+                        cur_tgz[0] = i
                     log_event("download_convert", "download_start", chunk=chunk, tgz=i)
                     t0 = time.time()
                     try:
@@ -290,7 +292,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                                   error=str(e))
                         error_event.set()
                         raise
-                    cur_tgz[0] = None
+                    with cur_tgz_lock:
+                        cur_tgz[0] = None
                     ready_q.put(i)
                     continue
 
@@ -300,7 +303,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                     pool_tgz      = raw_pool_dir / "data" / "train" / "imgs" / f"{i:03d}.tgz"
                     pool_sentinel = raw_pool_sentinels / f"{i:03d}"
                     if not pool_sentinel.exists():
-                        cur_tgz[0] = i
+                        with cur_tgz_lock:
+                            cur_tgz[0] = i
                         log_event("download_convert", "download_start", chunk=chunk, tgz=i)
                         t0 = time.time()
                         try:
@@ -318,7 +322,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                     _pool_link_or_copy(pool_tgz, tgz_staging, use_symlinks_raw)
                 else:
                     if not ready.exists():
-                        cur_tgz[0] = i
+                        with cur_tgz_lock:
+                            cur_tgz[0] = i
                         log_event("download_convert", "download_start", chunk=chunk, tgz=i)
                         t0 = time.time()
                         try:
@@ -332,9 +337,13 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                             error_event.set()
                             raise
 
-                cur_tgz[0] = None
+                with cur_tgz_lock:
+                    cur_tgz[0] = None
                 ready.touch()
                 ready_q.put(i)
+        except Exception:
+            error_event.set()
+            raise
         finally:
             ready_q.put(None)  # sentinel to stop consumer
 
@@ -393,6 +402,9 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
                               error=str(e))
                     error_event.set()
                     raise
+        except Exception:
+            error_event.set()
+            raise
         finally:
             done_event.set()
 
@@ -405,7 +417,8 @@ def run_jdb_download_convert(chunk: int, config: dict, scale: str = "all-in",
         while not done_event.is_set():
             done_count = sum(1 for i in tgz_range
                              if (sentinel_dir / f"{i:03d}.converted").exists())
-            tgz_i      = cur_tgz[0]
+            with cur_tgz_lock:
+                tgz_i = cur_tgz[0]
             now_bytes  = 0
             if tgz_i is not None:
                 tgz_file = dl_base / "data" / "train" / "imgs" / f"{tgz_i:03d}.tgz"

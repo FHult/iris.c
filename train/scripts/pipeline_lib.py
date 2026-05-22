@@ -237,7 +237,7 @@ def write_heartbeat(process: str, chunk: Optional[int] = None, **fields) -> None
     if chunk is not None:
         data["chunk"] = chunk
     data.update(fields)
-    tmp = p.with_suffix(".json.tmp")
+    tmp = p.with_name(p.stem + f".{os.getpid()}.tmp")
     with open(tmp, "w") as f:
         json.dump(data, f)
     tmp.rename(p)
@@ -324,7 +324,8 @@ def dispatch_issue(issue_id: str, severity: str, message: str,
             tmp.write_text("\n".join(json.dumps(k) for k in keep) + "\n")
             os.replace(tmp, DISPATCH_QUEUE)
     except Exception:
-        pass
+        import traceback
+        traceback.print_exc(file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
