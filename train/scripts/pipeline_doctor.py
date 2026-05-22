@@ -317,6 +317,7 @@ def _check_phantom_completions(cfg: dict, chunks: list[int]) -> None:
                 # was consumed successfully and may have been rotated by keep_last_n.
                 # That is expected — don't raise CRITICAL.
                 next_already_started = (is_done(next_chunk, "train") or
+                                        is_done(next_chunk, "training_warmup") or
                                         heartbeat_age_secs("trainer", next_chunk) is not None)
                 if next_already_started:
                     _add("INFO", "phantom",
@@ -586,6 +587,7 @@ def _check_checkpoint_continuity(cfg: dict, chunks: list[int]) -> None:
         if not near:
             next_chunk = chunk + 1
             next_already_started = (is_done(next_chunk, "train") or
+                                    is_done(next_chunk, "training_warmup") or
                                     heartbeat_age_secs("trainer", next_chunk) is not None)
             if not next_already_started:
                 _add("WARNING", "checkpoint",
