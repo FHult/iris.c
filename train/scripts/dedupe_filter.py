@@ -204,6 +204,8 @@ def run_dedupe_filter(
             return
         _tmp = str(index_path) + ".tmp"
         _faiss.write_index(faiss_index, _tmp)
+        with open(_tmp, "rb") as _f:
+            os.fsync(_f.fileno())
         os.replace(_tmp, str(index_path))
 
     try:

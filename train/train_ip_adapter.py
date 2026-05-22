@@ -37,6 +37,7 @@ try:
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
+    import mlx.utils as mx_utils
     import numpy as np
 except ImportError:
     print("Error: MLX not found. Run: source train/.venv/bin/activate", file=sys.stderr)
@@ -879,7 +880,7 @@ def train(config: dict) -> None:
     if loaded_ema is not None:
         ema_params = loaded_ema
     else:
-        ema_params = adapter.parameters()
+        ema_params = mx_utils.tree_map(lambda x: mx.array(x), adapter.parameters())
 
     # ── Pre-evaluate adapter parameters ───────────────────────────────────────
     # Flush all lazy init arrays (mx.random.normal * scale) before training.
@@ -957,9 +958,8 @@ def train(config: dict) -> None:
         Gradient graph: adapter → k_ip/v_ip → ip_out → h_final+ip → norm_out → pred → loss
         No Flux block ops appear in the backward pass.
         """
+        siglip_feats = mx.where(use_null_image, mx.zeros_like(siglip_feats), siglip_feats)
         ip_embeds = adapter.get_image_embeds(siglip_feats)
-        zero_embeds = mx.zeros_like(ip_embeds)
-        ip_embeds = mx.where(use_null_image, zero_embeds, ip_embeds)
 
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
@@ -1055,9 +1055,8 @@ def train(config: dict) -> None:
         hidden_states[i+1] → ... → pred → loss. Flux block weights are frozen;
         backward traces through them but accumulates no gradient for them.
         """
+        siglip_feats = mx.where(use_null_image, mx.zeros_like(siglip_feats), siglip_feats)
         ip_embeds = adapter.get_image_embeds(siglip_feats)
-        zero_embeds = mx.zeros_like(ip_embeds)
-        ip_embeds = mx.where(use_null_image, zero_embeds, ip_embeds)
         k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
         pred = _flux_forward_with_ip(
             flux, noisy, text_embeds, t_int,
@@ -1390,8 +1389,9 @@ def train(config: dict) -> None:
             if null_text:
                 text_embeds = mx.zeros_like(text_embeds)
         elif text_encoder is not None:
-            captions_in = [""] * len(captions) if null_text else captions
-            text_embeds = _encode_text(text_encoder, captions_in)
+            text_embeds = _encode_text(text_encoder, captions)
+            if null_text:
+                text_embeds = mx.zeros_like(text_embeds)
         else:
             # Text encoder not loaded (cache-only mode) but no cached embeddings.
             _skip_consecutive += 1

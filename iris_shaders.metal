@@ -164,7 +164,7 @@ kernel void adaln_norm(
     // Compute mean and std_inv
     float mean = simd_sums[0] / float(hidden);
     float var = simd_sqs[0] / float(hidden) - mean * mean;
-    float std_inv = rsqrt(var + eps);
+    float std_inv = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
 
     // Apply LayerNorm + AdaLN modulation
     for (int i = tid; i < hidden; i += threads) {
@@ -1138,7 +1138,7 @@ kernel void adaln_norm_bf16(
 
     float mean = simd_sums[0] / float(hidden);
     float var = simd_sqs[0] / float(hidden) - mean * mean;
-    float std_inv = rsqrt(var + eps);
+    float std_inv = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
 
     for (int i = tid; i < hidden; i += threads) {
         float val = bf16_to_f32(x_row[i]);
@@ -2163,7 +2163,7 @@ kernel void group_norm_f32(
 
     float mean = simd_sums[0] / float(group_size);
     float var = simd_sqs[0] / float(group_size) - mean * mean;
-    float inv_std = rsqrt(var + eps);
+    float inv_std = rsqrt(max(var, 0.0f) + eps);  // clamp prevents NaN from cancellation
 
     /* Apply normalization with gamma/beta per channel */
     for (int i = tid; i < group_size; i += threads) {

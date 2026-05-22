@@ -46,6 +46,7 @@ class PerceiverResampler(nn.Module):
             dims=hidden_dim,
             num_heads=num_heads,
             key_input_dims=siglip_dim,
+            bias=False,  # explicit: C inference loader expects no bias weights
         )
         self.norm = nn.LayerNorm(hidden_dim)
 

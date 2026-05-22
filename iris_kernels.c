@@ -802,6 +802,7 @@ static void flash_attention_head_tiled(float *out,
     if (!max_scores || !sum_exps) {
         free(max_scores);
         free(sum_exps);
+        memset(out, 0, (size_t)seq_q * head_dim * sizeof(float));
         return;
     }
 

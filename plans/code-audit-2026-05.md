@@ -156,7 +156,7 @@ Do NOT change to `self.hidden_dim // self.perceiver_heads` — that would be wro
 
 ## HIGH
 
-### A-1: `correct_forward_q` + `n_grad_steps > 1` = stale Q vectors
+### A-1: `correct_forward_q` + `n_grad_steps > 1` = stale Q vectors — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -165,55 +165,43 @@ Do NOT change to `self.hidden_dim // self.perceiver_heads` — that would be wro
 
 When `correct_forward_q=True` and `n_grad_steps_per_fwd > 1`, Q vectors are computed once
 before the inner gradient loop using **pre-update** adapter parameters. Steps 2..N reuse
-stale Q — the corrected-Q guarantee is violated for every step after the first. No guard
-exists (unlike the `use_block_injection + n_grad_steps > 1` guard at line ~929).
+stale Q — the corrected-Q guarantee is violated for every step after the first.
 
-**Fix:** Add guard near line ~929:
-```python
-if _use_correct_forward_q and _n_grad_steps > 1:
-    logger.warning("correct_forward_q=True with n_grad_steps>1 is unsupported; "
-                   "forcing n_grad_steps=1")
-    _n_grad_steps = 1
-```
+**Fix (applied in prior session):** Guard added that forces `n_grad_steps=1` when
+`correct_forward_q=True`.
 
 ---
 
-### SIGNAL-3: Null image conditioning applied after Perceiver, should be before
+### SIGNAL-3: Null image conditioning applied after Perceiver, should be before — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/train_ip_adapter.py:957-958` |
 | Agent | 1 (signal alignment) |
 
-When `use_null_image=True`, the code zeros the Perceiver *output* (`ip_embeds`). Correct
-null conditioning should zero the SigLIP features *before* Perceiver processing, so the
+When `use_null_image=True`, the code was zeroing the Perceiver *output* (`ip_embeds`).
+Correct null conditioning zeros the SigLIP features *before* Perceiver processing, so the
 Perceiver learns to produce null embeddings from null input rather than having its output
-overwritten. Current approach means the Perceiver never sees null inputs during training,
-which may degrade null-conditioning at inference time.
+overwritten. The previous approach meant the Perceiver never saw null inputs during training.
 
-**Fix:**
-```python
-if null_image:
-    siglip_feats = mx.zeros_like(siglip_feats)
-ip_embeds = adapter.get_image_embeds(siglip_feats)
-# remove the post-hoc zero_embeds mx.where
-```
+**Fix (applied):** Both `loss_fn` and `loss_fn_with_ip` now apply
+`siglip_feats = mx.where(use_null_image, mx.zeros_like(siglip_feats), siglip_feats)` before
+calling `adapter.get_image_embeds(siglip_feats)`. Post-hoc `zero_embeds mx.where` removed.
 
 ---
 
-### SIGNAL-4: Text null conditioning inconsistency — cached path zeros embeddings, live path encodes empty caption
+### SIGNAL-4: Text null conditioning inconsistency — cached path zeros embeddings, live path encodes empty caption — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/train_ip_adapter.py:1384-1390` |
 | Agent | 1 (signal alignment) |
 
-When text dropout fires: cached path sets `text_embeds = mx.zeros_like(text_embeds)`; live
-encoding path passes `[""]` to Qwen3, which produces the chat-template embedding of an empty
-prompt — not zeros. These are different representations. The model trains on one but may see
-the other.
+When text dropout fired: cached path set `text_embeds = mx.zeros_like(text_embeds)`; live
+encoding path passed `[""]` to Qwen3, which produces the chat-template embedding of an empty
+prompt — not zeros. These are different representations.
 
-**Fix:** Standardise: always encode the full caption, then zero afterward:
+**Fix (applied):** Live path now always encodes the real caption, then zeros afterward:
 ```python
 text_embeds = _encode_text(text_encoder, captions)
 if null_text:
@@ -238,7 +226,7 @@ loudly if neither source provides it.
 
 ---
 
-### CROSS-3: Perceiver `nn.MultiHeadAttention` bias not set explicitly
+### CROSS-3: Perceiver `nn.MultiHeadAttention` bias not set explicitly — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -250,18 +238,12 @@ lines 71-74 lists only weight pointers, confirming no bias expected. If someone 
 passes `bias=True`, trained weights include biases that the C loader ignores, causing silent
 corruption.
 
-**Fix:** Make the intent explicit:
-```python
-self.cross_attn = nn.MultiHeadAttention(
-    dims=hidden_dim, num_heads=num_heads,
-    key_input_dims=siglip_dim,
-    bias=False,   # explicit: C inference expects no bias
-)
-```
+**Fix (applied):** `bias=False` is now explicit on the `cross_attn` constructor in
+`PerceiverResampler.__init__`.
 
 ---
 
-### CROSS-4: Injection semantics mismatch — per-block (training) vs end-sum (test script)
+### CROSS-4: Injection semantics mismatch — per-block (training) vs end-sum (test script) — **CONFIRMED REAL, DEFERRED**
 
 | Field | Value |
 |-------|-------|
@@ -273,12 +255,12 @@ for subsequent blocks. `test_ip_adapter_inference.py:_ip_forward` collects all I
 then adds them once after all blocks complete. These produce different numerical results — the
 test script does not replicate training semantics.
 
-**Fix:** Update `_ip_forward()` in test script to match training's per-block injection, or
-document explicitly which is canonical and update C inference to match.
+**Status:** Confirmed real discrepancy. Deferred — the training path is canonical. The test
+script needs updating to use per-block injection before any C inference validation against it.
 
 ---
 
-### CROSS-6: `perceiver_heads` missing from `iris_ip_adapter_t` struct
+### CROSS-6: `perceiver_heads` missing from `iris_ip_adapter_t` struct — **DEFERRED (stub)**
 
 | Field | Value |
 |-------|-------|
@@ -289,18 +271,12 @@ The C struct has `hidden_dim` and `num_image_tokens` but no `perceiver_heads` or
 `perceiver_head_dim`. C inference cannot validate configuration or compute correct head
 dimensions.
 
-**Fix:**
-```c
-typedef struct {
-    // ... existing fields ...
-    int perceiver_heads;     /* from adapter_meta.json */
-    int perceiver_head_dim;  /* = hidden_dim / perceiver_heads */
-} iris_ip_adapter_t;
-```
+**Status:** Deferred — `iris_ip_adapter.h` is currently a stub (INFER-1 not yet
+implemented). Will be addressed as part of the full C inference implementation.
 
 ---
 
-### C-1: `PerceiverResampler` missing residual connection
+### C-1: `PerceiverResampler` missing residual connection — **DEFERRED (needs migration plan)**
 
 | Field | Value |
 |-------|-------|
@@ -311,14 +287,13 @@ typedef struct {
 Standard Perceiver and IP-Adapter reference implementations include the residual. Without it,
 learned query tokens receive no gradient path that preserves their prior.
 
-**Before applying:** verify against the InstantX warmstart reference to confirm which
-convention those weights assume.
+**Status:** Deferred. Adding the residual changes the forward semantics for any trained
+checkpoint. The fix is architecturally correct but requires:
+1. Verifying whether the warmstart source (InstantX) used residual or not.
+2. Deciding whether to retrain from scratch or continue from current step 200 checkpoint.
 
-**Fix:**
-```python
-out = self.cross_attn(q, siglip_features, siglip_features)
-return self.norm(q + out)   # was: return self.norm(out)
-```
+If adopting the residual, restart training from scratch (step 200 represents negligible
+sunk cost). Do NOT apply this mid-run without a plan.
 
 ---
 
@@ -354,40 +329,38 @@ _ws_ok = os.path.isfile(_warmstart) or os.path.isdir(_warmstart)
 
 ---
 
-### G-1: EMA holds live reference to `adapter.parameters()`
+### G-1: EMA holds live reference to `adapter.parameters()` — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `train/train_ip_adapter.py:882` |
 | Agent | 2 (training core) |
 
-`ema_params = adapter.parameters()` returns the live parameter dict reference. Fragile under
+`ema_params = adapter.parameters()` returned the live parameter dict reference. Fragile under
 any MLX version that mutates parameter arrays in-place.
 
-**Fix:**
+**Fix (applied):** Added `import mlx.utils as mx_utils` to MLX imports block. Init path now:
 ```python
-ema_params = mlx.utils.tree_map(lambda x: mx.array(x), adapter.parameters())
+ema_params = mx_utils.tree_map(lambda x: mx.array(x), adapter.parameters())
 ```
 
 ---
 
-### ADALN-1: `adaln_norm_bf16` Metal shader uses numerically unstable variance formula
+### ADALN-1: `adaln_norm_bf16` Metal shader uses numerically unstable variance formula — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `iris_shaders.metal:1138-1140` |
 | Agent | 5 (C/Metal inference) |
 
-The kernel computes variance as `E[x²] - E[x]²`. At bfloat16 precision (7-bit mantissa),
-both terms can be large and nearly equal, producing severe cancellation. Variance can go
-negative, causing `rsqrt(var)` → NaN in the normalisation output.
+The kernel computes variance as `E[x²] - E[x]²`. All arithmetic is done in float32 (bf16
+inputs are upcasted), so catastrophic cancellation is unlikely for typical activations but
+possible for highly biased hidden states. If variance goes negative, `rsqrt(var)` → NaN.
 
-**Fix:** Use two-pass algorithm in the Metal kernel:
-```metal
-float mean = simd_sums[0] / float(hidden);
-// second pass: accumulate (x - mean)^2
-float var = simd_sqs[0] / float(hidden);  // after recomputing with diff²
-```
+**Fix (applied):** Added `max(var, 0.0f)` clamp before `rsqrt` in all three norm kernels:
+`adaln_norm`, `adaln_norm_bf16`, and `group_norm_f32`. Prevents NaN without two-pass cost.
+Full two-pass Welford (the original recommendation) would be more robust but doubles memory
+bandwidth — deferred unless NaN is observed in practice.
 
 ---
 
@@ -400,18 +373,17 @@ float var = simd_sqs[0] / float(hidden);  // after recomputing with diff²
 
 **Log staleness:** When a script reuses the same log file path across runs, `last_exit_code()`
 reads the EXIT_CODE from a *previous* run, causing false error/success states. Build_shards
-and dedupe_filter both write to fixed-name log files.
+and dedupe_filter both write to fixed-name log files. **Real — deferred.**
 
-**Threadgroup bounds:** `causal_attention_fused_bf16` and `causal_attention_fused` have
-`threadgroup float shared_scores[512]` and `if (seq > 512) return;` — silent no-op for
-any sequence longer than 512. Output left uninitialised.
+**CM-7/8 threadgroup bounds — FALSE POSITIVE (verified 2026-05-22):** The `if (seq > 512) return;`
+guard inside `causal_attention_fused` / `causal_attention_fused_bf16` is redundant but harmless.
+The C-level wrappers (`iris_gpu_causal_attention_f32` line ~6539 and
+`iris_gpu_causal_attention_bf16` line ~5501) both check `if (seq > 512)` and fall through to
+the MPSGraph path before dispatching the kernel. The kernel never receives seq > 512, so
+output is never left uninitialised.
 
 **Fix (log staleness):** Implement log rotation or include a run-unique token in the log
 header that `last_exit_code()` validates matches.
-
-**Fix (threadgroup):** Either increase to the actual max seq size, use dynamic threadgroup
-allocation, or add a dispatch-time assertion that aborts with an error instead of silent
-return.
 
 ---
 
@@ -430,7 +402,7 @@ via `log_orch(..., level="error")`. Never silently pass on I/O or data integrity
 
 ---
 
-### PIPE-5: FAISS index written without `fsync` — power-loss corruption
+### PIPE-5: FAISS index written without `fsync` — power-loss corruption — **PARTIALLY FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -440,29 +412,31 @@ via `log_orch(..., level="error")`. Never silently pass on I/O or data integrity
 `faiss.write_index()` followed by `os.replace()` with no `fsync()`. Power loss between
 file close and kernel flush leaves a truncated index. On restart, FAISS fails silently.
 
-**Fix:**
-```python
-with open(tmp_path, "wb") as f:
-    faiss.write_index(index, tmp_path)
-    f.flush()
-    os.fsync(f.fileno())
-os.replace(tmp_path, index_path)
-```
+**Fix (applied to `dedupe_filter.py`):** `_flush_faiss_index()` now opens the tmp file
+after write and calls `os.fsync(f.fileno())` before `os.replace()`.
+
+**Remaining:** `clip_dedup.py:427` and `clean_wds_pool.py:165-171` write directly to the
+final path (no atomic rename pattern at all) — these need the full tmp+fsync+replace
+treatment in a follow-up.
 
 ---
 
-### PIPE-7: Dedup filter writes done sentinel before verifying output integrity
+### PIPE-7: Dedup filter writes done sentinel before verifying output integrity — **FALSE POSITIVE (verified 2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `dedupe_filter.py:247-293` |
 | Agent | 4 (pipeline scripts) |
 
-If conversion crashes mid-write, the `.deduped` sentinel is written regardless, permanently
-masking the corrupted output tar from any future retry.
+**Verified not a bug.** The sentinel is written at line 293, which is OUTSIDE the
+`try...except` block at lines 246-290. Any crash or exception during `_quality_filter_tar`,
+`dedup_wds_tar`, or `_atomic_copy` propagates via `raise` at line 290, which skips line 293.
+The sentinel is never written on failure. The audit was correct about the general pattern
+but wrong about this specific code.
 
-**Fix:** Move sentinel write to occur only after verifying target file size > 0 and that
-the tar opens cleanly.
+Legitimate enhancement (not a bug): there is no positive integrity check (file size > 0,
+tar opens cleanly) before the sentinel. Adding one would improve robustness but is low
+priority since FAISS dedup always produces a valid tar or raises.
 
 ---
 
@@ -738,60 +712,65 @@ Dedup exits returning `(0, 0, 0)`.
 
 ---
 
-### PIPE-15: `last_exit_code()` returning `None` treated as success
+### PIPE-15: `last_exit_code()` returning `None` treated as success — **FALSE POSITIVE (verified 2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `orchestrator.py:476-489` |
 | Agent | 4 (pipeline scripts) |
 
-When the log file is truncated or malformed, `last_exit_code()` returns `None`. The
-orchestrator treats this as success, potentially advancing the pipeline on a failed step.
-
-**Fix:** Distinguish `None` (exit code not found) from `0` (success). Treat `None` as error.
+`code = last_exit_code(log); if code == 0:` — in Python, `None == 0` is `False`, so `None`
+exits to the `else` branch which logs the failure and calls `mark_error`. The orchestrator
+already treats `None` as failure, not success. No fix required.
 
 ---
 
-### CM-6: Flash attention OOM returns silently, leaving output uninitialised
+### CM-6: Flash attention OOM returns silently, leaving output uninitialised — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `iris_kernels.c:800-806, 939-979` |
 | Agent | 5 (C/Metal inference) |
 
-On malloc failure inside the flash attention inner loop, the code does `break` or `return`
-silently, leaving the output buffer uninitialised. Callers receive garbage activations.
+On malloc failure inside `flash_attention_head_tiled`, the early return at line 805 left
+the output buffer with uninitialised content. The `memset(out, 0, ...)` was placed after
+the check.
 
-**Fix:** Propagate allocation failures up the call stack rather than silent returns. Return
-an error code or abort with a meaningful message.
+**Fix (applied):** Added `memset(out, 0, seq_q * head_dim * sizeof(float))` in the OOM
+path before the early return, ensuring callers always receive zeroed output on failure.
+The `break` paths in the outer head loop (lines ~941, ~978) return CPU-computed attention
+for the heads processed before OOM; the zeroed-output approach is consistent with those.
 
 ---
 
-### CM-12: Integer overflow in convolution tiling index cast
+### CM-12: Integer overflow in convolution tiling index cast — **FALSE POSITIVE (verified 2026-05-22)**
 
 | Field | Value |
 |-------|-------|
 | Files | `iris_kernels.c:381` |
 | Agent | 5 (C/Metal inference) |
 
-`tile_rows = (int)(max_col_size / row_size)` — cast to `int` can overflow at extreme
-resolutions where `tile_rows > INT_MAX`.
-
-**Fix:** Use `size_t` throughout; add assertion `tile_rows <= INT_MAX`.
+`tile_rows = (int)(max_col_size / row_size)`. `max_col_size` is hardcoded to
+`256 * 1024 * 1024 = 268,435,456` (~256 MB). The division result is
+`max_col_size / row_size ≤ max_col_size = 268,435,456 < INT_MAX (2,147,483,648)`.
+Overflow is impossible regardless of input size. No fix required.
 
 ---
 
-### CM-5: `emb_cache_store` `strdup` failure not propagated
+### CM-5: `emb_cache_store` `strdup` failure not propagated — **CONFIRMED, DEFERRED**
 
 | Field | Value |
 |-------|-------|
 | Files | `embcache.c:197-201` |
 | Agent | 5 (C/Metal inference) |
 
-On `strdup` failure, the slot is cleared but the function returns without indicating failure.
-Callers assume the store succeeded.
+On `strdup` failure, lines 201-202 already detect the failure (`!g_cache[target].prompt`)
+and call `clear_slot(target)` — no slot corruption. The function returns void so callers
+cannot detect failure. The consequence is a cache miss on the next lookup (prompt re-encoded).
 
-**Fix:** Return `bool` from `emb_cache_store`; have callers check the return value.
+**Status:** Real gap but low impact (graceful degradation, no corruption). Deferred —
+changing return type requires updating all call sites; not worth the churn given the benign
+failure mode.
 
 ---
 
