@@ -542,9 +542,9 @@ def train(config: dict) -> None:
     # Checkpoint if resuming
     _warmstart = mcfg.get("warmstart_path")
     if _warmstart:
-        _ws_ok = os.path.isfile(_warmstart)
+        _ws_ok = os.path.isfile(_warmstart) or os.path.isdir(_warmstart)
         _preflight_ok &= _check(f"resume checkpoint: {_warmstart}", _ws_ok,
-                                 "" if _ws_ok else "file not found")
+                                 "" if _ws_ok else "not found")
     # Output dir writable
     _out_dir = ocfg["checkpoint_dir"]
     try:
@@ -927,6 +927,10 @@ def train(config: dict) -> None:
     _use_block_injection = bool(tcfg.get("use_block_injection", False))
     if _use_block_injection and _n_grad_steps > 1:
         print("  TRAIN-6: use_block_injection=true — n_grad_steps_per_fwd forced to 1")
+        _n_grad_steps = 1
+    if tcfg.get("correct_forward_q") and _n_grad_steps > 1:
+        print("  WARNING: correct_forward_q=true with n_grad_steps_per_fwd>1 is unsupported "
+              "(Q vectors go stale after step 1) — forcing n_grad_steps_per_fwd=1")
         _n_grad_steps = 1
     # Option C: correct-forward Q vectors (IP-injected forward for Q extraction,
     # end-sum adapter-only backward). Ignored when use_block_injection=true.
