@@ -1559,62 +1559,78 @@ def _cmd_suggest_warmstart(args: argparse.Namespace) -> int:
     if _HAS_FLYWHEEL_DB and FLYWHEEL_DB_PATH.exists():
         try:
             fw = FlywheelDB(FLYWHEEL_DB_PATH)
-            summaries = fw.get_campaign_summaries()
-            fw.close()
-            # Filter to completed/plateau (not active/superseded) with quality signal
-            scored = [s for s in summaries
-                      if s.get("status") in ("completed", "plateau")
-                      and s.get("best_cond_gap") is not None]
-            scored.sort(key=lambda s: s["best_cond_gap"], reverse=True)
-            if scored:
-                top = scored[0]
-                camp_name = top["flywheel_name"]
-                camp_dir  = cold_weights / f"flywheel-{camp_name}"
-                if camp_dir.exists():
-                    # Find the checkpoint file with the highest cond_gap in that campaign
-                    fs_best: Optional[dict] = None
-                    for sf in sorted(camp_dir.iterdir()):
-                        if sf.suffix != ".safetensors" or sf.stem == "final":
-                            continue
-                        j = sf.with_suffix(".json")
-                        if not j.exists():
-                            continue
-                        try:
-                            meta = json.loads(j.read_text())
-                        except (ValueError, OSError):
-                            continue
-                        cg = meta.get("cond_gap")
-                        if cg is None:
-                            continue
-                        if fs_best is None or cg > fs_best["cond_gap"]:
-                            fs_best = {"cond_gap": cg, "path": str(sf),
-                                       "campaign": camp_name, "meta": meta}
-                    if fs_best:
-                        db_best = fs_best
-                        db_best["db_cond_gap"]  = top.get("best_cond_gap")
-                        db_best["db_ref_gap"]   = top.get("best_ref_gap")
-                        db_best["clip_i_best"]  = top.get("clip_i_best")
-                        db_best["total_steps"]  = top.get("total_steps")
-                        db_best["iters"]        = top.get("n_iterations")
-                        db_best["status"]       = top.get("status")
-            # Collect ablation context: any ablation runs tied to best campaign
-            if db_best:
-                try:
-                    from ablation_lib import AblationDB
-                    abl_db_path = COLD_METADATA_DIR / "ablation_history.db"
-                    if not abl_db_path.exists():
-                        from pipeline_lib import DATA_ROOT as _DR
-                        abl_db_path = _DR / "ablation_history.db"
-                    if abl_db_path.exists():
-                        adb = AblationDB(abl_db_path)
-                        runs = adb.get_runs(campaign=db_best["campaign"])
-                        adb.close()
-                        ablation_context = [{"run_id": r.get("run_id"),
-                                             "cond_gap": r.get("cond_gap"),
-                                             "config_delta": r.get("config_delta")}
-                                            for r in (runs or [])]
-                except Exception:
-                    pass
+            try:
+                summaries = fw.get_campaign_summaries()
+                # Filter to completed/plateau (not active/superseded) with quality signal
+                scored = [s for s in summaries
+                          if s.get("status") in ("completed", "plateau")
+                          and s.get("best_cond_gap") is not None]
+                scored.sort(key=lambda s: s["best_cond_gap"], reverse=True)
+                if scored:
+                    top = scored[0]
+                    camp_name = top["flywheel_name"]
+                    camp_dir  = cold_weights / f"flywheel-{camp_name}"
+                    if camp_dir.exists():
+                        # Find the checkpoint file with the highest cond_gap in that campaign
+                        fs_best: Optional[dict] = None
+                        for sf in sorted(camp_dir.iterdir()):
+                            if sf.suffix != ".safetensors" or sf.stem == "final":
+                                continue
+                            j = sf.with_suffix(".json")
+                            if not j.exists():
+                                continue
+                            try:
+                                meta = json.loads(j.read_text())
+                            except (ValueError, OSError):
+                                continue
+                            cg = meta.get("cond_gap")
+                            if cg is None:
+                                continue
+                            if fs_best is None or cg > fs_best["cond_gap"]:
+                                fs_best = {"cond_gap": cg, "path": str(sf),
+                                           "campaign": camp_name, "meta": meta}
+                        if fs_best:
+                            db_best = fs_best
+                            db_best["db_cond_gap"]  = top.get("best_cond_gap")
+                            db_best["db_ref_gap"]   = top.get("best_ref_gap")
+                            db_best["clip_i_best"]  = top.get("clip_i_best")
+                            db_best["total_steps"]  = top.get("total_steps")
+                            db_best["iters"]        = top.get("n_iterations")
+                            db_best["status"]       = top.get("status")
+
+                    # Collect ablation run names from the campaign's iteration records.
+                    # AblationDB (in ablation_harness.py) is keyed by run_name, not campaign
+                    # name, so we read run names from the flywheel iterations table.
+                    if db_best:
+                        abl_run_names = sorted({
+                            r["ablation_run"]
+                            for r in fw.get_iterations(camp_name)
+                            if r.get("ablation_run")
+                        })
+                        if abl_run_names:
+                            try:
+                                from ablation_harness import AblationDB as _AblDB
+                                abl_db_path = COLD_METADATA_DIR / "ablation_history.db"
+                                if not abl_db_path.exists():
+                                    abl_db_path = DATA_ROOT / "ablation_history.db"
+                                if abl_db_path.exists():
+                                    adb = _AblDB(abl_db_path)
+                                    for rn in abl_run_names:
+                                        # scored_only=False: filter by cond_gap below,
+                                        # not by Optuna score (a different field)
+                                        for exp in adb.get_experiments(rn):
+                                            if exp.get("cond_gap") is not None:
+                                                ablation_context.append({
+                                                    "run_name": rn,
+                                                    "cond_gap": exp.get("cond_gap"),
+                                                    "ref_gap":  exp.get("ref_gap"),
+                                                    "params":   exp.get("params"),
+                                                })
+                                    adb.close()
+                            except Exception:
+                                pass
+            finally:
+                fw.close()
         except Exception:
             pass
 
