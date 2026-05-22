@@ -1253,21 +1253,22 @@ class EarlyStopper:
         # Instant kill: loss explosion / NaN (no warmup guard — always active)
         loss_smooth = snap.get("loss_smooth")
         loss = loss_smooth if loss_smooth is not None else snap.get("loss", 0.0)
-        if loss is not None and loss > self.nan_loss_threshold:
+        if loss > self.nan_loss_threshold:
             return self._trigger(f"loss={loss:.3f} > {self.nan_loss_threshold}")
 
         # Grad explosion guard (3 consecutive snapshots, no warmup guard)
         if self.grad_norm_threshold is not None:
             grad = snap.get("grad_norm")
-            if grad is not None and grad > self.grad_norm_threshold:
-                self._grad_streak += 1
-                if self._grad_streak >= 3:
-                    return self._trigger(
-                        f"grad_norm={grad:.1f} > {self.grad_norm_threshold} "
-                        f"for {self._grad_streak} steps"
-                    )
-            else:
-                self._grad_streak = 0
+            if grad is not None:
+                if grad > self.grad_norm_threshold:
+                    self._grad_streak += 1
+                    if self._grad_streak >= 3:
+                        return self._trigger(
+                            f"grad_norm={grad:.1f} > {self.grad_norm_threshold} "
+                            f"for {self._grad_streak} steps"
+                        )
+                else:
+                    self._grad_streak = 0
 
         # Warmup guard: signals below require min_snapshots
         if self._n_snapshots <= self.min_snapshots:
