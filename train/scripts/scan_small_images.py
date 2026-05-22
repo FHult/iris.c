@@ -154,6 +154,13 @@ def main() -> None:
         action="store_true",
         help="(rewrite mode) Print what would be removed but do not modify tars",
     )
+    ap.add_argument(
+        "--tgz-range",
+        nargs=2,
+        type=int,
+        metavar=("START", "END"),
+        help="Only process tars in this numeric range (inclusive)",
+    )
     args = ap.parse_args()
 
     pool_dir = Path(args.pool_dir)
@@ -165,6 +172,11 @@ def main() -> None:
     if not tars:
         print(f"No *.tar files found in {pool_dir}")
         sys.exit(0)
+
+    if args.tgz_range:
+        lo, hi = args.tgz_range
+        tars = [t for t in tars if lo <= int(t.stem) <= hi]
+        print(f"Filtering to tgz range {lo:03d}–{hi:03d}: {len(tars)} tars")
 
     if args.only_deduped:
         tars = [t for t in tars if t.with_suffix(".tar.deduped").exists()]
