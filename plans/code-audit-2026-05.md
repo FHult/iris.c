@@ -61,7 +61,7 @@ would be a real regression — it would extract layers 7, 16, 25 instead.
 
 ---
 
-### SIGNAL-2: SigLIP receives bucket-resolution image, not 384×384 — **CONFIRMED REAL (mitigated, 2026-05-22)**
+### SIGNAL-2: SigLIP receives bucket-resolution image, not 384×384 — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -80,18 +80,13 @@ Mitigating factor: the live SigLIP path (`elif siglip is not None`) only runs wh
 coverage, so this path is never reached. Fix remains important for any training run without
 a precomputed cache.
 
-**Fix:** Before `siglip(images)` at line 1409, resize to 384×384:
-```python
-images_384 = mx.array(
-    resize_batch_to_384(images),  # new helper: denorm → PIL resize → renorm
-    dtype=mx.bfloat16,
-)
-siglip_feats = siglip(images_384)
-```
+**Fix (applied):** Added `_resize_images_for_siglip()` helper in `train_ip_adapter.py`
+(near `_load_siglip`). Performs CHW→HWC, denorm→uint8, PIL LANCZOS resize to 384,
+renorm→bf16. Call site changed to `siglip(_resize_images_for_siglip(images))`.
 
 ---
 
-### EXPORT-1: `perceiver_heads` mismatch — trained as 16, exported as 24 — **CONFIRMED REAL (2026-05-22)**
+### EXPORT-1: `perceiver_heads` mismatch — trained as 16, exported as 24 — **FIXED (2026-05-22)**
 
 | Field | Value |
 |-------|-------|
@@ -116,11 +111,11 @@ regardless of num_heads, the load succeeds silently, but the Perceiver now compu
 cross-attention with head_dim=128 (24-head split) instead of the trained head_dim=192
 (16-head split) — silent quality regression in any Python inference test.
 
-**Fix:**
-1. At training time, write `perceiver_heads` into checkpoint `_meta` dict alongside other
-   adapter config (e.g. in `save_checkpoint`).
-2. In export script, read `perceiver_heads` from checkpoint `_meta`; fail explicitly if absent.
-3. Add assertion: `assert meta["perceiver_heads"] == config_perceiver_heads`.
+**Fix (applied):** `save_checkpoint_async` already writes the full `config` dict (including
+`config.adapter.perceiver_heads`) into the sidecar JSON. `export()` in
+`train/export/export_adapter.py` now reads the sidecar (`step_NNNNNNN.json`) to extract
+`perceiver_heads`; raises an explicit error if neither the sidecar nor `--perceiver-heads`
+provides a value. The Flux head count fallback is removed.
 
 ---
 
@@ -1028,9 +1023,9 @@ ever added.
 4. A-1 (stale Q guard)
 
 **Fix before Stage 2 launch:**
-5. SIGNAL-2 (SigLIP 384px resize — mitigated by cache, fix anyway for correctness)
+5. ~~SIGNAL-2~~ FIXED — `_resize_images_for_siglip()` added; live path now resizes to 384px
 6. SIGNAL-3 (null image conditioning gate)
-7. EXPORT-1 (store perceiver_heads in checkpoint _meta; export reads from there — CONFIRMED REAL)
+7. ~~EXPORT-1~~ FIXED — export reads `perceiver_heads` from checkpoint sidecar JSON
 8. EXPORT-2 (post-export param count check)
 9. C-1 (Perceiver residual — verify against InstantX reference first)
 

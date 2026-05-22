@@ -589,6 +589,29 @@ def export(
             except ValueError:
                 pass
 
+    # 4b. Resolve perceiver_heads from sidecar JSON > CLI arg > error.
+    # The sidecar (step_NNNNNNN.json) written by save_checkpoint_async contains
+    # config.adapter.perceiver_heads from training time.  We cannot recover this
+    # value from weight shapes alone (all projection matrices are [D, D] regardless
+    # of head count), so we require an authoritative source.
+    if perceiver_heads is None:
+        sidecar = checkpoint.replace(".safetensors", ".json")
+        if os.path.exists(sidecar):
+            try:
+                with open(sidecar) as _f:
+                    _sc = json.load(_f)
+                perceiver_heads = _sc.get("config", {}).get("adapter", {}).get("perceiver_heads")
+                if perceiver_heads is not None:
+                    print(f"  perceiver_heads={perceiver_heads} (from checkpoint sidecar)")
+            except Exception as e:
+                print(f"  WARNING: could not read sidecar {sidecar}: {e}")
+    if perceiver_heads is None:
+        raise ValueError(
+            "perceiver_heads could not be determined: no --perceiver-heads flag and no "
+            f"sidecar JSON found at {checkpoint.replace('.safetensors', '.json')}.\n"
+            "Pass --perceiver-heads N explicitly."
+        )
+
     # 5. Quantise
     print(f"Applying quantisation: {quant}")
     weights_q = apply_quant(weights_f32, quant)
@@ -600,7 +623,7 @@ def export(
         "model_target":       "flux-klein-4b" if dims["hidden_dim"] == 3072 else "flux-klein-9b",
         "iris_version":       "v2.7",
         **dims,
-        "perceiver_heads":    perceiver_heads if perceiver_heads is not None else dims["num_heads"],
+        "perceiver_heads":    perceiver_heads,
         "style_only":         style_only,
         "quant":              quant,
         "training_step":      step,

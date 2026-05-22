@@ -1406,7 +1406,7 @@ def train(config: dict) -> None:
         if siglip_np is not None:
             siglip_feats = mx.array(siglip_np, dtype=mx.bfloat16)
         elif siglip is not None:
-            siglip_feats = siglip(images)
+            siglip_feats = siglip(_resize_images_for_siglip(images))
         else:
             # Cache miss with no live encoder — force null image conditioning so
             # the adapter sees exact zeros after mx.where, not Perceiver(zeros).
@@ -2077,6 +2077,24 @@ class _TextEncoderBundle:
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _resize_images_for_siglip(images: "mx.array") -> "mx.array":
+    """Resize [B, 3, H, W] bf16 in [-1,1] → [B, 3, 384, 384] bf16 in [-1,1].
+
+    SigLIP SO400M was pretrained on 384×384 inputs. This helper ensures the
+    live-encode path matches the precompute path, which explicitly resizes to
+    384 before encoding. Only called when siglip_cache_dir is None.
+    """
+    from PIL import Image as _PilImage
+    imgs_np = np.array(images.astype(mx.float32))  # [B, 3, H, W]
+    out = np.empty((imgs_np.shape[0], 3, 384, 384), dtype=np.float32)
+    for i in range(imgs_np.shape[0]):
+        img = imgs_np[i].transpose(1, 2, 0)                              # [H, W, 3]
+        img = ((img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+        img = np.array(_PilImage.fromarray(img).resize((384, 384), _PilImage.LANCZOS))
+        out[i] = img.astype(np.float32) / 127.5 - 1.0                   # back to [-1,1]
+    return mx.array(out, dtype=mx.bfloat16)
+
 
 def _load_siglip(model_name: str):
     """

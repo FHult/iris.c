@@ -5,6 +5,39 @@ are in git history.
 
 ---
 
+## Code Audit May 2026 — Resolved Items
+
+### Fixed
+
+- **SIGNAL-2** (SigLIP bucket-resolution input) — `_resize_images_for_siglip()` added to
+  `train_ip_adapter.py`; live SigLIP path now resizes to 384×384 before encoding, matching
+  the precompute path. Was mitigated in practice by 100% precomputed cache coverage.
+
+- **EXPORT-1** (`perceiver_heads` in exported metadata defaulted to Flux head count 24 instead
+  of trained value 16) — `export()` in `train/export/export_adapter.py` now reads `perceiver_heads`
+  from the checkpoint sidecar JSON (`config.adapter.perceiver_heads`). Raises an explicit error
+  rather than silently defaulting. Sidecar always present for checkpoints saved by
+  `save_checkpoint_async`.
+
+### False Positives (do not re-raise)
+
+- **SIGNAL-1** (Qwen3 layers `(9,18,27)` claimed wrong, should be `(8,17,26)`) — The two
+  indexing schemes are equivalent. Precompute uses a manual loop index (`i=8,17,26` →
+  transformer layers 8, 17, 26). Training uses `hidden_states_list` where index 0 is the
+  embedding output, so index N+1 = transformer layer N. `(9,18,27)` correctly extracts layers
+  8, 17, 26. The mflux reference implementation also defaults to `(9,18,27)`. Changing to
+  `(8,17,26)` would extract layers 7, 16, 25 — a real regression.
+
+- **CROSS-1** (`inject()` hardcodes `hidden_dim // 24`, audit claimed this should be
+  `perceiver_heads`) — The 24 is the Flux 4B transformer head count, which is correct for the
+  inject cross-attention. `perceiver_heads` (16) controls only the PerceiverResampler's internal
+  SigLIP→query attention; the inject attention uses Flux Q (24 heads, 128 head_dim) and must
+  match accordingly. The two head counts are independent. The real latent issue is that 24 is
+  hardcoded rather than derived from the Flux model config, which would break Flux 9B (32 heads)
+  — but 9B adapter is unsupported. Fix if/when 9B adapter is added: use `img_q.shape[1]`.
+
+---
+
 ## Web UI — Completed
 
 - **1. Guidance scale slider** — Auto-selects 1.0 distilled / 4.0 base.
