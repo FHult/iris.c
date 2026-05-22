@@ -1039,7 +1039,7 @@ def _build_run_config(
 
 def _score(snapshots: list[dict], exit_code: int) -> float:
     """Batch-mode fixed scoring: 100*ref_gap + 200*cond_gap - 3*final_loss."""
-    if exit_code != 0 or not snapshots:
+    if exit_code not in (0,) or not snapshots:
         return float("-inf")
     n_skip = max(0, len(snapshots) * 2 // 5)
     tail = snapshots[n_skip:] or snapshots
@@ -1060,7 +1060,7 @@ def _score_weighted(snapshots: list[dict], exit_code: int, objective: dict) -> f
       gap_w       → mean_cond_gap (adapter learning; typical [-2, 0.5] → /2.5)
       stability_w → -(final_loss - 1) / 4  (stability; typical 0.5–5.0)
     """
-    if exit_code != 0 or not snapshots:
+    if exit_code not in (0,) or not snapshots:
         return float("-inf")
 
     clip_i_w    = float(objective.get("clip_i_weight", 0.55))
@@ -1086,6 +1086,8 @@ def _score_weighted(snapshots: list[dict], exit_code: int, objective: dict) -> f
 
 
 def _verdict(snapshots: list[dict], exit_code: int) -> str:
+    if exit_code == -3:
+        return "TIMEOUT"
     if exit_code != 0:
         return "CRASH"
     if not snapshots:
@@ -1135,55 +1137,168 @@ def _export_best_config(result: dict, output_dir: Path, run_name: str = "") -> N
         print(f"WARNING: could not write best_config.yaml: {e}", file=sys.stderr)
 
 
-# ── Early stopping ────────────────────────────────────────────────────────────
+# ── Trial-level wallclock timeout (ABL-1) ────────────────────────────────────
 
-class EarlyStopper:
-    """Monitor training snapshots and SIGTERM the subprocess when cond_gap is persistently bad.
+class TrialTimer:
+    """Background thread that sends SIGTERM to the trainer subprocess after timeout_secs.
 
-    Activates only after `min_snapshots` snapshots have been collected (warmup guard).
-    After `patience` consecutive snapshots with cond_gap < min_cond_gap, the process
-    receives SIGTERM and the run is recorded as an early-stopped result.
+    Prevents the campaign from hanging indefinitely when the trainer stalls
+    (Metal graph compilation, MPS crash, GPU lock deadlock).  Fires once;
+    cancel() stops it if the process finishes naturally first.
     """
 
-    def __init__(self, min_cond_gap: float, patience: int, min_snapshots: int) -> None:
-        self.min_cond_gap  = min_cond_gap
-        self.patience      = patience
-        self.min_snapshots = min_snapshots
+    def __init__(self, timeout_secs: int) -> None:
+        self._timeout  = timeout_secs
         self._proc: Optional[subprocess.Popen] = None
-        self._n_snapshots  = 0
-        self._bad_streak   = 0
-        self._triggered    = False
+        self._cancel   = threading.Event()
+        self._triggered = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self, proc: subprocess.Popen) -> None:
+        self._proc      = proc
+        self._triggered = False
+        self._cancel.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        if not self._cancel.wait(self._timeout):
+            self._triggered = True
+            try:
+                if self._proc and self._proc.poll() is None:
+                    import signal as _sig
+                    self._proc.send_signal(_sig.SIGTERM)
+            except Exception:
+                pass
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @property
+    def timed_out(self) -> bool:
+        return self._triggered
+
+
+# ── Early stopping (ABL-2: multi-signal) ─────────────────────────────────────
+
+class EarlyStopper:
+    """Monitor training snapshots and SIGTERM the subprocess on persistent quality failure.
+
+    Monitors three signals (activating after min_snapshots warmup):
+    - cond_gap < min_cond_gap for patience consecutive snapshots (original)
+    - loss_smooth > nan_loss_threshold → immediate kill (no patience)
+    - grad_norm > grad_norm_threshold for 3 consecutive snapshots → kill
+    - ref_gap < ref_gap_min for ref_gap_patience consecutive snapshots → kill
+    """
+
+    def __init__(
+        self,
+        min_cond_gap: float,
+        patience: int,
+        min_snapshots: int,
+        nan_loss_threshold: float = 5.0,
+        grad_norm_threshold: Optional[float] = None,
+        ref_gap_min: Optional[float] = None,
+        ref_gap_patience: Optional[int] = None,
+    ) -> None:
+        self.min_cond_gap         = min_cond_gap
+        self.patience             = patience
+        self.min_snapshots        = min_snapshots
+        self.nan_loss_threshold   = nan_loss_threshold
+        self.grad_norm_threshold  = grad_norm_threshold
+        self.ref_gap_min          = ref_gap_min
+        self.ref_gap_patience     = ref_gap_patience if ref_gap_patience is not None else patience
+        self._proc: Optional[subprocess.Popen] = None
+        self._n_snapshots    = 0
+        self._bad_streak     = 0
+        self._ref_gap_streak = 0
+        self._grad_streak    = 0
+        self._triggered      = False
+        self._trigger_reason: Optional[str] = None
 
     def attach(self, proc: subprocess.Popen) -> None:
         """Wire up immediately after Popen()."""
-        self._proc        = proc
-        self._n_snapshots = 0
-        self._bad_streak  = 0
-        self._triggered   = False
+        self._proc           = proc
+        self._n_snapshots    = 0
+        self._bad_streak     = 0
+        self._ref_gap_streak = 0
+        self._grad_streak    = 0
+        self._triggered      = False
+        self._trigger_reason = None
+
+    def _send_term(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                import signal as _sig
+                self._proc.send_signal(_sig.SIGTERM)
+            except Exception:
+                pass
+
+    def _trigger(self, reason: str) -> bool:
+        self._triggered      = True
+        self._trigger_reason = reason
+        self._send_term()
+        return True
+
+    @property
+    def trigger_reason(self) -> Optional[str]:
+        return self._trigger_reason
 
     def feed_snapshot(self, snap: dict) -> bool:
         """Returns True if early stopping was triggered this call or previously."""
         if self._triggered:
             return True
         self._n_snapshots += 1
+
+        # Instant kill: loss explosion / NaN (no warmup guard — always active)
+        loss = snap.get("loss_smooth") or snap.get("loss", 0.0)
+        if loss is not None and loss > self.nan_loss_threshold:
+            return self._trigger(f"loss={loss:.3f} > {self.nan_loss_threshold}")
+
+        # Grad explosion guard (3 consecutive snapshots, no warmup guard)
+        if self.grad_norm_threshold is not None:
+            grad = snap.get("grad_norm")
+            if grad is not None and grad > self.grad_norm_threshold:
+                self._grad_streak += 1
+                if self._grad_streak >= 3:
+                    return self._trigger(
+                        f"grad_norm={grad:.1f} > {self.grad_norm_threshold} "
+                        f"for {self._grad_streak} steps"
+                    )
+            else:
+                self._grad_streak = 0
+
+        # Warmup guard: signals below require min_snapshots
         if self._n_snapshots <= self.min_snapshots:
             return False
+
+        # cond_gap floor (original signal)
         cond_gap = snap.get("cond_gap")
-        if cond_gap is None:
-            return False
-        if cond_gap < self.min_cond_gap:
-            self._bad_streak += 1
-        else:
-            self._bad_streak = 0
-        if self._bad_streak >= self.patience:
-            self._triggered = True
-            if self._proc is not None and self._proc.poll() is None:
-                try:
-                    import signal as _sig
-                    self._proc.send_signal(_sig.SIGTERM)
-                except Exception:
-                    pass
-            return True
+        if cond_gap is not None:
+            if cond_gap < self.min_cond_gap:
+                self._bad_streak += 1
+            else:
+                self._bad_streak = 0
+            if self._bad_streak >= self.patience:
+                return self._trigger(
+                    f"cond_gap={cond_gap:.4f} < {self.min_cond_gap} "
+                    f"for {self._bad_streak} steps"
+                )
+
+        # ref_gap floor: style signal absent
+        if self.ref_gap_min is not None:
+            ref_gap = snap.get("ref_gap")
+            if ref_gap is not None:
+                if ref_gap < self.ref_gap_min:
+                    self._ref_gap_streak += 1
+                else:
+                    self._ref_gap_streak = 0
+                if self._ref_gap_streak >= self.ref_gap_patience:
+                    return self._trigger(
+                        f"ref_gap={ref_gap:.4f} < {self.ref_gap_min} "
+                        f"for {self._ref_gap_streak} steps"
+                    )
+
         return False
 
 
@@ -1336,6 +1451,7 @@ def _run_one(
     hb: Optional[HeartbeatWriter] = None,
     early_stopper: Optional[EarlyStopper] = None,
     use_gpu_lock: bool = False,
+    trial_timer: Optional[TrialTimer] = None,
 ) -> dict:
     combo_id = combo["combo_id"]
     params   = combo["params"]
@@ -1390,6 +1506,8 @@ def _run_one(
         )
         if early_stopper is not None:
             early_stopper.attach(proc)
+        if trial_timer is not None:
+            trial_timer.start(proc)
         with open(log_path, "w") as log_f:
             for raw_line in proc.stdout:  # type: ignore[union-attr]
                 line = raw_line.rstrip()
@@ -1415,11 +1533,16 @@ def _run_one(
                             current_ref_gap=round(ref_gap, 4),
                         )
                     if early_stopper is not None and early_stopper.feed_snapshot(snap):
+                        reason = early_stopper.trigger_reason or f"cond_gap={cond_gap:+.4f}"
                         print(_c("yellow",
                                  f"  ↳ early stopping triggered at step {snap['step']} "
-                                 f"(cond_gap={cond_gap:+.4f})"), flush=True)
+                                 f"({reason})"), flush=True)
         proc.wait()
+        if trial_timer is not None:
+            trial_timer.cancel()
         exit_code = proc.returncode
+        if trial_timer is not None and trial_timer.timed_out:
+            exit_code = -3  # distinguish timeout from crash
     except KeyboardInterrupt:
         print(f"\n  [interrupted — saving partial results for {combo_id}]")
         try:
@@ -1449,7 +1572,9 @@ def _run_one(
     tail = collector.snapshots[n_skip:] or collector.snapshots
     last = collector.snapshots[-1] if collector.snapshots else {}
 
-    _stopped_early = early_stopper._triggered if early_stopper is not None else False
+    _stopped_early = (early_stopper._triggered if early_stopper is not None else False) or (
+        trial_timer is not None and trial_timer.timed_out
+    )
     _stop_step     = last.get("step") if _stopped_early else None
 
     result = {
@@ -1544,7 +1669,7 @@ def _build_search_strategy(cfg: dict, candidates: list[dict]) -> SearchStrategy:
     sys.exit(1)
 
 
-# ── Warm-start helper ────────────────────────────────────────────────────────
+# ── Warm-start helpers (ABL-3: Pareto-aware for NSGA-II) ────────────────────
 
 def _warm_start_candidate(warm_start_dir: Path, run_name: str,
                            current_db: "AblationDB") -> Optional[dict]:
@@ -1583,6 +1708,60 @@ def _warm_start_candidate(warm_start_dir: Path, run_name: str,
         return None
 
 
+def _warm_start_pareto(warm_start_dir: Path, run_name: str,
+                       current_db: "AblationDB", top_k: int = 3) -> list[dict]:
+    """Load top-K Pareto-optimal params from a prior campaign for NSGA-II seeding.
+
+    NSGA-II needs multiple diverse seed points to bootstrap its Pareto front
+    estimate — a single best-score point provides no diversity signal.  This
+    function returns up to top_k unique param dicts from the prior campaign's
+    Pareto front, sorted by score descending, excluding any already in current_db.
+
+    Falls back to the single-best list if no Pareto experiments are found.
+    """
+    db_path = warm_start_dir / "ablation_history.db"
+    if not db_path.exists():
+        print(f"WARNING: --warm-start-from DB not found: {db_path}", file=sys.stderr)
+        return []
+    try:
+        prior = AblationDB(db_path)
+        # Try the matching run name first, then any run
+        exps = prior.get_experiments(run_name, scored_only=True)
+        pareto_ids = _pareto_efficient(exps) if exps else set()
+        pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
+        if not pareto_exps:
+            for name in prior.get_all_run_names():
+                exps = prior.get_experiments(name, scored_only=True)
+                pareto_ids = _pareto_efficient(exps)
+                pareto_exps = [e for e in exps if e.get("id") in pareto_ids]
+                if pareto_exps:
+                    break
+        # Fall back to top-K scored if no Pareto experiments found
+        if not pareto_exps:
+            pareto_exps = prior.get_best(run_name, top_k) or []
+        prior.close()
+        # Sort by score desc, deduplicate params, exclude already-tried
+        pareto_exps.sort(key=lambda e: e.get("score") or 0, reverse=True)
+        result: list[dict] = []
+        seen: set[str] = set()
+        for exp in pareto_exps:
+            params = exp["params"]
+            pk = _params_key(params)
+            if pk in seen or current_db.is_duplicate(run_name, params):
+                continue
+            seen.add(pk)
+            result.append(params)
+            if len(result) >= top_k:
+                break
+        if result:
+            print(f"  Warm-start (Pareto): injecting {len(result)} seed point(s) "
+                  f"from prior campaign Pareto front")
+        return result
+    except Exception as exc:
+        print(f"WARNING: --warm-start-from Pareto failed: {exc}", file=sys.stderr)
+        return []
+
+
 # ── Long-term run loop ────────────────────────────────────────────────────────
 
 def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
@@ -1617,7 +1796,7 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
     searcher = _build_search_strategy(harness_cfg, candidates)
 
-    # Per-run early stopping
+    # Per-run early stopping (ABL-2: multi-signal)
     es_cfg = harness_cfg.get("early_stopping", {})
     early_stopper: Optional[EarlyStopper] = None
     if es_cfg.get("enabled", False):
@@ -1625,7 +1804,20 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             min_cond_gap=float(es_cfg.get("min_cond_gap", -0.3)),
             patience=int(es_cfg.get("patience", 4)),
             min_snapshots=int(es_cfg.get("min_snapshots", 5)),
+            nan_loss_threshold=float(es_cfg.get("nan_loss_threshold", 5.0)),
+            grad_norm_threshold=(float(es_cfg["grad_norm_threshold"])
+                                 if "grad_norm_threshold" in es_cfg else None),
+            ref_gap_min=(float(es_cfg["ref_gap_min"])
+                         if "ref_gap_min" in es_cfg else None),
+            ref_gap_patience=(int(es_cfg["ref_gap_patience"])
+                              if "ref_gap_patience" in es_cfg else None),
         )
+
+    # Per-trial wallclock timeout (ABL-1)
+    _trial_timeout_secs = int(harness_cfg.get("trial_timeout_secs", 0))
+    trial_timer: Optional[TrialTimer] = (
+        TrialTimer(_trial_timeout_secs) if _trial_timeout_secs > 0 else None
+    )
 
     # Campaign-level plateau detection
     pd_cfg = harness_cfg.get("plateau_detection", {})
@@ -1650,11 +1842,17 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
         for exp in all_experiments:
             plateau.update(exp.get("score"))
 
-    # Warm-start: inject best params from a prior campaign as the first candidate
-    _ws_params: Optional[dict] = None
+    # Warm-start: inject seed params from a prior campaign (ABL-3: Pareto-aware for NSGA-II)
+    _ws_queue: list[dict] = []
     ws_dir = getattr(cli_args, "warm_start_from", None)
     if ws_dir:
-        _ws_params = _warm_start_candidate(Path(ws_dir), run_name, db)
+        if strategy == "nsga2":
+            ws_top_k = int(harness_cfg.get("warm_start_top_k", 3))
+            _ws_queue = _warm_start_pareto(Path(ws_dir), run_name, db, top_k=ws_top_k)
+        else:
+            single = _warm_start_candidate(Path(ws_dir), run_name, db)
+            if single is not None:
+                _ws_queue = [single]
 
     print()
     print(_c("cyan", f"{'═'*64}"))
@@ -1671,12 +1869,16 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
     if early_stopper is not None:
         print(f"  early_stopping: min_cond_gap={early_stopper.min_cond_gap}  "
               f"patience={early_stopper.patience}  "
-              f"min_snapshots={early_stopper.min_snapshots}")
+              f"min_snapshots={early_stopper.min_snapshots}  "
+              f"nan_threshold={early_stopper.nan_loss_threshold}")
+    if trial_timer is not None:
+        print(f"  trial_timeout: {_trial_timeout_secs}s "
+              f"({_trial_timeout_secs // 3600}h {(_trial_timeout_secs % 3600) // 60}m)")
     if plateau is not None:
         print(f"  plateau_detection: patience={plateau.patience}  "
               f"min_delta={plateau.min_delta}  min_runs={plateau.min_runs}")
-    if _ws_params is not None:
-        print(f"  warm_start: {_ws_params}")
+    if _ws_queue:
+        print(f"  warm_start: {len(_ws_queue)} seed(s) from prior campaign")
     print(_c("cyan", f"{'═'*64}\n"))
 
     hb.update(status="running", strategy=strategy, n_candidates=len(candidates),
@@ -1703,10 +1905,9 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
             print("\n  Stop signal received — exiting")
             break
 
-        # Warm-start injection: override searcher for the first untried candidate
-        if _ws_params is not None:
-            params     = _ws_params
-            _ws_params = None
+        # Warm-start injection: drain seed queue before handing off to searcher (ABL-3)
+        if _ws_queue:
+            params     = _ws_queue.pop(0)
         else:
             params = searcher.next_candidate(tried)
         if params is None:
@@ -1742,7 +1943,8 @@ def run_long_term(harness_cfg: dict, db: AblationDB, cli_args) -> None:
 
         _print_combo_header(combo, n_done, max_runs, steps)
         result = _run_one(combo, run_dir, run_args, log_every, quiet=False, hb=hb,
-                          early_stopper=early_stopper, use_gpu_lock=use_gpu_lock)
+                          early_stopper=early_stopper, use_gpu_lock=use_gpu_lock,
+                          trial_timer=trial_timer)
 
         # Re-score with configurable objective
         weighted_score = _score_weighted(result.get("snapshots", []), result["exit_code"], objective)

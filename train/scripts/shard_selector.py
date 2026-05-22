@@ -304,8 +304,13 @@ class ShardScoreDB:
         checkpoint_hash: str = "",
         checkpoint_iter: int = 0,
         n_in_batch: int = 0,
+        temporal_decay: Optional[float] = None,
     ) -> None:
-        """Update included EMA for a shard after a training run."""
+        """Update included EMA for a shard after a training run.
+
+        temporal_decay: if set (e.g. 0.3), use fixed-alpha EMA so recent
+        iterations count more than old ones.  None = cumulative equal-weight mean.
+        """
         ts = now_iso()
         with self._lock:
             row = self._conn.execute(
@@ -315,9 +320,9 @@ class ShardScoreDB:
             if row is None:
                 return
             n = (row["n_scored"] or 0) + 1
-            new_ref  = _ema(row["ref_gap_mean"],  ref_gap,  n)
-            new_cond = _ema(row["cond_gap_mean"], cond_gap, n)
-            new_loss = _ema(row["loss_mean"],      loss,     n)
+            new_ref  = _ema(row["ref_gap_mean"],  ref_gap,  n, temporal_decay)
+            new_cond = _ema(row["cond_gap_mean"], cond_gap, n, temporal_decay)
+            new_loss = _ema(row["loss_mean"],      loss,     n, temporal_decay)
             raw_comp = _compute_raw_composite(new_ref, new_cond, new_loss)
 
             self._conn.execute("""
@@ -364,10 +369,12 @@ class ShardScoreDB:
         checkpoint_hash: str = "",
         checkpoint_iter: int = 0,
         n_in_batch: int = 0,
+        temporal_decay: Optional[float] = None,
     ) -> None:
         """
         Update excluded EMA for every shard NOT in selected_ids, then
         recompute attributed scores for all affected shards (selected + excluded).
+        temporal_decay: passed through to _ema for consistent decay with update_scores.
         """
         excluded_ids = [sid for sid in all_shard_ids if sid not in selected_ids]
         ts = now_iso()
@@ -380,8 +387,8 @@ class ShardScoreDB:
                 if row is None:
                     continue
                 n = (row["n_excluded"] or 0) + 1
-                new_ref_excl  = _ema(row["ref_gap_excl_mean"],  ref_gap,  n)
-                new_cond_excl = _ema(row["cond_gap_excl_mean"], cond_gap, n)
+                new_ref_excl  = _ema(row["ref_gap_excl_mean"],  ref_gap,  n, temporal_decay)
+                new_cond_excl = _ema(row["cond_gap_excl_mean"], cond_gap, n, temporal_decay)
 
                 self._conn.execute("""
                     UPDATE shards SET
@@ -662,13 +669,22 @@ class ShardScoreDB:
 # Scoring helpers
 # ---------------------------------------------------------------------------
 
-def _ema(old: Optional[float], new: Optional[float], n: int) -> Optional[float]:
-    """Exponential moving average with alpha=1/n (converges to simple mean)."""
+def _ema(old: Optional[float], new: Optional[float], n: int,
+         temporal_decay: Optional[float] = None) -> Optional[float]:
+    """Running mean update.
+
+    Default (temporal_decay=None): alpha=1/n — equal-weighted cumulative mean.
+    With temporal_decay in (0, 1): alpha=temporal_decay — fixed EMA where recent
+    observations count more.  temporal_decay=0.3 means each new value has 30%
+    weight; history retains 70%.  Use for long campaigns where early iterations
+    used different hyperparams and should matter less than recent ones.
+    n is still incremented for attr_confidence tracking regardless of mode.
+    """
     if old is None:
         return new
     if new is None:
         return old
-    alpha = 1.0 / n
+    alpha = temporal_decay if temporal_decay is not None else (1.0 / n)
     return (1.0 - alpha) * old + alpha * new
 
 

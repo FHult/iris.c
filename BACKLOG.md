@@ -321,6 +321,95 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 
 ---
 
+## Ablation Harness Improvements
+
+**ABL-1: Trial-level wallclock timeout** (High — safety, unblocked)
+
+If the trainer hangs (Metal graph compilation stall, GPU lock deadlock, MPS crash), `_run_one` blocks forever in the `proc.stdout` line loop and the entire campaign freezes. There is no per-trial time budget and no recovery path. The fix is a background `TrialTimer` thread that sends SIGTERM after `trial_timeout_secs` and marks the result as `verdict=TIMEOUT`. Implemented in `ablation_harness.py` (new class `TrialTimer`, wired into `_run_one`). Config key: `trial_timeout_secs` (default 14400 = 4 h).
+
+**Success criteria:** A deliberately hung trainer (inserted `time.sleep(9999)`) is killed within 60 s of the timeout, result written to DB as TIMEOUT, campaign proceeds to next trial. No regression on normal runs.
+
+---
+
+**ABL-2: Multi-signal early stopping** (High — quality + time savings)
+
+`EarlyStopper` currently monitors only `cond_gap < min_cond_gap`. Two failure modes it misses:
+
+1. **Loss explosion / NaN**: `loss_smooth > 5.0` should cause an immediate kill (no patience needed) — the run is unrecoverable. Currently only detected at scoring time, wasting potentially hours of GPU.
+2. **Style signal absent**: `ref_gap < min_ref_gap` for `ref_gap_patience` consecutive snapshots means the adapter is not learning from the style reference at all. This is a distinct failure from low cond_gap (adapter may learn from null prompt but style is dead).
+
+Extend `EarlyStopper.__init__` with `nan_loss_threshold`, `grad_norm_threshold`, `ref_gap_min`, `ref_gap_patience`. Add `trigger_reason` property for DB logging. Config YAML:
+
+```yaml
+early_stopping:
+  enabled: true
+  min_cond_gap: -0.3
+  patience: 4
+  min_snapshots: 5
+  nan_loss_threshold: 5.0      # instant kill
+  grad_norm_threshold: 50.0    # explosion guard (3 consecutive snapshots)
+  ref_gap_min: -0.5            # style-dead guard
+  ref_gap_patience: 6
+```
+
+**Success criteria:** Deliberately broken training (return constant loss=9.0) triggers immediate kill within 2 snapshots. Normal runs unaffected. Trigger reason recorded in DB.
+
+---
+
+**ABL-3: Pareto-front warm-start for NSGA-II** (Medium — quality)
+
+`_warm_start_candidate` loads the single highest-scored experiment from a prior campaign and injects it as the first candidate. For NSGA-II this is sub-optimal: the multi-objective sampler needs multiple diverse seed points to bootstrap the Pareto front estimate — a single point gives it nothing to work with for N_initial trials. Add `_warm_start_pareto(top_k=3)` that loads the top-K Pareto-optimal experiments from the prior DB (excluding already-tried) and injects them as forced first candidates. Single-objective campaigns use the existing single-best path; NSGA-II campaigns use the Pareto path.
+
+**Success criteria:** NSGA-II campaign warm-started from a prior run with 3 Pareto seeds produces a first-generation Pareto front within 5 trials vs 15+ without seeding.
+
+---
+
+**ABL-4: Pareto scatter plot in HTML report** (Medium — interpretability)
+
+The ablation HTML report shows a sortable table with an `is_pareto` flag column. This makes it impossible to see the shape of the Pareto front or where individual trials cluster. Add a `<canvas>` scatter plot above the table: ref_gap on X, cond_gap on Y, one circle per scored trial, Pareto points outlined in gold, tooltip showing params and score on hover. Render inline with vanilla JS — no dependencies.
+
+---
+
+## Shard Scoring Improvements
+
+**SHARD-1: Temporal momentum in shard score updates** (Medium — data quality)
+
+`shard_selector.py score_update()` computes a cumulative running mean: older iterations count equally with recent ones. After 20+ flywheel iterations a shard's score is dominated by its earliest runs, which may have been under a very different hyperparam regime (before ablation tuning). Add exponential moving average (EMA) weighting in `score_update` with a configurable `temporal_decay` (default 0.85 — each new iteration counts as 85% new, 15% history). The existing `n_scored` counter is preserved for confidence estimation. Add `temporal_decay` as a top-level config option in `shard_selector.yaml` / flywheel YAML.
+
+**Success criteria:** After 10 simulated score updates, the EMA-weighted mean responds to a regime change (scores flip from 0.3→0.7) in 3 iterations vs 10+ for the flat mean. Old campaigns unaffected (temporal_decay=1.0 is equivalent to flat mean).
+
+---
+
+**SHARD-2: Hyperparam-conditioned score table** (Low–Medium — long-term quality)
+
+A shard that scores well with `style_loss_weight=0.12` may score poorly with `style_loss_weight=0.0`. The current IPS attribution averages across all hyperparam configurations, conflating effects. Add a `shard_scores_by_regime` table to `shard_scores.db` that stores a separate (score, n_obs) pair per shard per param-regime hash. The flywheel's `_select_shards` call can pass the current ablation best-params as the active regime, and `score_update` partitions attribution by regime. Useful once ≥3 ablation iterations have been run under a stable best-config.
+
+**Dependencies:** Requires ABL-3 (stable best-params are needed as the regime key).
+
+---
+
+## Precompute / VAE Improvements
+
+**PRECOMP-1: VAE tiling for high-resolution precomputation** (High — enables Stage 2/3, unblocked)
+
+`precompute_all.py _preprocess_vae` encodes images at a single fixed resolution by resizing to `image_size` before encoding. Stage 2 (768px) and Stage 3 (1024px) training requires latents precomputed at that resolution. Encoding a 1024×1024 image through the Flux VAE in one pass requires ~6 GB of intermediate GPU memory — tight but feasible at 14 GB limit. However, for robustness and future-proofing (1280×1280+ or multi-crop), implement overlap-blend tiling: split into 512px tiles with 64px overlap, encode each tile independently, blend the overlap regions with a bilinear feather mask, reassemble the full latent.
+
+**Implementation:** New function `_encode_vae_tiled(vae, img_tensor, tile_size=512, overlap=64)`. Used in the VAE encoding pass when `image_size > 512`. The existing single-pass path is preserved as the fast path for ≤512px.
+
+**Success criteria:** A 1024×1024 image encoded via tiling produces a latent with ≤0.5% mean absolute difference vs single-pass encoding. Peak GPU memory stays below 8 GB during tiling (each tile is independent). No regression on 512px precompute.
+
+---
+
+**PRECOMP-2: Tiny proxy VAE encoder** (Low — long-term throughput)
+
+The Flux VAE is the precompute bottleneck at ~200 ms/image on MPS. A small CNN trained on `{image → Flux VAE latent}` pairs could replicate it at ~20 ms/image, enabling 10× faster precompute for large datasets. Architecture: EfficientNet-B0-style encoder (5.3M params) with a final 1×1 conv projecting to 32 channels at stride 8 — output is the pre-patchification latent `[32, H//8, W//8]`. Train with MSE loss on precomputed VAE latent pairs. Expected fidelity: LPIPS < 0.04 vs real VAE. This is a training subproject, not a quick fix.
+
+**Dependencies:** PRECOMP-1 (need high-res latents for training data), a corpus of precomputed VAE latents (~100K images sufficient for initial training).
+
+**Effort:** 3–5 days (architecture, training loop, validation). Does not block any current pipeline work.
+
+---
+
 ## Flywheel Management
 
 **FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** (unblocked — PIPELINE-29 done)

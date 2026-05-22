@@ -175,6 +175,100 @@ def _preprocess_vae(jpg_bytes: bytes, image_size: int, tj=None) -> np.ndarray:
     return img_f[np.newaxis]
 
 
+# ---------------------------------------------------------------------------
+# VAE tiling (PRECOMP-1)
+# ---------------------------------------------------------------------------
+
+_VAE_TILE_SIZE = 512    # max image-space tile side in pixels
+_VAE_TILE_OVERLAP = 64  # pixel overlap between adjacent tiles (must be divisible by 8)
+
+
+def _feather_mask(h: int, w: int, ov: int) -> np.ndarray:
+    """Linear feather mask [h, w] in [0,1].  Edges ramp from 0→1 over ov pixels."""
+    mask = np.ones((h, w), dtype=np.float32)
+    for i in range(ov):
+        v = (i + 0.5) / ov
+        mask[i, :] *= v
+        mask[h - 1 - i, :] *= v
+        mask[:, i] *= v
+        mask[:, w - 1 - i] *= v
+    return mask
+
+
+def _encode_vae_tiled(vae, img_chw: np.ndarray,
+                      tile_size: int = _VAE_TILE_SIZE,
+                      overlap: int = _VAE_TILE_OVERLAP) -> np.ndarray:
+    """Overlap-blend tiled VAE encode for images larger than tile_size.
+
+    img_chw: float32 [3, H, W] in [-1, 1] (single image, no batch dim).
+    Returns: float32 [32, H//8, W//8] — pre-patchification Flux VAE latent.
+
+    Tiles of tile_size×tile_size are encoded independently and blended at
+    boundaries using a bilinear feather mask.  Edge tiles are reflect-padded to
+    tile_size so the VAE always sees the same input dimensions; only the valid
+    region is accumulated into the output.
+    """
+    import mlx.core as mx
+
+    C, H, W = img_chw.shape
+    lH, lW = H // 8, W // 8
+    lC = 32  # Flux VAE latent channels
+    step = tile_size - overlap
+
+    # Compute tile start positions (image space)
+    def _starts(dim: int) -> list[int]:
+        s = list(range(0, max(1, dim - tile_size + 1), step))
+        if not s or s[-1] + tile_size < dim:
+            s.append(max(0, dim - tile_size))
+        return s
+
+    y_starts = _starts(H)
+    x_starts = _starts(W)
+    n_tiles = len(y_starts) * len(x_starts)
+
+    # Single-tile fast path
+    if n_tiles == 1:
+        x = mx.array(img_chw[np.newaxis])  # [1, 3, H, W]
+        lat = vae.encode(x)
+        mx.eval(lat)
+        return np.array(lat)[0]  # [32, H//8, W//8]
+
+    result  = np.zeros((lC, lH, lW), dtype=np.float32)
+    weights = np.zeros((lH, lW), dtype=np.float32)
+    ov_lat = overlap // 8  # overlap in latent space
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            y1 = min(y0 + tile_size, H)
+            x1 = min(x0 + tile_size, W)
+            th = y1 - y0
+            tw = x1 - x0
+
+            tile = img_chw[:, y0:y1, x0:x1]
+            pad_h = tile_size - th
+            pad_w = tile_size - tw
+            if pad_h > 0 or pad_w > 0:
+                tile = np.pad(tile, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
+
+            x_t = mx.array(tile[np.newaxis])  # [1, 3, tile_size, tile_size]
+            lat = vae.encode(x_t)
+            mx.eval(lat)
+            lat_np = np.array(lat)[0]  # [32, lT, lT]
+
+            # Valid latent region (clip padded edge)
+            ly0, ly1 = y0 // 8, y1 // 8
+            lx0, lx1 = x0 // 8, x1 // 8
+            lh_out = ly1 - ly0
+            lw_out = lx1 - lx0
+
+            mask = _feather_mask(lh_out, lw_out, ov_lat if n_tiles > 1 else 0)
+            result[:, ly0:ly1, lx0:lx1] += lat_np[:, :lh_out, :lw_out] * mask
+            weights[ly0:ly1, lx0:lx1]   += mask
+
+    result /= np.maximum(weights, 1e-6)
+    return result
+
+
 def _preprocess_siglip(jpg_bytes: bytes, tj=None) -> np.ndarray:
     """Returns float32 [1, 3, SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE] normalised for SigLIP."""
     img = _resize(_decode_jpg(jpg_bytes, tj), SIGLIP_IMAGE_SIZE)
@@ -483,11 +577,40 @@ def _encode_with_prefetch(records: list, out_dir: str, batch_size: int,
 
 
 def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
+    """Encode a batch of VAE images.
+
+    When image_size > _VAE_TILE_SIZE (512), falls back to per-image tiled
+    encoding via _encode_vae_tiled to avoid OOM on high-resolution inputs.
+    Below 512px, uses fast single-batch encode.
+    """
     import mlx.core as mx
     import time as _time
     vae = _W["vae"]
+    image_size = _W.get("image_size", 512)
     _n = _W.get("_vae_batch_n", 0)
     _W["_vae_batch_n"] = _n + 1
+    use_tiling = image_size > _VAE_TILE_SIZE
+
+    if use_tiling:
+        # Tiled path: encode each image independently with overlap-blend tiling
+        saved = 0
+        _t0 = _time.time()
+        for rec_id, img_np in zip(batch_ids, batch_imgs):
+            try:
+                lat_np = _encode_vae_tiled(vae, img_np[0])  # img_np is [1,3,H,W]
+                _save_npz_atomic(os.path.join(out_dir, f"{rec_id}.npz"),
+                                 latent=lat_np.astype(np.float32))
+                saved += 1
+            except Exception as e2:
+                print(f"  Skipping {rec_id} (tiled VAE failed: {e2})", file=sys.stderr)
+        _dt = _time.time() - _t0
+        if _n < 3 or _n % 50 == 0:
+            n = len(batch_ids)
+            print(f"  [vae tiled {_n}] n={n} dt={_dt:.2f}s ({_dt/max(n,1):.3f}s/img)",
+                  file=sys.stderr, flush=True)
+        return saved
+
+    # Fast batched path (image_size <= 512)
     try:
         stacked = np.concatenate(batch_imgs, axis=0)
         _t0 = _time.time()

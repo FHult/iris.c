@@ -2877,6 +2877,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             has_metrics = (metrics.get("ref_gap") is not None
                            or metrics.get("cond_gap") is not None)
             if has_metrics:
+                _temporal_decay = fw_cfg.get("temporal_decay") or None
                 for sid in shard_ids:
                     score_db.update_scores(
                         shard_id=sid,
@@ -2888,6 +2889,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                         checkpoint_hash=new_ckpt_hash,
                         checkpoint_iter=iteration,
                         n_in_batch=len(shard_ids),
+                        temporal_decay=_temporal_decay,
                     )
                 # Update excluded EMA for all other shards (contrastive attribution)
                 all_pool_ids = [s["shard_id"] for s in score_db.get_all_shards()]
@@ -2901,6 +2903,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     checkpoint_hash=new_ckpt_hash,
                     checkpoint_iter=iteration,
                     n_in_batch=len(shard_ids),
+                    temporal_decay=_temporal_decay,
                 )
 
             # Promote checkpoint for the next iteration; mark as best if quality improved.
