@@ -715,7 +715,11 @@ def dedup_wds_tar(
             # When the caller owns the index, persistence is its responsibility.
             if not caller_owns_index:
                 index_path.parent.mkdir(parents=True, exist_ok=True)
-                faiss.write_index(index, str(index_path))
+                _idx_tmp = index_path.with_suffix(".tmp")
+                faiss.write_index(index, str(_idx_tmp))
+                with open(str(_idx_tmp), "rb") as _f:
+                    os.fsync(_f.fileno())
+                os.replace(str(_idx_tmp), str(index_path))
 
     records_out = records_in - len(dup_stems)
 

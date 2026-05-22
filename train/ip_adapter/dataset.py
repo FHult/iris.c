@@ -328,7 +328,7 @@ def make_prefetch_loader(
       images:      float32 numpy [B, C, H+32, W+32] — padded for GPU crop augmentation
       captions:    list of str, len B (empty string if text dropout)
       text_embeds: float16 numpy [B, seq, 7680] or None (if no Qwen3 cache)
-      vae_latents: float16 numpy [B, 32, H/8, W/8] or None (if no VAE cache)
+      vae_latents: float32 numpy [B, 32, H/8, W/8] or None (if no VAE cache)
       siglip_feats:float16 numpy [B, 729, 1152] or None (if no SigLIP cache)
       bucket_hw:   (H, W) tuple for this batch
     """

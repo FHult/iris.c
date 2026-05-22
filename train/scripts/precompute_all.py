@@ -54,22 +54,6 @@ except Exception:
 # Quantisation helpers
 # ---------------------------------------------------------------------------
 
-def _quantize_int8(arr: np.ndarray):
-    """Per-channel absmax int8 quantisation for VAE latents [32, H, W]."""
-    scale = np.abs(arr).max(axis=(1, 2), keepdims=True) / 127.0
-    scale = np.where(scale == 0, 1e-8, scale)
-    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
-    return q, scale.astype(np.float16)
-
-
-def _quantize_int8_batch(arr: np.ndarray):
-    """Batch per-channel absmax int8 quantisation for VAE latents [B, 32, H, W]."""
-    scale = np.abs(arr).max(axis=(2, 3), keepdims=True) / 127.0
-    scale = np.where(scale == 0, 1e-8, scale)
-    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
-    return q, scale.astype(np.float16)
-
-
 def _quantize_4bit(arr: np.ndarray):
     """Per-token absmax 4-bit quantisation (nibble-packed) for [..., dim] arrays."""
     scale = np.abs(arr).max(axis=-1, keepdims=True) / 7.0

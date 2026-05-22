@@ -49,7 +49,7 @@ sys.path.insert(0, str(_TRAIN_DIR))
 
 try:
     from ip_adapter.model import IPAdapterKlein
-    from train_ip_adapter import _flux_forward_no_ip, _flux_forward_with_ip
+    from train_ip_adapter import _flux_forward_with_ip
     from export.export_adapter import _KEY_MAP as _TRAIN_TO_EXPORT_MAP
 except ImportError as e:
     print(f"Error: cannot import training code: {e}", file=sys.stderr)
@@ -351,9 +351,9 @@ def _generate(
     """
     Full Euler denoising loop with IP-Adapter.
 
-    Uses the training-matching inference approach: run Flux without IP to
-    collect Q vectors and h_final, then sum IP contributions at h_final.
-    sref_strength=0.0 gives a numerically exact baseline (ip_scale all zeros).
+    Uses per-block injection (via _flux_forward_with_ip) matching the training path.
+    sref_strength=0.0 produces ip_scale all-zeros — numerically equivalent to
+    no-adapter baseline (ip_scale[i] * ip_out == 0 at every block).
     """
     mx.random.seed(seed)
     H_lat, W_lat = height // 8, width // 8
