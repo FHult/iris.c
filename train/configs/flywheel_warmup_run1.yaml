@@ -1,0 +1,58 @@
+# Flywheel warm-up run 1 — Bootstrap / exploration-heavy
+#
+# Goal: first-contact coverage >= 55% of shards (~165 of 300).
+# n_shards=40 (vs default 20) to cover a 300-shard pool at reasonable pace.
+# No ablation: attribution data is too thin at this stage.
+#
+# Launch:
+#   pipeline_ctl start-flywheel train/configs/flywheel_warmup_run1.yaml
+#
+# Coverage check:
+#   train/.venv/bin/python train/scripts/shard_selector.py status
+#
+# Exit criteria:
+#   >= 55% shards with n_scored>=1  (both sources >= 45%)
+#   cond_gap mean across done iters >= 0.20
+#   No more than 2 consecutive failed iterations
+
+flywheel:
+  name: "warmup-run1"
+  max_iterations: 15
+  steps_per_iteration: 1000
+  n_shards: 40               # 40/300 = 13% per iter — covers pool in ~15 iters at high explore
+  poll_interval: 60
+  min_free_gb: 40
+
+  base_checkpoint: null      # start fresh; or set to sref-v1 best checkpoint path
+
+  training_config: "train/configs/stage1_512px.yaml"
+
+  hyperparams:
+    cross_ref_prob: 0.35
+    style_loss_weight: 0.07
+
+  shard_selection:
+    performance_weight: 0.30   # low — few shards have reliable scores yet
+    min_diversity_pct:  0.30   # high — maximize visual diversity
+    exploration_rate:   0.40   # high — aggressively discover unscored shards
+    recency_penalty:    0.20   # light — discourage returning to same 40 every iter
+    recency_window_iters: 2
+
+    # Exploration schedule: decay rate as coverage builds.
+    # Overrides exploration_rate for the matching iteration range.
+    exploration_schedule:
+      - {through_iteration: 8,  rate: 0.45}
+      - {through_iteration: 15, rate: 0.35}
+
+    # Source minimums: guarantee both sources are represented each iteration.
+    per_source_min:
+      laion_coyo: 6
+      journeydb:  6
+
+  min_attribution_obs: 3       # attribution won't fire much yet — few shards have excl data
+  siglip_sample_n: 50
+  shard_manifest: null
+
+  plateau_patience:   0        # disabled — too early to declare plateau
+  plateau_threshold:  0.02
+  ablation_every_n:   0        # disabled — not enough attribution signal yet

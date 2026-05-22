@@ -756,6 +756,19 @@ def select_shards(
     recency_penalty    = float(cfg.get("recency_penalty",    0.30))
     recency_window     = int(cfg.get("recency_window_iters", 3))
 
+    # Exploration schedule: override exploration_rate for the current iteration.
+    # Entries are checked in order; the first match wins.
+    # Format: [{through_iteration: N, rate: R}, ..., {after_iteration: N, rate: R}]
+    schedule = cfg.get("exploration_schedule")
+    if schedule and iteration > 0:
+        for entry in schedule:
+            if "through_iteration" in entry and iteration <= int(entry["through_iteration"]):
+                exploration_rate = float(entry["rate"])
+                break
+            if "after_iteration" in entry and iteration > int(entry["after_iteration"]):
+                exploration_rate = float(entry["rate"])
+                break
+
     all_shards = db.get_all_shards()
     if not all_shards:
         print("WARNING: no shards in DB — returning empty selection", file=sys.stderr)
@@ -897,6 +910,32 @@ def select_shards(
             picks_idx = _weighted_sample_no_replace(probs, min(needed, len(remaining)))
             for i in picks_idx:
                 _add_shard(remaining[i])
+
+    # ------------------------------------------------------------------
+    # Step 5: per-source minimum guarantee
+    # For each source with a configured minimum, add the best-scoring unselected
+    # shards from that source until the minimum is met (or the source is exhausted).
+    # Does not displace existing selections; may increase total above n_shards only
+    # if every slot is already filled — in that case we respect n_shards cap.
+    per_source_min = cfg.get("per_source_min", {})
+    if per_source_min and len(selected_ids) < n_shards:
+        for src, min_count in per_source_min.items():
+            current_count = sum(
+                1 for s in selected_shards
+                if (s.get("manifest_source") or s.get("source", "unknown")) == src
+            )
+            if current_count < min_count:
+                candidates = [
+                    s for s in all_shards
+                    if s["shard_id"] not in selected_ids
+                    and (s.get("manifest_source") or s.get("source", "unknown")) == src
+                ]
+                candidates.sort(key=_score_penalised, reverse=True)
+                for s in candidates:
+                    if current_count >= min_count or len(selected_ids) >= n_shards:
+                        break
+                    _add_shard(s)
+                    current_count += 1
 
     # ------------------------------------------------------------------
     # Logging and bookkeeping

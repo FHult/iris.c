@@ -38,7 +38,7 @@ from pipeline_lib import (
     HEARTBEAT_STALE_SECS, GPU_LOCK_FILE, SHARD_BLOCK,
     COLD_ROOT, COLD_PRECOMPUTE_DIR, COLD_WEIGHTS_DIR, COLD_METADATA_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
-    TMUX_ABLATION_WIN, FLYWHEEL_DB_PATH,
+    TMUX_ABLATION_WIN, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -1851,6 +1851,45 @@ def _check_campaign_state() -> None:
                  ctx={"campaign": name, "n_iterations": iters})
 
 
+def _check_shard_coverage() -> None:
+    """Warn when flywheel shard pool coverage is too low to build reliable scores."""
+    if not SHARD_SCORES_DB_PATH.exists():
+        return
+    try:
+        import sqlite3 as _sqlite3
+        _sdb = _sqlite3.connect(str(SHARD_SCORES_DB_PATH))
+        _row = _sdb.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN n_scored>0 THEN 1 ELSE 0 END) FROM shards"
+        ).fetchone()
+        _sdb.close()
+    except Exception:
+        return
+    total, scored = (_row[0] or 0), (_row[1] or 0)
+    if total == 0:
+        return
+    pct = round(100 * scored / total, 1)
+    venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    scripts  = str(SCRIPTS_DIR)
+    if pct < 50:
+        _add("WARNING", "flywheel",
+             f"Shard pool coverage low: {scored}/{total} scored ({pct}%)",
+             detail=("Fewer than half the shards have training observations. "
+                     "Attribution scores are unreliable at this coverage. "
+                     "Run explore-heavy flywheel iterations to build coverage "
+                     "before shifting to performance-biased selection."),
+             fix=(f"{venv_py} {scripts}/shard_selector.py status\n"
+                  f"# Use flywheel_warmup_run1.yaml for explore-heavy config"),
+             ctx={"total_shards": total, "scored_shards": scored,
+                  "coverage_pct": pct})
+    elif pct < 80:
+        _add("INFO", "flywheel",
+             f"Shard pool coverage building: {scored}/{total} scored ({pct}%)",
+             detail="Coverage is progressing. Attribution confidence is active for "
+                    "the scored subset. Continue warm-up runs to reach ≥80%.",
+             ctx={"total_shards": total, "scored_shards": scored,
+                  "coverage_pct": pct})
+
+
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     """Build compact machine-readable pipeline health summary for --ai mode."""
     scale = cfg.get("scale", "small")
@@ -2018,6 +2057,24 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         summary["ablation"] = ablation_info
     if pool_info is not None:
         summary["pool"] = pool_info
+
+    # Shard pool coverage (flywheel warm-up progress)
+    if SHARD_SCORES_DB_PATH.exists():
+        try:
+            import sqlite3 as _sqlite3
+            _sdb = _sqlite3.connect(str(SHARD_SCORES_DB_PATH))
+            _row = _sdb.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN n_scored>0 THEN 1 ELSE 0 END) FROM shards"
+            ).fetchone()
+            _sdb.close()
+            _total, _scored = (_row[0] or 0), (_row[1] or 0)
+            if _total > 0:
+                _pct = round(100 * _scored / _total, 1)
+                summary["shard_coverage"] = {
+                    "total": _total, "scored": _scored, "pct": _pct,
+                }
+        except Exception:
+            pass
 
     # Cold precompute version info (PIPELINE-26)
     if COLD_ROOT.exists():
@@ -2392,6 +2449,7 @@ def main() -> None:
         _check_stale_logs(chunks)
         _check_ablation_health()
         _check_campaign_state()
+        _check_shard_coverage()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)

@@ -2697,6 +2697,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                  f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
                  f"resume={Path(resume_ckpt).name if resume_ckpt else 'none'}")
 
+        # Record the starting checkpoint once so later campaigns know what to warm-start from.
+        fw_db.set_base_checkpoint(name, resume_ckpt)
+
         plateau_patience         = int(fw_cfg.get("plateau_patience",       0))
         plateau_threshold        = float(fw_cfg.get("plateau_threshold",    0.02))
         # Max ablation runs to fire when plateau is detected. 0 = disabled.
@@ -2877,6 +2880,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             has_metrics = (metrics.get("ref_gap") is not None
                            or metrics.get("cond_gap") is not None)
             if has_metrics:
+                # Snapshot which selected shards are currently unscored before the update
+                # so we can count first-contact discoveries for this iteration.
+                pre_zero = {s["shard_id"] for s in score_db.get_all_shards()
+                            if s.get("n_scored", 0) == 0}
                 _temporal_decay = fw_cfg.get("temporal_decay") or None
                 for sid in shard_ids:
                     score_db.update_scores(
@@ -2905,6 +2912,12 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     n_in_batch=len(shard_ids),
                     temporal_decay=_temporal_decay,
                 )
+
+                # Count shards that just received their first-ever score observation.
+                n_first_contact = sum(1 for sid in shard_ids if sid in pre_zero)
+                fw_db.set_n_first_contact(row_id, n_first_contact)
+                log_orch(f"[flywheel:{name}] iter {iteration}: "
+                         f"first_contact={n_first_contact}/{len(shard_ids)}")
 
             # Promote checkpoint for the next iteration; mark as best if quality improved.
             # cond_gap is the primary criterion: stable and informative at 1000-step budgets.

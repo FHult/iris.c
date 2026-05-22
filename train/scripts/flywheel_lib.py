@@ -137,6 +137,16 @@ _V5_MIGRATIONS = [
     "INSERT OR REPLACE INTO _meta VALUES ('schema_version', '5')",
 ]
 
+_V6_MIGRATIONS = [
+    # Number of shards that gained their first-ever score observation in this iteration.
+    # Tracks warm-up discovery rate; plateaus when pool coverage saturates.
+    "ALTER TABLE iterations ADD COLUMN n_first_contact INTEGER",
+    # Checkpoint the campaign started from (before any iterations ran).
+    # Makes it easy to identify what Run N+1 should warm-start from.
+    "ALTER TABLE campaign_summary ADD COLUMN base_checkpoint TEXT",
+    "INSERT OR REPLACE INTO _meta VALUES ('schema_version', '6')",
+]
+
 
 def _checkpoint_hash(ckpt_path: Optional[str]) -> str:
     """Stable 12-char version tag derived from the checkpoint filename."""
@@ -165,6 +175,11 @@ class FlywheelDB:
             except Exception:
                 pass
         for _mig in _V5_MIGRATIONS:
+            try:
+                self._conn.execute(_mig)
+            except Exception:
+                pass
+        for _mig in _V6_MIGRATIONS:
             try:
                 self._conn.execute(_mig)
             except Exception:
@@ -409,6 +424,29 @@ class FlywheelDB:
             self._conn.execute("""
                 UPDATE campaign_summary SET config_path=? WHERE flywheel_name=?
             """, (config_path, name))
+            self._conn.commit()
+
+    def set_base_checkpoint(self, name: str, checkpoint_path: Optional[str]) -> None:
+        """Record the checkpoint the campaign started from (written once at loop start)."""
+        if not checkpoint_path:
+            return
+        ts = now_iso()
+        with self._lock:
+            self._conn.execute("""
+                INSERT OR IGNORE INTO campaign_summary (flywheel_name, status, ts_first, ts_last)
+                VALUES (?, 'active', ?, ?)
+            """, (name, ts, ts))
+            self._conn.execute("""
+                UPDATE campaign_summary SET base_checkpoint=? WHERE flywheel_name=?
+            """, (checkpoint_path, name))
+            self._conn.commit()
+
+    def set_n_first_contact(self, row_id: int, n: int) -> None:
+        """Write the first-contact shard count for an iteration row."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE iterations SET n_first_contact=? WHERE id=?", (n, row_id)
+            )
             self._conn.commit()
 
     def get_non_superseded_campaigns(self) -> list[dict]:
@@ -674,6 +712,8 @@ def render_flywheel_index(
         abl = "✓" if it.get("ablation_run") else ""
         is_best = it["iteration"] == best_iter and st == "done"
         row_style = " style='background:#0d1a0d'" if is_best else ""
+        nfc = it.get("n_first_contact")
+        nfc_str = str(nfc) if nfc is not None else "—"
         rows += (
             f"<tr{row_style}>"
             f"<td style='color:#aaa'>{it['iteration']}"
@@ -683,6 +723,7 @@ def render_flywheel_index(
             f"<td style='color:#7df'>{_fmt(it.get('cond_gap'))}</td>"
             f"<td>{_fmt(it.get('train_loss'))}</td>"
             f"<td style='color:#888'>{it.get('n_shards',0)}</td>"
+            f"<td style='color:#fa7'>{nfc_str}</td>"
             f"<td style='color:#888'>{et}</td>"
             f"<td style='color:#7f7'>{abl}</td>"
             f"<td style='color:#777;font-size:0.75em'>{str(it.get('ts_start',''))[:16]}</td>"
@@ -735,6 +776,12 @@ def render_flywheel_index(
                 "cond_gap":  ej.get("cond_gap"),
                 "is_pareto": 0 if dominated else 1,
             })
+
+    # ── Discovery rate: n_first_contact per done iteration ────────────────────
+    discovery_pts = [
+        {"i": it["iteration"], "n": it.get("n_first_contact")}
+        for it in done
+    ]
 
     # ── Shard heatmap ─────────────────────────────────────────────────────────
     heatmap_shard_ids = [s["shard_id"] for s in top_shards[:20]]
@@ -813,6 +860,7 @@ def render_flywheel_index(
   <div class="stat">iterations done: <span>{len(done)}</span></div>
   <div class="stat">failed: <span>{len(failed)}</span></div>
   <div class="stat">shards scored: <span>{shard_stats.get('scored',0)}/{shard_stats.get('total',0)}</span></div>
+  <div class="stat">coverage: <span>{round(100*shard_stats.get('scored',0)/max(1,shard_stats.get('total',1)))}%</span></div>
 </div>
 
 <h2>Quality Trends</h2>
@@ -825,12 +873,16 @@ def render_flywheel_index(
     <div class="chart-label">Pareto front: ref_gap vs cond_gap</div>
     <canvas id="refTrend" width="340" height="200"></canvas>
   </div>
+  <div>
+    <div class="chart-label">New shards discovered per iteration (warm-up coverage rate)</div>
+    <canvas id="discoveryTrend" width="340" height="200"></canvas>
+  </div>
 </div>
 
 <h2>Iterations</h2>
 <table>
   <tr><th>#</th><th>Status</th><th>ref_gap ↑</th><th>cond_gap ↑</th>
-    <th>loss</th><th>shards</th><th>time</th><th>abl</th><th>started</th></tr>
+    <th>loss</th><th>shards</th><th>new</th><th>time</th><th>abl</th><th>started</th></tr>
   {rows}
 </table>
 
@@ -858,12 +910,13 @@ def render_flywheel_index(
 <p>Shard reports: <code>reports/shard_selection_iter&lt;N&gt;.html</code></p>
 
 <script>
-const TREND_PTS  = {json.dumps(trend_pts)};
-const COND_BAND  = {json.dumps(cond_band)};
-const BEST_COND  = {json.dumps(cond_best_line)};
-const PARETO_PTS = {json.dumps(pareto_pts)};
-const HM_SHARDS  = {json.dumps(heatmap_shard_ids)};
-const HM_ITERS   = {json.dumps(heatmap_iters)};
+const TREND_PTS      = {json.dumps(trend_pts)};
+const COND_BAND      = {json.dumps(cond_band)};
+const BEST_COND      = {json.dumps(cond_best_line)};
+const PARETO_PTS     = {json.dumps(pareto_pts)};
+const DISCOVERY_PTS  = {json.dumps(discovery_pts)};
+const HM_SHARDS      = {json.dumps(heatmap_shard_ids)};
+const HM_ITERS       = {json.dumps(heatmap_iters)};
 
 function drawTrend(id, key, color, band, bestLine) {{
   const cv=document.getElementById(id); if(!cv||!TREND_PTS.length) return;
@@ -955,6 +1008,43 @@ function drawPareto(id) {{
   }});
 }}
 
+function drawDiscovery(id) {{
+  const cv=document.getElementById(id); if(!cv||!DISCOVERY_PTS.length) return;
+  const ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height,pad={{t:16,r:16,b:28,l:40}};
+  const cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;
+  const vals=DISCOVERY_PTS.map(p=>p.n).filter(v=>v!=null);
+  if(!vals.length) return;
+  let yMax=Math.max(...vals,1); yMax=yMax+Math.ceil(yMax*0.15);
+  const n=DISCOVERY_PTS.length;
+  const sx=i=>pad.l+cw*i/(n-1||1);
+  const sy=y=>pad.t+ch*(1-y/yMax);
+  ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
+  for(let k=0;k<=4;k++){{
+    const y=yMax*k/4;
+    ctx.beginPath();ctx.moveTo(pad.l,sy(y));ctx.lineTo(pad.l+cw,sy(y));ctx.stroke();
+    ctx.fillStyle='#555';ctx.font='9px monospace';ctx.fillText(Math.round(y),2,sy(y)+3);
+  }}
+  // Zero line
+  ctx.strokeStyle='#444';ctx.lineWidth=1.5;ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(pad.l,sy(0));ctx.lineTo(pad.l+cw,sy(0));ctx.stroke();
+  ctx.setLineDash([]);
+  // Bar chart
+  const bw=Math.max(2,Math.floor(cw/n)-2);
+  DISCOVERY_PTS.forEach((p,i)=>{{
+    if(p.n==null) return;
+    const x=sx(i)-bw/2, barH=ch*p.n/yMax;
+    ctx.fillStyle='#fa7';
+    ctx.fillRect(x,pad.t+ch-barH,bw,barH);
+  }});
+  // X labels
+  for(let k=0;k<=4;k++){{
+    const i=Math.round(k*(n-1)/4);
+    ctx.fillStyle='#555';ctx.font='9px monospace';
+    ctx.fillText(DISCOVERY_PTS[i].i,sx(i)-4,pad.t+ch+18);
+  }}
+}}
+
 function drawHeatmap(id) {{
   const cv=document.getElementById(id); if(!cv||!HM_ITERS.length||!HM_SHARDS.length) return;
   const ctx=cv.getContext('2d');
@@ -982,6 +1072,7 @@ function drawHeatmap(id) {{
 
 drawTrend('condTrend', 'cond_gap', '#7df', COND_BAND, BEST_COND);
 drawPareto('refTrend');
+drawDiscovery('discoveryTrend');
 drawHeatmap('heatmap');
 </script>
 </body></html>"""

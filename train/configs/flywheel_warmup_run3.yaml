@@ -1,0 +1,65 @@
+# Flywheel warm-up run 3 — Performance-biased / exploit
+#
+# Goal: coverage >= 80% (~240 shards), establish attribution Pareto in shard scores,
+# cond_gap sustained >= 0.40.
+#
+# Pre-run checklist:
+#   1. Coverage >= 72% confirmed (shard_selector.py status)
+#   2. Pull run 2 ablation hyperparams and fill into 'hyperparams' below
+#   3. Set base_checkpoint to latest step_*.safetensors from run 2:
+#      ls -t /Volumes/2TBSSD/checkpoints/stage1/step_*.safetensors | head -1
+#
+# Warm-up complete when ALL of:
+#   >= 80% shards with n_scored>=1
+#   >= 30% shards with n_scored>=2
+#   attr_confidence>=1.0 on at least 20 shards
+#   mean cond_gap over last 5 done iters >= 0.35
+#   no single shard dominates: top shard n_selected <= 8 across all 3 runs
+#   >= 5 shards with positive attributed_composite (causal contributors confirmed)
+
+flywheel:
+  name: "warmup-run3"
+  max_iterations: 15
+  steps_per_iteration: 1000
+  n_shards: 35               # slight reduction — shift focus to top performers
+  poll_interval: 60
+  min_free_gb: 40
+
+  # Warm-start from run 2's latest checkpoint — fill in before launching
+  base_checkpoint: null   # SET THIS: /Volumes/2TBSSD/checkpoints/stage1/step_XXXXXX.safetensors
+
+  training_config: "train/configs/stage1_512px.yaml"
+
+  # Fill from run 2 ablation output before launching
+  hyperparams:
+    cross_ref_prob: 0.35    # REPLACE with ablation best
+    style_loss_weight: 0.07 # REPLACE with ablation best
+
+  shard_selection:
+    performance_weight: 0.60   # shift to exploit — attribution reliable for top shards
+    min_diversity_pct:  0.20
+    exploration_rate:   0.20   # lower — most shards scored, fill remaining gaps
+    recency_penalty:    0.30
+    recency_window_iters: 4
+
+    exploration_schedule:
+      - {through_iteration: 5,  rate: 0.25}
+      - {after_iteration: 5,    rate: 0.15}
+
+    per_source_min:
+      laion_coyo: 4
+      journeydb:  4
+
+  temporal_decay: 0.3
+
+  min_attribution_obs: 2
+  siglip_sample_n: 50
+  shard_manifest: null
+
+  plateau_patience:   5
+  plateau_threshold:  0.025
+  plateau_ablation_runs: 4   # fire ablation before pausing on plateau
+
+  ablation_every_n: 5
+  ablation_max_runs: 4
+  ablation_config: "train/configs/ablation_sref_v1.yaml"
