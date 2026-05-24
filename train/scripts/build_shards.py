@@ -17,10 +17,10 @@ Design:
 Usage:
     source train/.venv/bin/activate
     python train/scripts/build_shards.py \\
-        --sources train/data/raw/laion \\
-                  train/data/raw/journeydb \\
-                  train/data/raw/coyo \\
-                  train/data/raw/wikiart \\
+        --sources train/data/converted/laion \\
+                  train/data/converted/journeydb \\
+                  train/data/converted/coyo \\
+                  train/data/converted/wikiart \\
         --output train/data/shards \\
         --shard_size 5000 \\
         --workers 6 \\

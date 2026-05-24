@@ -2,7 +2,7 @@
 """
 train/scripts/download_laion_coyo.py — One-time cold-pool download for LAION and COYO.
 
-Downloads HF-hosted image-text datasets to cold_root/raw/{laion,coyo}/ as WebDataset
+Downloads HF-hosted image-text datasets to cold_root/converted/{laion,coyo}/ as WebDataset
 tar shards (paired {id}.jpg + {id}.txt per record). The cold pool survives hot disk
 resets; downloader.py stages hot symlinks on first use per chunk.
 
@@ -458,8 +458,8 @@ def _download_parquet(repo_id: str, out_dir: Path, dataset: str) -> tuple[int, i
 # ---------------------------------------------------------------------------
 
 def download_dataset(dataset: str, hf_repo: str, cold_root: Path) -> None:
-    """Download one dataset (laion or coyo) to cold_root/raw/{dataset}/."""
-    out_dir = cold_root / "raw" / dataset
+    """Download one dataset (laion or coyo) to cold_root/converted/{dataset}/."""
+    out_dir = cold_root / "converted" / dataset
     out_dir.mkdir(parents=True, exist_ok=True)
 
     existing = _read_sentinel(out_dir)

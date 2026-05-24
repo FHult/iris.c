@@ -55,7 +55,7 @@ jdb:
       4: [150, 199]
 
 # External image-text datasets downloaded once to cold pool.
-# download_laion_coyo.py reads these and writes cold_root/raw/{dataset}/.downloaded
+# download_laion_coyo.py reads these and writes cold_root/converted/{dataset}/.downloaded
 # when complete. check_laion() / check_coyo() in downloader.py create hot symlinks on
 # first use so existing build_shards logic works unchanged.
 data_sources:

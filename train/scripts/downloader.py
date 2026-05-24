@@ -9,8 +9,8 @@ file before the next download starts. This keeps peak disk usage to ~2 tgzs
 in-flight rather than all N simultaneously.
 
 WikiArt is downloaded from HuggingFace datasets (parquet → images).
-LAION and COYO: their source data (parquet manifests) must already exist in
-raw/laion/ and raw/coyo/ — downloader verifies presence only.
+LAION and COYO: their source data must already exist in
+converted/laion/ and converted/coyo/ — downloader verifies presence only.
 
 Usage (called by orchestrator):
     python train/scripts/downloader.py --chunk 1 --config train/configs/v2_pipeline.yaml
@@ -330,13 +330,13 @@ def run_wikiart_download(chunk: int, config: dict) -> None:
 
 def _stage_cold_pool_symlink(dataset: str, config: dict) -> Path:
     """
-    Return the hot raw/{dataset}/ path, creating a symlink to the cold pool
+    Return the hot converted/{dataset}/ path, creating a symlink to the cold pool
     if the hot path is absent and the cold pool sentinel exists.
     """
-    hot  = DATA_ROOT / "raw" / dataset
+    hot  = DATA_ROOT / "converted" / dataset
     cold_root_str = config.get("storage", {}).get("cold_root", "")
     if cold_root_str:
-        cold = Path(cold_root_str) / "raw" / dataset
+        cold = Path(cold_root_str) / "converted" / dataset
         if not hot.exists() and (cold / ".downloaded").exists():
             hot.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -350,24 +350,24 @@ def _stage_cold_pool_symlink(dataset: str, config: dict) -> Path:
 def check_laion(config: dict) -> bool:
     laion_dir = _stage_cold_pool_symlink("laion", config)
     if not laion_dir.exists() or not any(laion_dir.glob("*.tar")):
-        log_orch("WARNING: raw/laion/ is empty — LAION source will be skipped. "
+        log_orch("WARNING: converted/laion/ is empty — LAION source will be skipped. "
                  "Run: train/.venv/bin/python train/scripts/download_laion_coyo.py --dataset laion",
                  level="warning")
         return False
     count = sum(1 for _ in laion_dir.glob("*.tar"))
-    log_orch(f"LAION: {count} source tars present in raw/laion/")
+    log_orch(f"LAION: {count} source tars present in converted/laion/")
     return True
 
 
 def check_coyo(config: dict) -> bool:
     coyo_dir = _stage_cold_pool_symlink("coyo", config)
     if not coyo_dir.exists() or not any(coyo_dir.glob("*.tar")):
-        log_orch("WARNING: raw/coyo/ is empty — COYO source will be skipped. "
+        log_orch("WARNING: converted/coyo/ is empty — COYO source will be skipped. "
                  "Run: train/.venv/bin/python train/scripts/download_laion_coyo.py --dataset coyo",
                  level="warning")
         return False
     count = sum(1 for _ in coyo_dir.glob("*.tar"))
-    log_orch(f"COYO: {count} source tars present in raw/coyo/")
+    log_orch(f"COYO: {count} source tars present in converted/coyo/")
     return True
 
 

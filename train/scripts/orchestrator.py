@@ -1888,8 +1888,8 @@ class Orchestrator:
             parts.append(f"'{jdb_dir}'")
         if wiki_dir.exists():
             parts.append(f"'{wiki_dir}'")
-        laion = DATA_ROOT / "raw" / "laion"
-        coyo  = DATA_ROOT / "raw" / "coyo"
+        laion = DATA_ROOT / "converted" / "laion"
+        coyo  = DATA_ROOT / "converted" / "coyo"
         eff_denom = self._effective_chunk_denom()
         if laion.exists() and any(laion.glob("*.tar")):
             parts.append(f"'{laion}:{chunk}/{eff_denom}'")

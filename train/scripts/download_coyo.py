@@ -16,7 +16,7 @@ Pipeline:
      HTTP loop. Successful jpegs land at COLD_ROOT/coyo/raw_images/{id}.jpg
      and the DB is updated.
   3. pack — read 'downloaded' rows in id order, pack 10_000 image+caption
-     pairs per tar at COLD_ROOT/raw/coyo/shard-NNNNNN.tar (atomic .tar.tmp
+     pairs per tar at COLD_ROOT/converted/coyo/shard-NNNNNN.tar (atomic .tar.tmp
      → rename). Existing finished shards are skipped.
 
 Output WDS layout matches download_laion_coyo.py: each shard contains
@@ -126,7 +126,7 @@ def cold_paths(cold_root: Path) -> dict:
     base    = cold_root / "coyo"
     raw_img = base / "raw_images"
     db      = base / "coyo_index.db"
-    shards  = cold_root / "raw" / "coyo"
+    shards  = cold_root / "converted" / "coyo"
     return {"base": base, "raw_images": raw_img, "db": db, "shards": shards}
 
 

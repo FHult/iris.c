@@ -744,7 +744,7 @@ def _check_laion_coyo_pools(config: dict, config_path: Path, args) -> None:
         repo = sources.get(f"{ds}_hf_repo", "")
         if not repo:
             continue
-        sentinel = cold_root / "raw" / ds / ".downloaded"
+        sentinel = cold_root / "converted" / ds / ".downloaded"
         if not sentinel.exists():
             missing.append(ds)
 
@@ -753,7 +753,7 @@ def _check_laion_coyo_pools(config: dict, config_path: Path, args) -> None:
             repo = sources.get(f"{ds}_hf_repo", "")
             if not repo:
                 continue
-            sentinel = cold_root / "raw" / ds / ".downloaded"
+            sentinel = cold_root / "converted" / ds / ".downloaded"
             if sentinel.exists():
                 try:
                     meta = json.loads(sentinel.read_text())
