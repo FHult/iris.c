@@ -50,7 +50,9 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pipeline_lib import write_heartbeat
+from pipeline_lib import write_heartbeat, now_iso
+
+COLD_PREFIX = "/Volumes/16TBCold"
 
 try:
     from turbojpeg import TurboJPEG
@@ -141,6 +143,61 @@ def _parse_source_arg(arg: str) -> tuple:
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             return (path, int(parts[0]), int(parts[1]))
     return (arg, None, None)
+
+
+def _is_under_cold(path: str) -> bool:
+    """Return True if path resolves under the cold storage prefix."""
+    norm = os.path.abspath(path)
+    return norm == COLD_PREFIX or norm.startswith(COLD_PREFIX + os.sep)
+
+
+def _validate_cold_paths(source_args: list, output: str) -> None:
+    """Reject --cold-only invocations whose sources or output live off-cold.
+
+    Source args may carry slice specs (path:chunk/total); strip them before
+    checking. Raises SystemExit with a clear message on the first offender.
+    """
+    for arg in source_args:
+        src_dir, _, _ = _parse_source_arg(arg)
+        if not _is_under_cold(src_dir):
+            raise SystemExit(
+                f"--cold-only: source path must live under {COLD_PREFIX}/, "
+                f"got {src_dir!r}"
+            )
+    if not _is_under_cold(output):
+        raise SystemExit(
+            f"--cold-only: --output must live under {COLD_PREFIX}/, "
+            f"got {output!r}"
+        )
+
+
+def _scan_existing_shards(output_dir: str) -> tuple[set, list]:
+    """Inspect output_dir for resume state.
+
+    A shard counts as fully complete iff BOTH `{id:06d}.tar` and
+    `{id:06d}.provenance.json` exist. A `.tar` without a sidecar is treated as
+    orphaned (the previous run was interrupted before sidecars were written)
+    and returned for cleanup so the worker can rebuild it deterministically.
+    """
+    complete: set[int] = set()
+    orphans: list[str] = []
+    try:
+        entries = list(os.scandir(output_dir))
+    except FileNotFoundError:
+        return complete, orphans
+    for f in entries:
+        if not f.name.endswith(".tar") or f.name.endswith(".tar.tmp"):
+            continue
+        try:
+            shard_id = int(f.name[:-4])
+        except ValueError:
+            continue
+        prov = os.path.join(output_dir, f"{shard_id:06d}.provenance.json")
+        if os.path.exists(prov):
+            complete.add(shard_id)
+        else:
+            orphans.append(f.path)
+    return complete, orphans
 
 
 def _collect_records(source_args: list, workers: int = 1) -> list:
@@ -487,7 +544,16 @@ def main():
                         help="Cap output at this many shards; records beyond the cap are "
                              "discarded after shuffle. Use to match the precompute budget "
                              "so downstream steps never process shards that won't be trained on.")
+    parser.add_argument("--cold-only", action="store_true",
+                        help=f"Restrict --sources and --output to paths under {COLD_PREFIX}/. "
+                             "Use to pre-populate the cold shard pool without touching SSD "
+                             "staging. The run is fully resume-tolerant: shards with both "
+                             ".tar and .provenance.json on disk are skipped.")
     args = parser.parse_args()
+
+    if args.cold_only:
+        _validate_cold_paths(args.sources, args.output)
+        print(f"--cold-only: all paths verified under {COLD_PREFIX}/")
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -500,6 +566,24 @@ def main():
                 os.remove(p)
             except OSError:
                 pass
+
+    # Resume tolerance: a shard is complete iff both .tar and .provenance.json
+    # exist. Orphan .tars (sidecar missing) are deleted so workers regenerate
+    # them; without this they would be silently skipped forever, leaving the
+    # output pool permanently missing provenance for those ids.
+    complete_shards, orphan_tars = _scan_existing_shards(args.output)
+    if orphan_tars:
+        print(f"Cleaning up {len(orphan_tars)} orphan .tar files (no provenance sidecar) "
+              "so they can be rebuilt...")
+        for p in orphan_tars:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    shards_skipped_resumed = len(complete_shards)
+    if shards_skipped_resumed:
+        print(f"Resume: {shards_skipped_resumed:,} shards already complete on disk — "
+              "workers will skip them.")
 
     print(f"Collecting records from {len(args.sources)} source(s) using {args.workers} workers...")
     records = _collect_records(args.sources, workers=args.workers)  # args.sources may contain :chunk/total slices
@@ -570,13 +654,22 @@ def main():
     # proxy (pool.map blocks until all workers finish, so we can't get incremental
     # results from the pool itself).
     _hb_stop = threading.Event()
+    start_ts = now_iso()
     def _hb_loop():
         while not _hb_stop.is_set():
             try:
                 done_tars = sum(1 for f in os.scandir(args.output)
                                 if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
-                write_heartbeat("build_shards", args.chunk,
-                                done=done_tars, total=n_shards, pct=round(100 * done_tars / max(n_shards, 1)))
+                write_heartbeat(
+                    "build_shards", args.chunk,
+                    done=done_tars,
+                    total=n_shards,
+                    pct=round(100 * done_tars / max(n_shards, 1)),
+                    start_ts=start_ts,
+                    shards_skipped_resumed=shards_skipped_resumed,
+                    pairs_written_approx=done_tars * args.shard_size,
+                    cold_only=bool(args.cold_only),
+                )
             except OSError:
                 pass  # EINTR from sleep-wake signal; skip this tick, continue loop
             _hb_stop.wait(30)
@@ -599,9 +692,23 @@ def main():
     _write_provenance_sidecars(args.output, merged_prov)
     print(f"  Provenance: wrote sidecars for {len(merged_prov)} shards")
 
+    final_done = sum(1 for f in os.scandir(args.output)
+                     if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
+    write_heartbeat(
+        "build_shards", args.chunk,
+        done=final_done,
+        total=n_shards,
+        pct=round(100 * final_done / max(n_shards, 1)),
+        start_ts=start_ts,
+        shards_skipped_resumed=shards_skipped_resumed,
+        pairs_written_approx=final_done * args.shard_size,
+        cold_only=bool(args.cold_only),
+    )
+
     print(f"\nDone.")
-    print(f"  Written: {total_written:,} images across {n_shards} shards")
-    print(f"  Skipped: {total_skipped:,} (blocklist + invalid + corrupt)")
+    print(f"  Written: {total_written:,} images across {len(merged_prov)} shards this run")
+    print(f"  Resumed: {shards_skipped_resumed:,} shards already complete from prior run")
+    print(f"  Skipped: {total_skipped:,} records (blocklist + invalid + corrupt)")
     print(f"  Output:  {args.output}/")
     print(f"\nNext: python train/scripts/filter_shards.py --shards {args.output}")
 
