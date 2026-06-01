@@ -974,14 +974,20 @@ def main():
             print(f"  Light scores: skipping {n_skipped} discard-flagged shards "
                   f"({len(shards)} of {n_before} kept for precompute)", flush=True)
         elif n_before > 0:
-            # Check if any sidecars exist at all to give a useful diagnostic
-            from pipeline_lib import get_light_score as _get_light_score
-            if _get_light_score(shards[0]) is not None:
-                print(f"  Light scores: all {n_before} shards passed quality filter",
-                      flush=True)
-            else:
+            # Count sidecars to distinguish "all scored+kept" from "unscored=default keep"
+            import glob as _glob
+            n_sidecars = len(_glob.glob(
+                os.path.join(args.shards, "*.light_scores.json")))
+            if n_sidecars == 0:
                 print(f"  Light scores: no sidecars found — run score_shards_light.py first "
                       f"(or pass --skip-light-scores to suppress this hint)", flush=True)
+            elif n_sidecars < n_before:
+                print(f"  Light scores: {n_sidecars}/{n_before} shards scored, "
+                      f"none discarded yet (unscored shards treated as keep)",
+                      flush=True)
+            else:
+                print(f"  Light scores: all {n_before} shards scored and passed "
+                      f"quality filter", flush=True)
 
     if not shards:
         print("All shards were filtered by light scores — nothing to precompute.", flush=True)

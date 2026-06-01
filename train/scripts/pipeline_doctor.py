@@ -1902,8 +1902,7 @@ def _check_light_scoring() -> None:
     if total_shards == 0:
         return
 
-    n_scored  = len(sidecars)
-    n_pending = total_shards - n_scored
+    n_scored = len(sidecars)
 
     if n_scored == 0:
         venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
