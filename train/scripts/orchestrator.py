@@ -2798,7 +2798,77 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 iteration, name,
             )
 
+            # =====================================================================
+            # FLYWHEEL PER-ITER PRECOMPUTE + CACHED TRAINING + VERSIONED PUBLISH
+            # (Claude/AI-readable architecture summary)
+            #
+            # PROBLEM (historical):
+            #   Early flywheel warmup used "online" training config (all *_cache_dir: null)
+            #   for cold shard pools (no precomp yet). This meant inside every training
+            #   step the loader yielded no np arrays, so train_ip_adapter did live
+            #   _encode_text (Qwen3), _vae_encode, siglip() for the batch.
+            #   Even with the per-step _ensure_live_encoders / _release_live_encoders
+            #   (unload after ~100-400ms encode window, before Flux fwd), this was
+            #   inefficient: repeated encode work (if data replayed in 1000-5000 step
+            #   iters), extra latency serialized with training steps, high memory
+            #   pressure (hence 0.55 mlx_memory_pct + torch clear + our debug prints
+            #   with [online-encode] prefix).
+            #
+            #   The "actions" (encode the selected shards) were the same as normal
+            #   pipeline, but done in the wrong place/order.
+            #
+            # SOLUTION (this code):
+            #   After select_shards + stage_iteration_shards (shards now in staging_dir
+            #   as .tar, possibly some npz from cold via stager):
+            #   1. ALWAYS run precompute_all.py --shards <staging_dir> (with --siglip)
+            #      targeting per-iter flat tree: staging_dir/precomputed/{qwen3,vae,siglip}/
+            #      (models loaded once in precomp process with its 14GB cap + releases;
+            #       one tar read per shard + prefetch; skips already-present via scan;
+            #       under the GPU lock acquired for the whole iter).
+            #   2. Override the temp train config (even if base was online.yaml) to point
+            #      the three cache_dirs at the per-iter tree. Training now runs the
+            #      EFFICIENT CACHED PATH (only Flux+adapter, fast npz loads in loader,
+            #      no live encoders, lower memory).
+            #   3. AFTER training (inside the lock try, before unlink), call
+            #      _stager.publish_precomp_from_flywheel_iter(..., training_cfg=...)
+            #   4. In stager: if training_cfg, use encoder_config_subset + version_hash
+            #      + PrecomputeCache to target the EXACT v_XXXXXX/ dir on COLD for this
+            #      config. Copy .npz there, write_manifest_incomplete + mark_complete
+            #      (which does atomic current symlink update). This makes data first-class:
+            #      - participates in versioned invalidation story
+            #      - PrecomputeCache.is_complete / all_records will see manifests
+            #      - future stagings (which follow "current") will bring it
+            #      - effective_dir etc. work
+            #      Then ALWAYS rmtree the per-iter precomp_base (data now durable on cold).
+            #   Fallback (no cfg) does flat copy to existing current target + rmtree.
+            #
+            # INTEGRATION WITH PIPELINE:
+            #   - Matches exactly what _promote_chunk + precompute_all do for chunks
+            #     (version dirs, manifests, current update, move out of staging).
+            #   - DataStager.stage_iteration_shards will pick up published npz from cold
+            #     "current" on future iters (see its cold_ver logic).
+            #   - PrecomputeCache / list_versions / cache_manager tools see proper
+            #     versions + manifests.
+            #   - Main pipeline (chunks, mine, eval, etc.) benefits automatically.
+            #   - Incremental: re-selected shards are cheap (precomp skips).
+            #   - The original per-step unload logic + [online-encode] debug prints in
+            #     train_ip_adapter.py remain for manual online runs or as fallback when
+            #     precomp produces partial coverage.
+            #
+            # WHY THIS (efficiency + reusability):
+            #   "Actions same, efficiency vastly different" -- user observation was correct.
+            #   Precomp once (good batching, dedicated process) + cached train (fast,
+            #   low-mem) + publish to versioned cold (reusable, no waste) vs. live
+            #   per-step inside training.
+            #
+            # See also: plans/warmup-campaign-runbook.md (flywheel goals), data_stager.py
+            # (stager + publish impl), cache_manager.py (PrecomputeCache, version_hash,
+            # encoder_config_subset, mark_complete), train_ip_adapter.py (old online path
+            # + unload for compatibility).
+            # =====================================================================
+
             # === Precompute selected shards before training (the efficient path) ===
+            # (see big comment block above for full Claude/AI explanation)
             # Instead of "online" live Q/V/S encoding inside the training loop (with per-step
             # load/unload), we run precompute_all.py on exactly the shards chosen for this iter.
             # Benefits:

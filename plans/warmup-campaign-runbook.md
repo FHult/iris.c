@@ -477,6 +477,19 @@ ablation:
 ```
 
 **Phase 2 success criteria:**
+
+## Flywheel Precompute + Versioned Publish (Added Later)
+
+See dedicated `plans/flywheel-precompute-architecture.md` for the full Claude/AI-readable architecture doc (problem statement, the per-iter precompute + cached train + publish flow, versioning with PrecomputeCache + current update + rmtree, integration points, why it matches the "actions same but efficiency different" observation).
+
+Inline: big explanatory comment block right before the per-iter precomp setup in `orchestrator.py` (search for "FLYWHEEL PER-ITER PRECOMPUTE").
+
+The change lives in:
+- orchestrator.py (setup, cfg capture/override, publish call inside lock try)
+- data_stager.py (enhanced publish_... method with if training_cfg: versioned path using cache_manager symbols + always rmtree at end; fallback preserved)
+- Config comments (run1 now uses cached base; online.yaml notes manual use)
+
+This + the earlier per-step encoder unload/debug (in train_ip_adapter.py) gives both efficiency for flywheel and compatibility for online fallbacks.
 - best_cond_gap ≥0.45 (sustained, not a spike)
 - ref_gap positive (≥0.01) in at least 3 of last 5 iterations
 - NSGA-II Pareto front has ≥5 non-dominated configs
