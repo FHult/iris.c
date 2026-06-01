@@ -2053,42 +2053,71 @@ def _check_campaign_state() -> None:
 
 
 def _check_shard_coverage() -> None:
-    """Warn when flywheel shard pool coverage is too low to build reliable scores."""
+    """
+    Warn when flywheel shard pool coverage is too low to build reliable scores.
+
+    Cross-references shard_scores.db against the cold shard pool so that a DB
+    from a prior campaign (different pool of shards) is flagged as mismatched
+    rather than misleadingly reported as high-coverage.
+    """
     if not SHARD_SCORES_DB_PATH.exists():
         return
-    try:
-        import sqlite3 as _sqlite3
-        _sdb = _sqlite3.connect(str(SHARD_SCORES_DB_PATH))
-        _row = _sdb.execute(
-            "SELECT COUNT(*), SUM(CASE WHEN n_scored>0 THEN 1 ELSE 0 END) FROM shards"
-        ).fetchone()
-        _sdb.close()
-    except Exception:
+
+    cov = _flywheel_cold_coverage()
+    if cov["db_total"] == 0:
         return
-    total, scored = (_row[0] or 0), (_row[1] or 0)
-    if total == 0:
-        return
-    pct = round(100 * scored / total, 1)
+
     venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
     scripts  = str(SCRIPTS_DIR)
+
+    # Pool mismatch: DB was built against a different shard pool.
+    if cov["pool_mismatch"]:
+        _add("WARNING", "flywheel",
+             f"shard_scores.db is from a prior pool: {cov['db_total']} DB shards, "
+             f"only {cov['cold_overlap']} overlap with the {cov['cold_total']:,}-shard cold pool",
+             detail=(f"The flywheel DB on the hot volume was populated during a prior campaign "
+                     f"against a different (smaller) shard set. Coverage against the current "
+                     f"cold pool is effectively 0%. The DB should be reset before starting "
+                     f"warm-up runs against the new {cov['cold_total']:,}-shard pool."),
+             fix=(f"# Archive old DB to cold storage, then start fresh:\n"
+                  f"cp {SHARD_SCORES_DB_PATH} "
+                  f"{COLD_ROOT}/metadata/shard_scores_prior.db\n"
+                  f"rm {SHARD_SCORES_DB_PATH}"),
+             ctx={"db_total": cov["db_total"], "cold_total": cov["cold_total"],
+                  "cold_overlap": cov["cold_overlap"], "pool_mismatch": True})
+        return
+
+    # Normal coverage reporting against the current cold pool.
+    cold_total  = cov["cold_total"]
+    cold_scored = cov["cold_scored"]
+    pct         = cov["cold_coverage_pct"]
+
+    if cold_total == 0:
+        return
+
     if pct < 50:
         _add("WARNING", "flywheel",
-             f"Shard pool coverage low: {scored}/{total} scored ({pct}%)",
-             detail=("Fewer than half the shards have training observations. "
+             f"Cold-pool flywheel coverage low: {cold_scored:,}/{cold_total:,} scored ({pct}%)",
+             detail=("Fewer than half the cold-pool shards have training observations. "
                      "Attribution scores are unreliable at this coverage. "
                      "Run explore-heavy flywheel iterations to build coverage "
                      "before shifting to performance-biased selection."),
              fix=(f"{venv_py} {scripts}/shard_selector.py status\n"
                   f"# Use flywheel_warmup_run1.yaml for explore-heavy config"),
-             ctx={"total_shards": total, "scored_shards": scored,
-                  "coverage_pct": pct})
+             ctx={"total_shards": cold_total, "scored_shards": cold_scored,
+                  "coverage_pct": pct, "pool_mismatch": False})
     elif pct < 80:
         _add("INFO", "flywheel",
-             f"Shard pool coverage building: {scored}/{total} scored ({pct}%)",
+             f"Cold-pool flywheel coverage building: {cold_scored:,}/{cold_total:,} scored ({pct}%)",
              detail="Coverage is progressing. Attribution confidence is active for "
                     "the scored subset. Continue warm-up runs to reach ≥80%.",
-             ctx={"total_shards": total, "scored_shards": scored,
-                  "coverage_pct": pct})
+             ctx={"total_shards": cold_total, "scored_shards": cold_scored,
+                  "coverage_pct": pct, "pool_mismatch": False})
+    else:
+        _add("INFO", "flywheel",
+             f"Cold-pool flywheel coverage: {cold_scored:,}/{cold_total:,} scored ({pct}%)",
+             ctx={"total_shards": cold_total, "scored_shards": cold_scored,
+                  "coverage_pct": pct, "pool_mismatch": False})
 
 
 def _check_shard_index() -> None:
@@ -2570,6 +2599,75 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     return summary
 
 
+def _flywheel_cold_coverage() -> dict:
+    """
+    Cross-reference shard_scores.db shard IDs against the cold shard pool.
+
+    Returns a dict with:
+      db_total          — total shards in the DB
+      db_scored         — shards in the DB with n_scored > 0
+      cold_total        — shards in the cold pool
+      cold_overlap      — DB shards whose ID exists in the cold pool
+      cold_scored       — cold-pool shards with n_scored > 0 in the DB
+      cold_coverage_pct — cold_scored / cold_total * 100
+      pool_mismatch     — True when DB appears to be from a different pool
+    """
+    result: dict = {
+        "db_total": 0, "db_scored": 0,
+        "cold_total": 0, "cold_overlap": 0,
+        "cold_scored": 0, "cold_coverage_pct": 0.0,
+        "pool_mismatch": False,
+    }
+    if not SHARD_SCORES_DB_PATH.exists():
+        return result
+
+    # Cold pool shard stems
+    cold_total = 0
+    cold_stems: set[str] = set()
+    if COLD_SHARDS_DIR.exists():
+        for p in COLD_SHARDS_DIR.glob("*.tar"):
+            if not p.name.endswith(".tar.tmp"):
+                cold_stems.add(p.stem)
+        cold_total = len(cold_stems)
+    result["cold_total"] = cold_total
+
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(str(SHARD_SCORES_DB_PATH))
+        rows = conn.execute(
+            "SELECT shard_id, n_scored FROM shards"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return result
+
+    db_total  = len(rows)
+    db_scored = sum(1 for _, n in rows if (n or 0) > 0)
+    result["db_total"]  = db_total
+    result["db_scored"] = db_scored
+
+    if cold_total == 0:
+        return result
+
+    # Normalise DB IDs to zero-padded 6-digit form for comparison
+    def _norm(sid: str) -> str:
+        try:
+            return f"{int(sid):06d}"
+        except ValueError:
+            return sid
+
+    db_ids_normed = {_norm(str(sid)): (n or 0) for sid, n in rows}
+    overlap = cold_stems & set(db_ids_normed.keys())
+    cold_scored = sum(1 for s in overlap if db_ids_normed.get(s, 0) > 0)
+
+    result["cold_overlap"]      = len(overlap)
+    result["cold_scored"]       = cold_scored
+    result["cold_coverage_pct"] = round(100 * cold_scored / cold_total, 1)
+    result["pool_mismatch"]     = len(overlap) < 0.10 * cold_total and cold_total > 10
+
+    return result
+
+
 def print_warmup_status() -> None:
     """
     Print a focused warmup-readiness report drawn from the already-run issue set.
@@ -2641,31 +2739,24 @@ def print_warmup_status() -> None:
         print(f"  {'Diversity cache':<18} (no info)")
 
     # ── 5. Flywheel coverage ─────────────────────────────────────────────
-    sc = _first("flywheel")
-    if sc and sc.ctx:
-        ctx = sc.ctx
-        total  = ctx.get("total_shards", 0)
-        scored = ctx.get("scored_shards", 0)
-        pct    = ctx.get("coverage_pct", 0.0)
-        col    = _Y if pct < 50 else _C
-        print(f"  {'Flywheel coverage':<18} {col}{scored:,}/{total:,} scored ({pct}%){_R}")
+    # Always cross-reference the DB against the cold pool so we report coverage
+    # of the *current* 1280-shard pool, not a prior smaller pool.
+    if not SHARD_SCORES_DB_PATH.exists():
+        print(f"  {'Flywheel coverage':<18} no shard_scores.db — cold pool has 0% coverage")
     else:
-        try:
-            if SHARD_SCORES_DB_PATH.exists():
-                import sqlite3 as _sq
-                _c = _sq.connect(str(SHARD_SCORES_DB_PATH))
-                _r = _c.execute(
-                    "SELECT COUNT(*), SUM(CASE WHEN n_scored>0 THEN 1 ELSE 0 END) FROM shards"
-                ).fetchone()
-                _c.close()
-                total, scored = (_r[0] or 0), (_r[1] or 0)
-                pct = round(100 * scored / max(total, 1), 1) if total else 0.0
-                col = _Y if pct < 50 else _C
-                print(f"  {'Flywheel coverage':<18} {col}{scored:,}/{total:,} scored ({pct}%){_R}")
-            else:
-                print(f"  {'Flywheel coverage':<18} no shard_scores.db")
-        except Exception:
-            print(f"  {'Flywheel coverage':<18} (error reading DB)")
+        cov = _flywheel_cold_coverage()
+        cold_total = cov["cold_total"]
+        if cov["pool_mismatch"]:
+            print(f"  {'Flywheel coverage':<18} {_Y}0/{cold_total:,} cold-pool shards scored "
+                  f"(DB has {cov['db_total']} shards from a prior pool — "
+                  f"only {cov['cold_overlap']} overlap){_R}")
+        elif cold_total == 0:
+            print(f"  {'Flywheel coverage':<18} {_Y}cold pool not found{_R}")
+        else:
+            pct = cov["cold_coverage_pct"]
+            col = _Y if pct < 50 else _C
+            print(f"  {'Flywheel coverage':<18} {col}{cov['cold_scored']:,}/{cold_total:,} "
+                  f"cold-pool shards scored ({pct}%){_R}")
 
     # ── Phase summary ─────────────────────────────────────────────────────
     phase = (wr.ctx or {}).get("phase", "unknown") if wr else "unknown"
