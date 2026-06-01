@@ -105,6 +105,18 @@ def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
             if _si.INDEX_PATH.exists():
                 entries = _si.query_all(shards_dir)
                 if entries:
+                    # Quick staleness check: warn if on-disk count differs by >5%.
+                    # Does not abort — stale index still beats a slow directory scan.
+                    n_on_disk = sum(
+                        1 for p in shards_dir.glob("*.tar")
+                        if not p.name.endswith(".tar.tmp")
+                    ) if shards_dir.exists() else 0
+                    delta_pct = abs(n_on_disk - len(entries)) / max(n_on_disk, 1) * 100
+                    if n_on_disk > 0 and delta_pct > 5:
+                        print(f"  WARNING: shard index may be stale "
+                              f"({len(entries)} indexed vs {n_on_disk} on disk, "
+                              f"{delta_pct:.0f}% delta). "
+                              f"Run: shard_index.py update --shards {shards_dir}")
                     return entries
         except Exception:
             pass  # fall through to directory scan

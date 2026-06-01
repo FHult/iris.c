@@ -460,7 +460,6 @@ def main() -> None:
         sys.exit(0)
 
     # Score
-    n_training = len(training_by_stem)
     n_written = 0
     for i, shard_path in enumerate(pending):
         stem    = Path(shard_path).stem
