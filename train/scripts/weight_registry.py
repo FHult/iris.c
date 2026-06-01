@@ -290,7 +290,9 @@ def cmd_compare(args, cfg: dict) -> None:
         b_s = f"{b:{fmt}}" if b is not None and fmt else (str(b) if b is not None else "—")
         if a is not None and b is not None and isinstance(a, (int, float)) and isinstance(b, (int, float)):
             delta = b - a
-            d_s   = f"{delta:+.4f}" if fmt else f"{delta:+}"
+            # Apply the caller's format spec with a mandatory sign prefix.
+            # f"{delta:+,}" for integers, f"{delta:+.4f}" for floats.
+            d_s = f"{delta:+{fmt}}" if fmt else f"{delta:+g}"
         else:
             d_s = ""
         print(f"  {label:<28} {a_s:>12}  {b_s:>12}  {d_s:>12}")

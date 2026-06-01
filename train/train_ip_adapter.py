@@ -665,9 +665,25 @@ def train(config: dict) -> None:
     # Start data loader threads now so they can prefill the batch queue during
     # the Flux pre-eval below (which takes several minutes). By the time training
     # starts the first several batches will already be decoded and waiting.
-    shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
-    if not shard_paths:
-        raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
+    # Campaign manifest support: when dcfg["shard_manifest"] is set, load shard
+    # paths from the campaign's include-list instead of globbing a directory.
+    # Falls back to the existing dcfg["shard_path"] glob when no manifest is set.
+    _shard_manifest = dcfg.get("shard_manifest")
+    if _shard_manifest:
+        _m = json.loads(Path(_shard_manifest).read_text())
+        shard_paths = sorted([
+            e["path"] for e in _m.get("entries", [])
+            if e.get("decision") == "include"
+        ])
+        if not shard_paths:
+            raise RuntimeError(f"Campaign manifest has no included shards: {_shard_manifest}")
+        print(f"Campaign '{_m.get('campaign', '?')}': {len(shard_paths):,} shards "
+              f"(strategy={_m.get('strategy', '?')}, "
+              f"avg_score={_m.get('avg_final_value_score', 0):.4f})")
+    else:
+        shard_paths = sorted(glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
+        if not shard_paths:
+            raise RuntimeError(f"No .tar shards found in {dcfg['shard_path']}")
 
     # Filter to only shards that have at least qwen3+vae precomputed.
     # Without this, the loader reads every shard (1.9 GB each) but the training
