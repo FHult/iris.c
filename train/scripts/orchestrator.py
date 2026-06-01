@@ -2937,6 +2937,33 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 f"elapsed={elapsed}s"
             )
 
+            # Post-training: copy the npz we generated for this iter's selected shards
+            # from the ephemeral per-iter precomp tree back to cold precomputed storage.
+            # This ensures the (expensive) encoder work is reusable by future flywheel
+            # iterations (via DataStager cold→hot) and by the normal chunk pipeline,
+            # exactly like the main pipeline's promote+archive flow. The per-iter
+            # precomp + this publish step means flywheel "pays once" for the encodes
+            # on the shards it touches, instead of re-paying in online mode or
+            # leaving the data trapped in a throwaway staging dir.
+            if "precomp_base" in locals() and precomp_base.exists():
+                try:
+                    pub = _stager.publish_precomp_from_flywheel_iter(
+                        src_precomp_base=precomp_base,
+                        selected_shard_ids=shard_ids,
+                    )
+                    n = pub.get("npz_published", 0)
+                    if n > 0:
+                        mb = pub.get("bytes_transferred", 0) / 1e6
+                        log_orch(
+                            f"[flywheel:{name}] iter {iteration}: published {n} new npz "
+                            f"({mb:.1f} MB) to cold precomputed (now reusable by pipeline/future iters)"
+                        )
+                except Exception as _pub_err:
+                    log_orch(
+                        f"[flywheel:{name}] iter {iteration}: publish of precomp npz to cold failed: {_pub_err}",
+                        level="warning",
+                    )
+
             # Locate the checkpoint produced by this iteration
             ckpt_path: Optional[str] = None
             ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"))
