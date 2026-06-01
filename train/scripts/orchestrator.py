@@ -2762,19 +2762,29 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
 
             # Stage selected shards via DataStager (copy→hot when cross-device,
             # symlinks when same device — same logic as the V2 pipeline's chunk staging).
+            # Cross-device: run in a background thread so precompute can start as soon as
+            # the first few shards land (masking model-load time and early encode work).
+            # Symlink mode is instant; no pipelining needed — stage inline.
             staging_dir = DATA_ROOT / "flywheel_staging" / name / f"iter{iteration:04d}"
             if staging_dir.exists():
                 shutil.rmtree(staging_dir)
-            try:
-                stage_summary = _stager.stage_iteration_shards(selected_paths, staging_dir)
-                log_orch(f"[flywheel:{name}] staged {stage_summary['shards_staged']} shards "
-                         f"+ {stage_summary.get('npz_staged', 0)} npz "
-                         f"({'copy' if _stager.enabled else 'symlink'}, "
-                         f"{stage_summary['bytes_transferred'] / 1e6:.0f} MB) → {staging_dir}")
-            except Exception as _se:
-                log_orch(f"[flywheel:{name}] staging failed: {_se} — falling back to symlinks",
-                         level="warning")
-                stage_shards_for_iteration(selected_paths, staging_dir)
+
+            _stage_result: list = []
+
+            def _do_stage():
+                try:
+                    s = _stager.stage_iteration_shards(selected_paths, staging_dir)
+                    _stage_result.append({"ok": True, "summary": s})
+                except Exception as _se:
+                    _stage_result.append({"ok": False, "error": _se})
+
+            if _stager.enabled:
+                import threading as _threading
+                _stage_thread = _threading.Thread(target=_do_stage, daemon=True)
+                _stage_thread.start()
+            else:
+                _do_stage()
+                _stage_thread = None
 
             # Per-iteration shard report
             shard_html = render_shard_report(score_db, shard_ids, iteration, name)
@@ -2908,6 +2918,13 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 f"--qwen3-output '{q_out}' --vae-output '{v_out}' --siglip-output '{s_out}' "
                 f"{_flux_arg} {_sig_flag}"
             )
+            # PIPELINE_ORCHESTRATED=1: precompute_all skips GPU lock acquisition because
+            # the orchestrator already holds the lock for the whole iteration.
+            full_pre = (
+                f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
+                f"export PIPELINE_ORCHESTRATED=1 && "
+                f"source '{TRAIN_DIR}/.venv/bin/activate' && {pre_cmd}"
+            )
 
             # Launch training in TMUX_TRAIN_WIN
             log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
@@ -2922,8 +2939,8 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     time.sleep(poll_interval)
 
             # Acquire the GPU lock *once* for the whole iteration's work (precompute + training).
-            # We run precompute with PIPELINE_ORCHESTRATED=1 so it doesn't fight the lock;
-            # the advisory lock is held by this flywheel orchestrator process for the duration.
+            # Staging may still be running in a background thread; acquiring the lock here lets
+            # precompute pass 1 start as soon as the trigger threshold is reached.
             while True:
                 if acquire_gpu_lock(f"flywheel_{name}_iter{iteration}"):
                     break
@@ -2934,21 +2951,82 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 time.sleep(30)
 
             try:
-                # Precompute phase (under the lock)
+                # ── Pipelined staging + precompute ─────────────────────────────────
+                # If cross-device staging is still running in the background, start
+                # precompute pass 1 as a non-blocking Popen once enough shards have
+                # landed.  This masks model-load time (Qwen3/VAE/SigLIP load = several
+                # minutes) and processes early shards while the remaining staging IO is
+                # in flight.  Pass 2 catches shards that arrived after pass 1's scan.
+                _pass1_proc = None
+                if _stage_thread is not None and _stage_thread.is_alive():
+                    _trigger = int(fw_cfg.get("precomp_trigger_shards", 4))
+                    write_heartbeat("flywheel", status="staging",
+                                    flywheel_name=name, iteration=iteration)
+                    while _stage_thread.is_alive():
+                        _n_ready = sum(1 for _p in staging_dir.glob("*.tar"))
+                        if _n_ready >= _trigger:
+                            break
+                        _check_flywheel_control(name, fw_db)
+                        time.sleep(5)
+                    if _stage_thread.is_alive():
+                        _n_ready = sum(1 for _p in staging_dir.glob("*.tar"))
+                        _n_inflight = len(selected_paths) - _n_ready
+                        log_orch(f"[flywheel:{name}] iter {iteration}: {_n_ready} shards staged — "
+                                 f"starting precompute pass 1 while staging continues "
+                                 f"({_n_inflight} shards in flight)")
+                        write_heartbeat("flywheel", status="precomputing",
+                                        flywheel_name=name, iteration=iteration)
+                        _pass1_proc = subprocess.Popen(
+                            ["bash", "-c", f"({full_pre}) >> '{log_pre}' 2>&1"])
+
+                # Wait for staging to complete, then log the summary.
+                if _stage_thread is not None:
+                    _stage_thread.join()
+                if not _stage_result or not _stage_result[0].get("ok"):
+                    _se = (_stage_result[0]["error"] if _stage_result
+                           else RuntimeError("staging thread produced no result"))
+                    log_orch(f"[flywheel:{name}] staging failed: {_se} — falling back to symlinks",
+                             level="warning")
+                    if _pass1_proc is not None:
+                        _pass1_proc.terminate()
+                        _pass1_proc.wait()
+                        _pass1_proc = None
+                    stage_shards_for_iteration(selected_paths, staging_dir)
+                    stage_summary = {"shards_staged": len(selected_paths),
+                                     "npz_staged": 0, "bytes_transferred": 0}
+                else:
+                    stage_summary = _stage_result[0]["summary"]
+                log_orch(f"[flywheel:{name}] staged {stage_summary['shards_staged']} shards "
+                         f"+ {stage_summary.get('npz_staged', 0)} npz "
+                         f"({'copy' if _stager.enabled else 'symlink'}, "
+                         f"{stage_summary['bytes_transferred'] / 1e6:.0f} MB) → {staging_dir}")
+
+                # Wait for precompute pass 1 (if started concurrently with staging).
                 write_heartbeat("flywheel", status="precomputing",
                                 flywheel_name=name, iteration=iteration)
-                log_orch(f"[flywheel:{name}] iter {iteration}: precomputing Qwen3/VAE/SigLIP caches for selected shards → {precomp_base}")
-                full_pre = (
-                    f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
-                    f"source '{TRAIN_DIR}/.venv/bin/activate' && {pre_cmd}"
-                )
+                if _pass1_proc is not None:
+                    log_orch(f"[flywheel:{name}] iter {iteration}: waiting for precompute pass 1")
+                    _pass1_proc.wait()
+                    if _pass1_proc.returncode == 0:
+                        log_orch(f"[flywheel:{name}] iter {iteration}: precompute pass 1 complete")
+                    else:
+                        log_orch(f"[flywheel:{name}] iter {iteration}: precompute pass 1 exited "
+                                 f"{_pass1_proc.returncode}; pass 2 will fill any gaps",
+                                 level="warning")
+
+                # Precompute pass 2: catches shards that arrived after pass 1's initial scan,
+                # or handles all shards when staging finished before the trigger threshold.
+                _pass_label = "pass 2 (catch-up)" if _pass1_proc is not None else "pass 1"
+                log_orch(f"[flywheel:{name}] iter {iteration}: precomputing Qwen3/VAE/SigLIP "
+                         f"{_pass_label} → {precomp_base}")
                 pre_full = f"({full_pre}) >> '{log_pre}' 2>&1 ; echo EXIT_CODE=$? >> '{log_pre}'"
                 subprocess.run(["bash", "-c", pre_full])
                 pre_exit = last_exit_code(log_pre)
                 if pre_exit == 0:
                     log_orch(f"[flywheel:{name}] iter {iteration}: precompute complete")
                 else:
-                    log_orch(f"[flywheel:{name}] iter {iteration}: precompute exited {pre_exit}; training will use produced caches + live fallback for any misses",
+                    log_orch(f"[flywheel:{name}] iter {iteration}: precompute exited {pre_exit}; "
+                             f"training will use produced caches + live fallback for any misses",
                              level="warning")
 
                 # Override the (possibly "online") config so this training iter uses the caches we just ensured.
