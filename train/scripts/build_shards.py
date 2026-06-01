@@ -44,6 +44,7 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import sys
 import tarfile
 import threading
@@ -498,6 +499,193 @@ def _write_provenance_sidecars(output_dir: str, provenance: dict[int, list[str]]
 
 
 # ---------------------------------------------------------------------------
+# Stage-mode helpers (HDD → SSD copy before scanning)
+# ---------------------------------------------------------------------------
+
+def _list_source_tars(source_args: list) -> list:
+    """
+    Return [(tar_path, size_bytes), ...] for every tar in every source dir.
+    Handles :chunk/total slice specs by slicing the sorted file list with the
+    same deterministic shuffle used by _collect_records, so the two paths are
+    consistent.  Does NOT read tar contents.
+    """
+    result = []
+    for arg in source_args:
+        src_dir, chunk_idx, total_chunks = _parse_source_arg(arg)
+        tars = sorted(glob.glob(os.path.join(src_dir, "*.tar")))
+        if chunk_idx is not None and total_chunks and total_chunks > 1:
+            rng = random.Random(42)
+            rng.shuffle(tars)
+            n = len(tars)
+            start = (chunk_idx - 1) * n // total_chunks
+            end   = chunk_idx       * n // total_chunks
+            tars  = tars[start:end]
+        for t in tars:
+            try:
+                size = os.path.getsize(t)
+            except OSError:
+                size = 0
+            result.append((t, size))
+    return result
+
+
+def _batch_tars(tar_items: list, max_bytes: int) -> list:
+    """Greedily group tars into batches where each batch's total size ≤ max_bytes."""
+    batches: list = []
+    current: list = []
+    current_size = 0
+    for item in tar_items:
+        size = item[1]
+        if current and current_size + size > max_bytes:
+            batches.append(current)
+            current, current_size = [], 0
+        current.append(item)
+        current_size += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _stage_tars(tar_items: list, stage_dir: str) -> list:
+    """
+    Copy source tars to stage_dir sequentially (no parallelism — single HDD
+    stream maximises sequential read throughput).  Skips tars already present
+    with the correct size (crash-safe resume).  Returns list of staged paths.
+    """
+    os.makedirs(stage_dir, exist_ok=True)
+    total_gb = sum(s for _, s in tar_items) / 1e9
+    print(f"  Staging {len(tar_items)} tars ({total_gb:.1f} GB) → {stage_dir} ...",
+          flush=True)
+    staged = []
+    for tar_path, size in tar_items:
+        dst = os.path.join(stage_dir, os.path.basename(tar_path))
+        if os.path.exists(dst) and os.path.getsize(dst) == size:
+            pass  # already staged from a previous interrupted run
+        else:
+            shutil.copy2(tar_path, dst)
+        staged.append(dst)
+    return staged
+
+
+def _cleanup_staged(staged_paths: list) -> None:
+    """Remove staged tar copies after the batch is processed."""
+    for p in staged_paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Write-phase helper (shared by single-pass and batch modes)
+# ---------------------------------------------------------------------------
+
+def _write_phase(records: list, args, blocklist: list,
+                 start_idx: int, shards_skipped_resumed: int) -> tuple:
+    """
+    Shuffle records, cap to --max-shards if set, dispatch to worker pool,
+    write provenance sidecars.  Returns (total_written, n_shards, merged_prov).
+    """
+    rng = random.Random(args.seed)
+    rng.shuffle(records)
+
+    if args.max_shards is not None:
+        cap = args.max_shards * args.shard_size
+        if len(records) > cap:
+            print(f"  Capping to {cap:,} records ({args.max_shards} shards × "
+                  f"{args.shard_size} images/shard — discarding "
+                  f"{len(records) - cap:,} excess records)")
+            records = records[:cap]
+
+    if not records:
+        print("  No records — nothing to write.", flush=True)
+        return 0, 0, {}
+
+    n_shards  = math.ceil(len(records) / args.shard_size)
+    workers   = min(args.workers, n_shards)
+    total_shards = start_idx + n_shards
+    print(f"  Output: {n_shards} shards × {args.shard_size} images "
+          f"(writing {start_idx:06d}–{start_idx + n_shards - 1:06d} of {total_shards} total)")
+    print(f"  Workers: {workers} processes")
+
+    full_shard_ranges = [
+        list(range(start_idx + i, total_shards, workers))
+        for i in range(workers)
+    ]
+    worker_slice = math.ceil(len(records) / workers)
+    work_items = [
+        (
+            full_shard_ranges[w],
+            records[w * worker_slice : (w + 1) * worker_slice],
+            args.output,
+            args.shard_size,
+            blocklist,
+            args.quality,
+            w,
+            workers,
+        )
+        for w in range(workers)
+    ]
+
+    _hb_stop = threading.Event()
+    start_ts  = now_iso()
+
+    def _hb_loop():
+        while not _hb_stop.is_set():
+            try:
+                done_tars = sum(
+                    1 for f in os.scandir(args.output)
+                    if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp")
+                )
+                write_heartbeat(
+                    "build_shards", args.chunk,
+                    done=done_tars,
+                    total=n_shards,
+                    pct=round(100 * done_tars / max(n_shards, 1)),
+                    start_ts=start_ts,
+                    shards_skipped_resumed=shards_skipped_resumed,
+                    pairs_written_approx=done_tars * args.shard_size,
+                    cold_only=bool(args.cold_only),
+                )
+            except OSError:
+                pass
+            _hb_stop.wait(30)
+
+    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    _hb_thread.start()
+
+    with multiprocessing.Pool(processes=workers) as pool:
+        results = pool.map(_write_shard_range, work_items)
+
+    _hb_stop.set()
+
+    total_written = sum(r["written"] for r in results)
+
+    merged_prov: dict = {}
+    for r in results:
+        for sid, paths in r.get("provenance", {}).items():
+            merged_prov.setdefault(sid, []).extend(paths)
+    _write_provenance_sidecars(args.output, merged_prov)
+
+    final_done = sum(
+        1 for f in os.scandir(args.output)
+        if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp")
+    )
+    write_heartbeat(
+        "build_shards", args.chunk,
+        done=final_done,
+        total=n_shards,
+        pct=round(100 * final_done / max(n_shards, 1)),
+        start_ts=start_ts,
+        shards_skipped_resumed=shards_skipped_resumed,
+        pairs_written_approx=final_done * args.shard_size,
+        cold_only=bool(args.cold_only),
+    )
+
+    return total_written, n_shards, merged_prov
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -549,6 +737,15 @@ def main():
                              "Use to pre-populate the cold shard pool without touching SSD "
                              "staging. The run is fully resume-tolerant: shards with both "
                              ".tar and .provenance.json on disk are skipped.")
+    parser.add_argument("--stage-dir", default=None,
+                        help="Copy each batch of source tars here (e.g. fast SSD path) "
+                             "before scanning to avoid random-seek penalty on spinning HDDs. "
+                             "Staged copies are deleted after each batch. Compatible with "
+                             "--cold-only (stage-dir itself is exempt from the cold path check).")
+    parser.add_argument("--batch-gb", type=float, default=None,
+                        help="With --stage-dir: copy at most this many GB of source tars "
+                             "per batch. Use when sources exceed available staging space. "
+                             "Default: stage all sources in one pass.")
     args = parser.parse_args()
 
     if args.cold_only:
@@ -585,26 +782,7 @@ def main():
         print(f"Resume: {shards_skipped_resumed:,} shards already complete on disk — "
               "workers will skip them.")
 
-    print(f"Collecting records from {len(args.sources)} source(s) using {args.workers} workers...")
-    records = _collect_records(args.sources, workers=args.workers)  # args.sources may contain :chunk/total slices
-    print(f"  Found {len(records):,} total records")
-
-    # Shuffle globally before splitting to workers
-    rng = random.Random(args.seed)
-    rng.shuffle(records)
-    print(f"  Shuffled with seed={args.seed}")
-
-    # Cap to max_shards * shard_size records so we never build more shards
-    # than precompute is configured to process.  The cap is applied after shuffle
-    # so the kept records are a representative random sample of the full source pool.
-    if args.max_shards is not None:
-        cap = args.max_shards * args.shard_size
-        if len(records) > cap:
-            print(f"  Capping to {cap:,} records ({args.max_shards} shards × {args.shard_size} images/shard — "
-                  f"discarding {len(records) - cap:,} excess records)")
-            records = records[:cap]
-
-    # Load blocklist
+    # Load blocklist once — shared across all batches.
     blocklist = []
     if args.blocklist:
         if not os.path.exists(args.blocklist):
@@ -614,101 +792,76 @@ def main():
             blocklist = [line.strip() for line in f if line.strip()]
         print(f"  Blocklist: {len(blocklist):,} duplicate IDs to skip")
 
-    if not records:
-        print("  No records found in source directories — nothing to shard.", flush=True)
-        sys.exit(0)
-
-    n_shards = math.ceil(len(records) / args.shard_size)
-    workers = min(args.workers, n_shards)
-    start_idx = args.start_idx
-    total_shards = start_idx + n_shards
-    print(f"  Output: {n_shards} new shards × {args.shard_size} images (writing {start_idx:06d}–{start_idx+n_shards-1:06d} of {total_shards} total)")
-    print(f"  Workers: {workers} processes (targeting P-cores on Apple Silicon)")
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
-    # Each worker owns an interleaved subset of the NEW shards only (>= start_idx).
-    # Previously workers started from shard 0 and simulated consuming records for
-    # shards 0..start_idx-1 before writing — but each worker's record slice is too
-    # small to survive that simulation when start_idx is large (e.g. 84 for chunk 3),
-    # causing workers to exhaust their records before reaching writable shards → 0 output.
-    full_shard_ranges = [list(range(start_idx + i, total_shards, workers)) for i in range(workers)]
 
-    # Give each worker a contiguous slice of the shuffled record list.
-    worker_slice = math.ceil(len(records) / workers)
-    work_items = [
-        (
-            full_shard_ranges[w],
-            records[w * worker_slice : (w + 1) * worker_slice],
-            args.output,
-            args.shard_size,
-            blocklist,
-            args.quality,
-            w,          # worker_idx — used to stagger source-shard read order
-            workers,    # n_workers
-        )
-        for w in range(workers)
-    ]
+    total_written  = 0
+    total_skipped  = 0
+    all_prov: dict = {}
 
-    print(f"\nStarting {workers} parallel workers...")
+    if args.stage_dir:
+        # ------------------------------------------------------------------
+        # Stage mode: copy source tars to fast SSD one batch at a time,
+        # build shards from the hot copies, then delete the staged copies.
+        # Avoids the random-seek penalty of scanning large tars on a spinning HDD.
+        # ------------------------------------------------------------------
+        all_tar_items = _list_source_tars(args.sources)
+        total_source_gb = sum(s for _, s in all_tar_items) / 1e9
+        max_bytes = int(args.batch_gb * 1e9) if args.batch_gb else sum(
+            s for _, s in all_tar_items)
+        batches = _batch_tars(all_tar_items, max_bytes)
 
-    # Heartbeat thread: counts completed .tar files in output dir as a progress
-    # proxy (pool.map blocks until all workers finish, so we can't get incremental
-    # results from the pool itself).
-    _hb_stop = threading.Event()
-    start_ts = now_iso()
-    def _hb_loop():
-        while not _hb_stop.is_set():
+        print(f"\nStage mode: {len(all_tar_items)} source tars ({total_source_gb:.1f} GB) "
+              f"in {len(batches)} batch(es) of ≤{max_bytes / 1e9:.0f} GB each")
+        print(f"  Stage dir: {args.stage_dir}")
+
+        # Resume: shard index continues from however many shards are already done.
+        next_start_idx = shards_skipped_resumed
+
+        for bi, batch in enumerate(batches):
+            batch_gb = sum(s for _, s in batch) / 1e9
+            print(f"\n--- Batch {bi + 1}/{len(batches)}: "
+                  f"{len(batch)} tars ({batch_gb:.1f} GB) ---", flush=True)
+
+            staged = _stage_tars(batch, args.stage_dir)
             try:
-                done_tars = sum(1 for f in os.scandir(args.output)
-                                if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
-                write_heartbeat(
-                    "build_shards", args.chunk,
-                    done=done_tars,
-                    total=n_shards,
-                    pct=round(100 * done_tars / max(n_shards, 1)),
-                    start_ts=start_ts,
-                    shards_skipped_resumed=shards_skipped_resumed,
-                    pairs_written_approx=done_tars * args.shard_size,
-                    cold_only=bool(args.cold_only),
+                print(f"  Collecting records ...", flush=True)
+                batch_records = []
+                for p in staged:
+                    batch_records.extend(_collect_records_from_shard(p))
+                print(f"  {len(batch_records):,} records collected", flush=True)
+
+                written, n_shards, prov = _write_phase(
+                    batch_records, args, blocklist,
+                    next_start_idx, shards_skipped_resumed,
                 )
-            except OSError:
-                pass  # EINTR from sleep-wake signal; skip this tick, continue loop
-            _hb_stop.wait(30)
-    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
-    _hb_thread.start()
+                next_start_idx += n_shards
+                total_written  += written
+                for sid, paths in prov.items():
+                    all_prov.setdefault(sid, []).extend(paths)
+            finally:
+                _cleanup_staged(staged)
 
-    with multiprocessing.Pool(processes=workers) as pool:
-        results = pool.map(_write_shard_range, work_items)
+    else:
+        # ------------------------------------------------------------------
+        # Standard mode: collect all records from source dirs, shuffle,
+        # write shards in one pass.  Fast on SSD; slow on spinning HDD.
+        # ------------------------------------------------------------------
+        print(f"Collecting records from {len(args.sources)} source(s) "
+              f"using {args.workers} workers...")
+        records = _collect_records(args.sources, workers=args.workers)
+        print(f"  Found {len(records):,} total records")
+        print(f"  Shuffled with seed={args.seed}")
 
-    _hb_stop.set()
-
-    total_written = sum(r["written"] for r in results)
-    total_skipped = sum(r["skipped"] for r in results)
-
-    # Merge per-worker provenance dicts and write sidecars.
-    merged_prov: dict[int, list[str]] = {}
-    for r in results:
-        for sid, paths in r.get("provenance", {}).items():
-            merged_prov.setdefault(sid, []).extend(paths)
-    _write_provenance_sidecars(args.output, merged_prov)
-    print(f"  Provenance: wrote sidecars for {len(merged_prov)} shards")
-
-    final_done = sum(1 for f in os.scandir(args.output)
-                     if f.name.endswith(".tar") and not f.name.endswith(".tar.tmp"))
-    write_heartbeat(
-        "build_shards", args.chunk,
-        done=final_done,
-        total=n_shards,
-        pct=round(100 * final_done / max(n_shards, 1)),
-        start_ts=start_ts,
-        shards_skipped_resumed=shards_skipped_resumed,
-        pairs_written_approx=final_done * args.shard_size,
-        cold_only=bool(args.cold_only),
-    )
+        written, n_shards, prov = _write_phase(
+            records, args, blocklist,
+            args.start_idx, shards_skipped_resumed,
+        )
+        total_written += written
+        all_prov.update(prov)
 
     print(f"\nDone.")
-    print(f"  Written: {total_written:,} images across {len(merged_prov)} shards this run")
+    print(f"  Written: {total_written:,} images across {len(all_prov)} shards this run")
     print(f"  Resumed: {shards_skipped_resumed:,} shards already complete from prior run")
-    print(f"  Skipped: {total_skipped:,} records (blocklist + invalid + corrupt)")
     print(f"  Output:  {args.output}/")
     print(f"\nNext: python train/scripts/filter_shards.py --shards {args.output}")
 
