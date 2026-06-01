@@ -46,7 +46,6 @@ import argparse
 import glob
 import io
 import json
-import math
 import os
 import re
 import sys
@@ -54,13 +53,12 @@ import tarfile
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
-    COLD_ROOT, now_iso, write_heartbeat, log_event,
+    now_iso, write_heartbeat, log_event,
 )
 
 # ---------------------------------------------------------------------------
@@ -100,6 +98,16 @@ SOURCE_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 
 def _detect_source(shard_path: str) -> str:
+    """
+    Detect the primary source dataset for a shard.
+
+    For single-source shards (or source dirs named by dataset), the path
+    keyword match is sufficient.  For mixed-source output shards (the common
+    case from build_shards.py) the provenance sidecar is read.  If multiple
+    source types are present, "unknown" is returned so that the neutral
+    mixed-source weights are applied rather than biasing toward whichever
+    source type happens to sort first.
+    """
     p = shard_path.lower()
     if "journeydb" in p or "jdb" in p:
         return "journeydb"
@@ -109,15 +117,19 @@ def _detect_source(shard_path: str) -> str:
         return "laion"
     if "coyo" in p:
         return "coyo"
-    # Fall back to provenance sidecar if present
-    prov = Path(shard_path).with_suffix("").with_suffix(".provenance.json")
+    # Read provenance sidecar written by build_shards.py
+    prov = Path(shard_path).with_suffix(".provenance.json")
     if prov.exists():
         try:
             data = json.loads(prov.read_text())
-            types = {s.get("type", "unknown") for s in data.get("sources", [])}
-            for t in ("journeydb", "jdb", "wikiart", "laion", "coyo"):
-                if t in types:
-                    return "journeydb" if t == "jdb" else t
+            type_map = {"jdb": "journeydb"}
+            types = {
+                type_map.get(s.get("type", ""), s.get("type", "unknown"))
+                for s in data.get("sources", [])
+            } - {"unknown"}
+            if len(types) == 1:
+                return types.pop()
+            # Multiple source types → treat as mixed; caller uses "unknown" weights
         except Exception:
             pass
     return "unknown"
@@ -178,7 +190,7 @@ def _load_aesthetic_predictor(device: str):
 
 def _clip_scores(model, preprocess, tokenizer,
                  images_pil: list, captions: list,
-                 device: str) -> tuple[list[float], list[float]]:
+                 device: str) -> tuple[list[float], list[np.ndarray]]:
     """
     Returns (alignment_scores, image_features_list).
     alignment_scores: cosine similarity between each image and its caption.
@@ -387,11 +399,12 @@ def score_shard(shard_path: str, model, preprocess, tokenizer,
     clip_avg = float(np.mean(align_scores)) if align_scores else 0.0
 
     # Aesthetic score
-    if aesthetic_predictor is not None and img_feats:
+    has_aesthetic = aesthetic_predictor is not None and bool(img_feats)
+    if has_aesthetic:
         aesth_scores = _aesthetic_scores(aesthetic_predictor, img_feats, device)
         aesth_avg = float(np.mean(aesth_scores))
     else:
-        aesth_avg = 0.5  # neutral fallback when predictor unavailable
+        aesth_avg = 0.0  # unused when weight is redistributed below
 
     # Sharpness (CPU, fast)
     blur_scores = [_sharpness_score(img) for img in images]
@@ -401,8 +414,20 @@ def score_shard(shard_path: str, model, preprocess, tokenizer,
     cap_scores = [_caption_quality_score(cap) for cap in captions]
     cap_avg = float(np.mean(cap_scores)) if cap_scores else 0.0
 
-    # Combined weighted score
+    # Combined weighted score.
+    # When aesthetic predictor is unavailable, redistribute its weight
+    # proportionally to the remaining signals so the combined score stays
+    # on a comparable scale instead of receiving a fixed 0.5 bonus.
     w_clip, w_aesth, w_blur, w_cap = SOURCE_WEIGHTS.get(source, SOURCE_WEIGHTS["unknown"])
+    if not has_aesthetic:
+        # Redistribute aesthetic weight to the other three signals
+        remaining = w_clip + w_blur + w_cap
+        if remaining > 0:
+            scale = (w_clip + w_aesth + w_blur + w_cap) / remaining
+            w_clip *= scale
+            w_blur *= scale
+            w_cap  *= scale
+        w_aesth = 0.0
     combined = (
         w_clip  * clip_avg +
         w_aesth * aesth_avg +
