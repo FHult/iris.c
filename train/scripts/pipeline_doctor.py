@@ -2570,6 +2570,120 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     return summary
 
 
+def print_warmup_status() -> None:
+    """
+    Print a focused warmup-readiness report drawn from the already-run issue set.
+
+    Covers the five preconditions for starting a flywheel warm-up run:
+      1. Shard index          — fast campaign creation
+      2. Light scoring        — quality filter complete
+      3. Unified scores       — final_value_score available
+      4. SigLIP / diversity   — embedding diversity cache built
+      5. Flywheel coverage    — how much of the pool has training observations
+
+    Exit code is 0 when the pool is fully ready (phase contains "ready"), else 1.
+    """
+    _C = _CYAN; _B = _BOLD; _R = _RESET; _Y = _YELLOW; _G = _GREEN
+
+    # Collect relevant issues by category
+    by_cat: dict[str, list[Issue]] = {}
+    for issue in _issues:
+        by_cat.setdefault(issue.category, []).append(issue)
+
+    def _first(cat: str) -> Optional[Issue]:
+        return by_cat[cat][0] if cat in by_cat else None
+
+    print(f"\n{_B}Warmup Status{_R}  —  {now_iso()}\n")
+
+    # ── 1. Shard index ────────────────────────────────────────────────────
+    si = _first("shard_index")
+    if si:
+        col = _Y if si.severity == "WARNING" else _C
+        print(f"  {'Shard index':<18} {col}{si.title}{_R}")
+    else:
+        print(f"  {'Shard index':<18} (no info)")
+
+    # ── 2. Light scoring ─────────────────────────────────────────────────
+    ls_issues = [i for i in by_cat.get("light_scoring", [])
+                 if i.severity in ("INFO",) and "complete" in i.title.lower()
+                    or "progress" in i.title.lower() or "not yet" in i.title.lower()]
+    ls = ls_issues[0] if ls_issues else _first("light_scoring")
+    if ls:
+        col = _Y if ls.severity == "WARNING" else _C
+        print(f"  {'Light scoring':<18} {col}{ls.title}{_R}")
+    else:
+        print(f"  {'Light scoring':<18} (no info)")
+
+    # ── 3. Unified scoring ───────────────────────────────────────────────
+    us_issues = [i for i in by_cat.get("unified_scoring", [])
+                 if "complete" in i.title.lower() or "progress" in i.title.lower()
+                    or "not yet" in i.title.lower()]
+    us = us_issues[0] if us_issues else _first("unified_scoring")
+    if us:
+        col = _Y if us.severity == "WARNING" else _C
+        print(f"  {'Unified scores':<18} {col}{us.title}{_R}")
+    else:
+        print(f"  {'Unified scores':<18} (no info)")
+
+    # ── 4. Warmup readiness (siglip + diversity) ──────────────────────────
+    wr = _first("warmup_readiness")
+    if wr:
+        ctx   = wr.ctx or {}
+        siglip_label = (f"{ctx.get('n_siglip_shards', 0):,} shard centroid(s) cached"
+                        if ctx.get("n_centroids", 0) > 0 else "not precomputed")
+        div_label    = (f"{ctx.get('n_centroids', 0):,} centroids"
+                        if ctx.get("n_centroids", 0) > 0 else "none")
+        col = _Y if wr.severity == "WARNING" else _C
+        print(f"  {'SigLIP':<18} {col}{siglip_label}{_R}")
+        print(f"  {'Diversity cache':<18} {col}{div_label}{_R}")
+    else:
+        print(f"  {'SigLIP':<18} (no info)")
+        print(f"  {'Diversity cache':<18} (no info)")
+
+    # ── 5. Flywheel coverage ─────────────────────────────────────────────
+    sc = _first("flywheel")
+    if sc and sc.ctx:
+        ctx = sc.ctx
+        total  = ctx.get("total_shards", 0)
+        scored = ctx.get("scored_shards", 0)
+        pct    = ctx.get("coverage_pct", 0.0)
+        col    = _Y if pct < 50 else _C
+        print(f"  {'Flywheel coverage':<18} {col}{scored:,}/{total:,} scored ({pct}%){_R}")
+    else:
+        try:
+            if SHARD_SCORES_DB_PATH.exists():
+                import sqlite3 as _sq
+                _c = _sq.connect(str(SHARD_SCORES_DB_PATH))
+                _r = _c.execute(
+                    "SELECT COUNT(*), SUM(CASE WHEN n_scored>0 THEN 1 ELSE 0 END) FROM shards"
+                ).fetchone()
+                _c.close()
+                total, scored = (_r[0] or 0), (_r[1] or 0)
+                pct = round(100 * scored / max(total, 1), 1) if total else 0.0
+                col = _Y if pct < 50 else _C
+                print(f"  {'Flywheel coverage':<18} {col}{scored:,}/{total:,} scored ({pct}%){_R}")
+            else:
+                print(f"  {'Flywheel coverage':<18} no shard_scores.db")
+        except Exception:
+            print(f"  {'Flywheel coverage':<18} (error reading DB)")
+
+    # ── Phase summary ─────────────────────────────────────────────────────
+    phase = (wr.ctx or {}).get("phase", "unknown") if wr else "unknown"
+    next_cmd = wr.fix if wr and wr.fix else ""
+
+    ready = "ready" in phase
+    phase_col = _G if ready else _Y
+    print(f"\n  {'Phase':<18} {phase_col}{_B}{phase}{_R}")
+    if next_cmd:
+        print(f"\n  Next step:")
+        for line in next_cmd.splitlines():
+            print(f"    $ {line}")
+
+    print()
+    if not ready:
+        sys.exit(1)
+
+
 def _current_pipeline_state() -> str:
     if not tmux_session_exists():
         return "no tmux session"
@@ -2881,6 +2995,11 @@ def main() -> None:
                         help="Path to v2_pipeline.yaml (auto-detected if omitted)")
     parser.add_argument("--html", metavar="PATH",
                         help="Write rich HTML report to PATH (use - for stdout); auto-refreshes every 60s")
+    parser.add_argument("--warmup-status", action="store_true",
+                        help="Show a focused warmup-readiness summary "
+                             "(light scoring, unified scores, SigLIP, diversity cache, "
+                             "flywheel coverage). Runs only the relevant subset of checks. "
+                             "Exits 0 when ready, 1 when not.")
     parser.add_argument("--watch", action="store_true",
                         help="Re-run every --watch-interval seconds; only print when issue set changes")
     parser.add_argument("--watch-interval", type=int, default=60, metavar="SECS",
@@ -2896,8 +3015,23 @@ def main() -> None:
     if args.chunk is not None:
         chunks = [args.chunk]
 
-    if not args.json and not args.ai and not args.html and not args.watch:
+    if not args.json and not args.ai and not args.html and not args.watch \
+            and not args.warmup_status:
         print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
+
+    # --warmup-status: run only warmup-relevant checks for a fast focused report.
+    if args.warmup_status:
+        global _issues
+        _issues = []
+        _check_shard_index()
+        _check_light_scoring()
+        _check_unified_scoring()
+        _check_warmup_readiness()
+        _check_shard_coverage()
+        _check_campaigns()
+        _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))
+        print_warmup_status()
+        return  # print_warmup_status() calls sys.exit() if not ready
 
     def _run_checks() -> None:
         global _issues
