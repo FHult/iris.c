@@ -2758,6 +2758,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             try:
                 stage_summary = _stager.stage_iteration_shards(selected_paths, staging_dir)
                 log_orch(f"[flywheel:{name}] staged {stage_summary['shards_staged']} shards "
+                         f"+ {stage_summary.get('npz_staged', 0)} npz "
                          f"({'copy' if _stager.enabled else 'symlink'}, "
                          f"{stage_summary['bytes_transferred'] / 1e6:.0f} MB) → {staging_dir}")
             except Exception as _se:

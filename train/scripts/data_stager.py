@@ -193,58 +193,122 @@ class DataStager:
         staging_dir: "Path",
     ) -> dict:
         """
-        Stage a specific list of shards to staging_dir for one flywheel iteration.
+        Stage a specific list of shards — and their precomputed caches — to hot
+        storage for one flywheel iteration.
 
-        Unlike stage_for_chunk() which operates on a shard ID range, this method
-        stages an arbitrary selection of shards — as used by the flywheel loop.
+        Unlike stage_for_chunk() which operates on a contiguous shard ID range,
+        this method stages an arbitrary selection of shard paths as used by the
+        flywheel loop.
 
-        When cold and hot share the same device (enabled=False), creates relative
-        symlinks (zero cost) via _link_or_copy.  When cross-device, copies
-        atomically and checks that hot storage has enough headroom first.
+        Shard tars are staged into staging_dir.  Precomputed caches (qwen3, vae,
+        siglip) are staged into the standard hot precomputed tree so the training
+        config can reference them with the usual cache_dir paths.
 
-        Note on precomputed caches: precomputed npz files use per-record naming
-        ({rec_id}.npz) with no shard prefix, so we cannot determine which files
-        belong to which shard without opening the tar.  Precomputed staging for
-        flywheel iterations is therefore deferred until a shard→rec_id index is
-        available (see BACKLOG: PIPELINE-flywheel-precomp-stage).  Until then,
-        the training config should set cache dirs to null for online encoding.
+        npz naming: precompute_all.py uses {shard_id:06d}_{sample_index:04d}.npz,
+        so we filter by prefix match against the selected shard IDs.
 
-        Returns {shards_staged, bytes_transferred}.
+        When cold and hot share the same device (enabled=False), creates symlinks.
+        When cross-device, copies atomically.  Disk-space check runs up front.
+
+        Returns {shards_staged, npz_staged, bytes_transferred}.
         """
         from pathlib import Path as _Path
         staging_dir = _Path(staging_dir)
         staging_dir.mkdir(parents=True, exist_ok=True)
 
-        tasks: list = []
+        # Build set of selected shard ID strings (zero-padded 6-digit form)
+        selected_ids: set[str] = set()
+        for p in shard_paths:
+            try:
+                selected_ids.add(f"{int(_Path(p).stem):06d}")
+            except ValueError:
+                selected_ids.add(_Path(p).stem)
+
+        # ── 1. Stage raw shard tars ──────────────────────────────────────────
+        shard_tasks: list = []
         for path_str in shard_paths:
             src = _Path(path_str)
             dst = staging_dir / src.name
             if dst.exists() or dst.is_symlink():
                 dst.unlink()
-            tasks.append((src, dst))
+            shard_tasks.append((src, dst))
 
-        if not self._use_symlinks and tasks:
-            estimated = sum(_safe_size(src) for src, _ in tasks)
+        # ── 2. Collect precomputed npz tasks (for all available encoders) ────
+        npz_tasks: list = []
+        for encoder in ("qwen3", "vae", "siglip"):
+            cold_enc = self._cold_precomp / encoder
+            hot_enc  = self._hot_precomp / encoder
+            if not cold_enc.exists():
+                continue
+            # Handle versioned layout (current symlink)
+            cur_link = cold_enc / "current"
+            if cur_link.is_symlink():
+                import os as _os
+                ver = _os.path.basename(_os.readlink(str(cur_link)))
+                cold_ver = cold_enc / ver
+                hot_ver  = hot_enc / ver
+            else:
+                cold_ver = cold_enc
+                hot_ver  = hot_enc
+            if not cold_ver.exists():
+                continue
+            hot_ver.mkdir(parents=True, exist_ok=True)
+            # Stage npz files whose shard prefix matches the selection
+            for npz in cold_ver.glob("*.npz"):
+                try:
+                    shard_prefix = f"{int(npz.stem.split('_')[0]):06d}"
+                except (ValueError, IndexError):
+                    continue
+                if shard_prefix not in selected_ids:
+                    continue
+                dst_npz = hot_ver / npz.name
+                if not dst_npz.exists() and not dst_npz.is_symlink():
+                    npz_tasks.append((npz, dst_npz))
+            # Propagate/update current symlink on hot to match cold
+            if cur_link.is_symlink():
+                hot_cur = hot_enc / "current"
+                if not hot_cur.exists() and not hot_cur.is_symlink():
+                    import os as _os
+                    hot_enc.mkdir(parents=True, exist_ok=True)
+                    _os.symlink(ver, str(hot_cur))
+
+        all_tasks = shard_tasks + npz_tasks
+
+        # Disk-space preflight (cross-device only)
+        if not self._use_symlinks and all_tasks:
+            estimated = sum(_safe_size(src) for src, _ in all_tasks)
             if not self._check_hot_space(estimated):
                 raise RuntimeError(
-                    f"Insufficient hot-storage space to stage {len(tasks)} flywheel shards "
+                    f"Insufficient hot-storage space to stage {len(shard_tasks)} shards "
+                    f"+ {len(npz_tasks)} npz files "
                     f"(~{estimated / 1e9:.1f} GB needed, margin={self.staging_margin_gb:.0f} GB)"
                 )
 
-        shards_staged = 0
+        shards_staged = npz_staged = 0
         total_bytes   = 0
 
         def _do(src_dst):
-            nb = self._link_or_copy(*src_dst)
-            return max(0, nb)
+            return max(0, self._link_or_copy(*src_dst))
 
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
-            for fut in as_completed(pool.submit(_do, t) for t in tasks):
+            all_futs: dict = {}
+            for t in shard_tasks:
+                all_futs[pool.submit(_do, t)] = "shard"
+            for t in npz_tasks:
+                all_futs[pool.submit(_do, t)] = "npz"
+            for fut in as_completed(all_futs):
                 nb = fut.result()
-                shards_staged += 1
-                total_bytes   += nb
+                total_bytes += nb
+                if all_futs[fut] == "shard":
+                    shards_staged += 1
+                else:
+                    npz_staged += 1
 
-        return {"shards_staged": shards_staged, "bytes_transferred": total_bytes}
+        return {
+            "shards_staged":     shards_staged,
+            "npz_staged":        npz_staged,
+            "bytes_transferred": total_bytes,
+        }
 
     def archive_chunk(self, chunk: int) -> dict:
         """
