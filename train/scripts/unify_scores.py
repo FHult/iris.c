@@ -50,7 +50,7 @@ from pipeline_lib import (
     SHARD_SCORES_DB_PATH,
 )
 
-VERSION = "v1"
+VERSION = "v2"
 
 DEFAULT_WEIGHTS: dict[str, float] = {
     "light_score":   0.50,
@@ -287,6 +287,84 @@ def compute_unified_score(
 
 
 # ---------------------------------------------------------------------------
+# UnifiedScorer class — extensible scoring engine
+# ---------------------------------------------------------------------------
+
+class UnifiedScorer:
+    """
+    Computes final_value_score by combining quality signals for a shard.
+
+    Current signals:
+      light_score      — static quality from score_shards_light.py (always available)
+      diversity        — source rarity in the pool (always computed)
+      training_loss    — mean training loss on shard samples (dynamic, flywheel DB)
+      contribution     — per-shard model improvement (dynamic, flywheel DB)
+
+    Future signals can be added by:
+      1. Adding a weight key to DEFAULT_WEIGHTS
+      2. Implementing the signal computation in a subclass or optional method
+      3. Passing the value as an extra kwarg to compute_unified_score()
+
+    Embedding-diversity signal (inter/intra-shard SigLIP diversity):
+      Scaffold is present via _compute_embedding_diversity() below.
+      Returns None until precompute_all.py has run with --siglip.
+    """
+
+    def __init__(
+        self,
+        weights: dict[str, float],
+        source_fractions: dict[str, float],
+        loss_normalized_by_stem: dict[str, float],
+    ):
+        self.weights = weights
+        self.source_fractions = source_fractions
+        self.loss_normalized_by_stem = loss_normalized_by_stem
+
+    @classmethod
+    def from_data(
+        cls,
+        config_path: Optional[str],
+        light_by_stem: dict[str, dict],
+        training_by_stem: dict[str, dict],
+    ) -> "UnifiedScorer":
+        """Construct a scorer from already-loaded light and training data."""
+        weights = _load_config_weights(config_path) if config_path else dict(DEFAULT_WEIGHTS)
+        source_fractions = compute_source_fractions(light_by_stem)
+        loss_normalized_by_stem = normalize_losses(training_by_stem)
+        return cls(weights, source_fractions, loss_normalized_by_stem)
+
+    def score(self, shard_path: str, light_data: dict,
+              training_signals: Optional[dict]) -> dict:
+        """Compute and return the full scoring result dict for one shard."""
+        stem = Path(shard_path).stem
+        return compute_unified_score(
+            shard_path=shard_path,
+            source_fractions=self.source_fractions,
+            light_data=light_data,
+            training_signals=training_signals,
+            loss_normalized=self.loss_normalized_by_stem.get(stem),
+            weights=self.weights,
+        )
+
+    def _compute_embedding_diversity(self, shard_path: str) -> Optional[float]:
+        """
+        Intra-shard embedding diversity from precomputed SigLIP features.
+
+        Returns None when SigLIP features have not yet been precomputed for this shard.
+        To enable: run precompute_all.py with --siglip then set
+        unified_scoring.enable_embedding_diversity: true in v2_pipeline.yaml.
+
+        When implemented:
+          1. Load per-sample SigLIP embeddings from the precompute directory.
+          2. Compute the mean cosine similarity between all pairs of samples.
+          3. Return 1 - mean_similarity (higher = more diverse).
+        This provides an inter-sample diversity signal beyond the pool-level
+        source-rarity measure already captured by the diversity signal.
+        """
+        return None  # Not yet implemented — precomputed features required
+
+
+# ---------------------------------------------------------------------------
 # Sidecar / sentinel helpers
 # ---------------------------------------------------------------------------
 
@@ -339,9 +417,6 @@ def main() -> None:
         print(f"No shards found in {shards_dir}")
         sys.exit(0)
 
-    weights = _load_config_weights(args.config) if args.config else dict(DEFAULT_WEIGHTS)
-    print(f"Weights: " + "  ".join(f"{k}={v:.2f}" for k, v in weights.items()))
-
     # Load all light scores (fast — small JSON, sequential)
     print(f"\nReading light scores ...", flush=True)
     light_by_stem = read_light_scores(shards_dir)
@@ -361,12 +436,12 @@ def main() -> None:
     else:
         print("  No training signals — cold start: static signals only")
 
-    # Pool-wide diversity and loss normalisation
-    source_fractions = compute_source_fractions(light_by_stem)
+    # Build the scorer (handles weight loading, source fractions, loss normalization)
+    scorer = UnifiedScorer.from_data(args.config, light_by_stem, training_by_stem)
+    print(f"Weights: " + "  ".join(f"{k}={v:.2f}" for k, v in scorer.weights.items()))
     print("  Source distribution: " +
-          ", ".join(f"{src}={frac:.1%}" for src, frac in sorted(source_fractions.items())))
-
-    loss_normalized_by_stem = normalize_losses(training_by_stem)
+          ", ".join(f"{src}={frac:.1%}"
+                    for src, frac in sorted(scorer.source_fractions.items())))
 
     # Determine pending shards
     pending = [
@@ -385,22 +460,15 @@ def main() -> None:
         sys.exit(0)
 
     # Score
+    n_training = len(training_by_stem)
     n_written = 0
     for i, shard_path in enumerate(pending):
         stem    = Path(shard_path).stem
         light_d = light_by_stem[stem]
         train_d = training_by_stem.get(stem)
-        loss_n  = loss_normalized_by_stem.get(stem)
 
         try:
-            result = compute_unified_score(
-                shard_path=shard_path,
-                source_fractions=source_fractions,
-                light_data=light_d,
-                training_signals=train_d,
-                loss_normalized=loss_n,
-                weights=weights,
-            )
+            result = scorer.score(shard_path, light_d, train_d)
         except Exception as e:
             import traceback
             print(f"ERROR scoring {stem}: {e}")

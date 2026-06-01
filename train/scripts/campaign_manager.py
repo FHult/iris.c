@@ -32,6 +32,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -46,7 +47,16 @@ from pipeline_lib import (
 # Campaign manifests live on cold storage next to the shard pool they reference
 CAMPAIGNS_DIR = COLD_ROOT / "campaigns"
 
-MANIFEST_VERSION = "v1"
+MANIFEST_VERSION = "v2"
+
+
+def _compute_manifest_checksum(entries: list[dict]) -> str:
+    """SHA256 of the sorted (shard_id, decision) pairs. Detects tampering or corruption."""
+    payload = json.dumps(
+        sorted((e["shard_id"], e["decision"]) for e in entries),
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 # Default pre-defined campaigns (matches v2_pipeline.yaml campaigns section)
 DEFAULT_CAMPAIGNS: dict[str, dict] = {
@@ -77,26 +87,35 @@ DEFAULT_CAMPAIGNS: dict[str, dict] = {
 # Score loading helpers
 # ---------------------------------------------------------------------------
 
-def _load_shard_scores(shards_dir: Path) -> list[dict]:
+def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
     """
     Load scoring data for every shard in shards_dir.
 
-    Prefers .unified_score.json (final_value_score).
-    Falls back to .light_scores.json (combined_score) when unified score absent.
-    Shards with no score sidecar are included with score=0.0 and decision=unknown.
+    Fast path: queries the SQLite shard index when available (sub-second on 1280 shards).
+    Slow path: falls back to reading sidecar JSON files directly (used when index absent).
 
     Returns list of dicts, one per .tar shard:
       path, shard_id, source, final_value_score, light_score,
-      training_loss_normalized, decision, has_unified
+      training_loss_normalized, light_decision, has_unified, file_size_bytes
     """
-    entries: list[dict] = []
+    # Fast path: try the SQLite shard index first.
+    if use_index:
+        try:
+            import shard_index as _si
+            if _si.INDEX_PATH.exists():
+                entries = _si.query_all(shards_dir)
+                if entries:
+                    return entries
+        except Exception:
+            pass  # fall through to directory scan
 
+    # Slow path: scan directory and read JSON sidecars directly.
+    entries: list[dict] = []
     for tar_path in sorted(shards_dir.glob("*.tar")):
         if tar_path.name.endswith(".tar.tmp"):
             continue
         stem = tar_path.stem
 
-        # Try unified score first
         unified_p = tar_path.with_suffix(".unified_score.json")
         light_p   = tar_path.with_suffix(".light_scores.json")
 
@@ -108,13 +127,19 @@ def _load_shard_scores(shards_dir: Path) -> list[dict]:
             "final_value_score":       0.0,
             "light_score":             0.0,
             "training_loss_normalized": None,
-            # light_decision: the original keep/discard from score_shards_light.py.
+            # light_decision: original keep/discard from score_shards_light.py.
             # Stored separately so _apply_strategy() can read it after resetting "decision".
             "light_decision":         "unknown",
             "has_unified":            has_unified,
+            "file_size_bytes":        None,
         }
 
-        # Always read the light score sidecar first to capture the keep/discard decision.
+        try:
+            entry["file_size_bytes"] = tar_path.stat().st_size
+        except OSError:
+            pass
+
+        # Always read light sidecar first to capture keep/discard decision.
         if light_p.exists():
             try:
                 ld = json.loads(light_p.read_text())
@@ -127,7 +152,6 @@ def _load_shard_scores(shards_dir: Path) -> list[dict]:
             except (OSError, json.JSONDecodeError):
                 pass
 
-        # Prefer unified score for final_value_score when present.
         if has_unified:
             try:
                 data = json.loads(unified_p.read_text())
@@ -135,9 +159,8 @@ def _load_shard_scores(shards_dir: Path) -> list[dict]:
                 entry["final_value_score"]        = float(data.get("final_value_score", 0.0))
                 entry["light_score"]              = float(data.get("light_score", entry["light_score"]))
                 entry["training_loss_normalized"] = data.get("training_loss_normalized")
-                # light_decision is already populated from the light sidecar above.
-                # If the light sidecar was missing, default to "keep" — unified scores are only
-                # written after light scoring, so the shard was at minimum not explicitly rejected.
+                # If the light sidecar was missing, default to keep — unified scores are only
+                # written after light scoring, so the shard was not explicitly rejected.
                 if entry["light_decision"] == "unknown":
                     entry["light_decision"] = "keep"
             except (OSError, json.JSONDecodeError):
@@ -146,6 +169,29 @@ def _load_shard_scores(shards_dir: Path) -> list[dict]:
         entries.append(entry)
 
     return entries
+
+
+def _apply_base_campaign(entries: list[dict], base_name: str) -> None:
+    """
+    Pre-mark entries not in the base campaign as force_exclude.
+
+    This constrains the current campaign to only shards already included in
+    the named base campaign — enabling hierarchical campaign composition.
+    """
+    base_path = CAMPAIGNS_DIR / base_name / "manifest.json"
+    if not base_path.exists():
+        print(f"ERROR: base campaign '{base_name}' not found: {base_path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        base_manifest = json.loads(base_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: could not read base campaign manifest: {e}", file=sys.stderr)
+        sys.exit(1)
+    included_ids = {e["shard_id"] for e in base_manifest.get("entries", [])
+                    if e.get("decision") == "include"}
+    for entry in entries:
+        if entry["shard_id"] not in included_ids:
+            entry["force_exclude"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +365,33 @@ def cmd_create(args, cfg: dict) -> None:
     elif name in DEFAULT_CAMPAIGNS and "source_boosts" in DEFAULT_CAMPAIGNS[name]:
         strategy_params["source_boosts"] = DEFAULT_CAMPAIGNS[name]["source_boosts"]
 
+    # Optional: inherit from a base campaign before applying this strategy.
+    base_campaign = args.base
+    # min_score is applied post-strategy as a hard floor on final_value_score.
+    min_score = args.min_score
+
+    # force-include / force-exclude sets from CLI args
+    force_include_ids: set[str] = set(args.force_include or [])
+    force_exclude_ids: set[str] = set(args.force_exclude or [])
+
     # Load and score shards
     print(f"Loading shard scores from {shards_dir} ...", flush=True)
     entries = _load_shard_scores(shards_dir)
     if not entries:
         print("ERROR: no shards found.", file=sys.stderr)
         sys.exit(1)
+
+    # Apply base-campaign constraint: restrict pool to base's included set.
+    if base_campaign:
+        print(f"Applying base campaign '{base_campaign}' ...", flush=True)
+        _apply_base_campaign(entries, base_campaign)
+
+    # Wire per-entry force flags from CLI
+    for e in entries:
+        if e["shard_id"] in force_include_ids:
+            e["force_include"] = True
+        if e["shard_id"] in force_exclude_ids:
+            e["force_exclude"] = True
 
     n_with_unified = sum(1 for e in entries if e["has_unified"])
     n_with_light   = sum(1 for e in entries
@@ -336,6 +403,18 @@ def cmd_create(args, cfg: dict) -> None:
 
     print(f"Applying strategy '{strategy}' ...", flush=True)
     entries = _apply_strategy(entries, strategy, strategy_params)
+
+    # Post-strategy min_score floor: exclude shards below the threshold.
+    if min_score is not None:
+        n_filtered = 0
+        for e in entries:
+            if (e["decision"] == "include"
+                    and not e.get("force_include")
+                    and e["final_value_score"] < min_score):
+                e["decision"] = "exclude"
+                n_filtered += 1
+        if n_filtered:
+            print(f"  min_score={min_score:.4f}: filtered out {n_filtered} shards below threshold")
 
     included = [e for e in entries if e["decision"] == "include"]
     excluded = [e for e in entries if e["decision"] != "include"]
@@ -392,19 +471,54 @@ def cmd_create(args, cfg: dict) -> None:
         "version": MANIFEST_VERSION,
     }
 
+    # Checksum over shard_id + decision pairs; allows validation after the fact.
+    manifest["checksum"] = _compute_manifest_checksum(manifest["entries"])
+
+    if base_campaign:
+        manifest["base_campaign"] = base_campaign
+    if min_score is not None:
+        manifest["min_score"] = min_score
+
     if args.description:
         manifest["description"] = args.description
     elif name in DEFAULT_CAMPAIGNS:
         manifest["description"] = DEFAULT_CAMPAIGNS[name]["description"]
 
     out_path = CAMPAIGNS_DIR / name / "manifest.json"
-    if args.dry_run:
-        print(f"\n[dry-run] Would write manifest to {out_path}")
-        print(f"  include={len(included)}/{len(entries)}  "
-              f"avg_score={manifest['avg_final_value_score']:.4f}")
+    if args.dry_run or getattr(args, "simulate", False):
+        tag = "[simulate]" if getattr(args, "simulate", False) else "[dry-run]"
+        print(f"\n{tag} Would write manifest to {out_path}")
+        print(f"  Include: {len(included):,} / {len(entries):,} shards  "
+              f"({100 * len(included) // max(len(entries), 1)}%)")
+        print(f"  Avg final_value_score: {manifest['avg_final_value_score']:.4f}")
         for src, s in manifest["source_stats"].items():
             print(f"  {src}: include={s['include']} exclude={s['exclude']} "
                   f"avg={s['avg_score']:.4f}")
+        if getattr(args, "simulate", False):
+            # Disk usage from file sizes in index (may be None when index absent)
+            total_bytes = sum(
+                e.get("file_size_bytes") or 0 for e in entries
+                if e["decision"] == "include"
+            )
+            if total_bytes > 0:
+                print(f"\n  Estimated disk (included shards): {total_bytes / 1e9:.1f} GB")
+            # Epoch time estimate: ~5000 images/shard × 0.17 s/image at 512px on M1 Max
+            est_images = len(included) * 5000
+            est_epoch_h = est_images * 0.17 / 3600
+            print(f"  Estimated images:   {est_images:,}  ({len(included):,} shards × 5000)")
+            print(f"  Estimated epoch:    {est_epoch_h:.1f} h  (at 0.17 s/img; actual varies)")
+            # Score distribution
+            inc_scores = sorted(e["final_value_score"] for e in included
+                                if e["final_value_score"] > 0)
+            if inc_scores:
+                import statistics
+                n = len(inc_scores)
+                print(f"  Score distribution (included shards):")
+                print(f"    min={inc_scores[0]:.4f}  "
+                      f"p25={inc_scores[int(n*0.25)]:.4f}  "
+                      f"med={statistics.median(inc_scores):.4f}  "
+                      f"p75={inc_scores[int(n*0.75)]:.4f}  "
+                      f"max={inc_scores[-1]:.4f}")
         return
 
     save_manifest(manifest, out_path)
@@ -558,6 +672,84 @@ def cmd_diff(args, cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: validate
+# ---------------------------------------------------------------------------
+
+def cmd_validate(args, cfg: dict) -> None:
+    """
+    Validate a campaign manifest for consistency and integrity.
+
+    Checks:
+    - SHA256 checksum matches the stored entries (tamper/corruption detection)
+    - All included shard files exist on disk
+    - Shard count delta vs. current pool (staleness detection)
+    """
+    manifest_path = CAMPAIGNS_DIR / args.name / "manifest.json"
+    if not manifest_path.exists():
+        print(f"ERROR: campaign '{args.name}' not found at {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        m = load_manifest(manifest_path)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: could not read manifest: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # Checksum verification
+    stored_checksum = m.get("checksum")
+    if stored_checksum:
+        computed = _compute_manifest_checksum(m.get("entries", []))
+        if computed != stored_checksum:
+            errors.append(
+                f"Checksum mismatch: stored={stored_checksum[:12]}…  "
+                f"computed={computed[:12]}…  (manifest may be corrupted or manually edited)"
+            )
+    else:
+        warnings.append("No checksum in manifest (created before v3.15.0 — consider regenerating)")
+
+    # Verify included shards exist on disk
+    missing: list[str] = []
+    included_entries = [e for e in m.get("entries", []) if e.get("decision") == "include"]
+    for e in included_entries:
+        if not Path(e["path"]).exists():
+            missing.append(e["shard_id"])
+    if missing:
+        errors.append(f"{len(missing)} included shards missing from disk: "
+                      f"{', '.join(missing[:5])}" + (" ..." if len(missing) > 5 else ""))
+
+    # Staleness: warn if shard pool count has changed by >5% since manifest was created
+    shards_dir = Path(m.get("shards_dir", ""))
+    if shards_dir.exists():
+        current_count = sum(1 for _ in shards_dir.glob("*.tar")
+                            if not _.name.endswith(".tar.tmp"))
+        manifest_total = m.get("total_shards", 0)
+        if manifest_total > 0:
+            pct_delta = abs(current_count - manifest_total) / manifest_total * 100
+            if pct_delta > 5:
+                warnings.append(
+                    f"Pool size changed {manifest_total}→{current_count} shards "
+                    f"({pct_delta:.0f}%): manifest may be stale — consider regenerating"
+                )
+
+    # Report
+    print(f"Validating campaign '{args.name}' ({manifest_path}):")
+    print(f"  Errors:   {len(errors)}")
+    print(f"  Warnings: {len(warnings)}")
+    for msg in errors:
+        print(f"  ERROR: {msg}")
+    for msg in warnings:
+        print(f"  WARN:  {msg}")
+    if not errors and not warnings:
+        print("  OK — manifest is consistent with disk.")
+
+    if errors:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: create-defaults
 # ---------------------------------------------------------------------------
 
@@ -582,6 +774,11 @@ def cmd_create_defaults(args, cfg: dict) -> None:
         )
         fa.description = template.get("description")
         fa.dry_run = getattr(args, "dry_run", False)
+        fa.simulate = getattr(args, "simulate", False)
+        fa.base = None
+        fa.min_score = None
+        fa.force_include = None
+        fa.force_exclude = None
         print(f"\n{'='*60}")
         print(f"Creating default campaign: {name}")
         print(f"{'='*60}")
@@ -616,14 +813,31 @@ def main() -> None:
                           help="Score multiplier for a source (e.g. wikiart:2.0); repeatable")
     p_create.add_argument("--description", default=None,
                           help="Human-readable campaign description")
+    p_create.add_argument("--base", default=None, metavar="CAMPAIGN",
+                          help="Start from another campaign's included set (composition)")
+    p_create.add_argument("--min-score", type=float, default=None, metavar="FLOAT",
+                          help="Exclude shards with final_value_score below this threshold")
+    p_create.add_argument("--force-include", dest="force_include", action="append",
+                          default=None, metavar="SHARD_ID",
+                          help="Always include this shard regardless of strategy (repeatable)")
+    p_create.add_argument("--force-exclude", dest="force_exclude", action="append",
+                          default=None, metavar="SHARD_ID",
+                          help="Always exclude this shard regardless of strategy (repeatable)")
     p_create.add_argument("--dry-run", action="store_true",
                           help="Print manifest stats without writing to disk")
+    p_create.add_argument("--simulate", action="store_true",
+                          help="Like --dry-run but also shows disk usage and epoch time estimates")
 
     # create-defaults
     p_defaults = sub.add_parser("create-defaults",
                                  help="Create all four built-in default campaigns")
     p_defaults.add_argument("--shards", default=None, metavar="DIR")
     p_defaults.add_argument("--dry-run", action="store_true")
+    p_defaults.add_argument("--simulate", action="store_true")
+
+    # validate
+    p_val = sub.add_parser("validate", help="Check manifest integrity and shard consistency")
+    p_val.add_argument("name", help="Campaign name")
 
     # list
     sub.add_parser("list", help="List all campaigns")
@@ -658,6 +872,7 @@ def main() -> None:
         "show":            cmd_show,
         "stats":           cmd_stats,
         "diff":            cmd_diff,
+        "validate":        cmd_validate,
     }
     dispatch[args.cmd](args, cfg)
 

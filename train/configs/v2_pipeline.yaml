@@ -165,6 +165,17 @@ storage:
   # raw_pool_root omitted — raw tgzs are re-downloadable; no value storing them long-term
   converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
 
+# Shard index — SQLite cache for fast campaign manifest creation.
+# Builds a metadata database from .light_scores.json and .unified_score.json sidecars,
+# enabling campaign_manager.py to create manifests in <1s instead of scanning 1280+ sidecars.
+#
+# Build:   train/.venv/bin/python train/scripts/shard_index.py build --shards /Volumes/16TBCold/shards
+# Update:  train/.venv/bin/python train/scripts/shard_index.py update --shards /Volumes/16TBCold/shards
+# Stats:   train/.venv/bin/python train/scripts/shard_index.py stats
+shard_index:
+  enabled: true
+  path: "shard_index.db"  # relative to cold_root
+
 # Unified shard scoring — merges light scores with optional training signals.
 # Runs after score_shards_light.py; produces .unified_score.json per shard.
 # Output feeds campaign_manager.py for strategic shard selection.
@@ -223,6 +234,27 @@ campaigns:
     description: "Ranked by training difficulty — bias toward harder, less-learned shards"
     strategy: hard_focus
     top_pct: 60
+
+# --- Campaign composition examples (v3.15.0) ---
+# Composed campaigns start from a base campaign's included set, then apply
+# additional filters before the strategy runs.
+#
+# Create via CLI:
+#   python train/scripts/campaign_manager.py create wikiart_high_quality \
+#       --base large_baseline \
+#       --strategy source_boost --source-boost wikiart:2.0 \
+#       --min-score 0.55
+#
+#   python train/scripts/campaign_manager.py create ablation_journeydb_only \
+#       --base high_signal_pruned \
+#       --min-score 0.60 \
+#       --force-exclude 000042 --force-exclude 000099
+#
+# --simulate flag previews disk usage, epoch time, and score distribution:
+#   python train/scripts/campaign_manager.py create high_signal_pruned --simulate
+#
+# Validate an existing manifest (checksum + disk consistency):
+#   python train/scripts/campaign_manager.py validate large_baseline
 
 # Weight snapshot registry settings.
 # Snapshots are stored at: {cold_root}/weights/registry/

@@ -39,7 +39,7 @@ from pipeline_lib import (
     COLD_ROOT, COLD_PRECOMPUTE_DIR, COLD_WEIGHTS_DIR, COLD_METADATA_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     TMUX_ABLATION_WIN, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
-    COLD_SHARDS_DIR, CAMPAIGNS_DIR, WEIGHT_REGISTRY_DIR,
+    COLD_SHARDS_DIR, CAMPAIGNS_DIR, WEIGHT_REGISTRY_DIR, SHARD_INDEX_PATH,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -2053,6 +2053,53 @@ def _check_shard_coverage() -> None:
                   "coverage_pct": pct})
 
 
+def _check_shard_index() -> None:
+    """Report shard index health: existence, staleness, indexed count vs. pool."""
+    if not SHARD_INDEX_PATH.exists():
+        venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+        scripts = str(SCRIPTS_DIR)
+        _add("INFO", "shard_index",
+             "Shard index not built — campaign_manager will use slow directory scan",
+             detail="Building the index speeds up campaign manifest creation from ~60s to <1s.",
+             fix=(f"{venv_py} {scripts}/shard_index.py build --shards {COLD_SHARDS_DIR}"),
+             ctx={"index_path": str(SHARD_INDEX_PATH), "exists": False})
+        return
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(SHARD_INDEX_PATH))
+        n_indexed = conn.execute("SELECT COUNT(*) FROM shards").fetchone()[0]
+        n_light   = conn.execute(
+            "SELECT COUNT(*) FROM shards WHERE has_light_score=1"
+        ).fetchone()[0]
+        conn.close()
+    except Exception as e:
+        _add("WARNING", "shard_index",
+             f"Shard index unreadable: {e}",
+             fix=f"rm {SHARD_INDEX_PATH}  # then rebuild with shard_index.py build",
+             ctx={"index_path": str(SHARD_INDEX_PATH), "error": str(e)})
+        return
+
+    n_on_disk = (sum(1 for p in COLD_SHARDS_DIR.glob("*.tar")
+                     if not p.name.endswith(".tar.tmp"))
+                 if COLD_SHARDS_DIR.exists() else 0)
+
+    delta = abs(n_on_disk - n_indexed)
+    threshold = max(5, int(n_on_disk * 0.05))
+    if n_on_disk > 0 and delta > threshold:
+        venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+        scripts = str(SCRIPTS_DIR)
+        _add("WARNING", "shard_index",
+             f"Shard index may be stale: {n_indexed} indexed vs {n_on_disk} on disk",
+             detail="New shards were added (or removed) after the last index build.",
+             fix=(f"{venv_py} {scripts}/shard_index.py update --shards {COLD_SHARDS_DIR}"),
+             ctx={"n_indexed": n_indexed, "n_on_disk": n_on_disk, "delta": delta})
+    else:
+        _add("INFO", "shard_index",
+             f"Shard index: {n_indexed} shards indexed, {n_light} light-scored",
+             ctx={"n_indexed": n_indexed, "n_light_scored": n_light})
+
+
 def _check_light_scoring() -> None:
     """Report light-scoring pool health: coverage, keep/discard rates, per-source averages."""
     from pipeline_lib import COLD_SHARDS_DIR
@@ -2730,6 +2777,7 @@ def main() -> None:
         _check_ablation_health()
         _check_campaign_state()
         _check_shard_coverage()
+        _check_shard_index()
         _check_light_scoring()
         _check_unified_scoring()
         _check_campaigns()

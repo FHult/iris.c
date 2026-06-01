@@ -5,6 +5,7 @@ All pipeline scripts import from here for consistent state file I/O,
 sentinel management, structured event logging, and heartbeat handling.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -52,6 +53,7 @@ COLD_VAL_PRECOMP_DIR = COLD_VAL_DIR / "precomputed"
 COLD_SHARDS_DIR      = COLD_ROOT / "shards"   # unified shard pool (all sources)
 CAMPAIGNS_DIR        = COLD_ROOT / "campaigns"            # campaign manifests
 WEIGHT_REGISTRY_DIR  = COLD_ROOT / "weights" / "registry" # weight snapshot registry
+SHARD_INDEX_PATH     = COLD_ROOT / "shard_index.db"       # SQLite shard metadata index
 
 VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
 VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
@@ -597,6 +599,27 @@ def save_manifest(manifest: dict, path) -> None:
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
     tmp.rename(p)
+
+
+def compute_manifest_checksum(entries: list[dict]) -> str:
+    """SHA256 of the sorted (shard_id, decision) pairs in a manifest's entries list."""
+    payload = json.dumps(
+        sorted((e["shard_id"], e["decision"]) for e in entries),
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_manifest_checksum(manifest: dict) -> bool:
+    """
+    Return True if the manifest's checksum is valid.
+    Returns True unconditionally for manifests without a checksum field
+    (i.e. created before v3.15.0) to allow graceful migration.
+    """
+    stored = manifest.get("checksum")
+    if not stored:
+        return True
+    return compute_manifest_checksum(manifest.get("entries", [])) == stored
 
 
 def register_weight_snapshot(

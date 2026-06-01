@@ -118,6 +118,18 @@ def register_snapshot(
         "weights_path":              str(weights_path),
         "version":                   REGISTRY_VERSION,
     }
+
+    # Validate the weights file exists and has a non-zero size.
+    weights_p = Path(weights_path)
+    if not weights_p.exists():
+        print(f"  WARNING: weights file not found: {weights_path}")
+        snapshot["weights_file_verified"] = False
+    elif weights_p.stat().st_size == 0:
+        print(f"  WARNING: weights file is empty: {weights_path}")
+        snapshot["weights_file_verified"] = False
+    else:
+        snapshot["weights_file_size_bytes"] = weights_p.stat().st_size
+        snapshot["weights_file_verified"] = True
     if manifest_used is not None:
         snapshot["manifest_used"] = str(manifest_used)
     if shards_included is not None:
@@ -223,6 +235,13 @@ def cmd_list(args, cfg: dict) -> None:
         print(f"No snapshots in registry ({REGISTRY_DIR})")
         return
 
+    # Optional tag filter
+    if getattr(args, "tag_filter", None):
+        index = [e for e in index if args.tag_filter in e.get("tags", [])]
+        if not index:
+            print(f"No snapshots with tag '{args.tag_filter}'.")
+            return
+
     print(f"{'Snapshot ID':<40} {'Campaign':<20} {'Tags':<16} {'Val loss':>9}  {'Cond gap':>9}  Created")
     print("-" * 108)
     for e in index:
@@ -317,6 +336,49 @@ def cmd_tag(args, cfg: dict) -> None:
         sys.exit(1)
 
 
+def cmd_trend(args, cfg: dict) -> None:
+    """
+    Show metric progression across all snapshots in chronological order.
+    Useful for tracking training quality across experiments and campaigns.
+    """
+    index = _read_index()
+    if not index:
+        print(f"No snapshots in registry ({REGISTRY_DIR})")
+        return
+
+    sorted_snaps = sorted(index, key=lambda e: e.get("timestamp", ""))
+
+    print(f"{'#':<4} {'Snapshot ID':<38} {'Campaign':<20} "
+          f"{'Val loss':>9}  {'Δ loss':>8}  {'Cond gap':>9}")
+    print("-" * 96)
+
+    prev_val_loss: Optional[float] = None
+    for i, e in enumerate(sorted_snaps, 1):
+        val_loss = e.get("val_loss")
+        cond_gap = e.get("cond_gap")
+        vl_str   = f"{val_loss:.4f}" if val_loss is not None else "—"
+        cg_str   = f"{cond_gap:.4f}" if cond_gap is not None else "—"
+        if val_loss is not None and prev_val_loss is not None:
+            delta = val_loss - prev_val_loss
+            dl_str = f"{delta:+.4f}"
+        else:
+            dl_str = ""
+        tags_str = ",".join(e.get("tags", []))[:10]
+        label = e["snapshot_id"]
+        if tags_str:
+            label = f"{label} [{tags_str}]"
+        print(f"{i:<4} {label:<38} {e.get('campaign',''):<20} "
+              f"{vl_str:>9}  {dl_str:>8}  {cg_str:>9}")
+        if val_loss is not None:
+            prev_val_loss = val_loss
+
+    if len(sorted_snaps) > 1:
+        first = next((e["val_loss"] for e in sorted_snaps if e.get("val_loss") is not None), None)
+        last  = next((e["val_loss"] for e in reversed(sorted_snaps) if e.get("val_loss") is not None), None)
+        if first is not None and last is not None and first != last:
+            print(f"\n  Overall: {first:.4f} → {last:.4f}  ({last - first:+.4f})")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -350,7 +412,9 @@ def main() -> None:
                         metavar="TAG", help="Tag (repeatable)")
 
     # list
-    sub.add_parser("list", help="List all snapshots")
+    p_list = sub.add_parser("list", help="List all snapshots")
+    p_list.add_argument("--tag", dest="tag_filter", default=None, metavar="TAG",
+                        help="Filter to snapshots with this tag")
 
     # show
     p_show = sub.add_parser("show", help="Show snapshot details")
@@ -366,6 +430,9 @@ def main() -> None:
     p_tag.add_argument("snapshot_id")
     p_tag.add_argument("tag")
 
+    # trend
+    sub.add_parser("trend", help="Show metric progression across all snapshots (chronological)")
+
     args = parser.parse_args()
     cfg = load_config(args.config)
 
@@ -375,6 +442,7 @@ def main() -> None:
         "show":     cmd_show,
         "compare":  cmd_compare,
         "tag":      cmd_tag,
+        "trend":    cmd_trend,
     }
     dispatch[args.cmd](args, cfg)
 
