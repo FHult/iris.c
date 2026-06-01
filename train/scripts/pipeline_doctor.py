@@ -1965,24 +1965,20 @@ def _check_light_scoring() -> None:
                   "n_keep": n_keep, "n_discard": n_discard, "keep_pct": keep_pct})
 
     # Per-source averages
-    per_source_ctx = {}
     for src, entry in sorted(by_source.items()):
         sc = entry["scores"]
         avg = lambda key: round(sum(s[key] for s in sc) / len(sc), 3) if sc else 0.0
         n   = entry["keep"] + entry["discard"]
         kp  = round(100 * entry["keep"] / n, 1) if n else 0.0
-        per_source_ctx[src] = {
-            "n": n, "keep_pct": kp,
-            "avg_combined": avg("combined"), "avg_clip": avg("clip"),
-            "avg_aesthetic": avg("aesthetic"), "avg_sharpness": avg("sharpness"),
-            "avg_caption": avg("caption"),
-        }
         _add("INFO", "light_scoring",
              f"  {src}: {n} shards, {kp}% keep — "
              f"combined={avg('combined'):.3f}  clip={avg('clip'):.3f}  "
              f"aesth={avg('aesthetic'):.3f}  sharp={avg('sharpness'):.3f}  "
              f"cap={avg('caption'):.3f}",
-             ctx=per_source_ctx[src])
+             ctx={"n": n, "keep_pct": kp,
+                  "avg_combined": avg("combined"), "avg_clip": avg("clip"),
+                  "avg_aesthetic": avg("aesthetic"), "avg_sharpness": avg("sharpness"),
+                  "avg_caption": avg("caption")})
 
     # Threshold recommendation: if keep rate is very high or very low, flag it
     if n_discard > 0 and keep_pct < 50:

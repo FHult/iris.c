@@ -975,8 +975,7 @@ def main():
                   f"({len(shards)} of {n_before} kept for precompute)", flush=True)
         elif n_before > 0:
             # Count sidecars to distinguish "all scored+kept" from "unscored=default keep"
-            import glob as _glob
-            n_sidecars = len(_glob.glob(
+            n_sidecars = len(glob.glob(
                 os.path.join(args.shards, "*.light_scores.json")))
             if n_sidecars == 0:
                 print(f"  Light scores: no sidecars found — run score_shards_light.py first "
