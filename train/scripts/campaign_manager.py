@@ -255,7 +255,7 @@ def _top_pct_loss(entries: list, pct: float) -> frozenset:
     return frozenset(e["shard_id"] for e in ranked[:cutoff])
 
 
-_BUILTIN_NOARG: dict[str, any] = {
+_BUILTIN_NOARG: dict = {
     "keep":       lambda entries: frozenset(
                       e["shard_id"] for e in entries
                       if e.get("light_decision", "keep") != "discard"),
@@ -359,9 +359,9 @@ class _Evaluator:
             if prefix.lower() == "source":
                 return frozenset(e["shard_id"] for e in self._entries
                                  if e["source"].lower() == rest.lower())
-        # no-arg built-ins
-        if name in _BUILTIN_NOARG:
-            return frozenset(_BUILTIN_NOARG[name](self._entries))
+        # no-arg built-ins — normalise to lowercase so KEEP, Keep, keep all work
+        if name.lower() in _BUILTIN_NOARG:
+            return frozenset(_BUILTIN_NOARG[name.lower()](self._entries))
         # campaign reference
         return self._load_campaign(name)
 
@@ -1055,7 +1055,6 @@ def cmd_validate(args, cfg: dict) -> None:
     expression = m.get("expression")
     if expression:
         try:
-            _eval_expression.__module__  # ensure engine is loaded
             _Parser(_tokenize(expression)).parse()
         except ValueError as exc:
             errors.append(f"Expression syntax error: {exc}")

@@ -1648,6 +1648,7 @@ def _check_unified_scoring() -> None:
         try:
             _f = _np.load(str(diversity_cache), allow_pickle=True)
             n_div = len(_f["shard_ids"]) if "shard_ids" in _f else 0
+            _f.close()
             _add("INFO", "unified_scoring",
                  f"Embedding diversity cache: {n_div:,} shard centroids cached "
                  f"({diversity_cache.stat().st_size / 1e6:.1f} MB)",
@@ -1772,16 +1773,16 @@ def _check_campaigns() -> None:
             pct  = round(100 * n_inc / max(n_tot, 1))
             expr = m.get("expression")
             kind = f"expr={expr!r}" if expr else f"strategy={m.get('strategy','?')}"
-            # Diversity score distribution for included shards
-            div_vals = sorted(
+            # Score distribution for included shards
+            score_vals = sorted(
                 e.get("final_value_score", 0.0)
                 for e in m.get("entries", []) if e.get("decision") == "include"
             )
             score_range = ""
-            if div_vals:
-                n_d = len(div_vals)
-                score_range = (f"  scores=[{div_vals[0]:.3f}…{div_vals[n_d//2]:.3f}"
-                               f"…{div_vals[-1]:.3f}]")
+            if score_vals:
+                n_d = len(score_vals)
+                score_range = (f"  scores=[{score_vals[0]:.3f}…{score_vals[n_d//2]:.3f}"
+                               f"…{score_vals[-1]:.3f}]")
             _add("INFO", "campaigns",
                  f"Campaign '{name}': {n_inc:,}/{n_tot:,} shards ({pct}%)  "
                  f"avg_score={avg_s:.4f}  {kind}  created={created[:10]}"

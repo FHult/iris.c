@@ -104,7 +104,10 @@ def _open_db(path: Path = INDEX_PATH, create: bool = True) -> sqlite3.Connection
     if create:
         conn.executescript(_SCHEMA)
         conn.commit()
-        _migrate_schema(conn)
+    # Always migrate — idempotent for new DBs, adds missing columns to old ones.
+    # Must run even on create=False paths (query_all, cmd_stats) so that SELECT
+    # statements referencing new columns don't fail on pre-v3.16.0 databases.
+    _migrate_schema(conn)
     return conn
 
 
