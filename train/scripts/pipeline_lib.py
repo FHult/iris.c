@@ -604,7 +604,7 @@ def register_weight_snapshot(
     campaign: str,
     weights_path: str,
     **kwargs,
-) -> "Path":
+) -> Path:
     """
     Register a weight snapshot in the registry.
 

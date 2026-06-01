@@ -108,34 +108,40 @@ def _load_shard_scores(shards_dir: Path) -> list[dict]:
             "final_value_score":       0.0,
             "light_score":             0.0,
             "training_loss_normalized": None,
-            "decision":               "unknown",
+            # light_decision: the original keep/discard from score_shards_light.py.
+            # Stored separately so _apply_strategy() can read it after resetting "decision".
+            "light_decision":         "unknown",
             "has_unified":            has_unified,
         }
 
-        if has_unified:
+        # Always read the light score sidecar first to capture the keep/discard decision.
+        if light_p.exists():
             try:
-                data = json.loads(unified_p.read_text())
-                entry["source"]                   = data.get("source", "unknown")
-                entry["final_value_score"]        = float(data.get("final_value_score", 0.0))
-                entry["light_score"]              = float(data.get("light_score", 0.0))
-                entry["training_loss_normalized"] = data.get("training_loss_normalized")
-            except (OSError, json.JSONDecodeError):
-                pass
-        elif light_p.exists():
-            try:
-                data = json.loads(light_p.read_text())
-                scores = data.get("light_scores", {})
-                entry["source"]            = data.get("source", "unknown")
-                entry["final_value_score"] = float(scores.get("combined_score", 0.0))
-                entry["light_score"]       = float(scores.get("combined_score", 0.0))
-                # Use light score decision as proxy when no unified score
-                entry["decision"] = data.get("decision", "unknown")
+                ld = json.loads(light_p.read_text())
+                scores = ld.get("light_scores", {})
+                entry["source"]         = ld.get("source", "unknown")
+                entry["light_score"]    = float(scores.get("combined_score", 0.0))
+                entry["light_decision"] = ld.get("decision", "unknown")
+                if not has_unified:
+                    entry["final_value_score"] = entry["light_score"]
             except (OSError, json.JSONDecodeError):
                 pass
 
-        # When unified score present, decision is always "include" (filter happens at strategy)
+        # Prefer unified score for final_value_score when present.
         if has_unified:
-            entry["decision"] = "scored"
+            try:
+                data = json.loads(unified_p.read_text())
+                entry["source"]                   = data.get("source", entry["source"])
+                entry["final_value_score"]        = float(data.get("final_value_score", 0.0))
+                entry["light_score"]              = float(data.get("light_score", entry["light_score"]))
+                entry["training_loss_normalized"] = data.get("training_loss_normalized")
+                # light_decision is already populated from the light sidecar above.
+                # If the light sidecar was missing, default to "keep" — unified scores are only
+                # written after light scoring, so the shard was at minimum not explicitly rejected.
+                if entry["light_decision"] == "unknown":
+                    entry["light_decision"] = "keep"
+            except (OSError, json.JSONDecodeError):
+                pass
 
         entries.append(entry)
 
@@ -158,12 +164,10 @@ def _apply_strategy(entries: list[dict], strategy: str, params: dict) -> list[di
         e["decision"] = "exclude"
 
     if strategy == "all_keep":
-        # Include all shards that passed the light score filter
+        # Include all shards whose light scorer said "keep".
+        # "unknown" shards (no sidecar) are treated as keep (default-allow).
         for e in entries:
-            src_decision = e.get("decision")
-            # When unified score is present (decision="scored"), include all
-            # When only light score, use its keep/discard decision
-            if e["has_unified"] or src_decision not in ("discard",):
+            if e.get("light_decision", "keep") != "discard":
                 e["decision"] = "include"
 
     elif strategy == "top_pct":

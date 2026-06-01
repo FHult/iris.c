@@ -165,17 +165,6 @@ storage:
   # raw_pool_root omitted — raw tgzs are re-downloadable; no value storing them long-term
   converted_pool_root: "/Volumes/16TBCold/converted/journeydb"  # converted tars persisted; skip download+convert on hit
 
-# Precompute shard cap per scale: large/all-in produce many more shards than needed
-# for training; cap precompute so disk and wall-clock stay bounded.
-# null (or omitted) = precompute all available shards.
-# Lightweight quality scoring — runs after shard building, before precompute.
-# Shards with combined_score < threshold are flagged decision=discard and
-# skipped by precompute_all.py to save Qwen3 + VAE + SigLIP time.
-#
-# To run:
-#   train/.venv/bin/python train/scripts/score_shards_light.py \
-#       --shards /Volumes/16TBCold/shards \
-#       --config train/configs/v2_pipeline.yaml
 # Unified shard scoring — merges light scores with optional training signals.
 # Runs after score_shards_light.py; produces .unified_score.json per shard.
 # Output feeds campaign_manager.py for strategic shard selection.
@@ -244,6 +233,14 @@ weight_registry:
   enabled: true
   registry_dir: "weights/registry"  # relative to cold_root
 
+# Lightweight quality scoring — runs after shard building, before precompute.
+# Shards with combined_score < threshold are flagged decision=discard and
+# skipped by precompute_all.py to save Qwen3 + VAE + SigLIP time.
+#
+# To run:
+#   train/.venv/bin/python train/scripts/score_shards_light.py \
+#       --shards /Volumes/16TBCold/shards \
+#       --config train/configs/v2_pipeline.yaml
 light_scoring:
   enabled: true
   # Global fallback threshold (per-source entries below take precedence)
