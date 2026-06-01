@@ -25,9 +25,13 @@ flywheel:
 
   base_checkpoint: null      # start fresh; or set to sref-v1 best checkpoint path
 
-  # Online encoding: no precomputed qwen3/VAE/SigLIP caches yet.
-  # Switch to stage1_512px.yaml once precompute_all.py has been run.
-  training_config: "train/configs/stage1_512px_online.yaml"
+  # Flywheel now auto-runs precompute_all.py over the shards *it selects for this iteration*
+  # (writing to a per-iter precomputed/ tree under the staging dir, then overrides the
+  # cache dirs in the temp training config). This gives efficient cached training
+  # (Flux+adapter only) instead of live per-step encoding, while still bootstrapping
+  # on a cold pool. Any produced caches are left in the iter staging dir (and can be
+  # manually promoted/copied to cold precomputed/ for future runs).
+  training_config: "train/configs/stage1_512px.yaml"
 
   # Cold shard pool — flywheel stages selected shards as symlinks each iteration.
   shards_dir: "/Volumes/16TBCold/shards"

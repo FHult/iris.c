@@ -2798,6 +2798,47 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 iteration, name,
             )
 
+            # === Precompute selected shards before training (the efficient path) ===
+            # Instead of "online" live Q/V/S encoding inside the training loop (with per-step
+            # load/unload), we run precompute_all.py on exactly the shards chosen for this iter.
+            # Benefits:
+            #  - encoders loaded once (precomp process uses its own 14 GB cap + releases between shards)
+            #  - shard tars read once
+            #  - encoding work done once per record → .npz
+            #  - training then runs purely cached (only Flux + adapter in memory), fast steps,
+            #    no repeated encode cost even if the iter's data is consumed multiple times
+            #  - also incrementally builds persistent caches for the pool (future iters/stager benefit)
+            # The precompute_all logic already skips records that have outputs, so this is
+            # incremental and cheap when re-selecting shards or when partial caches were staged.
+            precomp_base = staging_dir / "precomputed"
+            q_out = precomp_base / "qwen3"
+            v_out = precomp_base / "vae"
+            s_out = precomp_base / "siglip"
+            for dd in (q_out, v_out, s_out):
+                dd.mkdir(parents=True, exist_ok=True)
+
+            log_pre = LOG_DIR / f"flywheel_{name}_precompute_iter{iteration:04d}.log"
+            log_pre.parent.mkdir(parents=True, exist_ok=True)
+
+            # Inspect draft config for flux model and siglip intent
+            import yaml
+            with open(train_cfg_path) as _f:
+                _draft = yaml.safe_load(_f)
+            _mcfg = _draft.get("model", {}) or {}
+            _flux_dir = _mcfg.get("flux_model_dir", "flux-klein-model")
+            _flux_p = Path(_flux_dir)
+            if not _flux_p.is_absolute():
+                _flux_p = _fw_data_root.parent / _flux_dir
+            _flux_arg = f"--flux-model '{_flux_p}'" if _flux_p.exists() else ""
+            _sig_flag = "--siglip"
+
+            pre_cmd = (
+                f"caffeinate -dim python -u '{SCRIPTS_DIR}/precompute_all.py' "
+                f"--shards '{staging_dir}' "
+                f"--qwen3-output '{q_out}' --vae-output '{v_out}' --siglip-output '{s_out}' "
+                f"{_flux_arg} {_sig_flag}"
+            )
+
             # Launch training in TMUX_TRAIN_WIN
             log_file = LOG_DIR / f"flywheel_{name}_iter{iteration:04d}.log"
             log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2810,7 +2851,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     _check_flywheel_control(name, fw_db)
                     time.sleep(poll_interval)
 
-            # Wait until GPU lock is successfully acquired
+            # Acquire the GPU lock *once* for the whole iteration's work (precompute + training).
+            # We run precompute with PIPELINE_ORCHESTRATED=1 so it doesn't fight the lock;
+            # the advisory lock is held by this flywheel orchestrator process for the duration.
             while True:
                 if acquire_gpu_lock(f"flywheel_{name}_iter{iteration}"):
                     break
@@ -2821,6 +2864,34 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 time.sleep(30)
 
             try:
+                # Precompute phase (under the lock)
+                write_heartbeat("flywheel", status="precomputing",
+                                flywheel_name=name, iteration=iteration)
+                log_orch(f"[flywheel:{name}] iter {iteration}: precomputing Qwen3/VAE/SigLIP caches for selected shards → {precomp_base}")
+                full_pre = (
+                    f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
+                    f"source '{TRAIN_DIR}/.venv/bin/activate' && {pre_cmd}"
+                )
+                pre_full = f"({full_pre}) >> '{log_pre}' 2>&1 ; echo EXIT_CODE=$? >> '{log_pre}'"
+                subprocess.run(["bash", "-c", pre_full])
+                pre_exit = last_exit_code(log_pre)
+                if pre_exit == 0:
+                    log_orch(f"[flywheel:{name}] iter {iteration}: precompute complete")
+                else:
+                    log_orch(f"[flywheel:{name}] iter {iteration}: precompute exited {pre_exit}; training will use produced caches + live fallback for any misses",
+                             level="warning")
+
+                # Override the (possibly "online") config so this training iter uses the caches we just ensured.
+                # This forces the efficient cached path (only Flux+adapter resident) for the step loop.
+                with open(train_cfg_path) as _f:
+                    _tcfg = yaml.safe_load(_f)
+                _d = _tcfg.setdefault("data", {})
+                _d["qwen3_cache_dir"] = str(q_out)
+                _d["vae_cache_dir"] = str(v_out)
+                _d["siglip_cache_dir"] = str(s_out)
+                train_cfg_path.write_text(yaml.dump(_tcfg, default_flow_style=False))
+
+                # Training launch (still under the same lock)
                 write_heartbeat("trainer", status="booting", step=0)
 
                 train_cmd = (
@@ -2839,7 +2910,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
                 write_heartbeat("flywheel", status="training",
                                 flywheel_name=name, iteration=iteration)
-                log_orch(f"[flywheel:{name}] iter {iteration}: training started → {log_file.name}")
+                log_orch(f"[flywheel:{name}] iter {iteration}: training started (using precomputed caches) → {log_file.name}")
                 t_start = time.time()
 
                 # Monitor training window

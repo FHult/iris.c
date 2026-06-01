@@ -2,8 +2,12 @@
 # Stage 1 training — 512px, online encoding (no precomputed caches).
 #
 # All three encoder caches are null so qwen3, VAE, and SigLIP are computed
-# at runtime.  ~380ms extra per step vs. the cached path; used for flywheel
-# warmup runs before precompute_all.py has been run on the shard pool.
+# at runtime.  ~380ms extra per step vs. the cached path.
+#
+# This is mainly for manual/one-off runs or testing before any precompute.
+# The flywheel now prefers to run precompute_all on its selected shards first
+# (see _run_flywheel_loop) and forces cached training even if this config is
+# referenced, for much better efficiency (encodes once, train with low memory).
 #
 # Inherits all other settings from stage1_512px.yaml except the cache dirs.
 
