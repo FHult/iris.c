@@ -68,8 +68,8 @@ VERSION = "v1"
 SAMPLE_N = 256          # images sampled per shard (enough for stable statistics)
 BATCH_SIZE = 32         # images per GPU forward pass
 AESTHETIC_WEIGHTS_URL = (
-    "https://huggingface.co/laion/aesthetics_predictor_v2_linear"
-    "/resolve/main/linear.pth"
+    "https://github.com/LAION-AI/aesthetic-predictor"
+    "/raw/main/sa_0_4_vit_l_14_linear.pth"
 )
 AESTHETIC_CACHE_PATH = Path.home() / ".cache" / "iris_pipeline" / "aesthetic_v2_linear.pth"
 
