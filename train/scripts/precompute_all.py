@@ -887,6 +887,10 @@ def main():
                              "directory. Shard coverage is detected from npz filenames "
                              "(format: SHARDID_RECID.npz). Use to align siglip with an "
                              "existing qwen3 or vae run instead of a new random selection.")
+    parser.add_argument("--skip-light-scores", action="store_true",
+                        help="Ignore .light_scores.json sidecars and precompute all shards "
+                             "regardless of their keep/discard decision. Default: shards with "
+                             "decision=discard are skipped to save compute.")
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--ai", action="store_true",
@@ -956,6 +960,31 @@ def main():
     shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if not shards:
         print(f"No .tar files in {args.shards} — nothing to precompute.", flush=True)
+        sys.exit(0)
+
+    # Filter out shards flagged as low-quality by score_shards_light.py.
+    # Shards without a sidecar are treated as "keep" so that an unscored pool
+    # is not silently blocked.  Use --skip-light-scores to disable.
+    if not args.skip_light_scores:
+        from pipeline_lib import should_precompute as _should_precompute
+        n_before = len(shards)
+        shards = [s for s in shards if _should_precompute(s, default=True)]
+        n_skipped = n_before - len(shards)
+        if n_skipped:
+            print(f"  Light scores: skipping {n_skipped} discard-flagged shards "
+                  f"({len(shards)} of {n_before} kept for precompute)", flush=True)
+        elif n_before > 0:
+            # Check if any sidecars exist at all to give a useful diagnostic
+            from pipeline_lib import get_light_score as _get_light_score
+            if _get_light_score(shards[0]) is not None:
+                print(f"  Light scores: all {n_before} shards passed quality filter",
+                      flush=True)
+            else:
+                print(f"  Light scores: no sidecars found — run score_shards_light.py first "
+                      f"(or pass --skip-light-scores to suppress this hint)", flush=True)
+
+    if not shards:
+        print("All shards were filtered by light scores — nothing to precompute.", flush=True)
         sys.exit(0)
 
     if args.match_dir is not None:

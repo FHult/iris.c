@@ -42,13 +42,14 @@ CONVERTED_POOL_DIR = DATA_ROOT / "converted" / "journeydb"
 # HuggingFace cache lives on cold storage; ~/.cache/huggingface symlinks here.
 HF_CACHE_DIR = Path("/Volumes/16TBCold/hf_cache")
 # Cold storage knowledge base (canonical volume; also readable from config storage.cold_root).
-COLD_ROOT           = Path("/Volumes/16TBCold")
-COLD_PRECOMPUTE_DIR = COLD_ROOT / "precomputed"
-COLD_WEIGHTS_DIR    = COLD_ROOT / "weights"
-COLD_METADATA_DIR   = COLD_ROOT / "metadata"
-COLD_VAL_DIR        = COLD_ROOT / "validation"
-COLD_VAL_SHARDS_DIR = COLD_VAL_DIR / "held_out"
+COLD_ROOT            = Path("/Volumes/16TBCold")
+COLD_PRECOMPUTE_DIR  = COLD_ROOT / "precomputed"
+COLD_WEIGHTS_DIR     = COLD_ROOT / "weights"
+COLD_METADATA_DIR    = COLD_ROOT / "metadata"
+COLD_VAL_DIR         = COLD_ROOT / "validation"
+COLD_VAL_SHARDS_DIR  = COLD_VAL_DIR / "held_out"
 COLD_VAL_PRECOMP_DIR = COLD_VAL_DIR / "precomputed"
+COLD_SHARDS_DIR      = COLD_ROOT / "shards"   # unified shard pool (all sources)
 
 VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
 VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
@@ -535,6 +536,41 @@ def release_gpu_lock() -> None:
             GPU_LOCK_FILE.unlink()
     except (ValueError, OSError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Light-scoring sidecar helpers
+# ---------------------------------------------------------------------------
+
+def get_light_score(shard_path: str) -> Optional[dict]:
+    """Read the .light_scores.json sidecar for a shard. Returns None if absent or unreadable."""
+    p = Path(shard_path).with_suffix(".light_scores.json")
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def get_combined_score(shard_path: str) -> Optional[float]:
+    """Return the combined_score from the light-scoring sidecar, or None if not scored."""
+    data = get_light_score(shard_path)
+    if data is None:
+        return None
+    return data.get("light_scores", {}).get("combined_score")
+
+
+def should_precompute(shard_path: str, default: bool = True) -> bool:
+    """
+    Return True if a shard should be precomputed.
+    Returns `default` when no sidecar exists (shard not yet scored — don't skip it).
+    Returns False only when the sidecar explicitly sets decision == "discard".
+    """
+    data = get_light_score(shard_path)
+    if data is None:
+        return default
+    return data.get("decision", "keep") != "discard"
 
 
 # ---------------------------------------------------------------------------

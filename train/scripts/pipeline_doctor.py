@@ -1890,6 +1890,128 @@ def _check_shard_coverage() -> None:
                   "coverage_pct": pct})
 
 
+def _check_light_scoring() -> None:
+    """Report light-scoring pool health: coverage, keep/discard rates, per-source averages."""
+    from pipeline_lib import COLD_SHARDS_DIR
+    shards_dir = COLD_SHARDS_DIR
+    if not shards_dir.exists():
+        return
+
+    sidecars = sorted(shards_dir.glob("*.light_scores.json"))
+    total_shards = sum(1 for _ in shards_dir.glob("*.tar"))
+    if total_shards == 0:
+        return
+
+    n_scored  = len(sidecars)
+    n_pending = total_shards - n_scored
+
+    if n_scored == 0:
+        venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+        scripts  = str(SCRIPTS_DIR)
+        _add("INFO", "light_scoring",
+             f"Light scoring not yet run: {total_shards} shards unscored",
+             detail="Run score_shards_light.py to score the shard pool before precompute. "
+                    "This filters low-quality shards and saves significant precompute time.",
+             fix=(f"caffeinate -i {venv_py} {scripts}/score_shards_light.py "
+                  f"--shards {shards_dir}"),
+             ctx={"total_shards": total_shards, "scored": 0})
+        return
+
+    # Aggregate per-source stats
+    by_source: dict = {}      # source → {keep, discard, scores_list}
+    n_keep = n_discard = 0
+    low_scorers: list = []    # (combined_score, shard_id, source) for bottom-10 report
+
+    for p in sidecars:
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        src     = data.get("source", "unknown")
+        dec     = data.get("decision", "keep")
+        scores  = data.get("light_scores", {})
+        combined = scores.get("combined_score", 0.0)
+
+        entry = by_source.setdefault(src, {"keep": 0, "discard": 0, "scores": []})
+        entry["scores"].append({
+            "combined":   combined,
+            "clip":       scores.get("clip_alignment_avg", 0.0),
+            "aesthetic":  scores.get("aesthetic_avg", 0.0),
+            "sharpness":  scores.get("blur_avg", 0.0),
+            "caption":    scores.get("caption_quality", 0.0),
+        })
+        if dec == "keep":
+            entry["keep"]   += 1
+            n_keep           += 1
+        else:
+            entry["discard"] += 1
+            n_discard        += 1
+            low_scorers.append((combined, data.get("shard_id", p.stem), src))
+
+    # Coverage
+    cov_pct = round(100 * n_scored / total_shards, 1)
+    keep_pct = round(100 * n_keep / n_scored, 1) if n_scored else 0.0
+
+    if cov_pct < 100:
+        _add("INFO", "light_scoring",
+             f"Light scoring in progress: {n_scored}/{total_shards} shards scored "
+             f"({cov_pct}%)",
+             ctx={"total_shards": total_shards, "scored": n_scored,
+                  "coverage_pct": cov_pct})
+    else:
+        _add("INFO", "light_scoring",
+             f"Light scoring complete: {n_scored} shards — "
+             f"{n_keep} keep ({keep_pct}%), {n_discard} discard",
+             ctx={"total_shards": total_shards, "scored": n_scored,
+                  "n_keep": n_keep, "n_discard": n_discard, "keep_pct": keep_pct})
+
+    # Per-source averages
+    per_source_ctx = {}
+    for src, entry in sorted(by_source.items()):
+        sc = entry["scores"]
+        avg = lambda key: round(sum(s[key] for s in sc) / len(sc), 3) if sc else 0.0
+        n   = entry["keep"] + entry["discard"]
+        kp  = round(100 * entry["keep"] / n, 1) if n else 0.0
+        per_source_ctx[src] = {
+            "n": n, "keep_pct": kp,
+            "avg_combined": avg("combined"), "avg_clip": avg("clip"),
+            "avg_aesthetic": avg("aesthetic"), "avg_sharpness": avg("sharpness"),
+            "avg_caption": avg("caption"),
+        }
+        _add("INFO", "light_scoring",
+             f"  {src}: {n} shards, {kp}% keep — "
+             f"combined={avg('combined'):.3f}  clip={avg('clip'):.3f}  "
+             f"aesth={avg('aesthetic'):.3f}  sharp={avg('sharpness'):.3f}  "
+             f"cap={avg('caption'):.3f}",
+             ctx=per_source_ctx[src])
+
+    # Threshold recommendation: if keep rate is very high or very low, flag it
+    if n_discard > 0 and keep_pct < 50:
+        _add("WARNING", "light_scoring",
+             f"Light scoring discarding {100 - keep_pct:.0f}% of shards — "
+             "threshold may be too strict",
+             detail="More than half the shard pool is being rejected. "
+                    "Consider lowering light_scoring.default_threshold in v2_pipeline.yaml "
+                    "or running with --threshold 0.35.",
+             ctx={"keep_pct": keep_pct, "n_discard": n_discard})
+    elif n_discard == 0 and n_scored >= 10:
+        _add("INFO", "light_scoring",
+             "All scored shards pass the quality threshold — threshold may be too lenient",
+             detail="No shards have been discarded. If data quality is a concern, "
+                    "consider raising light_scoring.default_threshold in v2_pipeline.yaml.",
+             ctx={"keep_pct": 100.0})
+
+    # Lowest-scoring shards (bottom 10 of discarded)
+    if low_scorers:
+        low_scorers.sort()
+        bottom = low_scorers[:10]
+        names  = ", ".join(f"{sid}({src}):{score:.3f}" for score, sid, src in bottom)
+        _add("INFO", "light_scoring",
+             f"Lowest-scoring discarded shards (review manually): {names}",
+             ctx={"bottom_shards": [{"shard": s, "source": src, "score": sc}
+                                    for sc, s, src in bottom]})
+
+
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     """Build compact machine-readable pipeline health summary for --ai mode."""
     scale = cfg.get("scale", "small")
@@ -2450,6 +2572,7 @@ def main() -> None:
         _check_ablation_health()
         _check_campaign_state()
         _check_shard_coverage()
+        _check_light_scoring()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)

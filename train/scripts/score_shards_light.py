@@ -521,6 +521,12 @@ def main() -> None:
         "--threshold", type=float, default=None,
         help="Override combined-score threshold for all sources"
     )
+    parser.add_argument(
+        "--config", default=None, metavar="PATH",
+        help="Pipeline YAML config (train/configs/v2_pipeline.yaml). Loads "
+             "light_scoring.thresholds_per_source, .default_threshold, and .weights "
+             "— command-line --threshold takes precedence over config values."
+    )
     args = parser.parse_args()
 
     import torch  # type: ignore
@@ -534,7 +540,33 @@ def main() -> None:
     else:
         device = "cpu"
 
-    # Apply threshold override
+    # Load config-driven thresholds/weights (before CLI override so --threshold wins)
+    if args.config:
+        try:
+            import yaml  # type: ignore
+            with open(args.config) as _f:
+                _cfg = yaml.safe_load(_f)
+            _ls = _cfg.get("light_scoring", {})
+            if _ls.get("default_threshold") is not None:
+                for _k in SOURCE_THRESHOLDS:
+                    SOURCE_THRESHOLDS[_k] = float(_ls["default_threshold"])
+            for _src, _t in _ls.get("thresholds_per_source", {}).items():
+                SOURCE_THRESHOLDS[_src] = float(_t)
+            _wc = _ls.get("weights", {})
+            if _wc:
+                _w = (
+                    float(_wc.get("clip_alignment", SOURCE_WEIGHTS["unknown"][0])),
+                    float(_wc.get("aesthetic",      SOURCE_WEIGHTS["unknown"][1])),
+                    float(_wc.get("blur",           SOURCE_WEIGHTS["unknown"][2])),
+                    float(_wc.get("caption_quality",SOURCE_WEIGHTS["unknown"][3])),
+                )
+                for _k in SOURCE_WEIGHTS:
+                    SOURCE_WEIGHTS[_k] = _w
+            print(f"  Config: loaded light_scoring from {args.config}")
+        except Exception as _e:
+            print(f"  WARNING: could not load --config {args.config}: {_e}")
+
+    # CLI --threshold overrides everything (applied last)
     if args.threshold is not None:
         for k in SOURCE_THRESHOLDS:
             SOURCE_THRESHOLDS[k] = args.threshold

@@ -168,6 +168,30 @@ storage:
 # Precompute shard cap per scale: large/all-in produce many more shards than needed
 # for training; cap precompute so disk and wall-clock stay bounded.
 # null (or omitted) = precompute all available shards.
+# Lightweight quality scoring — runs after shard building, before precompute.
+# Shards with combined_score < threshold are flagged decision=discard and
+# skipped by precompute_all.py to save Qwen3 + VAE + SigLIP time.
+#
+# To run:
+#   train/.venv/bin/python train/scripts/score_shards_light.py \
+#       --shards /Volumes/16TBCold/shards \
+#       --config train/configs/v2_pipeline.yaml
+light_scoring:
+  enabled: true
+  # Global fallback threshold (per-source entries below take precedence)
+  default_threshold: 0.40
+  thresholds_per_source:
+    journeydb: 0.42   # AI-generated art — stricter on aesthetic
+    laion:     0.38   # noisy web data — lenient
+    coyo:      0.38
+    wikiart:   0.40   # traditional painting — moderate
+  # Signal weights (must sum to 1.0; applied uniformly across all sources)
+  weights:
+    clip_alignment:  0.30
+    aesthetic:       0.35
+    blur:            0.15
+    caption_quality: 0.20
+
 precompute:
   max_shards:
     large: 80
