@@ -187,6 +187,65 @@ class DataStager:
             _log("stage_error", chunk, error=msg)
             raise
 
+    def stage_iteration_shards(
+        self,
+        shard_paths: list,
+        staging_dir: "Path",
+    ) -> dict:
+        """
+        Stage a specific list of shards to staging_dir for one flywheel iteration.
+
+        Unlike stage_for_chunk() which operates on a shard ID range, this method
+        stages an arbitrary selection of shards — as used by the flywheel loop.
+
+        When cold and hot share the same device (enabled=False), creates relative
+        symlinks (zero cost) via _link_or_copy.  When cross-device, copies
+        atomically and checks that hot storage has enough headroom first.
+
+        Note on precomputed caches: precomputed npz files use per-record naming
+        ({rec_id}.npz) with no shard prefix, so we cannot determine which files
+        belong to which shard without opening the tar.  Precomputed staging for
+        flywheel iterations is therefore deferred until a shard→rec_id index is
+        available (see BACKLOG: PIPELINE-flywheel-precomp-stage).  Until then,
+        the training config should set cache dirs to null for online encoding.
+
+        Returns {shards_staged, bytes_transferred}.
+        """
+        from pathlib import Path as _Path
+        staging_dir = _Path(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        tasks: list = []
+        for path_str in shard_paths:
+            src = _Path(path_str)
+            dst = staging_dir / src.name
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            tasks.append((src, dst))
+
+        if not self._use_symlinks and tasks:
+            estimated = sum(_safe_size(src) for src, _ in tasks)
+            if not self._check_hot_space(estimated):
+                raise RuntimeError(
+                    f"Insufficient hot-storage space to stage {len(tasks)} flywheel shards "
+                    f"(~{estimated / 1e9:.1f} GB needed, margin={self.staging_margin_gb:.0f} GB)"
+                )
+
+        shards_staged = 0
+        total_bytes   = 0
+
+        def _do(src_dst):
+            nb = self._link_or_copy(*src_dst)
+            return max(0, nb)
+
+        with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
+            for fut in as_completed(pool.submit(_do, t) for t in tasks):
+                nb = fut.result()
+                shards_staged += 1
+                total_bytes   += nb
+
+        return {"shards_staged": shards_staged, "bytes_transferred": total_bytes}
+
     def archive_chunk(self, chunk: int) -> dict:
         """
         Archive hot-storage data for chunk N back to cold storage.

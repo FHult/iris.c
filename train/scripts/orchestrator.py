@@ -2645,6 +2645,13 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     shards_dir     = Path(fw_cfg.get("shards_dir", str(_fw_data_root / "shards")))
     manifest_path  = Path(fw_cfg["shard_manifest"]) if fw_cfg.get("shard_manifest") else None
 
+    # DataStager handles cold→hot staging of shards (and eventually precomputed
+    # caches) for each iteration.  pipeline_config defaults to v2_pipeline.yaml
+    # auto-detection so the storage.cold_root / hot_root settings are respected.
+    pipeline_cfg_path = fw_cfg.get("pipeline_config")
+    _pipeline_cfg = load_config(pipeline_cfg_path)
+    _stager = DataStager(_pipeline_cfg)
+
     fw_db    = FlywheelDB()
     score_db = ShardScoreDB()
 
@@ -2743,11 +2750,20 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
 
             shard_ids = [Path(p).stem for p in selected_paths]
 
-            # Stage selected shards as symlinks
+            # Stage selected shards via DataStager (copy→hot when cross-device,
+            # symlinks when same device — same logic as the V2 pipeline's chunk staging).
             staging_dir = DATA_ROOT / "flywheel_staging" / name / f"iter{iteration:04d}"
             if staging_dir.exists():
                 shutil.rmtree(staging_dir)
-            stage_shards_for_iteration(selected_paths, staging_dir)
+            try:
+                stage_summary = _stager.stage_iteration_shards(selected_paths, staging_dir)
+                log_orch(f"[flywheel:{name}] staged {stage_summary['shards_staged']} shards "
+                         f"({'copy' if _stager.enabled else 'symlink'}, "
+                         f"{stage_summary['bytes_transferred'] / 1e6:.0f} MB) → {staging_dir}")
+            except Exception as _se:
+                log_orch(f"[flywheel:{name}] staging failed: {_se} — falling back to symlinks",
+                         level="warning")
+                stage_shards_for_iteration(selected_paths, staging_dir)
 
             # Per-iteration shard report
             shard_html = render_shard_report(score_db, shard_ids, iteration, name)

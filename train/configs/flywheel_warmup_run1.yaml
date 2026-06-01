@@ -25,7 +25,12 @@ flywheel:
 
   base_checkpoint: null      # start fresh; or set to sref-v1 best checkpoint path
 
-  training_config: "train/configs/stage1_512px.yaml"
+  # Online encoding: no precomputed qwen3/VAE/SigLIP caches yet.
+  # Switch to stage1_512px.yaml once precompute_all.py has been run.
+  training_config: "train/configs/stage1_512px_online.yaml"
+
+  # Cold shard pool — flywheel stages selected shards as symlinks each iteration.
+  shards_dir: "/Volumes/16TBCold/shards"
 
   hyperparams:
     cross_ref_prob: 0.35
