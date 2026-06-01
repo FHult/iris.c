@@ -2126,7 +2126,7 @@ def _resize_images_for_siglip(images: "mx.array") -> "mx.array":
         img = imgs_np[i].transpose(1, 2, 0)                              # [H, W, 3]
         img = ((img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
         img = np.array(_PilImage.fromarray(img).resize((SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE), _PilImage.LANCZOS))
-        out[i] = img.astype(np.float32) / 127.5 - 1.0                   # back to [-1,1]
+        out[i] = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)  # HWC→CHW, [-1,1]
     return mx.array(out, dtype=mx.bfloat16)
 
 
