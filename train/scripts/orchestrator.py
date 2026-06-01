@@ -2891,6 +2891,11 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 _d["siglip_cache_dir"] = str(s_out)
                 train_cfg_path.write_text(yaml.dump(_tcfg, default_flow_style=False))
 
+                # Capture the final config (with model/data for versioning) before launch.
+                # We will use it after training to publish with proper PrecomputeCache version dirs,
+                # manifests, and current symlink update.
+                _final_train_cfg_for_publish = dict(_tcfg)
+
                 # Training launch (still under the same lock)
                 write_heartbeat("trainer", status="booting", step=0)
 
@@ -2921,6 +2926,31 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                                     flywheel_name=name, iteration=iteration)
                     if not tmux_window_exists(TMUX_TRAIN_WIN):
                         break
+
+                # Post-training publish: use PrecomputeCache + encoder_config_subset + version_hash
+                # to put the data into a proper version dir on cold, write manifest, and update
+                # the "current" symlink so this iter's precomp participates in the full versioned
+                # story (invalidation, is_complete, effective_dir, future stagings that follow current).
+                # Then rmtree the per-iter precomp (data is now durable on cold).
+                if "precomp_base" in locals() and precomp_base.exists():
+                    try:
+                        pub = _stager.publish_precomp_from_flywheel_iter(
+                            src_precomp_base=precomp_base,
+                            selected_shard_ids=shard_ids,
+                            training_cfg=_final_train_cfg_for_publish,
+                        )
+                        n = pub.get("npz_published", 0)
+                        if n > 0:
+                            mb = pub.get("bytes_transferred", 0) / 1e6
+                            log_orch(
+                                f"[flywheel:{name}] iter {iteration}: published {n} new npz "
+                                f"({mb:.1f} MB) to cold precomputed (versioned dir + current updated + rmtree'd per-iter)"
+                            )
+                    except Exception as _pub_err:
+                        log_orch(
+                            f"[flywheel:{name}] iter {iteration}: publish of precomp npz to cold (versioned) failed: {_pub_err}",
+                            level="warning",
+                        )
             finally:
                 release_gpu_lock()
                 train_cfg_path.unlink(missing_ok=True)
@@ -2936,33 +2966,6 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 f"ref_gap={metrics.get('ref_gap')}  loss={metrics.get('loss_smooth')}  "
                 f"elapsed={elapsed}s"
             )
-
-            # Post-training: copy the npz we generated for this iter's selected shards
-            # from the ephemeral per-iter precomp tree back to cold precomputed storage.
-            # This ensures the (expensive) encoder work is reusable by future flywheel
-            # iterations (via DataStager cold→hot) and by the normal chunk pipeline,
-            # exactly like the main pipeline's promote+archive flow. The per-iter
-            # precomp + this publish step means flywheel "pays once" for the encodes
-            # on the shards it touches, instead of re-paying in online mode or
-            # leaving the data trapped in a throwaway staging dir.
-            if "precomp_base" in locals() and precomp_base.exists():
-                try:
-                    pub = _stager.publish_precomp_from_flywheel_iter(
-                        src_precomp_base=precomp_base,
-                        selected_shard_ids=shard_ids,
-                    )
-                    n = pub.get("npz_published", 0)
-                    if n > 0:
-                        mb = pub.get("bytes_transferred", 0) / 1e6
-                        log_orch(
-                            f"[flywheel:{name}] iter {iteration}: published {n} new npz "
-                            f"({mb:.1f} MB) to cold precomputed (now reusable by pipeline/future iters)"
-                        )
-                except Exception as _pub_err:
-                    log_orch(
-                        f"[flywheel:{name}] iter {iteration}: publish of precomp npz to cold failed: {_pub_err}",
-                        level="warning",
-                    )
 
             # Locate the checkpoint produced by this iteration
             ckpt_path: Optional[str] = None
