@@ -277,7 +277,11 @@ def main():
                         help="Require EMA weights for scoring. Also checks for a companion "
                              "{checkpoint}.ema.safetensors file. Exits if EMA unavailable.")
     parser.add_argument("--shards",        required=True,
-                        help="Directory of unified .tar shards")
+                        help="Directory of unified .tar shards, or a campaign manifest.json "
+                             "path — eval is restricted to included shards only")
+    parser.add_argument("--manifest",      default=None, metavar="PATH",
+                        help="Campaign manifest JSON; restricts eval to included shards "
+                             "(alias: pass manifest path as --shards directly)")
     parser.add_argument("--qwen3-cache",   required=True,
                         help="Precomputed Qwen3 .npz cache dir")
     parser.add_argument("--vae-cache",     required=True,
@@ -374,9 +378,39 @@ def main():
         if existing_ids:
             print(f"  Resuming: {len(existing_ids)} records already extracted — skipping those")
 
-    # ── Collect candidate records (those with qwen3 + vae cache) ──────────────
+    # ── Resolve campaign manifest if provided ─────────────────────────────────
+    # When --manifest or a .json path is passed as --shards, restrict eval to the
+    # included shards from that campaign.  Mining from excluded/low-quality shards
+    # would extract noise samples; manifests ensure hard examples come from the
+    # same curated pool used for training.
     import glob as _glob
-    shard_paths = sorted(_glob.glob(os.path.join(args.shards, "*.tar")))
+    import json as _json
+    _manifest_source = args.manifest or (args.shards if args.shards.endswith(".json") else None)
+    _manifest_include: list[str] | None = None
+    if _manifest_source:
+        try:
+            _m = _json.loads(Path(_manifest_source).read_text())
+            _manifest_include = [
+                e["path"] for e in _m.get("entries", [])
+                if e.get("decision") == "include"
+            ]
+            _campaign = _m.get("campaign", "?")
+            print(f"  Manifest '{_campaign}': restricting eval to "
+                  f"{len(_manifest_include):,} included shards")
+            if not _manifest_include:
+                print("ERROR: manifest has no included shards.", file=sys.stderr)
+                sys.exit(1)
+            if _m.get("shards_dir"):
+                args.shards = _m["shards_dir"]
+        except (OSError, _json.JSONDecodeError, KeyError) as _e:
+            print(f"ERROR: could not read manifest {_manifest_source}: {_e}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── Collect candidate records (those with qwen3 + vae cache) ──────────────
+    if _manifest_include is not None:
+        shard_paths = sorted(_manifest_include)
+    else:
+        shard_paths = sorted(_glob.glob(os.path.join(args.shards, "*.tar")))
     if not shard_paths:
         print(f"No shards found in {args.shards}", file=sys.stderr)
         sys.exit(1)

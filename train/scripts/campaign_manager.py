@@ -203,11 +203,10 @@ def _apply_strategy(entries: list[dict], strategy: str, params: dict) -> list[di
         for e in entries:
             if e["final_value_score"] > 0.0:
                 by_source[e["source"]].append(e)
-        total_eligible = sum(len(v) for v in by_source.values())
         for src, src_entries in by_source.items():
             src_entries.sort(key=lambda x: x["final_value_score"], reverse=True)
-            # Source cap = source fraction × total_eligible × pct%
-            src_frac = len(src_entries) / max(total_eligible, 1)
+            # Take top pct% from each source independently — proportional representation
+            # is preserved because each source's natural pool fraction is unchanged.
             n_include = max(1, int(len(src_entries) * pct / 100))
             for e in src_entries[:n_include]:
                 e["decision"] = "include"

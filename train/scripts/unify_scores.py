@@ -136,7 +136,7 @@ def read_training_signals(shard_stems: list[str]) -> dict[str, dict]:
 
     result: dict[str, dict] = {}
     for row in rows:
-        stem = str(row[0])
+        raw_id = str(row[0])
         entry: dict = {}
         if "avg_loss" in wanted:
             val = row[wanted.index("avg_loss") + 1]
@@ -146,8 +146,18 @@ def read_training_signals(shard_stems: list[str]) -> dict[str, dict]:
             val = row[wanted.index("contribution_score") + 1]
             if val is not None:
                 entry["contribution"] = float(val)
-        if entry:
-            result[stem] = entry
+        if not entry:
+            continue
+        # Store under the raw DB key. Also store under the 6-digit zero-padded form
+        # used on the filesystem (e.g. "42" → "000042") so lookups by shard stem
+        # succeed regardless of whether the DB stores integers or padded strings.
+        result[raw_id] = entry
+        try:
+            padded = f"{int(raw_id):06d}"
+            if padded != raw_id:
+                result[padded] = entry
+        except ValueError:
+            pass
     return result
 
 

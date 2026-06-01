@@ -837,7 +837,12 @@ def main():
         description="Unified single-pass precompute: Qwen3 + VAE [+ SigLIP]"
     )
     parser.add_argument("--shards", required=True,
-                        help="Directory containing .tar shards")
+                        help="Directory containing .tar shards, or a campaign manifest.json "
+                             "produced by campaign_manager.py (include-list is used directly; "
+                             "--max-shards, --new-shards-first, --match-dir still apply)")
+    parser.add_argument("--manifest", default=None, metavar="PATH",
+                        help="Campaign manifest JSON (alias for --shards when a manifest path is "
+                             "passed; prefer --shards directly)")
     parser.add_argument("--qwen3-output", default="data/precomputed/qwen3",
                         help="Output dir for Qwen3 .npz files")
     parser.add_argument("--vae-output", default="data/precomputed/vae",
@@ -957,7 +962,39 @@ def main():
     if args.workers > 1:
         print(f"  Note: --workers={args.workers} ignored; GPU precompute is single-threaded.")
 
-    shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
+    # Resolve --manifest / manifest path passed as --shards.
+    # When the caller passes a campaign manifest JSON, extract its include-list instead
+    # of globbing a directory.  This lets the orchestrator and manual runs say:
+    #   precompute_all.py --shards /path/to/campaigns/large_baseline/manifest.json
+    # without needing a separate --manifest flag.
+    _manifest_shards: list[str] | None = None
+    _manifest_source = args.manifest or (args.shards if args.shards.endswith(".json") else None)
+    if _manifest_source:
+        try:
+            _m = json.loads(Path(_manifest_source).read_text())
+            _manifest_shards = [
+                e["path"] for e in _m.get("entries", [])
+                if e.get("decision") == "include"
+            ]
+            _campaign = _m.get("campaign", "?")
+            print(f"  Manifest '{_campaign}': {len(_manifest_shards):,} included shards",
+                  flush=True)
+            if not _manifest_shards:
+                print("ERROR: manifest has no included shards.", file=sys.stderr)
+                sys.exit(1)
+            # Point args.shards at the shards_dir recorded in the manifest so that
+            # --match-dir, light-score sidecar reads, and resume-state writes use
+            # the correct directory root.
+            if _m.get("shards_dir"):
+                args.shards = _m["shards_dir"]
+        except (OSError, json.JSONDecodeError, KeyError) as _e:
+            print(f"ERROR: could not read manifest {_manifest_source}: {_e}", file=sys.stderr)
+            sys.exit(1)
+
+    if _manifest_shards is not None:
+        shards = sorted(_manifest_shards)
+    else:
+        shards = sorted(glob.glob(os.path.join(args.shards, "*.tar")))
     if not shards:
         print(f"No .tar files in {args.shards} — nothing to precompute.", flush=True)
         sys.exit(0)
