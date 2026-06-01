@@ -29,10 +29,12 @@ Usage:
     python train/scripts/campaign_manager.py show large_baseline
     python train/scripts/campaign_manager.py stats
     python train/scripts/campaign_manager.py diff large_baseline high_signal_pruned
+    python train/scripts/campaign_manager.py validate large_baseline
+    python train/scripts/campaign_manager.py create wikiart_high_quality \\
+        --base large_baseline --min-score 0.55 --simulate
 """
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -42,21 +44,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import (
     now_iso, COLD_ROOT,
     load_config,
+    compute_manifest_checksum,
 )
 
 # Campaign manifests live on cold storage next to the shard pool they reference
 CAMPAIGNS_DIR = COLD_ROOT / "campaigns"
 
 MANIFEST_VERSION = "v2"
-
-
-def _compute_manifest_checksum(entries: list[dict]) -> str:
-    """SHA256 of the sorted (shard_id, decision) pairs. Detects tampering or corruption."""
-    payload = json.dumps(
-        sorted((e["shard_id"], e["decision"]) for e in entries),
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
 
 # Default pre-defined campaigns (matches v2_pipeline.yaml campaigns section)
 DEFAULT_CAMPAIGNS: dict[str, dict] = {
@@ -484,7 +478,7 @@ def cmd_create(args, cfg: dict) -> None:
     }
 
     # Checksum over shard_id + decision pairs; allows validation after the fact.
-    manifest["checksum"] = _compute_manifest_checksum(manifest["entries"])
+    manifest["checksum"] = compute_manifest_checksum(manifest["entries"])
 
     if base_campaign:
         manifest["base_campaign"] = base_campaign
@@ -713,7 +707,7 @@ def cmd_validate(args, cfg: dict) -> None:
     # Checksum verification
     stored_checksum = m.get("checksum")
     if stored_checksum:
-        computed = _compute_manifest_checksum(m.get("entries", []))
+        computed = compute_manifest_checksum(m.get("entries", []))
         if computed != stored_checksum:
             errors.append(
                 f"Checksum mismatch: stored={stored_checksum[:12]}…  "
