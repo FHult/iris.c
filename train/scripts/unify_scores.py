@@ -67,10 +67,10 @@ VERSION = "v2"
 _DIVERSITY_CACHE_VERSION = 1  # bump to invalidate all cached centroids
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "light_score":   0.50,
-    "diversity":     0.10,
+    "light_score":   0.45,
+    "diversity":     0.20,  # raised in v3.17.0: embedding diversity now production-ready
     "training_loss": 0.25,  # inverted: lower loss → higher score (more to learn)
-    "contribution":  0.15,
+    "contribution":  0.10,
 }
 
 
@@ -362,6 +362,42 @@ class DiversityCache:
         return e["intra"] if e else None
 
 
+def _compute_shard_centroid(
+    shard_path: str, siglip_dir: Path, sample_k: int
+) -> tuple[str, Optional[np.ndarray], float, float]:
+    """
+    Compute centroid + intra-diversity for one shard.
+
+    Returns (stem, centroid_or_None, intra, tar_mtime).
+    Designed to be called from a thread pool — no shared mutable state.
+    """
+    stem = Path(shard_path).stem
+    try:
+        tar_mtime = Path(shard_path).stat().st_mtime
+    except OSError:
+        tar_mtime = 0.0
+
+    vecs = _shard_siglip_vecs(Path(shard_path), siglip_dir, sample_k)
+    if not vecs:
+        return (stem, None, 0.5, tar_mtime)
+
+    mat      = np.stack(vecs)
+    centroid = mat.mean(axis=0)
+    c_norm   = float(np.linalg.norm(centroid))
+    if c_norm > 1e-8:
+        centroid = centroid / c_norm
+
+    if len(vecs) >= 2:
+        sim  = mat @ mat.T
+        K    = len(vecs)
+        mask = np.triu(np.ones((K, K), dtype=bool), k=1)
+        intra = float(np.clip(1.0 - sim[mask].mean(), 0.0, 1.0))
+    else:
+        intra = 0.5
+
+    return (stem, centroid.astype(np.float32), intra, tar_mtime)
+
+
 def build_embedding_diversity(
     all_shards: list[str],
     siglip_dir: Path,
@@ -369,6 +405,7 @@ def build_embedding_diversity(
     sample_k: int = 256,
     intra_weight: float = 0.5,
     force: bool = False,
+    n_workers: int = 8,
 ) -> dict[str, float]:
     """
     Compute combined embedding-diversity scores for all shards.
@@ -385,46 +422,53 @@ def build_embedding_diversity(
     Centroids and intra scores are cached in cache_path (an .npz file).
     Only shards whose .tar mtime is newer than the cached entry are recomputed,
     making incremental runs fast even on 3 TB pools.
+
+    Pass 1 (centroid computation) is parallelised across n_workers threads,
+    significantly reducing wall-clock time for the initial build on 1000+ shards.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     cache = DiversityCache(cache_path)
+    cache_lock = threading.Lock()
     n_computed = n_cached = n_missing = 0
 
-    # Pass 1 — per-shard centroid + intra-diversity (cache-aware)
+    # Determine which shards need (re)computation
+    stale: list[str] = []
     for shard_path in all_shards:
         stem = Path(shard_path).stem
         try:
             tar_mtime = Path(shard_path).stat().st_mtime
         except OSError:
             tar_mtime = 0.0
-
-        if not force and not cache.is_stale(stem, tar_mtime):
-            n_cached += 1
-            continue
-
-        vecs = _shard_siglip_vecs(Path(shard_path), siglip_dir, sample_k)
-        if not vecs:
-            n_missing += 1
-            continue
-
-        mat      = np.stack(vecs)              # [K, dim], already L2-normalised
-        centroid = mat.mean(axis=0)
-        c_norm   = float(np.linalg.norm(centroid))
-        if c_norm > 1e-8:
-            centroid = centroid / c_norm
-
-        if len(vecs) >= 2:
-            sim  = mat @ mat.T
-            K    = len(vecs)
-            mask = np.triu(np.ones((K, K), dtype=bool), k=1)
-            intra = float(np.clip(1.0 - sim[mask].mean(), 0.0, 1.0))
+        if force or cache.is_stale(stem, tar_mtime):
+            stale.append(shard_path)
         else:
-            intra = 0.5
+            n_cached += 1
 
-        cache.update(stem, centroid.astype(np.float32), intra, tar_mtime)
-        n_computed += 1
-        if n_computed % 50 == 0:
-            print(f"  [{n_computed} shards computed, {n_cached} from cache] ...",
-                  flush=True)
+    # Pass 1 — per-shard centroid + intra-diversity (parallel)
+    if stale:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = {
+                pool.submit(_compute_shard_centroid, s, siglip_dir, sample_k): s
+                for s in stale
+            }
+            for fut in as_completed(futs):
+                try:
+                    stem, centroid, intra, tar_mtime = fut.result()
+                except Exception as exc:
+                    shard_path = futs[fut]
+                    print(f"  WARNING: error processing {Path(shard_path).stem}: {exc}")
+                    n_missing += 1
+                    continue
+                if centroid is None:
+                    n_missing += 1
+                    continue
+                with cache_lock:
+                    cache.update(stem, centroid, intra, tar_mtime)
+                n_computed += 1
+                if n_computed % 50 == 0:
+                    print(f"  [{n_computed} computed, {n_cached} cached] ...", flush=True)
 
     if n_computed > 0:
         cache.save()
@@ -640,6 +684,7 @@ class UnifiedScorer:
         training_by_stem: dict[str, dict],
         all_shards: Optional[list[str]] = None,
         force_diversity: bool = False,
+        n_diversity_workers: int = 8,
     ) -> "UnifiedScorer":
         """
         Construct a scorer from already-loaded light and training data.
@@ -649,6 +694,7 @@ class UnifiedScorer:
           back to source-rarity.
         force_diversity: pass True to rebuild the centroid cache even for shards
           that have not changed (useful after a full --siglip re-precompute).
+        n_diversity_workers: thread-pool size for parallel centroid computation.
         """
         weights              = _load_config_weights(config_path) if config_path else dict(DEFAULT_WEIGHTS)
         source_fractions     = compute_source_fractions(light_by_stem)
@@ -660,11 +706,12 @@ class UnifiedScorer:
                 _load_embedding_diversity_config(config_path)
             if enabled and siglip_dir and siglip_dir.exists():
                 print(f"  Computing SigLIP embedding diversity "
-                      f"(siglip_dir={siglip_dir}) ...", flush=True)
+                      f"(siglip_dir={siglip_dir}, workers={n_diversity_workers}) ...",
+                      flush=True)
                 embedding_diversity_by_stem = build_embedding_diversity(
                     all_shards, siglip_dir, cache_path,
                     sample_k=sample_k, intra_weight=intra_weight,
-                    force=force_diversity,
+                    force=force_diversity, n_workers=n_diversity_workers,
                 )
                 print(f"  Embedding diversity ready for "
                       f"{len(embedding_diversity_by_stem)} shards")
@@ -733,6 +780,13 @@ def main() -> None:
     parser.add_argument("--rebuild-diversity-cache", action="store_true",
                         help="Rebuild the SigLIP centroid cache for all shards and exit "
                              "(does not write .unified sidecars)")
+    parser.add_argument("--diversity-weight", type=float, default=None, metavar="FLOAT",
+                        help="Override the diversity signal weight (e.g. 0.20); "
+                             "the remaining weight budget is redistributed proportionally "
+                             "to other signals at scoring time")
+    parser.add_argument("--diversity-workers", type=int, default=8, metavar="N",
+                        help="Thread-pool size for parallel centroid computation "
+                             "(default: 8; set to 1 to disable parallelism)")
     args = parser.parse_args()
 
     shards_dir = Path(args.shards)
@@ -759,10 +813,13 @@ def main() -> None:
         if not siglip_dir or not siglip_dir.exists():
             print(f"ERROR: siglip_dir not found: {siglip_dir}", file=sys.stderr)
             sys.exit(1)
-        print(f"Rebuilding diversity centroid cache ({len(all_shards)} shards) ...")
+        n_workers = getattr(args, "diversity_workers", 8)
+        print(f"Rebuilding diversity centroid cache ({len(all_shards)} shards, "
+              f"{n_workers} workers) ...")
         scores = build_embedding_diversity(
             all_shards, siglip_dir, cache_path,
             sample_k=sample_k, intra_weight=intra_weight, force=True,
+            n_workers=n_workers,
         )
         print(f"Done. {len(scores)} shards with diversity scores → {cache_path}")
         sys.exit(0)
@@ -788,11 +845,27 @@ def main() -> None:
 
     # Build the scorer (handles weight loading, source fractions, loss normalization,
     # and optional SigLIP embedding diversity when configured)
+    n_workers = getattr(args, "diversity_workers", 8)
     scorer = UnifiedScorer.from_data(
         args.config, light_by_stem, training_by_stem,
         all_shards=all_shards,
         force_diversity=args.force,
+        n_diversity_workers=n_workers,
     )
+
+    # Apply --diversity-weight CLI override after scorer construction
+    if args.diversity_weight is not None:
+        dw = float(np.clip(args.diversity_weight, 0.0, 1.0))
+        old = scorer.weights.get("diversity", 0.0)
+        if dw != old:
+            delta = dw - old
+            total_others = sum(v for k, v in scorer.weights.items() if k != "diversity")
+            for k in scorer.weights:
+                if k != "diversity":
+                    scorer.weights[k] = max(0.0, scorer.weights[k]
+                                            - delta * scorer.weights[k] / max(total_others, 1e-9))
+            scorer.weights["diversity"] = dw
+            print(f"  --diversity-weight override: {old:.3f} → {dw:.3f}")
     print(f"Weights: " + "  ".join(f"{k}={v:.2f}" for k, v in scorer.weights.items()))
     print("  Source distribution: " +
           ", ".join(f"{src}={frac:.1%}"

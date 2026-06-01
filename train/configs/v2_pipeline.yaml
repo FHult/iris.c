@@ -187,11 +187,12 @@ shard_index:
 #   contribution   — model improvement per-shard (requires flywheel DB)
 # When dynamic signals are absent, their weight is redistributed to available signals.
 #
-# Embedding diversity (v3.16.0):
+# Embedding diversity (v3.16.0, production-ready in v3.17.0):
 #   Set enable_embedding_diversity: true after running precompute_all.py --siglip.
 #   Two signals are blended: intra-shard diversity (how varied images within a shard
 #   are) and inter-shard rarity (how unique this shard is vs. the rest of the pool).
 #   Centroids are cached in {cold_root}/diversity_centroids.npz.
+#   Pass 1 (centroid computation) runs in parallel across multiple threads for speed.
 #
 # To run (standard):
 #   train/.venv/bin/python train/scripts/unify_scores.py \
@@ -202,13 +203,17 @@ shard_index:
 #   train/.venv/bin/python train/scripts/unify_scores.py \
 #       --shards /Volumes/16TBCold/shards --config train/configs/v2_pipeline.yaml \
 #       --rebuild-diversity-cache
+#
+# To override the diversity weight at runtime (e.g. for experimentation):
+#   train/.venv/bin/python train/scripts/unify_scores.py \
+#       --shards /Volumes/16TBCold/shards --diversity-weight 0.28
 unified_scoring:
   enabled: true
   weights:
-    light_score:   0.50
-    diversity:     0.10
+    light_score:   0.45  # reduced in v3.17.0 to make room for higher diversity weight
+    diversity:     0.20  # raised in v3.17.0: embedding diversity now production-ready
     training_loss: 0.25  # inverted: lower training loss → lower score (already learned)
-    contribution:  0.15
+    contribution:  0.10
 
   # SigLIP embedding diversity — set true after precompute_all.py --siglip has run.
   # Replaces the source-rarity diversity signal with a richer two-component score.
@@ -277,10 +282,14 @@ campaigns:
 # Validate an existing manifest (checksum + disk consistency):
 #   python train/scripts/campaign_manager.py validate large_baseline
 #
-# --- Boolean expression campaigns (v3.16.0) ---
+# --- Boolean expression campaigns (v3.16.0, extended in v3.17.0) ---
 # Use AND / OR / NOT with built-in primitives and campaign references.
-# Primitives: top_pct(N), top_n(N), min_score(N), min_light(N), min_loss(N),
-#             source(NAME), hard_focus([N]), keep, campaign(NAME), source:NAME
+# Primitives (v3.17.0):
+#   keep, all, hard_focus, hard_mining_focus, high_diversity, low_caption
+#   top_pct(N), top_n(N)
+#   min_score(N), min_light(N), min_aesthetic(N), min_loss(N)
+#   high_diversity(N), min_diversity(N), min_caption(N), low_caption(N)
+#   source(NAME), source:NAME, campaign(NAME), hard_focus(N), hard_mining_focus(N)
 #
 #   # WikiArt shards that are also in the top 80% by score
 #   python train/scripts/campaign_manager.py create wikiart_high_quality \
@@ -290,14 +299,30 @@ campaigns:
 #   python train/scripts/campaign_manager.py create mixed_strategy \
 #       --expression "(top_pct(35) OR hard_focus) AND NOT source(laion)"
 #
+#   # High-quality AND highly diverse (visual variety emphasis)
+#   python train/scripts/campaign_manager.py create quality_diverse \
+#       --expression "top_pct(80) AND high_diversity"
+#
+#   # Strong aesthetic quality floor + exclude low-caption shards
+#   python train/scripts/campaign_manager.py create aesthetic_focus \
+#       --expression "min_aesthetic(0.60) AND NOT low_caption"
+#
+#   # Diversity-boosted reranking (higher diversity weight for this campaign)
+#   python train/scripts/campaign_manager.py create diverse_top80 \
+#       --expression "top_pct(80)" \
+#       --diversity-weight-override 0.28
+#
+#   # Hard-mining bias: top 60% by loss, exclude LAION, minimum aesthetic
+#   python train/scripts/campaign_manager.py create hard_artistic \
+#       --expression "hard_mining_focus(60) AND NOT source(laion) AND min_aesthetic(0.50)"
+#
 #   # Intersection of two existing campaigns with a score floor
 #   python train/scripts/campaign_manager.py create precision_high \
 #       --expression "campaign(large_baseline) AND min_score(0.58)"
 #
-#   # Wikiart + hard examples, excluding known low-quality shards
-#   python train/scripts/campaign_manager.py create wikiart_hard \
-#       --expression "source(wikiart) AND hard_focus" \
-#       --force-exclude 000099 --force-exclude 000100
+#   # Validate an expression before creating (checks syntax + campaign refs):
+#   python train/scripts/campaign_manager.py validate-expression \
+#       "(top_pct(35) OR hard_focus) AND NOT source(laion)"
 #
 #   # Preview before writing (--simulate shows disk, epoch, score distribution):
 #   python train/scripts/campaign_manager.py create mixed_strategy \

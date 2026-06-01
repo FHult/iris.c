@@ -23,12 +23,21 @@ Boolean expression campaigns (--expression, v3.16.0):
 
   Primitives:
     keep                  light_decision == keep
+    all                   every shard in the pool
     hard_focus            top 50%% by training_loss_normalized
+    hard_mining_focus     alias for hard_focus
+    high_diversity        top 50%% by diversity_score
+    low_caption           caption_quality < 0.45
     top_pct(N)            top N%% by final_value_score
     top_n(N)              top N shards by final_value_score
     min_score(N)          final_value_score >= N
     min_light(N)          light_score >= N
+    min_aesthetic(N)      aesthetic_avg >= N
     min_loss(N)           training_loss_normalized >= N
+    high_diversity(N)     top N%% by diversity_score (default 50%%)
+    min_diversity(N)      diversity_score >= N
+    min_caption(N)        caption_quality >= N
+    low_caption(N)        caption_quality < N (default 0.45)
     source(NAME)          source == NAME  (also: source:NAME bare syntax)
     campaign(NAME)        shards included in named campaign manifest
 
@@ -255,14 +264,30 @@ def _top_pct_loss(entries: list, pct: float) -> frozenset:
     return frozenset(e["shard_id"] for e in ranked[:cutoff])
 
 
+def _top_pct_diversity(entries: list, pct: float) -> frozenset:
+    """Return top pct% shard_ids by diversity_score (high-diversity filter)."""
+    scored = [e for e in entries if e.get("diversity_score") is not None]
+    if not scored:
+        # Fall back to all shards when no diversity scores are available
+        return frozenset(e["shard_id"] for e in entries)
+    ranked = sorted(scored, key=lambda e: e["diversity_score"], reverse=True)
+    cutoff = max(1, int(len(ranked) * pct / 100))
+    return frozenset(e["shard_id"] for e in ranked[:cutoff])
+
+
 _BUILTIN_NOARG: dict = {
-    "keep":       lambda entries: frozenset(
-                      e["shard_id"] for e in entries
-                      if e.get("light_decision", "keep") != "discard"),
-    "hard_focus": lambda entries: _top_pct_loss(entries, 50),
-    "all":        lambda entries: frozenset(e["shard_id"] for e in entries),
-    "all_unified":lambda entries: frozenset(
-                      e["shard_id"] for e in entries if e.get("has_unified")),
+    "keep":              lambda entries: frozenset(
+                             e["shard_id"] for e in entries
+                             if e.get("light_decision", "keep") != "discard"),
+    "hard_focus":        lambda entries: _top_pct_loss(entries, 50),
+    "hard_mining_focus": lambda entries: _top_pct_loss(entries, 50),
+    "all":               lambda entries: frozenset(e["shard_id"] for e in entries),
+    "all_unified":       lambda entries: frozenset(
+                             e["shard_id"] for e in entries if e.get("has_unified")),
+    "high_diversity":    lambda entries: _top_pct_diversity(entries, 50),
+    "low_caption":       lambda entries: frozenset(
+                             e["shard_id"] for e in entries
+                             if (e.get("caption_quality") or 0.0) < 0.45),
 }
 
 
@@ -342,13 +367,46 @@ class _Evaluator:
             pct = float(args[0]) if args else 50.0
             return _top_pct_loss(self._entries, pct)
 
+        if nm == "min_aesthetic":
+            thresh = float(args[0]) if args else 0.5
+            return frozenset(
+                e["shard_id"] for e in self._entries
+                if (e.get("aesthetic_avg") or 0.0) >= thresh
+            )
+
+        if nm == "high_diversity":
+            pct = float(args[0]) if args else 50.0
+            return _top_pct_diversity(self._entries, pct)
+
+        if nm == "min_diversity":
+            thresh = float(args[0]) if args else 0.5
+            return frozenset(
+                e["shard_id"] for e in self._entries
+                if (e.get("diversity_score") or 0.0) >= thresh
+            )
+
+        if nm in ("low_caption", "min_caption"):
+            thresh = float(args[0]) if args else 0.45
+            if nm == "low_caption":
+                return frozenset(
+                    e["shard_id"] for e in self._entries
+                    if (e.get("caption_quality") or 0.0) < thresh
+                )
+            else:  # min_caption
+                return frozenset(
+                    e["shard_id"] for e in self._entries
+                    if (e.get("caption_quality") or 0.0) >= thresh
+                )
+
         if nm == "campaign":
             return self._load_campaign(str(args[0]) if args else "")
 
         raise ValueError(
             f"Unknown primitive {name!r}. "
             "Available: top_pct(N), top_n(N), min_score(N), min_light(N), "
-            "min_loss(N), source(NAME), hard_focus([N]), campaign(NAME)"
+            "min_loss(N), min_aesthetic(N), high_diversity([N]), min_diversity(N), "
+            "low_caption([N]), min_caption(N), source(NAME), "
+            "hard_focus([N]), hard_mining_focus([N]), campaign(NAME)"
         )
 
     def _ident(self, name: str) -> frozenset:
@@ -450,6 +508,10 @@ def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
             "source":                  "unknown",
             "final_value_score":       0.0,
             "light_score":             0.0,
+            "aesthetic_avg":           None,
+            "caption_quality":         None,
+            "diversity_score":         None,
+            "diversity_source":        None,
             "training_loss_normalized": None,
             # light_decision: original keep/discard from score_shards_light.py.
             # Stored separately so _apply_strategy() can read it after resetting "decision".
@@ -471,6 +533,12 @@ def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
                 entry["source"]         = ld.get("source", "unknown")
                 entry["light_score"]    = float(scores.get("combined_score", 0.0))
                 entry["light_decision"] = ld.get("decision", "unknown")
+                aes = scores.get("aesthetic_avg")
+                cap = scores.get("caption_quality")
+                if aes is not None:
+                    entry["aesthetic_avg"]   = float(aes)
+                if cap is not None:
+                    entry["caption_quality"] = float(cap)
                 if not has_unified:
                     entry["final_value_score"] = entry["light_score"]
             except (OSError, json.JSONDecodeError):
@@ -483,6 +551,10 @@ def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
                 entry["final_value_score"]        = float(data.get("final_value_score", 0.0))
                 entry["light_score"]              = float(data.get("light_score", entry["light_score"]))
                 entry["training_loss_normalized"] = data.get("training_loss_normalized")
+                div_comp = data.get("components", {}).get("diversity", {})
+                if div_comp.get("value") is not None:
+                    entry["diversity_score"]  = float(div_comp["value"])
+                    entry["diversity_source"] = div_comp.get("source", "source_rarity")
                 # If the light sidecar was missing, default to keep — unified scores are only
                 # written after light scoring, so the shard was not explicitly rejected.
                 if entry["light_decision"] == "unknown":
@@ -493,6 +565,47 @@ def _load_shard_scores(shards_dir: Path, use_index: bool = True) -> list[dict]:
         entries.append(entry)
 
     return entries
+
+
+def _recompute_with_diversity_override(
+    entries: list[dict], new_diversity_weight: float
+) -> None:
+    """
+    Recompute final_value_score in-place using a different diversity weight.
+
+    Uses stored component scores (light_score, diversity_score,
+    training_loss_normalized) to reconstruct the unified score with the new
+    weight.  Missing signals are redistributed proportionally, matching the
+    same redistribution logic as compute_unified_score().
+
+    This allows per-campaign diversity emphasis without re-running
+    unify_scores.py on the full shard pool.
+    """
+    import numpy as _np
+
+    # We don't have the original weight totals, so build a synthetic weight
+    # vector: light + diversity + (training_loss when present).
+    # Contribution is excluded (not stored per-entry in the index).
+    total_budget = 1.0
+    dw = float(_np.clip(new_diversity_weight, 0.0, 0.99))
+
+    for e in entries:
+        ls       = float(e.get("light_score") or 0.0)
+        div_s    = float(e.get("diversity_score") or 0.0)
+        tl       = e.get("training_loss_normalized")
+        has_tl   = tl is not None
+
+        w_l  = (1.0 - dw) * 0.65  # apportion remaining budget: 65% light
+        w_t  = (1.0 - dw) * 0.35 if has_tl else 0.0  # 35% loss when available
+        w_d  = dw
+
+        total_avail = w_l + w_d + w_t
+        if total_avail < 1e-9:
+            continue
+        scale = total_budget / total_avail
+
+        score = (w_l * ls + w_d * div_s + (w_t * float(tl) if has_tl else 0.0)) * scale
+        e["final_value_score"] = float(_np.clip(score, 0.0, 1.0))
 
 
 def _apply_base_campaign(entries: list[dict], base_name: str) -> None:
@@ -693,6 +806,8 @@ def cmd_create(args, cfg: dict) -> None:
     base_campaign = args.base
     # min_score is applied post-strategy as a hard floor on final_value_score.
     min_score = args.min_score
+    # diversity_weight_override: recompute final_value_score with a higher diversity weight.
+    diversity_weight_override = getattr(args, "diversity_weight_override", None)
 
     # force-include / force-exclude sets from CLI args
     force_include_ids: set[str] = set(args.force_include or [])
@@ -724,6 +839,12 @@ def cmd_create(args, cfg: dict) -> None:
     print(f"  {len(entries)} shards: {n_with_unified} with unified scores, "
           f"{n_with_light} with light scores only, "
           f"{len(entries) - n_with_unified - n_with_light} unscored")
+
+    # Apply diversity weight override before any strategy or expression evaluation.
+    if diversity_weight_override is not None:
+        print(f"  Applying diversity_weight_override={diversity_weight_override:.3f} "
+              f"(recomputing final_value_score) ...", flush=True)
+        _recompute_with_diversity_override(entries, diversity_weight_override)
 
     expression = getattr(args, "expression", None)
 
@@ -828,6 +949,8 @@ def cmd_create(args, cfg: dict) -> None:
         manifest["min_score"] = min_score
     if expression:
         manifest["expression"] = expression
+    if diversity_weight_override is not None:
+        manifest["diversity_weight_override"] = diversity_weight_override
 
     if args.description:
         manifest["description"] = args.description
@@ -1111,6 +1234,96 @@ def cmd_validate(args, cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: validate-expression
+# ---------------------------------------------------------------------------
+
+def cmd_validate_expression(args, cfg: dict) -> None:
+    """
+    Parse a boolean expression and report its structure without creating a manifest.
+
+    Checks:
+    - Syntax (recursive descent parse)
+    - Known primitives vs. unknown identifiers
+    - Campaign references — verifies manifest.json exists on disk
+    """
+    expr = args.expression
+    print(f"Expression: {expr!r}\n")
+
+    try:
+        tokens = _tokenize(expr)
+        ast    = _Parser(tokens).parse()
+    except ValueError as exc:
+        print(f"  SYNTAX ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("  Syntax: OK")
+
+    # Walk AST to collect primitives and bare-identifier references
+    call_primitives: list[tuple[str, list]] = []
+    bare_idents:     list[str]              = []
+
+    def _walk(node) -> None:
+        tag = node[0]
+        if tag == "call":
+            call_primitives.append((node[1], node[2]))
+        elif tag == "ident":
+            bare_idents.append(node[1])
+        elif tag in ("or", "and"):
+            _walk(node[1]); _walk(node[2])
+        elif tag == "not":
+            _walk(node[1])
+
+    _walk(ast)
+
+    known_calls = {
+        "top_pct", "top_n", "min_score", "min_light", "min_loss",
+        "min_aesthetic", "high_diversity", "min_diversity",
+        "low_caption", "min_caption",
+        "source", "src", "hard_focus", "hard_mining_focus", "campaign",
+    }
+
+    if call_primitives:
+        print("\n  Call-form primitives:")
+        for name, pargs in call_primitives:
+            arg_str = ", ".join(str(a) for a in pargs)
+            status  = "" if name.lower() in known_calls else "  ← UNKNOWN"
+            print(f"    {name}({arg_str}){status}")
+
+    if bare_idents:
+        print("\n  Bare identifiers:")
+        ok = True
+        for name in bare_idents:
+            if ":" in name:
+                prefix, _, rest = name.partition(":")
+                if prefix.lower() == "source":
+                    print(f"    {name}  (source shorthand — {rest!r})")
+                else:
+                    print(f"    {name}  ← UNKNOWN prefix")
+                    ok = False
+            elif name.lower() in _BUILTIN_NOARG:
+                print(f"    {name}  (built-in: {name.lower()})")
+            else:
+                mpath = CAMPAIGNS_DIR / name / "manifest.json"
+                if mpath.exists():
+                    m = {}
+                    try:
+                        m = json.loads(mpath.read_text())
+                    except Exception:
+                        pass
+                    n_inc = m.get("n_include", "?")
+                    strat = m.get("expression") or m.get("strategy", "?")
+                    print(f"    {name}  (campaign ref — {n_inc} shards, {strat})")
+                else:
+                    print(f"    {name}  ← campaign '{name}' NOT FOUND at {mpath}")
+                    ok = False
+
+        if not ok:
+            sys.exit(1)
+
+    print("\n  Result: expression is valid and all references resolved.")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: create-defaults
 # ---------------------------------------------------------------------------
 
@@ -1141,6 +1354,7 @@ def cmd_create_defaults(args, cfg: dict) -> None:
         fa.force_include = None
         fa.force_exclude = None
         fa.expression = None
+        fa.diversity_weight_override = None
         print(f"\n{'='*60}")
         print(f"Creating default campaign: {name}")
         print(f"{'='*60}")
@@ -1189,6 +1403,10 @@ def main() -> None:
                           help="Boolean expression for shard inclusion using AND/OR/NOT "
                                "(e.g. \"top_pct(80) AND source(wikiart)\"); "
                                "mutually exclusive with --strategy")
+    p_create.add_argument("--diversity-weight-override", type=float, default=None, metavar="FLOAT",
+                          help="Recompute final_value_score using this diversity weight before "
+                               "applying the strategy (e.g. 0.28 to strongly favour visual variety). "
+                               "Does not modify the stored .unified_score.json files.")
     p_create.add_argument("--dry-run", action="store_true",
                           help="Print manifest stats without writing to disk")
     p_create.add_argument("--simulate", action="store_true",
@@ -1204,6 +1422,11 @@ def main() -> None:
     # validate
     p_val = sub.add_parser("validate", help="Check manifest integrity and shard consistency")
     p_val.add_argument("name", help="Campaign name")
+
+    # validate-expression
+    p_vexpr = sub.add_parser("validate-expression",
+                              help="Parse a boolean expression and verify all references")
+    p_vexpr.add_argument("expression", help="Boolean expression string to validate")
 
     # list
     sub.add_parser("list", help="List all campaigns")
@@ -1232,13 +1455,14 @@ def main() -> None:
         args.strategy_explicit = "--strategy" in sys.argv
 
     dispatch = {
-        "create":          cmd_create,
-        "create-defaults": cmd_create_defaults,
-        "list":            cmd_list,
-        "show":            cmd_show,
-        "stats":           cmd_stats,
-        "diff":            cmd_diff,
-        "validate":        cmd_validate,
+        "create":              cmd_create,
+        "create-defaults":     cmd_create_defaults,
+        "list":                cmd_list,
+        "show":                cmd_show,
+        "stats":               cmd_stats,
+        "diff":                cmd_diff,
+        "validate":            cmd_validate,
+        "validate-expression": cmd_validate_expression,
     }
     dispatch[args.cmd](args, cfg)
 

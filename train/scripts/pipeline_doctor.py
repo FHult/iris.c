@@ -2255,6 +2255,107 @@ def _check_light_scoring() -> None:
                                     for sc, s, src in bottom]})
 
 
+def _check_warmup_readiness() -> None:
+    """
+    Emit a single warmup-readiness summary covering the three preconditions for
+    starting a flywheel warm-up run:
+      1. Light scoring coverage  — what fraction of the shard pool has .light_scores.json
+      2. SigLIP precompute       — whether siglip npz files are present
+      3. Diversity cache         — whether the centroid cache has been built
+
+    Issues are emitted only at INFO level; this check is purely informational.
+    """
+    shards_dir = COLD_SHARDS_DIR
+    if not shards_dir.exists():
+        return
+
+    total_shards = sum(1 for _ in shards_dir.glob("*.tar")
+                       if not _.name.endswith(".tar.tmp"))
+    if total_shards == 0:
+        return
+
+    n_light    = sum(1 for _ in shards_dir.glob("*.light_scores.json"))
+    n_unified  = sum(1 for _ in shards_dir.glob("*.unified_score.json"))
+    light_pct  = round(100 * n_light  / total_shards, 1)
+    unified_pct= round(100 * n_unified / total_shards, 1)
+
+    # SigLIP precompute: check cold precomputed dir for siglip npz files
+    siglip_dir = COLD_PRECOMPUTE_DIR / "siglip"
+    current_link = siglip_dir / "current"
+    if current_link.is_symlink():
+        resolved = current_link.resolve()
+        if resolved.is_dir():
+            siglip_dir = resolved
+    n_siglip_shards = 0
+    if siglip_dir.exists():
+        shard_ids_with_siglip: set[str] = set()
+        try:
+            for f in os.listdir(siglip_dir):
+                if f.endswith(".npz") and not f.endswith(".tmp.npz"):
+                    # SigLIP npz files may be named {rec_id}.npz — no shard prefix
+                    # Just count existence as a proxy (non-zero = siglip ran)
+                    shard_ids_with_siglip.add(f)
+        except OSError:
+            pass
+        n_siglip_shards = min(len(shard_ids_with_siglip), total_shards)
+    siglip_pct = round(100 * n_siglip_shards / max(total_shards, 1), 1)
+
+    # Diversity cache
+    diversity_cache = COLD_ROOT / "diversity_centroids.npz"
+    n_centroids = 0
+    if diversity_cache.exists():
+        try:
+            import numpy as _np
+            _f = _np.load(str(diversity_cache), allow_pickle=True)
+            n_centroids = int(len(_f["shard_ids"])) if "shard_ids" in _f else 0
+            _f.close()
+        except Exception:
+            pass
+
+    # Determine warmup phase recommendation
+    if light_pct < 100:
+        phase = "not ready — light scoring incomplete"
+        sev   = "WARNING"
+    elif n_unified == 0:
+        phase = "ready for unify_scores.py"
+    elif n_siglip_shards == 0:
+        phase = "ready for warmup (no SigLIP; diversity = source-rarity)"
+    elif n_centroids == 0:
+        phase = "ready for warmup (enable embedding diversity + rebuild cache)"
+    else:
+        phase = "fully ready — embedding diversity active"
+
+    venv_py  = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    scripts  = str(SCRIPTS_DIR)
+    next_cmd = ""
+    if light_pct < 100:
+        next_cmd = (f"caffeinate -i {venv_py} {scripts}/score_shards_light.py "
+                    f"--shards {shards_dir}")
+    elif n_unified == 0:
+        next_cmd = (f"{venv_py} {scripts}/unify_scores.py "
+                    f"--shards {shards_dir} --config train/configs/v2_pipeline.yaml")
+    elif n_centroids == 0 and n_siglip_shards > 0:
+        next_cmd = (f"{venv_py} {scripts}/unify_scores.py "
+                    f"--shards {shards_dir} --config train/configs/v2_pipeline.yaml "
+                    f"--rebuild-diversity-cache")
+
+    sev = "WARNING" if light_pct < 100 else "INFO"
+    _add(sev, "warmup_readiness",
+         f"Warmup readiness: light={light_pct}% unified={unified_pct}% "
+         f"siglip={'yes' if n_siglip_shards > 0 else 'none'} "
+         f"diversity_cache={n_centroids} centroids — {phase}",
+         fix=next_cmd if next_cmd else "",
+         ctx={
+             "total_shards":    total_shards,
+             "light_pct":       light_pct,
+             "unified_pct":     unified_pct,
+             "n_siglip_shards": n_siglip_shards,
+             "siglip_pct":      siglip_pct,
+             "n_centroids":     n_centroids,
+             "phase":           phase,
+         })
+
+
 def _build_summary(cfg: dict, chunks: list[int]) -> dict:
     """Build compact machine-readable pipeline health summary for --ai mode."""
     scale = cfg.get("scale", "small")
@@ -2440,6 +2541,12 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
                 }
         except Exception:
             pass
+
+    # Warmup readiness from issues accumulated by _check_warmup_readiness()
+    for _issue in _issues:
+        if _issue.category == "warmup_readiness" and _issue.ctx:
+            summary["warmup_readiness"] = _issue.ctx
+            break
 
     # Cold precompute version info (PIPELINE-26)
     if COLD_ROOT.exists():
@@ -2819,6 +2926,7 @@ def main() -> None:
         _check_light_scoring()
         _check_unified_scoring()
         _check_campaigns()
+        _check_warmup_readiness()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)
