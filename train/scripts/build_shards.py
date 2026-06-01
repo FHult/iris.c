@@ -549,8 +549,11 @@ def _batch_tars(tar_items: list, max_bytes: int) -> list:
 def _stage_tars(tar_items: list, stage_dir: str) -> list:
     """
     Copy source tars to stage_dir sequentially (no parallelism — single HDD
-    stream maximises sequential read throughput).  Skips tars already present
-    with the correct size (crash-safe resume).  Returns list of staged paths.
+    stream maximises sequential read throughput).  Each tar is staged into a
+    per-source-directory subdirectory to avoid filename collisions when multiple
+    sources share identical tar names (e.g. laion and coyo both have
+    shard-000001.tar).  Skips tars already present with the correct size
+    (crash-safe resume).  Returns list of staged paths.
     """
     os.makedirs(stage_dir, exist_ok=True)
     total_gb = sum(s for _, s in tar_items) / 1e9
@@ -558,7 +561,10 @@ def _stage_tars(tar_items: list, stage_dir: str) -> list:
           flush=True)
     staged = []
     for tar_path, size in tar_items:
-        dst = os.path.join(stage_dir, os.path.basename(tar_path))
+        src_name = os.path.basename(os.path.dirname(os.path.abspath(tar_path)))
+        dst_dir  = os.path.join(stage_dir, src_name)
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, os.path.basename(tar_path))
         if os.path.exists(dst) and os.path.getsize(dst) == size:
             pass  # already staged from a previous interrupted run
         else:
@@ -794,8 +800,7 @@ def main():
 
     print(f"  turbojpeg: {'yes' if _HAS_TURBOJPEG else 'no (install: brew install libjpeg-turbo && pip install PyTurboJPEG)'}")
 
-    total_written  = 0
-    total_skipped  = 0
+    total_written = 0
     all_prov: dict = {}
 
     if args.stage_dir:
@@ -814,8 +819,11 @@ def main():
               f"in {len(batches)} batch(es) of ≤{max_bytes / 1e9:.0f} GB each")
         print(f"  Stage dir: {args.stage_dir}")
 
-        # Resume: shard index continues from however many shards are already done.
-        next_start_idx = shards_skipped_resumed
+        # Resume: always start from shard 0 and let _write_shard_range skip
+        # any shard whose .tar file already exists.  Setting next_start_idx to
+        # shards_skipped_resumed would shift all batch boundaries on restart,
+        # causing shard-slot collisions between batches.
+        next_start_idx = 0
 
         for bi, batch in enumerate(batches):
             batch_gb = sum(s for _, s in batch) / 1e9
@@ -850,7 +858,6 @@ def main():
               f"using {args.workers} workers...")
         records = _collect_records(args.sources, workers=args.workers)
         print(f"  Found {len(records):,} total records")
-        print(f"  Shuffled with seed={args.seed}")
 
         written, n_shards, prov = _write_phase(
             records, args, blocklist,
