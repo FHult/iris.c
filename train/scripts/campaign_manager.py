@@ -573,19 +573,21 @@ def _recompute_with_diversity_override(
     """
     Recompute final_value_score in-place using a different diversity weight.
 
-    Uses stored component scores (light_score, diversity_score,
-    training_loss_normalized) to reconstruct the unified score with the new
-    weight.  Missing signals are redistributed proportionally, matching the
-    same redistribution logic as compute_unified_score().
+    Uses the stored component scores available in each entry (light_score,
+    diversity_score, training_loss_normalized).  Contribution is NOT included
+    because it is not stored per-entry in the shard index or slow-path entries.
+
+    The non-diversity budget is split 65% light / 35% training_loss — a fixed
+    approximation, not the exact ratios from the original compute_unified_score()
+    call (which also included contribution).  The resulting scores are therefore
+    slightly different from what unify_scores.py would produce with the same
+    weight override, but the ranking effect is the same for campaign selection.
 
     This allows per-campaign diversity emphasis without re-running
     unify_scores.py on the full shard pool.
     """
     import numpy as _np
 
-    # We don't have the original weight totals, so build a synthetic weight
-    # vector: light + diversity + (training_loss when present).
-    # Contribution is excluded (not stored per-entry in the index).
     total_budget = 1.0
     dw = float(_np.clip(new_diversity_weight, 0.0, 0.99))
 
@@ -595,8 +597,9 @@ def _recompute_with_diversity_override(
         tl       = e.get("training_loss_normalized")
         has_tl   = tl is not None
 
-        w_l  = (1.0 - dw) * 0.65  # apportion remaining budget: 65% light
-        w_t  = (1.0 - dw) * 0.35 if has_tl else 0.0  # 35% loss when available
+        # Allocate remaining (1-dw) budget: 65% light, 35% loss (when present).
+        w_l  = (1.0 - dw) * 0.65
+        w_t  = (1.0 - dw) * 0.35 if has_tl else 0.0
         w_d  = dw
 
         total_avail = w_l + w_d + w_t
@@ -1282,16 +1285,20 @@ def cmd_validate_expression(args, cfg: dict) -> None:
         "source", "src", "hard_focus", "hard_mining_focus", "campaign",
     }
 
+    ok = True
+
     if call_primitives:
         print("\n  Call-form primitives:")
         for name, pargs in call_primitives:
             arg_str = ", ".join(str(a) for a in pargs)
-            status  = "" if name.lower() in known_calls else "  ← UNKNOWN"
-            print(f"    {name}({arg_str}){status}")
+            if name.lower() in known_calls:
+                print(f"    {name}({arg_str})")
+            else:
+                print(f"    {name}({arg_str})  ← UNKNOWN primitive")
+                ok = False
 
     if bare_idents:
         print("\n  Bare identifiers:")
-        ok = True
         for name in bare_idents:
             if ":" in name:
                 prefix, _, rest = name.partition(":")
@@ -1317,10 +1324,12 @@ def cmd_validate_expression(args, cfg: dict) -> None:
                     print(f"    {name}  ← campaign '{name}' NOT FOUND at {mpath}")
                     ok = False
 
-        if not ok:
-            sys.exit(1)
-
-    print("\n  Result: expression is valid and all references resolved.")
+    if ok:
+        print("\n  Result: expression is valid and all references resolved.")
+    else:
+        print("\n  Result: expression has errors (see ← markers above).",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

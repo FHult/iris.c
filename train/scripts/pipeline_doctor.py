@@ -2279,28 +2279,11 @@ def _check_warmup_readiness() -> None:
     light_pct  = round(100 * n_light  / total_shards, 1)
     unified_pct= round(100 * n_unified / total_shards, 1)
 
-    # SigLIP precompute: check cold precomputed dir for siglip npz files
-    siglip_dir = COLD_PRECOMPUTE_DIR / "siglip"
-    current_link = siglip_dir / "current"
-    if current_link.is_symlink():
-        resolved = current_link.resolve()
-        if resolved.is_dir():
-            siglip_dir = resolved
-    n_siglip_shards = 0
-    if siglip_dir.exists():
-        shard_ids_with_siglip: set[str] = set()
-        try:
-            for f in os.listdir(siglip_dir):
-                if f.endswith(".npz") and not f.endswith(".tmp.npz"):
-                    # SigLIP npz files may be named {rec_id}.npz — no shard prefix
-                    # Just count existence as a proxy (non-zero = siglip ran)
-                    shard_ids_with_siglip.add(f)
-        except OSError:
-            pass
-        n_siglip_shards = min(len(shard_ids_with_siglip), total_shards)
-    siglip_pct = round(100 * n_siglip_shards / max(total_shards, 1), 1)
-
-    # Diversity cache
+    # Diversity cache — load first; used for both the diversity and siglip metrics.
+    # The centroid cache records exactly one entry per shard that had at least one
+    # SigLIP feature at cache-build time, so n_centroids doubles as a reliable
+    # per-shard SigLIP coverage count (unlike counting individual npz files which
+    # are one-per-image and would always clamp to total_shards after min()).
     diversity_cache = COLD_ROOT / "diversity_centroids.npz"
     n_centroids = 0
     if diversity_cache.exists():
@@ -2311,6 +2294,22 @@ def _check_warmup_readiness() -> None:
             _f.close()
         except Exception:
             pass
+
+    # SigLIP precompute: detect whether the siglip directory exists at all
+    # (binary presence check — per-shard coverage comes from n_centroids above).
+    siglip_dir = COLD_PRECOMPUTE_DIR / "siglip"
+    current_link = siglip_dir / "current"
+    if current_link.is_symlink():
+        resolved = current_link.resolve()
+        if resolved.is_dir():
+            siglip_dir = resolved
+    siglip_present = siglip_dir.exists() and any(
+        True for f in (os.listdir(siglip_dir) if siglip_dir.exists() else [])
+        if f.endswith(".npz") and not f.endswith(".tmp.npz")
+    )
+    # Use centroid count as shard-level SigLIP coverage (centroids = shards with features).
+    n_siglip_shards = n_centroids
+    siglip_pct = round(100 * n_siglip_shards / max(total_shards, 1), 1)
 
     # Determine warmup phase recommendation
     if light_pct < 100:

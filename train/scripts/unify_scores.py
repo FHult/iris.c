@@ -7,10 +7,10 @@ final_value_score per shard.  Intended to run after score_shards_light.py
 and before campaign_manager.py creates training manifests.
 
 Signals and default weights (configurable via v2_pipeline.yaml):
-  light_score      0.50 — combined_score from score_shards_light.py (static, always)
-  diversity        0.10 — source rarity OR SigLIP embedding diversity (see below)
+  light_score      0.45 — combined_score from score_shards_light.py (static, always)
+  diversity        0.20 — source rarity OR SigLIP embedding diversity (see below)
   training_loss    0.25 — mean loss during training (dynamic, requires flywheel DB)
-  contribution     0.15 — model improvement per shard (dynamic, requires flywheel DB)
+  contribution     0.10 — model improvement per shard (dynamic, requires flywheel DB)
 
 Embedding diversity (v3.16.0):
   When unified_scoring.enable_embedding_diversity: true in v2_pipeline.yaml and
@@ -463,6 +463,10 @@ def build_embedding_diversity(
                     continue
                 if centroid is None:
                     n_missing += 1
+                    if force:
+                        # Remove any stale entry so deleted SigLIP features don't persist.
+                        with cache_lock:
+                            cache._data.pop(stem, None)
                     continue
                 with cache_lock:
                     cache.update(stem, centroid, intra, tar_mtime)
@@ -470,7 +474,9 @@ def build_embedding_diversity(
                 if n_computed % 50 == 0:
                     print(f"  [{n_computed} computed, {n_cached} cached] ...", flush=True)
 
-    if n_computed > 0:
+    if n_computed > 0 or (force and n_missing > 0):
+        # Save when new centroids were computed OR when force-evictions happened
+        # (to persist removal of stale entries for shards that lost SigLIP features).
         cache.save()
     print(f"  Embedding diversity: {n_computed} computed, "
           f"{n_cached} from cache, {n_missing} without SigLIP features")
