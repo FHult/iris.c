@@ -46,7 +46,6 @@ import argparse
 import glob
 import io
 import json
-import os
 import re
 import sys
 import tarfile
@@ -165,9 +164,12 @@ def _load_aesthetic_predictor(device: str):
 
     if not AESTHETIC_CACHE_PATH.exists():
         print(f"  Downloading aesthetic predictor weights → {AESTHETIC_CACHE_PATH}")
+        tmp = AESTHETIC_CACHE_PATH.with_suffix(".pth.tmp")
         try:
-            urllib.request.urlretrieve(AESTHETIC_WEIGHTS_URL, str(AESTHETIC_CACHE_PATH))
+            urllib.request.urlretrieve(AESTHETIC_WEIGHTS_URL, str(tmp))
+            tmp.rename(AESTHETIC_CACHE_PATH)
         except Exception as e:
+            tmp.unlink(missing_ok=True)
             print(f"  WARNING: could not download aesthetic predictor: {e}")
             print("  Aesthetic scores will be omitted.")
             return None
@@ -181,6 +183,7 @@ def _load_aesthetic_predictor(device: str):
         return linear
     except Exception as e:
         print(f"  WARNING: failed to load aesthetic predictor: {e}")
+        print(f"  Delete {AESTHETIC_CACHE_PATH} to trigger a fresh download.")
         return None
 
 
