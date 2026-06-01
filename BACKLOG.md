@@ -113,6 +113,8 @@ Three-tier design (target state — current system is hot + cold only):
 
 All directions are first-class operations. Staging populates the working set; archiving accumulates the knowledge; promotion makes results live. See **PIPELINE-30** for implementation.
 
+See also **PIPELINE-32** and **PIPELINE-33** (Hot ↔ Ultrahot movement helper + policy) for the remaining tier-transition convenience layer that is still largely manual today.
+
 ### Proposed cold storage layout
 
 ```
@@ -318,6 +320,38 @@ Full audit report: [`plans/telemetry-audit.md`](plans/telemetry-audit.md)
 - ~~**DA-3**: Campaign-level summary table in persistent DB~~ — Done (2026-05-17): `campaign_summary` table in FlywheelDB; refreshed after each iteration; viewable via `data_explorer campaign-summary`
 - ~~**DA-2**: Per-shard loss percentile distribution in mining output~~ — Done (2026-05-17): writes `shard_loss_percentiles.json` (p50/p75/p95/p99 per shard) after each mine run
 - **DA-7**: Link validation metrics back to `ablation_history.db` via `post_train_validation` table — deferred (requires validator subprocess from ablation harness, ~1 day)
+
+**PIPELINE-32: Small dedicated Hot ↔ Ultrahot tier movement helper script** (Medium — experiment velocity, unblocked)
+
+With the three-tier storage model now active (Cold = 16 TB HDD as immutable source of truth, Hot = 2 TB external SSD as primary training compute, Ultrahot = internal NVMe for small/fast runs), operators need an easy, safe way to move a small active working set between Hot and Ultrahot.
+
+Current situation:
+- `data_stager.py` handles Cold ↔ Hot staging/archiving very well (including background operation and the orchestrator integration).
+- Moving between the two SSD tiers (e.g. "I want to run a quick 8-shard ablation burst at maximum speed on the internal NVMe" or "I did some interesting small runs on Ultrahot, promote the new checkpoints + metrics back to Hot") is still manual, error-prone, and lacks the safety nets (size checks, manifests, provenance, heartbeats, resume) that the main stager provides.
+
+Deliver a small, focused helper (suggested name: `ultrahot_stage.py` or a `data_stager.py ultrahot-*` subcommand) that supports:
+- Stage a curated subset (explicit shard list, top-N from `shard_scores.db`, latest ablation run, specific campaign window, etc.) from Hot → Ultrahot.
+- One-way or bidirectional sync of results (new checkpoints, updated `ablation_history.db`, metrics, small precompute deltas) back from Ultrahot → Hot.
+- Proper handling of versioned precompute `current` symlinks, checkpoint lineage, and small manifests so the main pipeline/doctor can see what's resident on Ultrahot.
+- Space estimation + safety abort if Ultrahot would go below a configured margin.
+- Heartbeat + sentinel files compatible with the existing observability stack.
+- Optional "ephemeral experiment" mode that cleans up after itself on Ultrahot when done (or on explicit `cleanup` command).
+
+The tool should be usable both standalone (for quick experiments) and callable from `pipeline_ctl.py` / the ablation harness.
+
+**PIPELINE-33: Define and codify lightweight Hot ↔ Ultrahot movement policy** (Low–Medium — operational clarity)
+
+Accompanying the script in PIPELINE-32, document (and where helpful, lightly enforce) the intended policy for when work should live on Hot vs. Ultrahot:
+
+- Size / duration heuristics (e.g. < ~40 shards and < 10k steps → prefer Ultrahot; larger or multi-day runs → Hot).
+- How the ablation harness and `test_quality_features.py` / smoke runners declare their working-set size so the right tier is chosen automatically.
+- Rules for promoting "interesting" results from Ultrahot back to Hot (and then to Cold archive).
+- Visibility in `pipeline_status.py`, `pipeline_doctor.py --ai`, and `data_explorer` so an operator always knows what is currently on Ultrahot.
+- Interaction with the main orchestrator (should it ever auto-stage tiny windows to Ultrahot, or is Ultrahot strictly a manual "fast lane" for the operator?).
+
+Start with clear documentation + sensible CLI defaults in the new helper; wire deeper automation later once real usage patterns emerge.
+
+**Effort estimate:** PIPELINE-32 ~2–3 days (script + integration + tests). PIPELINE-33 ~1 day (policy doc + small CLI/policy hooks). Both are high-leverage for daily experiment velocity on the current hardware.
 
 ---
 
