@@ -697,6 +697,18 @@ def train(config: dict) -> None:
         print("Text encoder: will load on-demand per step (online) and unload after encode.")
         text_encoder = None  # populated transiently by _ensure_live_encoders()
 
+    # One-time banner for the online path (the scenario that was OOMing flywheel warmups).
+    _any_live = (not vae_cache_available) or (not text_cache_available) or use_siglip_live
+    if _any_live:
+        live_list = []
+        if not vae_cache_available: live_list.append("VAE")
+        if not text_cache_available: live_list.append("Qwen3")
+        if use_siglip_live: live_list.append("SigLIP")
+        print(f"\n[online-encode] LIVE ENCODER MODE ACTIVE for this run: {', '.join(live_list)}")
+        print("[online-encode] These models will be attached only for the ~100-400 ms feature extraction")
+        print("[online-encode] window at the TOP of each step, then fully unloaded (flux.*=None + gc +")
+        print("[online-encode] clear_cache + torch.mps.empty_cache) BEFORE the Flux forward + adapter step.\n")
+
     # Start data loader threads now so they can prefill the batch queue during
     # the Flux pre-eval below (which takes several minutes). By the time training
     # starts the first several batches will already be decoded and waiting.
@@ -1220,9 +1232,14 @@ def train(config: dict) -> None:
     # extraction window at the top of each step, then drop their ~3.8 GB of
     # GPU buffers so the Flux transformer forward + adapter backward fit in the
     # MLX memory limit.  Called from the main training loop only.
-    def _ensure_live_encoders() -> None:
-        """(Re)load any live encoders needed for this step's batch."""
+    def _ensure_live_encoders(step: int = 0) -> None:
+        """(Re)load any live encoders needed for this step's batch.
+        Debug prints are emitted only when we actually perform (re)loads so the
+        flywheel logs show exactly when the transient ~3.8 GB spike occurs.
+        """
         nonlocal vae, text_encoder, siglip
+
+        loaded_this_call = []
 
         # VAE (lives inside flux.vae when attached)
         if (not vae_cache_available) and vae is None:
@@ -1240,8 +1257,10 @@ def train(config: dict) -> None:
                 )
                 flux.vae = vae_mod
                 vae = vae_mod
+                loaded_this_call.append("VAE(re-attach)")
             elif getattr(flux, "vae", None) is not None:
                 vae = flux.vae
+                loaded_this_call.append("VAE(existing)")
             if vae is not None and hasattr(vae, "freeze"):
                 vae.freeze()
 
@@ -1263,20 +1282,30 @@ def train(config: dict) -> None:
                 # Rebuild the bundle (tokenizer lives on flux, safe to keep)
                 tok = flux.tokenizers.get("qwen3") if hasattr(flux, "tokenizers") else None
                 text_encoder = _TextEncoderBundle(te_mod, tok) if tok is not None else _TextEncoderBundle(te_mod, None)
+                loaded_this_call.append("Qwen3(re-attach)")
             elif getattr(flux, "text_encoder", None) is not None:
                 tok = flux.tokenizers.get("qwen3") if hasattr(flux, "tokenizers") else None
                 text_encoder = _TextEncoderBundle(flux.text_encoder, tok) if tok is not None else None
+                loaded_this_call.append("Qwen3(existing)")
             if text_encoder is not None and hasattr(text_encoder, "freeze"):
                 text_encoder.freeze()
 
-        # SigLIP (standalone, PyTorch or MLX)
+        # SigLIP (standalone, PyTorch or MLX) — always a full load when live
         if use_siglip_live and siglip is None:
             siglip = _load_siglip(mcfg["siglip_model"])
             if hasattr(siglip, "freeze"):
                 siglip.freeze()
+            loaded_this_call.append("SigLIP(full)")
 
-    def _release_live_encoders() -> None:
-        """Drop live encoders (free their GPU weight buffers) after encoding."""
+        if loaded_this_call:
+            print(f"[online-encode] step {step}: loaded {', '.join(loaded_this_call)} "
+                  f"(transient models now resident for encode window only)", flush=True)
+
+    def _release_live_encoders(step: int = 0) -> None:
+        """Drop live encoders (free their GPU weight buffers) after encoding.
+        This is the critical step that prevents the ~3.8 GB from sitting through
+        the entire Flux forward + adapter backward (the part that was causing jetsam).
+        """
         nonlocal vae, text_encoder, siglip
         vae = None
         text_encoder = None
@@ -1295,6 +1324,9 @@ def train(config: dict) -> None:
                 torch.mps.empty_cache()
         except Exception:
             pass
+        if step > 0:
+            print(f"[online-encode] step {step}: released all live encoders + cleared GPU caches "
+                  f"(~3.8 GB transient now eligible for reclaim before Flux fwd)", flush=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     _steps_this_run = _end_step - start_step
@@ -1511,7 +1543,7 @@ def train(config: dict) -> None:
         if (not vae_cache_available and vae_np is None) or \
            (not text_cache_available and text_np is None) or \
            (use_siglip_live and siglip_np is None):
-            _ensure_live_encoders()
+            _ensure_live_encoders(step=step)
             _did_live_encode = True
 
         if vae_np is not None:
@@ -1581,7 +1613,7 @@ def train(config: dict) -> None:
         # Online mode: drop the encoders (~3.8 GB) *now*, before Flux forward + adapter step.
         # They are only required for the feature extraction at the top of the step.
         if _did_live_encode:
-            _release_live_encoders()
+            _release_live_encoders(step=step)
 
         # PIPE-H-003: successful batch — reset consecutive-skip counter and count
         # this batch in the rolling window (slide window after _SKIP_WINDOW batches).
@@ -2116,7 +2148,7 @@ def train(config: dict) -> None:
                 # so the encoders must be attached for the duration of the eval.
                 _eval_needed_encoders = (not vae_cache_available) or (not text_cache_available) or use_siglip_live
                 if _eval_needed_encoders:
-                    _ensure_live_encoders()
+                    _ensure_live_encoders(step=step)
                     # Re-attach explicitly in case _ensure only set the python vars
                     if vae is not None:
                         flux.vae = vae
@@ -2148,7 +2180,7 @@ def train(config: dict) -> None:
                 except Exception as _eval_err:
                     print(f"  WARNING: eval hook failed at step {step}: {_eval_err}", flush=True)
                 if _eval_needed_encoders:
-                    _release_live_encoders()
+                    _release_live_encoders(step=step)
                 mx.clear_cache()
 
             # Peak reset deferred until after checkpoint so the reported peak
