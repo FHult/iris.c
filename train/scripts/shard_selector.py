@@ -835,31 +835,34 @@ def select_shards(
         ]
 
         if len(siglip_candidates) >= n_div and len(selected_embs) > 0:
-            # Max-min cosine distance selection
+            # Max-min cosine distance selection — vectorised for speed.
+            # Pre-build the candidate and selected embedding matrices; update
+            # incrementally rather than calling np.frombuffer in every inner loop.
             diversity_method = "siglip"
+            cand_mat  = np.stack([
+                np.frombuffer(s["siglip_mean_emb"], dtype=np.float32)
+                for s in siglip_candidates
+            ])                                            # [C, dim]
+            sel_mat   = np.stack(selected_embs)          # [S, dim]
+            cand_mask = np.ones(len(siglip_candidates), dtype=bool)
+
             for _ in range(n_div):
-                if not siglip_candidates:
+                if not cand_mask.any():
                     break
-                best = None
-                best_dist = -1.0
-                for s in siglip_candidates:
-                    emb = np.frombuffer(s["siglip_mean_emb"], dtype=np.float32)
-                    min_dist = min(
-                        1.0 - float(np.dot(emb, sel))
-                        for sel in selected_embs
-                    ) if selected_embs else 1.0
-                    if min_dist > best_dist:
-                        best_dist = min_dist
-                        best = s
-                if best is None:
-                    break
+                # Cosine sims: [C, S]; min across selected gives min-dist for each candidate
+                sims = cand_mat[cand_mask] @ sel_mat.T   # [C_active, S]
+                min_sims  = sims.max(axis=1)             # most-similar selected shard per candidate
+                best_local = int(np.argmin(min_sims))    # candidate most distant from all selected
+
+                # Map back to full index
+                active_indices = np.where(cand_mask)[0]
+                best_full_idx  = int(active_indices[best_local])
+                best = siglip_candidates[best_full_idx]
+
                 _add_shard(best)
-                selected_embs.append(
-                    np.frombuffer(best["siglip_mean_emb"], dtype=np.float32)
-                )
-                siglip_candidates = [
-                    s for s in siglip_candidates if s["shard_id"] != best["shard_id"]
-                ]
+                new_emb = cand_mat[best_full_idx:best_full_idx + 1]  # [1, dim]
+                sel_mat = np.vstack([sel_mat, new_emb])
+                cand_mask[best_full_idx] = False
         else:
             # Fallback: source-tag diversity (minimise source concentration)
             diversity_method = "source_tag"
@@ -939,9 +942,8 @@ def select_shards(
 
     # ------------------------------------------------------------------
     # Logging and bookkeeping
-    n_unscored = sum(1 for sid in selected_ids
-                     if next((s for s in all_shards if s["shard_id"] == sid), {})
-                     .get("n_scored", 0) == 0)
+    _scored_map = {s["shard_id"]: s.get("n_scored", 0) for s in all_shards}
+    n_unscored = sum(1 for sid in selected_ids if _scored_map.get(sid, 0) == 0)
     mean_raw   = _mean_field(selected_shards, "composite_score")
     mean_attr  = _mean_field(selected_shards, "effective_score")
 
@@ -962,23 +964,23 @@ def _mean_field(shards: list[dict], field: str) -> Optional[float]:
 
 
 def _weighted_sample_no_replace(probs: list[float], k: int) -> list[int]:
-    """Sample k indices without replacement using given probabilities."""
-    indices = list(range(len(probs)))
-    chosen = []
-    remaining_probs = list(probs)
-    for _ in range(min(k, len(indices))):
-        total = sum(remaining_probs)
-        if total <= 0:
-            break
-        r = random.random() * total
-        cum = 0.0
-        for idx, p in enumerate(remaining_probs):
-            cum += p
-            if r <= cum:
-                chosen.append(indices[idx])
-                remaining_probs[idx] = 0.0
-                break
-    return chosen
+    """Sample k indices without replacement using given probabilities.
+
+    Uses numpy for correct vectorised weighted sampling.  The pure-Python
+    implementation was O(k×n) and could return fewer than k items when
+    floating-point rounding caused total to reach zero before k picks.
+    """
+    n = len(probs)
+    k = min(k, n)
+    if k <= 0:
+        return []
+    arr = np.array(probs, dtype=np.float64)
+    total = arr.sum()
+    if total <= 0:
+        # All weights zero — fall back to uniform sampling
+        return list(np.random.choice(n, size=k, replace=False))
+    arr /= total
+    return list(np.random.choice(n, size=k, replace=False, p=arr))
 
 
 # ---------------------------------------------------------------------------

@@ -167,22 +167,22 @@ class FlywheelDB:
         for _mig in (_V2_MIGRATION, _V3_MIGRATION):
             try:
                 self._conn.executescript(_mig)
-            except Exception:
-                pass
+            except sqlite3.OperationalError:
+                pass  # expected: "duplicate column name" on already-migrated DBs
         for _mig in _V4_MIGRATIONS:
             try:
                 self._conn.execute(_mig)
-            except Exception:
+            except sqlite3.OperationalError:
                 pass
         for _mig in _V5_MIGRATIONS:
             try:
                 self._conn.execute(_mig)
-            except Exception:
+            except sqlite3.OperationalError:
                 pass
         for _mig in _V6_MIGRATIONS:
             try:
                 self._conn.execute(_mig)
-            except Exception:
+            except sqlite3.OperationalError:
                 pass
         self._conn.commit()
 

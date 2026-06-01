@@ -123,6 +123,10 @@ def read_training_signals(shard_stems: list[str]) -> dict[str, dict]:
     Returns {shard_stem: {"avg_loss": float, "contribution": float}}.
     Returns {} when the DB is absent or has no matching schema.
 
+    Column names match shard_selector.py's ShardScoreDB schema:
+      loss_mean          → "avg_loss" in the returned dict
+      attributed_composite → "contribution"
+
     Columns are detected defensively — only fields present in the schema are read.
     """
     if not SHARD_SCORES_DB_PATH.exists():
@@ -131,15 +135,16 @@ def read_training_signals(shard_stems: list[str]) -> dict[str, dict]:
         import sqlite3
         conn = sqlite3.connect(str(SHARD_SCORES_DB_PATH))
         cols = {row[1] for row in conn.execute("PRAGMA table_info(shards)").fetchall()}
-        wanted: list[str] = []
-        if "avg_loss" in cols:
-            wanted.append("avg_loss")
-        if "contribution_score" in cols:
-            wanted.append("contribution_score")
-        if not wanted:
+        # Map DB column name → key in the returned entry dict
+        col_map: list[tuple[str, str]] = []
+        if "loss_mean" in cols:
+            col_map.append(("loss_mean", "avg_loss"))
+        if "attributed_composite" in cols:
+            col_map.append(("attributed_composite", "contribution"))
+        if not col_map:
             conn.close()
             return {}
-        select = ", ".join(["shard_id"] + wanted)
+        select = ", ".join(["shard_id"] + [c for c, _ in col_map])
         rows = conn.execute(
             f"SELECT {select} FROM shards WHERE n_scored > 0"
         ).fetchall()
@@ -152,14 +157,10 @@ def read_training_signals(shard_stems: list[str]) -> dict[str, dict]:
     for row in rows:
         raw_id = str(row[0])
         entry: dict = {}
-        if "avg_loss" in wanted:
-            val = row[wanted.index("avg_loss") + 1]
+        for i, (_, key) in enumerate(col_map):
+            val = row[i + 1]
             if val is not None:
-                entry["avg_loss"] = float(val)
-        if "contribution_score" in wanted:
-            val = row[wanted.index("contribution_score") + 1]
-            if val is not None:
-                entry["contribution"] = float(val)
+                entry[key] = float(val)
         if not entry:
             continue
         # Store under the raw DB key. Also store under the 6-digit zero-padded form

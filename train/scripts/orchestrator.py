@@ -1538,7 +1538,7 @@ class Orchestrator:
         log_orch(f"Chunk {chunk}: warming up IP Adapter Metal training graphs", chunk=chunk)
         cfg_path = self.cfg.get("training_config", str(TRAIN_DIR / "configs" / "stage1_512px.yaml"))
         log_file = LOG_DIR / f"training_warmup_chunk{chunk}.log"
-        cmd = f"python -u '{TRAIN_DIR}/train_ip_adapter.py' --config '{cfg_path}' --warmup-only --data-root '{self.prep_root}'"
+        cmd = f"{VENV_PYTHON} -u '{TRAIN_DIR}/train_ip_adapter.py' --config '{cfg_path}' --warmup-only --data-root '{self.prep_root}'"
         self._launch_prep(
             f"training_warmup chunk {chunk}", cmd, log_file,
             chunk, "training_warmup", token="GPU_TOKEN",
@@ -2680,6 +2680,14 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
         # Prefer the chronologically latest step_*.safetensors from CKPT_DIR so that
         # restarts always continue the cumulative training chain.  get_best() returns
         # best-by-ref_gap which may be an older checkpoint (FLYWHEEL-BUG-1).
+        #
+        # base_checkpoint semantics:
+        #   key absent or non-null value  → auto-detect latest ckpt, then use the value
+        #   key explicitly set to null    → fresh start; do NOT auto-detect from disk
+        #     (use this when starting a new flywheel campaign from scratch so that
+        #      leftover checkpoints from prior campaigns are not accidentally loaded)
+        _base_ckpt_explicit_null = ("base_checkpoint" in fw_cfg
+                                    and fw_cfg["base_checkpoint"] is None)
         resume_ckpt: Optional[str] = None
 
         def _step_num(p: Path) -> int:
@@ -2688,17 +2696,19 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             except (IndexError, ValueError):
                 return 0
 
-        ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"), key=_step_num)
-        if ckpts:
-            resume_ckpt = str(ckpts[-1])
-        else:
-            done_iters = [r for r in prior if r["status"] == "done"]
-            if done_iters:
-                best = fw_db.get_best(name)
-                if best and best.get("checkpoint"):
-                    resume_ckpt = best["checkpoint"]
-        if resume_ckpt is None:
-            resume_ckpt = fw_cfg.get("base_checkpoint")
+        if not _base_ckpt_explicit_null:
+            # Auto-detect: use latest step checkpoint, falling back to DB best.
+            ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"), key=_step_num)
+            if ckpts:
+                resume_ckpt = str(ckpts[-1])
+            else:
+                done_iters = [r for r in prior if r["status"] == "done"]
+                if done_iters:
+                    best = fw_db.get_best(name)
+                    if best and best.get("checkpoint"):
+                        resume_ckpt = best["checkpoint"]
+            if resume_ckpt is None:
+                resume_ckpt = fw_cfg.get("base_checkpoint")
 
         log_orch(f"[flywheel:{name}] starting — iter={iteration}/{max_iters}  "
                  f"n_shards={n_shards}  steps_per_iter={steps_per_iter}  "
