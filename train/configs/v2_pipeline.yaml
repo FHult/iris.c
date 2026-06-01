@@ -182,15 +182,26 @@ shard_index:
 #
 # Signal weights (must sum to 1.0):
 #   light_score    — static quality score from CLIP + aesthetic + sharpness + caption
-#   diversity      — source rarity in pool (computed from pool composition, always available)
+#   diversity      — SigLIP embedding diversity when available, else source-rarity
 #   training_loss  — avg loss on shard samples during training (requires flywheel DB)
 #   contribution   — model improvement per-shard (requires flywheel DB)
 # When dynamic signals are absent, their weight is redistributed to available signals.
 #
-# To run:
+# Embedding diversity (v3.16.0):
+#   Set enable_embedding_diversity: true after running precompute_all.py --siglip.
+#   Two signals are blended: intra-shard diversity (how varied images within a shard
+#   are) and inter-shard rarity (how unique this shard is vs. the rest of the pool).
+#   Centroids are cached in {cold_root}/diversity_centroids.npz.
+#
+# To run (standard):
 #   train/.venv/bin/python train/scripts/unify_scores.py \
 #       --shards /Volumes/16TBCold/shards \
 #       --config train/configs/v2_pipeline.yaml
+#
+# To rebuild diversity cache only:
+#   train/.venv/bin/python train/scripts/unify_scores.py \
+#       --shards /Volumes/16TBCold/shards --config train/configs/v2_pipeline.yaml \
+#       --rebuild-diversity-cache
 unified_scoring:
   enabled: true
   weights:
@@ -198,6 +209,16 @@ unified_scoring:
     diversity:     0.10
     training_loss: 0.25  # inverted: lower training loss → lower score (already learned)
     contribution:  0.15
+
+  # SigLIP embedding diversity — set true after precompute_all.py --siglip has run.
+  # Replaces the source-rarity diversity signal with a richer two-component score.
+  enable_embedding_diversity: false
+  # Path to per-image SigLIP .npz files (auto-detected relative to cold_root if omitted)
+  # siglip_precompute_dir: /Volumes/16TBCold/precomputed/siglip
+  # Fraction of each shard to sample for centroid/intra computation (1..5000)
+  embedding_diversity_sample_k: 256
+  # Blend weight: intra-shard diversity vs. inter-shard rarity (0.0 = all inter, 1.0 = all intra)
+  embedding_diversity_alpha: 0.5
 
 # Campaign definitions — named shard selection strategies.
 # Each campaign produces a manifest at:
@@ -239,7 +260,7 @@ campaigns:
 # Composed campaigns start from a base campaign's included set, then apply
 # additional filters before the strategy runs.
 #
-# Create via CLI:
+# Create via CLI (strategy-based composition):
 #   python train/scripts/campaign_manager.py create wikiart_high_quality \
 #       --base large_baseline \
 #       --strategy source_boost --source-boost wikiart:2.0 \
@@ -255,6 +276,33 @@ campaigns:
 #
 # Validate an existing manifest (checksum + disk consistency):
 #   python train/scripts/campaign_manager.py validate large_baseline
+#
+# --- Boolean expression campaigns (v3.16.0) ---
+# Use AND / OR / NOT with built-in primitives and campaign references.
+# Primitives: top_pct(N), top_n(N), min_score(N), min_light(N), min_loss(N),
+#             source(NAME), hard_focus([N]), keep, campaign(NAME), source:NAME
+#
+#   # WikiArt shards that are also in the top 80% by score
+#   python train/scripts/campaign_manager.py create wikiart_high_quality \
+#       --expression "source(wikiart) AND top_pct(80)"
+#
+#   # High-quality OR hard examples, excluding LAION noise
+#   python train/scripts/campaign_manager.py create mixed_strategy \
+#       --expression "(top_pct(35) OR hard_focus) AND NOT source(laion)"
+#
+#   # Intersection of two existing campaigns with a score floor
+#   python train/scripts/campaign_manager.py create precision_high \
+#       --expression "campaign(large_baseline) AND min_score(0.58)"
+#
+#   # Wikiart + hard examples, excluding known low-quality shards
+#   python train/scripts/campaign_manager.py create wikiart_hard \
+#       --expression "source(wikiart) AND hard_focus" \
+#       --force-exclude 000099 --force-exclude 000100
+#
+#   # Preview before writing (--simulate shows disk, epoch, score distribution):
+#   python train/scripts/campaign_manager.py create mixed_strategy \
+#       --expression "(top_pct(35) OR hard_focus) AND NOT source(laion)" \
+#       --simulate
 
 # Weight snapshot registry settings.
 # Snapshots are stored at: {cold_root}/weights/registry/

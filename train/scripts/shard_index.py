@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS shards (
     has_unified           INTEGER NOT NULL DEFAULT 0,
     final_value_score     REAL,
     training_loss_normalized REAL,
+    diversity_score       REAL,
+    diversity_source      TEXT,
     indexed_at            REAL NOT NULL,
     tar_mtime             REAL,
     light_mtime           REAL,
@@ -69,7 +71,21 @@ CREATE TABLE IF NOT EXISTS shards (
 CREATE INDEX IF NOT EXISTS idx_source ON shards(source);
 CREATE INDEX IF NOT EXISTS idx_fvs    ON shards(final_value_score);
 CREATE INDEX IF NOT EXISTS idx_dec    ON shards(light_decision);
+CREATE INDEX IF NOT EXISTS idx_div    ON shards(diversity_score);
 """
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add new columns to existing databases as the schema evolves."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(shards)").fetchall()}
+    migrations = [
+        ("diversity_score",  "ALTER TABLE shards ADD COLUMN diversity_score REAL"),
+        ("diversity_source", "ALTER TABLE shards ADD COLUMN diversity_source TEXT"),
+    ]
+    for col, stmt in migrations:
+        if col not in cols:
+            conn.execute(stmt)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +104,7 @@ def _open_db(path: Path = INDEX_PATH, create: bool = True) -> sqlite3.Connection
     if create:
         conn.executescript(_SCHEMA)
         conn.commit()
+        _migrate_schema(conn)
     return conn
 
 
@@ -115,6 +132,8 @@ def _read_shard(tar_path: Path) -> dict:
         "has_unified":       0,
         "final_value_score": None,
         "training_loss_normalized": None,
+        "diversity_score":   None,
+        "diversity_source":  None,
         "indexed_at":        time.time(),
         "tar_mtime":         _mtime(tar_path),
         "light_mtime":       None,
@@ -148,6 +167,11 @@ def _read_shard(tar_path: Path) -> dict:
             entry["source"]            = ud.get("source", entry["source"])
             entry["final_value_score"] = float(ud.get("final_value_score", 0.0))
             entry["training_loss_normalized"] = ud.get("training_loss_normalized")
+            # Diversity signal — present only after unify_scores.py v3.16.0+
+            div_comp = ud.get("components", {}).get("diversity", {})
+            if div_comp.get("value") is not None:
+                entry["diversity_score"]  = float(div_comp["value"])
+                entry["diversity_source"] = div_comp.get("source", "source_rarity")
         except (OSError, json.JSONDecodeError, ValueError):
             pass
 
@@ -218,11 +242,13 @@ def build(shards_dir: Path, force: bool = False, quiet: bool = False) -> int:
             (shard_id, path, source, file_size_bytes,
              has_light_score, light_score, light_decision,
              has_unified, final_value_score, training_loss_normalized,
+             diversity_score, diversity_source,
              indexed_at, tar_mtime, light_mtime, unified_mtime)
             VALUES
             (:shard_id, :path, :source, :file_size_bytes,
              :has_light_score, :light_score, :light_decision,
              :has_unified, :final_value_score, :training_loss_normalized,
+             :diversity_score, :diversity_source,
              :indexed_at, :tar_mtime, :light_mtime, :unified_mtime)
         """, entry)
         n_written += 1
@@ -253,6 +279,7 @@ def query_all(shards_dir: Optional[Path] = None) -> list[dict]:
         SELECT shard_id, path, source,
                has_light_score, light_score, light_decision,
                has_unified, final_value_score, training_loss_normalized,
+               diversity_score, diversity_source,
                file_size_bytes
         FROM shards ORDER BY shard_id
     """).fetchall()
@@ -269,6 +296,8 @@ def query_all(shards_dir: Optional[Path] = None) -> list[dict]:
             "final_value_score":       row["final_value_score"] or 0.0,
             "light_score":             row["light_score"] or 0.0,
             "training_loss_normalized": row["training_loss_normalized"],
+            "diversity_score":         row["diversity_score"],
+            "diversity_source":        row["diversity_source"],
             "light_decision":         row["light_decision"] or "unknown",
             "has_unified":            bool(row["has_unified"]),
             "file_size_bytes":        row["file_size_bytes"],
@@ -335,17 +364,37 @@ def cmd_stats(args) -> None:
                COUNT(*) as n,
                SUM(file_size_bytes) as total_bytes,
                AVG(final_value_score) as avg_fvs,
-               AVG(light_score) as avg_ls
+               AVG(light_score) as avg_ls,
+               AVG(diversity_score) as avg_div,
+               SUM(CASE WHEN diversity_source='embedding' THEN 1 ELSE 0 END) as n_emb_div
         FROM shards GROUP BY source ORDER BY n DESC
     """).fetchall()
-    print(f"  {'Source':<16} {'Count':>6}  {'GB':>6}  {'Avg score':>9}  {'Avg light':>9}")
-    print(f"  {'-'*55}")
+    print(f"  {'Source':<16} {'Count':>6}  {'GB':>6}  {'Avg score':>9}  "
+          f"{'Avg light':>9}  {'Avg div':>8}  {'Emb div':>8}")
+    print(f"  {'-'*73}")
     for row in rows:
-        src  = (row["source"] or "unknown")
-        gb   = f"{(row['total_bytes'] or 0) / 1e9:.1f}"
-        fvs  = f"{row['avg_fvs']:.4f}" if row["avg_fvs"] is not None else "—"
-        ls   = f"{row['avg_ls']:.4f}"  if row["avg_ls"]  is not None else "—"
-        print(f"  {src:<16} {row['n']:>6}  {gb:>6}  {fvs:>9}  {ls:>9}")
+        src     = (row["source"] or "unknown")
+        gb      = f"{(row['total_bytes'] or 0) / 1e9:.1f}"
+        fvs     = f"{row['avg_fvs']:.4f}"  if row["avg_fvs"]  is not None else "—"
+        ls      = f"{row['avg_ls']:.4f}"   if row["avg_ls"]   is not None else "—"
+        div     = f"{row['avg_div']:.4f}"  if row["avg_div"]  is not None else "—"
+        n_emb   = row["n_emb_div"] or 0
+        pct_emb = f"{100*n_emb//max(row['n'],1)}%" if n_emb > 0 else "—"
+        print(f"  {src:<16} {row['n']:>6}  {gb:>6}  {fvs:>9}  "
+              f"{ls:>9}  {div:>8}  {pct_emb:>8}")
+
+    # Diversity distribution across all scored shards
+    div_rows = conn.execute(
+        "SELECT diversity_score FROM shards WHERE diversity_score IS NOT NULL "
+        "ORDER BY diversity_score"
+    ).fetchall()
+    if div_rows:
+        vals = [r[0] for r in div_rows]
+        n    = len(vals)
+        print(f"\n  Diversity score distribution ({n} shards with diversity):")
+        print(f"    min={vals[0]:.4f}  p25={vals[n//4]:.4f}  "
+              f"med={vals[n//2]:.4f}  p75={vals[3*n//4]:.4f}  max={vals[-1]:.4f}")
+
     conn.close()
 
 

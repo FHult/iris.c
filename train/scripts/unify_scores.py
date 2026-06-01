@@ -8,9 +8,17 @@ and before campaign_manager.py creates training manifests.
 
 Signals and default weights (configurable via v2_pipeline.yaml):
   light_score      0.50 — combined_score from score_shards_light.py (static, always)
-  diversity        0.10 — source rarity in pool (computed here, always available)
+  diversity        0.10 — source rarity OR SigLIP embedding diversity (see below)
   training_loss    0.25 — mean loss during training (dynamic, requires flywheel DB)
   contribution     0.15 — model improvement per shard (dynamic, requires flywheel DB)
+
+Embedding diversity (v3.16.0):
+  When unified_scoring.enable_embedding_diversity: true in v2_pipeline.yaml and
+  SigLIP features have been precomputed (precompute_all.py --siglip), the diversity
+  signal is replaced by a richer two-component score:
+    intra-shard diversity  — 1 - mean pairwise cosine similarity within the shard
+    inter-shard rarity     — 1 - mean cosine sim to the 10 most similar shard centroids
+  Centroids are cached in {cold_root}/diversity_centroids.npz for fast incremental runs.
 
 When dynamic signals are absent (cold start), their weight is redistributed
 proportionally to available signals — same approach as aesthetic weight
@@ -25,13 +33,17 @@ Usage:
         --shards /Volumes/16TBCold/shards \\
         --config train/configs/v2_pipeline.yaml
 
-    # Force re-score all shards:
+    # Force re-score all shards (also rebuilds diversity cache):
     train/.venv/bin/python train/scripts/unify_scores.py \\
         --shards /Volumes/16TBCold/shards --force
 
     # Dry run (print score preview without writing files):
     train/.venv/bin/python train/scripts/unify_scores.py \\
         --shards /Volumes/16TBCold/shards --dry-run
+
+    # Force-rebuild the diversity centroid cache only, then exit:
+    train/.venv/bin/python train/scripts/unify_scores.py \\
+        --shards /Volumes/16TBCold/shards --rebuild-diversity-cache
 """
 
 import argparse
@@ -51,6 +63,8 @@ from pipeline_lib import (
 )
 
 VERSION = "v2"
+
+_DIVERSITY_CACHE_VERSION = 1  # bump to invalidate all cached centroids
 
 DEFAULT_WEIGHTS: dict[str, float] = {
     "light_score":   0.50,
@@ -197,6 +211,290 @@ def normalize_losses(training_signals: dict[str, dict]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# SigLIP embedding diversity (v3.16.0)
+# ---------------------------------------------------------------------------
+
+def _dequantize_4bit(q_packed: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """
+    Inverse of precompute_all._quantize_4bit: nibble-packed int8 + per-token scale.
+
+    Input:  q_packed [..., dim//2] uint8,  scale [..., 1] float16.
+    Output: float32 array shape [..., dim].
+    """
+    lo = (q_packed & 0x0F).astype(np.int8)
+    hi = ((q_packed >> 4) & 0x0F).astype(np.int8)
+    # sign-extend from 4-bit two's complement (values 8..15 → -8..-1)
+    lo = np.where(lo > 7, lo - 16, lo).astype(np.float32)
+    hi = np.where(hi > 7, hi - 16, hi).astype(np.float32)
+    out = np.empty((*q_packed.shape[:-1], q_packed.shape[-1] * 2), dtype=np.float32)
+    out[..., 0::2] = lo
+    out[..., 1::2] = hi
+    return out * scale.astype(np.float32)
+
+
+def _load_siglip_pooled(npz_path: Path) -> Optional[np.ndarray]:
+    """
+    Load one SigLIP .npz, dequantize, mean-pool over patch tokens, L2-normalise.
+    Returns float32 [dim] or None on any error.
+    """
+    try:
+        f = np.load(str(npz_path))
+        feat = _dequantize_4bit(f["q"], f["scale"])   # [seq_len, dim] or [dim]
+        if feat.ndim == 2:
+            feat = feat.mean(axis=0)                   # mean-pool patches → [dim]
+        norm = float(np.linalg.norm(feat))
+        if norm > 1e-8:
+            feat = feat / norm
+        return feat.astype(np.float32)
+    except Exception:
+        return None
+
+
+def _shard_siglip_vecs(
+    tar_path: Path, siglip_dir: Path, sample_k: int
+) -> list[np.ndarray]:
+    """
+    Return up to sample_k L2-normalised pooled embeddings for samples in a shard.
+
+    Discovers record IDs by listing tar member stems; looks up {rec_id}.npz
+    in siglip_dir; subsamples randomly when more than sample_k are available.
+    """
+    import tarfile as _tar
+    import random as _rnd
+    try:
+        with _tar.open(str(tar_path), "r:") as tf:
+            stems: set[str] = set()
+            for m in tf.getmembers():
+                if m.isfile():
+                    stem, _, _ = m.name.rpartition(".")
+                    stems.add(stem)
+    except Exception:
+        return []
+
+    available = [s for s in stems if (siglip_dir / f"{s}.npz").exists()]
+    if not available:
+        return []
+    if len(available) > sample_k:
+        available = _rnd.sample(available, sample_k)
+
+    vecs: list[np.ndarray] = []
+    for rid in available:
+        v = _load_siglip_pooled(siglip_dir / f"{rid}.npz")
+        if v is not None:
+            vecs.append(v)
+    return vecs
+
+
+class DiversityCache:
+    """
+    On-disk cache of per-shard SigLIP centroids and intra-diversity scores.
+
+    Stored at {cold_root}/diversity_centroids.npz.  Invalidated per-shard
+    by tar mtime: if the shard's .tar has been replaced since the centroid
+    was computed, it is recomputed on the next run.
+
+    Arrays in the .npz:
+      shard_ids   object  [N]         — shard stem strings
+      centroids   float32 [N, dim]    — L2-normalised mean embedding per shard
+      intra       float32 [N]         — intra-shard diversity score ∈ [0, 1]
+      tar_mtimes  float64 [N]         — tar mtime at compute time (for invalidation)
+      version     int32  scalar       — cache format version
+    """
+
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.cache_path.exists():
+            return
+        try:
+            f = np.load(str(self.cache_path), allow_pickle=True)
+            if int(f["version"]) != _DIVERSITY_CACHE_VERSION:
+                return
+            for i, sid in enumerate(f["shard_ids"]):
+                self._data[str(sid)] = {
+                    "centroid":  f["centroids"][i],
+                    "intra":     float(f["intra"][i]),
+                    "tar_mtime": float(f["tar_mtimes"][i]),
+                }
+        except Exception:
+            pass  # corrupt or version mismatch — start fresh
+
+    def is_stale(self, shard_id: str, tar_mtime: float) -> bool:
+        entry = self._data.get(shard_id)
+        return entry is None or tar_mtime > entry["tar_mtime"]
+
+    def update(self, shard_id: str, centroid: np.ndarray, intra: float,
+               tar_mtime: float) -> None:
+        self._data[shard_id] = {
+            "centroid":  centroid.astype(np.float32),
+            "intra":     float(intra),
+            "tar_mtime": float(tar_mtime),
+        }
+
+    def save(self) -> None:
+        if not self._data:
+            return
+        ids    = np.array(list(self._data.keys()), dtype=object)
+        cens   = np.stack([v["centroid"]  for v in self._data.values()]).astype(np.float32)
+        intra  = np.array([v["intra"]     for v in self._data.values()], dtype=np.float32)
+        mtimes = np.array([v["tar_mtime"] for v in self._data.values()], dtype=np.float64)
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cache_path.with_suffix(".npz.tmp")
+        np.savez(str(tmp),
+                 shard_ids=ids, centroids=cens, intra=intra, tar_mtimes=mtimes,
+                 version=np.array(_DIVERSITY_CACHE_VERSION, dtype=np.int32))
+        # rename the file np.savez actually creates (appends .npz to the stem)
+        real_tmp = Path(str(tmp) + ".npz") if not str(tmp).endswith(".npz") else tmp
+        if real_tmp.exists() and real_tmp != self.cache_path:
+            real_tmp.rename(self.cache_path)
+        elif tmp.exists():
+            tmp.rename(self.cache_path)
+
+    def centroid(self, shard_id: str) -> Optional[np.ndarray]:
+        e = self._data.get(shard_id)
+        return e["centroid"] if e else None
+
+    def intra_score(self, shard_id: str) -> Optional[float]:
+        e = self._data.get(shard_id)
+        return e["intra"] if e else None
+
+
+def build_embedding_diversity(
+    all_shards: list[str],
+    siglip_dir: Path,
+    cache_path: Path,
+    sample_k: int = 256,
+    intra_weight: float = 0.5,
+    force: bool = False,
+) -> dict[str, float]:
+    """
+    Compute combined embedding-diversity scores for all shards.
+
+    Two signals are blended:
+      intra_weight      — intra-shard diversity: 1 - mean pairwise cosine sim
+                          among sample_k images within the shard.
+      1 - intra_weight  — inter-shard rarity: 1 - mean cosine sim to the 10
+                          most similar shard centroids in the pool.
+
+    Returns {shard_stem: score ∈ [0, 1]}.  Shards without any SigLIP features
+    are omitted; the caller substitutes source-rarity diversity for those.
+
+    Centroids and intra scores are cached in cache_path (an .npz file).
+    Only shards whose .tar mtime is newer than the cached entry are recomputed,
+    making incremental runs fast even on 3 TB pools.
+    """
+    cache = DiversityCache(cache_path)
+    n_computed = n_cached = n_missing = 0
+
+    # Pass 1 — per-shard centroid + intra-diversity (cache-aware)
+    for shard_path in all_shards:
+        stem = Path(shard_path).stem
+        try:
+            tar_mtime = Path(shard_path).stat().st_mtime
+        except OSError:
+            tar_mtime = 0.0
+
+        if not force and not cache.is_stale(stem, tar_mtime):
+            n_cached += 1
+            continue
+
+        vecs = _shard_siglip_vecs(Path(shard_path), siglip_dir, sample_k)
+        if not vecs:
+            n_missing += 1
+            continue
+
+        mat      = np.stack(vecs)              # [K, dim], already L2-normalised
+        centroid = mat.mean(axis=0)
+        c_norm   = float(np.linalg.norm(centroid))
+        if c_norm > 1e-8:
+            centroid = centroid / c_norm
+
+        if len(vecs) >= 2:
+            sim  = mat @ mat.T
+            K    = len(vecs)
+            mask = np.triu(np.ones((K, K), dtype=bool), k=1)
+            intra = float(np.clip(1.0 - sim[mask].mean(), 0.0, 1.0))
+        else:
+            intra = 0.5
+
+        cache.update(stem, centroid.astype(np.float32), intra, tar_mtime)
+        n_computed += 1
+        if n_computed % 50 == 0:
+            print(f"  [{n_computed} shards computed, {n_cached} from cache] ...",
+                  flush=True)
+
+    if n_computed > 0:
+        cache.save()
+    print(f"  Embedding diversity: {n_computed} computed, "
+          f"{n_cached} from cache, {n_missing} without SigLIP features")
+
+    # Collect shards that have valid centroids (computed or cached)
+    valid = [(Path(s).stem, cache.centroid(Path(s).stem))
+             for s in all_shards if cache.centroid(Path(s).stem) is not None]
+    if not valid:
+        return {}
+
+    stems     = [v[0] for v in valid]
+    centroids = np.stack([v[1] for v in valid])        # [N, dim]
+
+    # Pass 2 — inter-shard rarity via pairwise cosine similarity matrix
+    sim_matrix = centroids @ centroids.T               # [N, N], already normalised
+    np.fill_diagonal(sim_matrix, 0.0)
+
+    top_k = min(10, len(stems) - 1)
+    if top_k > 0:
+        top_sims = np.sort(sim_matrix, axis=1)[:, -top_k:].mean(axis=1)
+        inter    = np.clip(1.0 - top_sims, 0.0, 1.0)
+    else:
+        inter = np.full(len(stems), 0.5, dtype=np.float32)
+
+    # Normalise inter to [0, 1] across the pool
+    lo, hi = inter.min(), inter.max()
+    if hi > lo:
+        inter = (inter - lo) / (hi - lo)
+
+    result: dict[str, float] = {}
+    for i, stem in enumerate(stems):
+        intra_v  = cache.intra_score(stem) or 0.5
+        combined = intra_weight * intra_v + (1.0 - intra_weight) * float(inter[i])
+        result[stem] = float(np.clip(combined, 0.0, 1.0))
+    return result
+
+
+def _load_embedding_diversity_config(
+    config_path: str,
+) -> tuple[Optional[Path], int, float, bool, Path]:
+    """
+    Parse embedding diversity settings from the pipeline YAML.
+
+    Returns (siglip_dir, sample_k, intra_weight, enabled, cache_path).
+    """
+    try:
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        us       = cfg.get("unified_scoring", {})
+        enabled  = bool(us.get("enable_embedding_diversity", False))
+        raw_dir  = us.get("siglip_precompute_dir")
+        cold_str = cfg.get("storage", {}).get("cold_root", "/Volumes/16TBCold")
+        cold_root = Path(cold_str)
+        siglip_dir: Optional[Path] = (
+            Path(raw_dir) if raw_dir
+            else cold_root / "precomputed" / "siglip"
+        )
+        sample_k     = int(us.get("embedding_diversity_sample_k", 256))
+        intra_weight = float(us.get("embedding_diversity_alpha",  0.5))
+        cache_path   = cold_root / "diversity_centroids.npz"
+        return siglip_dir, sample_k, intra_weight, enabled, cache_path
+    except Exception as e:
+        print(f"  WARNING: could not load embedding diversity config: {e}")
+        return None, 256, 0.5, False, Path("/tmp/diversity_centroids.npz")
+
+
+# ---------------------------------------------------------------------------
 # Core scoring
 # ---------------------------------------------------------------------------
 
@@ -207,6 +505,7 @@ def compute_unified_score(
     training_signals: Optional[dict],
     loss_normalized: Optional[float],
     weights: dict[str, float],
+    embedding_diversity: Optional[float] = None,
 ) -> dict:
     """
     Compute final_value_score for a single shard.
@@ -214,13 +513,22 @@ def compute_unified_score(
     Weights for absent signals are redistributed proportionally to whichever
     signals are available — ensures the final score stays on a [0, 1] scale
     regardless of which dynamic signals have been collected.
+
+    embedding_diversity: pre-computed SigLIP-based diversity score (v3.16.0).
+      When provided, replaces the source-rarity fallback for the diversity
+      signal.  When None, falls back to 1 - source_fraction.
     """
     shard_id = Path(shard_path).stem
     source = light_data.get("source", "unknown")
     light_combined = float(light_data.get("light_scores", {}).get("combined_score", 0.0))
 
-    # Diversity: rarer source → higher diversity value (more unique content per shard)
-    diversity_score = float(max(0.0, 1.0 - source_fractions.get(source, 1.0)))
+    # Diversity: SigLIP-based when available, else rarer source → higher value.
+    if embedding_diversity is not None:
+        diversity_score  = float(np.clip(embedding_diversity, 0.0, 1.0))
+        diversity_source = "embedding"
+    else:
+        diversity_score  = float(max(0.0, 1.0 - source_fractions.get(source, 1.0)))
+        diversity_source = "source_rarity"
 
     has_loss  = loss_normalized is not None
     has_contr = training_signals is not None and "contribution" in training_signals
@@ -270,7 +578,8 @@ def compute_unified_score(
         "final_value_score":         round(final_value_score, 4),
         "components": {
             "light_score":   {"value": round(light_combined, 4), "weight": round(w_l_eff, 4)},
-            "diversity":     {"value": round(diversity_score, 4), "weight": round(w_d_eff, 4)},
+            "diversity":     {"value": round(diversity_score, 4), "weight": round(w_d_eff, 4),
+                              "source": diversity_source},
             "training_loss": {
                 "value":  round(loss_normalized, 4) if loss_normalized is not None else None,
                 "weight": round(w_lo_eff, 4),
@@ -294,20 +603,19 @@ class UnifiedScorer:
     """
     Computes final_value_score by combining quality signals for a shard.
 
-    Current signals:
+    Signals:
       light_score      — static quality from score_shards_light.py (always available)
-      diversity        — source rarity in the pool (always computed)
+      diversity        — SigLIP embedding diversity when precomputed, else source-rarity
       training_loss    — mean training loss on shard samples (dynamic, flywheel DB)
       contribution     — per-shard model improvement (dynamic, flywheel DB)
 
-    Future signals can be added by:
-      1. Adding a weight key to DEFAULT_WEIGHTS
-      2. Implementing the signal computation in a subclass or optional method
-      3. Passing the value as an extra kwarg to compute_unified_score()
-
-    Embedding-diversity signal (inter/intra-shard SigLIP diversity):
-      Scaffold is present via _compute_embedding_diversity() below.
-      Returns None until precompute_all.py has run with --siglip.
+    Embedding diversity (v3.16.0):
+      Pre-computed in from_data() when enable_embedding_diversity: true in
+      v2_pipeline.yaml and SigLIP features are present in siglip_precompute_dir.
+      Two components are blended:
+        intra — 1 - mean pairwise cosine sim within the shard (varied content)
+        inter — 1 - mean cosine sim to the 10 nearest shard centroids (rarity)
+      Centroids are cached in {cold_root}/diversity_centroids.npz.
     """
 
     def __init__(
@@ -315,10 +623,14 @@ class UnifiedScorer:
         weights: dict[str, float],
         source_fractions: dict[str, float],
         loss_normalized_by_stem: dict[str, float],
+        embedding_diversity_by_stem: Optional[dict[str, float]] = None,
     ):
         self.weights = weights
         self.source_fractions = source_fractions
         self.loss_normalized_by_stem = loss_normalized_by_stem
+        self.embedding_diversity_by_stem: dict[str, float] = (
+            embedding_diversity_by_stem or {}
+        )
 
     @classmethod
     def from_data(
@@ -326,12 +638,42 @@ class UnifiedScorer:
         config_path: Optional[str],
         light_by_stem: dict[str, dict],
         training_by_stem: dict[str, dict],
+        all_shards: Optional[list[str]] = None,
+        force_diversity: bool = False,
     ) -> "UnifiedScorer":
-        """Construct a scorer from already-loaded light and training data."""
-        weights = _load_config_weights(config_path) if config_path else dict(DEFAULT_WEIGHTS)
-        source_fractions = compute_source_fractions(light_by_stem)
+        """
+        Construct a scorer from already-loaded light and training data.
+
+        all_shards: list of shard .tar paths — required to compute embedding
+          diversity.  When None or when the config disables it, diversity falls
+          back to source-rarity.
+        force_diversity: pass True to rebuild the centroid cache even for shards
+          that have not changed (useful after a full --siglip re-precompute).
+        """
+        weights              = _load_config_weights(config_path) if config_path else dict(DEFAULT_WEIGHTS)
+        source_fractions     = compute_source_fractions(light_by_stem)
         loss_normalized_by_stem = normalize_losses(training_by_stem)
-        return cls(weights, source_fractions, loss_normalized_by_stem)
+
+        embedding_diversity_by_stem: dict[str, float] = {}
+        if all_shards and config_path:
+            siglip_dir, sample_k, intra_weight, enabled, cache_path = \
+                _load_embedding_diversity_config(config_path)
+            if enabled and siglip_dir and siglip_dir.exists():
+                print(f"  Computing SigLIP embedding diversity "
+                      f"(siglip_dir={siglip_dir}) ...", flush=True)
+                embedding_diversity_by_stem = build_embedding_diversity(
+                    all_shards, siglip_dir, cache_path,
+                    sample_k=sample_k, intra_weight=intra_weight,
+                    force=force_diversity,
+                )
+                print(f"  Embedding diversity ready for "
+                      f"{len(embedding_diversity_by_stem)} shards")
+            elif enabled:
+                print(f"  WARNING: enable_embedding_diversity=true but "
+                      f"siglip_dir not found: {siglip_dir}")
+
+        return cls(weights, source_fractions, loss_normalized_by_stem,
+                   embedding_diversity_by_stem)
 
     def score(self, shard_path: str, light_data: dict,
               training_signals: Optional[dict]) -> dict:
@@ -344,24 +686,8 @@ class UnifiedScorer:
             training_signals=training_signals,
             loss_normalized=self.loss_normalized_by_stem.get(stem),
             weights=self.weights,
+            embedding_diversity=self.embedding_diversity_by_stem.get(stem),
         )
-
-    def _compute_embedding_diversity(self, shard_path: str) -> Optional[float]:
-        """
-        Intra-shard embedding diversity from precomputed SigLIP features.
-
-        Returns None when SigLIP features have not yet been precomputed for this shard.
-        To enable: run precompute_all.py with --siglip then set
-        unified_scoring.enable_embedding_diversity: true in v2_pipeline.yaml.
-
-        When implemented:
-          1. Load per-sample SigLIP embeddings from the precompute directory.
-          2. Compute the mean cosine similarity between all pairs of samples.
-          3. Return 1 - mean_similarity (higher = more diverse).
-        This provides an inter-sample diversity signal beyond the pool-level
-        source-rarity measure already captured by the diversity signal.
-        """
-        return None  # Not yet implemented — precomputed features required
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +730,9 @@ def main() -> None:
                         help="Print scores without writing sidecars or sentinels")
     parser.add_argument("--shard-pattern", default="*.tar",
                         help="Glob pattern for shards within --shards (default: *.tar)")
+    parser.add_argument("--rebuild-diversity-cache", action="store_true",
+                        help="Rebuild the SigLIP centroid cache for all shards and exit "
+                             "(does not write .unified sidecars)")
     args = parser.parse_args()
 
     shards_dir = Path(args.shards)
@@ -415,6 +744,27 @@ def main() -> None:
     all_shards = [s for s in all_shards if s.endswith(".tar") and not s.endswith(".tar.tmp")]
     if not all_shards:
         print(f"No shards found in {shards_dir}")
+        sys.exit(0)
+
+    # --rebuild-diversity-cache: compute/refresh centroids only, no sidecar writes
+    if getattr(args, "rebuild_diversity_cache", False):
+        if not args.config:
+            print("ERROR: --rebuild-diversity-cache requires --config", file=sys.stderr)
+            sys.exit(1)
+        siglip_dir, sample_k, intra_weight, enabled, cache_path = \
+            _load_embedding_diversity_config(args.config)
+        if not enabled:
+            print("WARNING: enable_embedding_diversity is false in config — nothing to do")
+            sys.exit(0)
+        if not siglip_dir or not siglip_dir.exists():
+            print(f"ERROR: siglip_dir not found: {siglip_dir}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Rebuilding diversity centroid cache ({len(all_shards)} shards) ...")
+        scores = build_embedding_diversity(
+            all_shards, siglip_dir, cache_path,
+            sample_k=sample_k, intra_weight=intra_weight, force=True,
+        )
+        print(f"Done. {len(scores)} shards with diversity scores → {cache_path}")
         sys.exit(0)
 
     # Load all light scores (fast — small JSON, sequential)
@@ -436,8 +786,13 @@ def main() -> None:
     else:
         print("  No training signals — cold start: static signals only")
 
-    # Build the scorer (handles weight loading, source fractions, loss normalization)
-    scorer = UnifiedScorer.from_data(args.config, light_by_stem, training_by_stem)
+    # Build the scorer (handles weight loading, source fractions, loss normalization,
+    # and optional SigLIP embedding diversity when configured)
+    scorer = UnifiedScorer.from_data(
+        args.config, light_by_stem, training_by_stem,
+        all_shards=all_shards,
+        force_diversity=args.force,
+    )
     print(f"Weights: " + "  ".join(f"{k}={v:.2f}" for k, v in scorer.weights.items()))
     print("  Source distribution: " +
           ", ".join(f"{src}={frac:.1%}"
@@ -490,6 +845,7 @@ def main() -> None:
                 "unify_scores", chunk=None,
                 done=i + 1, total=len(pending), pct=pct,
                 n_with_training=n_training,
+                n_with_embedding_diversity=len(scorer.embedding_diversity_by_stem),
             )
 
     if args.dry_run:

@@ -6,18 +6,34 @@ produces a manifest JSON that lists which shards to include in a training run,
 ranked by final_value_score from unify_scores.py (or combined_score from light
 scores if unified scores are not yet available).
 
-Built-in strategies:
+Built-in strategies (--strategy):
   all_keep        — all shards where light scoring decision == keep
   top_pct N       — top N% of scored shards by final_value_score
   source_boost    — multiply per-source scores by a factor before ranking
   balanced        — equal (per-source-proportional) representation
   hard_focus      — rank by training_loss_normalized; prefer harder examples
 
+Boolean expression campaigns (--expression, v3.16.0):
+  Combine built-in filter primitives and named campaign references using
+  AND / OR / NOT with full parenthesis grouping:
+
+    top_pct(80) AND source(wikiart)
+    (top_pct(35) OR hard_focus) AND NOT min_light(0.3)
+    campaign(large_baseline) AND min_score(0.55) AND NOT source(laion)
+
+  Primitives:
+    keep                  light_decision == keep
+    hard_focus            top 50%% by training_loss_normalized
+    top_pct(N)            top N%% by final_value_score
+    top_n(N)              top N shards by final_value_score
+    min_score(N)          final_value_score >= N
+    min_light(N)          light_score >= N
+    min_loss(N)           training_loss_normalized >= N
+    source(NAME)          source == NAME  (also: source:NAME bare syntax)
+    campaign(NAME)        shards included in named campaign manifest
+
 Manifests are written to:
     {cold_root}/campaigns/{name}/manifest.json
-
-They can be consumed by ip_adapter/dataset.py via make_prefetch_loader_from_manifest()
-or read by training scripts to construct the shard_paths list.
 
 Usage:
     python train/scripts/campaign_manager.py create large_baseline
@@ -25,6 +41,11 @@ Usage:
     python train/scripts/campaign_manager.py create wikiart_focused \\
         --source-boost wikiart:2.0 --top-pct 80
     python train/scripts/campaign_manager.py create hard_example_heavy --strategy hard_focus
+    python train/scripts/campaign_manager.py create wikiart_high_quality \\
+        --expression "source(wikiart) AND top_pct(80)" --min-score 0.55
+    python train/scripts/campaign_manager.py create mixed_strategy \\
+        --expression "(top_pct(35) OR hard_focus) AND NOT source(laion)"
+    python train/scripts/campaign_manager.py create mixed_strategy --simulate
     python train/scripts/campaign_manager.py list
     python train/scripts/campaign_manager.py show large_baseline
     python train/scripts/campaign_manager.py stats
@@ -75,6 +96,303 @@ DEFAULT_CAMPAIGNS: dict[str, dict] = {
         "top_pct": 60,
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Boolean expression engine (v3.16.0)
+# ---------------------------------------------------------------------------
+# Grammar (precedence low→high):
+#   expr     := or_expr
+#   or_expr  := and_expr  ("OR"  and_expr)*
+#   and_expr := not_expr  ("AND" not_expr)*
+#   not_expr := "NOT" not_expr | atom
+#   atom     := "(" expr ")"
+#              | IDENT "(" [arg ("," arg)*] ")"   # primitive call
+#              | IDENT                              # no-arg primitive or campaign ref
+
+class _TT:
+    AND    = "AND";    OR     = "OR";    NOT   = "NOT"
+    LPAREN = "(";      RPAREN = ")"
+    COMMA  = ",";      EOF    = "EOF"
+    NUMBER = "NUMBER"; IDENT  = "IDENT"
+
+
+class _Tok:
+    __slots__ = ("tt", "val")
+    def __init__(self, tt: str, val): self.tt = tt; self.val = val
+    def __repr__(self): return f"Tok({self.tt},{self.val!r})"
+
+
+_KW = {"AND", "OR", "NOT"}
+
+
+def _tokenize(text: str) -> list:
+    """Tokenize a boolean expression string into _Tok objects."""
+    toks: list = []
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        ch = text[i]
+        if ch == "(":
+            toks.append(_Tok(_TT.LPAREN, "("));  i += 1
+        elif ch == ")":
+            toks.append(_Tok(_TT.RPAREN, ")"));  i += 1
+        elif ch == ",":
+            toks.append(_Tok(_TT.COMMA,  ","));  i += 1
+        elif ch.isdigit() or (ch in "-." and i + 1 < n and text[i + 1].isdigit()):
+            j = i
+            if text[j] in "-.":
+                j += 1
+            while j < n and (text[j].isdigit() or text[j] == "."):
+                j += 1
+            toks.append(_Tok(_TT.NUMBER, float(text[i:j])));  i = j
+        elif ch.isalpha() or ch == "_":
+            j = i
+            # Allow colon in identifiers for source:name syntax
+            while j < n and (text[j].isalnum() or text[j] in "_:"):
+                j += 1
+            word = text[i:j]
+            tt   = word.upper() if word.upper() in _KW else _TT.IDENT
+            toks.append(_Tok(tt, word));  i = j
+        else:
+            raise ValueError(f"Unexpected character {ch!r} at position {i} "
+                             f"in expression: {text!r}")
+    toks.append(_Tok(_TT.EOF, ""))
+    return toks
+
+
+class _Parser:
+    """Recursive-descent parser — produces an AST as nested tuples."""
+
+    def __init__(self, tokens: list):
+        self._t   = tokens
+        self._pos = 0
+
+    def _peek(self) -> _Tok:
+        return self._t[self._pos]
+
+    def _eat(self, expected: Optional[str] = None) -> _Tok:
+        tok = self._t[self._pos]
+        if expected and tok.tt != expected:
+            raise ValueError(
+                f"Expected {expected!r}, got {tok.tt!r} ({tok.val!r}) "
+                f"at token {self._pos}"
+            )
+        self._pos += 1
+        return tok
+
+    def parse(self):
+        node = self._or()
+        if self._peek().tt != _TT.EOF:
+            raise ValueError(f"Unexpected token: {self._peek()!r}")
+        return node
+
+    def _or(self):
+        left = self._and()
+        while self._peek().tt == _TT.OR:
+            self._eat(_TT.OR)
+            right = self._and()
+            left  = ("or", left, right)
+        return left
+
+    def _and(self):
+        left = self._not()
+        while self._peek().tt == _TT.AND:
+            self._eat(_TT.AND)
+            right = self._not()
+            left  = ("and", left, right)
+        return left
+
+    def _not(self):
+        if self._peek().tt == _TT.NOT:
+            self._eat(_TT.NOT)
+            return ("not", self._not())    # right-associative
+        return self._atom()
+
+    def _atom(self):
+        tok = self._peek()
+        if tok.tt == _TT.LPAREN:
+            self._eat(_TT.LPAREN)
+            node = self._or()
+            self._eat(_TT.RPAREN)
+            return node
+        if tok.tt == _TT.IDENT:
+            self._eat(_TT.IDENT)
+            if self._peek().tt == _TT.LPAREN:   # function call
+                self._eat(_TT.LPAREN)
+                args: list = []
+                if self._peek().tt != _TT.RPAREN:
+                    args.append(self._arg())
+                    while self._peek().tt == _TT.COMMA:
+                        self._eat(_TT.COMMA)
+                        args.append(self._arg())
+                self._eat(_TT.RPAREN)
+                return ("call", tok.val, args)
+            return ("ident", tok.val)           # bare identifier
+        raise ValueError(f"Unexpected token {tok!r} — expected expression atom")
+
+    def _arg(self):
+        tok = self._peek()
+        if tok.tt == _TT.NUMBER:
+            self._eat(_TT.NUMBER)
+            return tok.val
+        if tok.tt == _TT.IDENT:
+            self._eat(_TT.IDENT)
+            return tok.val
+        raise ValueError(f"Expected argument, got {tok!r}")
+
+
+def _top_pct_loss(entries: list, pct: float) -> frozenset:
+    """Return top pct% shard_ids ranked by training loss (hard focus)."""
+    def _score(e):
+        tl = e.get("training_loss_normalized")
+        return float(tl) if tl is not None else 1.0 - e["light_score"]
+    ranked = sorted(entries, key=_score, reverse=True)
+    cutoff = max(1, int(len(ranked) * pct / 100))
+    return frozenset(e["shard_id"] for e in ranked[:cutoff])
+
+
+_BUILTIN_NOARG: dict[str, any] = {
+    "keep":       lambda entries: frozenset(
+                      e["shard_id"] for e in entries
+                      if e.get("light_decision", "keep") != "discard"),
+    "hard_focus": lambda entries: _top_pct_loss(entries, 50),
+    "all":        lambda entries: frozenset(e["shard_id"] for e in entries),
+    "all_unified":lambda entries: frozenset(
+                      e["shard_id"] for e in entries if e.get("has_unified")),
+}
+
+
+class _Evaluator:
+    """
+    Walk the AST and return a frozenset of shard_ids that match each node.
+
+    Built-in primitives are resolved directly against `entries`.
+    Bare identifiers that don't match a built-in are treated as campaign
+    references — they load the named manifest from campaigns_dir.
+    """
+
+    def __init__(self, entries: list, campaigns_dir: Path):
+        self._entries     = entries
+        self._all_ids     = frozenset(e["shard_id"] for e in entries)
+        self._campaigns_dir = campaigns_dir
+
+    def eval(self, node) -> frozenset:
+        tag = node[0]
+        if tag == "or":
+            return self.eval(node[1]) | self.eval(node[2])
+        if tag == "and":
+            return self.eval(node[1]) & self.eval(node[2])
+        if tag == "not":
+            return self._all_ids - self.eval(node[1])
+        if tag == "call":
+            return self._call(node[1], node[2])
+        if tag == "ident":
+            return self._ident(node[1])
+        raise ValueError(f"Unknown AST node: {node!r}")
+
+    def _call(self, name: str, args: list) -> frozenset:
+        """Evaluate parameterised primitives like top_pct(80), source(wikiart)."""
+        nm = name.lower()
+
+        if nm == "top_pct":
+            pct      = float(args[0]) if args else 80.0
+            eligible = sorted(
+                (e for e in self._entries if e["final_value_score"] > 0),
+                key=lambda e: e["final_value_score"], reverse=True,
+            )
+            cutoff = max(1, int(len(eligible) * pct / 100))
+            return frozenset(e["shard_id"] for e in eligible[:cutoff])
+
+        if nm == "top_n":
+            n        = int(args[0]) if args else 100
+            eligible = sorted(
+                (e for e in self._entries if e["final_value_score"] > 0),
+                key=lambda e: e["final_value_score"], reverse=True,
+            )
+            return frozenset(e["shard_id"] for e in eligible[:n])
+
+        if nm == "min_score":
+            thresh = float(args[0]) if args else 0.5
+            return frozenset(e["shard_id"] for e in self._entries
+                             if e["final_value_score"] >= thresh)
+
+        if nm == "min_light":
+            thresh = float(args[0]) if args else 0.5
+            return frozenset(e["shard_id"] for e in self._entries
+                             if e["light_score"] >= thresh)
+
+        if nm == "min_loss":
+            thresh = float(args[0]) if args else 0.5
+            return frozenset(
+                e["shard_id"] for e in self._entries
+                if e.get("training_loss_normalized") is not None
+                and e["training_loss_normalized"] >= thresh
+            )
+
+        if nm in ("source", "src"):
+            target = str(args[0]).lower() if args else ""
+            return frozenset(e["shard_id"] for e in self._entries
+                             if e["source"].lower() == target)
+
+        if nm in ("hard_focus", "hard_mining_focus"):
+            pct = float(args[0]) if args else 50.0
+            return _top_pct_loss(self._entries, pct)
+
+        if nm == "campaign":
+            return self._load_campaign(str(args[0]) if args else "")
+
+        raise ValueError(
+            f"Unknown primitive {name!r}. "
+            "Available: top_pct(N), top_n(N), min_score(N), min_light(N), "
+            "min_loss(N), source(NAME), hard_focus([N]), campaign(NAME)"
+        )
+
+    def _ident(self, name: str) -> frozenset:
+        """Bare identifier: source:NAME shorthand, built-in no-arg, or campaign ref."""
+        # source:name shorthand
+        if ":" in name:
+            prefix, _, rest = name.partition(":")
+            if prefix.lower() == "source":
+                return frozenset(e["shard_id"] for e in self._entries
+                                 if e["source"].lower() == rest.lower())
+        # no-arg built-ins
+        if name in _BUILTIN_NOARG:
+            return frozenset(_BUILTIN_NOARG[name](self._entries))
+        # campaign reference
+        return self._load_campaign(name)
+
+    def _load_campaign(self, name: str) -> frozenset:
+        path = self._campaigns_dir / name / "manifest.json"
+        if not path.exists():
+            raise ValueError(
+                f"Expression references '{name}', which is neither a known "
+                f"primitive nor an existing campaign "
+                f"(manifest not found: {path})"
+            )
+        try:
+            m = json.loads(path.read_text())
+            return frozenset(
+                e["shard_id"] for e in m.get("entries", [])
+                if e.get("decision") == "include"
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            raise ValueError(f"Could not load campaign '{name}': {e}")
+
+
+def _eval_expression(expr: str, entries: list, campaigns_dir: Path) -> frozenset:
+    """
+    Parse and evaluate a boolean expression.
+
+    Returns frozenset of shard_ids that satisfy the expression.
+    Raises ValueError with a descriptive message on syntax or reference errors.
+    """
+    tokens = _tokenize(expr)
+    ast    = _Parser(tokens).parse()
+    return _Evaluator(entries, campaigns_dir).eval(ast)
 
 
 # ---------------------------------------------------------------------------
@@ -407,10 +725,25 @@ def cmd_create(args, cfg: dict) -> None:
           f"{n_with_light} with light scores only, "
           f"{len(entries) - n_with_unified - n_with_light} unscored")
 
-    print(f"Applying strategy '{strategy}' ...", flush=True)
-    entries = _apply_strategy(entries, strategy, strategy_params)
+    expression = getattr(args, "expression", None)
 
-    # Post-strategy min_score floor: exclude shards below the threshold.
+    if expression:
+        # Expression path: evaluate boolean expression → set of included shard_ids.
+        print(f"Evaluating expression: {expression!r}", flush=True)
+        try:
+            included_ids = _eval_expression(expression, entries, CAMPAIGNS_DIR)
+        except ValueError as exc:
+            print(f"ERROR: expression error — {exc}", file=sys.stderr)
+            sys.exit(1)
+        for e in entries:
+            e["decision"] = "include" if e["shard_id"] in included_ids else "exclude"
+        strategy = "expression"
+        print(f"  Expression matched {len(included_ids):,} / {len(entries):,} shards")
+    else:
+        print(f"Applying strategy '{strategy}' ...", flush=True)
+        entries = _apply_strategy(entries, strategy, strategy_params)
+
+    # Post-strategy / post-expression min_score floor.
     if min_score is not None:
         n_filtered = 0
         for e in entries:
@@ -421,6 +754,15 @@ def cmd_create(args, cfg: dict) -> None:
                 n_filtered += 1
         if n_filtered:
             print(f"  min_score={min_score:.4f}: filtered out {n_filtered} shards below threshold")
+
+    # Post-expression force overrides (when using --expression, _apply_strategy isn't
+    # called, so we apply force flags here explicitly).
+    if expression:
+        for e in entries:
+            if e.get("force_include"):
+                e["decision"] = "include"
+            elif e.get("force_exclude"):
+                e["decision"] = "exclude"
 
     included = [e for e in entries if e["decision"] == "include"]
     excluded = [e for e in entries if e["decision"] != "include"]
@@ -484,6 +826,8 @@ def cmd_create(args, cfg: dict) -> None:
         manifest["base_campaign"] = base_campaign
     if min_score is not None:
         manifest["min_score"] = min_score
+    if expression:
+        manifest["expression"] = expression
 
     if args.description:
         manifest["description"] = args.description
@@ -572,7 +916,10 @@ def cmd_show(args, cfg: dict) -> None:
     print(f"Campaign: {m['campaign']}")
     if m.get("description"):
         print(f"  {m['description']}")
-    print(f"  Strategy:      {m['strategy']}  params={m.get('strategy_params', {})}")
+    if m.get("expression"):
+        print(f"  Expression:    {m['expression']}")
+    else:
+        print(f"  Strategy:      {m['strategy']}  params={m.get('strategy_params', {})}")
     print(f"  Shards dir:    {m['shards_dir']}")
     print(f"  Include:       {m['n_include']:,} / {m['total_shards']:,}")
     print(f"  Samples (est): {m['total_samples']:,}")
@@ -704,6 +1051,15 @@ def cmd_validate(args, cfg: dict) -> None:
     errors: list[str] = []
     warnings: list[str] = []
 
+    # Expression syntax check (re-parse to catch any changes to the engine)
+    expression = m.get("expression")
+    if expression:
+        try:
+            _eval_expression.__module__  # ensure engine is loaded
+            _Parser(_tokenize(expression)).parse()
+        except ValueError as exc:
+            errors.append(f"Expression syntax error: {exc}")
+
     # Checksum verification
     stored_checksum = m.get("checksum")
     if stored_checksum:
@@ -785,6 +1141,7 @@ def cmd_create_defaults(args, cfg: dict) -> None:
         fa.min_score = None
         fa.force_include = None
         fa.force_exclude = None
+        fa.expression = None
         print(f"\n{'='*60}")
         print(f"Creating default campaign: {name}")
         print(f"{'='*60}")
@@ -829,6 +1186,10 @@ def main() -> None:
     p_create.add_argument("--force-exclude", dest="force_exclude", action="append",
                           default=None, metavar="SHARD_ID",
                           help="Always exclude this shard regardless of strategy (repeatable)")
+    p_create.add_argument("--expression", default=None, metavar="EXPR",
+                          help="Boolean expression for shard inclusion using AND/OR/NOT "
+                               "(e.g. \"top_pct(80) AND source(wikiart)\"); "
+                               "mutually exclusive with --strategy")
     p_create.add_argument("--dry-run", action="store_true",
                           help="Print manifest stats without writing to disk")
     p_create.add_argument("--simulate", action="store_true",

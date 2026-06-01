@@ -1641,9 +1641,25 @@ def _check_unified_scoring() -> None:
 
     cov_pct = round(100 * n_scored / total_shards, 1)
 
+    # Check embedding diversity cache
+    diversity_cache = COLD_ROOT / "diversity_centroids.npz"
+    if diversity_cache.exists():
+        import numpy as _np
+        try:
+            _f = _np.load(str(diversity_cache), allow_pickle=True)
+            n_div = len(_f["shard_ids"]) if "shard_ids" in _f else 0
+            _add("INFO", "unified_scoring",
+                 f"Embedding diversity cache: {n_div:,} shard centroids cached "
+                 f"({diversity_cache.stat().st_size / 1e6:.1f} MB)",
+                 ctx={"diversity_cache": str(diversity_cache),
+                      "n_centroids": n_div})
+        except Exception:
+            pass
+
     # Aggregate per-source stats
     by_source: dict = {}
     n_with_dynamic = 0
+    n_with_emb_div = 0
     for p in sidecars:
         try:
             data = json.loads(p.read_text())
@@ -1656,6 +1672,9 @@ def _check_unified_scoring() -> None:
                        or data.get("contribution_score") is not None)
         if has_dyn:
             n_with_dynamic += 1
+        div_src = data.get("components", {}).get("diversity", {}).get("source", "")
+        if div_src == "embedding":
+            n_with_emb_div += 1
 
         entry = by_source.setdefault(src, {"scores": [], "light_scores": [], "n": 0})
         entry["scores"].append(fvs)
@@ -1669,11 +1688,15 @@ def _check_unified_scoring() -> None:
                   "coverage_pct": cov_pct})
     else:
         dyn_pct = round(100 * n_with_dynamic / max(n_scored, 1), 1)
+        emb_pct = round(100 * n_with_emb_div / max(n_scored, 1), 1)
         _add("INFO", "unified_scoring",
              f"Unified scores complete: {n_scored} shards — "
-             f"{n_with_dynamic} ({dyn_pct}%) have dynamic training signals",
+             f"{n_with_dynamic} ({dyn_pct}%) dynamic signals, "
+             f"{n_with_emb_div} ({emb_pct}%) embedding diversity",
              ctx={"total_shards": total_shards, "unified_scored": n_scored,
-                  "n_with_dynamic": n_with_dynamic, "dynamic_pct": dyn_pct})
+                  "n_with_dynamic": n_with_dynamic, "dynamic_pct": dyn_pct,
+                  "n_with_emb_diversity": n_with_emb_div,
+                  "emb_diversity_pct": emb_pct})
 
     for src, entry in sorted(by_source.items()):
         sc = entry["scores"]
@@ -1746,12 +1769,26 @@ def _check_campaigns() -> None:
                  ctx={"campaign": name, "manifest_shards": n_tot,
                       "current_shards": n_current_shards})
         else:
-            pct = round(100 * n_inc / max(n_tot, 1))
+            pct  = round(100 * n_inc / max(n_tot, 1))
+            expr = m.get("expression")
+            kind = f"expr={expr!r}" if expr else f"strategy={m.get('strategy','?')}"
+            # Diversity score distribution for included shards
+            div_vals = sorted(
+                e.get("final_value_score", 0.0)
+                for e in m.get("entries", []) if e.get("decision") == "include"
+            )
+            score_range = ""
+            if div_vals:
+                n_d = len(div_vals)
+                score_range = (f"  scores=[{div_vals[0]:.3f}…{div_vals[n_d//2]:.3f}"
+                               f"…{div_vals[-1]:.3f}]")
             _add("INFO", "campaigns",
                  f"Campaign '{name}': {n_inc:,}/{n_tot:,} shards ({pct}%)  "
-                 f"avg_score={avg_s:.4f}  created={created[:10]}",
+                 f"avg_score={avg_s:.4f}  {kind}  created={created[:10]}"
+                 f"{score_range}",
                  ctx={"campaign": name, "n_include": n_inc, "n_total": n_tot,
-                      "pct": pct, "avg_score": avg_s})
+                      "pct": pct, "avg_score": avg_s,
+                      "expression": expr, "strategy": m.get("strategy")})
 
     # Weight registry summary
     if WEIGHT_REGISTRY_DIR.exists():
