@@ -50,6 +50,8 @@ COLD_VAL_DIR         = COLD_ROOT / "validation"
 COLD_VAL_SHARDS_DIR  = COLD_VAL_DIR / "held_out"
 COLD_VAL_PRECOMP_DIR = COLD_VAL_DIR / "precomputed"
 COLD_SHARDS_DIR      = COLD_ROOT / "shards"   # unified shard pool (all sources)
+CAMPAIGNS_DIR        = COLD_ROOT / "campaigns"            # campaign manifests
+WEIGHT_REGISTRY_DIR  = COLD_ROOT / "weights" / "registry" # weight snapshot registry
 
 VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
 VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
@@ -559,6 +561,63 @@ def get_combined_score(shard_path: str) -> Optional[float]:
     if data is None:
         return None
     return data.get("light_scores", {}).get("combined_score")
+
+
+def get_unified_score(shard_path: str) -> Optional[dict]:
+    """Read the .unified_score.json sidecar for a shard. Returns None if absent."""
+    p = Path(shard_path).with_suffix(".unified_score.json")
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def get_final_value_score(shard_path: str) -> Optional[float]:
+    """Return final_value_score from the unified score sidecar, or None if absent."""
+    data = get_unified_score(shard_path)
+    if data is not None:
+        return data.get("final_value_score")
+    # Fall back to combined_score from light scoring
+    return get_combined_score(shard_path)
+
+
+def load_manifest(manifest_path) -> dict:
+    """Load a campaign manifest JSON from disk."""
+    p = Path(manifest_path)
+    return json.loads(p.read_text())
+
+
+def save_manifest(manifest: dict, path) -> None:
+    """Atomically write a campaign manifest JSON."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp.rename(p)
+
+
+def register_weight_snapshot(
+    snapshot_id: str,
+    campaign: str,
+    weights_path: str,
+    **kwargs,
+) -> "Path":
+    """
+    Register a weight snapshot in the registry.
+
+    Thin wrapper around weight_registry.register_snapshot — kept here so
+    training scripts can import a single function without needing weight_registry.
+    """
+    # Import lazily to avoid mandatory weight_registry dep on every pipeline_lib import
+    import importlib, sys as _sys
+    _wr_path = str(SCRIPTS_DIR)
+    if _wr_path not in _sys.path:
+        _sys.path.insert(0, _wr_path)
+    wr = importlib.import_module("weight_registry")
+    return wr.register_snapshot(snapshot_id, campaign, weights_path, **kwargs)
 
 
 def should_precompute(shard_path: str, default: bool = True) -> bool:

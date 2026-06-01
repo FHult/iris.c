@@ -39,6 +39,7 @@ from pipeline_lib import (
     COLD_ROOT, COLD_PRECOMPUTE_DIR, COLD_WEIGHTS_DIR, COLD_METADATA_DIR,
     TMUX_SESSION, TMUX_TRAIN_WIN, TMUX_PREP_WIN, TMUX_STAGE_WIN,
     TMUX_ABLATION_WIN, FLYWHEEL_DB_PATH, SHARD_SCORES_DB_PATH,
+    COLD_SHARDS_DIR, CAMPAIGNS_DIR, WEIGHT_REGISTRY_DIR,
     read_state, load_config,
     is_done, has_error, read_error,
     read_heartbeat, heartbeat_age_secs,
@@ -1609,6 +1610,168 @@ def _check_val_set(cfg: dict) -> None:
                   "tier": tier_label})
 
 
+def _check_unified_scoring() -> None:
+    """Report unified score pool health: coverage, per-source distributions, dynamic signal status."""
+    shards_dir = COLD_SHARDS_DIR
+    if not shards_dir.exists():
+        return
+
+    total_shards = sum(1 for _ in shards_dir.glob("*.tar"))
+    if total_shards == 0:
+        return
+
+    sidecars = list(shards_dir.glob("*.unified_score.json"))
+    n_scored = len(sidecars)
+
+    if n_scored == 0:
+        light_sidecars = sum(1 for _ in shards_dir.glob("*.light_scores.json"))
+        if light_sidecars > 0:
+            venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+            scripts  = str(SCRIPTS_DIR)
+            _add("INFO", "unified_scoring",
+                 f"Unified scores not yet computed: {light_sidecars} light scores available",
+                 detail="Run unify_scores.py to merge light scores + training signals into "
+                        "final_value_score. This enables campaign-based shard selection.",
+                 fix=(f"{venv_py} {scripts}/unify_scores.py "
+                      f"--shards {shards_dir} "
+                      f"--config train/configs/v2_pipeline.yaml"),
+                 ctx={"total_shards": total_shards, "light_scored": light_sidecars,
+                      "unified_scored": 0})
+        return
+
+    cov_pct = round(100 * n_scored / total_shards, 1)
+
+    # Aggregate per-source stats
+    by_source: dict = {}
+    n_with_dynamic = 0
+    for p in sidecars:
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        src = data.get("source", "unknown")
+        fvs = float(data.get("final_value_score", 0.0))
+        ls  = float(data.get("light_score", 0.0))
+        has_dyn = bool(data.get("training_loss_normalized") is not None
+                       or data.get("contribution_score") is not None)
+        if has_dyn:
+            n_with_dynamic += 1
+
+        entry = by_source.setdefault(src, {"scores": [], "light_scores": [], "n": 0})
+        entry["scores"].append(fvs)
+        entry["light_scores"].append(ls)
+        entry["n"] += 1
+
+    if cov_pct < 100:
+        _add("INFO", "unified_scoring",
+             f"Unified scoring in progress: {n_scored}/{total_shards} shards ({cov_pct}%)",
+             ctx={"total_shards": total_shards, "unified_scored": n_scored,
+                  "coverage_pct": cov_pct})
+    else:
+        dyn_pct = round(100 * n_with_dynamic / max(n_scored, 1), 1)
+        _add("INFO", "unified_scoring",
+             f"Unified scores complete: {n_scored} shards — "
+             f"{n_with_dynamic} ({dyn_pct}%) have dynamic training signals",
+             ctx={"total_shards": total_shards, "unified_scored": n_scored,
+                  "n_with_dynamic": n_with_dynamic, "dynamic_pct": dyn_pct})
+
+    for src, entry in sorted(by_source.items()):
+        sc = entry["scores"]
+        ls = entry["light_scores"]
+        avg_fvs = round(sum(sc) / max(len(sc), 1), 4)
+        avg_ls  = round(sum(ls) / max(len(ls), 1), 4)
+        delta   = round(avg_fvs - avg_ls, 4)
+        _add("INFO", "unified_scoring",
+             f"  {src}: n={entry['n']}  avg_final_value={avg_fvs:.4f}  "
+             f"avg_light={avg_ls:.4f}  Δ={delta:+.4f}",
+             ctx={"source": src, "n": entry["n"],
+                  "avg_final_value": avg_fvs, "avg_light": avg_ls, "delta": delta})
+
+
+def _check_campaigns() -> None:
+    """Report campaign manifest health: coverage, shard counts, age."""
+    if not CAMPAIGNS_DIR.exists():
+        return
+
+    manifests = list(CAMPAIGNS_DIR.glob("*/manifest.json"))
+    if not manifests:
+        # Only flag absence if light scoring is done (campaigns are optional until then)
+        light_sidecars = sum(1 for _ in COLD_SHARDS_DIR.glob("*.light_scores.json")) \
+            if COLD_SHARDS_DIR.exists() else 0
+        if light_sidecars > 0:
+            venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+            scripts  = str(SCRIPTS_DIR)
+            _add("INFO", "campaigns",
+                 "No campaign manifests found — consider creating one for strategic training",
+                 detail="Campaigns define which shards to include in a training run.",
+                 fix=(f"{venv_py} {scripts}/campaign_manager.py create-defaults "
+                      f"--shards {COLD_SHARDS_DIR}"),
+                 ctx={"campaigns_dir": str(CAMPAIGNS_DIR), "n_manifests": 0})
+        return
+
+    import time as _time
+    now_ts = _time.time()
+
+    for manifest_path in sorted(manifests):
+        try:
+            m = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            _add("WARNING", "campaigns",
+                 f"Campaign manifest unreadable: {manifest_path.parent.name}",
+                 fix=f"rm {manifest_path}  # regenerate with campaign_manager.py create")
+            continue
+
+        name    = m.get("campaign", manifest_path.parent.name)
+        n_inc   = m.get("n_include", 0)
+        n_tot   = m.get("total_shards", 0)
+        avg_s   = m.get("avg_final_value_score", 0.0)
+        created = m.get("created_at", "")
+
+        # Age check: warn if shards_dir has changed since the manifest was written
+        # (new shards built after the last campaign create run)
+        shards_dir = Path(m.get("shards_dir", str(COLD_SHARDS_DIR)))
+        n_current_shards = sum(1 for _ in shards_dir.glob("*.tar")) if shards_dir.exists() else 0
+        stale = n_current_shards > 0 and abs(n_current_shards - n_tot) > max(10, n_tot * 0.05)
+
+        if stale:
+            venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+            scripts  = str(SCRIPTS_DIR)
+            _add("WARNING", "campaigns",
+                 f"Campaign '{name}' manifest may be stale: "
+                 f"manifest={n_tot} shards, pool now has {n_current_shards}",
+                 detail="New shards were built after this campaign manifest was created. "
+                        "Regenerate to include new shards in the selection.",
+                 fix=(f"{venv_py} {scripts}/campaign_manager.py create {name} "
+                      f"--shards {shards_dir}"),
+                 ctx={"campaign": name, "manifest_shards": n_tot,
+                      "current_shards": n_current_shards})
+        else:
+            pct = round(100 * n_inc / max(n_tot, 1))
+            _add("INFO", "campaigns",
+                 f"Campaign '{name}': {n_inc:,}/{n_tot:,} shards ({pct}%)  "
+                 f"avg_score={avg_s:.4f}  created={created[:10]}",
+                 ctx={"campaign": name, "n_include": n_inc, "n_total": n_tot,
+                      "pct": pct, "avg_score": avg_s})
+
+    # Weight registry summary
+    if WEIGHT_REGISTRY_DIR.exists():
+        index_path = WEIGHT_REGISTRY_DIR / "index.json"
+        try:
+            index = json.loads(index_path.read_text()) if index_path.exists() else []
+            if index:
+                latest = index[0]
+                _add("INFO", "campaigns",
+                     f"Weight registry: {len(index)} snapshot(s) — "
+                     f"latest='{latest.get('snapshot_id','?')}' "
+                     f"campaign='{latest.get('campaign','?')}' "
+                     f"({latest.get('timestamp','')[:10]})",
+                     ctx={"n_snapshots": len(index),
+                          "latest_id": latest.get("snapshot_id"),
+                          "latest_campaign": latest.get("campaign")})
+        except (OSError, json.JSONDecodeError):
+            pass
+
+
 def _check_pool_health(cfg: dict) -> None:
     storage = cfg.get("storage", {})
     for key, label, sentinel in [
@@ -2568,6 +2731,8 @@ def main() -> None:
         _check_campaign_state()
         _check_shard_coverage()
         _check_light_scoring()
+        _check_unified_scoring()
+        _check_campaigns()
         _check_pool_health(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)

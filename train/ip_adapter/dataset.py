@@ -31,6 +31,7 @@ Pre-computed embed loading:
 """
 
 import io
+import json
 import os
 import queue
 import random
@@ -66,9 +67,17 @@ BUCKETS: List[Tuple[int, int]] = [
     (640, 640),
     (512, 896),
     (896, 512),
+    # 1024 px stage (TRAIN-7 / Stage 3) — add after shard resolution sweep + memory profiling
+    # (1024, 1024),
+    # (896, 1152), (1152, 896), (1024, 1280), (1280, 1024),
 ]
 
 # Do NOT add 256px — degenerate for Flux's patchification.
+# 1024 px buckets should only be enabled after:
+#   - VAE tiling is proven at 1024 (already implemented in precompute_all.py)
+#   - A shard sweep confirms sufficient native-resolution images in the pool
+#   - Memory profiling at 1024 px batch=1 succeeds on the target hardware
+# See BACKLOG.md "Stage 3: 1024px fine-tune" and plans/warmup-campaign-runbook.md.
 
 
 def _select_bucket(w: int, h: int) -> Tuple[int, int]:
@@ -535,3 +544,44 @@ def make_prefetch_loader(
                 "shard_loader encountered too many consecutive errors — dataset exhausted"
             )
         yield item
+
+
+# ---------------------------------------------------------------------------
+# Manifest-based loader
+# ---------------------------------------------------------------------------
+
+def make_prefetch_loader_from_manifest(
+    manifest_path: str,
+    **kwargs,
+) -> Iterator:
+    """
+    Create a prefetch loader from a campaign manifest.
+
+    Reads the "include"-decision shard paths from a manifest written by
+    campaign_manager.py and passes them to make_prefetch_loader.
+
+    manifest_path: path to a campaign manifest.json
+    **kwargs:      forwarded verbatim to make_prefetch_loader (batch_size, etc.)
+
+    Raises ValueError when no shards are marked "include" in the manifest.
+    """
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    included = [
+        e["path"]
+        for e in manifest.get("entries", [])
+        if e.get("decision") == "include"
+    ]
+    if not included:
+        raise ValueError(
+            f"No included shards in manifest {manifest_path} "
+            f"(n_entries={len(manifest.get('entries', []))})"
+        )
+    campaign = manifest.get("campaign", "unknown")
+    print(
+        f"[dataset] manifest '{campaign}': {len(included):,} shards "
+        f"(strategy={manifest.get('strategy', '?')}, "
+        f"avg_score={manifest.get('avg_final_value_score', 0):.4f})",
+        flush=True,
+    )
+    return make_prefetch_loader(shard_paths=included, **kwargs)

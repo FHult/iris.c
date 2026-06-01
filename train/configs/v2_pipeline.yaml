@@ -176,6 +176,74 @@ storage:
 #   train/.venv/bin/python train/scripts/score_shards_light.py \
 #       --shards /Volumes/16TBCold/shards \
 #       --config train/configs/v2_pipeline.yaml
+# Unified shard scoring — merges light scores with optional training signals.
+# Runs after score_shards_light.py; produces .unified_score.json per shard.
+# Output feeds campaign_manager.py for strategic shard selection.
+#
+# Signal weights (must sum to 1.0):
+#   light_score    — static quality score from CLIP + aesthetic + sharpness + caption
+#   diversity      — source rarity in pool (computed from pool composition, always available)
+#   training_loss  — avg loss on shard samples during training (requires flywheel DB)
+#   contribution   — model improvement per-shard (requires flywheel DB)
+# When dynamic signals are absent, their weight is redistributed to available signals.
+#
+# To run:
+#   train/.venv/bin/python train/scripts/unify_scores.py \
+#       --shards /Volumes/16TBCold/shards \
+#       --config train/configs/v2_pipeline.yaml
+unified_scoring:
+  enabled: true
+  weights:
+    light_score:   0.50
+    diversity:     0.10
+    training_loss: 0.25  # inverted: lower training loss → lower score (already learned)
+    contribution:  0.15
+
+# Campaign definitions — named shard selection strategies.
+# Each campaign produces a manifest at:
+#   /Volumes/16TBCold/campaigns/{name}/manifest.json
+#
+# Strategies:
+#   all_keep     — all shards with light score decision=keep
+#   top_pct      — top N% by final_value_score
+#   source_boost — multiply per-source scores before ranking
+#   balanced     — proportional per-source representation
+#   hard_focus   — rank by training loss (prefer harder/novel shards)
+#
+# To create all default campaigns at once:
+#   train/.venv/bin/python train/scripts/campaign_manager.py create-defaults \
+#       --shards /Volumes/16TBCold/shards
+campaigns:
+  large_baseline:
+    description: "All keep-rated shards, balanced across sources"
+    strategy: all_keep
+
+  high_signal_pruned:
+    description: "Top 80% by final_value_score — removes lowest-quality tail"
+    strategy: top_pct
+    top_pct: 80
+
+  wikiart_focused:
+    description: "WikiArt score-boosted 2×, top 80% — emphasises artistic style transfer"
+    strategy: source_boost
+    source_boosts:
+      wikiart: 2.0
+    top_pct: 80
+
+  hard_example_heavy:
+    description: "Ranked by training difficulty — bias toward harder, less-learned shards"
+    strategy: hard_focus
+    top_pct: 60
+
+# Weight snapshot registry settings.
+# Snapshots are stored at: {cold_root}/weights/registry/
+# Register a snapshot:
+#   train/.venv/bin/python train/scripts/weight_registry.py register <id> \
+#       --campaign large_baseline --weights-path <safetensors>
+weight_registry:
+  enabled: true
+  registry_dir: "weights/registry"  # relative to cold_root
+
 light_scoring:
   enabled: true
   # Global fallback threshold (per-source entries below take precedence)
