@@ -50,7 +50,8 @@ training:
   n_grad_steps_per_fwd: 1
   memory_profile: false
   use_block_injection: false
-  correct_forward_q: false  # disabled in online mode: with 4 models loaded, correct-Q doubles activation memory and pushes past the 14 GB MLX limit
+  correct_forward_q: false  # disabled: correct-Q doubles activation memory; incompatible with online mode
+  mlx_memory_pct: 0.55      # 17.6 GB on 32 GB — online mode loads SigLIP via PyTorch (~1.4 GB extra outside MLX budget); 44% default is too tight
   image_dropout_prob: 0.30
   text_dropout_prob: 0.10
   style_loss_weight: 0.05

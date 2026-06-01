@@ -599,21 +599,24 @@ def train(config: dict) -> None:
     except Exception:
         pass  # non-macOS or sysctl unavailable — skip check
 
-    # Cap MLX GPU allocation to 20 GB on 32 GB systems (leaves ~12 GB for OS +
-    # Metal driver + other processes).  Without this cap, jetsam kills the
-    # process during mx.compile's first backward-pass compilation (~step 250)
-    # when transient buffer peaks exceed the system's memory pressure threshold.
-    # set_cache_limit(0) prevents MLX from holding freed buffers in a cache —
-    # forces immediate return to the OS, reducing peak wired memory.
+    # Cap MLX GPU allocation.  The fraction is configurable via training.mlx_memory_pct:
+    #   0.44 (default) → 14 GB on 32 GB — calibrated for precomputed-cache mode
+    #   0.55           → 17.6 GB on 32 GB — use for online-encoding mode where
+    #                    SigLIP (PyTorch, ~1.4 GB) + 4 MLX models saturate 14 GB
+    # Without a cap, jetsam kills the process during mx.compile's first backward-pass
+    # compilation when transient buffer peaks exceed the system pressure threshold.
+    # set_cache_limit(0) prevents MLX holding freed buffers in a cache, forcing
+    # immediate return to the OS and reducing peak wired memory.
+    _mem_pct = float(tcfg.get("mlx_memory_pct", 0.44))
     try:
         import subprocess as _sp
         _hw = _sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3)
         _ram_bytes = int(_hw.stdout.strip())
     except Exception:
         _ram_bytes = 32 * 1024 ** 3  # fallback for non-macOS or sysctl unavailable
-    mx.set_memory_limit(int(_ram_bytes * 0.44))   # 44% → 14 GB on 32 GB, 28 GB on 64 GB
-    mx.set_cache_limit(int(_ram_bytes * 0.06))    # 6% → 2 GB on 32 GB, 4 GB on 64 GB
-    print(f"MLX memory limit: {int(_ram_bytes * 0.44) // 1024**3} GB  "
+    mx.set_memory_limit(int(_ram_bytes * _mem_pct))
+    mx.set_cache_limit(int(_ram_bytes * 0.06))    # 6% → 2 GB on 32 GB
+    print(f"MLX memory limit: {int(_ram_bytes * _mem_pct) // 1024**3} GB  "
           f"cache limit: {int(_ram_bytes * 0.06) // 1024**2} MB")
 
     # Write loading heartbeats every 60s while models initialise.
