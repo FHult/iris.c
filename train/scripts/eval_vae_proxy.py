@@ -194,64 +194,30 @@ def tier3(proxy, vae_cache: str, shards_dir: str, n_images: int = 500) -> dict:
     )
 
     ch_std = np.array(proxy._ch_std).reshape(1, -1, 1, 1) + 1e-6
-
-    # Per-shard MSE accumulator.  The dataset yields consecutive batches from
-    # the same shard (grouped internally), so we track which shard we're on by
-    # watching index position.
-    shard_mse: dict[str, list[float]] = {}
     all_mse: list[float] = []
     seen = 0
 
-    # Build a shard-stem → shard_path lookup for attribution
-    shard_of: dict[str, str] = {Path(sp).stem: sp for sp, _ in subset}
-
-    # Track which shard each dataset batch came from by following the index.
-    # Since VAEDistillDataset.shard_groups processes all indices for one shard
-    # before moving to the next, record shard membership by batch order.
-    idx_flat = [sp for sp, _ in subset]
-    batch_shard_tracker: list[str] = []
-    current = None
-    for sp in idx_flat:
-        stem = Path(sp).stem
-        if stem != current:
-            current = stem
-        batch_shard_tracker.append(sp)
-
-    batch_idx = 0
     for images_np, latents_np in dataset:
         if seen >= n_images:
             break
-
-        images_mx  = mx.array(images_np)
-        proxy_lat  = proxy.encode(images_mx, check_confidence=False)
+        images_mx = mx.array(images_np)
+        proxy_lat = proxy.encode(images_mx, check_confidence=False)
         mx.eval(proxy_lat)
-
         p = np.array(proxy_lat)
         t = latents_np
-        # Per-image normalised MSE: [B]
+        # Per-image normalised MSE: mean over channels and spatial dims
         mse_per = np.mean(((p - t) / ch_std) ** 2, axis=(1, 2, 3))
-
-        for i, mse in enumerate(mse_per):
-            shard_path = batch_shard_tracker[batch_idx] if batch_idx < len(batch_shard_tracker) else "unknown"
-            shard_stem = Path(shard_path).stem
-            shard_mse.setdefault(shard_stem, []).append(float(mse))
-            all_mse.append(float(mse))
-            batch_idx += 1
-
+        all_mse.extend(mse_per.tolist())
         seen += len(images_np)
 
-    worst_shards = sorted(
-        [(s, float(np.mean(v))) for s, v in shard_mse.items()],
-        key=lambda x: x[1], reverse=True
-    )[:10]
+    if not all_mse:
+        return {"n_images": 0, "error": "dataset yielded no images"}
 
     result = {
-        "n_images":      seen,
-        "mean_norm_mse": round(float(np.mean(all_mse)), 4),
-        "p95_norm_mse":  round(float(np.percentile(all_mse, 95)), 4),
-        "p99_norm_mse":  round(float(np.percentile(all_mse, 99)), 4),
-        "worst_shards":  [{"shard": s, "mean_norm_mse": round(v, 4)}
-                          for s, v in worst_shards],
+        "n_images":            seen,
+        "mean_norm_mse":       round(float(np.mean(all_mse)), 4),
+        "p95_norm_mse":        round(float(np.percentile(all_mse, 95)), 4),
+        "p99_norm_mse":        round(float(np.percentile(all_mse, 99)), 4),
         "proxy_fallback_rate": round(proxy.fallback_rate, 4),
     }
 
@@ -259,7 +225,6 @@ def tier3(proxy, vae_cache: str, shards_dir: str, n_images: int = 500) -> dict:
     print(f"  p95 norm MSE:  {result['p95_norm_mse']:.4f}")
     print(f"  p99 norm MSE:  {result['p99_norm_mse']:.4f}")
     print(f"  fallback rate: {result['proxy_fallback_rate']:.1%}")
-    print(f"  worst shards:  {[s['shard'] for s in result['worst_shards'][:3]]}")
     return result
 
 

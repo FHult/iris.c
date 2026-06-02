@@ -237,7 +237,7 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
     log_every    = _cfg(cfg, "training", "log_every",    default=100)
     ckpt_every   = _cfg(cfg, "training", "checkpoint_every", default=2000)
     qat_bits     = _cfg(cfg, "training", "qat_bits",     default=None)
-    use_feats    = _cfg(cfg, "losses",   "feature_weight", default=0.0) > 0.0
+    use_feats    = float(_cfg(cfg, "losses", "feature_weight", default=0.0) or 0.0) > 0.0
     seed         = _cfg(cfg, "data",     "seed",          default=42)
 
     # ── Memory cap ─────────────────────────────────────────────────────────
