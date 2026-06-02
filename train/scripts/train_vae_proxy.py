@@ -109,7 +109,9 @@ def _save_checkpoint(
     )
 
     mx.eval(list(payload.values()))
-    tmp = str(path) + ".tmp"
+    # mx.save_safetensors forces a .safetensors extension; the temp path must end
+    # in .safetensors so os.replace finds the file that was actually written.
+    tmp = str(path) + ".tmp.safetensors"
     mx.save_safetensors(tmp, payload)
     os.replace(tmp, str(path))
     size_mb = path.stat().st_size / 1e6

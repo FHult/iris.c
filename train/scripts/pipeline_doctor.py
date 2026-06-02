@@ -1465,6 +1465,118 @@ def _check_environment(cfg: dict = None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. Pool health
 
+def _check_proxy_vae(cfg: dict) -> None:
+    """v3.19.0: Report proxy VAE health — checkpoint presence, config validity,
+    and the most recent evaluation report if one exists.
+
+    Proxy eval results are written by evaluate_vae_proxy.py --out to
+    {DATA_ROOT}/proxy_vae_eval.json (latest run). This check surfaces the
+    headline quality metrics and flags failed quality gates.
+    """
+    pcfg = cfg.get("proxy_vae", {}) or {}
+    proxy_path = pcfg.get("proxy_path")
+    enabled    = pcfg.get("enabled", False)
+
+    # Nothing configured — proxy is opt-in, so stay silent unless partially set up.
+    if not proxy_path and not enabled:
+        return
+
+    venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    scripts = str(SCRIPTS_DIR)
+
+    # enabled=true but no path, or path set but file missing → misconfiguration.
+    if enabled and not proxy_path:
+        _add("WARNING", "proxy_vae",
+             "proxy_vae.enabled=true but proxy_path is null",
+             detail="The proxy VAE master switch is on but no checkpoint path is set. "
+                    "Precompute will silently use the real VAE.",
+             fix="Set proxy_vae.proxy_path in the pipeline config, or set enabled: false.",
+             ctx={"enabled": True, "proxy_path": None})
+        return
+
+    if proxy_path and not Path(proxy_path).exists():
+        _add("WARNING", "proxy_vae",
+             f"Proxy VAE checkpoint not found: {proxy_path}",
+             detail="proxy_path points to a missing file. Precompute will fall back "
+                    "to the real VAE.",
+             fix=(f"Train a proxy: {venv_py} {scripts}/train_vae_proxy.py "
+                  f"--config train/configs/vae_proxy_512px.yaml"),
+             ctx={"proxy_path": proxy_path, "exists": False})
+        return
+
+    if not proxy_path:
+        return  # path null and not enabled — already returned above; defensive.
+
+    mode = pcfg.get("default_mode", "balanced")
+    thr  = pcfg.get("fallback_threshold", 0.75)
+
+    # Read the latest evaluation report if available.
+    eval_path = DATA_ROOT / "proxy_vae_eval.json"
+    if not eval_path.exists():
+        _add("INFO", "proxy_vae",
+             f"Proxy VAE configured ({mode} mode) but no evaluation report found",
+             detail="Run the evaluation suite before trusting the proxy in production. "
+                    "It compares proxy vs teacher on latent MSE, cosine similarity, "
+                    "FFT correlation and decoded PSNR.",
+             fix=(f"{venv_py} {scripts}/evaluate_vae_proxy.py --proxy {proxy_path} "
+                  f"--flux-model flux-klein-model --out {eval_path} "
+                  f"--report {DATA_ROOT}/proxy_vae_eval.html"),
+             ctx={"proxy_path": proxy_path, "mode": mode})
+        return
+
+    try:
+        ev = json.loads(eval_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        _add("WARNING", "proxy_vae",
+             f"Proxy VAE eval report unreadable: {e}",
+             ctx={"eval_path": str(eval_path)})
+        return
+
+    t1 = ev.get("tier1", {})
+    t2 = ev.get("tier2", {})
+    t3 = ev.get("tier3", {})
+
+    cosine    = t1.get("cosine_sim")
+    std_ratio = t1.get("ch_std_ratio")
+    fft_corr  = t1.get("fft_corr")
+    psnr      = t2.get("decoded_psnr_db")
+    fb_rate   = (t3.get("proxy_stats") or {}).get("fallback_rate")
+
+    # Collect failed gates.
+    failed = []
+    if t1.get("pass_cosine") is False:
+        failed.append(f"cosine_sim={cosine} (<0.95)")
+    if t1.get("pass_ch_std") is False:
+        failed.append(f"ch_std_ratio={std_ratio} (out of 0.95–1.05)")
+    if t1.get("pass_fft") is False:
+        failed.append(f"fft_corr={fft_corr} (<0.98)")
+    if t2.get("pass_psnr") is False:
+        failed.append(f"decoded_psnr={psnr}dB (<35)")
+
+    summary = (f"cosine={cosine} std_ratio={std_ratio} fft={fft_corr}"
+               + (f" psnr={psnr}dB" if psnr is not None else "")
+               + (f" fallback={fb_rate}" if fb_rate is not None else ""))
+
+    if failed:
+        _add("WARNING", "proxy_vae",
+             f"Proxy VAE quality gates failed: {', '.join(failed)}",
+             detail=f"Proxy ({mode} mode) did not pass all quality checks. "
+                    f"Consider retraining, using high_fidelity mode, or raising "
+                    f"fallback_threshold (currently {thr}). Full summary: {summary}",
+             fix=(f"{venv_py} {scripts}/evaluate_vae_proxy.py --proxy {proxy_path} "
+                  f"--flux-model flux-klein-model --report {DATA_ROOT}/proxy_vae_eval.html"),
+             ctx={"failed_gates": failed, "mode": mode, "threshold": thr,
+                  "cosine_sim": cosine, "ch_std_ratio": std_ratio,
+                  "fft_corr": fft_corr, "decoded_psnr_db": psnr})
+    else:
+        _add("INFO", "proxy_vae",
+             f"Proxy VAE healthy ({mode} mode): {summary}",
+             detail="All evaluated quality gates passed.",
+             ctx={"mode": mode, "threshold": thr, "cosine_sim": cosine,
+                  "ch_std_ratio": std_ratio, "fft_corr": fft_corr,
+                  "decoded_psnr_db": psnr, "fallback_rate": fb_rate})
+
+
 def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
     """PIPELINE-26/29: Check cold storage health — precompute versions and archive freshness."""
     if not COLD_ROOT.exists():
@@ -2033,8 +2145,17 @@ def _check_campaign_state() -> None:
         if status != "active":
             continue
 
-        # Active campaign: warn if DB not updated recently (orchestrator may have died)
-        age_h = round((now - ts) / 3600, 1) if ts else None
+        # Active campaign: warn if DB not updated recently (orchestrator may have died).
+        # ts_last is an ISO-8601 string; parse it to epoch seconds before diffing.
+        age_h = None
+        if ts:
+            try:
+                _ts_dt = datetime.fromisoformat(str(ts))
+                if _ts_dt.tzinfo is None:
+                    _ts_dt = _ts_dt.replace(tzinfo=timezone.utc)
+                age_h = round((now - _ts_dt.timestamp()) / 3600, 1)
+            except (ValueError, TypeError):
+                age_h = None
         if age_h is not None and age_h > 4:
             _add("WARNING", "flywheel",
                  f"Campaign '{name}' active but last DB update {age_h}h ago",
@@ -3152,6 +3273,7 @@ def main() -> None:
         _check_campaigns()
         _check_warmup_readiness()
         _check_pool_health(cfg)
+        _check_proxy_vae(cfg)
         _check_cold_storage(cfg, chunks)
         _check_val_set(cfg)
         _issues.sort(key=lambda i: (_SEV_ORDER.get(i.severity, 9), i.chunk or 0, i.category))

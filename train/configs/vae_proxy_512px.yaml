@@ -15,16 +15,19 @@
 #       --config train/configs/vae_proxy_512px.yaml
 #
 # Estimated time: ~4–8h on M1 Max for 50K steps at batch=8.
-# Validation: run eval_vae_proxy.py after training. Promote to precompute_all
-# via --proxy-vae flag once Tier 2 evaluation passes.
+# Validation: run evaluate_vae_proxy.py after training (writes HTML report +
+# JSON for pipeline_doctor). Promote via proxy_vae.proxy_path + enabled: true
+# once quality gates pass. See plans/proxy-vae-v3.19-migration.md.
 
 teacher:
   flux_model_dir: "flux-klein-model"        # same dir used by precompute_all
 
 student:
-  channels:          [64, 128, 256, 256]    # quarter-scale of teacher [128,256,512,512]
-  layers_per_block:  1                      # teacher uses 2; halving saves ~60% params
-  norm_groups:       16                     # teacher uses 32; proportional to channel count
+  variant: "default"                        # small (~3.4M) | default (~6.0M) | medium (~9.3M)
+  # variant presets live in vae_distill/student.py PRESETS; override any field below.
+  # channels:          [64, 128, 256, 256]  # quarter-scale of teacher [128,256,512,512]
+  # layers_per_block:  1
+  # norm_groups:       16
   latent_channels:   32                     # must match teacher (32 channels out)
   use_mid_attention: true                   # spatial self-attention in bottleneck
 

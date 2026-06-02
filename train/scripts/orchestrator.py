@@ -1301,6 +1301,33 @@ class Orchestrator:
         self._launch_prep(f"clip_dups chunk {chunk}", cmd, log_file,
                           chunk, "clip_dups")
 
+    def _proxy_vae_args(self, campaign: Optional[str] = None) -> str:
+        """Resolve proxy VAE CLI args for precompute_all.py from pipeline config.
+
+        Reads cfg["proxy_vae"]: requires both proxy_path and enabled=true.
+        Per-campaign overrides (proxy_vae.campaigns.<name>) take precedence over
+        default_mode / fallback_threshold.  Returns "" when proxy is disabled or
+        the checkpoint is missing (precompute then uses the real VAE).
+        """
+        pcfg = self.cfg.get("proxy_vae", {}) or {}
+        proxy_path = pcfg.get("proxy_path")
+        if not proxy_path or not pcfg.get("enabled", False):
+            return ""
+        if not Path(proxy_path).exists():
+            log_orch(f"proxy_vae.proxy_path missing ({proxy_path}); using real VAE",
+                     level="warning")
+            return ""
+
+        mode = pcfg.get("default_mode", "balanced")
+        thr  = pcfg.get("fallback_threshold", 0.75)
+        camp_overrides = (pcfg.get("campaigns") or {}).get(campaign, {}) if campaign else {}
+        mode = camp_overrides.get("mode", mode)
+        thr  = camp_overrides.get("fallback_threshold", thr)
+
+        return (f"--proxy-vae '{proxy_path}' "
+                f"--proxy-vae-threshold {thr} "
+                f"--proxy-mode {mode} ")
+
     def _start_precompute(self, chunk: int) -> None:
         if is_done(chunk, "precompute") or self._prep_busy():
             return
@@ -1326,6 +1353,7 @@ class Orchestrator:
         vae_batch_arg  = f"--vae-batch {vae_batch}" if vae_batch is not None else ""
         log_file     = LOG_DIR / f"precompute_chunk{chunk}.log"
         log_orch(f"Chunk {chunk}: precomputing Qwen3+VAE embeddings", chunk=chunk)
+        proxy_arg = self._proxy_vae_args(campaign=self.cfg.get("run_name"))
         cmd = self._python_cmd("precompute_all.py",
                                f"--shards '{shard_dir}' "
                                f"--qwen3-output '{qwen3_out}' "
@@ -1335,6 +1363,7 @@ class Orchestrator:
                                f"{flux_model_arg} "
                                f"{max_shards_arg} "
                                f"{vae_batch_arg} "
+                               f"{proxy_arg}"
                                f"{siglip_flag}")
         self._launch_prep(f"precompute chunk {chunk}", cmd, log_file,
                           chunk, "precompute", token="GPU_TOKEN")
@@ -2585,6 +2614,31 @@ def _read_ablation_best(run_name: str) -> Optional[dict]:
     return best_list[0].get("params") or None
 
 
+def _resolve_proxy_vae_args(pipeline_cfg: dict, campaign: Optional[str] = None) -> str:
+    """Resolve proxy VAE CLI args for precompute_all.py (flywheel + standalone use).
+
+    Mirrors Orchestrator._proxy_vae_args but operates on a plain config dict so
+    the module-level flywheel loop can use it.  Returns "" when the proxy is
+    disabled, unconfigured, or the checkpoint file is missing.
+    """
+    pcfg = (pipeline_cfg or {}).get("proxy_vae", {}) or {}
+    proxy_path = pcfg.get("proxy_path")
+    if not proxy_path or not pcfg.get("enabled", False):
+        return ""
+    if not Path(proxy_path).exists():
+        log_orch(f"[flywheel] proxy_vae.proxy_path missing ({proxy_path}); using real VAE",
+                 level="warning")
+        return ""
+    mode = pcfg.get("default_mode", "balanced")
+    thr  = pcfg.get("fallback_threshold", 0.75)
+    camp = (pcfg.get("campaigns") or {}).get(campaign, {}) if campaign else {}
+    mode = camp.get("mode", mode)
+    thr  = camp.get("fallback_threshold", thr)
+    return (f"--proxy-vae '{proxy_path}' "
+            f"--proxy-vae-threshold {thr} "
+            f"--proxy-mode {mode} ")
+
+
 def _flywheel_report_only(fw_cfg: dict) -> None:
     """Regenerate the HTML report from existing DB data and exit."""
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -2912,11 +2966,12 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             _flux_arg = f"--flux-model '{_flux_p}'" if _flux_p.exists() else ""
             _sig_flag = "--siglip"
 
+            _proxy_arg = _resolve_proxy_vae_args(_pipeline_cfg, campaign=name)
             pre_cmd = (
                 f"caffeinate -dim python -u '{SCRIPTS_DIR}/precompute_all.py' "
                 f"--shards '{staging_dir}' "
                 f"--qwen3-output '{q_out}' --vae-output '{v_out}' --siglip-output '{s_out}' "
-                f"{_flux_arg} {_sig_flag}"
+                f"{_flux_arg} {_proxy_arg}{_sig_flag}"
             )
             # PIPELINE_ORCHESTRATED=1: precompute_all skips GPU lock acquisition because
             # the orchestrator already holds the lock for the whole iteration.

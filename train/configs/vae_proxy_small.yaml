@@ -1,0 +1,48 @@
+# train/configs/vae_proxy_small.yaml
+# Proxy VAE distillation — SMALL variant (~3.4M params, maximum speed).
+#
+# Use when precompute throughput matters more than marginal fidelity, e.g.
+# warmup campaigns on known-good data distributions. Pair with proxy quality
+# mode "speed" in v2_pipeline.yaml campaigns.<name>.mode.
+#
+# Train:
+#   python train/scripts/train_vae_proxy.py --config train/configs/vae_proxy_small.yaml
+
+teacher:
+  flux_model_dir: "flux-klein-model"
+
+student:
+  variant: "small"                          # [48, 96, 192, 192], norm_groups=12 → ~3.4M params
+  latent_channels:   32
+  use_mid_attention: true
+
+data:
+  shard_dirs:
+    - "/Volumes/16TBCold/shards"
+  vae_cache_dir: "/Volumes/16TBCold/precomputed/vae/current"
+  image_size:          512
+  batch_size:          12                   # smaller model → larger batch fits
+  min_unified_score:   0.40
+  max_shards:          null
+  seed:                42
+
+losses:
+  latent_mse_weight:   1.0
+  decoded_mse_weight:  0.10
+  freq_alpha:          0.50
+  dist_weight:         0.01
+  feature_weight:      0.00
+
+training:
+  num_steps:        50000
+  warmup_steps:     500
+  learning_rate:    2.5e-4                   # slightly higher LR for the smaller model
+  weight_decay:     1.0e-2
+  grad_clip:        1.0
+  log_every:        100
+  checkpoint_every: 2000
+  keep_last_n:      3
+  qat_bits: null
+
+output:
+  checkpoint_dir: "/Volumes/2TBSSD/checkpoints/vae_proxy_small"

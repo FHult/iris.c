@@ -331,7 +331,8 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
                  enable_siglip: bool, image_size: int, progress_q,
                  load_qwen3: bool = True, load_vae: bool = True,
                  proxy_vae_path: str = None,
-                 proxy_vae_threshold: float = 0.75) -> None:
+                 proxy_vae_threshold: float = 0.75,
+                 proxy_vae_mode: str = "balanced") -> None:
     """Load all models once.
 
     load_qwen3/load_vae: set False when the caller has confirmed all records
@@ -380,10 +381,12 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
             _proxy = ProxyVAE.load(
                 proxy_vae_path,
                 teacher=_teacher_wrapper,
-                confidence_threshold=proxy_vae_threshold,
+                quality_mode=proxy_vae_mode,
+                fallback_threshold=proxy_vae_threshold,
             )
             _W["vae_proxy"] = _proxy
-            print(f"  [precompute] proxy VAE loaded (threshold={proxy_vae_threshold:.2f})")
+            print(f"  [precompute] proxy VAE loaded  mode={proxy_vae_mode}  "
+                  f"threshold={proxy_vae_threshold:.2f}")
         except Exception as _e:
             print(f"  [precompute] WARNING: proxy VAE load failed ({_e}); using real VAE",
                   file=sys.stderr)
@@ -934,6 +937,11 @@ def main():
     parser.add_argument("--proxy-vae-threshold", type=float, default=0.75,
                         help="Confidence threshold for proxy VAE fallback (default 0.75). "
                              "Lower = more aggressive fallback to real VAE.")
+    parser.add_argument("--proxy-mode", default="balanced",
+                        choices=["speed", "balanced", "high_fidelity"],
+                        help="Proxy VAE quality mode: speed (no check), balanced "
+                             "(Mahalanobis), high_fidelity (balanced + decode check). "
+                             "Overridden by pipeline config proxy_vae.campaigns.<name>.mode.")
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--ai", action="store_true",
@@ -1280,7 +1288,8 @@ def main():
     _worker_init(args.qwen3_model, args.flux_model, args.siglip, args.image_size, progress_q,
                  _load_qwen3, _load_vae,
                  proxy_vae_path=args.proxy_vae,
-                 proxy_vae_threshold=args.proxy_vae_threshold)
+                 proxy_vae_threshold=args.proxy_vae_threshold,
+                 proxy_vae_mode=args.proxy_mode)
 
     def _read_shard_records(shard_path: str) -> list:
         """Read all shard records into memory for IO prefetch."""

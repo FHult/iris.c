@@ -2,6 +2,11 @@
 """
 train/scripts/eval_vae_proxy.py — Evaluate proxy VAE quality.
 
+DEPRECATED (v3.19.0): superseded by evaluate_vae_proxy.py, which adds FFT
+correlation, quality-mode-aware fallback simulation, per-channel charts, and a
+self-contained HTML report that pipeline_doctor.py consumes. This script is
+retained for its lightweight CLI but will be removed in a future release.
+
 Runs the three-tier evaluation from plans/precomp2-proxy-vae-design.md:
 
   Tier 1  (fast)       — latent-space and decoded-image quality metrics
@@ -48,7 +53,7 @@ def _load_proxy_and_teacher(proxy_path: str, flux_model: str | None):
         teacher = TeacherEncoder.load(flux_model)
 
     print(f"Loading proxy from {proxy_path} ...")
-    proxy = ProxyVAE.load(proxy_path, teacher=teacher, confidence_threshold=0.75)
+    proxy = ProxyVAE.load(proxy_path, teacher=teacher, fallback_threshold=0.75)
     return proxy, teacher
 
 

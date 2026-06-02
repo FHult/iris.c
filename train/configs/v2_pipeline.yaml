@@ -371,11 +371,27 @@ precompute:
   vae_batch: 4
 
 # Proxy VAE encoder — faster precompute (~20ms/img vs ~185ms/img).
-# Trained via train/scripts/train_vae_proxy.py.
-# Set proxy_path to the safetensors checkpoint path to enable.
-# When proxy_path is null, the real Flux VAE is always used.
-# See plans/precomp2-proxy-vae-design.md for design rationale and
-# train/configs/vae_proxy_512px.yaml for training hyperparameters.
+# Train:    python train/scripts/train_vae_proxy.py --config train/configs/vae_proxy_512px.yaml
+# Evaluate: python train/scripts/evaluate_vae_proxy.py --proxy <path> --report /tmp/eval.html
+# Design:   plans/precomp2-proxy-vae-design.md
 proxy_vae:
-  proxy_path: null               # set to checkpoint path to enable
-  confidence_threshold: 0.75    # fall back to real VAE below this score
+  proxy_path: null               # path to .safetensors checkpoint; null = disabled
+  enabled: false                 # master switch (also requires proxy_path)
+
+  # speed: unconditional proxy | balanced: Mahalanobis check | high_fidelity: +decode check
+  default_mode: "balanced"
+
+  fallback_threshold: 0.75       # confidence below this -> fall back to real VAE
+  regression_window:    100      # rolling window for regression detection
+  regression_threshold: 0.60    # auto-disable if rolling mean confidence < this
+
+  # Per-campaign overrides (campaign = flywheel name or pipeline run name).
+  # Unrecognised campaigns fall back to default_mode / fallback_threshold.
+  campaigns: {}
+  # Example:
+  #   campaigns:
+  #     warmup-run1:
+  #       mode: "speed"
+  #     wikiart-focused:
+  #       mode: "high_fidelity"
+  #       fallback_threshold: 0.90
