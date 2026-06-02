@@ -159,6 +159,48 @@ Metrics: latent MSE, cosine similarity, per-channel mean/std, FFT magnitude
 correlation, decoded PSNR (needs `--flux-model`), error distribution, and a
 fallback-rate simulation across thresholds.
 
+### Speed benchmark
+
+`benchmark_vae_proxy.py` measures encode latency (ms/image) for the proxy
+variants and, optionally, the real Flux VAE, then reports the speedup ratio.
+
+```bash
+# Proxy-only — safe to run during a live precompute (variants compared to each other)
+python train/scripts/benchmark_vae_proxy.py --variants small,default,medium
+
+# Full proxy-vs-teacher ratio — run ONLY when the GPU is idle (loads the teacher VAE)
+python train/scripts/benchmark_vae_proxy.py \
+    --with-teacher --flux-model flux-klein-model --variants default --batch 4
+```
+
+IMPORTANT: absolute ms/image is inflated under GPU contention, and proxy and
+teacher are not under matched load unless both run in the same idle-GPU session.
+The script prints a warning and the GPU-lock holder when contention is detected.
+Trust the **speedup ratio** from a single idle-GPU run, not absolute latencies
+measured while a flywheel/pipeline precompute is active.
+
+### Downstream A/B (the definitive Tier-2 test)
+
+`compare_downstream_quality.py` trains two short IP-Adapter runs that differ ONLY
+in their VAE latents (real vs proxy), on identical shards/seed/steps, then compares
+final `cond_gap` / `ref_gap`. This is the authoritative quality test — latent
+metrics can pass while downstream training quality regresses.
+
+```bash
+python train/scripts/compare_downstream_quality.py \
+    --proxy /Volumes/2TBSSD/checkpoints/vae_proxy/proxy_final.safetensors \
+    --shards /Volumes/16TBCold/shards \
+    --base-config train/configs/stage1_512px.yaml \
+    --flux-model flux-klein-model \
+    --n-shards 4 --steps 500 --seed 1234 \
+    --workdir /Volumes/2TBSSD/proxy_ab \
+    --out /Volumes/2TBSSD/proxy_ab/result.json
+```
+
+PASS = proxy-run final `cond_gap` is within `--tolerance` (default 5%) of the
+real-run `cond_gap`. Refuses to run while the GPU lock is held (it launches
+training) unless `--force` is passed — run it on an idle GPU.
+
 ---
 
 ## 6. pipeline_doctor.py
