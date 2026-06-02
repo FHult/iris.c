@@ -256,17 +256,20 @@ def _fake_quantize(x: mx.array, bits: int = 8) -> mx.array:
     """
     Simulate uniform int<bits> quantisation on x.
 
-    Clips to [-1, 1] (standard latent range), quantises to 2^bits levels,
-    adds straight-through gradient via (x + noise - stop_gradient(noise)).
+    Uses the per-batch min/max as the quantisation range so the clamp adapts
+    to the actual latent distribution (Flux VAE latents are in roughly [-13, +10],
+    not [-1, 1]).  Adds straight-through gradient so backprop passes through.
     Does NOT actually change the stored dtype.
     """
     n_levels = 2 ** bits - 1
-    x_clamp  = mx.clip(x, -1.0, 1.0)
-    step     = 2.0 / n_levels
-    q        = mx.round(x_clamp / step) * step
+    x_min = mx.stop_gradient(mx.min(x))
+    x_max = mx.stop_gradient(mx.max(x))
+    x_range = mx.maximum(x_max - x_min, mx.array(1e-6))
+    step  = x_range / n_levels
+    q     = mx.round((x - x_min) / step) * step + x_min
     # Straight-through estimator: gradient passes through unmodified
-    noise    = mx.stop_gradient(q - x_clamp)
-    return x_clamp + noise
+    noise = mx.stop_gradient(q - x)
+    return x + noise
 
 
 # ---------------------------------------------------------------------------

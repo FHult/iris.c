@@ -109,7 +109,8 @@ class ProxyVAE:
         # Reconstruct student architecture from metadata
         meta_json = weights.get("meta.config_json")
         if meta_json is not None:
-            cfg = json.loads(str(np.array(meta_json)))
+            # Stored as uint8 byte array via np.frombuffer(json_str.encode())
+            cfg = json.loads(bytes(np.array(meta_json).tolist()).decode())
         else:
             cfg = {}  # fall back to default architecture
 

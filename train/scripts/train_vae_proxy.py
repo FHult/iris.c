@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import yaml
@@ -252,15 +253,6 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
         feature_weight    = float(loss_cfg.get("feature_weight",     0.0)),
     )
 
-    # ── Optimizer ──────────────────────────────────────────────────────────
-    all_trainable = student.trainable_parameters()
-    if feat_adapters:
-        for a in feat_adapters:
-            all_trainable = mx_utils.tree_map(
-                lambda x, y: x,  # merge not directly supported; just train all
-                all_trainable,
-            )
-
     def _lr_schedule(step: int) -> float:
         if step < warmup_steps:
             return lr * (step + 1) / warmup_steps
@@ -296,18 +288,21 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
         start_step = _resume(resume_path, student, optimizer)
 
     # ── Loss/grad function ─────────────────────────────────────────────────
-    # Freeze teacher weights — never compute gradients through teacher
+    # Freeze teacher — no gradients flow through it.
     teacher._vae.freeze()
 
-    def _loss_fn(student_params, images, teacher_latents):
-        student.update(student_params)
+    # Auxiliary loss components captured via mutable reference (MLX pattern
+    # from train_ip_adapter.py) since nn.value_and_grad returns only a scalar.
+    _aux: dict[str, mx.array] = {}
+
+    def _loss_fn(images_mx, teacher_latents_mx):
         if use_feats:
             proxy_latent, s_feats = student(
-                mx.array(images), return_features=True, qat_bits=qat_bits)
-            t_latent, t_feats = teacher.encode_with_features(mx.array(images))
+                images_mx, return_features=True, qat_bits=qat_bits)
+            t_latent, t_feats = teacher.encode_with_features(images_mx)
         else:
-            proxy_latent = student(mx.array(images), qat_bits=qat_bits)
-            t_latent     = mx.array(teacher_latents)
+            proxy_latent = student(images_mx, qat_bits=qat_bits)
+            t_latent     = teacher_latents_mx
             s_feats = t_feats = None
 
         total, components = distill_loss(
@@ -317,12 +312,27 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
             scaling_factor = teacher.scaling_factor,
             shift_factor   = teacher.shift_factor,
             student_feats  = s_feats,
-            teacher_feats  = t_feats if t_feats else None,
+            teacher_feats  = t_feats,
             feat_adapters  = feat_adapters,
         )
-        return total, components
+        _aux.update(components)
+        return total  # scalar — nn.value_and_grad requires scalar return
 
-    loss_and_grad = nn.value_and_grad(_loss_fn, has_aux=True)
+    # nn.value_and_grad(model, fn): computes gradients of fn w.r.t. model's
+    # trainable parameters. fn closes over student; images/latents are args.
+    loss_and_grad = nn.value_and_grad(student, _loss_fn)
+
+    # When feature adapters are used they are separate nn.Module instances and
+    # need their own gradient pass.  Build a combined model wrapper so the
+    # optimizer sees all parameters in one update.
+    if feat_adapters:
+        class _Combined(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.student = student
+                self.adapters = feat_adapters
+        _combined = _Combined()
+        loss_and_grad = nn.value_and_grad(_combined, _loss_fn)
 
     # ── Training loop ──────────────────────────────────────────────────────
     print(f"[train_vae_proxy] Training {num_steps:,} steps  "
@@ -344,27 +354,30 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
 
     while step < num_steps:
         images_np, latents_np = next(data_iter)
+        images_mx  = mx.array(images_np)
+        latents_mx = mx.array(latents_np)
 
         # Update learning rate
         new_lr = _lr_schedule(step)
         optimizer.learning_rate = new_lr
 
-        # Forward + backward
-        (loss_val, components), grads = loss_and_grad(
-            student.trainable_parameters(), images_np, latents_np
-        )
+        # Forward + backward — loss_and_grad differentiates w.r.t. student params
+        _aux.clear()
+        loss_val, grads = loss_and_grad(images_mx, latents_mx)
 
         # Gradient clip
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=grad_clip)
 
         # Optimizer step
-        optimizer.update(student, grads)
+        model_to_update = _combined if feat_adapters else student
+        optimizer.update(model_to_update, grads)
         mx.eval(student.parameters(), optimizer.state, loss_val)
 
-        # Logging
+        # Collect logged component values (evaluated lazily above)
+        mx.eval(list(_aux.values()))
         loss_f = float(loss_val)
         log_loss += loss_f
-        for k, v in components.items():
+        for k, v in _aux.items():
             log_terms[k] = log_terms.get(k, 0.0) + float(v)
 
         step += 1

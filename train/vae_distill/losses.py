@@ -106,9 +106,7 @@ def freq_weighted_mse(
         weight    = 1.0 + alpha * freq_mag
         diff_sq   = diff_sq * weight
 
-    # Normalise by number of frequency bins
-    H, W = pred.shape[-2], pred.shape[-1]
-    return mx.mean(diff_sq) / (H * W)
+    return mx.mean(diff_sq)
 
 
 def dist_match(

@@ -31,8 +31,10 @@ Usage:
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -156,22 +158,28 @@ def _run_precompute_vae(
 
     # Write a temporary shards dir with symlinks for just these shards
     import tempfile, os
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, \
+         tempfile.TemporaryDirectory() as qwen3_tmp, \
+         tempfile.TemporaryDirectory() as siglip_tmp:
         for s in shards:
             link = Path(tmpdir) / s.name
             os.symlink(s, link)
 
+        # Pass real temp dirs for qwen3/siglip — precompute_all.py calls
+        # os.makedirs() on all output paths, so /dev/null would crash it.
+        # The outputs are discarded; only vae_cache receives keeper files.
         cmd = [
             str(venv_python), "-u",
             str(scripts_dir / "precompute_all.py"),
-            "--shards", tmpdir,
-            "--vae-output", str(vae_cache),
-            "--qwen3-output", "/dev/null",  # skip Qwen3
+            "--shards",       tmpdir,
+            "--vae-output",   str(vae_cache),
+            "--qwen3-output", qwen3_tmp,
+            "--siglip-output", siglip_tmp,
         ]
         if (Path(flux_model)).exists():
             cmd += ["--flux-model", flux_model]
 
-        print(f"  Running VAE precompute for {len(shards)} shards ...")
+        print(f"  Running VAE-only precompute for {len(shards)} shards ...")
         env = {**os.environ, "PIPELINE_ORCHESTRATED": "1"}
         result = subprocess.run(cmd, env=env)
         if result.returncode != 0:
