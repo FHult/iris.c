@@ -329,7 +329,9 @@ def _load_flux_vae_only(flux_model_path: str):
 
 def _worker_init(qwen3_model_path: str, flux_model_path: str,
                  enable_siglip: bool, image_size: int, progress_q,
-                 load_qwen3: bool = True, load_vae: bool = True) -> None:
+                 load_qwen3: bool = True, load_vae: bool = True,
+                 proxy_vae_path: str = None,
+                 proxy_vae_threshold: float = 0.75) -> None:
     """Load all models once.
 
     load_qwen3/load_vae: set False when the caller has confirmed all records
@@ -365,6 +367,29 @@ def _worker_init(qwen3_model_path: str, flux_model_path: str,
         _W["vae"] = vae
     else:
         _W["vae"] = None
+
+    # Load proxy VAE if requested. The proxy is a drop-in replacement for the
+    # VAE encode step (~20ms/img vs ~185ms/img). The real VAE is still loaded
+    # as the fallback for low-confidence proxy outputs.
+    if proxy_vae_path and load_vae:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from vae_distill.proxy import ProxyVAE
+            from vae_distill.teacher import TeacherEncoder
+            _teacher_wrapper = TeacherEncoder(vae)
+            _proxy = ProxyVAE.load(
+                proxy_vae_path,
+                teacher=_teacher_wrapper,
+                confidence_threshold=proxy_vae_threshold,
+            )
+            _W["vae_proxy"] = _proxy
+            print(f"  [precompute] proxy VAE loaded (threshold={proxy_vae_threshold:.2f})")
+        except Exception as _e:
+            print(f"  [precompute] WARNING: proxy VAE load failed ({_e}); using real VAE",
+                  file=sys.stderr)
+            _W["vae_proxy"] = None
+    else:
+        _W["vae_proxy"] = None
 
     if enable_siglip:
         try:
@@ -611,14 +636,18 @@ def _vae_gpu_encode(batch_ids, batch_imgs, out_dir) -> int:
         return saved
 
     # Fast batched path (image_size <= 512)
+    # Use proxy VAE if loaded — same interface, ~9× faster, with confidence fallback.
+    _proxy = _W.get("vae_proxy")
+    _encoder = _proxy if _proxy is not None else vae
+    _enc_tag = "proxy" if _proxy is not None else "vae"
     try:
         stacked = np.concatenate(batch_imgs, axis=0)
         _t0 = _time.time()
-        latents = vae.encode(mx.array(stacked))
+        latents = _encoder.encode(mx.array(stacked))
         mx.eval(latents)
         _dt = _time.time() - _t0
         if _n < 3 or _n % 50 == 0:
-            print(f"  [vae batch {_n}] n={len(batch_ids)} dt={_dt:.2f}s ({_dt/len(batch_ids):.3f}s/img)",
+            print(f"  [{_enc_tag} batch {_n}] n={len(batch_ids)} dt={_dt:.2f}s ({_dt/len(batch_ids):.3f}s/img)",
                   file=sys.stderr, flush=True)
         latents_np = np.array(latents.astype(mx.float32))
         for k, rec_id in enumerate(batch_ids):
@@ -896,6 +925,15 @@ def main():
                         help="Ignore .light_scores.json sidecars and precompute all shards "
                              "regardless of their keep/discard decision. Default: shards with "
                              "decision=discard are skipped to save compute.")
+    parser.add_argument("--proxy-vae", default=None, metavar="PATH",
+                        help="Path to proxy VAE safetensors checkpoint. "
+                             "When set, uses the lightweight student encoder (~20ms/img) "
+                             "instead of the full Flux VAE (~185ms/img), with automatic "
+                             "fallback to the real VAE when confidence is below threshold. "
+                             "See plans/precomp2-proxy-vae-design.md.")
+    parser.add_argument("--proxy-vae-threshold", type=float, default=0.75,
+                        help="Confidence threshold for proxy VAE fallback (default 0.75). "
+                             "Lower = more aggressive fallback to real VAE.")
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--ai", action="store_true",
@@ -1240,7 +1278,9 @@ def main():
 
     # Load models once in the main process (no subprocess fork / pickle overhead).
     _worker_init(args.qwen3_model, args.flux_model, args.siglip, args.image_size, progress_q,
-                 _load_qwen3, _load_vae)
+                 _load_qwen3, _load_vae,
+                 proxy_vae_path=args.proxy_vae,
+                 proxy_vae_threshold=args.proxy_vae_threshold)
 
     def _read_shard_records(shard_path: str) -> list:
         """Read all shard records into memory for IO prefetch."""

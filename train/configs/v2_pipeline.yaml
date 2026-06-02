@@ -369,3 +369,13 @@ precompute:
   # VAE encode batch size. Profiled on M1 Max at 512px: B=4 is optimal (145ms/img).
   # B=16 (prior default) is 20% slower; B=32+ degrades further; B=64 OOM.
   vae_batch: 4
+
+# Proxy VAE encoder — faster precompute (~20ms/img vs ~185ms/img).
+# Trained via train/scripts/train_vae_proxy.py.
+# Set proxy_path to the safetensors checkpoint path to enable.
+# When proxy_path is null, the real Flux VAE is always used.
+# See plans/precomp2-proxy-vae-design.md for design rationale and
+# train/configs/vae_proxy_512px.yaml for training hyperparameters.
+proxy_vae:
+  proxy_path: null               # set to checkpoint path to enable
+  confidence_threshold: 0.75    # fall back to real VAE below this score

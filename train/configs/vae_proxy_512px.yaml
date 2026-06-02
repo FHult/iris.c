@@ -1,0 +1,75 @@
+# train/configs/vae_proxy_512px.yaml
+# Proxy VAE distillation — Stage 1 (512px)
+#
+# Trains a ~6.5M-param student encoder to approximate the Flux2 VAE encoder.
+# See plans/precomp2-proxy-vae-design.md for architecture and loss rationale.
+#
+# Prerequisites:
+#   1. ≥100K teacher VAE latents in vae_cache_dir (run flywheel ≥1 successful iter
+#      OR run generate_teacher_latents.py --run-precompute).
+#   2. Source shard tars available in shard_dirs.
+#
+# Training command:
+#   source train/.venv/bin/activate
+#   python train/scripts/train_vae_proxy.py \
+#       --config train/configs/vae_proxy_512px.yaml
+#
+# Estimated time: ~4–8h on M1 Max for 50K steps at batch=8.
+# Validation: run eval_vae_proxy.py after training. Promote to precompute_all
+# via --proxy-vae flag once Tier 2 evaluation passes.
+
+teacher:
+  flux_model_dir: "flux-klein-model"        # same dir used by precompute_all
+
+student:
+  channels:          [64, 128, 256, 256]    # quarter-scale of teacher [128,256,512,512]
+  layers_per_block:  1                      # teacher uses 2; halving saves ~60% params
+  norm_groups:       16                     # teacher uses 32; proportional to channel count
+  latent_channels:   32                     # must match teacher (32 channels out)
+  use_mid_attention: true                   # spatial self-attention in bottleneck
+
+data:
+  shard_dirs:
+    - "/Volumes/16TBCold/shards"
+  vae_cache_dir: "/Volumes/16TBCold/precomputed/vae/current"
+  image_size:          512
+  batch_size:          8                    # student is small; larger batches improve dist_match loss
+  min_unified_score:   0.40                 # include diverse quality for better generalisation
+  max_shards:          null                 # null = use all available
+  seed:                42
+
+losses:
+  # Primary: channel-normalised MSE in latent space
+  latent_mse_weight:   1.0
+
+  # Decoded pixel MSE via VAE decoder (adds perceptual signal; ~20ms overhead/batch)
+  decoded_mse_weight:  0.10
+
+  # Frequency-domain weighting: up-weight high spatial frequencies to counter MSE blurring
+  # 0.0 = plain MSE; 0.5 = moderate high-freq emphasis (recommended)
+  freq_alpha:          0.50
+
+  # Per-batch channel mean/std alignment (cheap regulariser; prevents channel-level bias)
+  dist_weight:         0.01
+
+  # Intermediate feature matching (requires teacher forward pass per batch; expensive)
+  # Set > 0 only if Tier 1 evaluation shows channel distribution mismatch
+  feature_weight:      0.00
+
+training:
+  num_steps:       50000
+  warmup_steps:    500
+  learning_rate:   2.0e-4
+  weight_decay:    1.0e-2
+  grad_clip:       1.0
+  log_every:       100
+  checkpoint_every: 2000
+  keep_last_n:     3
+
+  # Quantization-aware training: simulate int<qat_bits> during forward pass.
+  # null = standard float32 training.  Set to 8 to produce a model that
+  # quantizes cleanly to int8 without quality drop.
+  qat_bits: null
+
+output:
+  checkpoint_dir: "/Volumes/2TBSSD/checkpoints/vae_proxy"
