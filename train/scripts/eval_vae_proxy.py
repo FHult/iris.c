@@ -170,90 +170,96 @@ def tier1(proxy, teacher, vae_cache: str, shards_dir: str, n_images: int) -> dic
 
 def tier3(proxy, vae_cache: str, shards_dir: str, n_images: int = 500) -> dict:
     """
-    Identify images where proxy error is highest.
-    Groups failures by shard source (prefix) to detect distribution shift.
+    Failure mode analysis: run the proxy on real images and measure per-shard
+    normalised MSE between proxy output and cached teacher latents.
+
+    Groups results by shard to surface systematic distribution failures.
+    The dataset iterator naturally groups batches by shard, so per-shard
+    aggregation is correct without any ordering assumptions.
     """
     import mlx.core as mx
     from vae_distill.dataset import build_index, VAEDistillDataset
 
-    print(f"\n[Tier 3] Failure mode analysis on {n_images} images ...")
+    print(f"\n[Tier 3] Failure mode analysis — running proxy on {n_images} images ...")
     index = build_index([shards_dir], vae_cache)
     np.random.shuffle(index)
     subset = index[:n_images]
 
-    # batch_size=1 with no augmentation so we can attribute errors per record.
-    # Load latents directly from cache rather than going through the dataset
-    # iterator (which reorders by shard), so rec_id attribution is correct.
-    errors: list[dict] = []
-    ch_std = np.array(proxy._ch_std).reshape(1, -1, 1, 1) + 1e-6
-    cache_p = Path(vae_cache)
-
-    from vae_distill.dataset import VAEDistillDataset, build_index
+    # batch_size=8 for speed; hflip disabled so results are deterministic.
+    # The dataset groups batches by shard — no per-record ordering guarantee,
+    # but per-shard aggregation is exact.
     dataset = VAEDistillDataset(
         index=subset, vae_cache=vae_cache, image_size=512,
-        batch_size=1, hflip_prob=0.0, seed=0,
+        batch_size=8, hflip_prob=0.0, seed=0,
     )
 
-    # Rebuild a fast lookup: rec_id → npz path (bypasses dataset ordering issue)
-    rec_to_npz = {p.stem: p for p in cache_p.glob("*.npz")}
+    ch_std = np.array(proxy._ch_std).reshape(1, -1, 1, 1) + 1e-6
 
+    # Per-shard MSE accumulator.  The dataset yields consecutive batches from
+    # the same shard (grouped internally), so we track which shard we're on by
+    # watching index position.
+    shard_mse: dict[str, list[float]] = {}
+    all_mse: list[float] = []
     seen = 0
-    for shard_path, rec_id in subset:
-        npz_path = rec_to_npz.get(rec_id)
-        if npz_path is None:
-            continue
-        try:
-            latent_np = np.load(str(npz_path))["latent"].astype(np.float32)
-        except Exception:
-            continue
 
-        # Load the image (one at a time from the shard tar)
-        # For efficiency, proxy error can be estimated from latent statistics alone
-        # without re-running the full image decode. If the latent is cached,
-        # we compare proxy(decoded_approx) vs teacher — but we don't have the
-        # original image here. Instead compare proxy output on the stored latent
-        # distribution directly via a synthetic perturbation test.
-        # Simpler: use the stored latent as "teacher" and report channel z-score
-        # deviation as a proxy for error, which doesn't require reloading images.
-        t = latent_np[np.newaxis]  # [1, 32, H, W]
-        ch_std_arr = np.array(proxy._ch_std).reshape(1, -1, 1, 1) + 1e-6
-        # Use per-channel deviation from corpus mean as error estimate
-        ch_mean_arr = np.array(proxy._ch_mean).reshape(1, -1, 1, 1)
-        norm_dev = float(np.mean(((t - ch_mean_arr) / ch_std_arr) ** 2))
-        errors.append({"rec_id": rec_id, "shard": shard_path, "norm_dev": norm_dev})
-        seen += 1
+    # Build a shard-stem → shard_path lookup for attribution
+    shard_of: dict[str, str] = {Path(sp).stem: sp for sp, _ in subset}
+
+    # Track which shard each dataset batch came from by following the index.
+    # Since VAEDistillDataset.shard_groups processes all indices for one shard
+    # before moving to the next, record shard membership by batch order.
+    idx_flat = [sp for sp, _ in subset]
+    batch_shard_tracker: list[str] = []
+    current = None
+    for sp in idx_flat:
+        stem = Path(sp).stem
+        if stem != current:
+            current = stem
+        batch_shard_tracker.append(sp)
+
+    batch_idx = 0
+    for images_np, latents_np in dataset:
         if seen >= n_images:
             break
 
-    metric_key = "norm_dev"
-    errors.sort(key=lambda e: e[metric_key], reverse=True)
-    top20 = errors[:20]
+        images_mx  = mx.array(images_np)
+        proxy_lat  = proxy.encode(images_mx, check_confidence=False)
+        mx.eval(proxy_lat)
 
-    # Group by shard to detect systematic failures (high-deviation shard pools)
-    shard_errors: dict[str, list[float]] = {}
-    for e in errors:
-        prefix = Path(e["shard"]).stem
-        shard_errors.setdefault(prefix, []).append(e[metric_key])
+        p = np.array(proxy_lat)
+        t = latents_np
+        # Per-image normalised MSE: [B]
+        mse_per = np.mean(((p - t) / ch_std) ** 2, axis=(1, 2, 3))
+
+        for i, mse in enumerate(mse_per):
+            shard_path = batch_shard_tracker[batch_idx] if batch_idx < len(batch_shard_tracker) else "unknown"
+            shard_stem = Path(shard_path).stem
+            shard_mse.setdefault(shard_stem, []).append(float(mse))
+            all_mse.append(float(mse))
+            batch_idx += 1
+
+        seen += len(images_np)
+
     worst_shards = sorted(
-        [(s, np.mean(v)) for s, v in shard_errors.items()],
+        [(s, float(np.mean(v))) for s, v in shard_mse.items()],
         key=lambda x: x[1], reverse=True
     )[:10]
 
-    vals = [e[metric_key] for e in errors]
     result = {
-        "n_records":     len(errors),
-        "note":          "norm_dev is channel z-score deviation from corpus mean; "
-                         "high values indicate out-of-distribution inputs",
-        "top20_records": top20,
-        "worst_shards":  [{"shard": s, "mean_norm_dev": round(v, 4)}
+        "n_images":      seen,
+        "mean_norm_mse": round(float(np.mean(all_mse)), 4),
+        "p95_norm_mse":  round(float(np.percentile(all_mse, 95)), 4),
+        "p99_norm_mse":  round(float(np.percentile(all_mse, 99)), 4),
+        "worst_shards":  [{"shard": s, "mean_norm_mse": round(v, 4)}
                           for s, v in worst_shards],
-        "p95_norm_dev":  round(float(np.percentile(vals, 95)), 4),
-        "p99_norm_dev":  round(float(np.percentile(vals, 99)), 4),
+        "proxy_fallback_rate": round(proxy.fallback_rate, 4),
     }
 
-    print(f"  p95 norm_dev: {result['p95_norm_dev']:.4f}")
-    print(f"  p99 norm_dev: {result['p99_norm_dev']:.4f}")
-    print(f"  worst shards: {[s['shard'] for s in result['worst_shards'][:3]]}")
+    print(f"  mean norm MSE: {result['mean_norm_mse']:.4f}")
+    print(f"  p95 norm MSE:  {result['p95_norm_mse']:.4f}")
+    print(f"  p99 norm MSE:  {result['p99_norm_mse']:.4f}")
+    print(f"  fallback rate: {result['proxy_fallback_rate']:.1%}")
+    print(f"  worst shards:  {[s['shard'] for s in result['worst_shards'][:3]]}")
     return result
 
 

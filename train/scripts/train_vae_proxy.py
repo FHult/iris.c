@@ -80,14 +80,20 @@ def _save_checkpoint(
     teacher: TeacherEncoder,
     cfg: dict,
     ckpt_dir: Path,
+    feat_adapters=None,
 ) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / f"step_{step:07d}.safetensors"
 
-    # Full training checkpoint: student weights + optimizer state
+    # Full training checkpoint: student weights + optimizer state + optional adapters
     payload: dict[str, mx.array] = {}
     for k, v in mx_utils.tree_flatten(student.parameters()):
         payload[f"student.{k}"] = v
+    # Save feature adapter weights when present (separate prefix for clean loading)
+    if feat_adapters:
+        for ai, adapter in enumerate(feat_adapters):
+            for k, v in mx_utils.tree_flatten(adapter.parameters()):
+                payload[f"adapter{ai}.{k}"] = v
     opt_state = optimizer.state
     for k, v in mx_utils.tree_flatten(opt_state):
         if isinstance(v, mx.array):
@@ -121,11 +127,33 @@ def _purge_old_checkpoints(ckpt_dir: Path, keep: int = 3) -> None:
         old.unlink(missing_ok=True)
 
 
-def _resume(path: str, student, optimizer) -> int:
+def _resume(path: str, student, optimizer, feat_adapters=None) -> int:
     weights = mx.load(path)
+    # Restore student weights
     student_w = {k[len("student."):]: v
                  for k, v in weights.items() if k.startswith("student.")}
     student.load_weights(list(student_w.items()))
+    # Restore feature adapter weights if present
+    if feat_adapters:
+        for ai, adapter in enumerate(feat_adapters):
+            prefix = f"adapter{ai}."
+            adapter_w = {k[len(prefix):]: v
+                         for k, v in weights.items() if k.startswith(prefix)}
+            if adapter_w:
+                adapter.load_weights(list(adapter_w.items()))
+    # Restore optimizer state (AdamW moments) so momentum carries over correctly
+    opt_saved = {k[len("opt."):]: v
+                 for k, v in weights.items() if k.startswith("opt.")}
+    if opt_saved:
+        try:
+            # Reconstruct the nested state dict and assign it to the optimizer.
+            # mx_utils.tree_unflatten converts a flat {key: array} dict back to
+            # the nested structure that optimizer.state expects.
+            nested = mx_utils.tree_unflatten(list(opt_saved.items()))
+            optimizer.state = nested
+        except Exception as e:
+            print(f"  WARNING: could not restore optimizer state ({e}); "
+                  f"optimizer starts from scratch")
     start_step = int(np.array(weights.get("meta.step", np.int32(0))))
     print(f"  resumed from {path} at step {start_step:,}")
     return start_step
@@ -285,7 +313,7 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
     # ── Resume ─────────────────────────────────────────────────────────────
     start_step = 0
     if resume_path:
-        start_step = _resume(resume_path, student, optimizer)
+        start_step = _resume(resume_path, student, optimizer, feat_adapters)
 
     # ── Loss/grad function ─────────────────────────────────────────────────
     # Freeze teacher — no gradients flow through it.
@@ -404,7 +432,7 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
         if step % ckpt_every == 0:
             _save_checkpoint(step, student, optimizer,
                              channel_mean, channel_std,
-                             teacher, cfg, ckpt_dir)
+                             teacher, cfg, ckpt_dir, feat_adapters)
             # Also save inference-ready proxy checkpoint
             proxy_path = ckpt_dir / f"proxy_step_{step:07d}.safetensors"
             save_proxy_checkpoint(
@@ -416,7 +444,7 @@ def train(cfg: dict, resume_path: Optional[str] = None) -> None:
 
     # Final checkpoint
     _save_checkpoint(step, student, optimizer, channel_mean, channel_std,
-                     teacher, cfg, ckpt_dir)
+                     teacher, cfg, ckpt_dir, feat_adapters)
     proxy_final = ckpt_dir / "proxy_final.safetensors"
     save_proxy_checkpoint(
         str(proxy_final), student, channel_mean, channel_std,

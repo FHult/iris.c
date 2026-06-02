@@ -159,7 +159,6 @@ class StudentEncoder(nn.Module):
         assert len(channels) == 4, "channels must have exactly 4 entries"
 
         self.conv_in = nn.Conv2d(3, channels[0], 3, padding=1)
-        self._in_norm = nn.GroupNorm(norm_groups, channels[0], pytorch_compatible=True)
 
         self.down_blocks = [
             _DownBlock(
