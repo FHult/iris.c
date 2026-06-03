@@ -681,3 +681,68 @@ re-calibrated to *urgency* (the report's HIGHs are mostly "hurts at multi-machin
   total `logs/` size (fixed-name jsonl/.log can accumulate across runs).
 
 Original report retained as `grok_train_bug_report.md` (untracked) for full detail.
+
+---
+
+## Testing-Suite Review (Grok 4.3, 2026-06) — Triaged
+
+External review of the test suite's completeness/accuracy (`grok_testing_bug_report.md`,
+untracked). Most numerically precise of the three Grok reports — verified exactly 209
+Python test functions, and confirmed **zero** dedicated test coverage for orchestrator,
+pipeline_doctor, ablation_harness, flywheel_lib, precompute_all, mine_hard_examples,
+cache_manager, campaign_manager (all 8 grepped to 0 test files). Central finding is
+correct and important: 209 tests but all concentrated in the ML core (loss/ema/model/
+dataset/export) + storage primitives + the parity guard; the autonomous MLOps "brain"
+is unit-test-free.
+
+**One verified inaccuracy in the report:** it credits the storage tests (lines 26, 240)
+as "improved post-audit to avoid machine-specific literals" — but `test_importable` was
+still asserting exact `/Volumes/16TBCold` literals until commit `dff58d8` *this session*
+(GROK-T-2). The report conflated the one abstract test with the suite as a whole.
+
+**Relevance:** this is the report most validated by live failures — the flywheel failed
+iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report's P0
+(synthetic handoff/state tests) is exactly the missing class.
+
+### Done (targeted test for the live failure — actioned 2026-06)
+
+- **GROK-TEST-1: shard-cache-filter contract test** — DONE. Extracted the
+  precompute→train filter (was closures inside `train()`) into module-level
+  `shard_internal_prefix` / `shard_has_cache` / `filter_shards_with_cache` in
+  `train_ip_adapter.py`, and added `train/tests/test_shard_cache_filter.py` (12 tests).
+  Covers the exact iter-10 failure modes: empty cache → 0 shards, naming mismatch
+  (tar stem ≠ npz key prefix) → excluded, partial precompute (missing `_0049`) →
+  excluded, qwen3/vae-only → excluded, ordering preserved. Pure (fake tar paths +
+  empty npz touch-files; no mflux/Metal/data). Note: guards the *contract*, not the
+  fs-visibility race that triggered iter 10 — that needs a different guard (GROK-TEST-2).
+
+### Open (real but substantial — net-new test suites)
+
+- **GROK-TEST-2 (P0): synthetic orchestrator state-machine harness.** `test_orchestrator_state.py`
+  that builds synthetic sentinel/heartbeat/dispatch dirs and asserts `derive_chunk_state`,
+  next-action, phantom detection, jetsam, chunk transition, resume-from-N, last-chunk —
+  fast, no tmux/launch. Highest-value missing suite. (Would NOT have caught iter 10's
+  fs race, but would catch transition/resume regressions.)
+- **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** Feed each `_check_*` synthetic
+  state, assert the issues/fixes reported. The doctor's phantom/integrity detectors are
+  trusted from production use, not unit-verified against golden synthetic states.
+- **GROK-TEST-4 (P1): model-quality regression automation.** Make `test_quality_features`
+  emit machine-readable goldens (final cond/null gap, ip_scale stats, cross/self gap) on a
+  fixed small set; gate in a `make test-quality`. No golden quality regression exists today.
+- **GROK-TEST-5 (P2): perf/memory assertions.** Assert on telemetry the mini-loop already
+  computes (step time, `mx.get_peak_memory`, grad-norm, ema-drift); micro-bench for the
+  online-encoder overhead. Critical for the 32 GB tightrope; currently absent.
+- **GROK-TEST-6 (P3): precompute_all + cache_manager units.** Synthetic test of the 1-pass
+  iter + "already done" skip + version-hash logic without real encoders; direct
+  cache_manager encoder-subset/version-hash unit.
+- **GROK-TEST-7 (P4): property-based + flywheel/ablation DB roundtrip.** hypothesis for
+  bucket selection / schedule / quant roundtrips / hard-ex t-sampling; minimal DB +
+  warmstart roundtrip tests.
+
+### Maintainability (nice-to-have)
+
+- **GROK-TEST-8: pytest markers** (slow / requires_shards / requires_mps / quality) +
+  a `make test-ci` (fast units + smoke + validate + C + run_test, data-req tests noted
+  separately); an "untested modules" grep gate.
+
+Original report retained as `grok_testing_bug_report.md` (untracked) for full detail.

@@ -477,6 +477,56 @@ def _flat_to_nested(flat: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shard ↔ precompute-cache contract (the precompute → train handoff)
+#
+# These are the seam that silently failed flywheel iter 10 ("0/40 shards have
+# qwen3+vae precomputed"): the trainer only trains on shards whose precomputed
+# .npz files are present and findable under the configured cache dirs. The
+# record-key naming convention ({shard_stem}_{index:04d}.npz) MUST match what
+# precompute_all.py writes, or every shard is silently skipped.
+#
+# Extracted to module scope (from closures inside train()) so the contract is
+# unit-testable — see train/tests/test_shard_cache_filter.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Records probed per shard to decide "is this shard substantially precomputed?".
+# Checking only _0000 would pass even if precompute crashed after the first
+# write, silently skipping 99%+ of that shard's batches.
+_SHARD_CACHE_PROBE_INDICES = (0, 49)
+
+
+def shard_internal_prefix(tar_path: str) -> str:
+    """Return the npz record-key prefix for a shard tar.
+
+    Production shards keep their staging filename (e.g. "000000.tar" → "000000",
+    "250000.tar" → "250000"), so the tar stem IS the internal record prefix.
+    precompute_all.py writes records as "{prefix}_{index:04d}.npz".
+    """
+    return os.path.splitext(os.path.basename(tar_path))[0]
+
+
+def shard_has_cache(tar_path: str, qwen3_dir: str, vae_dir: str,
+                    probe_indices=_SHARD_CACHE_PROBE_INDICES) -> bool:
+    """True iff probe records exist in BOTH qwen3_dir and vae_dir for this shard."""
+    pfx = shard_internal_prefix(tar_path)
+    return all(
+        os.path.exists(os.path.join(d, f"{pfx}_{i:04d}.npz"))
+        for d in (qwen3_dir, vae_dir)
+        for i in probe_indices
+    )
+
+
+def filter_shards_with_cache(shard_paths: list, qwen3_dir: str,
+                             vae_dir: str) -> list:
+    """Return the subset of shard_paths whose qwen3+vae precompute is present.
+
+    Shards missing only siglip are kept (siglip falls back to zeros); that check
+    lives separately in train(). This filter gates on qwen3+vae only.
+    """
+    return [p for p in shard_paths if shard_has_cache(p, qwen3_dir, vae_dir)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -739,25 +789,11 @@ def train(config: dict) -> None:
     qwen3_dir = dcfg.get("qwen3_cache_dir")
     vae_dir   = dcfg.get("vae_cache_dir")
 
-    def _internal_prefix(tar_path):
-        # Production shards keep their staging filename (e.g. "000000.tar" for
-        # chunk 1, "250000.tar" for chunk 2) so the stem IS the internal prefix.
-        return os.path.splitext(os.path.basename(tar_path))[0]
-
     if qwen3_dir and vae_dir:
-        def _has_cache(tar_path):
-            pfx = _internal_prefix(tar_path)
-            # Check first and 50th record: if both exist, the shard is substantially
-            # precomputed.  Checking only _0000 passes even if precompute crashed after
-            # the first write, causing 99%+ of that shard's batches to be skipped silently.
-            return all(
-                os.path.exists(os.path.join(d, f"{pfx}_{i:04d}.npz"))
-                for d in (qwen3_dir, vae_dir)
-                for i in (0, 49)
-            )
-
+        # See the "Shard ↔ precompute-cache contract" helpers above. This is the
+        # seam that silently failed flywheel iter 10 (0/40 shards matched).
         all_shards = shard_paths
-        shard_paths = [p for p in all_shards if _has_cache(p)]
+        shard_paths = filter_shards_with_cache(all_shards, qwen3_dir, vae_dir)
         print(f"Shard cache filter: {len(shard_paths)}/{len(all_shards)} shards "
               f"have qwen3+vae precomputed — training on {len(shard_paths)} shards only.")
         if not shard_paths:
