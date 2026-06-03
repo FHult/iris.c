@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from ablation_harness import TrialTimer, EarlyStopper
+from ablation_harness import TrialTimer, EarlyStopper, CampaignPlateau
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +169,62 @@ class TestEarlyStopperGeneral:
         # Decision logic must work even without a process to signal.
         es = _stopper(nan_loss_threshold=5.0)
         assert es.feed_snapshot({"loss_smooth": 9.0}) is True   # no crash
+
+
+# ---------------------------------------------------------------------------
+# CampaignPlateau — campaign-level "this search is played out" detector
+# ---------------------------------------------------------------------------
+
+class TestCampaignPlateau:
+    def test_warmup_suppresses_early_trigger(self):
+        # patience=2 would fire after 2 stale runs, but min_runs=5 holds it off.
+        cp = CampaignPlateau(patience=2, min_delta=0.01, min_runs=5)
+        # 4 flat runs: stale climbs but we're still under min_runs → no trigger.
+        results = [cp.update(0.30) for _ in range(4)]
+        assert results == [False, False, False, False]
+
+    def test_plateau_fires_when_stale_reaches_patience_past_warmup(self):
+        cp = CampaignPlateau(patience=3, min_delta=0.01, min_runs=3)
+        assert cp.update(0.30) is False       # run 1: first best, stale 0
+        assert cp.update(0.30) is False       # run 2: stale 1 (n_runs<min_runs)
+        assert cp.update(0.30) is False       # run 3: stale 2 (n_runs==min_runs, 2<3)
+        assert cp.update(0.30) is True        # run 4: stale 3 >= patience 3 → plateau
+        assert cp.stale_count == 3
+
+    def test_real_improvement_resets_stale(self):
+        cp = CampaignPlateau(patience=3, min_delta=0.01, min_runs=2)
+        cp.update(0.30)
+        cp.update(0.30)        # stale 1
+        cp.update(0.30)        # stale 2
+        cp.update(0.50)        # clear improvement → stale resets to 0
+        assert cp.stale_count == 0
+        assert cp.best_score == 0.50
+
+    def test_sub_min_delta_change_is_not_improvement(self):
+        # An increase smaller than min_delta does NOT reset the stale counter.
+        cp = CampaignPlateau(patience=5, min_delta=0.05, min_runs=2)
+        cp.update(0.300)
+        cp.update(0.310)       # +0.010 < min_delta 0.05 → stale, not improvement
+        cp.update(0.320)       # +0.010 again → stale
+        assert cp.stale_count == 2
+        assert cp.best_score == 0.300
+
+    def test_triggers_after_patience_consecutive_stale(self):
+        cp = CampaignPlateau(patience=3, min_delta=0.01, min_runs=2)
+        cp.update(0.50)                       # best
+        assert cp.update(0.40) is False       # stale 1
+        assert cp.update(0.40) is False       # stale 2
+        assert cp.update(0.40) is True        # stale 3 == patience → plateau
+
+    def test_none_scores_dont_corrupt_state(self):
+        cp = CampaignPlateau(patience=2, min_delta=0.01, min_runs=1)
+        cp.update(0.50)                       # best
+        assert cp.update(None) is False       # crashed run — no effect on best/stale
+        assert cp.best_score == 0.50
+        assert cp.stale_count == 0
+
+    def test_status_string(self):
+        cp = CampaignPlateau(patience=4, min_delta=0.01, min_runs=1)
+        assert cp.status() == "no data"
+        cp.update(0.42)
+        assert cp.status() == "best=0.420  stale=0/4"
