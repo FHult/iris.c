@@ -523,6 +523,43 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   webhook URL is a secret read from $SLACK_WEBHOOK_URL (config holds only the env
   var NAME). 16 tests (test_slack_sink.py); network POST mocked, never hit.
 
+- **QL-6: Bidirectional Slack — trigger pipeline actions from Slack** (Medium —
+  ops velocity; outbound QL-5 is the prereq, done). Let the operator drive the
+  pipeline from Slack (e.g. `/iris status`, `/iris pause-flywheel`,
+  `/iris resume`, `/iris quality-report`, `/iris promote-champion`, `/iris
+  golden-eval`). This is a different shape from the outbound webhook — it needs an
+  *inbound* path, so it carries real design + security weight:
+
+  - **Transport.** Two options: (a) Slack Slash Commands / Events API → needs a
+    public HTTPS endpoint Slack can POST to (ngrok/Cloudflare Tunnel/Tailscale
+    Funnel from the Mac, or a tiny relay). (b) Socket Mode → a persistent outbound
+    WebSocket (no inbound port; best for a home/NAT box). **Prefer Socket Mode** for
+    a single Mac behind NAT — no public endpoint, no tunnel.
+  - **Security (the hard part).** Verify Slack request signatures (`X-Slack-Signature`
+    + timestamp, HMAC over the raw body with the signing secret) OR Socket Mode app
+    token; allow-list the workspace + a specific channel + specific user IDs;
+    map each command to an explicit, **whitelisted** action (never exec arbitrary
+    strings); destructive actions (pause/promote/disable-proxy/launch) require a
+    confirm step or a separate `--armed` token. Secrets via env (`SLACK_APP_TOKEN`,
+    `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`), never in repo/config.
+  - **Action surface.** Map to the existing control plane, don't reinvent it:
+    `pipeline_ctl.py` (pause/resume/stop flywheel, restart-orchestrator,
+    clear-error, force-next-chunk), `pipeline_doctor.py --ai/--monitor/--quality-report`,
+    `experiments.tracker promote`. Read-only commands (status/report) are safe to
+    enable first; gate state-changing ones behind the confirm/allow-list.
+  - **Process model.** A small long-running `monitoring/slack_bot.py` (Socket Mode
+    listener) in its own tmux window, supervised like the other pipeline processes;
+    structured command log + audit trail of who triggered what; rate-limit.
+  - **Dependency note.** Socket Mode needs the `slack_sdk` package in train/.venv
+    (acceptable as a train-only dev dep; pin it). The Slash-Command/HTTP route can
+    stay stdlib but requires the public endpoint.
+  - **Build order.** (1) read-only `/iris status|report` over Socket Mode with
+    signature/allow-list; (2) safe controls (pause/resume) behind confirm;
+    (3) heavier actions (promote-champion, golden-eval launch) with `--armed`.
+  - **Effort:** ~2–3 days incl. auth, allow-list, audit log, tests (command
+    parsing + auth + action mapping are unit-testable with the Slack transport
+    mocked, same pattern as test_slack_sink.py).
+
 ---
 
 ## C Binary / CLI
