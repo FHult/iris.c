@@ -747,12 +747,20 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   (2026-06): `train/tests/test_cache_manager.py` (13 tests) covers version_hash
   (determinism, key-order stability, config/git-sha sensitivity, format) and
   encoder_config_subset (vae flux_model dir-stripping, image_size version separation,
-  qwen3/siglip/unknown subsets, end-to-end vae version stability). STILL OPEN: the
-  precompute_all 1-pass iter + "already done" skip logic (needs synthetic tar/npz
-  harness without real encoders).
-- **GROK-TEST-7 (P4): property-based + flywheel/ablation DB roundtrip.** hypothesis for
-  bucket selection / schedule / quant roundtrips / hard-ex t-sampling; minimal DB +
-  warmstart roundtrip tests.
+  qwen3/siglip/unknown subsets, end-to-end vae version stability). precompute_all
+  building blocks DONE too (2026-06): `train/tests/test_precompute_all.py` (14 tests)
+  — _scan_existing (the "already done" set), iter_shard (jpg+txt pairing, png,
+  corrupt-tar-warns, whitespace strip), _save_npz_atomic (no torn writes) + the
+  done→skip round-trip. STILL OPEN: full _process_shard_inner orchestration (needs
+  model stubs).
+- **GROK-TEST-7 (P4): property-based + flywheel/ablation DB roundtrip.** DB PART DONE
+  (2026-06): `train/tests/test_flywheel_db.py` (10 tests) — insert/get roundtrip,
+  selected_shards JSON, ordering, update (status/metrics/failed exit codes), get_best
+  cond_gap selection (null-excluded, highest-wins), checkpoint_log + mark_best, campaign
+  isolation. Uses an explicit tempdir db_path (never touches live flywheel_history.db).
+  STILL OPEN: property-based (hypothesis) for bucket selection / schedule / quant /
+  hard-ex t-sampling — deferred (would add the `hypothesis` dev dependency); ablation DB
+  + warmstart roundtrip.
 
 ### Maintainability (nice-to-have)
 
