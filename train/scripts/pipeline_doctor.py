@@ -2783,6 +2783,101 @@ def _check_campaign_eta(cfg: dict) -> None:
               "campaign_eta_days": round(days, 2), "budget_days": budget_days})
 
 
+_PROGRESS_STATE_FILE = ".doctor_progress.json"
+
+
+def _check_progress_stall(cfg: dict) -> None:
+    """Detect a worker that is alive (fresh heartbeat) but not making progress.
+
+    Freshness != progress: a heartbeat thread can keep ticking while the actual
+    work is wedged — invisible to the liveness checks. We persist the last observed
+    (value, ts) per progress signal (precompute `done`, trainer `step`) in a small
+    doctor-owned state file and compare across runs. A fresh heartbeat whose
+    progress value hasn't advanced for longer than the per-signal window is flagged.
+    Self-contained (no TrendStore coupling); never raises."""
+    health    = (cfg or {}).get("flywheel_health", {}) or {}
+    win_pre   = float(health.get("stall_precompute_secs", 3600))  # shard ~30min; >1h flat = wedged
+    win_train = float(health.get("stall_train_secs", 600))        # step ~5/s; >10min flat = wedged
+    now = time.time()
+
+    # (key, label, value, window, detail) for each present+fresh progress signal.
+    signals = []
+    pc = read_heartbeat("precompute")
+    if pc is not None and (heartbeat_age_secs("precompute") or 1e9) <= _FLYWHEEL_LIVE_SECS:
+        d = pc.get("done")
+        if isinstance(d, int):
+            signals.append(("precompute_done", "Precompute", d, win_pre,
+                            f"shard {d}/{pc.get('total', '?')} ({pc.get('current_shard', '?')})"))
+    th = read_heartbeat("trainer")
+    if th is not None and (heartbeat_age_secs("trainer") or 1e9) <= HEARTBEAT_STALE_SECS:
+        s = th.get("step")
+        if isinstance(s, int) and s > 0:
+            signals.append(("trainer_step", "Trainer", s, win_train, f"step {s}"))
+
+    state_path = DATA_ROOT / ".heartbeat" / _PROGRESS_STATE_FILE
+    try:
+        prior = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        prior = {}
+
+    new_state = {}
+    for key, label, value, window, detail in signals:
+        p = prior.get(key)
+        if p and p.get("value") == value:
+            stalled_for = now - p.get("ts", now)
+            if stalled_for > window:
+                _add("WARNING", "flywheel",
+                     f"{label} appears wedged — heartbeat fresh but no progress "
+                     f"in {_fmt_duration(stalled_for)}",
+                     detail=(f"{detail}. The heartbeat is updating but the work counter "
+                             f"({key}) has not advanced past {value} for "
+                             f"{_fmt_duration(stalled_for)}. Check the worker's log for a hang."),
+                     ctx={"signal": key, "value": value,
+                          "stalled_secs": round(stalled_for), "window_secs": window})
+            # Unchanged: keep the original ts so the stall duration keeps growing.
+            new_state[key] = {"value": value, "ts": p.get("ts", now)}
+        else:
+            # Advanced (or first observation) — reset the clock.
+            new_state[key] = {"value": value, "ts": now}
+
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(new_state))
+    except OSError:
+        pass
+
+
+def _check_log_disk(cfg: dict) -> None:
+    """Warn when logs/ grows large (GROK-T-13).
+
+    Log/jsonl filenames are fixed (per-step/per-iter, not per-run), so old logs
+    persist across runs and bloat logs/. Flag total size past a threshold; the fix
+    prunes only logs older than a week so active logs are never touched."""
+    if not LOG_DIR.exists():
+        return
+    max_gb = float((cfg or {}).get("flywheel_health", {}).get("logs_max_gb", 5.0))
+    total = n = 0
+    try:
+        for f in LOG_DIR.iterdir():
+            if f.is_file() and f.suffix in (".log", ".jsonl"):
+                try:
+                    total += f.stat().st_size
+                    n += 1
+                except OSError:
+                    continue
+    except OSError:
+        return
+    gb = total / 1e9
+    if gb > max_gb:
+        _add("WARNING", "environment",
+             f"logs/ is {gb:.1f} GB across {n} files (> {max_gb:.0f} GB budget)",
+             detail=("Fixed-name logs accumulate across runs and bloat logs/ (and slow "
+                     "log-tail reads). Prune logs older than a week — active logs are kept."),
+             fix=f"find {LOG_DIR} -maxdepth 1 \\( -name '*.log' -o -name '*.jsonl' \\) "
+                 f"-mtime +7 -delete",
+             ctx={"logs_gb": round(gb, 2), "n_files": n, "max_gb": max_gb})
+
+
 def _check_shard_coverage() -> None:
     """
     Warn when flywheel shard pool coverage is too low to build reliable scores.
@@ -3973,6 +4068,8 @@ def main() -> None:
         _check_campaign_state()
         _check_flywheel_failures(cfg)
         _check_campaign_eta(cfg)
+        _check_progress_stall(cfg)
+        _check_log_disk(cfg)
         _check_shard_coverage()
         _check_shard_index()
         _check_light_scoring()

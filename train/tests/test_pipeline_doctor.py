@@ -692,3 +692,189 @@ class TestCampaignEta:
                    fw={"flywheel_name": "run1", "iteration": 12})
         pd._check_campaign_eta({})
         assert [i for i in pd._issues if "ETA" in i.title] == []
+
+
+class TestProgressStall:
+    """_check_progress_stall: a fresh heartbeat whose work counter hasn't advanced
+    past its window is 'alive but wedged'. State persists in a doctor-owned file."""
+
+    def _seed(self, doctor, prior):
+        d = doctor.DATA_ROOT / ".heartbeat"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / pd._PROGRESS_STATE_FILE).write_text(json.dumps(prior))
+
+    def _stub(self, monkeypatch, *, pc=None, pc_age=None, tr=None, tr_age=None):
+        hbs = {"precompute": pc, "trainer": tr}
+        ages = {"precompute": pc_age, "trainer": tr_age}
+        monkeypatch.setattr(pd, "read_heartbeat", lambda proc, chunk=None: hbs.get(proc))
+        monkeypatch.setattr(pd, "heartbeat_age_secs", lambda proc, chunk=None: ages.get(proc))
+
+    def _state(self, doctor):
+        return json.loads((doctor.DATA_ROOT / ".heartbeat"
+                           / pd._PROGRESS_STATE_FILE).read_text())
+
+    def test_precompute_stall_warns(self, doctor, monkeypatch):
+        import time as _t
+        self._seed(doctor, {"precompute_done": {"value": 30, "ts": _t.time() - 7200}})
+        self._stub(monkeypatch, pc={"done": 30, "total": 35, "current_shard": "x"}, pc_age=40.0)
+        pd._check_progress_stall({})
+        w = [i for i in pd._issues if "wedged" in i.title]
+        assert len(w) == 1 and w[0].severity == "WARNING"
+        assert w[0].title.startswith("Precompute") and w[0].ctx["signal"] == "precompute_done"
+
+    def test_no_warn_when_progress_advances(self, doctor, monkeypatch):
+        import time as _t
+        self._seed(doctor, {"precompute_done": {"value": 30, "ts": _t.time() - 7200}})
+        self._stub(monkeypatch, pc={"done": 31, "total": 35}, pc_age=40.0)
+        pd._check_progress_stall({})
+        assert [i for i in pd._issues if "wedged" in i.title] == []
+        assert self._state(doctor)["precompute_done"]["value"] == 31
+
+    def test_first_observation_seeds_no_warn(self, doctor, monkeypatch):
+        self._stub(monkeypatch, pc={"done": 5, "total": 35}, pc_age=40.0)
+        pd._check_progress_stall({})
+        assert [i for i in pd._issues if "wedged" in i.title] == []
+        assert self._state(doctor)["precompute_done"]["value"] == 5
+
+    def test_unchanged_within_window_no_warn(self, doctor, monkeypatch):
+        import time as _t
+        self._seed(doctor, {"precompute_done": {"value": 30, "ts": _t.time() - 100}})
+        self._stub(monkeypatch, pc={"done": 30, "total": 35}, pc_age=40.0)
+        pd._check_progress_stall({})
+        assert [i for i in pd._issues if "wedged" in i.title] == []
+
+    def test_trainer_step_stall(self, doctor, monkeypatch):
+        import time as _t
+        self._seed(doctor, {"trainer_step": {"value": 500, "ts": _t.time() - 700}})
+        self._stub(monkeypatch, tr={"step": 500}, tr_age=30.0)
+        pd._check_progress_stall({})
+        w = [i for i in pd._issues if "wedged" in i.title]
+        assert len(w) == 1 and w[0].title.startswith("Trainer")
+
+    def test_stale_heartbeat_no_warn(self, doctor, monkeypatch):
+        import time as _t
+        self._seed(doctor, {"precompute_done": {"value": 30, "ts": _t.time() - 7200}})
+        self._stub(monkeypatch, pc={"done": 30, "total": 35}, pc_age=99999.0)
+        pd._check_progress_stall({})
+        assert [i for i in pd._issues if "wedged" in i.title] == []
+
+
+class TestLogDisk:
+    """_check_log_disk: warn when logs/ exceeds the size budget (GROK-T-13)."""
+
+    def _logs(self, tmp_path, monkeypatch, sizes):
+        logs = tmp_path / "logs"; logs.mkdir()
+        for name, size in sizes.items():
+            (logs / name).write_bytes(b"x" * size)
+        monkeypatch.setattr(pd, "LOG_DIR", logs)
+
+    def test_warns_over_budget(self, doctor, tmp_path, monkeypatch):
+        self._logs(tmp_path, monkeypatch, {"a.log": 1000, "b.jsonl": 2000, "skip.txt": 9999})
+        pd._check_log_disk({"flywheel_health": {"logs_max_gb": 0.0}})
+        e = [i for i in pd._issues if i.category == "environment" and "logs/" in i.title]
+        assert len(e) == 1 and e[0].severity == "WARNING"
+        assert e[0].ctx["n_files"] == 2          # .txt excluded
+
+    def test_silent_under_budget(self, doctor, tmp_path, monkeypatch):
+        self._logs(tmp_path, monkeypatch, {"a.log": 1000})
+        pd._check_log_disk({})                    # default 5 GB
+        assert [i for i in pd._issues if "logs/" in i.title] == []
+
+    def test_no_logdir_silent(self, doctor, tmp_path, monkeypatch):
+        monkeypatch.setattr(pd, "LOG_DIR", tmp_path / "nope")
+        pd._check_log_disk({"flywheel_health": {"logs_max_gb": 0.0}})
+        assert [i for i in pd._issues if "logs/" in i.title] == []
+
+
+class TestTrainingIntegrity:
+    """_check_training_integrity: forensics over train_chunk{N}.log (GROK-TEST-3)."""
+
+    CFG = {"scale": "small", "training": {"steps": {"small": {1: 1000}}}}
+
+    def _log(self, doctor, monkeypatch, text, done=False):
+        logs = doctor.DATA_ROOT / "logs"; logs.mkdir(exist_ok=True)
+        (logs / "train_chunk1.log").write_text(text)
+        monkeypatch.setattr(pd, "LOG_DIR", logs)
+        if done:
+            sd = doctor.SENTINEL_DIR / "chunk1"; sd.mkdir(parents=True, exist_ok=True)
+            (sd / "train.done").touch()
+
+    def test_nan_loss_critical(self, doctor, monkeypatch):
+        self._log(doctor, monkeypatch, "step 5: loss = nan\nmore\n" * 3)
+        pd._check_training_integrity(self.CFG, [1])
+        t = [i for i in _by_category("training") if "NaN loss" in i.title]
+        assert len(t) == 1 and t[0].severity == "CRITICAL"
+
+    def test_nonzero_exit_not_done_critical(self, doctor, monkeypatch):
+        self._log(doctor, monkeypatch, "step 5: loss=0.1\nboom\nEXIT_CODE=1\n")
+        pd._check_training_integrity(self.CFG, [1])
+        t = [i for i in _by_category("training") if "exited with code 1" in i.title]
+        assert len(t) == 1 and t[0].severity == "CRITICAL" and t[0].ctx["exit_code"] == 1
+
+    def test_short_log_but_done_warning(self, doctor, monkeypatch):
+        self._log(doctor, monkeypatch, "started\ndone\n", done=True)
+        pd._check_training_integrity(self.CFG, [1])
+        assert any("very short" in i.title for i in _by_category("training"))
+
+    def test_resume_past_end_critical(self, doctor, monkeypatch):
+        self._log(doctor, monkeypatch, "Resuming from step 1,000\n" + "x\n" * 25)
+        pd._check_training_integrity(self.CFG, [1])
+        t = [i for i in _by_category("training") if "ran 0 steps" in i.title]
+        assert len(t) == 1 and t[0].severity == "CRITICAL"
+
+    def test_clean_log_silent(self, doctor, monkeypatch):
+        body = "\n".join(f"step {i}/1000 loss=0.1" for i in range(960, 1001))
+        self._log(doctor, monkeypatch, body + "\nEXIT_CODE=0\n", done=True)
+        pd._check_training_integrity(self.CFG, [1])
+        assert _by_category("training") == []
+
+
+class TestPrecomputeForensics:
+    """_check_precompute_forensics: NPZ coverage + crash artifacts (GROK-TEST-3)."""
+
+    CFG = {"training": {"siglip": False}}   # subdirs = qwen3, vae
+
+    def _wire(self, doctor, monkeypatch, tars=("000005.tar",), precomp=None):
+        shards = doctor.DATA_ROOT / "shards"; shards.mkdir(exist_ok=True)
+        for t in tars:
+            (shards / t).touch()
+        monkeypatch.setattr(pd, "SHARDS_DIR", shards)
+        pdir = doctor.DATA_ROOT / "precomputed"
+        for sub in ("qwen3", "vae"):
+            (pdir / sub).mkdir(parents=True, exist_ok=True)
+        for rel in (precomp or []):
+            f = pdir / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.touch()
+        monkeypatch.setattr(pd, "PRECOMP_DIR", pdir)
+
+    def _precompute_done(self, doctor):
+        sd = doctor.SENTINEL_DIR / "chunk1"; sd.mkdir(parents=True, exist_ok=True)
+        (sd / "precompute.done").touch()
+
+    def test_orphaned_tmp_warning(self, doctor, monkeypatch):
+        self._wire(doctor, monkeypatch, precomp=["qwen3/000005_0000.tmp.npz"])
+        pd._check_precompute_forensics(self.CFG, [1])
+        w = [i for i in _by_category("precompute") if "orphaned .tmp.npz" in i.title]
+        assert len(w) == 1 and w[0].severity == "WARNING"
+
+    def test_double_extension_critical(self, doctor, monkeypatch):
+        self._wire(doctor, monkeypatch, precomp=["qwen3/000005_0000.npz.tmp.npz"])
+        pd._check_precompute_forensics(self.CFG, [1])
+        c = [i for i in _by_category("precompute") if ".npz.tmp.npz" in i.title]
+        assert len(c) == 1 and c[0].severity == "CRITICAL"
+
+    def test_low_coverage_warning(self, doctor, monkeypatch):
+        # 2 shards, precompute.done, but 0 clean NPZ → coverage 0/2 < 50%.
+        self._wire(doctor, monkeypatch, tars=("000005.tar", "000006.tar"), precomp=[])
+        self._precompute_done(doctor)
+        pd._check_precompute_forensics(self.CFG, [1])
+        assert any("coverage low" in i.title for i in _by_category("precompute"))
+
+    def test_clean_silent(self, doctor, monkeypatch):
+        # both encoders fully covered for the one shard, no tmp artifacts.
+        precomp = [f"{enc}/000005_{i:04d}.npz" for enc in ("qwen3", "vae") for i in (0, 1)]
+        self._wire(doctor, monkeypatch, precomp=precomp)
+        self._precompute_done(doctor)
+        pd._check_precompute_forensics(self.CFG, [1])
+        assert _by_category("precompute") == []

@@ -922,8 +922,13 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   `_check_phantom_completions` (promoted.done-but-no-shards CRITICAL / shards-in-range-ok
   / not-promoted-silent — the headline phantom, same class as iter-10). Hermetic via
   DATA_ROOT + SENTINEL_DIR (both doctor and pipeline_lib bindings) + LOG_DIR/SHARDS_DIR/
-  PRECOMP_DIR monkeypatch + _issues reset. STILL OPEN: training-integrity +
-  precompute-forensics detectors (need richer log/heartbeat fixtures).
+  PRECOMP_DIR monkeypatch + _issues reset. EXTENDED (2026-06): training-integrity
+  (NaN loss, non-zero exit, short-log-but-done, resume-past-end, clean-silent) and
+  precompute-forensics (orphaned .tmp.npz, double-extension crash artifact, low
+  coverage, clean-silent) detectors now covered. Also added tests for the newer
+  flywheel observability checks — liveness reconciliation, failure-loop +
+  fingerprinting, cache-coverage confirmation, trainer-anomaly (chunkless), campaign
+  ETA, progress-stall, logs-disk. STILL OPEN: none of note for the doctor.
 - **GROK-TEST-4 (P1): model-quality regression automation.** Make `test_quality_features`
   emit machine-readable goldens (final cond/null gap, ip_scale stats, cross/self gap) on a
   fixed small set; gate in a `make test-quality`. No golden quality regression exists today.
