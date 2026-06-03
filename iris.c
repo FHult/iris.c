@@ -35,7 +35,6 @@ extern void iris_tokenizer_free(iris_tokenizer *tok);
 extern int *iris_tokenize(iris_tokenizer *tok, const char *text,
                           int *num_tokens, int max_len);
 
-extern iris_vae_t *iris_vae_load(FILE *f);
 extern iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf);
 extern iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                                   int z_channels,

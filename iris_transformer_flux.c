@@ -253,7 +253,6 @@ typedef struct iris_transformer {
     uint16_t *final_proj_weight_bf16; /* [latent_channels, hidden] (bf16) */
 
     /* RoPE frequencies (precomputed) */
-    float *rope_freqs;              /* [max_seq, head_dim/2, 2] - legacy 1D */
     float *rope_cos;                /* [max_seq, axis_dim] - 2D cos frequencies */
     float *rope_sin;                /* [max_seq, axis_dim] - 2D sin frequencies */
     int max_seq_len;
@@ -832,20 +831,6 @@ static void warmup_mmap_bf16_buffers(iris_transformer_t *tf) {
 /* ========================================================================
  * RoPE (Rotary Position Embeddings)
  * ======================================================================== */
-
-/* Precompute RoPE frequencies for given positions (1D version) */
-static void compute_rope_freqs(float *freqs, int max_seq, int dim, float theta) {
-    int half_dim = dim / 2;
-
-    for (int pos = 0; pos < max_seq; pos++) {
-        for (int d = 0; d < half_dim; d++) {
-            float freq = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
-            float angle = (float)pos * freq;
-            freqs[pos * half_dim * 2 + d * 2] = cosf(angle);
-            freqs[pos * half_dim * 2 + d * 2 + 1] = sinf(angle);
-        }
-    }
-}
 
 /* Build 4-axis RoPE frequency tables for image tokens on a (patch_h x patch_w) grid.
  * Axes are T (temporal), H (height), W (width), L (sequence), each with axes_dim/2
@@ -4647,10 +4632,6 @@ iris_transformer_t *iris_transformer_load(FILE *f) {
     tf->final_norm_weight = read_floats(f, tf->hidden_size);
     tf->final_proj_weight = read_floats(f, tf->latent_channels * tf->hidden_size);
 
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = (float *)malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
-
     /* Work buffers are dynamically allocated in forward() based on actual sequence
      * length. This avoids 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
@@ -4772,7 +4753,6 @@ void iris_transformer_free(iris_transformer_t *tf) {
     free(tf->final_norm_weight);
     free(tf->final_proj_weight);
     free(tf->final_proj_weight_bf16);
-    free(tf->rope_freqs);
     free(tf->img_hidden);
     free(tf->txt_hidden);
     free(tf->work1);
@@ -5145,12 +5125,6 @@ iris_transformer_t *iris_transformer_load_safetensors(const char *model_dir) {
     /* Close safetensors files (non-mmap: data already copied) */
     for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    if (tf->rope_freqs) {
-        compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
-    }
-
     /* Work buffers are dynamically allocated in forward() based on actual sequence
      * length. This avoids the 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
@@ -5282,12 +5256,6 @@ iris_transformer_t *iris_transformer_load_safetensors_mmap(const char *model_dir
     tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     if (tf->use_bf16) {
         tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
-    }
-
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    if (tf->rope_freqs) {
-        compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
     }
 
     /* Work buffers - dynamically allocated in forward() */

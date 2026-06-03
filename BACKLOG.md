@@ -693,14 +693,16 @@ is the C binary only; none of this affects the Python training/flywheel pipeline
 
 ### Do soon (cheap, low-risk)
 
-- **GROK-1 (was H-01): Remove dead `rope_freqs`** (~30 min) — `iris_transformer_flux.c`.
-  Field is malloc'd + `compute_rope_freqs()`'d + freed in 3 load paths (≈4651, 5149,
-  5288) but **never read** in any forward (verified: only alloc/compute/free/NULL-guard
-  references). Delete field + `compute_rope_freqs` helper if it has no other caller.
-  Violates "leave no dead code".
-- **GROK-2 (was M-08): Remove dead `iris_vae_load(FILE*)`** (~30 min) — `iris_vae.c:1057`,
-  decl `iris.c:38`. The legacy `.bin` VAE loader has **zero call sites** (only decl +
-  def). `#ifdef` out or delete; shrinks binary and removes a duplicate VAE load path.
+- ~~**GROK-1 (was H-01): Remove dead `rope_freqs`**~~ — DONE (2026-06). Removed the
+  `rope_freqs` field, the 1D `compute_rope_freqs` helper, all 3 alloc/compute load
+  sites + the free in `iris_transformer_flux.c` (verified never read in any forward).
+  `iris_qwen3.c`'s own `compute_rope_freqs` is unrelated and untouched. Clean BLAS build,
+  `make test-unit` green.
+- ~~**GROK-2 (was M-08): Remove dead `iris_vae_load(FILE*)`**~~ — DONE (2026-06). Removed
+  the legacy `.bin` VAE loader + its exclusive helpers (`read_uint32`, `read_floats`,
+  `load_resblock`, `load_attnblock`) from `iris_vae.c` and the decl from `iris.c`
+  (zero call sites). `free_resblock`/`free_attnblock` and the `_sf` safetensors loaders
+  kept. Clean build.
 - ~~**GROK-3 (was L-01): Dedup AGENT.md / CLAUDE.md**~~ — NOT A BUG (verified 2026-06).
   Already deduplicated: `AGENT.md` is the real file (git mode 100644) and `CLAUDE.md`
   is already a symlink to it (git mode 120000). Both the Grok report and a shallow
