@@ -560,8 +560,11 @@ is the C binary only; none of this affects the Python training/flywheel pipeline
 - **GROK-2 (was M-08): Remove dead `iris_vae_load(FILE*)`** (~30 min) — `iris_vae.c:1057`,
   decl `iris.c:38`. The legacy `.bin` VAE loader has **zero call sites** (only decl +
   def). `#ifdef` out or delete; shrinks binary and removes a duplicate VAE load path.
-- **GROK-3 (was L-01): Dedup AGENT.md / CLAUDE.md** (~5 min). Byte-identical (verified
-  `diff -q`). Symlink one to the other or delete the duplicate to prevent drift.
+- ~~**GROK-3 (was L-01): Dedup AGENT.md / CLAUDE.md**~~ — NOT A BUG (verified 2026-06).
+  Already deduplicated: `AGENT.md` is the real file (git mode 100644) and `CLAUDE.md`
+  is already a symlink to it (git mode 120000). Both the Grok report and a shallow
+  `diff -q` were fooled — the files "match" precisely *because* one is a symlink to
+  the other. No action; drift is already impossible.
 - **GROK-4 (was H-04): Z-Image pad/pos-id cross-path golden test** (~2–3h) —
   `iris_transformer_zimage.c`. NOT a bug fix — a regression guard for the documented
   "CPU/GPU position-id mismatch under padded captions" pitfall. Add a unit test
@@ -736,9 +739,13 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
 - **GROK-TEST-5 (P2): perf/memory assertions.** Assert on telemetry the mini-loop already
   computes (step time, `mx.get_peak_memory`, grad-norm, ema-drift); micro-bench for the
   online-encoder overhead. Critical for the 32 GB tightrope; currently absent.
-- **GROK-TEST-6 (P3): precompute_all + cache_manager units.** Synthetic test of the 1-pass
-  iter + "already done" skip + version-hash logic without real encoders; direct
-  cache_manager encoder-subset/version-hash unit.
+- **GROK-TEST-6 (P3): precompute_all + cache_manager units.** cache_manager PART DONE
+  (2026-06): `train/tests/test_cache_manager.py` (13 tests) covers version_hash
+  (determinism, key-order stability, config/git-sha sensitivity, format) and
+  encoder_config_subset (vae flux_model dir-stripping, image_size version separation,
+  qwen3/siglip/unknown subsets, end-to-end vae version stability). STILL OPEN: the
+  precompute_all 1-pass iter + "already done" skip logic (needs synthetic tar/npz
+  harness without real encoders).
 - **GROK-TEST-7 (P4): property-based + flywheel/ablation DB roundtrip.** hypothesis for
   bucket selection / schedule / quant roundtrips / hard-ex t-sampling; minimal DB +
   warmstart roundtrip tests.
