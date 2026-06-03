@@ -560,6 +560,57 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
     parsing + auth + action mapping are unit-testable with the Slack transport
     mocked, same pattern as test_slack_sink.py).
 
+- **QL-7: `iris_slackd` — minimal hardened command daemon** (Medium — the concrete,
+  shippable subset of QL-6; do this *instead of* the full QL-6 surface first). A
+  deliberately tiny long-running daemon whose only job is: listen to one Slack
+  channel, and on a recognised command, invoke a **fixed, whitelisted pipeline
+  script** — nothing else. Security and smallness are the features.
+
+  - **Threat model first.** Assume the channel could be seen by more people than
+    intended and that Slack messages are attacker-influenceable. Therefore: the
+    daemon must be incapable of running anything not in its compiled-in allow-list,
+    regardless of message content.
+  - **Hard rules (non-negotiable):**
+    - **Socket Mode only** — outbound WebSocket, no inbound port, no public
+      endpoint, no tunnel. App token + bot token from env (`SLACK_APP_TOKEN`,
+      `SLACK_BOT_TOKEN`); never in repo/config.
+    - **Single channel allow-list** (`SLACK_CMD_CHANNEL` id) + **user allow-list**
+      (`SLACK_CMD_USERS`, comma-sep ids). Messages from anywhere/anyone else are
+      ignored and audit-logged.
+    - **Fixed command table** mapping a short keyword → an explicit `argv list`
+      (e.g. `status → [venv_py, pipeline_status.py]`, `doctor → [venv_py,
+      pipeline_doctor.py, --ai]`, `quality → […, --quality-report]`,
+      `pause → […, pipeline_ctl.py, pause-flywheel]`, `resume → […, resume-flywheel]`).
+      **No user-supplied arguments** in v1 (or a strict per-command validator —
+      e.g. chunk must match `^[1-9][0-9]?$`). **Never** `shell=True`, never string
+      interpolation of message text into a command.
+    - **Default read-only.** State-changing commands (pause/resume/clear-error)
+      require `IRIS_SLACKD_ARMED=1` in the daemon's env; otherwise they are
+      acknowledged-but-refused. Destructive ones (stop, force-next-chunk) always
+      require an explicit `confirm <token>` reply.
+    - **No GPU, no direct pipeline mutation** — the daemon only spawns the existing
+      scripts (which already own locking/sentinels); it never touches state itself.
+    - **Audit everything** to `logs/slackd.jsonl`: ts, user, channel, raw text,
+      matched command (or "rejected: reason"), exit code. Rate-limit per user.
+    - **Output back to the channel** = the script's stdout tail (truncated), via the
+      QL-5 sink. Long output → a file snippet, not a wall of text.
+  - **Process model.** `monitoring/slack_bot.py` (or `train/scripts/iris_slackd.py`),
+    run in its own `iris-slackd` tmux window under caffeinate, supervised like the
+    other pipeline processes; clean shutdown on SIGTERM; reconnect on socket drop.
+  - **Why separate from QL-6.** QL-6 is the general design space (could grow
+    interactive buttons, broad actions). QL-7 is the *minimum viable, maximally
+    hardened* realisation: a closed command set that can only launch known scripts.
+    Ship QL-7; let QL-6's richer surface be optional later.
+  - **Dependency.** `slack_sdk` (Socket Mode) pinned in train/.venv — the one new
+    train-only dep, flagged as a conscious choice.
+  - **Tests (transport mocked, no network):** allow-list enforcement (wrong
+    channel/user rejected + logged), command-table mapping (keyword → exact argv),
+    unknown/again-malformed message rejected, armed-gate on state-changing commands,
+    confirm-token flow, audit-log shape. Same mock pattern as test_slack_sink.py.
+  - **Build order:** (1) listener + auth/allow-list + `status`/`doctor`/`quality`
+    (read-only) + audit log; (2) `pause`/`resume` behind `IRIS_SLACKD_ARMED`;
+    (3) `confirm`-gated heavier actions. **Effort:** ~1.5–2 days for (1)+(2).
+
 ---
 
 ## C Binary / CLI
