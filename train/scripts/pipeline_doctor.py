@@ -3300,7 +3300,8 @@ def main() -> None:
         chunks = [args.chunk]
 
     if not args.json and not args.ai and not args.html and not args.watch \
-            and not args.warmup_status:
+            and not args.warmup_status and not args.monitor \
+            and not args.quality_report:
         print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
 
     # --monitor: trend + alert dashboard from the monitoring store (v3.21.0).
