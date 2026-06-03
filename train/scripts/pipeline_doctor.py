@@ -3173,7 +3173,16 @@ def run_fix_mode(args_chunk: Optional[int]) -> None:
                 if not cmd or cmd.startswith("#"):
                     continue
                 print(f"  Running: {cmd}")
-                ret = subprocess.run(cmd, shell=True)
+                # shell=True is deliberate here: issue.fix strings are
+                # author-authored templates that use shell features (pipes,
+                # globs, `rm -f *.log`, `&&` chains), so a list-form conversion
+                # would break them. The mitigation is human-in-the-loop — each
+                # line is printed verbatim and run only after explicit per-issue
+                # "y" confirmation above. Residual risk: interpolated paths in a
+                # fix string containing shell metacharacters. Those paths come
+                # from the pipeline's own controlled namespace (DATA_ROOT,
+                # numeric shard stems); auditing them is tracked as GROK-T-3.
+                ret = subprocess.run(cmd, shell=True)  # noqa: S602
                 if ret.returncode != 0:
                     print(f"  Command exited {ret.returncode}")
         else:

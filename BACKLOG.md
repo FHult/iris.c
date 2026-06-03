@@ -608,3 +608,76 @@ is the C binary only; none of this affects the Python training/flywheel pipeline
   on change would speed dev. Cosmetic — defer.
 
 Original report retained as `grok_bug_report.md` (untracked) for full detail.
+
+---
+
+## train/ Static Review (Grok 4.3, 2026-06) — Triaged
+
+External static review of the Python training pipeline (`grok_train_bug_report.md`,
+untracked). Verified accurate on spot-check (shell=True at doctor:3176, the
+`/Users/fredrikhult/ultrahot` literal, path-asserting tests, 3k+ LOC files all
+confirmed). Character note: found **zero CRITICAL and zero concrete correctness
+defects** — entirely architectural/portability debt, most of it a known and
+accepted single-host constraint. It also **missed the live precompute→train
+fresh-write race** that failed flywheel iter 10, illustrating that static review
+surfaces debt but not the operational bugs that actually bite. Severities below
+re-calibrated to *urgency* (the report's HIGHs are mostly "hurts at multi-machine
+/ handoff time", not "wrong results now").
+
+### Done (cheap wins — actioned 2026-06)
+
+- **GROK-T-1 (H-T01): ultrahot username literal** — DONE. `ULTRAHOT_ROOT` was
+  `/Users/fredrikhult/ultrahot`; now `~/ultrahot` via `Path.home()` + a
+  `PIPELINE_ULTRAHOT_ROOT` env override matching the `DATA_ROOT` convention. Same
+  value on this machine, no behaviour change.
+- **GROK-T-2 (H-T01): path-asserting storage tests** — DONE.
+  `test_pipeline_storage.py::test_importable` asserted exact `/Volumes/16TBCold`
+  literals (machine-coupled, tested a constant against its own literal). Rewritten
+  to assert the real invariant — importable absolute `Path`s — leaving the
+  derivation check to `test_derived_from_cold_root`.
+
+### Open (real but deferred)
+
+- **GROK-T-3 (H-T05): `shell=True` in doctor --fix** (doctor:3176). Kept (7 fix
+  strings use pipes/globs/`&&`, so list-form would break them); documented inline
+  why it's deliberate + the human-in-the-loop mitigation. Real remaining task:
+  audit that no untrusted data flows into interpolated `issue.fix` paths
+  (currently all from DATA_ROOT + numeric shard stems). Low risk on a single-user
+  box.
+- **GROK-T-4 (H-T01 remainder): centralise storage roots.** ~90 hardcoded
+  `/Volumes`/`/Users` literals across leaf scripts + argparse defaults + docstrings.
+  Proposal: one `pipeline_lib.get_storage(cfg)` returning a `StoragePaths` object;
+  ban new literals. P0 *when* moving to a second machine / V3; not before.
+- **GROK-T-5 (H-T03): mflux dependency + sys.path hacks.** Unvendored mflux +
+  `sys.path.insert` in every entrypoint. Add `requirements-train.txt` pinning
+  mflux/mlx/etc., make `train/` a real package (`python -m train.scripts.x`),
+  drop the path shims. Reproducibility win; do at V3 packaging time.
+- **GROK-T-6 (H-T04): LiveEncoderManager.** The 32 GB attach/detach + mflux
+  private-weight manipulation is the most regression-prone code. Encapsulate in a
+  `with live_encoders_for_batch():` context manager + a mem-profile assert + a
+  hard error (not silent fallback) when precompute coverage is 100%. Worth doing
+  before adding any new live-encoder feature.
+- **GROK-T-7 (M-T03): config schema + load_and_validate.** 15+ yaml variants, no
+  schema; typo'd keys fail silently or deep in the loop. Add a dataclass/validator
+  + `config --validate`. Medium effort, real safety win.
+- **GROK-T-8 (M-T05): state-machine / resume scenario tests.** Synthetic
+  sentinels+heartbeats asserting `derive_chunk_state` + next-action across phantom,
+  jetsam, last-chunk, manual-rm, hard-ex-mixing. Catches resume regressions before
+  days of compute are wasted. (Note: would NOT have caught iter 10's fs race.)
+
+### Fix opportunistically (when already in that file)
+
+- **GROK-T-9 (H-T02): split god modules** (orchestrator 3480, doctor 3340,
+  train_ip_adapter 3071, ablation 3011 LOC). Legitimate but high-risk multi-week
+  refactor of the live state machine — only when V3/containerization forces it.
+- **GROK-T-10 (M-T01/M-T02): sentinel TOCTOU + resume special-cases.** Optional
+  sqlite step-state alongside sentinels; central pure-function "mixing policy" +
+  "step-range math" that's unit-tested. Pay down when next touching transitions.
+- **GROK-T-11 (M-T04): tar hardening.** Per-member size caps, optional sha256 at
+  build, per-shard `.error` sentinels. Pedantic — current data is trusted JDB/LAION.
+- **GROK-T-12 (M-T06): config-only script entrypoints.** Collapse duplicate argparse
+  (paths that already live in yaml) so standalone and orchestrated paths can't drift.
+- **GROK-T-13 (L-T03): log rotation/retention** — or at least a doctor check for
+  total `logs/` size (fixed-name jsonl/.log can accumulate across runs).
+
+Original report retained as `grok_train_bug_report.md` (untracked) for full detail.

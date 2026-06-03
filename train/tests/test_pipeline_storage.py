@@ -44,11 +44,16 @@ def _load(name: str):
 
 class TestColdConstants:
     def test_importable(self):
+        # Verify the constants exist as absolute Paths — NOT their literal values.
+        # Asserting exact /Volumes/... literals coupled the suite to one machine's
+        # mount layout and tested nothing (a constant equals its own literal).
+        # The derivation relationship is checked in test_derived_from_cold_root.
         lib = _load("pipeline_lib")
-        assert lib.COLD_ROOT           == Path("/Volumes/16TBCold")
-        assert lib.COLD_PRECOMPUTE_DIR == Path("/Volumes/16TBCold/precomputed")
-        assert lib.COLD_WEIGHTS_DIR    == Path("/Volumes/16TBCold/weights")
-        assert lib.COLD_METADATA_DIR   == Path("/Volumes/16TBCold/metadata")
+        for name in ("COLD_ROOT", "COLD_PRECOMPUTE_DIR",
+                     "COLD_WEIGHTS_DIR", "COLD_METADATA_DIR"):
+            val = getattr(lib, name)
+            assert isinstance(val, Path), f"{name} is not a Path"
+            assert val.is_absolute(), f"{name} is not absolute"
 
     def test_derived_from_cold_root(self):
         lib = _load("pipeline_lib")

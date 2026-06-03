@@ -59,7 +59,10 @@ VAL_SHARDS_DIR  = DATA_ROOT / "validation" / "held_out"
 VAL_PRECOMP_DIR = DATA_ROOT / "validation" / "precomputed"
 # Ultrahot tier — internal NVMe, lowest-latency serving path for the web app.
 # Populated by data_stager.py promote_to_ultrahot(); never written by training.
-ULTRAHOT_ROOT      = Path("/Users/fredrikhult/ultrahot")
+# Defaults to ~/ultrahot (home-relative, no hardcoded username); override with
+# PIPELINE_ULTRAHOT_ROOT to match DATA_ROOT's PIPELINE_DATA_ROOT convention.
+ULTRAHOT_ROOT      = Path(os.environ.get("PIPELINE_ULTRAHOT_ROOT",
+                                         str(Path.home() / "ultrahot")))
 ULTRAHOT_WEIGHTS   = ULTRAHOT_ROOT / "weights"
 ULTRAHOT_PRECOMP   = ULTRAHOT_ROOT / "precomputed"
 ULTRAHOT_CURATED   = ULTRAHOT_ROOT / "curated_shards"
