@@ -357,15 +357,20 @@ Start with clear documentation + sensible CLI defaults in the new helper; wire d
 
 ## Ablation Harness Improvements
 
-**ABL-1: Trial-level wallclock timeout** (High — safety, unblocked)
-
-If the trainer hangs (Metal graph compilation stall, GPU lock deadlock, MPS crash), `_run_one` blocks forever in the `proc.stdout` line loop and the entire campaign freezes. There is no per-trial time budget and no recovery path. The fix is a background `TrialTimer` thread that sends SIGTERM after `trial_timeout_secs` and marks the result as `verdict=TIMEOUT`. Implemented in `ablation_harness.py` (new class `TrialTimer`, wired into `_run_one`). Config key: `trial_timeout_secs` (default 14400 = 4 h).
-
-**Success criteria:** A deliberately hung trainer (inserted `time.sleep(9999)`) is killed within 60 s of the timeout, result written to DB as TIMEOUT, campaign proceeds to next trial. No regression on normal runs.
+~~**ABL-1: Trial-level wallclock timeout** (High — safety)~~ — DONE (class `TrialTimer`
+in `ablation_harness.py`, wired into `_run_one`; `trial_timeout_secs` config, default
+14400). Unit-tested 2026-06 in `train/tests/test_ablation_safety.py` (fires SIGTERM after
+timeout; cancel() before timeout is a no-op). The backlog entry was stale — the feature
+shipped but had no test coverage.
 
 ---
 
-**ABL-2: Multi-signal early stopping** (High — quality + time savings)
+~~**ABL-2: Multi-signal early stopping** (High — quality + time savings)~~ — DONE.
+`EarlyStopper` monitors all four signals (cond_gap floor, loss/NaN instant-kill,
+grad-norm explosion over 3 snapshots, ref_gap style-dead) with `trigger_reason` for
+DB logging. Unit-tested 2026-06 in `train/tests/test_ablation_safety.py` (incl. the
+backlog's own success criterion: constant loss=9.0 → kill on snapshot 1). Backlog
+entry was stale — shipped without test coverage. Original design retained below.
 
 `EarlyStopper` currently monitors only `cond_gap < min_cond_gap`. Two failure modes it misses:
 
@@ -434,13 +439,16 @@ A shard that scores well with `style_loss_weight=0.12` may score poorly with `st
 
 ---
 
-**PRECOMP-2: Tiny proxy VAE encoder** (Low — long-term throughput)
-
-The Flux VAE is the precompute bottleneck at ~200 ms/image on MPS. A small CNN trained on `{image → Flux VAE latent}` pairs could replicate it at ~20 ms/image, enabling 10× faster precompute for large datasets. Architecture: EfficientNet-B0-style encoder (5.3M params) with a final 1×1 conv projecting to 32 channels at stride 8 — output is the pre-patchification latent `[32, H//8, W//8]`. Train with MSE loss on precomputed VAE latent pairs. Expected fidelity: LPIPS < 0.04 vs real VAE. This is a training subproject, not a quick fix.
-
-**Dependencies:** PRECOMP-1 (need high-res latents for training data), a corpus of precomputed VAE latents (~100K images sufficient for initial training).
-
-**Effort:** 3–5 days (architecture, training loop, validation). Does not block any current pipeline work.
+~~**PRECOMP-2: Tiny proxy VAE encoder** (Low — long-term throughput)~~ — IMPLEMENTED
+in v3.18.0 + v3.19.0 (`train/vae_distill/`). The design deviated from this sketch
+(task-specific stride-8 encoder, not EfficientNet-B0; composite loss = channel-norm
+MSE + decoded MSE + frequency-weighted MSE + distribution matching, not plain MSE)
+for the reasons in `plans/precomp2-proxy-vae-design.md`. Ships small/default/medium
+variants (3.4M/6.0M/9.3M), ProxyVAE with confidence gating + regression detection +
+quality modes, evaluate_vae_proxy.py, benchmark_vae_proxy.py, compare_downstream_quality.py,
+and precompute_all/orchestrator integration. **Still pending validation** (idle GPU +
+a trained proxy): the 5–7× speedup number and the downstream A/B verdict — see the
+flywheel-gated items. Migration: `plans/proxy-vae-v3.19-migration.md`.
 
 ---
 
@@ -506,8 +514,10 @@ Individual campaigns are managed by the orchestrator. This item is the layer abo
 
 ## Test Gaps
 
-- **TB-001: Qwen3 Tokenizer Correctness** (P1) — no model needed, only tokenizer JSON
-- **TB-010: Flash Attention vs Naive Attention Parity** (P2) — no model needed
+- ~~**TB-001: Qwen3 Tokenizer Correctness** (P1)~~ — DONE. `debug/test_tokenizer.c`
+  (58 tests) runs in `make test`.
+- ~~**TB-010: Flash Attention vs Naive Attention Parity** (P2)~~ — DONE.
+  `debug/test_kernels.c` flash-vs-naive parity runs in `make test`.
 - **TB-002: Base Model Regression 4B-base** (P1) — requires model
 - **TB-004: VAE Encode/Decode Roundtrip** (P2) — requires model
 - **TB-005: img2img Strength Sweep** (P2) — requires model
