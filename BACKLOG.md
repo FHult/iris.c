@@ -516,8 +516,12 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   precompute speed, train loss, champion quality, system disk/mem) from the flywheel
   loop, so `--quality-report` / `--monitor` populate automatically. Pure code, but
   takes effect only after an orchestrator restart (don't interrupt a live campaign).
-- **QL-5 (optional): alert sinks** — `monitoring/alerts.py` returns structured
-  alerts rendered to console today; add email/Slack sinks behind config when desired.
+- ~~**QL-5: Slack alert sink**~~ — DONE (2026-06). `monitoring/sinks.py`:
+  slack_payload (header + per-alert blocks + text fallback) + dispatch_slack
+  (severity filter, env-var webhook resolution, mockable poster) + post_to_slack
+  (stdlib urllib, no deps). Wired as `pipeline_doctor.py --monitor --notify`;
+  webhook URL is a secret read from $SLACK_WEBHOOK_URL (config holds only the env
+  var NAME). 16 tests (test_slack_sink.py); network POST mocked, never hit.
 
 ---
 

@@ -9,5 +9,7 @@ renders. Surfaced via `pipeline_doctor.py --monitor --history N`.
 
 from .trends import TrendStore
 from .alerts import AlertRule, evaluate, rules_from_config, DEFAULT_RULES
+from .sinks import slack_payload, dispatch_slack, post_to_slack
 
-__all__ = ["TrendStore", "AlertRule", "evaluate", "rules_from_config", "DEFAULT_RULES"]
+__all__ = ["TrendStore", "AlertRule", "evaluate", "rules_from_config",
+           "DEFAULT_RULES", "slack_payload", "dispatch_slack", "post_to_slack"]

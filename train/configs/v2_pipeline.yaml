@@ -413,6 +413,13 @@ monitoring:
   # quality drop, disk/mem). Each: {metric, kind, threshold?, rel?, window_days?,
   # severity?, campaign?, message?}. kinds: threshold_high|threshold_low|spike|drop
   alerts: []
+  # Slack alerting (QL-5). The webhook URL is a SECRET — never put it here; set the
+  # named env var instead:  export SLACK_WEBHOOK_URL='https://hooks.slack.com/...'
+  # Then:  pipeline_doctor.py --monitor --notify
+  slack:
+    enabled: false
+    webhook_env: "SLACK_WEBHOOK_URL"   # name of the env var holding the webhook URL
+    min_severity: "WARNING"            # CRITICAL | WARNING | INFO
   # Example:
   #   alerts:
   #     - {metric: proxy_fallback_rate, kind: threshold_high, threshold: 0.25}

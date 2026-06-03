@@ -3227,6 +3227,7 @@ def _run_monitor(cfg: dict, history_days: int) -> None:
         print(f"  {len(alerts)} active alert(s):")
         for a in alerts:
             print(f"    [{a['severity']}] {a['message']}  ({a['detail']})")
+    return alerts
 
 
 def _run_quality_report(cfg: dict) -> None:
@@ -3285,6 +3286,10 @@ def main() -> None:
                              "Use with --history N to set the window in days.")
     parser.add_argument("--history", type=int, default=30, metavar="DAYS",
                         help="Trend window in days for --monitor (default: 30)")
+    parser.add_argument("--notify", action="store_true",
+                        help="With --monitor: push active alerts to Slack via the "
+                             "incoming webhook in $SLACK_WEBHOOK_URL (or the env var "
+                             "named in monitoring.slack.webhook_env).")
     parser.add_argument("--quality-report", action="store_true",
                         help="v3.21.0: show the experiment Champion/Challenger ranking "
                              "from golden-set evaluations (experiments.db).")
@@ -3306,7 +3311,14 @@ def main() -> None:
 
     # --monitor: trend + alert dashboard from the monitoring store (v3.21.0).
     if args.monitor:
-        _run_monitor(cfg, args.history)
+        alerts = _run_monitor(cfg, args.history)
+        if args.notify and alerts:
+            try:
+                from monitoring.sinks import dispatch_slack
+                res = dispatch_slack(alerts, cfg, context="pipeline_doctor --monitor")
+                print(f"\n  Slack: {'sent ' + str(res['n_sent']) + ' alert(s)' if res['sent'] else 'not sent — ' + str(res.get('skipped'))}")
+            except Exception as e:
+                print(f"\n  Slack notify failed: {e}")
         return
 
     # --quality-report: experiment Champion/Challenger ranking (v3.21.0).
