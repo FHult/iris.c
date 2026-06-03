@@ -134,3 +134,55 @@ class TestResourceManager:
         rm = orch.ResourceManager()
         rm.release("DISK_WRITE_HIGH")   # never requested — must not raise
         assert rm.holder("DISK_WRITE_HIGH") is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_proxy_vae_args — config → precompute CLI flags (+ campaign overrides)
+# ---------------------------------------------------------------------------
+
+class TestResolveProxyVaeArgs:
+    @pytest.fixture(autouse=True)
+    def _silence_log(self, monkeypatch):
+        # The missing-path branch calls log_orch; stub it so tests never write
+        # to the live orchestrator log.
+        monkeypatch.setattr(orch, "log_orch", lambda *a, **k: None)
+
+    def test_disabled_returns_empty(self, tmp_path):
+        p = tmp_path / "proxy.safetensors"; p.touch()
+        cfg = {"proxy_vae": {"enabled": False, "proxy_path": str(p)}}
+        assert orch._resolve_proxy_vae_args(cfg) == ""
+
+    def test_no_path_returns_empty(self):
+        cfg = {"proxy_vae": {"enabled": True, "proxy_path": None}}
+        assert orch._resolve_proxy_vae_args(cfg) == ""
+
+    def test_missing_file_returns_empty(self):
+        cfg = {"proxy_vae": {"enabled": True, "proxy_path": "/no/such.safetensors"}}
+        assert orch._resolve_proxy_vae_args(cfg) == ""
+
+    def test_enabled_emits_default_flags(self, tmp_path):
+        p = tmp_path / "proxy.safetensors"; p.touch()
+        cfg = {"proxy_vae": {"enabled": True, "proxy_path": str(p)}}
+        out = orch._resolve_proxy_vae_args(cfg)
+        assert f"--proxy-vae '{p}'" in out
+        assert "--proxy-mode balanced" in out
+        assert "--proxy-vae-threshold 0.75" in out
+
+    def test_campaign_override_applies(self, tmp_path):
+        p = tmp_path / "proxy.safetensors"; p.touch()
+        cfg = {"proxy_vae": {
+            "enabled": True, "proxy_path": str(p),
+            "default_mode": "balanced", "fallback_threshold": 0.75,
+            "campaigns": {"wikiart": {"mode": "high_fidelity",
+                                      "fallback_threshold": 0.9}}}}
+        out = orch._resolve_proxy_vae_args(cfg, campaign="wikiart")
+        assert "--proxy-mode high_fidelity" in out
+        assert "--proxy-vae-threshold 0.9" in out
+
+    def test_unknown_campaign_uses_defaults(self, tmp_path):
+        p = tmp_path / "proxy.safetensors"; p.touch()
+        cfg = {"proxy_vae": {
+            "enabled": True, "proxy_path": str(p), "default_mode": "speed",
+            "campaigns": {"wikiart": {"mode": "high_fidelity"}}}}
+        out = orch._resolve_proxy_vae_args(cfg, campaign="not-listed")
+        assert "--proxy-mode speed" in out

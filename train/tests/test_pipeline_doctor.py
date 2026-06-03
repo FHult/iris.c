@@ -21,13 +21,21 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import pipeline_doctor as pd
+import pipeline_lib
 
 
 @pytest.fixture
 def doctor(tmp_path, monkeypatch):
-    """Redirect doctor path globals to a tempdir; reset _issues; yield helpers."""
+    """Redirect doctor path globals to a tempdir; reset _issues; yield helpers.
+
+    Patches SENTINEL_DIR in BOTH modules: the doctor's own binding (used by
+    checks that read SENTINEL_DIR directly) and pipeline_lib's (used by the
+    is_done/has_error helpers the checks call). They must agree.
+    """
+    sent = tmp_path / "pipeline"
     monkeypatch.setattr(pd, "DATA_ROOT", tmp_path)
-    monkeypatch.setattr(pd, "SENTINEL_DIR", tmp_path / "pipeline")
+    monkeypatch.setattr(pd, "SENTINEL_DIR", sent)
+    monkeypatch.setattr(pipeline_lib, "SENTINEL_DIR", sent)
     pd._issues.clear()
     yield pd
     pd._issues.clear()
@@ -163,3 +171,91 @@ class TestCheckErrorSentinels:
         issues = _by_category("error_sentinel")
         assert len(issues) == 2
         assert {i.chunk for i in issues} == {1, 2}
+
+
+# ---------------------------------------------------------------------------
+# _check_stale_logs — a step's log older than its .done sentinel is from a
+# prior run and will mislead. (LOG_DIR lambdas in _STEP_LOGS read the global.)
+# ---------------------------------------------------------------------------
+
+class TestCheckStaleLogs:
+    @pytest.fixture
+    def logs(self, doctor, tmp_path, monkeypatch):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        monkeypatch.setattr(doctor, "LOG_DIR", log_dir)
+        (doctor.SENTINEL_DIR / "chunk1").mkdir(parents=True)
+        return doctor, log_dir
+
+    def test_log_older_than_sentinel_warns(self, logs):
+        import os
+        doctor, log_dir = logs
+        sent = doctor.SENTINEL_DIR / "chunk1" / "train.done"
+        sent.touch()
+        log = log_dir / "train_chunk1.log"
+        log.touch()
+        # Make the log 1h older than the sentinel (well beyond the 300s grace).
+        os.utime(log, (sent.stat().st_mtime - 3600, sent.stat().st_mtime - 3600))
+        doctor._check_stale_logs([1])
+        assert len(_by_category("stale_log")) >= 1
+
+    def test_fresh_log_is_silent(self, logs):
+        import os
+        doctor, log_dir = logs
+        sent = doctor.SENTINEL_DIR / "chunk1" / "train.done"
+        sent.touch()
+        log = log_dir / "train_chunk1.log"
+        log.touch()
+        # Log newer than sentinel → not stale.
+        os.utime(log, (sent.stat().st_mtime + 10, sent.stat().st_mtime + 10))
+        doctor._check_stale_logs([1])
+        assert _by_category("stale_log") == []
+
+    def test_no_sentinel_is_silent(self, logs):
+        doctor, log_dir = logs
+        (log_dir / "train_chunk1.log").touch()   # log but no .done sentinel
+        doctor._check_stale_logs([1])
+        assert _by_category("stale_log") == []
+
+
+# ---------------------------------------------------------------------------
+# _check_phantom_completions — "promoted.done but the data isn't there".
+# The headline phantom detector (same class as iter-10: looks done, data absent).
+# ---------------------------------------------------------------------------
+
+class TestCheckPhantomCompletions:
+    @pytest.fixture
+    def phantom(self, doctor, tmp_path, monkeypatch):
+        shards = tmp_path / "shards"
+        precomp = tmp_path / "precomputed"
+        shards.mkdir()
+        precomp.mkdir()
+        monkeypatch.setattr(doctor, "SHARDS_DIR", shards)
+        monkeypatch.setattr(doctor, "PRECOMP_DIR", precomp)
+        (doctor.SENTINEL_DIR / "chunk1").mkdir(parents=True)
+        cfg = {"scale": "small", "training": {"steps": {"small": 1000}}}
+        return doctor, shards, cfg
+
+    def test_promoted_but_no_shards_is_critical(self, phantom):
+        doctor, shards, cfg = phantom
+        (doctor.SENTINEL_DIR / "chunk1" / "promoted.done").touch()
+        doctor._check_phantom_completions(cfg, [1])
+        crit = [i for i in doctor._issues
+                if i.category == "phantom" and i.severity == "CRITICAL"]
+        assert len(crit) == 1
+        assert crit[0].ctx["shard_count"] == 0
+
+    def test_promoted_with_shards_in_range_is_ok(self, phantom):
+        doctor, shards, cfg = phantom
+        (doctor.SENTINEL_DIR / "chunk1" / "promoted.done").touch()
+        (shards / "000005.tar").touch()      # id 5 ∈ chunk 1 range [0, 200000)
+        doctor._check_phantom_completions(cfg, [1])
+        crit = [i for i in doctor._issues
+                if i.category == "phantom" and i.severity == "CRITICAL"]
+        assert crit == []
+
+    def test_not_promoted_is_silent(self, phantom):
+        doctor, shards, cfg = phantom
+        # No promoted.done → nothing to validate.
+        doctor._check_phantom_completions(cfg, [1])
+        assert [i for i in doctor._issues if i.category == "phantom"] == []

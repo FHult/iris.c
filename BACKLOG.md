@@ -724,8 +724,9 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
 - **GROK-TEST-2 (P0): synthetic orchestrator state-machine harness.** PARTIALLY DONE
   (2026-06). `train/tests/test_orchestrator_state.py` added (14 tests): `derive_chunk_state`
   across all steps + error-precedence + last-done-wins + chunk independence, the
-  CHUNK_STEPS/_STEP_TO_STATE contract, and ResourceManager non-GPU token semantics.
-  Hermetic via `pipeline_lib.SENTINEL_DIR` monkeypatch (flywheel-safe — separate process).
+  CHUNK_STEPS/_STEP_TO_STATE contract, and ResourceManager non-GPU token semantics, plus _resolve_proxy_vae_args
+  (config→precompute flags + per-campaign overrides). Hermetic via
+  `pipeline_lib.SENTINEL_DIR` monkeypatch (flywheel-safe — separate process).
   STILL OPEN: phantom-hard_ex detection, jetsam retry/backoff, chunk-transition (`_check_ready`
   gating), resume-from-N, last-chunk special cases, dispatch-queue seeding — these live in
   larger orchestrator methods that launch processes; testing them needs further extraction
@@ -733,10 +734,13 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
 - **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** PARTIALLY DONE (2026-06).
   `train/tests/test_pipeline_doctor.py` (12 tests): `_check_proxy_vae` (all 8 branches —
   silent/misconfigured/missing-ckpt/no-eval/failed-gates/healthy/unreadable) and
-  `_check_error_sentinels` (none/critical/done-skip/multi-chunk). Hermetic via
-  DATA_ROOT+SENTINEL_DIR monkeypatch + _issues reset. STILL OPEN: the phantom-completion,
-  training-integrity, precompute-forensics, and stale-log detectors (more coupled to
-  DB/log-mtime/heartbeat state — need richer synthetic fixtures).
+  `_check_error_sentinels` (none/critical/done-skip/multi-chunk), `_check_stale_logs`
+  (log-older-than-sentinel WARNING / fresh-silent / no-sentinel-silent), and
+  `_check_phantom_completions` (promoted.done-but-no-shards CRITICAL / shards-in-range-ok
+  / not-promoted-silent — the headline phantom, same class as iter-10). Hermetic via
+  DATA_ROOT + SENTINEL_DIR (both doctor and pipeline_lib bindings) + LOG_DIR/SHARDS_DIR/
+  PRECOMP_DIR monkeypatch + _issues reset. STILL OPEN: training-integrity +
+  precompute-forensics detectors (need richer log/heartbeat fixtures).
 - **GROK-TEST-4 (P1): model-quality regression automation.** Make `test_quality_features`
   emit machine-readable goldens (final cond/null gap, ip_scale stats, cross/self gap) on a
   fixed small set; gate in a `make test-quality`. No golden quality regression exists today.
