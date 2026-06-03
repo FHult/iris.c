@@ -186,3 +186,67 @@ class TestResolveProxyVaeArgs:
             "campaigns": {"wikiart": {"mode": "high_fidelity"}}}}
         out = orch._resolve_proxy_vae_args(cfg, campaign="not-listed")
         assert "--proxy-mode speed" in out
+
+
+# ---------------------------------------------------------------------------
+# Crash diagnosis + retry/backoff policy (GROK-TEST-2: jetsam vs code-error).
+# ---------------------------------------------------------------------------
+
+class TestExitCodeParse:
+    def test_extracts_code(self):
+        assert orch._parse_exit_code_from_msg("Training exited 137; jetsam") == 137
+
+    def test_missing_or_empty_returns_minus1(self):
+        assert orch._parse_exit_code_from_msg("no code here") == -1
+        assert orch._parse_exit_code_from_msg("") == -1
+        assert orch._parse_exit_code_from_msg(None) == -1
+
+
+class TestRetryPolicy:
+    def test_jetsam_retries_with_backoff(self):
+        should, mx, delay = orch._retry_policy("jetsam_oom", 0)
+        assert should is True
+        assert mx == orch.JETSAM_MAX_RETRIES and delay == orch.JETSAM_RETRY_DELAY_S
+
+    def test_jetsam_stops_at_limit(self):
+        should, _, _ = orch._retry_policy("jetsam_oom", orch.JETSAM_MAX_RETRIES)
+        assert should is False
+
+    def test_code_error_single_retry_no_delay(self):
+        should, mx, delay = orch._retry_policy("code_error", 0)
+        assert should is True and mx == 1 and delay == 0
+
+    def test_code_error_stops_after_one(self):
+        should, _, _ = orch._retry_policy("code_error", 1)
+        assert should is False
+
+
+class TestDiagnoseCrash:
+    def test_non_137_is_code_error(self, tmp_path):
+        log = tmp_path / "t.log"; log.write_text("boom\n")
+        reason, detail = orch._diagnose_crash(log, 1)
+        assert reason == "code_error" and "exit 1" in detail
+
+    def test_137_jetsam_confirmed(self, tmp_path, monkeypatch):
+        log = tmp_path / "t.log"; log.write_text("x\n")
+        monkeypatch.setattr(orch, "_query_macos_jetsam_log", lambda *a, **k: True)
+        reason, detail = orch._diagnose_crash(log, 137)
+        assert reason == "jetsam_oom" and "confirmed" in detail
+
+    def test_137_jetsam_assumed_when_log_silent(self, tmp_path, monkeypatch):
+        log = tmp_path / "t.log"; log.write_text("x\n")
+        monkeypatch.setattr(orch, "_query_macos_jetsam_log", lambda *a, **k: False)
+        reason, detail = orch._diagnose_crash(log, 137)
+        assert reason == "jetsam_oom" and "assumed" in detail
+
+
+class TestParseLastMem:
+    def test_extracts_last_mem(self, tmp_path):
+        log = tmp_path / "t.log"
+        log.write_text("step 1 mem: 10.0 GB used  5.0 GB free\n"
+                       "step 2 mem: 12.0 GB used  3.0 GB free\n")
+        assert orch._parse_last_mem_from_log(log) == "12.0 GB used  3.0 GB free"
+
+    def test_no_mem_returns_empty(self, tmp_path):
+        log = tmp_path / "t.log"; log.write_text("no memory here\n")
+        assert orch._parse_last_mem_from_log(log) == ""

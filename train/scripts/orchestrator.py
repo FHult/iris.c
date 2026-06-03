@@ -84,6 +84,19 @@ def _parse_exit_code_from_msg(msg: str) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _retry_policy(reason: str, restarts: int) -> tuple[bool, int, int]:
+    """Pure retry decision for a crashed step.
+
+    Jetsam (transient macOS OOM SIGKILL) is retried up to JETSAM_MAX_RETRIES with a
+    JETSAM_RETRY_DELAY_S backoff to let memory pressure settle; a real code error is
+    retried at most once with no delay. Returns
+    (should_retry, max_retries, retry_delay_secs)."""
+    is_jetsam   = reason == "jetsam_oom"
+    max_retries = JETSAM_MAX_RETRIES if is_jetsam else 1
+    retry_delay = JETSAM_RETRY_DELAY_S if is_jetsam else 0
+    return restarts < max_retries, max_retries, retry_delay
+
+
 def _diagnose_crash(log_file: Path, exit_code: int,
                     mem_log: Optional[Path] = None) -> tuple[str, str]:
     """
@@ -1842,11 +1855,9 @@ class Orchestrator:
                 if _diag_key not in self._crash_diag:
                     self._crash_diag[_diag_key] = _diagnose_crash(log_file, exit_code, self._mem_log)
                 reason, detail = self._crash_diag[_diag_key]
-                is_jetsam = reason == "jetsam_oom"
-                max_retries = JETSAM_MAX_RETRIES if is_jetsam else 1
-                retry_delay = JETSAM_RETRY_DELAY_S if is_jetsam else 0
+                should_retry, max_retries, retry_delay = _retry_policy(reason, restarts)
 
-                if restarts < max_retries:
+                if should_retry:
                     # Honour backoff window: don't relaunch until pressure settles.
                     retry_at = self._retry_after.get(key, 0.0)
                     if time.time() < retry_at:

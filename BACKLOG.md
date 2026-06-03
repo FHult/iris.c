@@ -915,10 +915,16 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   CHUNK_STEPS/_STEP_TO_STATE contract, and ResourceManager non-GPU token semantics, plus _resolve_proxy_vae_args
   (config→precompute flags + per-campaign overrides). Hermetic via
   `pipeline_lib.SENTINEL_DIR` monkeypatch (flywheel-safe — separate process).
-  STILL OPEN: phantom-hard_ex detection, jetsam retry/backoff, chunk-transition (`_check_ready`
-  gating), resume-from-N, last-chunk special cases, dispatch-queue seeding — these live in
-  larger orchestrator methods that launch processes; testing them needs further extraction
-  of pure cores. (None would catch iter 10's fs race — that's a separate guard.)
+  EXTENDED (2026-06): jetsam-vs-code-error retry/backoff now covered — extracted the
+  pure `_retry_policy(reason, restarts)` decision out of the crash-handler method and
+  tested it (jetsam → JETSAM_MAX_RETRIES with backoff, code error → 1 retry no delay,
+  stop-at-limit), plus the already-pure crash functions `_parse_exit_code_from_msg`,
+  `_diagnose_crash` (non-137 code_error / 137 jetsam-confirmed / 137 jetsam-assumed via
+  monkeypatched system-log query), `_parse_last_mem_from_log`. 11 new tests.
+  STILL OPEN: phantom-hard_ex detection, chunk-transition (`_check_ready` gating),
+  resume-from-N, last-chunk special cases, dispatch-queue seeding — still embedded in
+  larger process-launching methods; need further pure-core extraction. (None would catch
+  iter 10's fs race — that's a separate guard.)
 - **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** PARTIALLY DONE (2026-06).
   `train/tests/test_pipeline_doctor.py` (12 tests): `_check_proxy_vae` (all 8 branches —
   silent/misconfigured/missing-ckpt/no-eval/failed-gates/healthy/unreadable) and
