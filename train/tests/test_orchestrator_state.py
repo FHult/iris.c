@@ -250,3 +250,77 @@ class TestParseLastMem:
     def test_no_mem_returns_empty(self, tmp_path):
         log = tmp_path / "t.log"; log.write_text("no memory here\n")
         assert orch._parse_last_mem_from_log(log) == ""
+
+
+# ---------------------------------------------------------------------------
+# GROK-TEST-2 remainder: chunk-transition gate, staging gate, dispatch seeding.
+# ---------------------------------------------------------------------------
+
+class TestReadyGate:
+    def test_waits_for_prev_train(self):
+        assert orch._ready_gate(2, prev_train_done=False, gpu_free=True,
+                                stager_enabled=False, stage_done=True,
+                                stage_error=False) == "wait_prev_train"
+
+    def test_waits_for_gpu(self):
+        assert orch._ready_gate(1, prev_train_done=True, gpu_free=False,
+                                stager_enabled=False, stage_done=True,
+                                stage_error=False) == "wait_gpu"
+
+    def test_waits_for_staging(self):
+        assert orch._ready_gate(2, prev_train_done=True, gpu_free=True,
+                                stager_enabled=True, stage_done=False,
+                                stage_error=False) == "wait_stage"
+
+    def test_proceeds_without_stage_on_stage_error(self):
+        assert orch._ready_gate(2, prev_train_done=True, gpu_free=True,
+                                stager_enabled=True, stage_done=False,
+                                stage_error=True) == "proceed_no_stage"
+
+    def test_proceeds_when_all_clear(self):
+        assert orch._ready_gate(2, prev_train_done=True, gpu_free=True,
+                                stager_enabled=True, stage_done=True,
+                                stage_error=False) == "proceed"
+
+    def test_chunk1_not_gated_on_staging(self):
+        # chunk 1 never waits for staging even when the stager is enabled.
+        assert orch._ready_gate(1, prev_train_done=True, gpu_free=True,
+                                stager_enabled=True, stage_done=False,
+                                stage_error=False) == "proceed"
+
+
+class TestShouldAttemptStage:
+    def test_chunk1_never_staged(self):
+        assert orch._should_attempt_stage(1, predecessor_promoted=True, stage_done=False) is False
+
+    def test_predecessor_not_promoted(self):
+        assert orch._should_attempt_stage(2, predecessor_promoted=False, stage_done=False) is False
+
+    def test_ready_and_unstaged(self):
+        assert orch._should_attempt_stage(2, predecessor_promoted=True, stage_done=False) is True
+
+    def test_already_staged(self):
+        assert orch._should_attempt_stage(2, predecessor_promoted=True, stage_done=True) is False
+
+
+class TestLoadOpenDispatchIds:
+    def _queue(self, tmp_path, monkeypatch, lines):
+        import json as _j
+        q = tmp_path / "dispatch_queue.jsonl"
+        q.write_text("\n".join(_j.dumps(x) for x in lines) + "\n")
+        monkeypatch.setattr(orch, "DISPATCH_QUEUE", q)
+
+    def test_open_ids_returned(self, tmp_path, monkeypatch):
+        self._queue(tmp_path, monkeypatch,
+                    [{"id": "a", "resolved": False}, {"id": "b"}])
+        assert orch._load_open_dispatch_ids() == {"a", "b"}
+
+    def test_resolved_after_open_is_excluded(self, tmp_path, monkeypatch):
+        # later 'resolved' entry for the same id wins → not open.
+        self._queue(tmp_path, monkeypatch,
+                    [{"id": "a", "resolved": False}, {"id": "a", "resolved": True}])
+        assert orch._load_open_dispatch_ids() == set()
+
+    def test_missing_file_is_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(orch, "DISPATCH_QUEUE", tmp_path / "nope.jsonl")
+        assert orch._load_open_dispatch_ids() == set()

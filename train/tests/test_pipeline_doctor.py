@@ -878,3 +878,28 @@ class TestPrecomputeForensics:
         self._precompute_done(doctor)
         pd._check_precompute_forensics(self.CFG, [1])
         assert _by_category("precompute") == []
+
+
+class TestPhantomHardExLastChunk:
+    """_check_phantom_completions hard-example branch: 0 hard-ex after mine.done is
+    CRITICAL mid-pipeline but only INFO on the last chunk (no consumer)."""
+
+    def _wire(self, doctor, tmp_path, monkeypatch, chunk):
+        hx = tmp_path / "hard_ex"; hx.mkdir()
+        monkeypatch.setattr(pd, "HARD_EX_DIR", hx)   # no chunk dir → 0 hard examples
+        sd = doctor.SENTINEL_DIR / f"chunk{chunk}"; sd.mkdir(parents=True, exist_ok=True)
+        (sd / "mine.done").touch()
+        return {"scale": "small", "training": {"steps": {"small": {1: 1000}}}}
+
+    def test_last_chunk_zero_hard_ex_is_info(self, doctor, tmp_path, monkeypatch):
+        cfg = self._wire(doctor, tmp_path, monkeypatch, chunk=4)
+        pd._check_phantom_completions(cfg, [4])      # chunk 4 == max → last
+        ph = _by_category("phantom")
+        assert any(i.severity == "INFO" and "last chunk" in i.title for i in ph)
+        assert not any(i.severity == "CRITICAL" for i in ph)
+
+    def test_middle_chunk_zero_hard_ex_is_critical(self, doctor, tmp_path, monkeypatch):
+        cfg = self._wire(doctor, tmp_path, monkeypatch, chunk=2)
+        pd._check_phantom_completions(cfg, [2, 3])   # chunk 2 not last; next (3) not trained
+        crit = [i for i in _by_category("phantom") if i.severity == "CRITICAL"]
+        assert any("0 hard-example files" in i.title for i in crit)

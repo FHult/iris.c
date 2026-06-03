@@ -928,10 +928,16 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   stop-at-limit), plus the already-pure crash functions `_parse_exit_code_from_msg`,
   `_diagnose_crash` (non-137 code_error / 137 jetsam-confirmed / 137 jetsam-assumed via
   monkeypatched system-log query), `_parse_last_mem_from_log`. 11 new tests.
-  STILL OPEN: phantom-hard_ex detection, chunk-transition (`_check_ready` gating),
-  resume-from-N, last-chunk special cases, dispatch-queue seeding — still embedded in
-  larger process-launching methods; need further pure-core extraction. (None would catch
-  iter 10's fs race — that's a separate guard.)
+  COMPLETED (2026-06): the remaining decision logic is now extracted + tested —
+  `_ready_gate` (chunk-transition: wait_prev_train/wait_gpu/wait_stage/proceed_no_stage/
+  proceed, incl. chunk-1-never-staged), `_should_attempt_stage` (predecessor-promoted
+  staging gate), `_restart_plan` in pipeline_ctl (resume-from-N: reset exactly N..total,
+  never a chunk before N), `_load_open_dispatch_ids` (dispatch seeding: open vs
+  resolved-after-open), and the doctor phantom hard-ex last-chunk branch (INFO on last
+  chunk vs CRITICAL mid-pipeline). All behaviour-preserving extractions; tests in
+  test_orchestrator_state.py / test_pipeline_ctl.py / test_pipeline_doctor.py.
+  Note: none of these would catch iter 10's fs race — that's the separate shard-cache
+  guard (GROK-TEST-1 / GROK-VAE-1).
 - **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** PARTIALLY DONE (2026-06).
   `train/tests/test_pipeline_doctor.py` (12 tests): `_check_proxy_vae` (all 8 branches —
   silent/misconfigured/missing-ckpt/no-eval/failed-gates/healthy/unreadable) and

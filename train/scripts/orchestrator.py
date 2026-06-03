@@ -97,6 +97,36 @@ def _retry_policy(reason: str, restarts: int) -> tuple[bool, int, int]:
     return restarts < max_retries, max_retries, retry_delay
 
 
+def _ready_gate(chunk: int, prev_train_done: bool, gpu_free: bool,
+                stager_enabled: bool, stage_done: bool, stage_error: bool) -> str:
+    """Pure gating decision for a READY chunk (promote → train).
+
+    Returns one of:
+      'wait_prev_train' — chunk N≥2 must wait for chunk N-1 training to finish
+      'wait_gpu'        — GPU is held by another step
+      'wait_stage'      — predictive staging for N≥2 hasn't completed (and didn't error)
+      'proceed_no_stage'— staging errored; proceed without staged data (bad cold drive
+                          must not permanently stall the pipeline)
+      'proceed'         — all gates clear
+    """
+    if chunk > 1 and not prev_train_done:
+        return "wait_prev_train"
+    if not gpu_free:
+        return "wait_gpu"
+    if stager_enabled and chunk > 1 and not stage_done:
+        return "proceed_no_stage" if stage_error else "wait_stage"
+    return "proceed"
+
+
+def _should_attempt_stage(chunk: int, predecessor_promoted: bool,
+                          stage_done: bool) -> bool:
+    """Pure: stage chunk N from cold only once its predecessor (N-1) is promoted
+    (training is imminent), only for N>=2 (chunk 1 is never staged), and only if
+    not already staged."""
+    predecessor_ready = chunk == 1 or predecessor_promoted
+    return predecessor_ready and not stage_done and chunk > 1
+
+
 def _diagnose_crash(log_file: Path, exit_code: int,
                     mem_log: Optional[Path] = None) -> tuple[str, str]:
     """
@@ -985,8 +1015,11 @@ class Orchestrator:
             # Only retry staging for chunk N once chunk N-1 has been promoted
             # (training is imminent).  Chunk 1 is never gated on staging.
             stage_err_id = f"stager_stage_{chunk}"
-            predecessor_ready = (chunk == 1 or is_done(chunk - 1, "promoted"))
-            if predecessor_ready and not is_done(chunk, "stage") and chunk > 1:
+            if _should_attempt_stage(
+                chunk,
+                predecessor_promoted=(chunk > 1 and is_done(chunk - 1, "promoted")),
+                stage_done=is_done(chunk, "stage"),
+            ):
                 if has_error(chunk, "stage"):
                     if stage_err_id not in self._stager_dispatched_errors:
                         dispatch_issue(
@@ -1383,21 +1416,25 @@ class Orchestrator:
 
     def _check_ready(self, chunk: int) -> None:
         """Promote staging to production, then start training."""
-        if chunk > 1 and not is_done(chunk - 1, "train"):
-            return  # wait for previous chunk's training
-        if not gpu_is_free():
-            return
-
-        # Gate chunk N ≥ 2 on staging completion (two-device setup only).
-        # Chunk 1 is never subject to predictive staging; the gate only applies
-        # to chunks that were predictively staged while the predecessor trained.
-        # If staging errored: _poll_stager already dispatched an issue; proceed
+        # Chunk 1 is never subject to predictive staging; the staging gate only
+        # applies to chunks predictively staged while the predecessor trained.
+        # If staging errored, _poll_stager already dispatched an issue; we proceed
         # anyway so a bad cold drive doesn't permanently stall the pipeline.
-        if self.stager.enabled and chunk > 1 and not is_done(chunk, "stage"):
-            if not has_error(chunk, "stage"):
-                log_orch(f"Chunk {chunk}: waiting for staging to complete before training",
-                         chunk=chunk)
-                return
+        gate = _ready_gate(
+            chunk,
+            prev_train_done=(chunk == 1 or is_done(chunk - 1, "train")),
+            gpu_free=gpu_is_free(),
+            stager_enabled=self.stager.enabled,
+            stage_done=is_done(chunk, "stage"),
+            stage_error=has_error(chunk, "stage"),
+        )
+        if gate in ("wait_prev_train", "wait_gpu"):
+            return
+        if gate == "wait_stage":
+            log_orch(f"Chunk {chunk}: waiting for staging to complete before training",
+                     chunk=chunk)
+            return
+        if gate == "proceed_no_stage":
             log_orch(f"Chunk {chunk}: staging failed — proceeding without staged data "
                      f"(see dispatch queue for details)", chunk=chunk, level="warning")
 

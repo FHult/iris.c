@@ -186,6 +186,19 @@ def _find_cold_checkpoint():
     return None, None, None
 
 
+def _restart_plan(chunk: int, total: int) -> dict:
+    """Pure plan for restarting the pipeline from chunk N.
+
+    Resets chunks N..total inclusive (and drops their hard-example dirs so mining
+    re-runs against the new checkpoint) — NEVER a chunk before N, which are complete
+    and must be preserved; an off-by-one here would re-run finished chunks (wasted
+    days of compute) or skip needed resets. restore_predecessor is the chunk whose
+    final checkpoint training resumes from (None for chunk 1)."""
+    targets = list(range(chunk, total + 1))
+    return {"reset_chunks": targets, "hard_ex_chunks": list(targets),
+            "restore_predecessor": (chunk - 1) if chunk > 1 else None}
+
+
 def cmd_restart_from_chunk(args) -> None:
     """
     Safely restart the pipeline from chunk N:
@@ -226,10 +239,12 @@ def cmd_restart_from_chunk(args) -> None:
     else:
         total = 4  # fallback
 
+    plan = _restart_plan(chunk, total)
+
     # Identify hard example dirs that would be stale after the restart
     hard_ex_to_delete = [
         HARD_EX_DIR / f"chunk{c}"
-        for c in range(chunk, total + 1)
+        for c in plan["hard_ex_chunks"]
         if (HARD_EX_DIR / f"chunk{c}").exists()
     ]
 
@@ -275,7 +290,7 @@ def cmd_restart_from_chunk(args) -> None:
         print("Killed iris-train window")
 
     # Clear sentinels for chunks N..total
-    for c in range(chunk, total + 1):
+    for c in plan["reset_chunks"]:
         chunk_dir = SENTINEL_DIR / f"chunk{c}"
         if chunk_dir.exists():
             shutil.rmtree(chunk_dir)
