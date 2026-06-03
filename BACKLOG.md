@@ -730,9 +730,13 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   gating), resume-from-N, last-chunk special cases, dispatch-queue seeding — these live in
   larger orchestrator methods that launch processes; testing them needs further extraction
   of pure cores. (None would catch iter 10's fs race — that's a separate guard.)
-- **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** Feed each `_check_*` synthetic
-  state, assert the issues/fixes reported. The doctor's phantom/integrity detectors are
-  trusted from production use, not unit-verified against golden synthetic states.
+- **GROK-TEST-3 (P0): pipeline_doctor black-box tests.** PARTIALLY DONE (2026-06).
+  `train/tests/test_pipeline_doctor.py` (12 tests): `_check_proxy_vae` (all 8 branches —
+  silent/misconfigured/missing-ckpt/no-eval/failed-gates/healthy/unreadable) and
+  `_check_error_sentinels` (none/critical/done-skip/multi-chunk). Hermetic via
+  DATA_ROOT+SENTINEL_DIR monkeypatch + _issues reset. STILL OPEN: the phantom-completion,
+  training-integrity, precompute-forensics, and stale-log detectors (more coupled to
+  DB/log-mtime/heartbeat state — need richer synthetic fixtures).
 - **GROK-TEST-4 (P1): model-quality regression automation.** Make `test_quality_features`
   emit machine-readable goldens (final cond/null gap, ip_scale stats, cross/self gap) on a
   fixed small set; gate in a `make test-quality`. No golden quality regression exists today.
