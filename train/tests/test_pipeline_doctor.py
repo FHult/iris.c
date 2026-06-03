@@ -536,3 +536,76 @@ class TestCheckFlywheelFailures:
         fw = [i for i in pd._issues if i.category == "flywheel"
               and "consecutive iterations failed" in i.title][0]
         assert fw.severity == "WARNING"
+
+
+class TestFlywheelCacheCoverage:
+    """_flywheel_iter_cache_coverage + the shard_cache_empty auto-confirmation:
+    codifies the manual forensics that distinguished a cache-dir RESOLUTION bug
+    (npz present, trainer read the wrong dir) from genuinely-missing precompute."""
+
+    def _wire_cov(self, tmp_path, monkeypatch, ids, present_ids, iteration=5):
+        dbfile = tmp_path / "fw.db"
+        dbfile.touch()
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+        iters = {"run1": [{"iteration": iteration, "status": "failed", "exit_code": 1,
+                           "selected_shards": json.dumps(ids)}]}
+        monkeypatch.setattr(flywheel_lib, "FlywheelDB",
+                            _fake_db_factory([{"flywheel_name": "run1"}], iters))
+        cold = tmp_path / "cold"
+        for enc in ("qwen3", "vae"):
+            cur = cold / "precomputed" / enc / "current"
+            cur.mkdir(parents=True)
+            for sid in present_ids:
+                for i in (0, 49):
+                    (cur / f"{sid}_{i:04d}.npz").write_bytes(b"x")
+        monkeypatch.setattr(pd, "COLD_ROOT", cold)
+        monkeypatch.setattr(pd, "PRECOMP_DIR", tmp_path / "hot_precomp")
+
+    def test_all_present(self, doctor, tmp_path, monkeypatch):
+        ids = ["000000", "000001", "000002"]
+        self._wire_cov(tmp_path, monkeypatch, ids, ids)
+        assert pd._flywheel_iter_cache_coverage("run1", 5) == (3, 3)
+
+    def test_partial_coverage(self, doctor, tmp_path, monkeypatch):
+        ids = ["000000", "000001", "000002", "000003"]
+        self._wire_cov(tmp_path, monkeypatch, ids, ids[:1])
+        assert pd._flywheel_iter_cache_coverage("run1", 5) == (1, 4)
+
+    def test_no_cold_returns_none(self, doctor, tmp_path, monkeypatch):
+        dbfile = tmp_path / "fw.db"; dbfile.touch()
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+        monkeypatch.setattr(flywheel_lib, "FlywheelDB", _fake_db_factory(
+            [{"flywheel_name": "run1"}],
+            {"run1": [{"iteration": 5, "selected_shards": json.dumps(["000000"])}]}))
+        monkeypatch.setattr(pd, "COLD_ROOT", tmp_path / "nope")
+        monkeypatch.setattr(pd, "PRECOMP_DIR", tmp_path / "nope2")
+        assert pd._flywheel_iter_cache_coverage("run1", 5) == (None, None)
+
+    def test_failure_check_confirms_resolution_bug(self, doctor, tmp_path, monkeypatch):
+        ids = ["000000", "000001", "000002"]
+        dbfile = tmp_path / "fw.db"; dbfile.touch()
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+        iters = {"run1": [
+            {"iteration": 9,  "status": "failed", "exit_code": 1, "selected_shards": json.dumps(ids)},
+            {"iteration": 10, "status": "failed", "exit_code": 1, "selected_shards": json.dumps(ids)},
+        ]}
+        monkeypatch.setattr(flywheel_lib, "FlywheelDB",
+                            _fake_db_factory([{"flywheel_name": "run1"}], iters))
+        logs = tmp_path / "logs"; logs.mkdir()
+        (logs / "flywheel_run1_iter0010.log").write_text(_fixture("iter0010_shard_cache_empty.log"))
+        monkeypatch.setattr(pd, "LOG_DIR", logs)
+        cold = tmp_path / "cold"
+        for enc in ("qwen3", "vae"):
+            cur = cold / "precomputed" / enc / "current"; cur.mkdir(parents=True)
+            for sid in ids:
+                for i in (0, 49):
+                    (cur / f"{sid}_{i:04d}.npz").write_bytes(b"x")
+        monkeypatch.setattr(pd, "COLD_ROOT", cold)
+        monkeypatch.setattr(pd, "PRECOMP_DIR", tmp_path / "hot")
+
+        pd._check_flywheel_failures({})
+        fw = [i for i in pd._issues if i.category == "flywheel"
+              and "consecutive iterations failed" in i.title][0]
+        assert fw.ctx["cache_coverage"] == {"present": 3, "total": 3}
+        assert "cache-dir resolution bug" in fw.detail.lower()
+        assert "confirmed" in fw.detail.lower()

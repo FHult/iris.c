@@ -2320,21 +2320,28 @@ FAILURE_SIGNATURES: list[dict] = [
                      "have qwen3+vae precomputed — training on 0 shards",
                      "have qwen3+vae precomputed - training on 0 shards"],
         "severity": "CRITICAL",
-        "transient": True,
-        "summary": "precompute→train handoff failed (0 shards with qwen3+vae cache)",
+        "transient": False,
+        "summary": "trainer --data-root resolution clobbers the per-iter staging cache (0/N shards)",
         "diagnosis": ("The shard-cache filter found 0 shards with qwen3+vae npz at "
-                      "train start, so training aborted immediately. This is the "
-                      "precompute→train handoff failure: either the per-iter precompute "
-                      "wrote to a path training doesn't read (PIPELINE_ORCHESTRATED not "
-                      "set), or a fresh-write fs-visibility race left the npz invisible "
-                      "when the filter ran."),
+                      "train start. ROOT CAUSE (confirmed 2026-06): the orchestrator sets "
+                      "the per-iteration cache dirs to staging_dir/precomputed/{enc} (where "
+                      "the npz are), but train_ip_adapter.py's --data-root block "
+                      "(~lines 3046-3065) then UNCONDITIONALLY overwrites them with the "
+                      "GLOBAL versioned cache {data_root}/precomputed/{enc}/current — which "
+                      "during an active flywheel iter is the in-progress, 0-record version. "
+                      "The filter probes that empty dir → 0/N. Deterministic: every iteration "
+                      "fails identically. (shard_path survives because it's absolute and the "
+                      "relative-path prefixer skips it; the versioned-cache block has no such "
+                      "guard.) NOT a fs race — recurs with npz staged hours earlier."),
         "remedies": [
-            "Check the iter's npz exist: ls -1 {staging}/{name}/iter{iter:04d}/precomputed/vae | head",
-            "If npz ARE present, this was a transient fs-visibility race; the next "
-            "iteration (cold-staged npz, written earlier) is protected — let it run.",
-            "If npz are MISSING, re-run precompute for this iter: "
-            "{venv} {scripts}/precompute_all.py --shards {staging}/{name}/iter{iter:04d}",
-            "Confirm PIPELINE_ORCHESTRATED=1 is exported into the train env (orchestrator sets this).",
+            "FIX the trainer: guard train_ip_adapter.py:3046-3065 so the versioned-cache "
+            "resolution fires ONLY when the configured cache_dir is empty or the flat "
+            "{data_root}/precomputed/{enc} default — never clobber an explicit absolute "
+            "cache_dir the orchestrator set to a per-iter staging path.",
+            "Confirm the bug: the npz DO exist for the iter "
+            "({venv} {scripts}/pipeline_doctor.py shows the iter published N npz to cold); "
+            "the trainer just looked in the wrong (global, 0-record) dir.",
+            "After the fix, run one iteration and confirm 'Shard cache filter: N/N' before resuming.",
         ],
     },
     {
@@ -2522,6 +2529,51 @@ def _count_trailing_failures(iterations: list[dict]) -> tuple[int, Optional[dict
     return count, latest_failed, exit_codes
 
 
+def _flywheel_iter_cache_coverage(name: str, iteration: int,
+                                  probe_indices=(0, 49)) -> tuple:
+    """Return (n_with_npz, n_total) for an iteration's selected shards vs the
+    published precompute `current` (qwen3 AND vae).
+
+    Distinguishes a cache-dir resolution bug (npz present but the trainer's filter
+    found 0 — it read the wrong dir) from genuinely-missing precompute. Probes the
+    cold-published `current` first, then the hot global. Returns (None, None) when
+    the data isn't available — never raises."""
+    if not FLYWHEEL_DB_PATH.exists():
+        return None, None
+    try:
+        from flywheel_lib import FlywheelDB
+        db = FlywheelDB(FLYWHEEL_DB_PATH)
+        rows = [r for r in db.get_iterations(name) if r.get("iteration") == iteration]
+        db.close()
+    except Exception:
+        return None, None
+    if not rows:
+        return None, None
+    raw = rows[0].get("selected_shards")
+    try:
+        ids = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except (ValueError, TypeError):
+        return None, None
+    if not ids:
+        return None, None
+
+    qd = vd = None
+    for base in (COLD_ROOT / "precomputed", PRECOMP_DIR):
+        q, v = base / "qwen3" / "current", base / "vae" / "current"
+        if q.exists() and v.exists():
+            qd, vd = q, v
+            break
+    if qd is None:
+        return None, None
+
+    def _has(pfx: str) -> bool:
+        return all((d / f"{pfx}_{i:04d}.npz").exists()
+                   for d in (qd, vd) for i in probe_indices)
+
+    n_present = sum(1 for s in ids if _has(str(s)))
+    return n_present, len(ids)
+
+
 def _check_flywheel_failures(cfg: dict) -> None:
     """Detect a flywheel hard-failure loop and fingerprint the latest crash.
 
@@ -2573,12 +2625,30 @@ def _check_flywheel_failures(cfg: dict) -> None:
         nonnull  = [e for e in exit_codes if e not in (None, -1)]
         systemic = len(nonnull) >= 2 and len(set(nonnull)) == 1
 
+        cache_cov = None
         if diag:
             title  = f"Flywheel '{name}': {count} consecutive iterations failed — {diag['summary']}"
             detail = diag["diagnosis"]
             if diag.get("severity") == "CRITICAL":
                 severity = "CRITICAL"
             evidence = diag.get("evidence", "")
+            # For the cache-empty signature, auto-confirm whether the npz actually
+            # exist for this iter's selected shards — distinguishes a cache-dir
+            # resolution bug (data present, trainer read the wrong dir) from
+            # genuinely-missing precompute. Codifies the manual forensics.
+            if diag["id"] == "shard_cache_empty" and it_n is not None:
+                n_present, n_total = _flywheel_iter_cache_coverage(name, it_n)
+                if n_present is not None and n_total:
+                    cache_cov = {"present": n_present, "total": n_total}
+                    if n_present >= max(1, (n_total + 1) // 2):
+                        detail += (f"  CONFIRMED: {n_present}/{n_total} of this iter's selected "
+                                   f"shards DO have published npz — precompute succeeded and the "
+                                   f"trainer read the wrong cache dir. This is the cache-dir "
+                                   f"resolution bug, NOT missing data.")
+                    else:
+                        detail += (f"  Only {n_present}/{n_total} selected shards have published "
+                                   f"npz — precompute coverage is genuinely low; investigate the "
+                                   f"precompute step rather than the trainer.")
             fix = _format_remedies(name, it_n, log_path,
                                    diag.get("remedies", []),
                                    transient=diag.get("transient", False) and not systemic)
@@ -2603,7 +2673,8 @@ def _check_flywheel_failures(cfg: dict) -> None:
                   "last_iteration": it_n, "last_exit_code": ec,
                   "exit_codes": exit_codes, "ever_succeeded": ever_done,
                   "signature": diag["id"] if diag else None,
-                  "evidence": evidence, "systemic": systemic})
+                  "evidence": evidence, "systemic": systemic,
+                  "cache_coverage": cache_cov})
 
 
 def _check_shard_coverage() -> None:

@@ -155,3 +155,59 @@ class TestFilterShards:
             tars = _tars(stems)
             got = tia.filter_shards_with_cache(tars, q, v)
             assert got == tars   # filter must not reorder
+
+
+class TestResolveVersionedCacheDirs:
+    """_resolve_versioned_cache_dirs follows `current` for the flat default but must
+    NEVER clobber an explicit cache dir (the per-iter flywheel staging path). This
+    is the regression guard for the cache-dir clobber that failed every flywheel
+    iteration: training resolved its cache dir to the global, 0-record `current`
+    instead of the staging dir the orchestrator set, so the filter matched 0 shards.
+    """
+
+    def test_explicit_staging_dir_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # Global default exists with a `current` version — the trap the old
+            # code clobbered every explicit cache dir with.
+            for enc in ("qwen3", "vae", "siglip"):
+                ver = root / "precomputed" / enc / "v_global"
+                ver.mkdir(parents=True)
+                (ver / "000000_0000.npz").write_bytes(b"x")
+                os.symlink(ver, root / "precomputed" / enc / "current")
+            staging = root / "flywheel_staging" / "run1" / "iter0011" / "precomputed"
+            cfg = {"data": {
+                "qwen3_cache_dir": str(staging / "qwen3"),
+                "vae_cache_dir":   str(staging / "vae"),
+                "siglip_cache_dir": str(staging / "siglip"),
+            }}
+            tia._resolve_versioned_cache_dirs(cfg, str(root))
+            assert cfg["data"]["qwen3_cache_dir"] == str(staging / "qwen3")
+            assert cfg["data"]["vae_cache_dir"]   == str(staging / "vae")
+            assert cfg["data"]["siglip_cache_dir"] == str(staging / "siglip")
+            assert "current" not in cfg["data"]["qwen3_cache_dir"]
+
+    def test_flat_default_resolves_to_current(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ver = root / "precomputed" / "qwen3" / "v_abc"
+            ver.mkdir(parents=True)
+            (ver / "000000_0000.npz").write_bytes(b"x")
+            os.symlink(ver, root / "precomputed" / "qwen3" / "current")
+            cfg = {"data": {"qwen3_cache_dir": str(root / "precomputed" / "qwen3")}}
+            tia._resolve_versioned_cache_dirs(cfg, str(root))
+            assert os.path.realpath(cfg["data"]["qwen3_cache_dir"]) == os.path.realpath(str(ver))
+
+    def test_no_cache_dirs_is_noop(self):
+        cfg = {"data": {"shard_path": "/x"}}
+        tia._resolve_versioned_cache_dirs(cfg, "/tmp")  # must not raise
+        assert "qwen3_cache_dir" not in cfg["data"]
+
+    def test_flat_default_without_current_is_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            flat = root / "precomputed" / "qwen3"
+            flat.mkdir(parents=True)  # exists, but no `current` symlink and no npz
+            cfg = {"data": {"qwen3_cache_dir": str(flat)}}
+            tia._resolve_versioned_cache_dirs(cfg, str(root))
+            assert cfg["data"]["qwen3_cache_dir"] == str(flat)

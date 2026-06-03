@@ -526,6 +526,49 @@ def filter_shards_with_cache(shard_paths: list, qwen3_dir: str,
     return [p for p in shard_paths if shard_has_cache(p, qwen3_dir, vae_dir)]
 
 
+def _resolve_versioned_cache_dirs(config: dict, data_root: str) -> None:
+    """Follow the `current` symlink ONLY for cache dirs that are the flat default.
+
+    A cache dir written as the bare `{data_root}/precomputed/{enc}` default is
+    version-resolved to its `current` directory. An explicit cache_dir set to
+    anything else — notably a per-iteration flywheel staging path
+    (`.../iterNNNN/precomputed/{enc}`) — is respected as-is.
+
+    Historically this unconditionally overwrote *every* cache dir with the global
+    `current`, clobbering the per-iter staging path the orchestrator had set. When
+    the global `current` was an in-progress, 0-record version, the shard-cache
+    filter then matched 0 shards and every flywheel iteration aborted at startup.
+    Mutates config in place; never raises.
+    """
+    data = config.get("data") or {}
+    enc_for_key = {"qwen3_cache_dir": "qwen3",
+                   "vae_cache_dir":   "vae",
+                   "siglip_cache_dir": "siglip"}
+    if not any(data.get(k) for k in enc_for_key):
+        return
+    try:
+        _scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+        if _scripts not in sys.path:
+            sys.path.insert(0, _scripts)
+        from cache_manager import PrecomputeCache
+    except Exception:
+        return  # cache_manager unavailable — keep configured paths as-is
+    precomp_root = os.path.join(data_root, "precomputed")
+    for key, enc in enc_for_key.items():
+        cur = data.get(key)
+        if not cur:
+            continue
+        # Only the flat default gets version-resolved; an explicit dir is respected.
+        if os.path.realpath(cur) != os.path.realpath(os.path.join(precomp_root, enc)):
+            continue
+        try:
+            eff = PrecomputeCache.effective_dir(Path(precomp_root), enc)
+        except Exception:
+            eff = None
+        if eff:
+            data[key] = str(eff)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3043,26 +3086,9 @@ def main():
                 rel = val[len(_strip_prefix):] if val.startswith(_strip_prefix) else val
                 config[section][key] = os.path.join(_dr, rel)
 
-        # Resolve versioned cache dirs: if enc_dir/current symlink exists, follow it.
-        # This is transparent to everything downstream — the resolved path is an
-        # ordinary directory containing .npz files.
-        try:
-            _scripts = Path(__file__).parent / "scripts"
-            import sys as _sys
-            _sys.path.insert(0, str(_scripts))
-            from cache_manager import PrecomputeCache as _PCC
-            _precomp_root = Path(_dr) / "precomputed"
-            _enc_for_key = {"qwen3_cache_dir": "qwen3",
-                            "vae_cache_dir":   "vae",
-                            "siglip_cache_dir": "siglip"}
-            for _cache_key, _enc in _enc_for_key.items():
-                if not config.get("data", {}).get(_cache_key):
-                    continue
-                _eff = _PCC.effective_dir(_precomp_root, _enc)
-                if _eff:
-                    config["data"][_cache_key] = str(_eff)
-        except Exception:
-            pass  # cache_manager unavailable or no versioned cache — keep flat path
+        # Version-resolve ONLY flat-default cache dirs to their `current` symlink;
+        # never clobber an explicit (e.g. per-iter flywheel staging) cache dir.
+        _resolve_versioned_cache_dirs(config, _dr)
 
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
