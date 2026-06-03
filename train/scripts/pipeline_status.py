@@ -783,6 +783,25 @@ def print_human(status: dict, verbose: bool = False) -> None:
             last_str = f"  last checkin: {last[:10]}" if last else ""
             print(f"  Mobile: {completed} completed session(s).{last_str}")
 
+    # Health deferral footer. By design, status reports progress + observable
+    # facts; it does NOT diagnose. Diagnosis, severity, and remedial steps live in
+    # the doctor (which also catches issues status can't see — e.g. flywheel
+    # failure loops). We flag only unambiguous local facts here (error sentinels,
+    # open dispatch issues) — never heartbeat staleness, which the doctor
+    # reconciles against live phase activity — and we never assert "all healthy",
+    # since status's chunk-scoped view can miss campaign-level failures.
+    n_disp = len(status.get("dispatch_issues", []))
+    n_err  = sum(len(cs.get("errors", {})) for cs in status.get("chunks", {}).values())
+    doctor_cmd = "train/.venv/bin/python train/scripts/pipeline_doctor.py"
+    if n_disp or n_err:
+        bits = []
+        if n_err:
+            bits.append(f"{n_err} step error sentinel(s)")
+        if n_disp:
+            bits.append(f"{n_disp} open dispatch issue(s)")
+        print(f"  ⚠️  {', '.join(bits)} present.")
+    print(f"  Diagnosis & remedial options →  {doctor_cmd}")
+
     print(f"{'─'*64}\n")
 
 

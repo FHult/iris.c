@@ -1,0 +1,25 @@
+  ✅ import yaml
+  ✅ import turbojpeg
+  ✅ model dir: flux-klein-model
+  ✅ shards: /Volumes/2TBSSD/flywheel_staging/warmup-run1/iter0010  (40 tars)
+  ✅ output dir writable: /Volumes/2TBSSD/checkpoints/stage1
+
+MLX memory limit: 14 GB  cache limit: 1966 MB
+Loading Flux Klein 4B (frozen) ...
+SigLIP: using precomputed cache — skipping model load.
+VAE: using precomputed cache — skipping model load.
+Text encoder: using precomputed cache — skipping model load.
+Shard cache filter: 0/40 shards have qwen3+vae precomputed — training on 0 shards only.
+Traceback (most recent call last):
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 3071, in <module>
+    main()
+    ~~~~^^
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 3067, in main
+    train(config)
+    ~~~~~^^^^^^^^
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 764, in train
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: No shards with precomputed qwen3+vae cache found. Run train/scripts/precompute_all.py first.
+EXIT_CODE=1

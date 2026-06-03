@@ -1,0 +1,25 @@
+Warming up Flux training graphs (all bucket shapes)...
+  [512x512] compiling...
+  [512x512] done (1.1s)
+  [512x768] compiling...
+  [512x768] done (1.5s)
+  [768x512] compiling...
+  [768x512] done (1.5s)
+  [640x640] compiling...
+  [640x640] done (1.6s)
+  [512x896] compiling...
+  [512x896] done (1.8s)
+  [896x512] compiling...
+  [896x512] done (1.8s)
+Flux training graphs ready.
+Building IPAdapterKlein ...
+
+Training: 1,000 steps (steps 0→1,000), batch_size=1
+
+Validation held-out: not found — T-05 disabled
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 89512.59it/s]
+ERROR:root:Model type siglip not supported. Error: No module named 'mlx_vlm.models.siglip'
+Loading weights:   0%|          | 0/888 [00:00<?, ?it/s]Loading weights:  47%|████▋     | 421/888 [00:00<00:00, 4208.98it/s]Loading weights: 100%|██████████| 888/888 [00:00<00:00, 4741.79it/s]
+[online-encode] step 0: loaded VAE(re-attach), Qwen3(re-attach), SigLIP(full) (transient models now resident for encode window only)
+bash: line 1: 11450 Segmentation fault: 11  caffeinate -dim python -u '/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py' --config '/tmp/flywheel_warmup-run1_iter0007_train.yaml' --max-steps 1000 --data-root '/Volumes/2TBSSD'
+EXIT_CODE=139

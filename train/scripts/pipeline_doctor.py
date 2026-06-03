@@ -208,11 +208,79 @@ def _fmt_age(secs: Optional[float]) -> str:
     return f"{secs/3600:.1f}h ago"
 
 
+# A fresh precompute/flywheel heartbeat proves the campaign is alive and
+# advancing even when the FlywheelDB and orchestrator log have gone quiet — those
+# only update at iteration/phase boundaries, so a multi-hour precompute leaves
+# them stale by design. Staleness checks consult this to avoid crying
+# "stalled / orchestrator down" at a phase that is demonstrably running. A None
+# return means no fresh worker signal, so a genuine stall is still flagged.
+_FLYWHEEL_LIVE_SECS = 900  # mirror pipeline_lib.HEARTBEAT_STALE_SECS
+
+
+def _flywheel_phase_active() -> Optional[dict]:
+    """Live flywheel phase summary from per-worker heartbeats, or None.
+
+    Returns {process, age_s, label} when the precompute or flywheel heartbeat is
+    fresh (<= _FLYWHEEL_LIVE_SECS). `label` is a one-line human summary (campaign,
+    iteration, shard progress, ETA) merged from the flywheel heartbeat (campaign/
+    iteration context — only rewritten at phase transitions, so it may be older)
+    and the precompute heartbeat (rich live progress)."""
+    fw = read_heartbeat("flywheel") or {}
+    pc = read_heartbeat("precompute") or {}
+    pc_age = heartbeat_age_secs("precompute")
+    fw_age = heartbeat_age_secs("flywheel")
+
+    # Precompute ticks every ~60s during the long phase; flywheel is only
+    # rewritten at phase transitions. Either being fresh means we are alive.
+    if pc_age is not None and pc_age <= _FLYWHEEL_LIVE_SECS:
+        proc, fresh_age = "precompute", pc_age
+    elif fw_age is not None and fw_age <= _FLYWHEEL_LIVE_SECS:
+        proc, fresh_age = "flywheel", fw_age
+    else:
+        return None
+
+    parts: list[str] = []
+    if fw.get("flywheel_name"):
+        parts.append(str(fw["flywheel_name"]))
+    if fw.get("iteration") is not None:
+        parts.append(f"iter {fw['iteration']}")
+    status = fw.get("status")
+    if not status and pc:
+        status = "precomputing"
+    if status:
+        parts.append(str(status))
+    if pc.get("done") is not None and pc.get("total") is not None:
+        parts.append(f"shard {pc['done']}/{pc['total']}")
+    if pc.get("current_phase"):
+        parts.append(str(pc["current_phase"]))
+    eta = pc.get("eta_sec")
+    if eta:
+        h, m = divmod(int(eta) // 60, 60)
+        parts.append(f"ETA {h}h{m:02d}m" if h else f"ETA {m}m")
+
+    return {"process": proc, "age_s": fresh_age,
+            "label": ", ".join(parts) if parts else "in progress"}
+
+
 def _read_log(log_file: Path) -> str:
     if not log_file.exists():
         return ""
     try:
         return log_file.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_log_tail(log_file: Path, max_bytes: int = 8192) -> str:
+    """Return the last `max_bytes` of a log (enough to hold a traceback + EXIT_CODE)."""
+    if not log_file.exists():
+        return ""
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(0, 2)
+            n = min(max_bytes, f.tell())
+            f.seek(-n, 2)
+            return f.read(n).decode("utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -531,6 +599,9 @@ def _check_precompute_cache_staleness() -> None:
     except ImportError:
         return
 
+    # While a flywheel precompute is actively running, the hot "current" version
+    # it is building is legitimately incomplete / 0-records — don't cry wolf.
+    active = _flywheel_phase_active()
     encoders = ("qwen3", "vae", "siglip")
     for enc in encoders:
         try:
@@ -555,19 +626,35 @@ def _check_precompute_cache_staleness() -> None:
             continue
         cur = current[0]
         if not cur.get("complete"):
-            _add("WARNING", "precompute",
-                 f"Precompute: current version for '{enc}' is incomplete",
-                 detail=f"Version {cur.get('version','?')} has complete=False in its manifest. "
-                        "Training may use partial embeddings.",
-                 fix=f"Re-run precompute for '{enc}' to complete the cache.",
-                 ctx={"encoder": enc, "version": cur.get("version"), "records": cur.get("record_count", 0)})
+            if active:
+                _add("INFO", "precompute",
+                     f"Precompute: current '{enc}' version incomplete — build in progress ({active['label']})",
+                     detail=f"Version {cur.get('version','?')} is mid-build by the active flywheel "
+                            "precompute; it completes when the phase finishes.",
+                     ctx={"encoder": enc, "version": cur.get("version"),
+                          "records": cur.get("record_count", 0), "flywheel_phase": active["label"]})
+            else:
+                _add("WARNING", "precompute",
+                     f"Precompute: current version for '{enc}' is incomplete",
+                     detail=f"Version {cur.get('version','?')} has complete=False in its manifest. "
+                            "Training may use partial embeddings.",
+                     fix=f"Re-run precompute for '{enc}' to complete the cache.",
+                     ctx={"encoder": enc, "version": cur.get("version"), "records": cur.get("record_count", 0)})
         elif cur.get("record_count", 0) == 0:
-            _add("WARNING", "precompute",
-                 f"Precompute: current '{enc}' cache reports 0 records",
-                 detail=f"Version {cur.get('version','?')} is complete but has 0 records. "
-                        "Manifest may be stale.",
-                 fix=f"Re-run precompute for '{enc}'.",
-                 ctx={"encoder": enc, "version": cur.get("version")})
+            if active:
+                _add("INFO", "precompute",
+                     f"Precompute: current '{enc}' reports 0 records — build in progress ({active['label']})",
+                     detail=f"Version {cur.get('version','?')} is being populated by the active "
+                            "flywheel precompute.",
+                     ctx={"encoder": enc, "version": cur.get("version"),
+                          "flywheel_phase": active["label"]})
+            else:
+                _add("WARNING", "precompute",
+                     f"Precompute: current '{enc}' cache reports 0 records",
+                     detail=f"Version {cur.get('version','?')} is complete but has 0 records. "
+                            "Manifest may be stale.",
+                     fix=f"Re-run precompute for '{enc}'.",
+                     ctx={"encoder": enc, "version": cur.get("version")})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1133,10 +1220,20 @@ def _check_orchestrator_log() -> None:
         newest_mtime = newest_log.stat().st_mtime
         age = time.time() - newest_mtime
         if age > 600:
-            _add("WARNING", "orchestrator",
-                 f"Orchestrator log last written {_fmt_age(age)} (orchestrator may be down)",
-                 detail=f"Most recent log file: {newest_log.name}",
-                 ctx={"last_write_age_s": round(age), "log_file": newest_log.name})
+            active = _flywheel_phase_active()
+            if active:
+                _add("INFO", "orchestrator",
+                     f"Orchestrator log quiet ({_fmt_age(age)}) — flywheel phase active: {active['label']}",
+                     detail="The orchestrator logs at phase boundaries; a long precompute "
+                            f"leaves it quiet by design. Worker heartbeat is fresh "
+                            f"({_fmt_age(active['age_s'])}).",
+                     ctx={"last_write_age_s": round(age), "log_file": newest_log.name,
+                          "flywheel_phase": active["label"]})
+            else:
+                _add("WARNING", "orchestrator",
+                     f"Orchestrator log last written {_fmt_age(age)} (orchestrator may be down)",
+                     detail=f"Most recent log file: {newest_log.name}",
+                     ctx={"last_write_age_s": round(age), "log_file": newest_log.name})
     except OSError:
         pass
 
@@ -1585,7 +1682,10 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
     storage = cfg.get("storage", {})
     cold_root = Path(storage.get("cold_root", str(COLD_ROOT)))
 
-    # PIPELINE-26: cold precompute version matches hot
+    # PIPELINE-26: cold precompute version matches hot. A running flywheel
+    # rebuilds the hot version per-iteration and only syncs cold at iter/chunk
+    # completion, so a mismatch mid-phase is expected, not a fault.
+    active = _flywheel_phase_active()
     for encoder in ("qwen3", "vae", "siglip"):
         hot_cur  = PRECOMP_DIR / encoder / "current"
         cold_cur = cold_root / "precomputed" / encoder / "current"
@@ -1593,10 +1693,18 @@ def _check_cold_storage(cfg: dict, chunks: list[int]) -> None:
             hot_ver  = os.path.basename(os.readlink(str(hot_cur)))
             cold_ver = os.path.basename(os.readlink(str(cold_cur)))
             if hot_ver != cold_ver:
-                _add("WARNING", "cold_storage",
-                     f"Cold precompute {encoder} version mismatch: hot={hot_ver} cold={cold_ver}",
-                     detail="Run data_stager.py archive --chunk N (last completed chunk) to sync.",
-                     ctx={"encoder": encoder, "hot_ver": hot_ver, "cold_ver": cold_ver})
+                if active:
+                    _add("INFO", "cold_storage",
+                         f"Cold precompute {encoder} version mismatch: hot={hot_ver} cold={cold_ver} "
+                         f"— expected during active flywheel ({active['label']})",
+                         detail="Hot is rebuilt per-iteration; cold syncs at iter/chunk completion.",
+                         ctx={"encoder": encoder, "hot_ver": hot_ver, "cold_ver": cold_ver,
+                              "flywheel_phase": active["label"]})
+                else:
+                    _add("WARNING", "cold_storage",
+                         f"Cold precompute {encoder} version mismatch: hot={hot_ver} cold={cold_ver}",
+                         detail="Run data_stager.py archive --chunk N (last completed chunk) to sync.",
+                         ctx={"encoder": encoder, "hot_ver": hot_ver, "cold_ver": cold_ver})
 
     # PIPELINE-29: stale weights archive (train.done exists but cold weights dir empty)
     weights_dir = cold_root / "weights"
@@ -2079,6 +2187,7 @@ def _check_campaign_state() -> None:
     scripts  = str(SCRIPTS_DIR)
     ctl      = str(SCRIPTS_DIR / "pipeline_ctl.py")
     now = time.time()
+    phase_active = _flywheel_phase_active()
 
     for c in campaigns:
         name        = c.get("flywheel_name", "?")
@@ -2157,12 +2266,21 @@ def _check_campaign_state() -> None:
             except (ValueError, TypeError):
                 age_h = None
         if age_h is not None and age_h > 4:
-            _add("WARNING", "flywheel",
-                 f"Campaign '{name}' active but last DB update {age_h}h ago",
-                 detail="Orchestrator may have stopped without updating campaign status. "
-                        "Check orchestrator log or run pipeline_ctl.py status.",
-                 fix=f"{venv_py} {ctl} status",
-                 ctx={"campaign": name, "age_h": age_h})
+            if phase_active:
+                _add("INFO", "flywheel",
+                     f"Campaign '{name}' DB quiet ({age_h}h) — phase active: {phase_active['label']}",
+                     detail="Campaign summary updates at iteration boundaries; a long "
+                            "precompute leaves the DB quiet by design. Worker heartbeat is "
+                            f"fresh ({_fmt_age(phase_active['age_s'])}).",
+                     ctx={"campaign": name, "age_h": age_h,
+                          "flywheel_phase": phase_active["label"]})
+            else:
+                _add("WARNING", "flywheel",
+                     f"Campaign '{name}' active but last DB update {age_h}h ago",
+                     detail="Orchestrator may have stopped without updating campaign status. "
+                            "Check orchestrator log or run pipeline_ctl.py status.",
+                     fix=f"{venv_py} {ctl} status",
+                     ctx={"campaign": name, "age_h": age_h})
 
         if iters >= 3 and best is None:
             _add("WARNING", "flywheel",
@@ -2171,6 +2289,321 @@ def _check_campaign_state() -> None:
                         "refresh_campaign_summary has not been called.",
                  fix=f"{venv_py} {ctl} status",
                  ctx={"campaign": name, "n_iterations": iters})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flywheel iteration-failure detection + iter-log forensic fingerprinting
+#
+# The orchestrator records every failed flywheel iteration as an `info` event and
+# in the FlywheelDB (status/exit_code/elapsed), and the per-iteration tmux log
+# (flywheel_<name>_iter<NNNN>.log) ends with EXIT_CODE=N plus the crash output.
+# None of that was read here, so a hard-failure loop (training crashing every
+# iteration) showed up only as the soft "no quality signal" hint. These two
+# checks close that gap: a consecutive-failure detector over the DB, and a
+# signature table that fingerprints the latest failed iter's log into a specific,
+# actionable diagnosis. The signature table is seeded ONLY from failures we have
+# actually observed (see train/tests/fixtures/flywheel_logs/); add a fixture +
+# entry as new modes appear so detection coverage ratchets up and never regresses.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each signature: id, optional exit_codes (match set), optional patterns (any
+# substring, case-insensitive), severity, summary (short headline), diagnosis,
+# `transient` (True ⇒ a retry may succeed; False ⇒ deterministic, retrying is
+# futile until fixed), and `remedies` — ordered, copy-pasteable corrective steps
+# templated with {name},{iter},{venv},{scripts},{staging}. The check wraps these
+# with universal options (inspect-log, pause, resume). Ordered specific →
+# generic; first match wins.
+FAILURE_SIGNATURES: list[dict] = [
+    {
+        "id": "shard_cache_empty",
+        "patterns": ["No shards with precomputed",
+                     "have qwen3+vae precomputed — training on 0 shards",
+                     "have qwen3+vae precomputed - training on 0 shards"],
+        "severity": "CRITICAL",
+        "transient": True,
+        "summary": "precompute→train handoff failed (0 shards with qwen3+vae cache)",
+        "diagnosis": ("The shard-cache filter found 0 shards with qwen3+vae npz at "
+                      "train start, so training aborted immediately. This is the "
+                      "precompute→train handoff failure: either the per-iter precompute "
+                      "wrote to a path training doesn't read (PIPELINE_ORCHESTRATED not "
+                      "set), or a fresh-write fs-visibility race left the npz invisible "
+                      "when the filter ran."),
+        "remedies": [
+            "Check the iter's npz exist: ls -1 {staging}/{name}/iter{iter:04d}/precomputed/vae | head",
+            "If npz ARE present, this was a transient fs-visibility race; the next "
+            "iteration (cold-staged npz, written earlier) is protected — let it run.",
+            "If npz are MISSING, re-run precompute for this iter: "
+            "{venv} {scripts}/precompute_all.py --shards {staging}/{name}/iter{iter:04d}",
+            "Confirm PIPELINE_ORCHESTRATED=1 is exported into the train env (orchestrator sets this).",
+        ],
+    },
+    {
+        "id": "siglip_module_missing",
+        "patterns": ["No module named 'mlx_vlm.models.siglip'",
+                     "Model type siglip not supported"],
+        "severity": "CRITICAL",
+        "transient": False,
+        "summary": "live SigLIP encode path hit a missing mlx_vlm.siglip module",
+        "diagnosis": ("Training fell into the online-encode path and tried to load "
+                      "SigLIP live, but mlx_vlm has no siglip module — this commonly "
+                      "precedes a segfault. The online path should not run when a "
+                      "precomputed SigLIP cache is present."),
+        "remedies": [
+            "Ensure the SigLIP precompute cache covers this iter's shards so training "
+            "uses cached features (not live encode): {venv} {scripts}/pipeline_doctor.py --ai | grep siglip",
+            "If SigLIP coverage is incomplete, re-run precompute: "
+            "{venv} {scripts}/precompute_all.py --shards {staging}/{name}/iter{iter:04d}",
+            "Or disable live SigLIP encode in the flywheel config (training.siglip / online-encode).",
+        ],
+    },
+    {
+        "id": "shape_broadcast",
+        "patterns": ["could not broadcast input array from shape"],
+        "severity": "CRITICAL",
+        "transient": False,
+        "summary": "array shape/transpose mismatch (HWC vs CHW)",
+        "diagnosis": ("A numpy broadcast failed — a tensor was in the wrong layout "
+                      "(channels-last vs channels-first), e.g. in SigLIP image "
+                      "preprocessing. This is a deterministic code defect, not a "
+                      "data/infra issue: every iteration will fail identically."),
+        "remedies": [
+            "Fix the transpose/reshape in train_ip_adapter.py at the frame shown in the "
+            "traceback (the shapes in the error name the offending axis order).",
+            "Re-run a single iter to verify before resuming the campaign.",
+        ],
+    },
+    {
+        "id": "oom",
+        "exit_codes": {137},
+        "patterns": ["out of memory", "RESOURCE_EXHAUSTED", "Insufficient Memory",
+                     "MTLBuffer", "Killed"],
+        "severity": "CRITICAL",
+        "transient": False,
+        "summary": "out-of-memory / process killed",
+        "diagnosis": ("The trainer was killed or ran out of memory. On M1 Max the "
+                      "precompute/train memory cap is tight; resolution or batch size "
+                      "may be too high for the resident model set."),
+        "remedies": [
+            "Lower training.batch_size or the training resolution in the flywheel config.",
+            "Confirm precompute caches are present so live models (VAE/Qwen3/SigLIP) "
+            "are not resident during training.",
+            "Free memory: close other GPU apps; check `vm_stat` / Activity Monitor.",
+        ],
+    },
+    {
+        "id": "segfault",
+        "exit_codes": {139},
+        "patterns": [],
+        "severity": "CRITICAL",
+        "transient": False,
+        "summary": "native segfault (EXIT_CODE=139)",
+        "diagnosis": ("The trainer crashed with a segmentation fault. If the log shows "
+                      "an [online-encode] step, the live SigLIP/VAE load path is the "
+                      "likely culprit; otherwise suspect a native (MLX/Metal) crash."),
+        "remedies": [
+            "Inspect the crash site in the iteration log (look for an [online-encode] "
+            "step just before the fault).",
+            "If live-encode triggered the fault, ensure precompute caches are present "
+            "so the online path is not used.",
+        ],
+    },
+    {
+        "id": "generic_traceback",
+        "patterns": ["Traceback (most recent call last)"],
+        "severity": "WARNING",
+        "transient": False,
+        "summary": "training raised an exception",
+        "diagnosis": "The trainer exited on an unhandled exception (see evidence).",
+        "remedies": [
+            "Read the traceback in the iteration log and fix the underlying exception.",
+        ],
+    },
+]
+
+
+def _format_remedies(name: str, it_n: Optional[int], log_path: Path,
+                     remedies: list[str], transient: bool) -> str:
+    """Assemble a numbered, copy-pasteable remediation block.
+
+    Wraps the signature-specific `remedies` with universal options: inspect the
+    log, pause the campaign to stop burning iterations, and resume after the fix.
+    For deterministic (non-transient) failures it says plainly that resuming
+    without a fix will fail identically."""
+    venv     = str(TRAIN_DIR / ".venv" / "bin" / "python")
+    scripts  = str(SCRIPTS_DIR)
+    ctl      = f"{venv} {SCRIPTS_DIR / 'pipeline_ctl.py'}"
+    staging  = str(DATA_ROOT / "flywheel_staging")
+    ctx = {"name": name, "iter": int(it_n) if it_n is not None else 0,
+           "venv": venv, "scripts": scripts, "staging": staging}
+
+    steps: list[str] = [f"Inspect the full crash log: tail -60 {log_path}"]
+    if not transient:
+        steps.append("Stop burning iterations — pause now (this failure repeats every "
+                     f"iteration until fixed): {ctl} pause-flywheel")
+    else:
+        steps.append(f"Optional — pause while you investigate: {ctl} pause-flywheel")
+    for r in remedies:
+        try:
+            steps.append(r.format(**ctx))
+        except (KeyError, IndexError, ValueError):
+            steps.append(r)
+    steps.append(f"Resume after the fix: {ctl} resume-flywheel")
+    steps.append(f"Or abandon the campaign: {ctl} stop-flywheel  "
+                 f"(then mark-campaign-completed {name})")
+    return "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+
+
+def _line_containing(text: str, substr: str) -> str:
+    if not substr:
+        return ""
+    for line in text.splitlines():
+        if substr.lower() in line.lower():
+            return line.strip()[:300]
+    return ""
+
+
+_EXC_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Fault|Interrupt|Warning):.*")
+
+
+def _extract_exception(text: str) -> str:
+    """Return the last Python-exception line (e.g. 'RuntimeError: ...'), if any."""
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if _EXC_RE.match(s):
+            return s[:300]
+    return ""
+
+
+def _fingerprint_log_tail(text: str, exit_code: Optional[int] = None) -> Optional[dict]:
+    """Match a failed iter log tail against FAILURE_SIGNATURES → diagnosis dict.
+
+    Pure: returns a copy of the first matching signature augmented with `evidence`
+    (the matched line / exception) or None if nothing matches. Generic matches get
+    their summary filled from the extracted exception line."""
+    low = text.lower()
+    for sig in FAILURE_SIGNATURES:
+        if sig.get("exit_codes") and exit_code not in sig["exit_codes"]:
+            continue
+        pats = sig.get("patterns") or []
+        matched = next((p for p in pats if p.lower() in low), None)
+        if pats and matched is None:
+            continue
+        if not pats and not sig.get("exit_codes"):
+            continue  # never match a catch-all with neither constraint
+        out = dict(sig)
+        out["evidence"] = _line_containing(text, matched) if matched else _extract_exception(text)
+        if out["id"] == "generic_traceback":
+            exc = _extract_exception(text)
+            if exc:
+                out["summary"] = exc[:120]
+        return out
+    return None
+
+
+def _count_trailing_failures(iterations: list[dict]) -> tuple[int, Optional[dict], list]:
+    """Count consecutive 'failed' iterations at the tail of the (iteration-ordered)
+    list, skipping in-flight rows, stopping at the first successful one.
+
+    Returns (count, latest_failed_row, [exit_codes_of_counted_failures])."""
+    count = 0
+    latest_failed: Optional[dict] = None
+    exit_codes: list = []
+    for row in reversed(iterations):
+        st = (row.get("status") or "").lower()
+        if st in ("", "running", "pending", "started", "training", "precomputing"):
+            continue  # in-flight tail — ignore, keep scanning back
+        if st == "failed":
+            count += 1
+            if latest_failed is None:
+                latest_failed = row
+            exit_codes.append(row.get("exit_code"))
+            continue
+        break  # 'done' / any successful terminal status ends the streak
+    return count, latest_failed, exit_codes
+
+
+def _check_flywheel_failures(cfg: dict) -> None:
+    """Detect a flywheel hard-failure loop and fingerprint the latest crash.
+
+    Reads the FlywheelDB for consecutive trailing failures per active campaign,
+    then reads that iteration's tmux log and matches it against FAILURE_SIGNATURES
+    to emit a specific, actionable diagnosis (instead of the soft 'no quality
+    signal' hint)."""
+    if not FLYWHEEL_DB_PATH.exists():
+        return
+    try:
+        from flywheel_lib import FlywheelDB
+        db = FlywheelDB(FLYWHEEL_DB_PATH)
+        campaigns = db.get_non_superseded_campaigns()
+        per = {c.get("flywheel_name"): db.get_iterations(c.get("flywheel_name"))
+               for c in campaigns if c.get("flywheel_name")}
+        db.close()
+    except Exception:
+        return
+
+    health  = (cfg or {}).get("flywheel_health", {}) or {}
+    warn_n  = int(health.get("consecutive_fail_warn", 2))
+    crit_n  = int(health.get("consecutive_fail_crit", 3))
+
+    for name, iterations in per.items():
+        if not iterations:
+            continue
+        count, latest, exit_codes = _count_trailing_failures(iterations)
+        if count < warn_n:
+            continue
+
+        ever_done = any((r.get("status") or "").lower() == "done" for r in iterations)
+        # A campaign that has never trained successfully and keeps failing is
+        # critical regardless of the raw streak length.
+        severity = "CRITICAL" if (count >= crit_n or not ever_done) else "WARNING"
+
+        it_n = latest.get("iteration") if latest else None
+        ec   = latest.get("exit_code") if latest else None
+        diag = None
+        log_path = (LOG_DIR / f"flywheel_{name}_iter{int(it_n):04d}.log"
+                    if it_n is not None else LOG_DIR / f"flywheel_{name}.log")
+        if it_n is not None:
+            tail = _read_log_tail(log_path)
+            if tail:
+                if ec in (None, -1):
+                    ec = last_exit_code(log_path)
+                diag = _fingerprint_log_tail(tail, ec)
+
+        # Same non-trivial exit code across the streak ⇒ systemic, not transient.
+        nonnull  = [e for e in exit_codes if e not in (None, -1)]
+        systemic = len(nonnull) >= 2 and len(set(nonnull)) == 1
+
+        if diag:
+            title  = f"Flywheel '{name}': {count} consecutive iterations failed — {diag['summary']}"
+            detail = diag["diagnosis"]
+            if diag.get("severity") == "CRITICAL":
+                severity = "CRITICAL"
+            evidence = diag.get("evidence", "")
+            fix = _format_remedies(name, it_n, log_path,
+                                   diag.get("remedies", []),
+                                   transient=diag.get("transient", False) and not systemic)
+        else:
+            title  = (f"Flywheel '{name}': {count} consecutive iterations failed "
+                      f"(last exit code {ec})")
+            detail = ("Training is crashing every iteration; no checkpoints are being "
+                      "produced. Inspect the iteration log for the cause.")
+            evidence = ""
+            fix = _format_remedies(
+                name, it_n, log_path,
+                ["Identify the failure from the log tail, then re-run a single iter to "
+                 "verify before resuming."],
+                transient=False)
+
+        if systemic:
+            detail += (f"  Same exit code across {len(nonnull)} failures — systemic, "
+                       f"not transient (fix the cause, don't keep retrying).")
+
+        _add(severity, "flywheel", title, detail=detail, fix=fix,
+             ctx={"campaign": name, "consecutive_failures": count,
+                  "last_iteration": it_n, "last_exit_code": ec,
+                  "exit_codes": exit_codes, "ever_succeeded": ever_done,
+                  "signature": diag["id"] if diag else None,
+                  "evidence": evidence, "systemic": systemic})
 
 
 def _check_shard_coverage() -> None:
@@ -3361,6 +3794,7 @@ def main() -> None:
         _check_stale_logs(chunks)
         _check_ablation_health()
         _check_campaign_state()
+        _check_flywheel_failures(cfg)
         _check_shard_coverage()
         _check_shard_index()
         _check_light_scoring()

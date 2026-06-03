@@ -1,0 +1,25 @@
+  [640x640] done (2.3s)
+  [512x896] compiling...
+  [512x896] done (2.6s)
+  [896x512] compiling...
+  [896x512] done (2.6s)
+Correct-forward-Q graphs ready.
+
+Training: 1,000 steps (steps 200→1,200), batch_size=1
+
+Validation held-out: not found — T-05 disabled
+Traceback (most recent call last):
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 2898, in <module>
+    main()
+    ~~~~^^
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 2894, in main
+    train(config)
+    ~~~~~^^^^^^^^
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 1439, in train
+    siglip_feats = siglip(_resize_images_for_siglip(images))
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "/Users/fredrikhult/src/iris.c/train/train_ip_adapter.py", line 2129, in _resize_images_for_siglip
+    out[i] = img.astype(np.float32) / 127.5 - 1.0                   # back to [-1,1]
+    ~~~^^^
+ValueError: could not broadcast input array from shape (384,384,3) into shape (3,384,384)
+EXIT_CODE=1

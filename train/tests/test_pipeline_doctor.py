@@ -259,3 +259,280 @@ class TestCheckPhantomCompletions:
         # No promoted.done → nothing to validate.
         doctor._check_phantom_completions(cfg, [1])
         assert [i for i in doctor._issues if i.category == "phantom"] == []
+
+
+# ---------------------------------------------------------------------------
+# Flywheel-phase liveness reconciliation (suppresses staleness false positives
+# while a long precompute is demonstrably progressing).
+# ---------------------------------------------------------------------------
+
+def _fake_heartbeats(monkeypatch, *, pc=None, pc_age=None, fw=None, fw_age=None):
+    """Stub pd.read_heartbeat / pd.heartbeat_age_secs for precompute + flywheel."""
+    hbs = {"precompute": pc, "flywheel": fw}
+    ages = {"precompute": pc_age, "flywheel": fw_age}
+    monkeypatch.setattr(pd, "read_heartbeat", lambda proc, chunk=None: hbs.get(proc))
+    monkeypatch.setattr(pd, "heartbeat_age_secs", lambda proc, chunk=None: ages.get(proc))
+
+
+class TestFlywheelPhaseActive:
+    def test_fresh_precompute_is_active_with_progress_label(self, doctor, monkeypatch):
+        _fake_heartbeats(
+            monkeypatch,
+            pc={"process": "precompute", "done": 30, "total": 35,
+                "current_phase": "qwen3 290/625", "eta_sec": 11327},
+            pc_age=42.0,
+            fw={"flywheel_name": "warmup-run1", "iteration": 11, "status": "precomputing"},
+            fw_age=65000.0,  # flywheel hb is stale (only rewritten at transitions)
+        )
+        a = pd._flywheel_phase_active()
+        assert a is not None
+        assert a["process"] == "precompute"
+        # Label merges stale flywheel context with live precompute progress.
+        assert "warmup-run1" in a["label"]
+        assert "iter 11" in a["label"]
+        assert "shard 30/35" in a["label"]
+        assert "ETA 3h" in a["label"]
+
+    def test_stale_everything_is_none(self, doctor, monkeypatch):
+        _fake_heartbeats(monkeypatch, pc={"done": 1}, pc_age=5000.0,
+                         fw={"status": "x"}, fw_age=99999.0)
+        assert pd._flywheel_phase_active() is None
+
+    def test_no_heartbeats_is_none(self, doctor, monkeypatch):
+        _fake_heartbeats(monkeypatch, pc=None, pc_age=None, fw=None, fw_age=None)
+        assert pd._flywheel_phase_active() is None
+
+    def test_fresh_flywheel_only_is_active(self, doctor, monkeypatch):
+        # Precompute heartbeat absent/stale but flywheel fresh (e.g. between phases).
+        _fake_heartbeats(monkeypatch, pc=None, pc_age=None,
+                         fw={"flywheel_name": "run1", "iteration": 3, "status": "training"},
+                         fw_age=30.0)
+        a = pd._flywheel_phase_active()
+        assert a is not None and a["process"] == "flywheel"
+        assert "training" in a["label"] and "iter 3" in a["label"]
+
+
+class TestOrchestratorLogGating:
+    """The 'orchestrator may be down' warning must be downgraded to INFO while a
+    flywheel phase is demonstrably alive, but still fire on a true stall."""
+
+    def _stale_log(self, doctor, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        f = log_dir / "orchestrator.jsonl"
+        f.write_text(json.dumps({"event": "poll", "ts": pd.now_iso(),
+                                 "message": "polling"}) + "\n")
+        import os as _os
+        old = pd.time.time() - 7200  # 2h old mtime -> age > 600
+        _os.utime(f, (old, old))
+        return log_dir
+
+    def test_downgraded_to_info_when_phase_active(self, doctor, tmp_path, monkeypatch):
+        monkeypatch.setattr(pd, "LOG_DIR", self._stale_log(doctor, tmp_path))
+        monkeypatch.setattr(pd, "_flywheel_phase_active",
+                            lambda: {"process": "precompute", "age_s": 40.0,
+                                     "label": "warmup-run1, iter 11, shard 30/35"})
+        pd._check_orchestrator_log()
+        orch = _by_category("orchestrator")
+        assert any(i.severity == "INFO" and "phase active" in i.title for i in orch)
+        assert not any(i.severity == "WARNING" and "may be down" in i.title for i in orch)
+
+    def test_warns_when_no_phase_active(self, doctor, tmp_path, monkeypatch):
+        monkeypatch.setattr(pd, "LOG_DIR", self._stale_log(doctor, tmp_path))
+        monkeypatch.setattr(pd, "_flywheel_phase_active", lambda: None)
+        pd._check_orchestrator_log()
+        orch = _by_category("orchestrator")
+        assert any(i.severity == "WARNING" and "may be down" in i.title for i in orch)
+
+
+class TestColdStorageVersionGating:
+    """Cold-vs-hot precompute version mismatch is expected mid-flywheel; it must
+    be INFO while a phase is active and WARNING otherwise."""
+
+    def _symlinks(self, tmp_path, hot_ver, cold_ver):
+        precomp = tmp_path / "precomputed"
+        cold = tmp_path / "cold"
+        for enc in ("qwen3", "vae", "siglip"):
+            (precomp / enc / hot_ver).mkdir(parents=True)
+            (precomp / enc / "current").symlink_to(precomp / enc / hot_ver)
+            (cold / "precomputed" / enc / cold_ver).mkdir(parents=True)
+            (cold / "precomputed" / enc / "current").symlink_to(
+                cold / "precomputed" / enc / cold_ver)
+        return precomp, cold
+
+    def test_mismatch_is_info_when_active(self, doctor, tmp_path, monkeypatch):
+        precomp, cold = self._symlinks(tmp_path, "v_hot", "v_cold")
+        monkeypatch.setattr(pd, "PRECOMP_DIR", precomp)
+        monkeypatch.setattr(pd, "COLD_ROOT", cold)
+        monkeypatch.setattr(pd, "_flywheel_phase_active",
+                            lambda: {"process": "precompute", "age_s": 10.0, "label": "run1, iter 2"})
+        pd._check_cold_storage({"storage": {"cold_root": str(cold)}}, [1])
+        cs = _by_category("cold_storage")
+        assert len(cs) == 3 and all(i.severity == "INFO" for i in cs)
+
+    def test_mismatch_is_warning_when_idle(self, doctor, tmp_path, monkeypatch):
+        precomp, cold = self._symlinks(tmp_path, "v_hot", "v_cold")
+        monkeypatch.setattr(pd, "PRECOMP_DIR", precomp)
+        monkeypatch.setattr(pd, "COLD_ROOT", cold)
+        monkeypatch.setattr(pd, "_flywheel_phase_active", lambda: None)
+        pd._check_cold_storage({"storage": {"cold_root": str(cold)}}, [1])
+        cs = [i for i in _by_category("cold_storage") if "version mismatch" in i.title]
+        assert len(cs) == 3 and all(i.severity == "WARNING" for i in cs)
+
+
+# ---------------------------------------------------------------------------
+# Flywheel failure-loop detection + iter-log forensic fingerprinting.
+# The fingerprint tests are driven by REAL historical iter-log tails captured in
+# train/tests/fixtures/flywheel_logs/ — mining our own logs as the test corpus.
+# ---------------------------------------------------------------------------
+
+import flywheel_lib
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "flywheel_logs"
+
+
+def _fixture(name):
+    return (_FIXTURES / name).read_text(errors="replace")
+
+
+class TestFingerprint:
+    def test_real_shard_cache_empty(self):
+        d = pd._fingerprint_log_tail(_fixture("iter0010_shard_cache_empty.log"), 1)
+        assert d is not None and d["id"] == "shard_cache_empty"
+        assert d["severity"] == "CRITICAL"
+        assert "No shards with precomputed" in d["evidence"]
+
+    def test_real_segfault_siglip(self):
+        # iter 7 has the mlx_vlm siglip pattern AND exit 139 — the more specific
+        # siglip signature must win over the generic segfault one.
+        d = pd._fingerprint_log_tail(_fixture("iter0007_segfault_siglip.log"), 139)
+        assert d is not None and d["id"] == "siglip_module_missing"
+        assert d["severity"] == "CRITICAL"
+
+    def test_real_shape_broadcast(self):
+        d = pd._fingerprint_log_tail(_fixture("iter0001_shape_broadcast.log"), 1)
+        assert d is not None and d["id"] == "shape_broadcast"
+
+    def test_pure_segfault_without_siglip(self):
+        d = pd._fingerprint_log_tail("some native crash\nSegmentation fault\n", 139)
+        assert d is not None and d["id"] == "segfault"
+
+    def test_generic_traceback_fallback_carries_exception(self):
+        log = ("Traceback (most recent call last):\n"
+               "  File 'x.py', line 1\n"
+               "KeyError: 'missing_key'\n")
+        d = pd._fingerprint_log_tail(log, 1)
+        assert d is not None and d["id"] == "generic_traceback"
+        assert "KeyError: 'missing_key'" in d["summary"]
+
+    def test_no_match_returns_none(self):
+        assert pd._fingerprint_log_tail("everything is fine\nEXIT_CODE=0\n", 0) is None
+
+
+class TestCountTrailingFailures:
+    def test_counts_trailing_and_skips_inflight(self):
+        iters = [
+            {"iteration": 1, "status": "failed", "exit_code": 1},
+            {"iteration": 2, "status": "failed", "exit_code": 1},
+            {"iteration": 3, "status": "running", "exit_code": None},  # in-flight tail
+        ]
+        count, latest, codes = pd._count_trailing_failures(iters)
+        assert count == 2 and latest["iteration"] == 2 and codes == [1, 1]
+
+    def test_stops_at_success(self):
+        iters = [
+            {"iteration": 1, "status": "failed", "exit_code": 1},
+            {"iteration": 2, "status": "done", "exit_code": 0},
+            {"iteration": 3, "status": "failed", "exit_code": 139},
+        ]
+        count, latest, codes = pd._count_trailing_failures(iters)
+        assert count == 1 and latest["iteration"] == 3 and codes == [139]
+
+    def test_no_failures(self):
+        iters = [{"iteration": 1, "status": "done", "exit_code": 0}]
+        assert pd._count_trailing_failures(iters) == (0, None, [])
+
+
+def _fake_db_factory(campaigns, iters_by_name):
+    class _FakeDB:
+        def __init__(self, path): pass
+        def get_non_superseded_campaigns(self): return campaigns
+        def get_iterations(self, name): return iters_by_name.get(name, [])
+        def close(self): pass
+    return _FakeDB
+
+
+class TestCheckFlywheelFailures:
+    def _wire(self, doctor, tmp_path, monkeypatch, campaigns, iters, log_name=None, log_text=None):
+        dbfile = tmp_path / "flywheel.db"
+        dbfile.touch()
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+        monkeypatch.setattr(flywheel_lib, "FlywheelDB",
+                            _fake_db_factory(campaigns, iters))
+        logs = tmp_path / "logs"
+        logs.mkdir(exist_ok=True)
+        monkeypatch.setattr(pd, "LOG_DIR", logs)
+        if log_name and log_text is not None:
+            (logs / log_name).write_text(log_text)
+
+    def test_fires_critical_with_fingerprint(self, doctor, tmp_path, monkeypatch):
+        iters = {"run1": [
+            {"iteration": 8, "status": "failed", "exit_code": 1},
+            {"iteration": 9, "status": "failed", "exit_code": 139},
+            {"iteration": 10, "status": "failed", "exit_code": 1},
+        ]}
+        self._wire(doctor, tmp_path, monkeypatch,
+                   [{"flywheel_name": "run1"}], iters,
+                   log_name="flywheel_run1_iter0010.log",
+                   log_text=_fixture("iter0010_shard_cache_empty.log"))
+        pd._check_flywheel_failures({})
+        fw = [i for i in pd._issues
+              if i.category == "flywheel" and "consecutive iterations failed" in i.title]
+        assert len(fw) == 1
+        i = fw[0]
+        assert i.severity == "CRITICAL"
+        assert i.ctx["signature"] == "shard_cache_empty"
+        assert i.ctx["consecutive_failures"] == 3
+        assert i.ctx["ever_succeeded"] is False
+
+    def test_silent_when_latest_succeeded(self, doctor, tmp_path, monkeypatch):
+        iters = {"run1": [
+            {"iteration": 1, "status": "failed", "exit_code": 1},
+            {"iteration": 2, "status": "failed", "exit_code": 1},
+            {"iteration": 3, "status": "done", "exit_code": 0},
+        ]}
+        self._wire(doctor, tmp_path, monkeypatch, [{"flywheel_name": "run1"}], iters)
+        pd._check_flywheel_failures({})
+        assert [i for i in pd._issues
+                if i.category == "flywheel" and "consecutive iterations failed" in i.title] == []
+
+    def test_systemic_flag_on_repeated_exit_code(self, doctor, tmp_path, monkeypatch):
+        iters = {"run1": [
+            {"iteration": 5, "status": "done", "exit_code": 0},
+            {"iteration": 6, "status": "failed", "exit_code": 139},
+            {"iteration": 7, "status": "failed", "exit_code": 139},
+            {"iteration": 8, "status": "failed", "exit_code": 139},
+        ]}
+        self._wire(doctor, tmp_path, monkeypatch, [{"flywheel_name": "run1"}], iters,
+                   log_name="flywheel_run1_iter0008.log",
+                   log_text="native crash\nSegmentation fault\nEXIT_CODE=139\n")
+        pd._check_flywheel_failures({})
+        fw = [i for i in pd._issues if i.category == "flywheel"
+              and "consecutive iterations failed" in i.title][0]
+        assert fw.ctx["systemic"] is True
+        assert "systemic" in fw.detail.lower()
+
+    def test_warning_below_crit_threshold_with_prior_success(self, doctor, tmp_path, monkeypatch):
+        # 2 trailing failures but the campaign HAS succeeded before → WARNING not CRITICAL.
+        iters = {"run1": [
+            {"iteration": 1, "status": "done", "exit_code": 0},
+            {"iteration": 2, "status": "failed", "exit_code": 1},
+            {"iteration": 3, "status": "failed", "exit_code": 1},
+        ]}
+        self._wire(doctor, tmp_path, monkeypatch, [{"flywheel_name": "run1"}], iters,
+                   log_name="flywheel_run1_iter0003.log",
+                   log_text="Traceback (most recent call last):\nValueError: x\nEXIT_CODE=1\n")
+        pd._check_flywheel_failures({})
+        fw = [i for i in pd._issues if i.category == "flywheel"
+              and "consecutive iterations failed" in i.title][0]
+        assert fw.severity == "WARNING"
