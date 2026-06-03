@@ -488,6 +488,39 @@ Individual campaigns are managed by the orchestrator. This item is the layer abo
 
 ---
 
+## v3.21.0 Quality Loop — Remaining (GPU-gated + wiring)
+
+v3.21.0 shipped the four quality-loop subsystems (experiment tracking, monitoring,
+golden-set gate, preference store) with all decision/recording logic tested. These
+are the deferred pieces — the GPU-bound execution and the orchestrator wiring that
+needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
+
+- **QL-1 (GPU): wire `run_golden_eval`'s 3-arm training + scoring** —
+  `evaluate_golden_set.py` currently raises `NotImplementedError`. Reuse the
+  `compare_downstream_quality.py` per-arm machinery (precompute golden shards per
+  arm: real / proxy+fallback / proxy-forced → train short IP-Adapter → score
+  CLIP-I/T + aesthetic + LPIPS + FID). Feed the arm metrics into the already-tested
+  `regression_gate()` + `write_results()` + `maybe_disable_proxy()`. Run on an idle
+  GPU. ~1–2 days. This is what actually exercises the trust gate end-to-end.
+- **QL-2 (one-time, needs data): build the golden-set manifest** — a fixed,
+  stratified ~3000-image set (≥30% natural LAION/COYO vs synthetic JourneyDB) via
+  `campaign_manager.py`. Set `golden_set.manifest` in the config. Prereq for QL-1.
+- **QL-3 (GPU): champion image-generation loop for the data flywheel** — sample
+  candidate images from the Champion model, score them, and register the keepers via
+  `PreferenceStore.record_synthetic()` so they re-enter scoring. The provenance store
+  + `apply_preferences()` blend are done and tested; the generation/scoring loop is
+  the GPU-bound piece. ~1–2 days.
+- **QL-4 (wiring, needs orchestrator restart): auto-populate the new stores** —
+  call `experiments.tracker.record_from_campaign()` from the orchestrator's
+  post-campaign path, and the `monitoring.collector` recorders (proxy fallback rate,
+  precompute speed, train loss, champion quality, system disk/mem) from the flywheel
+  loop, so `--quality-report` / `--monitor` populate automatically. Pure code, but
+  takes effect only after an orchestrator restart (don't interrupt a live campaign).
+- **QL-5 (optional): alert sinks** — `monitoring/alerts.py` returns structured
+  alerts rendered to console today; add email/Slack sinks behind config when desired.
+
+---
+
 ## C Binary / CLI
 
 - **B-001: --vary-from / --vary-strength CLI wiring** (~1 hour) — `main.c`, `iris.h`
