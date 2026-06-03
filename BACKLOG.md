@@ -740,12 +740,19 @@ is the C binary only; none of this affects the Python training/flywheel pipeline
 - **GROK-8 (was H-05): Per-ctx progress callbacks.** Global callback pointers in
   `iris_kernels.c` are not reentrant. Move to `iris_ctx` or document "not thread-safe,
   set from main thread only" at minimum.
-- **GROK-9 (M-02/M-03/M-06): Error-reporting + cleanup consistency.** Standardise on
-  `set_error` for user-visible failures (stderr for dev only); add `d[N-1]='\0'` after
-  `strncpy(,,N-1)` even where `calloc` currently saves it; tighten OOM/bad-weight cleanup.
-- **GROK-10 (M-01/M-04/L-07): Architectural-invariant asserts + magic-number cleanup.**
-  Validate derived dims after config parse (`hidden == heads*128`, `axis_dim*4 ==
-  head_dim`); centralise reference constants. Add `static_assert` where cheap.
+- ~~**GROK-9 (M-02/M-03/M-06): Error-reporting + cleanup consistency.**~~ — CLOSED:
+  WON'T DO (2026-06). Standardise on `set_error`, add `d[N-1]='\0'` after
+  `strncpy(,,N-1)`, tighten OOM cleanup. Closed as a defensive sweep across the
+  inference-path C files with no functional gain (the `strncpy` buffers are already
+  `calloc`-zeroed, so the null-term is a no-op today). Same risk/reward as GROK-10.
+  Reconsider only if a real defect surfaces or these files are being refactored anyway.
+- ~~**GROK-10 (M-01/M-04/L-07): Architectural-invariant asserts + magic-number cleanup.**~~
+  — CLOSED: WON'T DO (2026-06, user-skipped). Validate derived dims after config parse
+  (`hidden == heads*head_dim`, `head_dim == 4*axis_dim`); add `static_assert`. Closed
+  because it requires touching 4 config-parse sites across the critical 5.3k-LOC
+  inference file for marginal benefit — the dims come from the model's own (correct)
+  config; a speculative sweep the backlog itself flags "do not sweep". Reconsider only
+  when already editing those load paths for a real feature.
 
 ### Build / nits (observation)
 
