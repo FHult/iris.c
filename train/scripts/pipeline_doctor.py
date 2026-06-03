@@ -3190,6 +3190,60 @@ def run_fix_mode(args_chunk: Optional[int]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v3.21.0 — monitoring + quality dashboards
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_monitor(cfg: dict, history_days: int) -> None:
+    """Render trend summaries + alerts from the monitoring store."""
+    sys.path.insert(0, str(TRAIN_DIR))
+    try:
+        from monitoring.trends import TrendStore
+        from monitoring.alerts import evaluate, rules_from_config
+    except Exception as e:
+        print(f"monitoring module unavailable: {e}")
+        return
+
+    store = TrendStore()
+    metrics = store.metrics()
+    print(f"── Monitoring trends (last {history_days}d) "
+          f"──────────────────────────────")
+    if not metrics:
+        print("  No trend data recorded yet. The orchestrator/flywheel populate this "
+              "store as campaigns run (proxy fallback rate, champion quality, disk/mem).")
+    for m in metrics:
+        s = store.summary(m, since_days=history_days)
+        if s["n"] == 0:
+            continue
+        direction = ("↑" if (s["slope"] or 0) > 1e-9 else
+                     "↓" if (s["slope"] or 0) < -1e-9 else "→")
+        print(f"  {m:<28} n={s['n']:<4} last={s['last']:<10.4g} "
+              f"mean={s['mean']:<10.4g} min={s['min']:<8.4g} max={s['max']:<8.4g} {direction}")
+
+    alerts = evaluate(store, rules_from_config(cfg))
+    print()
+    if not alerts:
+        print("  ✓ No active alerts.")
+    else:
+        print(f"  {len(alerts)} active alert(s):")
+        for a in alerts:
+            print(f"    [{a['severity']}] {a['message']}  ({a['detail']})")
+
+
+def _run_quality_report(cfg: dict) -> None:
+    """Render the experiment Champion/Challenger ranking from golden-set evals."""
+    sys.path.insert(0, str(TRAIN_DIR))
+    try:
+        from experiments.registry import ExperimentRegistry
+        from experiments.tracker import format_report
+    except Exception as e:
+        print(f"experiments module unavailable: {e}")
+        return
+    metric = (cfg.get("experiments", {}) or {}).get("rank_metric", "clip_i")
+    reg = ExperimentRegistry()
+    print(format_report(reg, metric))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3225,6 +3279,15 @@ def main() -> None:
                         help="Re-run every --watch-interval seconds; only print when issue set changes")
     parser.add_argument("--watch-interval", type=int, default=60, metavar="SECS",
                         help="Seconds between re-runs in --watch mode (default: 60)")
+    parser.add_argument("--monitor", action="store_true",
+                        help="v3.21.0: show monitoring trends + alerts from the trend "
+                             "store (proxy fallback rate, champion quality, disk/mem). "
+                             "Use with --history N to set the window in days.")
+    parser.add_argument("--history", type=int, default=30, metavar="DAYS",
+                        help="Trend window in days for --monitor (default: 30)")
+    parser.add_argument("--quality-report", action="store_true",
+                        help="v3.21.0: show the experiment Champion/Challenger ranking "
+                             "from golden-set evaluations (experiments.db).")
     args = parser.parse_args()
 
     global _quality_mode
@@ -3239,6 +3302,16 @@ def main() -> None:
     if not args.json and not args.ai and not args.html and not args.watch \
             and not args.warmup_status:
         print(f"Diagnosing chunks: {chunks}  quality={_quality_mode}")
+
+    # --monitor: trend + alert dashboard from the monitoring store (v3.21.0).
+    if args.monitor:
+        _run_monitor(cfg, args.history)
+        return
+
+    # --quality-report: experiment Champion/Challenger ranking (v3.21.0).
+    if args.quality_report:
+        _run_quality_report(cfg)
+        return
 
     # --warmup-status: run only warmup-relevant checks for a fast focused report.
     if args.warmup_status:

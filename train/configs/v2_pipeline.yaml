@@ -395,3 +395,38 @@ proxy_vae:
   #     wikiart-focused:
   #       mode: "high_fidelity"
   #       fallback_threshold: 0.90
+
+# ── v3.21.0: quality loop — experiments, monitoring, golden-set eval ──────────
+
+# Experiment tracking (train/experiments/registry.py). Every trained model from a
+# campaign becomes an experiment record with golden-set results + Champion ranking.
+experiments:
+  rank_metric: "clip_i"          # golden metric for Champion/Challenger ranking
+                                 # one of: clip_i clip_t aesthetic lpips fid
+  promote_min_margin: 0.01       # hysteresis: new best must beat champion by this
+
+# Monitoring (train/monitoring/). Durable trend store + alerts surfaced by
+#   pipeline_doctor.py --monitor --history N
+monitoring:
+  enabled: true
+  # Alert rules. Omit to use the built-in defaults (proxy fallback rate, champion
+  # quality drop, disk/mem). Each: {metric, kind, threshold?, rel?, window_days?,
+  # severity?, campaign?, message?}. kinds: threshold_high|threshold_low|spike|drop
+  alerts: []
+  # Example:
+  #   alerts:
+  #     - {metric: proxy_fallback_rate, kind: threshold_high, threshold: 0.25}
+  #     - {metric: champion_clip_i,     kind: drop, rel: 0.05, window_days: 60}
+
+# Golden-set evaluation (train/scripts/evaluate_golden_set.py — phase 3).
+# A fixed, stratified validation set used to prove the proxy VAE (and campaigns)
+# do not degrade downstream quality via a 3-arm A/B (real / proxy+fallback / proxy-forced).
+golden_set:
+  manifest: null                 # path to the golden-set shard manifest (built once)
+  size: 3000                     # recommended 2000–5000 images, stratified by source
+  steps: 500                     # short controlled IP-Adapter run per arm
+  seed: 1234
+  # Regression gate: auto-disable the proxy if it degrades a key metric by > this
+  # fraction vs the real-VAE arm (e.g. 0.03 = 3%). Checked by --quality-report.
+  regression_tolerance: 0.03
+  eval_frequency: "per_campaign" # per_campaign | weekly | manual
