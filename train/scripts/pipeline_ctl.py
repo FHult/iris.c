@@ -1151,6 +1151,15 @@ def cmd_dispatch_resolve_all(args) -> None:
     print(f"Resolved {len(open_issues)} issue(s)")
 
 
+def cmd_validate_config(args) -> None:
+    """Validate a pipeline/flywheel/training YAML config against the schema (GROK-T-7)."""
+    from config_schema import validate_file, format_issues
+    issues = validate_file(args.config)
+    print(format_issues(issues, source=args.config))
+    if any(i["severity"] == "ERROR" for i in issues):
+        raise SystemExit(1)
+
+
 def main() -> None:
     # data-explorer is a transparent passthrough; intercept before argparse sees the flags.
     if len(sys.argv) >= 2 and sys.argv[1] == "data-explorer":
@@ -1162,6 +1171,9 @@ def main() -> None:
 
     p = sub.add_parser("status",           help="Show pipeline status + doctor summary")
     p.add_argument("--brief", action="store_true", help="One-line summary only")
+
+    p = sub.add_parser("validate-config", help="Validate a pipeline/flywheel/training YAML config")
+    p.add_argument("config", help="Path to the YAML config to validate")
 
     p = sub.add_parser("restart-from-chunk",
                        help="Safely restart pipeline from chunk N (clears sentinels, restores checkpoint)")
@@ -1302,6 +1314,7 @@ def main() -> None:
     args = ap.parse_args()
     handlers = {
         "status":                  cmd_status,
+        "validate-config":         cmd_validate_config,
         "restart-from-chunk":      cmd_restart_from_chunk,
         "clear-phantoms":          cmd_clear_phantoms,
         "create-val-set":          cmd_create_val_set,

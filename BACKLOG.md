@@ -843,9 +843,14 @@ re-calibrated to *urgency* (the report's HIGHs are mostly "hurts at multi-machin
   `with live_encoders_for_batch():` context manager + a mem-profile assert + a
   hard error (not silent fallback) when precompute coverage is 100%. Worth doing
   before adding any new live-encoder feature.
-- **GROK-T-7 (M-T03): config schema + load_and_validate.** 15+ yaml variants, no
-  schema; typo'd keys fail silently or deep in the loop. Add a dataclass/validator
-  + `config --validate`. Medium effort, real safety win.
+- **GROK-T-7 (M-T03): config schema + load_and_validate.** DONE (2026-06).
+  `train/scripts/config_schema.py`: `validate_config(cfg)` flags unknown top-level
+  sections (typos), non-mapping sections (ERROR), unknown `flywheel_health` knobs
+  (doctor-consumed, silent-default class), and missing flywheel required keys; a
+  standalone CLI and a `pipeline_ctl.py validate-config <path>` subcommand (exits
+  non-zero on ERROR). Conservative — all 16 real configs pass clean. 11 tests in
+  `test_config_schema.py`. Deferred: full per-key dataclass typing + wiring into
+  `load_config` (kept non-invasive — validate is opt-in, not silent on every load).
 - **GROK-T-8 (M-T05): state-machine / resume scenario tests.** Synthetic
   sentinels+heartbeats asserting `derive_chunk_state` + next-action across phantom,
   jetsam, last-chunk, manual-rm, hard-ex-mixing. Catches resume regressions before
