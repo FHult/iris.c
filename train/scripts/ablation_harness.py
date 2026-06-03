@@ -2446,9 +2446,12 @@ _HTML_TEMPLATE = """\
     <canvas id="trendChart" width="480" height="220"></canvas>
   </div>
   <div id="paretoBox" style="display:none">
-    <div class="chart-label">Pareto front — ref_gap vs cond_gap (★ = Pareto-efficient)</div>
+    <div class="chart-label">Pareto front — ref_gap vs cond_gap (★ = Pareto-efficient, hover any point)</div>
     <canvas id="paretoChart" width="480" height="220"></canvas>
   </div>
+  <div id="paretoTip" style="display:none;position:fixed;z-index:50;pointer-events:none;
+       background:#111;border:1px solid #555;border-radius:4px;padding:6px 8px;
+       font:11px monospace;color:#eee;box-shadow:0 2px 8px rgba(0,0,0,.5)"></div>
 </div>
 
 <h2>Data</h2>
@@ -2663,18 +2666,46 @@ function drawPareto(id) {{
     }}
   }} else if (paretoEff.length===1) {{ bestComp=paretoEff[0]; }}
 
+  const hit=[];   // {{cx, cy, r, p}} in canvas coords for hover hit-testing
   pts.forEach(p=>{{
     const x=sx(p.ref_gap), y=sy(p.cond_gap);
     const ip=p.is_pareto===1;
     const bc=bestComp&&p.id===bestComp.id;
+    const rad=bc?8:ip?6:3;
     ctx.fillStyle=bc?'#ff7':ip?p.color:'rgba(90,90,90,0.6)';
     ctx.strokeStyle=bc?'#fff':ip?'rgba(255,255,255,0.6)':'transparent';
     ctx.lineWidth=bc?2:1.5;
-    ctx.beginPath(); ctx.arc(x,y,bc?8:ip?6:3,0,2*Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(x,y,rad,0,2*Math.PI); ctx.fill();
     if(ip||bc){{ ctx.stroke(); }}
     if(bc){{ ctx.fillStyle='#ff7'; ctx.font='bold 8px monospace'; ctx.fillText('⊕ '+p.combo_id+' (best)',x+10,y+3); }}
     else if(ip){{ ctx.fillStyle='#ccc'; ctx.font='8px monospace'; ctx.fillText('★ '+p.combo_id,x+8,y+3); }}
+    hit.push({{cx:x, cy:y, r:Math.max(rad,5), p:p}});
   }});
+
+  // Hover tooltip: show the combo + score + metrics for the nearest point.
+  const tip=document.getElementById('paretoTip');
+  const fmt=v=>(v==null?'—':(+v).toFixed(4));
+  cv.onmousemove=function(e){{
+    const rect=cv.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*(cv.width/rect.width);
+    const my=(e.clientY-rect.top)*(cv.height/rect.height);
+    let best=null, bestD=Infinity;
+    for(const h of hit){{
+      const d=Math.hypot(h.cx-mx, h.cy-my);
+      if(d<=h.r+4 && d<bestD){{ bestD=d; best=h.p; }}
+    }}
+    if(!best){{ tip.style.display='none'; return; }}
+    const tag=best.is_pareto===1?'★ ':'';
+    tip.innerHTML=tag+'<b>'+best.combo_id+'</b><br>'+
+      'score: '+fmt(best.score)+'<br>'+
+      'ref_gap: '+fmt(best.ref_gap)+'<br>'+
+      'cond_gap: '+fmt(best.cond_gap)+'<br>'+
+      'final_loss: '+fmt(best.final_loss);
+    tip.style.left=(e.clientX+12)+'px';
+    tip.style.top =(e.clientY+12)+'px';
+    tip.style.display='block';
+  }};
+  cv.onmouseleave=function(){{ tip.style.display='none'; }};
 }}
 
 drawChart('refChart',  'ref_gap',  true);

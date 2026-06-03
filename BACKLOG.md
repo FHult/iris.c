@@ -403,9 +403,15 @@ early_stopping:
 
 ---
 
-**ABL-4: Pareto scatter plot in HTML report** (Medium — interpretability)
-
-The ablation HTML report shows a sortable table with an `is_pareto` flag column. This makes it impossible to see the shape of the Pareto front or where individual trials cluster. Add a `<canvas>` scatter plot above the table: ref_gap on X, cond_gap on Y, one circle per scored trial, Pareto points outlined in gold, tooltip showing params and score on hover. Render inline with vanilla JS — no dependencies.
+~~**ABL-4: Pareto scatter plot in HTML report** (Medium — interpretability)~~ — DONE.
+The scatter (`drawPareto` in `ablation_harness.py`: ref_gap X / cond_gap Y, Pareto
+points starred + outlined, a gold "best-compromise" point, zero-lines, axis labels)
+already existed — the entry was stale. The remaining spec gap, a **hover tooltip
+showing the combo + score + metrics for any trial**, was added 2026-06 (vanilla JS,
+no deps): `paretoTip` div + canvas-coord hit-testing in `drawPareto`. Locked in by
+`train/tests/test_ablation_report.py` (renders synthetic results, asserts the
+template fully formats and the tooltip/hover elements are present — the report is a
+brittle str.format() template where one unbalanced brace silently breaks rendering).
 
 ---
 
