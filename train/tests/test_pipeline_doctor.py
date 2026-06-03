@@ -609,3 +609,86 @@ class TestFlywheelCacheCoverage:
         assert fw.ctx["cache_coverage"] == {"present": 3, "total": 3}
         assert "cache-dir resolution bug" in fw.detail.lower()
         assert "confirmed" in fw.detail.lower()
+
+
+class TestFlywheelTrainerAnomalies:
+    """The flywheel trainer writes a chunkless `trainer.json`; it must get the same
+    in-flight anomaly checks the chunked per-chunk trainers do (previously absent)."""
+
+    def _stub(self, monkeypatch, trainer_hb, trainer_age=30.0):
+        def _rh(proc, chunk=None):
+            return trainer_hb if (proc == "trainer" and chunk is None) else None
+        def _age(proc, chunk=None):
+            return trainer_age if (proc == "trainer" and chunk is None) else None
+        monkeypatch.setattr(pd, "read_heartbeat", _rh)
+        monkeypatch.setattr(pd, "heartbeat_age_secs", _age)
+
+    def test_high_loss_fires_with_flywheel_label(self, doctor, monkeypatch):
+        self._stub(monkeypatch, {"step": 500, "loss": 5.0})
+        pd._check_training_anomalies({"anomaly": {"loss_threshold": 2.0},
+                                      "training": {"siglip": False}}, [])
+        a = _by_category("anomaly")
+        assert any(i.severity == "WARNING" and i.title.startswith("Flywheel trainer: loss")
+                   for i in a)
+
+    def test_booting_heartbeat_is_silent(self, doctor, monkeypatch):
+        # step 0 (booting) must not raise anomalies even with a bad-looking loss.
+        self._stub(monkeypatch, {"status": "booting", "step": 0, "loss": 99.0})
+        pd._check_training_anomalies({"anomaly": {}, "training": {}}, [])
+        assert _by_category("anomaly") == []
+
+    def test_stale_heartbeat_is_silent(self, doctor, monkeypatch):
+        self._stub(monkeypatch, {"step": 500, "loss": 5.0}, trainer_age=5000.0)
+        pd._check_training_anomalies({"anomaly": {"loss_threshold": 2.0}, "training": {}}, [])
+        assert _by_category("anomaly") == []
+
+    def test_ip_adapter_not_learning_flywheel(self, doctor, monkeypatch):
+        self._stub(monkeypatch, {"step": 1500, "loss_cond": 0.500, "loss_null": 0.505})
+        pd._check_training_anomalies({"anomaly": {}, "training": {}}, [])
+        a = _by_category("anomaly")
+        assert any("IP adapter not learning" in i.title and i.title.startswith("Flywheel trainer")
+                   for i in a)
+
+
+class TestCampaignEta:
+    """_check_campaign_eta estimates campaign wall-clock from live precompute s/shard
+    × configured n_shards × remaining iterations."""
+
+    def _wire(self, tmp_path, monkeypatch, *, pc, pc_age, fw, max_iters=15, n_shards=40):
+        cfgp = tmp_path / "fw.yaml"
+        cfgp.write_text(f"flywheel:\n  max_iterations: {max_iters}\n  n_shards: {n_shards}\n")
+        dbfile = tmp_path / "fw.db"; dbfile.touch()
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+        monkeypatch.setattr(flywheel_lib, "FlywheelDB", _fake_db_factory(
+            [{"flywheel_name": "run1", "config_path": str(cfgp)}], {}))
+        def _rh(proc, chunk=None):
+            return {"precompute": pc, "flywheel": fw}.get(proc)
+        def _age(proc, chunk=None):
+            return {"precompute": pc_age, "flywheel": 30.0}.get(proc)
+        monkeypatch.setattr(pd, "read_heartbeat", _rh)
+        monkeypatch.setattr(pd, "heartbeat_age_secs", _age)
+
+    def test_eta_uses_n_shards_not_heartbeat_total(self, doctor, tmp_path, monkeypatch):
+        # heartbeat total=5 (a pass batch), but per-iter should use n_shards=40.
+        self._wire(tmp_path, monkeypatch,
+                   pc={"done": 4, "total": 5, "eta_sec": 1800}, pc_age=40.0,
+                   fw={"flywheel_name": "run1", "iteration": 12})
+        pd._check_campaign_eta({})
+        e = [i for i in pd._issues if i.category == "flywheel" and "ETA" in i.title][0]
+        assert e.ctx["s_per_shard"] == 1800.0
+        assert e.ctx["per_iter_hours"] == 20.0      # 1800*40/3600, NOT 1800*5
+        assert e.severity == "INFO"                  # ~2.5d < 7d default
+
+    def test_warns_past_budget(self, doctor, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch,
+                   pc={"done": 4, "total": 5, "eta_sec": 1800}, pc_age=40.0,
+                   fw={"flywheel_name": "run1", "iteration": 12})
+        pd._check_campaign_eta({"flywheel_health": {"max_campaign_days": 1}})
+        e = [i for i in pd._issues if i.category == "flywheel" and "ETA" in i.title][0]
+        assert e.severity == "WARNING"
+
+    def test_silent_without_active_precompute(self, doctor, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, pc=None, pc_age=None,
+                   fw={"flywheel_name": "run1", "iteration": 12})
+        pd._check_campaign_eta({})
+        assert [i for i in pd._issues if "ETA" in i.title] == []

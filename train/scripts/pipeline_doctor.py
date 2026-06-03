@@ -208,6 +208,21 @@ def _fmt_age(secs: Optional[float]) -> str:
     return f"{secs/3600:.1f}h ago"
 
 
+def _fmt_duration(secs: Optional[float]) -> str:
+    """Human duration without the 'ago' suffix (for ETAs): '2d 6h', '18h 5m', '40m'."""
+    if secs is None:
+        return "N/A"
+    secs = int(max(0, secs))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
 # A fresh precompute/flywheel heartbeat proves the campaign is alive and
 # advancing even when the FlywheelDB and orchestrator log have gone quiet — those
 # only update at iteration/phase boundaries, so a multi-hour precompute leaves
@@ -1015,13 +1030,111 @@ def _check_code_consistency(cfg: dict, chunks: list[int]) -> None:
 # 7. Training anomaly detection (live heartbeat vs config thresholds)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
-    anomaly    = cfg.get("anomaly", {})
+def _emit_trainer_anomalies(hb: dict, label: str, chunk, anomaly: dict,
+                            siglip_on: bool) -> None:
+    """Emit anomaly issues for one trainer heartbeat (chunked or flywheel).
+
+    `label` prefixes each title ("Chunk N" or "Flywheel trainer"); `chunk` is
+    threaded into _add (None for the flywheel trainer)."""
     loss_thr   = float(anomaly.get("loss_threshold",   2.0))
     gn_pause   = float(anomaly.get("grad_norm_pause",  50.0))
     gn_warn    = float(anomaly.get("grad_norm_warn",   10.0))
     siglip_min = float(anomaly.get("siglip_min_coverage", 90))
-    siglip_on  = cfg.get("training", {}).get("siglip", False)
+
+    step         = hb.get("step", 0)
+    loss         = hb.get("loss")
+    loss_smooth  = hb.get("loss_smooth")
+    gn_smooth    = hb.get("grad_norm_smooth")
+    siglip_pct   = hb.get("siglip_coverage_pct")
+
+    if loss is not None and loss > loss_thr:
+        _add("WARNING", "anomaly",
+             f"{label}: loss {loss:.4f} exceeds threshold {loss_thr} at step {step:,}",
+             detail=(f"loss_smooth={loss_smooth}. Orchestrator pauses after "
+                     f"{anomaly.get('loss_high_steps', 100)} sustained steps above threshold."),
+             chunk=chunk,
+             ctx={"step": step, "loss": loss, "loss_smooth": loss_smooth,
+                  "threshold": loss_thr})
+
+    if gn_smooth is not None and gn_smooth > gn_pause:
+        _add("WARNING", "anomaly",
+             f"{label}: grad_norm_smooth {gn_smooth:.2f} exceeds pause threshold {gn_pause}",
+             detail=(f"Step {step:,}. Orchestrator pauses after "
+                     f"{anomaly.get('grad_spike_polls', 10)} consecutive polls above threshold."),
+             chunk=chunk,
+             ctx={"step": step, "grad_norm_smooth": gn_smooth, "pause_threshold": gn_pause})
+    elif gn_smooth is not None and gn_smooth > gn_warn:
+        _add("INFO", "anomaly",
+             f"{label}: grad_norm_smooth {gn_smooth:.2f} above warn threshold {gn_warn}",
+             chunk=chunk,
+             ctx={"step": step, "grad_norm_smooth": gn_smooth, "warn_threshold": gn_warn})
+
+    if siglip_on and siglip_pct is not None and siglip_pct < siglip_min:
+        _fix = (f"# After training: recheck precompute coverage for chunk {chunk}\n"
+                f"python train/scripts/pipeline_ctl.py clear-error {chunk} precompute"
+                if chunk is not None else "")
+        _add("WARNING", "anomaly",
+             f"{label}: SigLIP coverage {siglip_pct:.1f}% below minimum {siglip_min:.0f}%",
+             detail=(f"Step {step:,}. Some shards lack precomputed SigLIP embeddings — "
+                     f"image conditioning quality will be degraded for those samples."),
+             fix=_fix,
+             chunk=chunk,
+             ctx={"step": step, "siglip_pct": siglip_pct, "min_pct": siglip_min})
+
+    # QUALITY-4: adapter conditioning health checks (only after warm-up)
+    loss_cond = hb.get("loss_cond")
+    loss_null = hb.get("loss_null")
+    ip_scale  = hb.get("ip_scale_mean")
+    if step > 1000 and loss_cond is not None and loss_null is not None and loss_null > 0:
+        _gap_pct = 100 * (loss_null - loss_cond) / loss_null
+        if _gap_pct < 1.0:
+            _add("WARNING", "anomaly",
+                 f"{label}: IP adapter not learning — loss_cond ≈ loss_null at step {step:,}",
+                 detail=(f"loss_cond={loss_cond:.4f} loss_null={loss_null:.4f} gap={_gap_pct:+.1f}%. "
+                         f"Adapter is not improving conditioned reconstruction vs unconditioned baseline. "
+                         f"Check adapter.scale values and learning rate."),
+                 chunk=chunk,
+                 ctx={"step": step, "loss_cond": loss_cond, "loss_null": loss_null,
+                      "gap_pct": round(_gap_pct, 2)})
+    if step > 500 and ip_scale is not None and ip_scale < 0.05:
+        _add("WARNING", "anomaly",
+             f"{label}: IP adapter scales near zero (mean={ip_scale:.4f}) at step {step:,}",
+             detail="Adapter scale weights have collapsed — IP conditioning has no effect on output.",
+             chunk=chunk,
+             ctx={"step": step, "ip_scale_mean": ip_scale})
+
+    # QUALITY-1/6: cross-ref vs self-ref loss health check (only when permutation training is active)
+    loss_self_ref  = hb.get("loss_self_ref")
+    loss_cross_ref = hb.get("loss_cross_ref")
+    if step > 1000 and loss_self_ref is not None and loss_cross_ref is not None:
+        if loss_cross_ref < loss_self_ref - 0.01:
+            _add("WARNING", "anomaly",
+                 f"{label}: loss_cross_ref < loss_self_ref at step {step:,} — unexpected",
+                 detail=(f"loss_self_ref={loss_self_ref:.4f} loss_cross_ref={loss_cross_ref:.4f}. "
+                         f"Cross-ref batches (different style reference) should be harder than "
+                         f"self-ref; this inversion suggests the model may be ignoring SigLIP "
+                         f"conditioning entirely and relying on text only."),
+                 chunk=chunk,
+                 ctx={"step": step, "loss_self_ref": loss_self_ref,
+                      "loss_cross_ref": loss_cross_ref,
+                      "gap": round(loss_cross_ref - loss_self_ref, 4)})
+
+    loader_wait = hb.get("loader_wait_pct")
+    if loader_wait is not None and loader_wait > 20.0:
+        sev = "WARNING" if loader_wait > 40.0 else "INFO"
+        _add(sev, "anomaly",
+             f"{label}: loader_wait_pct {loader_wait:.1f}% — training I/O bound",
+             detail=(f"Step {step:,}. Training is spending {loader_wait:.1f}% of wall-clock "
+                     f"time waiting for the data loader. Note: download/build/filter steps "
+                     f"run throttled (IOPOL_THROTTLE) during training and should not cause "
+                     f"this. Likely causes: precomputed cache read contention or slow 2TBSSD."),
+             chunk=chunk,
+             ctx={"step": step, "loader_wait_pct": loader_wait})
+
+
+def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
+    anomaly   = cfg.get("anomaly", {})
+    siglip_on = cfg.get("training", {}).get("siglip", False)
 
     for chunk in chunks:
         if is_done(chunk, "train"):
@@ -1030,94 +1143,17 @@ def _check_training_anomalies(cfg: dict, chunks: list[int]) -> None:
         age = heartbeat_age_secs("trainer", chunk)
         if hb is None or age is None or age > HEARTBEAT_STALE_SECS:
             continue
+        _emit_trainer_anomalies(hb, f"Chunk {chunk}", chunk, anomaly, siglip_on)
 
-        step         = hb.get("step", 0)
-        loss         = hb.get("loss")
-        loss_smooth  = hb.get("loss_smooth")
-        gn_smooth    = hb.get("grad_norm_smooth")
-        siglip_pct   = hb.get("siglip_coverage_pct")
-
-        if loss is not None and loss > loss_thr:
-            _add("WARNING", "anomaly",
-                 f"Chunk {chunk}: loss {loss:.4f} exceeds threshold {loss_thr} at step {step:,}",
-                 detail=(f"loss_smooth={loss_smooth}. Orchestrator pauses after "
-                         f"{anomaly.get('loss_high_steps', 100)} sustained steps above threshold."),
-                 chunk=chunk,
-                 ctx={"step": step, "loss": loss, "loss_smooth": loss_smooth,
-                      "threshold": loss_thr})
-
-        if gn_smooth is not None and gn_smooth > gn_pause:
-            _add("WARNING", "anomaly",
-                 f"Chunk {chunk}: grad_norm_smooth {gn_smooth:.2f} exceeds pause threshold {gn_pause}",
-                 detail=(f"Step {step:,}. Orchestrator pauses after "
-                         f"{anomaly.get('grad_spike_polls', 10)} consecutive polls above threshold."),
-                 chunk=chunk,
-                 ctx={"step": step, "grad_norm_smooth": gn_smooth, "pause_threshold": gn_pause})
-        elif gn_smooth is not None and gn_smooth > gn_warn:
-            _add("INFO", "anomaly",
-                 f"Chunk {chunk}: grad_norm_smooth {gn_smooth:.2f} above warn threshold {gn_warn}",
-                 chunk=chunk,
-                 ctx={"step": step, "grad_norm_smooth": gn_smooth, "warn_threshold": gn_warn})
-
-        if siglip_on and siglip_pct is not None and siglip_pct < siglip_min:
-            _add("WARNING", "anomaly",
-                 f"Chunk {chunk}: SigLIP coverage {siglip_pct:.1f}% below minimum {siglip_min:.0f}%",
-                 detail=(f"Step {step:,}. Some shards lack precomputed SigLIP embeddings — "
-                         f"image conditioning quality will be degraded for those samples."),
-                 fix=(f"# After training: recheck precompute coverage for chunk {chunk}\n"
-                      f"python train/scripts/pipeline_ctl.py clear-error {chunk} precompute"),
-                 chunk=chunk,
-                 ctx={"step": step, "siglip_pct": siglip_pct, "min_pct": siglip_min})
-
-        # QUALITY-4: adapter conditioning health checks (only after warm-up)
-        loss_cond = hb.get("loss_cond")
-        loss_null = hb.get("loss_null")
-        ip_scale  = hb.get("ip_scale_mean")
-        if step > 1000 and loss_cond is not None and loss_null is not None and loss_null > 0:
-            _gap_pct = 100 * (loss_null - loss_cond) / loss_null
-            if _gap_pct < 1.0:
-                _add("WARNING", "anomaly",
-                     f"Chunk {chunk}: IP adapter not learning — loss_cond ≈ loss_null at step {step:,}",
-                     detail=(f"loss_cond={loss_cond:.4f} loss_null={loss_null:.4f} gap={_gap_pct:+.1f}%. "
-                             f"Adapter is not improving conditioned reconstruction vs unconditioned baseline. "
-                             f"Check adapter.scale values and learning rate."),
-                     chunk=chunk,
-                     ctx={"step": step, "loss_cond": loss_cond, "loss_null": loss_null,
-                          "gap_pct": round(_gap_pct, 2)})
-        if step > 500 and ip_scale is not None and ip_scale < 0.05:
-            _add("WARNING", "anomaly",
-                 f"Chunk {chunk}: IP adapter scales near zero (mean={ip_scale:.4f}) at step {step:,}",
-                 detail="Adapter scale weights have collapsed — IP conditioning has no effect on output.",
-                 chunk=chunk,
-                 ctx={"step": step, "ip_scale_mean": ip_scale})
-
-        # QUALITY-1/6: cross-ref vs self-ref loss health check (only when permutation training is active)
-        loss_self_ref  = hb.get("loss_self_ref")
-        loss_cross_ref = hb.get("loss_cross_ref")
-        if step > 1000 and loss_self_ref is not None and loss_cross_ref is not None:
-            if loss_cross_ref < loss_self_ref - 0.01:
-                _add("WARNING", "anomaly",
-                     f"Chunk {chunk}: loss_cross_ref < loss_self_ref at step {step:,} — unexpected",
-                     detail=(f"loss_self_ref={loss_self_ref:.4f} loss_cross_ref={loss_cross_ref:.4f}. "
-                             f"Cross-ref batches (different style reference) should be harder than "
-                             f"self-ref; this inversion suggests the model may be ignoring SigLIP "
-                             f"conditioning entirely and relying on text only."),
-                     chunk=chunk,
-                     ctx={"step": step, "loss_self_ref": loss_self_ref,
-                          "loss_cross_ref": loss_cross_ref,
-                          "gap": round(loss_cross_ref - loss_self_ref, 4)})
-
-        loader_wait = hb.get("loader_wait_pct")
-        if loader_wait is not None and loader_wait > 20.0:
-            sev = "WARNING" if loader_wait > 40.0 else "INFO"
-            _add(sev, "anomaly",
-                 f"Chunk {chunk}: loader_wait_pct {loader_wait:.1f}% — training I/O bound",
-                 detail=(f"Step {step:,}. Training is spending {loader_wait:.1f}% of wall-clock "
-                         f"time waiting for the data loader. Note: download/build/filter steps "
-                         f"run throttled (IOPOL_THROTTLE) during training and should not cause "
-                         f"this. Likely causes: precomputed cache read contention or slow 2TBSSD."),
-                 chunk=chunk,
-                 ctx={"step": step, "loader_wait_pct": loader_wait})
+    # Flywheel trainer writes a chunkless `trainer.json`; give it the same in-flight
+    # health checks (previously only the chunked per-chunk trainers were covered).
+    # Only when the heartbeat is fresh AND actually training (step > 0) — a booting
+    # or idle heartbeat must not raise anomalies.
+    fhb  = read_heartbeat("trainer")
+    fage = heartbeat_age_secs("trainer")
+    if (fhb is not None and fage is not None and fage <= HEARTBEAT_STALE_SECS
+            and (fhb.get("step") or 0) > 0):
+        _emit_trainer_anomalies(fhb, "Flywheel trainer", None, anomaly, siglip_on)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2677,6 +2713,76 @@ def _check_flywheel_failures(cfg: dict) -> None:
                   "cache_coverage": cache_cov})
 
 
+def _check_campaign_eta(cfg: dict) -> None:
+    """Estimate flywheel campaign wall-clock from live precompute speed.
+
+    Precompute (VAE-dominated) is the per-iteration bottleneck. From the live
+    precompute heartbeat (done/total/eta_sec) we derive s/shard, extrapolate over
+    the remaining iterations, and surface the campaign ETA — decision support for
+    the proxy-VAE / --subsample levers. INFO normally; WARNING past
+    flywheel_health.max_campaign_days. Silent unless precompute is actively running."""
+    pc = read_heartbeat("precompute") or {}
+    pc_age = heartbeat_age_secs("precompute")
+    if pc_age is None or pc_age > _FLYWHEEL_LIVE_SECS:
+        return
+    done, total, eta = pc.get("done"), pc.get("total"), pc.get("eta_sec")
+    if not (isinstance(done, int) and isinstance(total, int) and total > 0):
+        return
+    remaining_shards = total - done
+    if remaining_shards < 1 or not eta or eta <= 0:
+        return
+    # s/shard is stable; the per-iteration shard COUNT is not the heartbeat `total`
+    # (that swings between precompute pass 1's trigger batch and pass 2's catch-up).
+    # Use the campaign's configured n_shards for the per-iter estimate.
+    s_per_shard = eta / remaining_shards
+
+    # Need current + max iteration (+ n_shards) to extrapolate the rest.
+    fw = read_heartbeat("flywheel") or {}
+    name, cur_iter = fw.get("flywheel_name"), fw.get("iteration")
+    max_iters = n_shards = None
+    if name and FLYWHEEL_DB_PATH.exists():
+        try:
+            from flywheel_lib import FlywheelDB
+            db = FlywheelDB(FLYWHEEL_DB_PATH)
+            camp = [c for c in db.get_non_superseded_campaigns()
+                    if c.get("flywheel_name") == name]
+            db.close()
+            cfg_path = camp[0].get("config_path") if camp else None
+            if cfg_path and Path(cfg_path).exists():
+                import yaml as _yaml
+                _raw = _yaml.safe_load(Path(cfg_path).read_text()) or {}
+                _fwc = _raw.get("flywheel", _raw)
+                max_iters = _fwc.get("max_iterations")
+                n_shards  = _fwc.get("n_shards")
+        except Exception:
+            pass
+    if not (isinstance(cur_iter, int) and isinstance(max_iters, int)
+            and max_iters >= cur_iter):
+        return
+
+    shards_per_iter = n_shards if isinstance(n_shards, int) and n_shards > 0 else total
+    per_iter_secs   = s_per_shard * shards_per_iter
+    iters_after     = max_iters - cur_iter        # iterations not yet started
+    campaign_secs   = eta + per_iter_secs * iters_after
+    days = campaign_secs / 86400.0
+    budget_days = float((cfg or {}).get("flywheel_health", {}).get("max_campaign_days", 7))
+    sev = "WARNING" if days > budget_days else "INFO"
+
+    _add(sev, "flywheel",
+         f"Campaign '{name}' ETA ~{_fmt_duration(campaign_secs)} "
+         f"(iter {cur_iter}/{max_iters}, ~{per_iter_secs/3600:.1f}h/iter at {s_per_shard:.0f}s/shard)",
+         detail=("Per-iteration cost is dominated by VAE precompute. To cut it: enable "
+                 "the proxy VAE for precompute, or --subsample-per-shard for a faster first "
+                 "pass. Upper bound — assumes full precompute each iter; later iters run "
+                 "faster as the cold cache grows." if sev == "WARNING" else
+                 "Estimated from live precompute speed (s/shard × configured n_shards). "
+                 "Upper bound — later iters run faster as the cold precompute cache grows."),
+         ctx={"campaign": name, "iteration": cur_iter, "max_iterations": max_iters,
+              "s_per_shard": round(s_per_shard, 1),
+              "per_iter_hours": round(per_iter_secs / 3600, 2),
+              "campaign_eta_days": round(days, 2), "budget_days": budget_days})
+
+
 def _check_shard_coverage() -> None:
     """
     Warn when flywheel shard pool coverage is too low to build reliable scores.
@@ -3866,6 +3972,7 @@ def main() -> None:
         _check_ablation_health()
         _check_campaign_state()
         _check_flywheel_failures(cfg)
+        _check_campaign_eta(cfg)
         _check_shard_coverage()
         _check_shard_index()
         _check_light_scoring()
