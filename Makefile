@@ -178,6 +178,10 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_embcache debug/test_embcache.c embcache.c -lm
 	@/tmp/flux_test_embcache
 	@rm -f /tmp/flux_test_embcache
+	@echo "=== VAE white-box tests (encode/decode parity, synthetic weights) ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_vae debug/test_vae.c iris_kernels.c iris_safetensors.c -lm
+	@/tmp/flux_test_vae
+	@rm -f /tmp/flux_test_vae
 	@echo "=== JPEG unit tests ==="
 	@$(MAKE) -C jpg_test test --no-print-directory
 	@echo "=== PNG tests ==="

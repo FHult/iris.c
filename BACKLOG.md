@@ -755,6 +755,46 @@ Original report retained as `grok_bug_report.md` (untracked) for full detail.
 
 ---
 
+## Proxy-VAE Design vs C Inference Review (Grok, 2026-06) — Triaged
+
+External static review of the proxy-VAE design (`grok_proxy_vae_analysis.md`,
+untracked) cross-referenced against the C `iris_vae`. File:line refs verified
+accurate; severities re-calibrated. Net: the report inflated two "Criticals" that
+block nothing today (the flywheel runs the real VAE; the proxy is pending
+validation and not enabled), and most findings duplicate existing items. The one
+genuine, non-duplicate insight is the **three-distribution framing**: teacher
+(Python diffusers/mflux, makes precompute latents) → proxy (MLX student,
+approximates teacher encoder) → **C `iris_vae` decoder** (inference). The proxy is
+trained to match the teacher *encoder*, but generated latents are decoded by the C
+decoder, so the binding invariant is proxy-distribution ↔ C-decoder. The design's
+decoded-LPIPS loss already binds proxy outputs to decode correctly under the *real
+decoder*; the residual gap is teacher-vs-C parity, which is **pre-existing and
+independent of the proxy** (precompute already uses the Python teacher today).
+
+Duplicates (no new action): config-parser brittleness = GROK-6; dead `.bin` VAE
+loader = GROK-2; "pending validation" already stated under PRECOMP-2; GPU-resident
+encode / scalar patch loops are perf-backlog.
+
+- **GROK-VAE-1: C VAE inference-ground-truth guard** — DONE (2026-06). Added
+  `debug/test_vae.c` (wired into `make test-unit`, CPU-only, flywheel-safe): builds
+  small architecturally-real Flux/Z VAEs with seeded synthetic weights and exercises
+  the real CPU encode/decode to assert shapes (16× compression), finiteness,
+  bit-determinism, z_channels→latent_channels wiring (32→128, 16→64), and that the
+  latent normalization **branch** is config-selected and uses the exact
+  `(x-shift)*scaling` vs `(x-mean)/sqrt(var+eps)` form (the path the brittle
+  `vae/config.json` parser feeds — guards C-2/GROK-6 at the integration level). Also
+  added a "ground truth" contract note to the `iris_vae.c` header + AGENT.md/CLAUDE.md
+  Flux-VAE section. This is the foundation a future teacher-golden comparison plugs
+  into (a true cross-impl golden needs the GPU + Python teacher → flywheel-gated).
+- **GROK-VAE-2 (Low): Z-Image proxy gap** — the proxy design is Flux-32ch only;
+  Z-Image VAE (16ch + explicit scale/shift, no BN/quant) gets no precompute relief
+  despite full C support. Note for if/when a Z-Image training campaign is run; not a
+  defect. Would need a 16ch student preset + Z teacher path.
+
+Original report retained as `grok_proxy_vae_analysis.md` (untracked) for full detail.
+
+---
+
 ## train/ Static Review (Grok 4.3, 2026-06) — Triaged
 
 External static review of the Python training pipeline (`grok_train_bug_report.md`,

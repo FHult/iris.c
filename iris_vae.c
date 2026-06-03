@@ -9,6 +9,24 @@
  * - 16x spatial compression
  * - Channel multipliers: [1, 2, 4, 4] -> [128, 256, 512, 512]
  * - GroupNorm (32 groups) + Swish activation
+ *
+ * INFERENCE GROUND TRUTH: this C implementation is the production VAE for all
+ * inference (img2img/ref encode, generated-latent decode, step previews). The
+ * training pipeline precomputes latents with a *separate* teacher VAE
+ * (diffusers/mflux), and optionally a distilled proxy that approximates that
+ * teacher (see plans/precomp2-proxy-vae-design.md, esp. the Tier-2 downstream
+ * A/B). Those precomputed latents are only valid to the extent this C encode/
+ * decode stays distributionally and structurally compatible with the teacher:
+ *   - normalization: Flux batch-norm (x-mean)/sqrt(var+eps); Z-Image scaling
+ *     (x-shift)*scaling  (scaling==0 selects the Flux branch);
+ *   - patchify/unpatchify 2x2, GroupNorm (32 groups), eps (1e-4 Flux / 1e-6 Z),
+ *     asymmetric right/bottom downsample pad, single-head mid-block attention.
+ * Any change to the encode/decode math, eps, padding, channel order, or the
+ * config that drives the normalization branch can silently corrupt conditioning
+ * or decoded images even when the proxy passes its own metrics. Such changes
+ * must be validated against the teacher VAE; debug/test_vae.c (run via
+ * `make test-unit`) guards shapes, finiteness, determinism, and the
+ * normalization branch. (GROK-VAE-1.)
  */
 
 #include "iris.h"

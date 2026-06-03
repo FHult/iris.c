@@ -205,6 +205,12 @@ Flux extraction: concatenate layers 8, 17, 26 (0-indexed):
 - Patchify (encode): [B, 32, H/8, W/8] -> [B, 128, H/16, W/16]
 - Unpatchify (decode): [B, 128, H/16, W/16] -> [B, 32, H/8, W/8]
 - Channel multipliers: [1,2,4,4] -> [128,256,512,512]
+- **C `iris_vae` is the inference ground truth.** Training precomputes latents
+  with a separate teacher VAE (diffusers/mflux) + optional distilled proxy; those
+  latents are only valid while C encode/decode stays compatible with the teacher
+  (normalization branch, eps, pad, patchify, attention). Validate any VAE math
+  change against the teacher. `debug/test_vae.c` (`make test-unit`) guards shapes,
+  finiteness, determinism, and the normalization branch. See iris_vae.c header.
 
 # Flux Double Block Flow
 
