@@ -540,3 +540,71 @@ All 14 bugs fixed in commit `76564f8` (2026-05-15). See COMPLETED_BACKLOG.md.
 ## Known Bugs — Inference/Training Cross-Reference Review 2026-05-15
 
 All 9 bugs fixed: INFER-C-001 in commit `76564f8`; INFER-H-001 and INFER-M-001 in commit `ffecfcc`; INFER-M-002 and INFER-L-001–005 in commit `76564f8`. See COMPLETED_BACKLOG.md.
+
+---
+
+## C-Engine Static Review (Grok 4.3, 2026-06) — Triaged
+
+External static review of the C inference engine (`grok_bug_report.md`, untracked).
+Verified accurate on spot-check (C-01, H-01, H-04, L-01, M-08 confirmed against
+source). Triaged below — severities re-calibrated from the original report. Scope
+is the C binary only; none of this affects the Python training/flywheel pipeline.
+
+### Do soon (cheap, low-risk)
+
+- **GROK-1 (was H-01): Remove dead `rope_freqs`** (~30 min) — `iris_transformer_flux.c`.
+  Field is malloc'd + `compute_rope_freqs()`'d + freed in 3 load paths (≈4651, 5149,
+  5288) but **never read** in any forward (verified: only alloc/compute/free/NULL-guard
+  references). Delete field + `compute_rope_freqs` helper if it has no other caller.
+  Violates "leave no dead code".
+- **GROK-2 (was M-08): Remove dead `iris_vae_load(FILE*)`** (~30 min) — `iris_vae.c:1057`,
+  decl `iris.c:38`. The legacy `.bin` VAE loader has **zero call sites** (only decl +
+  def). `#ifdef` out or delete; shrinks binary and removes a duplicate VAE load path.
+- **GROK-3 (was L-01): Dedup AGENT.md / CLAUDE.md** (~5 min). Byte-identical (verified
+  `diff -q`). Symlink one to the other or delete the duplicate to prevent drift.
+- **GROK-4 (was H-04): Z-Image pad/pos-id cross-path golden test** (~2–3h) —
+  `iris_transformer_zimage.c`. NOT a bug fix — a regression guard for the documented
+  "CPU/GPU position-id mismatch under padded captions" pitfall. Add a unit test
+  asserting byte-identical pos-ids for real tokens between the GPU-table and CPU-unified
+  paths, exercised with `cap_len % 32 != 0`. Highest-value item here: cheap insurance
+  on a pitfall that has already bitten the project.
+
+### Roadmap decision (not a bug)
+
+- **GROK-5 (was C-01/C-02): `--sref` / C IP-Adapter is declared but not implemented.**
+  `train/export/iris_ip_adapter.h` provides the full public surface; no `.c` implements
+  it; `main.c:1273-1275` cleanly rejects `--sref` ("not yet implemented, planned for
+  v2.6"). This is a **deferred feature with a clean guard**, not a correctness defect
+  (re-severed from the report's CRITICAL). Decision required: either (a) implement the
+  C IP-Adapter (loader + Perceiver + get_kv + inject, wired into double/single block
+  forwards, parity-checked vs `test_ip_adapter_inference.py`) and make it the P0, or
+  (b) remove the public surface and stop advertising `--sref` until ready. Do not leave
+  it half-advertised.
+
+### Fix opportunistically (when already in that file — do not sweep)
+
+- **GROK-6 (was H-02): Unify ad-hoc JSON extraction.** Multiple independent strstr/atoi
+  config parsers (`iris.c`, `iris_transformer_flux.c`, `iris_safetensors.c`, `main.c`,
+  tokenizer). Extract one minimal `iris_json.c` helper (no new deps) + adversarial tests.
+  Real debt, but a dedicated refactor is risky for no functional gain.
+- **GROK-7 (was H-03): Collapse duplicated block load/forward/free variants** (f32 / bf16
+  / mmap / GPU / debug). Largest structural debt; touches every historical pitfall
+  (timestep cache, RoPE indexing, sgemm B-cache). High-risk multi-week refactor — only
+  undertake when a concrete feature (e.g. full IP-Adapter) forces touching these paths.
+- **GROK-8 (was H-05): Per-ctx progress callbacks.** Global callback pointers in
+  `iris_kernels.c` are not reentrant. Move to `iris_ctx` or document "not thread-safe,
+  set from main thread only" at minimum.
+- **GROK-9 (M-02/M-03/M-06): Error-reporting + cleanup consistency.** Standardise on
+  `set_error` for user-visible failures (stderr for dev only); add `d[N-1]='\0'` after
+  `strncpy(,,N-1)` even where `calloc` currently saves it; tighten OOM/bad-weight cleanup.
+- **GROK-10 (M-01/M-04/L-07): Architectural-invariant asserts + magic-number cleanup.**
+  Validate derived dims after config parse (`hidden == heads*128`, `axis_dim*4 ==
+  head_dim`); centralise reference constants. Add `static_assert` where cheap.
+
+### Build / nits (observation)
+
+- **GROK-11 (M-07/M-10): Monolithic units + always-clean backend builds.** `iris_transformer_flux.c`
+  (~5.3k LOC), `iris_metal.m` (~7k LOC); per-backend build dirs and only re-`xxd` shaders
+  on change would speed dev. Cosmetic — defer.
+
+Original report retained as `grok_bug_report.md` (untracked) for full detail.
