@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -2021,7 +2022,7 @@ def _check_campaigns() -> None:
                  f"manifest={n_tot} shards, pool now has {n_current_shards}",
                  detail="New shards were built after this campaign manifest was created. "
                         "Regenerate to include new shards in the selection.",
-                 fix=(f"{venv_py} {scripts}/campaign_manager.py create {name} "
+                 fix=(f"{venv_py} {scripts}/campaign_manager.py create {shlex.quote(name)} "
                       f"--shards {shards_dir}"),
                  ctx={"campaign": name, "manifest_shards": n_tot,
                       "current_shards": n_current_shards})

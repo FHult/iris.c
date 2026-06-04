@@ -906,12 +906,18 @@ re-calibrated to *urgency* (the report's HIGHs are mostly "hurts at multi-machin
 
 ### Open (real but deferred)
 
-- **GROK-T-3 (H-T05): `shell=True` in doctor --fix** (doctor:3176). Kept (7 fix
-  strings use pipes/globs/`&&`, so list-form would break them); documented inline
-  why it's deliberate + the human-in-the-loop mitigation. Real remaining task:
-  audit that no untrusted data flows into interpolated `issue.fix` paths
-  (currently all from DATA_ROOT + numeric shard stems). Low risk on a single-user
-  box.
+- ~~**GROK-T-3 (H-T05): `shell=True` in doctor --fix**~~ — AUDITED + HARDENED (2026-06).
+  `run_fix_mode` is human-gated: each fix is printed verbatim and run only after a
+  per-issue `y` confirm (not auto-exec); `shell=True` is deliberate (fix strings use
+  pipes/globs/`&&`). Audited every interpolated value in every `fix=` string: all come
+  from the pipeline's controlled namespace — path constants (DATA_ROOT/SENTINEL_DIR/
+  PRECOMP_DIR/CKPT_DIR/LOG_DIR/…), the fixed qwen3/vae/siglip encoder set, numeric
+  chunk/step (checkpoint ones `:07d`-forced to int), and compiled-in tmux window-name
+  constants. **No external/untrusted data** (tar member names, file contents,
+  heartbeat/log JSON, env, argv) reaches any fix string. The one operator-typed value
+  — the campaign `name` in `_check_campaigns` — is now `shlex.quote()`d (defense-in-depth:
+  robust to names with spaces/metachars; it was already human-gated, never
+  attacker-reachable on a single-user box). 70 doctor tests green.
 - **GROK-T-4 (H-T01 remainder): centralise storage roots.** ~90 hardcoded
   `/Volumes`/`/Users` literals across leaf scripts + argparse defaults + docstrings.
   Proposal: one `pipeline_lib.get_storage(cfg)` returning a `StoragePaths` object;
@@ -1049,9 +1055,19 @@ iters 1–10, iter 10 on the precompute→train shard-cache handoff. The report'
   selected_shards JSON, ordering, update (status/metrics/failed exit codes), get_best
   cond_gap selection (null-excluded, highest-wins), checkpoint_log + mark_best, campaign
   isolation. Uses an explicit tempdir db_path (never touches live flywheel_history.db).
-  STILL OPEN: property-based (hypothesis) for bucket selection / schedule / quant /
-  hard-ex t-sampling — deferred (would add the `hypothesis` dev dependency); ablation DB
-  + warmstart roundtrip.
+  ABLATION DB DONE (2026-06): `train/tests/test_ablation_db.py` (15 tests) — AblationDB
+  insert/get/update roundtrip, params_hash determinism + is_duplicate (per-run scoped),
+  get_best (score-desc, unscored-excluded, limit), scored_only filter, run isolation,
+  3-objective Pareto front (dominated excluded / non-dominated both kept), and
+  post_train_validation roundtrip (weight_errors JSON, verdict defaults). Tempdir db_path,
+  never touches live ablation_history.db. STILL OPEN: property-based (hypothesis) for
+  bucket selection / schedule / quant / hard-ex t-sampling — deferred (would add the
+  `hypothesis` dev dependency); ablation warmstart roundtrip.
+
+Also new (2026-06): `train/tests/test_dataset_bucketing.py` (17 tests) — the
+precompute↔train resolution contract (`_select_bucket` aspect math, `_load_vae_latent`
+shape-rejection, and the headline "square-512 latent matches ONLY the (512,512) bucket"
+that mandates the `data.bucket` pin). Guards the 4th warmup-run2 blocker; see PRECOMP-4.
 
 ### Maintainability (nice-to-have)
 
