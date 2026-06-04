@@ -865,6 +865,18 @@ def train(config: dict) -> None:
         else:
             print(f"SigLIP cache: {_coverage*100:.0f}% coverage ({len(_shard_prefixes)} shards). OK.")
 
+    # Precompute<->train resolution contract: VAE latents are precomputed at a
+    # single fixed resolution (precompute_all.py resizes to image_size), so a
+    # cached entry's spatial shape only matches one training bucket. With cached
+    # VAE (no live encoder to fall back on), a non-matching bucket is a hard
+    # cache miss -> the sample is skipped, and multi-bucket training skips ~100%
+    # of batches. Pin training to `data.bucket` ([H, W]) matching the precompute
+    # resolution. Leave unset only when VAE latents were precomputed per-bucket.
+    _bucket_cfg = dcfg.get("bucket")
+    _fixed_bucket = tuple(_bucket_cfg) if _bucket_cfg else None
+    if _fixed_bucket:
+        print(f"Training pinned to single bucket {_fixed_bucket} "
+              f"(matches fixed-resolution VAE precompute).")
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -877,6 +889,7 @@ def train(config: dict) -> None:
         anchor_mix_ratio=dcfg.get("anchor_mix_ratio", 0.20),
         hard_example_dir=dcfg.get("hard_example_dir"),
         hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
+        bucket=_fixed_bucket,
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before

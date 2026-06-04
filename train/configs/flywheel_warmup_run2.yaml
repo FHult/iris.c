@@ -1,23 +1,23 @@
-# Flywheel warm-up run 2 — Validation / balanced
+# Flywheel warm-up run 2 — Bootstrap / exploration-heavy (fixed pipeline)
 #
-# Goal: coverage >= 72% (~215 shards), attribution confidence on 15-20% of pool,
-# first ablation burst at iter 8 to find better hyperparams.
+# This supersedes the original run-2 plan, which assumed a *successful* run 1.
+# run 1 never trained (cache-dir clobber + a NameError in the SigLIP-coverage
+# check, both now fixed), so there is no checkpoint, no performance scores, and
+# no attribution data yet. run 2 is therefore a fresh exploration bootstrap with
+# the same profile as run 1 — plus the pipeline fixes:
+#   - precompute reuse via the consolidated cold cache (PRECOMP-3 encoder key)
+#   - correct provenance-derived shard source labels in both DBs
+#   - retain_staging to avoid re-copying overlapping shards cold->hot each iter
 #
-# Pre-run checklist:
-#   1. Coverage >= 55% confirmed (shard_selector.py status)
-#   2. Set base_checkpoint to latest step_*.safetensors from run 1:
-#      ls -t /Volumes/2TBSSD/checkpoints/stage1/step_*.safetensors | head -1
-#   3. After iter 8 ablation fires, pull best hyperparams:
-#      python3 -c "import sqlite3,json; db=sqlite3.connect('/Volumes/2TBSSD/flywheel_history.db');
-#        db.row_factory=sqlite3.Row; r=db.execute('SELECT best_hyperparams FROM campaign_summary
-#        WHERE flywheel_name=?',('warmup-run2',)).fetchone();
-#        print(json.loads(r['best_hyperparams']) if r and r['best_hyperparams'] else 'none')"
+# Pool: 1280 shards (journeydb 744, coyo 413, coyo+laion+wikiart 95,
+# journeydb+wikiart 28). 96 shards are already precomputed on cold under the
+# canonical version (v_059443 / v_2232c1 / v_336c6e) and will be reused on reselect.
 #
-# Exit criteria:
-#   >= 72% shards with n_scored>=1  (both sources >= 60%)
-#   >= 15% shards with n_scored>=2
-#   attr_confidence>=1.0 on at least 10 shards
-#   best cond_gap >= 0.35 in at least one iteration
+# Launch:
+#   pipeline_ctl start-flywheel train/configs/flywheel_warmup_run2.yaml
+#
+# Coverage check:
+#   train/.venv/bin/python train/scripts/shard_selector.py status
 
 flywheel:
   name: "warmup-run2"
@@ -27,42 +27,41 @@ flywheel:
   poll_interval: 60
   min_free_gb: 40
 
-  # Warm-start from run 1's latest checkpoint — fill in before launching
-  base_checkpoint: null   # SET THIS: /Volumes/2TBSSD/checkpoints/stage1/step_XXXXXX.safetensors
+  base_checkpoint: null      # run 1 produced no checkpoint — start fresh
 
   training_config: "train/configs/stage1_512px.yaml"
 
+  # Cold shard pool (1280 tars + provenance.json). Selected shards are staged to
+  # hot per iteration.
+  shards_dir: "/Volumes/16TBCold/shards"
+
   hyperparams:
-    cross_ref_prob: 0.35   # will be updated after iter 8 ablation fires
+    cross_ref_prob: 0.35
     style_loss_weight: 0.07
 
   shard_selection:
-    performance_weight: 0.45   # increase — more shards have scores now
-    min_diversity_pct:  0.25
-    exploration_rate:   0.30   # fallback if no schedule entry matches (schedule covers all iters)
-    recency_penalty:    0.25
-    recency_window_iters: 3
+    performance_weight: 0.30   # low — few shards have reliable scores yet
+    min_diversity_pct:  0.30   # high — maximize visual diversity
+    exploration_rate:   0.40
+    recency_penalty:    0.20
+    recency_window_iters: 2
 
     exploration_schedule:
-      - {through_iteration: 5,  rate: 0.35}
-      - {through_iteration: 10, rate: 0.28}
-      - {after_iteration: 10,   rate: 0.22}
+      - {through_iteration: 8,  rate: 0.45}
+      - {through_iteration: 15, rate: 0.35}
 
+    # Source minimums: guarantee a synthetic and a natural bucket each iter.
+    # Keys MUST match the corrected provenance-derived source labels
+    # (journeydb / coyo / coyo+laion+wikiart / journeydb+wikiart). The old
+    # "laion_coyo" key matched zero shards after the source fix.
     per_source_min:
-      laion_coyo: 5
-      journeydb:  5
+      journeydb: 6
+      coyo:      6
 
-  temporal_decay: 0.3          # recent iters weighted 30% vs older — start applying now
-
-  min_attribution_obs: 2       # lower — shards getting 2nd observations
+  min_attribution_obs: 3
   siglip_sample_n: 50
   shard_manifest: null
 
-  plateau_patience:   7        # soft check — unlikely to fire in 15 iters
-  plateau_threshold:  0.03
-  plateau_ablation_runs: 0
-
-  # First ablation burst at midpoint (iter 8); adds ~4h to wall-clock
-  ablation_every_n: 8
-  ablation_max_runs: 4
-  ablation_config: "train/configs/ablation_sref_v1.yaml"
+  plateau_patience:   0        # disabled — too early to declare plateau
+  plateau_threshold:  0.02
+  ablation_every_n:   0        # disabled — no attribution signal yet

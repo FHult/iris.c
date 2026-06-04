@@ -29,6 +29,12 @@ adapter:
 
 data:
   shard_path: "train/data/shards"
+  # Pin training to a single bucket matching the fixed-resolution VAE precompute
+  # (precompute_all.py squashes to image_size²). With cached VAE (no live encoder
+  # fallback), a non-matching bucket is a hard cache miss → sample skipped, and
+  # multi-bucket training skips ~100% of batches. Remove only once latents are
+  # precomputed per-bucket (see BACKLOG PRECOMP-4). [H, W].
+  bucket: [512, 512]
   # Pre-computed encoder caches (see train/scripts/precompute_*.py)
   # Set to null to compute at runtime (slower but no storage needed)
   qwen3_cache_dir: "train/data/precomputed/qwen3"    # ~143 GB, saves ~200ms/step

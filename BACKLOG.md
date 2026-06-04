@@ -481,6 +481,58 @@ The two iters share 12 anchor shards (`000000`–`000011`); those 12 were re-enc
 
 ---
 
+**PRECOMP-4: Aspect-ratio bucketing, end-to-end (re-shard by shape → multi-res precompute → aspect-aware loader → refine)** (High for final quality; **not** needed for the warmup bootstrap, which is correctly pinned to 512² square)
+
+The data path squashes every image to a single **square** resolution and the training
+loader does not honour aspect ratio, so the multi-resolution machinery that exists is
+non-functional. Discovered when the quick training test hit 100% VAE cache-miss
+(latent shape ≠ training bucket); root-caused to a chain of three issues:
+
+1. **Precompute is single-resolution square.** `_preprocess_vae` does
+   `PilImage.resize((image_size, image_size))` ([precompute_all.py:162](train/scripts/precompute_all.py#L162)) —
+   a squash, not aspect-preserving. Every latent is `(32, S/8, S/8)` regardless of
+   source aspect, so only one training bucket can ever match.
+2. **The shard loader random-buckets.** `make_prefetch_loader(bucket=None)` picks
+   `rng.choice(BUCKETS)` **per shard** ([dataset.py:445](train/ip_adapter/dataset.py#L445)),
+   not the per-image aspect bucket. The aspect-aware `_select_bucket` exists but is
+   unused by the shard loader. So even with per-bucket precompute, batches would
+   mismatch. `_load_vae_latent` then rejects any shape mismatch as a cache miss
+   ([dataset.py:235](train/ip_adapter/dataset.py#L235)); in cached mode (no live VAE)
+   a miss is an unrecoverable skip → ~100% skip → trainer exits.
+3. **Shards mix aspect ratios.** Tars hold arbitrary-shape images, so a per-shard
+   single bucket squashes all of a shard's varied images into one shape.
+
+**Current workaround (shipped):** `data.bucket: [512, 512]` pins training to the one
+bucket that matches the square precompute (wired in train_ip_adapter.py; set in
+stage1_512px.yaml). Training is then *consistent* (squashed image ↔ squashed latent)
+and valid — the bootstrap IP-adapter learns aspect-tolerant style conditioning and is
+a usable warm-start. Quality cost: geometric distortion + square output bias.
+
+**Roadmap to distortion-free multi-aspect (do after the warmup proves the loop):**
+- **Re-shard by aspect** — group images into aspect-homogeneous shards (recommended:
+  makes the existing per-shard-single-bucket loader *correct*, gives clean same-shape
+  caches and retrace-free homogeneous batches). Alternative: keep tars, do per-image
+  bucket precompute (variable-shape latents per shard) + an aspect-grouping loader.
+- **Multi-res precompute** — encode each shard at its bucket's native (non-square)
+  resolution using the **teacher VAE** as ground truth, with the **distilled proxy
+  (PRECOMP-2)** for speed (confidence-gated, teacher fallback; teacher authoritative
+  for golden/validation). Large buckets use VAE tiling (PRECOMP-1). Retrain the proxy
+  on the new pairs — the current proxy only saw square 512².
+- **Fix the loader** — assign each image to `_select_bucket(w, h)` instead of
+  `rng.choice`; build homogeneous batches; drop the 512² pin.
+- **Keep SigLIP consistent** — SigLIP is architecturally fixed to 384² (so "full
+  image" still resizes); today's 384² squash is *coherent* with the 512² VAE squash
+  (conditioning aligns with target). Under the aspect regime, feed SigLIP the *same*
+  aspect-bucketed image resized to 384² so conditioning and target stay aligned.
+  Higher-detail style needs a larger/tiled vision encoder — separate, lower priority.
+- **Refine the adapter** — warm-start from the 512² foundation weights; fine-tune on
+  the multi-aspect cache to correct geometry/proportion handling.
+
+Relates to PRECOMP-1 (tiling for large buckets) and PRECOMP-2 (proxy). The re-shard is
+the big one-time data job; everything else composes on top.
+
+---
+
 ## Flywheel Management
 
 **FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** (unblocked — PIPELINE-29 done)
