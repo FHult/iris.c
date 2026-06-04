@@ -270,13 +270,12 @@ class TestCurrentSymlinkResolution:
         cm._atomic_symlink(enc / "current", "v_real")
         assert cm.PrecomputeCache.effective_dir(tmp_path, "qwen3") == enc / "v_real"
 
-    def test_effective_dir_empty_current_is_the_root_cause_footgun(self, tmp_path):
-        # SHARP EDGE — this is the exact mechanism of the flywheel cache-clobber
-        # bug: when `current` resolves to an existing but EMPTY (0-record) version
-        # dir, effective_dir returns it, so every reader silently sees 0 shards
-        # even though a fully populated version sits right next to it. Pinned to
-        # keep the hazard visible. If effective_dir is ever hardened to fall
-        # through to the newest complete version, flip this assertion deliberately.
+    def test_effective_dir_empty_current_falls_through_to_complete(self, tmp_path):
+        # The hardened behavior: when `current` resolves to an existing but EMPTY
+        # (0-record) version dir, effective_dir must SKIP it and fall through to
+        # the newest complete, non-empty version. This is the fix for the
+        # flywheel cache-clobber bug — an empty `current` no longer silently
+        # yields 0 shards when a populated version sits right next to it.
         enc = tmp_path / "qwen3"
         empty = enc / "v_empty"
         empty.mkdir(parents=True)
@@ -285,8 +284,32 @@ class TestCurrentSymlinkResolution:
         _make_version(enc, "v_full", [0, 1], 2, {"x": 1})
         cm._atomic_symlink(enc / "current", "v_empty")
         eff = cm.PrecomputeCache.effective_dir(tmp_path, "qwen3")
-        assert eff == enc / "v_empty"                          # NOT v_full — the footgun
-        assert not list(eff.glob("*.npz"))
+        assert eff == enc / "v_full"                           # fell through, not empty
+        assert list(eff.glob("*.npz"))
+
+    def test_effective_dir_empty_current_no_complete_returns_none(self, tmp_path):
+        # Empty current and nothing else usable → None (honest "no cache"),
+        # rather than a path to an empty dir.
+        enc = tmp_path / "qwen3"
+        empty = enc / "v_empty"
+        empty.mkdir(parents=True)
+        (empty / "manifest.json").write_text(
+            _json.dumps({"version": "v_empty", "complete": True, "record_count": 0}))
+        cm._atomic_symlink(enc / "current", "v_empty")
+        assert cm.PrecomputeCache.effective_dir(tmp_path, "qwen3") is None
+
+    def test_effective_dir_picks_newest_complete_when_current_empty(self, tmp_path):
+        # Two complete versions, empty current → newest (by completed_at) wins.
+        enc = tmp_path / "qwen3"
+        empty = enc / "v_empty"; empty.mkdir(parents=True)
+        (empty / "manifest.json").write_text(
+            _json.dumps({"version": "v_empty", "complete": True, "record_count": 0}))
+        _make_version(enc, "v_old", [0], 2, {"x": 1},
+                      completed_at="2026-06-01T00:00:00+00:00")
+        _make_version(enc, "v_new", [1], 2, {"x": 1},
+                      completed_at="2026-06-03T00:00:00+00:00")
+        cm._atomic_symlink(enc / "current", "v_empty")
+        assert cm.PrecomputeCache.effective_dir(tmp_path, "qwen3") == enc / "v_new"
 
     def test_current_dir_none_when_dangling(self, tmp_path):
         # A truly dangling symlink (target removed) → current_dir returns None and

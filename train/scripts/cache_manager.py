@@ -215,13 +215,34 @@ class PrecomputeCache:
     def effective_dir(precomp_root: Path, encoder: str) -> Optional[Path]:
         """
         Best available cache dir for encoder:
-          1. Versioned current dir (current symlink resolved)
-          2. Flat legacy dir (flat .npz files directly in enc_dir)
-          3. None if nothing is available
+          1. The `current` version — only if it actually holds records.
+          2. The newest complete, non-empty version dir.
+          3. Flat legacy dir (flat .npz files directly in enc_dir).
+          4. None if nothing usable is available.
+
+        An *empty* `current` (0 records) is deliberately skipped: that is the
+        cache-clobber footgun — `current` pointing at an in-progress or stub
+        version made every reader silently see 0 shards even though a fully
+        populated version sat right next to it (the flywheel cache-clobber bug).
+        A read path that returns an empty dir is never useful, so fall through to
+        the newest complete version instead. (`any(glob)` short-circuits on the
+        first file — cheap even on a 200k-file cold dir.)
         """
         cur = PrecomputeCache.current_dir(precomp_root, encoder)
-        if cur:
+        if cur is not None and any(cur.glob("*.npz")):
             return cur
+
+        best: Optional[str] = None
+        best_key = ""
+        for v in PrecomputeCache.list_versions(precomp_root, encoder):
+            if not v.get("complete") or v.get("record_count", 0) <= 0:
+                continue
+            key = v.get("completed_at") or v.get("created_at") or ""
+            if best is None or key >= best_key:
+                best, best_key = v["version"], key
+        if best is not None:
+            return precomp_root / encoder / best
+
         flat = precomp_root / encoder
         if flat.is_dir() and any(flat.glob("*.npz")):
             return flat
