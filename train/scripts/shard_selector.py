@@ -56,6 +56,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_lib import DATA_ROOT, PRECOMP_DIR, SHARDS_DIR, SHARD_SCORES_DB_PATH, now_iso
+from shard_source import source_for_tar
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1027,11 @@ def scan_shard_pool(
         meta = manifest.get(shard_id, {})
         manifest_src = meta.get("source") if meta else None
         if not db.shard_exists(shard_id):
-            source = manifest_src or _infer_source(shard_id)
+            # Source priority: explicit manifest > provenance.json (authoritative,
+            # always present) > ID-range heuristic (wrong for interleaved builds,
+            # last resort only). The old code skipped provenance and let the
+            # heuristic stamp every shard "journeydb".
+            source = manifest_src or source_for_tar(tar) or _infer_source(shard_id)
             db.upsert_shard(shard_id, str(tar), source=source,
                             manifest_source=manifest_src)
             added += 1
@@ -1048,7 +1053,13 @@ def scan_shard_pool(
 
 
 def _infer_source(shard_id: str) -> str:
-    """Infer data source from shard ID conventions (heuristic fallback)."""
+    """Last-resort source guess from shard-ID range.
+
+    DEPRECATED as a primary source: this assumes jdb occupies ids < 400000 and
+    laion/coyo above, which is false for interleaved builds (it mislabeled all
+    1280 shards "journeydb"). scan_shard_pool now prefers provenance.json
+    (source_for_tar); this is reached only when provenance is missing.
+    """
     try:
         n = int(shard_id)
         if n < 400_000:

@@ -45,6 +45,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_lib import COLD_ROOT
+from shard_source import source_for_tar
 
 # Index lives alongside the shard pool on cold storage.
 INDEX_PATH = COLD_ROOT / "shard_index.db"
@@ -190,6 +191,16 @@ def _read_shard(tar_path: Path) -> dict:
                 entry["diversity_source"] = div_comp.get("source", "source_rarity")
         except (OSError, json.JSONDecodeError, ValueError):
             pass
+
+    # Authoritative source from provenance.json (the shard's build manifest).
+    # This overrides the light/unified `source`, which the scorer leaves as
+    # "unknown" for any multi-source shard. provenance.json is always present and
+    # lists every contributing dataset, so it is the ground truth. Pure shards
+    # collapse to a single label (e.g. "journeydb"); mixes get a combined tag
+    # (e.g. "coyo+laion+wikiart").
+    prov_source = source_for_tar(tar_path)
+    if prov_source:
+        entry["source"] = prov_source
 
     # Use light_score as final_value_score when no unified score exists yet.
     if not entry["has_unified"] and entry["has_light_score"]:
