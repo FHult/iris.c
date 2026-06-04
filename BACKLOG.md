@@ -458,6 +458,29 @@ flywheel-gated items. Migration: `plans/proxy-vae-v3.19-migration.md`.
 
 ---
 
+**PRECOMP-3: Precompute version key is over-sensitive — bound to whole-repo git SHA, not encoder identity** (High — directly causes redundant re-precompute; compounds with the v3.23.0 cache fix) — **CODE FIX LANDED; cold-data migration pending run-end.**
+
+**Status (2026-06-03):** `cache_manager.version_hash` no longer mixes in the git SHA — the key is now `sha256(config_subset)` where `config_subset` carries a per-encoder `code_version` (`ENCODER_CODE_VERSION = {qwen3,vae,siglip → "1"}`, bump only on an encoder-output-semantics change). `encoder_config_subset` folds `code_version` in; `git_sha` is still accepted (call-site compat) and recorded in the manifest for provenance but does not affect the key. Added `cache_manager.py consolidate <encoder|all> [--apply]` (hardlink-based union of same-identity version dirs, dedup by filename, repoint `current`, drop redundant dirs) + `list`. `list_versions` now skips the `current` symlink (was a phantom version). Tests in `train/tests/test_cache_manager.py` (git-SHA-independence, code_version bump, consolidate dry-run/apply/skip-different-identity/ignore-empty-stub). **Remaining:** after the warmup-run1 flywheel finishes (iter 15) and the orchestrator is restarted to pick up the new key, run `cache_manager.py consolidate all --apply` on `/Volumes/16TBCold/precomputed` to fold the per-SHA dirs (`v_d9a32b`, `v_c56d1c`, + iters 12–15) into the single canonical `v_059443`-class version. Until that restart the running orchestrator keeps the old git-SHA key (it won't reload the edited module), so iters 12–15 still publish per-SHA dirs — expected, the consolidation captures them.
+
+Original analysis (kept for context):
+
+`version_hash(config_subset, git_sha)` in [cache_manager.py:60](train/scripts/cache_manager.py#L60) computes the precompute cache version as `sha256(json(config_subset) + git_sha[:8])`. The `config_subset` correctly captures encoder identity (e.g. qwen3: model + extracted layers + think_tags), but mixing in the **whole-repo git SHA** means *any* commit anywhere in the tree — orchestrator, doctor, docs, an unrelated C change — produces a brand-new version dir and forces a full re-precompute of the same shard pool, even though the encoder and its outputs are byte-identical.
+
+**Observed impact (flywheel warmup-run1).** iters 10 and 11 published functionally identical Qwen3 config (`Qwen3-4B`, layers `[8,17,26]`, `think_tags:true`) under two different versions purely because we committed code between iterations:
+- iter 10 → `v_d9a32b` (git_sha `31e647a4`, 194,127 records, 40 shards)
+- iter 11 → `v_c56d1c` (git_sha `5d36078c`, 199,271 records, 40 shards)
+
+The two iters share 12 anchor shards (`000000`–`000011`); those 12 were re-encoded from scratch in iter 11 instead of being reused from iter 10's cold version, despite zero change to the encoder. With the cache key fixed, iter 11 would have reused iter 10's overlapping shards (and the hot/cold `current` symlinks would not fragment across SHAs).
+
+**Fix direction.** Key the precompute version on **encoder identity only**, not the global repo SHA:
+- Replace `git_sha[:8]` in the version hash with a narrow fingerprint of the code that actually affects this encoder's output — e.g. a hash of the relevant encoder module(s) (`precompute_all.py` encoder fn + the model/config), or a hand-maintained `ENCODER_CODE_VERSION` bumped only when the encoding semantics change. The principle is already stated in this file's Warm-Start section ("6-month-old embeddings remain valid if the encoder is unchanged") — the implementation contradicts it.
+- Keep `encoder_config_subset` as-is (it's correct).
+- On change, add a one-shot migration/alias so existing `v_d9a32b`/`v_c56d1c` data is discoverable under the new key (or a `cache_manager.py --warm-start-precompute` pass to fold them forward) — don't strand the ~68 shards already on cold.
+
+**Tests:** version_hash is stable across an unrelated git commit (same encoder config + different repo SHA → same version); version_hash *changes* when the encoder config subset changes; migration/alias resolves old version dirs. Pure-function, no GPU, no network — same pattern as the existing cache_manager tests.
+
+---
+
 ## Flywheel Management
 
 **FLYWHEEL-1: Long-term campaign management and cross-campaign analysis** (unblocked — PIPELINE-29 done)
