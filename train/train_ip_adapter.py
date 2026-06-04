@@ -852,7 +852,7 @@ def train(config: dict) -> None:
         _siglip_npz = glob.glob(os.path.join(siglip_dir, "*.npz"))
         # Precomputed files are keyed by shard stem (e.g. "000000" for chunk 1, "250000" for chunk 2).
         _covered = {os.path.basename(f).split("_")[0] for f in _siglip_npz}
-        _shard_prefixes = {_internal_prefix(p) for p in shard_paths}
+        _shard_prefixes = {shard_internal_prefix(p) for p in shard_paths}
         _missing = _shard_prefixes - _covered
         _coverage = len(_covered & _shard_prefixes) / len(_shard_prefixes) if _shard_prefixes else 1.0
         if _missing:
