@@ -487,7 +487,7 @@ The two iters share 12 anchor shards (`000000`–`000011`); those 12 were re-enc
 
 ---
 
-**PRECOMP-4: Aspect-ratio bucketing, end-to-end (re-shard by shape → multi-res precompute → aspect-aware loader → refine)** (High for final quality; **not** needed for the warmup bootstrap, which is correctly pinned to 512² square)
+**PRECOMP-4: Aspect-ratio bucketing, end-to-end** — full implementation plan: [plans/precomp4-aspect-bucketing.md](plans/precomp4-aspect-bucketing.md) (decision: per-image-bucket, NOT re-shard, to preserve the carry-forward cache + scores; shared `aspect_bucket` primitive landed in train/ip_adapter/bucketing.py). Original sketch: (re-shard by shape → multi-res precompute → aspect-aware loader → refine)** (High for final quality; **not** needed for the warmup bootstrap, which is correctly pinned to 512² square)
 
 The data path squashes every image to a single **square** resolution and the training
 loader does not honour aspect ratio, so the multi-resolution machinery that exists is
