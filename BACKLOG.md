@@ -641,9 +641,18 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
     parsing + auth + action mapping are unit-testable with the Slack transport
     mocked, same pattern as test_slack_sink.py).
 
-- **QL-7: `iris_slackd` — minimal hardened command daemon** (Medium — the concrete,
-  shippable subset of QL-6; do this *instead of* the full QL-6 surface first). A
-  deliberately tiny long-running daemon whose only job is: listen to one Slack
+- **QL-7: `iris_slackd` — minimal hardened command daemon** — CODE+TESTS DONE
+  (2026-06-05), deploy gated on Slack tokens. `train/scripts/slackd_core.py` (pure
+  policy: command table, auth, parse, resolve, rate limit, audit — 39 tests incl. a
+  2000-case fuzz proving no message text can synthesise an out-of-table argv) +
+  `train/scripts/iris_slackd.py` (thin Socket-Mode shell + `Daemon.handle`, 15
+  tests, `--self-test` runs the full pipeline with no SDK/network). All three build
+  phases (read-only, armed gate, confirm-gated `stop`) implemented. Remaining to go
+  live: `train/.venv/bin/pip install slack_sdk`, create the Slack app (Socket Mode +
+  scopes per plan), export the 4 env vars, launch in an `iris-slackd` tmux window.
+  See `plans/slack-command-daemon.md`. Original design notes below.
+
+  A deliberately tiny long-running daemon whose only job is: listen to one Slack
   channel, and on a recognised command, invoke a **fixed, whitelisted pipeline
   script** — nothing else. Security and smallness are the features.
 

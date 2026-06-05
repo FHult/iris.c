@@ -1,7 +1,25 @@
 # Plan: Slack Command Daemon (QL-7) + Bidirectional Slack (QL-6)
 
-Status: design / not started. Earmarked for a dedicated, security-first session.
+Status: **CODE + TESTS DONE (2026-06-05)**; deploy gated on Slack tokens.
 Prereq QL-5 (outbound alert sink) is DONE in `train/monitoring/sinks.py`.
+
+Built:
+- `train/scripts/slackd_core.py` — pure policy core (all hard rules; 39 tests).
+- `train/scripts/iris_slackd.py` — thin Socket-Mode shell + `Daemon.handle`
+  (15 tests; `--self-test` exercises the full pipeline with no SDK/network).
+- `train/tests/test_slackd_core.py`, `train/tests/test_slackd_daemon.py` — 54
+  tests total, incl. a 2000-case fuzz proving `resolve()` can never emit an argv
+  outside `COMMANDS[*].argv` verbatim.
+
+All three build phases below are implemented (read-only, armed gate, confirm-gated
+`stop`). To go live (operator, when credentials exist):
+1. `train/.venv/bin/pip install slack_sdk`
+2. Create a Slack app: Socket Mode on; scopes `connections:write`, `chat:write`,
+   `files:write`, `channels:history`, `app_mentions:read`; install to the workspace.
+3. Export `SLACK_APP_TOKEN` (xapp-), `SLACK_BOT_TOKEN` (xoxb-), `SLACK_CMD_CHANNEL`,
+   `SLACK_CMD_USERS`; optionally `IRIS_SLACKD_ARMED=1` for pause/resume/stop.
+4. `train/.venv/bin/python train/scripts/iris_slackd.py` (ideally in an
+   `iris-slackd` tmux window under `caffeinate -dim`).
 
 ## Decision: ship QL-7 first, QL-6 is the optional later superset
 

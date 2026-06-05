@@ -255,6 +255,41 @@ Checks: tmux available · DATA_ROOT exists and writable · venv python · disk �
 
 ---
 
+## `iris-slackd` — Slack command daemon (QL-7)
+
+A small, hardened daemon that lets you drive the pipeline from one Slack channel.
+Read-only by default; can only launch a fixed, compiled-in set of pipeline scripts
+(no message text ever reaches a shell or argv slot). Security design + full
+rationale: `plans/slack-command-daemon.md`.
+
+**Files**
+- `train/scripts/slackd_core.py` — pure policy (command table, auth, parse,
+  resolve, rate limit, audit). All security logic; unit-tested without network.
+- `train/scripts/iris_slackd.py` — thin Socket-Mode shell around `Daemon.handle`.
+- Audit log: `logs/slackd.jsonl` (override with `IRIS_SLACKD_LOG`).
+
+**Commands** (DM/mention in the allow-listed channel): `status`, `doctor`,
+`quality`, `flywheel` (read-only); `pause`, `resume` (need `IRIS_SLACKD_ARMED=1`);
+`stop` (armed + reply `confirm <token>` within 60s); `help`.
+
+**Bring-up** (operator, once a Slack app exists — tokens are secrets, never commit):
+```bash
+train/.venv/bin/pip install slack_sdk
+export SLACK_APP_TOKEN=xapp-...   # connections:write
+export SLACK_BOT_TOKEN=xoxb-...   # chat:write, files:write, channels:history, app_mentions:read
+export SLACK_CMD_CHANNEL=C0XXXXXXX
+export SLACK_CMD_USERS=U0AAA,U0BBB
+# export IRIS_SLACKD_ARMED=1      # only to enable pause/resume/stop
+train/.venv/bin/python train/scripts/iris_slackd.py
+```
+Run it in an `iris-slackd` tmux window under `caffeinate -dim`, like the other
+pipeline processes. Verify wiring with no SDK/network/tokens:
+```bash
+train/.venv/bin/python train/scripts/iris_slackd.py --self-test
+```
+
+---
+
 ## Data Layout (`/Volumes/2TBSSD`)
 
 ```
