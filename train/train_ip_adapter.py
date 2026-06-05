@@ -982,6 +982,16 @@ def train(config: dict) -> None:
         if loaded_ema is not None:
             print(f"  Loaded EMA from checkpoint")
 
+    # Weights-only warm-start (e.g. ablation arms from a campaign checkpoint):
+    # load the adapter weights but DELIBERATELY keep start_step=0 — fresh warmup,
+    # fresh optimizer, fresh step horizon — so the arm trains its full --max-steps
+    # under its own config rather than inheriting the checkpoint's training horizon.
+    _ws_weights_only = mcfg.get("warmstart_weights_only")
+    if _ws_weights_only and os.path.isfile(_ws_weights_only):
+        load_checkpoint(adapter, _ws_weights_only)
+        print(f"  Warm-started adapter weights from "
+              f"{os.path.basename(_ws_weights_only)} (fresh schedule, start_step=0)")
+
     if bool(tcfg.get("correct_forward_q", False)) and not bool(tcfg.get("use_block_injection", False)):
         _txt_warmup_cq = mx.zeros(
             (1, 64, flux.transformer.context_embedder.weight.shape[1]), dtype=mx.bfloat16)
@@ -3036,6 +3046,12 @@ def main():
     parser.add_argument("--config", required=True, help="YAML config file")
     parser.add_argument("--resume", default=None,
                         help="Resume from checkpoint .safetensors path")
+    parser.add_argument("--warmstart-weights", default=None,
+                        help="Load adapter weights from this checkpoint but start a FRESH "
+                             "schedule (start_step=0, fresh warmup/optimizer). Unlike --resume, "
+                             "it does NOT continue the checkpoint's step count. For ablation "
+                             "arms that warm-start from a campaign checkpoint without inheriting "
+                             "its training horizon.")
     parser.add_argument("--lr", type=float, default=None,
                         help="Override learning rate from config (use lower LR for later chunks)")
     parser.add_argument("--max-steps", type=int, default=None,
@@ -3105,6 +3121,9 @@ def main():
 
     if args.resume:
         config["model"]["warmstart_path"] = args.resume
+    if args.warmstart_weights:
+        # Weights-only warm-start: load adapter weights but keep a fresh schedule.
+        config["model"]["warmstart_weights_only"] = args.warmstart_weights
     if args.lr is not None:
         config["training"]["learning_rate"] = args.lr
     if args.max_steps is not None:

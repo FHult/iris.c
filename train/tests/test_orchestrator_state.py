@@ -324,3 +324,29 @@ class TestLoadOpenDispatchIds:
     def test_missing_file_is_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(orch, "DISPATCH_QUEUE", tmp_path / "nope.jsonl")
         assert orch._load_open_dispatch_ids() == set()
+
+
+# ---------------------------------------------------------------------------
+# _ablation_warmstart_ckpt — opt-in arm warm-start decision (default off)
+# ---------------------------------------------------------------------------
+
+class TestAblationWarmstartCkpt:
+    def test_flag_off_returns_none(self, tmp_path):
+        (tmp_path / "step_0000300.safetensors").write_bytes(b"x")
+        # default (key absent) and explicit-false both cold-start
+        assert orch._ablation_warmstart_ckpt({}, tmp_path) is None
+        assert orch._ablation_warmstart_ckpt({"ablation_warmstart_arms": False}, tmp_path) is None
+
+    def test_flag_on_returns_latest_ckpt(self, tmp_path):
+        for s in ("step_0000300.safetensors", "step_0001000.safetensors",
+                  "step_0000500.safetensors"):
+            (tmp_path / s).write_bytes(b"x")
+        got = orch._ablation_warmstart_ckpt({"ablation_warmstart_arms": True}, tmp_path)
+        assert got is not None and got.endswith("step_0001000.safetensors")
+
+    def test_flag_on_no_checkpoint_returns_none(self, tmp_path):
+        assert orch._ablation_warmstart_ckpt({"ablation_warmstart_arms": True}, tmp_path) is None
+
+    def test_flag_on_missing_dir_returns_none(self, tmp_path):
+        assert orch._ablation_warmstart_ckpt(
+            {"ablation_warmstart_arms": True}, tmp_path / "nope") is None

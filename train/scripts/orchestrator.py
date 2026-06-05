@@ -2582,15 +2582,42 @@ def _build_flywheel_train_config(
     return tmp_path
 
 
+def _ablation_warmstart_ckpt(fw_cfg: dict, ckpt_dir) -> Optional[str]:
+    """Opt-in warm-start checkpoint for ablation arms.
+
+    When `ablation_warmstart_arms` is truthy in the flywheel config, return the
+    campaign's latest `step_*.safetensors` so each arm warm-starts its weights
+    (with a FRESH schedule — see train_ip_adapter --warmstart-weights) instead of
+    cold-starting. Returns None when the flag is off (default) or no checkpoint
+    exists yet.
+
+    Default-off on purpose: warm-starting arms matches the flywheel's warm-started
+    per-iter regime (higher fidelity) but reduces how much the arms can diverge in
+    1000 steps (lower discrimination). Which is better is empirical; keep the
+    today's cold-start default until the golden-set cross-run comparison can settle it.
+    """
+    if not fw_cfg.get("ablation_warmstart_arms"):
+        return None
+    d = Path(ckpt_dir)
+    if not d.is_dir():
+        return None
+    ckpts = sorted(d.glob("step_*.safetensors"))
+    return str(ckpts[-1]) if ckpts else None
+
+
 def _run_flywheel_ablation(
     fw_cfg: dict,
     name: str,
     iteration: int,
+    warmstart_ckpt: Optional[str] = None,
 ) -> Optional[str]:
     """
     Run a capped ablation burst to tune hyperparams.
     Blocks until the ablation subprocess exits.
     Returns the ablation run_name on success, None on failure.
+
+    warmstart_ckpt: if set (opt-in), arms warm-start their weights from this
+    checkpoint with a fresh schedule instead of cold-starting.
     """
     import yaml
     abl_cfg_path = fw_cfg.get("ablation_config")
@@ -2635,6 +2662,10 @@ def _run_flywheel_ablation(
         f"--vae-cache '{_fw_data_root / 'precomputed' / 'vae'}' "
         f"--siglip-cache '{_fw_data_root / 'precomputed' / 'siglip'}'"
     )
+    if warmstart_ckpt:
+        cmd += f" --warmstart-weights '{warmstart_ckpt}'"
+        log_orch(f"[flywheel:{name}] iter {iteration}: ablation arms warm-start from "
+                 f"{os.path.basename(warmstart_ckpt)} (fresh schedule)")
     log_file.parent.mkdir(parents=True, exist_ok=True)
     full_cmd = f"({cmd}) >> '{log_file}' 2>&1; echo EXIT_CODE=$? >> '{log_file}'"
     try:
@@ -3318,7 +3349,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             # Ablation burst (every N iterations, only on successful runs)
             ablation_run: Optional[str] = None
             if ablation_every > 0 and iteration % ablation_every == 0 and status == "done":
-                ablation_run = _run_flywheel_ablation(fw_cfg, name, iteration)
+                ablation_run = _run_flywheel_ablation(
+                    fw_cfg, name, iteration,
+                    warmstart_ckpt=_ablation_warmstart_ckpt(fw_cfg, _fw_ckpt_dir))
                 if ablation_run:
                     new_hp = _read_ablation_best(ablation_run)
                     if new_hp:
@@ -3355,7 +3388,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                         # Temporarily override max_runs for this targeted burst
                         _saved_max = fw_cfg.get("ablation_max_runs")
                         fw_cfg["ablation_max_runs"] = plateau_ablation_runs
-                        plateau_abl_run = _run_flywheel_ablation(fw_cfg, name, iteration)
+                        plateau_abl_run = _run_flywheel_ablation(
+                            fw_cfg, name, iteration,
+                            warmstart_ckpt=_ablation_warmstart_ckpt(fw_cfg, _fw_ckpt_dir))
                         if _saved_max is None:
                             fw_cfg.pop("ablation_max_runs", None)
                         else:

@@ -1491,6 +1491,10 @@ def _run_one(
         "--max-steps", str(args.steps),
         "--log-every", str(log_every),
     ]
+    # Opt-in: warm-start each arm's weights from a campaign checkpoint (fresh schedule).
+    _ws_weights = getattr(args, "warmstart_weights", None)
+    if _ws_weights:
+        cmd += ["--warmstart-weights", str(_ws_weights)]
 
     collector = MetricCollector()
     t_start = time.time()
@@ -2824,6 +2828,10 @@ def main() -> None:
                     help="Regenerate HTML report from existing DB without running new experiments")
     ap.add_argument("--warm-start-from", default=None, metavar="DIR",
                     help="Output dir of a prior campaign; injects its best params as first candidate")
+    ap.add_argument("--warmstart-weights", default=None, metavar="CKPT",
+                    help="Warm-start each arm's adapter weights from this checkpoint with a fresh "
+                         "schedule (passed to train_ip_adapter --warmstart-weights). Opt-in: makes "
+                         "arms continue from a campaign checkpoint instead of cold-starting.")
     ap.add_argument("--force-continue", action="store_true",
                     help="Keep running even after campaign plateau is detected")
     ap.add_argument("--goal", default=None, metavar="PRESET",
