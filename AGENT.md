@@ -437,6 +437,41 @@ Previously documented gaps now resolved:
 - ~~Hung prep workers undetected~~ — orchestrator now dispatches a warning after `PREP_HUNG_HOURS` (6h) of continuous prep window activity.
 - ~~SigLIP coverage not checked at promotion~~ — `_promote_chunk()` enforces ≥90% siglip coverage when `training.siglip: true`.
 
+## Training Pipeline Invariants (Keep — 2026-06)
+
+Hard-won contracts from the warmup-run2 debugging. Violating any silently breaks training.
+
+1. **Precompute↔train resolution contract.** VAE latents are precomputed at a SINGLE
+   square resolution (`precompute_all._resize` squashes to `image_size²`). Training
+   buckets by aspect (`BUCKETS`), and `_load_vae_latent` rejects any latent whose shape
+   ≠ the bucket's `(H//8, W//8)` as a cache miss — which, with no live VAE in cached
+   mode, is an unrecoverable per-sample skip. So **training MUST pin `data.bucket:
+   [512,512]`** to match the square precompute (set in `stage1_512px.yaml`; wired via
+   `train_ip_adapter --warmstart-weights`-adjacent `data.bucket`). Multi-bucket training
+   without per-bucket precompute = ~100% cache-miss skip → trainer exits. Distortion-free
+   multi-aspect is the deferred PRECOMP-4 work (`plans/precomp4-aspect-bucketing.md`);
+   the shared `aspect_bucket()` primitive is in `train/ip_adapter/bucketing.py`.
+
+2. **Precompute cache key = encoder IDENTITY, not git SHA (PRECOMP-3).**
+   `cache_manager.version_hash` keys on `encoder_config_subset` (model + output config +
+   per-encoder `ENCODER_CODE_VERSION`), NOT the repo git SHA. Bumping a code_version is
+   the deliberate way to invalidate an encoder's cache. The cache is machine-independent
+   (content-addressed) → it carries forward across hardware. `cache_manager.py consolidate
+   <enc|all> [--apply]` folds same-identity version dirs into one canonical version.
+
+3. **Shard `source` comes from `provenance.json` (`shard_source.py`), authoritative.**
+   NOT the light-scorer's `source` (which is "unknown" for multi-source shards) and NOT
+   `shard_selector._infer_source` (an ID-range heuristic that mislabeled all shards
+   "journeydb"). Labels: `journeydb` / `coyo` / `laion` / `wikiart`, with combined tags
+   for mixes (`coyo+laion+wikiart`). `backfill_shard_source.py` repairs both
+   `shard_index.db` and `shard_scores.db`. `flywheel.per_source_min` keys must match these
+   labels (the old `laion_coyo` matched zero).
+
+4. **`shard_scores.db` (hot) vs cold `precomputed/` — `current` symlink must point at a
+   populated version.** An empty `current` makes `effective_dir` yield 0 records (the
+   original cache-clobber). `effective_dir` now skips an empty `current` and falls through
+   to the newest complete version; don't reintroduce a blind `current` trust.
+
 ## Project docs
 - `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
 - `BUGS.md` — known anomalies and observed issues (training, pipeline)
