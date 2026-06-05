@@ -17,19 +17,30 @@
   built each way. Needs root-cause in the non-BLAS conv/GEMM (candidate: an accumulation or
   layout assumption that only holds under the BLAS path).
 
-## Open Questions (Train/Inference latent-convention — needs confirmation)
+## Training Bugs (Fixed)
 
-- **VAE-Q1: does IP-adapter training pack latents in the same BN convention the frozen
-  Flux.2 transformer / C inference expect?** The precompute stores the mflux **VAE-latent**
-  space (`encode()` = `(mean-shift)*scale`, no BN, std≈1.72). Training packs it to the
-  transformer via **patchify only, no BatchNorm** (`train_ip_adapter.py:2508-2511`), whereas
-  mflux's `decode_packed_latents` defines the transformer/packed space as BN'd
-  (`packed*bn_std + bn_mean`, std≈1) and C's `iris_vae_encode` applies that BN. If the frozen
-  base transformer expects BN'd packed latents, training feeds it std≈1.72 (un-BN'd) latents —
-  a train/inference latent-scale mismatch. Could equally be correct if the base variant
-  operates on un-BN'd latents. Resolve by tracing the C txt2img denoising convention + the
-  frozen transformer's expected input space before treating as a bug. This is the genuine
-  C-1-class risk the parity harness surfaced.
+- **VAE-Q1: IP-adapter trained in the wrong latent space (raw VAE-latent, not the
+  BN'd packed space C inference uses). FIXED 2026-06-05.**
+  - **Root cause (confirmed by 4 independent code paths):** precompute stores the mflux
+    **VAE-latent** space (`encode()`, no BN, std≈1.72). Training used it directly
+    (`latents = mx.array(vae_np)`; `_vae_encode → vae.encode()`) and packed via **patchify
+    only, no BatchNorm**. But C inference operates the frozen Flux.2 transformer in the
+    **BN'd packed space** (std≈1): txt2img noise init std‑1 at 128ch (iris.c:900); img2img
+    uses BN'd `iris_vae_encode`; decode "denormalize (batch denorm) → unpatchify" — identical
+    to mflux `decode_packed_latents`. So the adapter was trained against the frozen base
+    receiving std≈1.72 latents while inference feeds it std≈1 — the trained adapter would not
+    transfer to C inference. (Training loss/ref_gap still improved because the loss measures
+    self-consistency within the wrong space, not transfer.)
+  - **Fix:** BN-pack the loaded latent on load to match C exactly. `_load_vae_bn_stats` reads
+    the VAE `bn.running_mean/running_var`; `_bn_pack_latents` applies per-128-feature BN with
+    feature(c,h,w)=c*4+(h%2)*2+(w%2) (the patchify channel order) in [32,Lh,Lw] space, so the
+    trainer's existing patchify pack yields exactly C `iris_vae_encode`'s output. Applied to
+    cached, live, and validation latent paths. **No re-precompute needed** — raw latents are
+    fine; the BN is applied on load.
+  - **Validation:** `_bn_pack_latents(teacher)` vs C's real packed output (`debug/vae_parity.c`
+    dump) → **corr 0.9995, std 0.972 vs 0.973** (through the real bf16 code path).
+  - **Impact:** warmup-run2 (and any prior IP-adapter training) was in the wrong space and was
+    restarted after this fix.
 
 ## Pipeline Bugs (Fixed)
 

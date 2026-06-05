@@ -633,6 +633,16 @@ def train(config: dict) -> None:
     _flux_ok = os.path.isdir(_flux_dir)
     _preflight_ok &= _check(f"model dir: {_flux_dir}", _flux_ok,
                              "" if _flux_ok else "not found")
+
+    # VAE-Q1: load the VAE BatchNorm stats used to convert raw precomputed
+    # VAE-latents (mflux encode() space, std~1.7) into the transformer's packed/BN
+    # convention that C iris_vae inference operates in (std~1). Without this the
+    # model trains in a latent space that does not transfer to C inference. See
+    # BUGS.md VAE-Q1 and debug/vae_parity.c (validated corr 0.9995).
+    _bn_mean_r, _bn_std_r = _load_vae_bn_stats(_flux_dir)
+    if _bn_mean_r is not None:
+        print("VAE-Q1: VAE batch-norm stats loaded; latents will be BN-packed to "
+              "the C-inference convention.", flush=True)
     # Shard path
     _shard_dir = dcfg["shard_path"]
     _shard_count = len(glob.glob(os.path.join(_shard_dir, "*.tar")))
@@ -1298,7 +1308,9 @@ def train(config: dict) -> None:
                 if _vae_np is None or _text_np is None:
                     continue
                 _siglip_np = _load_siglip_embed(_stem, _val_siglip)
-                _lat = mx.array(_vae_np[None], dtype=mx.bfloat16)
+                # VAE-Q1: same raw->packed/BN convention as the training path.
+                _lat = _bn_pack_latents(mx.array(_vae_np[None], dtype=mx.bfloat16),
+                                        _bn_mean_r, _bn_std_r)
                 _txt = mx.array(_text_np[None], dtype=mx.bfloat16)
                 # Sample a random timestep so val loss reflects the full noise distribution.
                 _t     = mx.clip((mx.sigmoid(mx.random.normal(shape=(1,))) * 1000).astype(mx.int32), 0, 999)
@@ -1649,9 +1661,11 @@ def train(config: dict) -> None:
             _did_live_encode = True
 
         if vae_np is not None:
-            latents = mx.array(vae_np, dtype=mx.bfloat16)
+            latents = _bn_pack_latents(mx.array(vae_np, dtype=mx.bfloat16),
+                                       _bn_mean_r, _bn_std_r)
         elif vae is not None:
-            latents = _vae_encode(vae, images)
+            latents = _bn_pack_latents(_vae_encode(vae, images),
+                                       _bn_mean_r, _bn_std_r)
         else:
             # VAE not loaded (cache-only mode) but this batch has no cached latents.
             # Skip rather than crash — incomplete precompute coverage.
@@ -2451,6 +2465,43 @@ def _load_text_encoder(flux):
 # ─────────────────────────────────────────────────────────────────────────────
 # Encode helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _load_vae_bn_stats(flux_model_dir: str):
+    """Load the VAE BatchNorm running stats as [32,2,2] mean / std arrays (VAE-Q1).
+
+    Returns (bn_mean_r, bn_std_r) or (None, None) if unavailable. The 128 BN
+    features map to (latent_channel c, patch-row pi, patch-col pj) as
+    feature = c*4 + pi*2 + pj — the same channel order iris_patchify / the trainer's
+    pack step use — so reshaping to [32,2,2] lets a spatial tile apply the right
+    per-feature stat at each (h%2, w%2). eps = 1e-4 (config batch_norm_eps)."""
+    try:
+        import os as _os
+        path = _os.path.join(flux_model_dir, "vae", "diffusion_pytorch_model.safetensors")
+        st = mx.load(path)
+        bn_mean_r = st["bn.running_mean"].astype(mx.float32).reshape(32, 2, 2)
+        bn_std_r = mx.sqrt(st["bn.running_var"].astype(mx.float32).reshape(32, 2, 2) + 1e-4)
+        mx.eval(bn_mean_r, bn_std_r)
+        return bn_mean_r, bn_std_r
+    except Exception as e:
+        print(f"  WARNING: VAE-Q1 bn stats unavailable ({e}); latents will NOT be "
+              f"BN-packed — training space will not match C inference", flush=True)
+        return None, None
+
+
+def _bn_pack_latents(lat: mx.array, bn_mean_r, bn_std_r) -> mx.array:
+    """Map a raw VAE-latent [B,32,Lh,Lw] (mflux encode() space, std~1.7) into the
+    transformer's packed/BatchNorm convention that C inference operates in
+    (std~1) — VAE-Q1. Per-128-feature BN with feature(c,h,w)=c*4+(h%2)*2+(w%2),
+    applied in [32,Lh,Lw] space so the trainer's existing patchify pack produces
+    exactly C iris_vae_encode's output (validated: corr 0.9995 on a real image).
+    No-op if stats are unavailable."""
+    if bn_mean_r is None:
+        return lat
+    _, _, Lh, Lw = lat.shape
+    mean_full = mx.tile(bn_mean_r, (1, Lh // 2, Lw // 2))   # [32, Lh, Lw]
+    std_full = mx.tile(bn_std_r, (1, Lh // 2, Lw // 2))
+    return ((lat.astype(mx.float32) - mean_full) / std_full).astype(lat.dtype)
+
 
 def _vae_encode(vae, images: mx.array) -> mx.array:
     """
