@@ -730,6 +730,33 @@ def _compute_raw_composite(
 # Selection algorithm
 # ---------------------------------------------------------------------------
 
+def _resolve_exploration_rate(cfg: dict, iteration: int, unscored_frac: float) -> float:
+    """Exploration rate for this iteration.
+
+    Base `cfg['exploration_rate']`, overridden by the FIRST matching
+    `exploration_schedule` entry (`through_iteration` / `after_iteration`, checked
+    in order), then floored to EXPLORE_BOOSTED when the unscored fraction exceeds
+    EXPLORE_THRESH (adaptive boost so a cold pool gets explored faster). The
+    schedule is ignored at iteration 0.
+
+    Extracted from select_shards (behaviour-preserving) so the schedule boundary
+    logic is unit-testable.
+    """
+    rate = float(cfg.get("exploration_rate", 0.15))
+    schedule = cfg.get("exploration_schedule")
+    if schedule and iteration > 0:
+        for entry in schedule:
+            if "through_iteration" in entry and iteration <= int(entry["through_iteration"]):
+                rate = float(entry["rate"])
+                break
+            if "after_iteration" in entry and iteration > int(entry["after_iteration"]):
+                rate = float(entry["rate"])
+                break
+    if unscored_frac > EXPLORE_THRESH:
+        rate = max(rate, EXPLORE_BOOSTED)
+    return rate
+
+
 def select_shards(
     db: ShardScoreDB,
     n_shards: int,
@@ -752,23 +779,11 @@ def select_shards(
     Unscored shards carry a UCB-style optimism bonus so they eventually get explored.
     """
     performance_weight = float(cfg.get("performance_weight", 0.60))
-    exploration_rate   = float(cfg.get("exploration_rate",   0.15))
     min_diversity_pct  = float(cfg.get("min_diversity_pct",  0.20))
     recency_penalty    = float(cfg.get("recency_penalty",    0.30))
     recency_window     = int(cfg.get("recency_window_iters", 3))
-
-    # Exploration schedule: override exploration_rate for the current iteration.
-    # Entries are checked in order; the first match wins.
-    # Format: [{through_iteration: N, rate: R}, ..., {after_iteration: N, rate: R}]
-    schedule = cfg.get("exploration_schedule")
-    if schedule and iteration > 0:
-        for entry in schedule:
-            if "through_iteration" in entry and iteration <= int(entry["through_iteration"]):
-                exploration_rate = float(entry["rate"])
-                break
-            if "after_iteration" in entry and iteration > int(entry["after_iteration"]):
-                exploration_rate = float(entry["rate"])
-                break
+    # exploration_rate is resolved below, once the unscored fraction is known
+    # (schedule override + adaptive boost) — see _resolve_exploration_rate.
 
     all_shards = db.get_all_shards()
     if not all_shards:
@@ -790,8 +805,7 @@ def select_shards(
     # boost exploration_rate so unseen shards get sampled faster.
     n_total_unscored = sum(1 for s in all_shards if s.get("n_scored", 0) == 0)
     unscored_frac = n_total_unscored / len(all_shards)
-    if unscored_frac > EXPLORE_THRESH:
-        exploration_rate = max(exploration_rate, EXPLORE_BOOSTED)
+    exploration_rate = _resolve_exploration_rate(cfg, iteration, unscored_frac)
 
     def _score(s: dict) -> float:
         return s.get("effective_score") or s.get("composite_score") or 0.3
