@@ -2605,6 +2605,24 @@ def _ablation_warmstart_ckpt(fw_cfg: dict, ckpt_dir) -> Optional[str]:
     return str(ckpts[-1]) if ckpts else None
 
 
+def _quality_gate_target(fw_cfg: dict, best_checkpoint: Optional[str]) -> Optional[str]:
+    """Opt-in champion checkpoint for the cross-run quality gate.
+
+    When `quality_gate` is truthy in the flywheel config, return the campaign's
+    champion checkpoint so quality_gate.py can golden-set-eval it and compare to
+    the previous campaign's champion. Returns None when the flag is off (default)
+    or the checkpoint is missing.
+
+    Default-off: the gate runs a GPU golden-set eval, so it only fires at campaign
+    end when explicitly enabled. See quality_gate.py / BACKLOG ABL-FIDELITY.
+    """
+    if not fw_cfg.get("quality_gate"):
+        return None
+    if best_checkpoint and os.path.isfile(best_checkpoint):
+        return best_checkpoint
+    return None
+
+
 def _run_flywheel_ablation(
     fw_cfg: dict,
     name: str,
@@ -3452,6 +3470,26 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
         written = write_campaign_summary_json(name, fw_db, cold_root)
         if written:
             log_orch(f"[flywheel:{name}] summary written: {written}")
+
+        # Opt-in cross-run quality gate: golden-set eval the champion checkpoint and
+        # compare to the previous campaign's champion (clip_i/lpips/fid). Default off
+        # (needs `quality_gate: true` + a golden set + GPU); only runs at campaign end.
+        try:
+            _qg_ckpt = _quality_gate_target(
+                fw_cfg, (fw_db.get_best(name) or {}).get("checkpoint"))
+            if _qg_ckpt:
+                _qg_log = LOG_DIR / f"flywheel_{name}_quality_gate.log"
+                _qg_cmd = (f"source '{TRAIN_DIR}/.venv/bin/activate' && "
+                           f"python -u '{SCRIPTS_DIR}/quality_gate.py' "
+                           f"--checkpoint '{_qg_ckpt}' --campaign '{name}'")
+                log_orch(f"[flywheel:{name}] cross-run quality gate on "
+                         f"{os.path.basename(_qg_ckpt)} → {_qg_log.name}")
+                subprocess.run(["bash", "-c",
+                                f"({_qg_cmd}) >> '{_qg_log}' 2>&1; "
+                                f"echo EXIT_CODE=$? >> '{_qg_log}'"])
+        except Exception as _qg_err:
+            log_orch(f"[flywheel:{name}] quality gate error: {_qg_err}", level="warning")
+
         notify("iris flywheel", f"{name} complete ({max_iters} iterations)")
     finally:
         fw_db.close()

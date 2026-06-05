@@ -350,3 +350,27 @@ class TestAblationWarmstartCkpt:
     def test_flag_on_missing_dir_returns_none(self, tmp_path):
         assert orch._ablation_warmstart_ckpt(
             {"ablation_warmstart_arms": True}, tmp_path / "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# _quality_gate_target — opt-in cross-run quality gate at campaign end (default off)
+# ---------------------------------------------------------------------------
+
+class TestQualityGateTarget:
+    def test_flag_off_returns_none(self, tmp_path):
+        ck = tmp_path / "step_0001000.safetensors"
+        ck.write_bytes(b"x")
+        assert orch._quality_gate_target({}, str(ck)) is None
+        assert orch._quality_gate_target({"quality_gate": False}, str(ck)) is None
+
+    def test_flag_on_existing_ckpt_returns_it(self, tmp_path):
+        ck = tmp_path / "step_0001000.safetensors"
+        ck.write_bytes(b"x")
+        assert orch._quality_gate_target({"quality_gate": True}, str(ck)) == str(ck)
+
+    def test_flag_on_missing_ckpt_returns_none(self, tmp_path):
+        assert orch._quality_gate_target({"quality_gate": True},
+                                         str(tmp_path / "nope.safetensors")) is None
+
+    def test_flag_on_no_ckpt_returns_none(self):
+        assert orch._quality_gate_target({"quality_gate": True}, None) is None
