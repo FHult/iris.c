@@ -45,7 +45,26 @@ A proxy can pass every Tier-1/2 metric *against the teacher* and still degrade r
 inference if the C VAE (the actual inference engine) diverges from that teacher. Resolve
 **C-1 and C-2 before any proxy latent enters a training set you intend to ship from.**
 
-### 🔴 C-1 — C `iris_vae` ↔ teacher-VAE parity is assumed, never tested (BLOCKING)
+### ✅ C-1 — harness built + first run done (2026-06-05); one real bug + one open question
+**Status:** `debug/vae_parity.c` (+ `debug/gen_vae_parity_fixture.py`) built and run on a
+real image (000004_3398) against the stored mflux teacher latent — CPU, no GPU, no teacher
+re-run (references already in the cold cache). Results:
+- **Encoders agree:** C `iris_vae` (BLAS build) vs mflux teacher encoder = **0.99906
+  per-channel correlation**. The ~1.76× magnitude gap is the packed-BN vs VAE-latent
+  *convention* (mflux `encode()` returns un-patchified `(mean-shift)*scale`; C/`decode_packed_latents`
+  use patchified + BatchNorm), not an encoder error.
+- **Bug found (BUGS.md VAE-1):** the **generic (non-BLAS) build's VAE encode is broken** —
+  correlation ≈ −0.04 (uncorrelated). Pure-C conv/GEMM fallback only; production MPS/BLAS path
+  is correct.
+- **Open question (BUGS.md VAE-Q1):** training packs the teacher VAE-latent via *patchify
+  only, no BN* (`train_ip_adapter.py:2508-2511`) while the transformer/packed space is BN'd —
+  possible train/inference latent-scale mismatch; needs the C denoising-convention trace to
+  rule in/out. **This is the C-1-class risk worth resolving before scaling production.**
+
+Remaining for a CI-grade golden: commit a tiny fixture + a packed-space (BN-applied) compare
+so the parity asserts tightly, and add CPU-vs-Metal decode parity. Below is the original spec.
+
+### (original) C-1 — C `iris_vae` ↔ teacher-VAE parity is assumed, never tested
 - The proxy is validated against the **teacher** (diffusers/mflux) used for precompute.
   But inference uses the **separate C `iris_vae`** for ref encoding (img2img/sref/IP)
   and final decode. If C encode/decode differs in distribution or spatial structure
