@@ -8,6 +8,7 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include "iris_vae_config.h"
 #include "iris_qwen3.h"
 #include "iris_lora.h"
 #include "embcache.h"
@@ -399,22 +400,8 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
             buf[n] = '\0';
             fclose(f);
-            char *p;
-            if ((p = strstr(buf, "\"latent_channels\""))) {
-                char *colon = strchr(p, ':');
-                if (colon) {
-                    int lc = atoi(colon + 1);
-                    if (lc > 0) ctx->vae_z_channels = lc;
-                }
-            }
-            if ((p = strstr(buf, "\"scaling_factor\""))) {
-                char *colon = strchr(p, ':');
-                if (colon) ctx->vae_scaling = atof(colon + 1);
-            }
-            if ((p = strstr(buf, "\"shift_factor\""))) {
-                char *colon = strchr(p, ':');
-                if (colon) ctx->vae_shift = atof(colon + 1);
-            }
+            iris_parse_vae_config(buf, &ctx->vae_z_channels,
+                                  &ctx->vae_scaling, &ctx->vae_shift);
         }
     }
 

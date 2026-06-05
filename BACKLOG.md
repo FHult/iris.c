@@ -461,6 +461,16 @@ quality modes, evaluate_vae_proxy.py, benchmark_vae_proxy.py, compare_downstream
 and precompute_all/orchestrator integration. **Still pending validation** (idle GPU +
 a trained proxy): the 5–7× speedup number and the downstream A/B verdict — see the
 flywheel-gated items. Migration: `plans/proxy-vae-v3.19-migration.md`.
+  - **Validation runbook: `plans/proxy-vae-validation-runbook.md`** — train→Tier1→
+    benchmark→Tier2 with pass gates, fallback-threshold tuning, subsampling alt arm,
+    and sequencing against flywheel-idle / M5 bring-up.
+  - **Two BLOCKING pre-trust items (must land before any proxy latent ships), from
+    `grok_proxy_vae_analysis.md`:** (C-1) no golden test that C `iris_vae` encode/decode
+    matches the teacher VAE the proxy is trained against — proxy can pass Tier-1/2 vs
+    teacher yet degrade real C inference; add per-channel + decoded-LPIPS/PSNR golden +
+    CPU/Metal decode parity. (C-2) brittle ad-hoc `vae/config.json` strstr/atoi parse can
+    select the wrong z/scale/shift/BN branch; schema-validate or golden the resolved VAE
+    config. These are doable NOW (no GPU) and are prerequisites regardless.
 
 ---
 

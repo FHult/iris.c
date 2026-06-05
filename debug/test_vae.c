@@ -35,6 +35,7 @@
 #include <math.h>
 
 #include "iris.h"
+#include "iris_vae_config.h"
 
 /* The decoder allocates its output image via iris_image_create(); provide a
  * minimal local definition so we don't have to drag in iris_image.c (and its
@@ -396,6 +397,64 @@ static void test_normalization_branch(void) {
     iris_vae_free(b);
 }
 
+/* ------------------------------------------------------------------------- */
+/* vae/config.json parse (grok C-2): the strstr/atoi parse that selects        */
+/* z_channels (latent shape) + scaling/shift (normalization branch). A         */
+/* mis-parse of a pretty-printed or variant config silently poisons every      */
+/* precomputed latent, so pin the resolved values directly.                    */
+/* ------------------------------------------------------------------------- */
+static void test_vae_config_parse(void) {
+    int z; float sc, sh;
+    #define RESET() do { z = IRIS_VAE_Z_CHANNELS; sc = 0.0f; sh = 0.0f; } while (0)
+
+    /* Z-Image config: overrides all three. */
+    RESET();
+    iris_parse_vae_config(
+        "{\"latent_channels\": 16, \"scaling_factor\": 0.3611, \"shift_factor\": 0.1159}",
+        &z, &sc, &sh);
+    check_true("config zimage z_channels=16", z == 16);
+    check_f("config zimage scaling", sc, 0.3611f, 1e-5f);
+    check_f("config zimage shift",   sh, 0.1159f, 1e-5f);
+
+    /* Flux config: none of the keys present -> defaults preserved (32, BN path). */
+    RESET();
+    iris_parse_vae_config("{\"in_channels\": 3, \"out_channels\": 3}", &z, &sc, &sh);
+    check_true("config flux default z_channels=32", z == 32);
+    check_f("config flux default scaling (BN)", sc, 0.0f, 1e-9f);
+    check_f("config flux default shift (BN)",   sh, 0.0f, 1e-9f);
+
+    /* Pretty-printed, multi-line, extra whitespace around colons. */
+    RESET();
+    iris_parse_vae_config(
+        "{\n  \"latent_channels\" : 16 ,\n  \"scaling_factor\" : 0.5\n}", &z, &sc, &sh);
+    check_true("config pretty z_channels=16", z == 16);
+    check_f("config pretty scaling", sc, 0.5f, 1e-6f);
+
+    /* Substring guard: keys ending in '..._channels' (e.g. block_out_channels)    */
+    /* must NOT hijack the leading-quote-anchored "latent_channels" search.        */
+    RESET();
+    iris_parse_vae_config(
+        "{\"sample_size\": 1024, \"block_out_channels\": [128, 256]}", &z, &sc, &sh);
+    check_true("config no false latent_channels match -> default 32", z == 32);
+
+    /* Empty / missing file content -> defaults preserved (override-only contract).*/
+    RESET();
+    iris_parse_vae_config("", &z, &sc, &sh);
+    check_true("config empty -> default z_channels=32", z == 32);
+
+    /* Scientific-notation scaling parses via atof. */
+    RESET();
+    iris_parse_vae_config("{\"scaling_factor\": 1.5e-1}", &z, &sc, &sh);
+    check_f("config sci-notation scaling", sc, 0.15f, 1e-6f);
+
+    /* latent_channels <= 0 is rejected (keeps default), guarding a malformed 0.   */
+    RESET();
+    iris_parse_vae_config("{\"latent_channels\": 0}", &z, &sc, &sh);
+    check_true("config latent_channels=0 rejected -> default 32", z == 32);
+
+    #undef RESET
+}
+
 int main(void) {
     printf("=== VAE white-box tests (CPU, synthetic weights) ===\n");
     test_flux_encode_shape_finite();
@@ -404,6 +463,7 @@ int main(void) {
     test_decode_deterministic();
     test_zimage_latent_channels();
     test_normalization_branch();
+    test_vae_config_parse();
 
     printf("\n%d passed, %d failed\n", passes, failures);
     return failures ? 1 : 0;
