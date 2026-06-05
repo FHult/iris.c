@@ -357,6 +357,12 @@ Start with clear documentation + sensible CLI defaults in the new helper; wire d
 
 ## Ablation Harness Improvements
 
+**ABL-FIDELITY: ablation-proxy fidelity + cross-run quality gate** (the ablation arm is a short, cold-start proxy for a warm-started long run — two fixes, both landed as opt-in/instrument, validation deferred to a GPU-free-window):
+
+- ~~**Arm warm-start (opt-in)**~~ — DONE (default OFF). Arms cold-start (harness gets caches+shards, no checkpoint); the flywheel's own per-iter training warm-starts — a fidelity gap. Added `train_ip_adapter --warmstart-weights` (loads adapter weights but keeps start_step=0 — fresh schedule, unlike `--resume` which continues the step count), harness passthrough, and `orchestrator._ablation_warmstart_ckpt(fw_cfg, ckpt_dir)` gated on `ablation_warmstart_arms` (default false). Kept off because warm-start trades fidelity for *discrimination* (arms diverge less in 1000 steps from a shared checkpoint) — which is better is empirical, settle it with the gate below. Tests in test_orchestrator_state.py.
+- ~~**Cross-run quality gate (instrument)**~~ — DONE (built, GPU eval deferred). `train/scripts/quality_gate.py`: `compare_quality(current, previous)` (pure verdict core — clip_i/clip_t/aesthetic higher-better, lpips/fid lower-better; REGRESSION/IMPROVED/NEUTRAL/NO_BASELINE) + `run_quality_gate` glue (golden-set eval → weight_registry register → compare-to-prior; eval/registry injectable) + CLI (`--fail-on-regression` gates a pipeline). 16 tests in test_quality_gate.py. This is the apples-to-apples *output*-quality comparison that validates whether an ablation-chosen config actually improved the long run vs the previous one — and the instrument to A/B warm-start vs cold-start arms.
+- **OPEN (needs GPU / golden set):** wire `quality_gate.py` to auto-run at long-run/champion-promotion end; then run the warm-start-arms A/B to decide the default. No automatic golden regression gate exists yet (GROK-TEST-4).
+
 ~~**ABL-1: Trial-level wallclock timeout** (High — safety)~~ — DONE (class `TrialTimer`
 in `ablation_harness.py`, wired into `_run_one`; `trial_timeout_secs` config, default
 14400). Unit-tested 2026-06 in `train/tests/test_ablation_safety.py` (fires SIGTERM after
