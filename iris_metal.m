@@ -1639,8 +1639,13 @@ void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
         size_t sizeB_elem = (size_t)rowsB * ldb * sizeof(float);
         size_t sizeC_elem = (size_t)M * ldc * sizeof(float);
 
-        /* Store C buffers so we can copy results back after GPU completes */
-        id<MTLBuffer> *cBuffers = (id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
+        /* Store C buffers so we can copy results back after GPU completes.
+         * __strong so ARC retains on assignment (cBuffers[i] = bufC) and releases
+         * on cBuffers[i] = nil below; calloc zero-inits the slots as ARC requires.
+         * Newer toolchains require the explicit ownership qualifier on a malloc'd
+         * array of object pointers. */
+        __strong id<MTLBuffer> *cBuffers =
+            (__strong id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
         float **cPtrs = (float **)malloc(batch_count * sizeof(float *));
         if (!cBuffers || !cPtrs) {
             free(cBuffers);
