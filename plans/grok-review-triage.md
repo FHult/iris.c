@@ -14,10 +14,14 @@ Disposition key: **DONE** · **FIX-NOW** (safe, GPU-free, not live-pipeline) ·
   the full loader/Perceiver/inject surface; there is no `.c`, and `main.c` hard-errors on
   `--sref`. Trained adapters (the entire flywheel output) cannot yet run in the `iris`
   binary. Recurs in bug_report C-01, audit_plan CRITICAL, vaeparser A4, reviews.
-  **Disposition: GATED / headline open feature.** Port Perceiver + inject hooks from
+  **Disposition: GATED / headline open feature — now has a phased plan:
+  `plans/c-ip-adapter.md`.** Port Perceiver + inject hooks from
   `train/ip_adapter/model.py`, wire into double/single block forward (CPU + MPS), parity
-  vs `test_ip_adapter_inference.py`. Large; not a wait-window task. This is the real
-  "why are we training" endgame — should be the next major C effort after the campaign.
+  vs `test_ip_adapter_inference.py`. The plan phases it: (0/1) `iris_ip_adapter.c` +
+  parity fixtures, (2) transformer hooks, (3) SigLIP-in-C for interactive `--ip`, (4) the
+  separate training-free `--sref`. Key unlock: a **precomputed-feature path**
+  (`--ip-features`) ships adapter evaluation in C before the SigLIP port. Start once the
+  campaign yields a champion checkpoint.
 
 ## HIGH
 
