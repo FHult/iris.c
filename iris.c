@@ -9,6 +9,7 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_vae_config.h"
+#include "iris_config_parse.h"
 #include "iris_qwen3.h"
 #include "iris_lora.h"
 #include "embcache.h"
@@ -271,15 +272,11 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             buf[n] = '\0';
             fclose(f);
             /* Check for Z-Image pipeline */
-            if (strstr(buf, "ZImagePipeline") || strstr(buf, "Z-Image")) {
+            if (cfg_contains(buf, "ZImagePipeline") || cfg_contains(buf, "Z-Image")) {
                 ctx->is_zimage = 1;
             }
-            /* If "is_distilled" is present and true, it's distilled.
-             * If absent, it's the base model. */
-            if (!strstr(buf, "\"is_distilled\": true") &&
-                !strstr(buf, "\"is_distilled\":true")) {
-                ctx->is_distilled = 0;
-            }
+            /* "is_distilled": true -> distilled; absent or false -> base model. */
+            ctx->is_distilled = cfg_bool(buf, "is_distilled", 0);
         }
     }
 
@@ -294,91 +291,31 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
             buf[n] = '\0';
             fclose(f);
-            char *p;
-            if ((p = strstr(buf, "\"num_attention_heads\""))) {
-                if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
-            }
-            int joint_dim = 0;
-            if ((p = strstr(buf, "\"joint_attention_dim\""))) {
-                if ((p = strchr(p, ':'))) joint_dim = atoi(p + 1);
-            }
+            num_heads = cfg_int(buf, "num_attention_heads", num_heads);
+            int joint_dim = cfg_int(buf, "joint_attention_dim", 0);
             if (joint_dim > 0) ctx->text_dim = joint_dim;
 
             /* Z-Image autodetection: look for Z-Image-specific fields */
-            if ((p = strstr(buf, "\"cap_feat_dim\""))) {
+            if (cfg_find_value(buf, "cap_feat_dim")) {
                 ctx->is_zimage = 1;
             }
 
             /* Parse Z-Image config if detected */
             if (ctx->is_zimage) {
-                /* dim (hidden size) */
-                ctx->zi_dim = 3840;
-                if ((p = strstr(buf, "\"dim\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_dim = atoi(colon + 1);
-                }
-                num_heads = ctx->zi_dim / 128;  /* head_dim = 128 */
+                ctx->zi_dim          = cfg_int(buf, "dim", 3840);
+                num_heads            = ctx->zi_dim / 128;  /* head_dim = 128 */
+                ctx->zi_n_layers     = cfg_int(buf, "n_layers", 30);
+                ctx->zi_n_refiner    = cfg_int(buf, "n_refiner_layers", 2);
+                ctx->zi_cap_feat_dim = cfg_int(buf, "cap_feat_dim", 2560);
+                ctx->zi_in_channels  = cfg_int(buf, "in_channels", 16);
+                ctx->zi_patch_size   = cfg_int(buf, "patch_size", 2);
+                ctx->zi_rope_theta   = cfg_float(buf, "rope_theta", 256.0f);
 
-                /* n_layers */
-                ctx->zi_n_layers = 30;
-                if ((p = strstr(buf, "\"n_layers\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_n_layers = atoi(colon + 1);
-                }
-
-                /* n_refiner_layers */
-                ctx->zi_n_refiner = 2;
-                if ((p = strstr(buf, "\"n_refiner_layers\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_n_refiner = atoi(colon + 1);
-                }
-
-                /* cap_feat_dim */
-                ctx->zi_cap_feat_dim = 2560;
-                if ((p = strstr(buf, "\"cap_feat_dim\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_cap_feat_dim = atoi(colon + 1);
-                }
-
-                /* in_channels */
-                ctx->zi_in_channels = 16;
-                if ((p = strstr(buf, "\"in_channels\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_in_channels = atoi(colon + 1);
-                }
-
-                /* patch_size */
-                ctx->zi_patch_size = 2;
-                if ((p = strstr(buf, "\"patch_size\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_patch_size = atoi(colon + 1);
-                }
-
-                /* rope_theta */
-                ctx->zi_rope_theta = 256.0f;
-                if ((p = strstr(buf, "\"rope_theta\""))) {
-                    char *colon = strchr(p, ':');
-                    if (colon) ctx->zi_rope_theta = atof(colon + 1);
-                }
-
-                /* axes_dims - parse JSON array [32, 48, 48] */
+                /* axes_dims JSON array [32, 48, 48] */
                 ctx->zi_axes_dims[0] = 32;
                 ctx->zi_axes_dims[1] = 48;
                 ctx->zi_axes_dims[2] = 48;
-                if ((p = strstr(buf, "\"axes_dims\""))) {
-                    char *bracket = strchr(p, '[');
-                    if (bracket) {
-                        ctx->zi_axes_dims[0] = atoi(bracket + 1);
-                        char *comma1 = strchr(bracket, ',');
-                        if (comma1) {
-                            ctx->zi_axes_dims[1] = atoi(comma1 + 1);
-                            char *comma2 = strchr(comma1 + 1, ',');
-                            if (comma2) {
-                                ctx->zi_axes_dims[2] = atoi(comma2 + 1);
-                            }
-                        }
-                    }
-                }
+                cfg_int_array(buf, "axes_dims", ctx->zi_axes_dims, 3);
 
                 /* Derived values */
                 ctx->zi_latent_channels = ctx->zi_in_channels *
