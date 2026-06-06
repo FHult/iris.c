@@ -102,8 +102,9 @@ def _run(cmd: list[str], log_path: Path, env: dict) -> int:
 
 def _precompute(shard_dir: Path, q_out: Path, v_out: Path, s_out: Path,
                 flux_model: str, proxy_path: str | None, log_path: Path,
-                venv_py: str) -> int:
-    """Run precompute_all for one VAE arm (real if proxy_path None, else proxy)."""
+                venv_py: str, subsample: int = 0) -> int:
+    """Run precompute_all for one arm. Real VAE if proxy_path None and subsample 0;
+    proxy VAE if proxy_path set; subsampled real VAE if subsample > 0."""
     for d in (q_out, v_out, s_out):
         d.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -118,6 +119,8 @@ def _precompute(shard_dir: Path, q_out: Path, v_out: Path, s_out: Path,
         cmd += ["--flux-model", flux_model]
     if proxy_path:
         cmd += ["--proxy-vae", proxy_path, "--proxy-mode", "speed"]
+    if subsample and subsample > 0:
+        cmd += ["--subsample-per-shard", str(subsample)]
     env = {**os.environ, "PIPELINE_ORCHESTRATED": "1"}
     return _run(cmd, log_path, env)
 
@@ -164,8 +167,13 @@ def _train_arm(base_config: dict, shard_dir: Path, q_dir: Path, v_dir: Path,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Downstream IP-Adapter proxy-vs-real A/B")
-    ap.add_argument("--proxy",       required=True, help="Trained proxy checkpoint")
+    ap = argparse.ArgumentParser(
+        description="Downstream IP-Adapter A/B: full real VAE vs (proxy VAE | subsampled). "
+                    "Exactly one of --proxy / --subsample selects the B arm.")
+    ap.add_argument("--proxy",       default=None, help="Trained proxy checkpoint (proxy A/B)")
+    ap.add_argument("--subsample",   type=int, default=0, metavar="N",
+                    help="Subsample A/B: B arm precomputes the first N records/shard "
+                         "(real VAE), to validate --subsample-per-shard quality vs full.")
     ap.add_argument("--shards",      default="/Volumes/16TBCold/shards")
     ap.add_argument("--campaign",    default=None, help="Restrict to a campaign's shard pool")
     ap.add_argument("--base-config", default="train/configs/stage1_512px.yaml")
@@ -192,9 +200,15 @@ def main():
               f"Wait for it to free, or pass --force.", file=sys.stderr)
         sys.exit(1)
 
-    if not Path(args.proxy).exists():
+    # Exactly one B-arm mode: proxy checkpoint OR subsample N.
+    if bool(args.proxy) == bool(args.subsample):
+        print("ERROR: pass exactly one of --proxy <ckpt> or --subsample N",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.proxy and not Path(args.proxy).exists():
         print(f"ERROR: proxy checkpoint not found: {args.proxy}", file=sys.stderr)
         sys.exit(1)
+    _blabel = f"subsample-{args.subsample}" if args.subsample else "proxy"
 
     venv_py = str(TRAIN_DIR / ".venv" / "bin" / "python")
     work = Path(args.workdir)
@@ -203,8 +217,8 @@ def main():
     prox = work / "proxy"      # proxy VAE latents
     base_config = yaml.safe_load(open(args.base_config))
 
-    print(f"=== Downstream A/B: proxy vs real VAE ===")
-    print(f"  proxy:   {args.proxy}")
+    print(f"=== Downstream A/B: full real VAE vs {_blabel} ===")
+    print(f"  B arm:   {args.proxy if args.proxy else f'subsample {args.subsample}/shard'}")
     print(f"  shards:  {args.n_shards}  steps: {args.steps}  seed: {args.seed}")
     print(f"  workdir: {work}\n")
 
@@ -228,12 +242,15 @@ def main():
             print(f"ERROR: real precompute failed (exit {rc})", file=sys.stderr)
             sys.exit(1)
 
-        print("[2/4] Precomputing PROXY VAE (reusing qwen3/siglip) ...")
-        # Point qwen3/siglip outputs at the same dirs so they are skipped (already present)
-        rc = _precompute(shard_dir, q_dir, prox_v, s_dir,
-                         args.flux_model, args.proxy, work / "precompute_proxy.log", venv_py)
+        print(f"[2/4] Precomputing B arm ({_blabel}, reusing qwen3/siglip) ...")
+        # Point qwen3/siglip outputs at the same dirs so they are skipped (already present).
+        # subsample mode reuses the real VAE but only the first N records/shard.
+        rc = _precompute(shard_dir, q_dir, prox_v, s_dir, args.flux_model,
+                         args.proxy if not args.subsample else None,
+                         work / "precompute_b.log", venv_py,
+                         subsample=args.subsample)
         if rc != 0:
-            print(f"ERROR: proxy precompute failed (exit {rc})", file=sys.stderr)
+            print(f"ERROR: B-arm precompute failed (exit {rc})", file=sys.stderr)
             sys.exit(1)
     else:
         print("[1-2/4] Skipping precompute (--skip-precompute)")

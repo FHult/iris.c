@@ -195,11 +195,20 @@ and is the intended way to reach "good enough." Per-campaign overrides live unde
 
 Before committing to the proxy, the design flags a config-only lever (no model):
 precompute **1K images/shard instead of 5K** → ~4h/iter (vs ~20h), if downstream quality
-holds within ~5%. Validate with the *same* Tier-2 harness (a real-vs-subsampled A/B). If
-it passes, the proxy may be unnecessary for the near-term precompute speedup. Implement/
-confirm the `--subsample-per-shard N` flag in `precompute_all.py` (design §339) and run
-one `compare_downstream_quality`-style A/B. Cheapest experiment with the highest chance
-of mooting the whole proxy effort — **do this first if the only goal is precompute time.**
+holds within ~5%. **Both pieces are now wired** (no implementation left, just an idle-GPU run):
+
+```bash
+# B arm = first 1000 records/shard (real VAE); A arm = full. Same Tier-2 compare.
+train/.venv/bin/python train/scripts/compare_downstream_quality.py \
+  --subsample 1000 --n-shards 4 --steps 500 --tolerance 0.05 \
+  --workdir /Volumes/2TBSSD/subsample_ab --out /Volumes/2TBSSD/subsample_ab/result.json
+```
+
+The flag is `precompute_all.py --subsample-per-shard N` (first N records, deterministic);
+`compare_downstream_quality.py --subsample N` runs the full-vs-subsampled A/B and PASSES if
+the subsampled arm's cond_gap is within `--tolerance` of full. Cheapest experiment with the
+highest chance of mooting the whole proxy effort — **do this first if the only goal is
+precompute time.**
 
 ---
 
