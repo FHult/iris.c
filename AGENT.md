@@ -472,6 +472,27 @@ Hard-won contracts from the warmup-run2 debugging. Violating any silently breaks
    original cache-clobber). `effective_dir` now skips an empty `current` and falls through
    to the newest complete version; don't reintroduce a blind `current` trust.
 
+5. **VAE latent convention: training MUST BN-pack to C's inference space (VAE-Q1).**
+   There are two latent spaces. (a) **VAE-latent** — what mflux `encode()` returns and what
+   precompute STORES: un-patchified `[32,H/8,W/8]`, `(mean-shift)*scale`, NO BatchNorm,
+   std≈1.7. (b) **Packed/transformer** — what the frozen Flux.2 transformer and C inference
+   operate in: patchified `[128,H/16,W/16]` + BatchNorm, std≈1 (C txt2img inits std-1 noise
+   at 128ch; `iris_vae_encode` applies the BN; decode un-BNs — same as mflux
+   `decode_packed_latents`). The IP-adapter trains the FROZEN base, so its diffusion target/
+   noise MUST be in space (b). The trainer therefore BN-packs the loaded raw latent on load
+   (`_load_vae_bn_stats` + `_bn_pack_latents`, feature = c*4+(h%2)*2+(w%2) so the existing
+   patchify pack reproduces `iris_vae_encode` exactly — corr 0.9995). Feeding raw std≈1.7
+   latents trains a model that does NOT transfer to C inference (loss still falls — it's
+   self-consistent in the wrong space). **No re-precompute needed** — raw is the canonical
+   stored form; BN is applied on load. Guards: `test_bn_pack.py` (hermetic), `debug/vae_parity.c`
+   (real-weights, on demand). See BUGS.md VAE-Q1.
+
+   Related C pitfall (VAE-1): the naive (non-BLAS) `iris_conv2d` corrupts when output
+   aliases input — BLAS's im2col hides it. `resblock_forward` placed `conv1_out` so a
+   channel-increasing block's conv2 self-aliased. Fixed at the call site
+   (`max(in_ch,out_ch)*spatial` offset) AND hardened in the kernel (copy-on-overlap). Guard:
+   `test_encode_golden` in `debug/test_vae.c`.
+
 ## Project docs
 - `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
 - `BUGS.md` — known anomalies and observed issues (training, pipeline)
