@@ -114,8 +114,19 @@ def _save_npz_atomic(path: str, **arrays) -> None:
 # Shard iteration
 # ---------------------------------------------------------------------------
 
+# Optional cap on records precomputed per shard (PRECOMP-2 alternative to the
+# proxy VAE). 0 = process all records. When >0, iter_shard yields only the first
+# N valid records, deterministically (tar member order), so qwen3/vae/siglip all
+# precompute the SAME subset and reruns are stable. Set once from
+# --subsample-per-shard in main(); read by both the direct and prefetch read paths.
+_SUBSAMPLE_PER_SHARD = 0
+
+
 def iter_shard(shard_path: str):
-    """Yield (id, jpg_bytes, caption) for records that have both image and text."""
+    """Yield (id, jpg_bytes, caption) for records that have both image and text.
+
+    Honors the module-level _SUBSAMPLE_PER_SHARD cap (first N valid records)."""
+    cap = _SUBSAMPLE_PER_SHARD
     try:
         with tarfile.open(shard_path) as tar:
             members = {m.name: m for m in tar.getmembers() if m.isfile()}
@@ -124,6 +135,7 @@ def iter_shard(shard_path: str):
                 stem, _, ext = name.rpartition(".")
                 keys.setdefault(stem, {})[ext.lower()] = name
 
+            n = 0
             for stem, exts in keys.items():
                 jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
                 txt_key = exts.get("txt") or exts.get("caption")
@@ -134,6 +146,9 @@ def iter_shard(shard_path: str):
                     "utf-8", errors="replace"
                 ).strip()
                 yield stem, jpg, txt
+                n += 1
+                if cap and n >= cap:
+                    break
     except Exception as e:
         print(f"Warning: {shard_path}: {e}", file=sys.stderr)
 
@@ -942,6 +957,13 @@ def main():
                         help="Proxy VAE quality mode: speed (no check), balanced "
                              "(Mahalanobis), high_fidelity (balanced + decode check). "
                              "Overridden by pipeline config proxy_vae.campaigns.<name>.mode.")
+    parser.add_argument("--subsample-per-shard", type=int, default=0, metavar="N",
+                        help="Precompute only the first N records per shard (0=all, the "
+                             "default). Deterministic (tar order), so qwen3/vae/siglip share "
+                             "the same subset and reruns are stable. The simple, model-free "
+                             "alternative to the proxy VAE for cutting per-iter precompute "
+                             "time (see plans/precomp2-proxy-vae-design.md 'Subsampled "
+                             "Precompute'); validate downstream quality before relying on it.")
     parser.add_argument("--chunk", type=int, default=None,
                         help="Pipeline chunk number (for heartbeat naming)")
     parser.add_argument("--ai", action="store_true",
@@ -951,6 +973,13 @@ def main():
     parser.add_argument("--clear-stale", default=None, metavar="PRECOMP_ROOT",
                         help="Delete non-current cache versions under PRECOMP_ROOT and exit")
     args = parser.parse_args()
+
+    if args.subsample_per_shard and args.subsample_per_shard > 0:
+        global _SUBSAMPLE_PER_SHARD
+        _SUBSAMPLE_PER_SHARD = args.subsample_per_shard
+        print(f"Subsampling: first {_SUBSAMPLE_PER_SHARD} records per shard "
+              f"(deterministic; shared across qwen3/vae/siglip).",
+              file=sys.stderr, flush=True)
 
     # Cache management shortcuts — these exit immediately without doing any precompute.
     if args.list_cache or args.clear_stale:
