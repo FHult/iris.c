@@ -15,6 +15,47 @@ Do **Phase 0→2 against a champion checkpoint via the precomputed-feature path 
 that ships in-C adapter evaluation without the SigLIP port; **Phase 3 follows for
 interactive use**. **Trigger is a quality champion from warmup-run2.**
 
+### What counts as a "champion checkpoint"
+
+"Champion" has two meanings; only the cheap one is automatic.
+
+**1. Training-internal champion (automatic).** `FlywheelDB.get_best()` ranks iterations by
+`cond_gap DESC` and records it as `best_checkpoint` (+ `best.safetensors`). The metrics:
+- `cond_gap = loss_null − loss_cond` (train_ip_adapter.py:2077): how much lower the diffusion
+  loss is *with* image conditioning vs without — i.e. the adapter is actually using the
+  reference. Higher = stronger; `< 1%` triggers a "may not be learning" warning. Primary
+  signal (stable at the 1000-step iteration budget).
+- `ref_gap = loss_cross_ref − loss_self_ref` (2112): style/content separation. Noisy at 1000
+  steps, so secondary.
+- **Limit:** these are training-loss *proxies* — they show the adapter learned to exploit
+  conditioning, NOT that generated images look good or transfer. A high-cond_gap checkpoint
+  can still produce over-cooked or off images. `get_best` gives a *candidate*, not a verdict.
+
+**2. True output-quality champion (the real test — GPU-gated).** The apples-to-apples signal
+is the golden-set eval (`quality_gate.py` + `evaluate_golden_set`): generate from a fixed
+prompt+reference set and score clip_i / clip_t / aesthetic (higher better) + lpips / fid
+(lower better) vs a baseline / prior campaign. **This requires running the adapter through
+inference — i.e. G-1 itself** (or, until then, the Python `test_ip_adapter_inference.py`
+harness on idle GPU). The loop closes: the definitive champion signal needs the inference
+path this plan builds.
+
+**Checklist to declare a champion** — needs (1) AND (2):
+1. *Automatic (free):* `cond_gap` trending up and comfortably > 1% (not flatlining), `ref_gap`
+   climbing toward/above 0, grad stable → flywheel records `best_checkpoint`.
+2. *Definitive (idle GPU):* golden-set eval on that checkpoint shows clip_i/aesthetic up vs
+   the base model (no adapter), no lpips/fid regression, ideally beating the prior campaign.
+   `test_ip_adapter_inference.py` also saves side-by-side panels for eyeballing.
+
+**warmup-run2 caveat — two different bars.** warmup-run2 is an *exploration bootstrap* (first
+campaign on the corrected VAE-Q1 convention, 1000 steps/iter to validate the loop), not the
+final shippable model. So:
+- **For validating G-1 (Phases 0–2): a low bar suffices.** Any checkpoint where cond_gap
+  shows the adapter is genuinely conditioning is enough to prove the C inference port is
+  correct (parity vs Python on the same checkpoint is what matters, not the checkpoint's
+  absolute quality).
+- **For shipping to users: the high bar (golden-set win) applies**, and the production
+  champion will likely come from a later, longer, tuned campaign — not warmup-run2.
+
 ---
 
 ## Current state (what's done, what's missing)
