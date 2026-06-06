@@ -547,6 +547,23 @@ a usable warm-start. Quality cost: geometric distortion + square output bias.
 Relates to PRECOMP-1 (tiling for large buckets) and PRECOMP-2 (proxy). The re-shard is
 the big one-time data job; everything else composes on top.
 
+**PRECOMP-5: Hot precompute cache (defer-rmtree LRU) — cut ~30% of cold↔hot transfers**
+(Medium — pipeline throughput) — full plan: [plans/hot-precompute-cache.md](plans/hot-precompute-cache.md).
+Each iter currently archives precompute to cold then `rmtree`s it from hot, so recurring
+shards get **re-copied** cold→hot next time (hot/cold are different physical devices, so
+staging is a real copy, not a symlink). **Measured** on warmup-run1 (13 iters,
+flywheel_history.db `selected_shards`): **30.6% of each iter's shards were selected in the
+immediately prior iter** (LRU-1 ≈ LRU-3 ≈ unbounded at 30.6/31.0/33.1% — almost all reuse is
+consecutive; rising 30%→40% as a campaign matures). So a **1-iteration** cache captures ~92%
+of the benefit. Fix: in the publish step, **decouple archive-to-cold (keep) from
+rmtree-from-hot (defer)** — keep a content-addressed hot precompute cache, link recurring
+shards into the per-iter dir, copy only cache-misses, evict LRU under a hard
+`storage.hot_precompute_cache_gb` budget; add the hot cache as the first tier in
+`effective_dir`. Footprint ≈ one iter's precompute (~120 GB, the order already staged
+transiently today). Transfer-I/O win only (not encode/compute); complementary to PRECOMP-2
+(proxy) and `--subsample-per-shard`. Touches live orchestrator publish/cleanup + DataStager
++ `effective_dir` — **land in a non-campaign window.**
+
 ---
 
 ## Flywheel Management
