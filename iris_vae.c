@@ -224,8 +224,17 @@ static void resblock_forward(float *out, const float *x,
                     batch, in_ch, H, W, num_groups, eps);
     swish_inplace(work, batch * in_ch * spatial);
 
-    /* Conv1: in_ch -> out_ch */
-    float *conv1_out = work + batch * in_ch * spatial;
+    /* Conv1: in_ch -> out_ch.
+     * Place conv1_out past max(in_ch,out_ch)*spatial so neither conv1 (input
+     * in_ch channels) nor conv2 (input the out_ch norm2 result, written back to
+     * work[0..out_ch*spatial)) ever aliases its own output. With the old
+     * in_ch*spatial offset, a channel-increasing resblock (in_ch < out_ch) made
+     * conv2's input/output overlap; the BLAS conv tolerates that (im2col copies
+     * input first) but the naive conv reads partially-overwritten input and
+     * corrupts the result. max(in,out) keeps the buffer bound unchanged (the
+     * mid block's in==out==512 case already needs 2*512*spatial). */
+    int max_ch = in_ch > out_ch ? in_ch : out_ch;
+    float *conv1_out = work + batch * max_ch * spatial;
     vae_conv2d(conv1_out, work, block->conv1_weight, block->conv1_bias,
                 batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
 

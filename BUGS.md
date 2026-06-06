@@ -1,21 +1,25 @@
 # Bugs and Anomalies
 
-## C Inference Bugs (Open)
+## C Inference Bugs (Fixed)
 
-- **VAE-1: generic (non-BLAS) build VAE encode is catastrophically wrong.** Found via the
-  C-1 parity harness (`debug/vae_parity.c`) on a real image (000004_3398) against the
-  mflux teacher latent. Same source + inputs:
-  - **BLAS/Accelerate build**: per-channel correlation **0.99906** vs the teacher encoder
-    (encoders agree; the ~1.76× magnitude gap is the packed-BN vs VAE-latent convention,
-    not an error).
-  - **Generic `-O2` build (no `-DUSE_BLAS`)**: correlation **≈ −0.04** — the latent is
-    essentially uncorrelated garbage.
-  The pure-C conv/GEMM fallback path in `iris_vae.c` produces wrong results for VAE encode.
-  Low operational priority (generic is the "very slow fallback"; production uses MPS/BLAS),
-  but it means generic-build image quality is silently broken and the generic path is not
-  a trustworthy reference. Repro: `debug/gen_vae_parity_fixture.py` then `debug/vae_parity.c`
-  built each way. Needs root-cause in the non-BLAS conv/GEMM (candidate: an accumulation or
-  layout assumption that only holds under the BLAS path).
+- **VAE-1: generic (non-BLAS) build VAE encode was catastrophically wrong. FIXED 2026-06-06.**
+  - **Symptom:** generic `-O2` build's VAE encode correlated **≈ −0.04** with the teacher,
+    while the BLAS build correlated **0.99906** (same source + inputs). Found via the parity
+    harness (`debug/vae_parity.c`) on image 000004_3398.
+  - **Root cause (buffer aliasing, not a kernel bug):** in `resblock_forward`, `conv1_out`
+    was placed at `work + in_ch*spatial`. After `norm2` writes the `out_ch`-channel result
+    back to `work[0..out_ch*spatial)`, `conv2` reads that while writing `conv1_out`. For a
+    channel-*increasing* resblock (`in_ch < out_ch`, e.g. the encoder's 128→256 blocks) the
+    input and output **overlap**. The BLAS `iris_conv2d` tolerates it (im2col copies the
+    input first); the naive CPU conv reads partially-overwritten input → corruption. Localized
+    by per-stage checksums to L1_resblk0 → conv2. Decoder resblocks (`in_ch > out_ch`) were
+    unaffected.
+  - **Fix:** place `conv1_out` at `work + max(in_ch,out_ch)*spatial` so neither conv1 nor
+    conv2 ever aliases its output. Buffer bound unchanged (mid block's in==out==512 already
+    needs 2·512·spatial); identical for `in_ch==out_ch` and for the decoder. After the fix,
+    generic and BLAS encode are **bit-identical (corr 1.000000)** and BLAS↔teacher stays
+    0.99906. Regression guard: `test_encode_golden` in `debug/test_vae.c` (pins the
+    channel-increasing encode path; fails by diff ~118 if the aliasing returns).
 
 ## Training Bugs (Fixed)
 

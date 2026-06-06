@@ -284,6 +284,30 @@ static void test_flux_encode_shape_finite(void) {
     iris_vae_free(vae);
 }
 
+/* Pins the encoder output for fixed synthetic weights. build_vae creates
+ * channel-increasing resblocks (level>0, r0: prev->ch, e.g. 128->256), which is
+ * exactly the path that the conv2 buffer-aliasing bug (BUGS VAE-1) corrupted in
+ * the naive CPU conv. A regression that reintroduces the aliasing changes this
+ * checksum. Tolerance is relative-ish (abs on a ~O(1e3) magnitude). */
+static void test_encode_golden(void) {
+    iris_vae_t *vae = build_vae(1, 32, 0.0f, 0.0f, 1e-4f, 1, IMG);
+    int oh = 0, ow = 0;
+    float *img = make_input(7, IMG, IMG);
+    float *lat = iris_vae_encode(vae, img, 1, IMG, IMG, &oh, &ow);
+    double s = 0.0;
+    if (lat) {
+        size_t n = (size_t)vae->latent_channels * oh * ow;
+        for (size_t i = 0; i < n; i++) s += (double)lat[i] * ((i % 13) + 1);
+    }
+    check_true("encode golden non-null", lat != NULL);
+    /* Golden from the fixed code (conv2 no longer aliases). The buffer-aliasing
+     * bug shifted this by orders of magnitude; tolerance absorbs float-order jitter. */
+    check_f("encode golden checksum", (float)s, 29.091131f, 0.2f);
+    free(lat);
+    free(img);
+    iris_vae_free(vae);
+}
+
 static void test_flux_decode_shape_finite(void) {
     iris_vae_t *vae = build_vae(1, 32, 0.0f, 0.0f, 1e-4f, 1, IMG);
     int oh = -1, ow = -1;
@@ -463,6 +487,7 @@ int main(void) {
     test_decode_deterministic();
     test_zimage_latent_channels();
     test_normalization_branch();
+    test_encode_golden();
     test_vae_config_parse();
 
     printf("\n%d passed, %d failed\n", passes, failures);
