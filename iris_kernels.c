@@ -450,7 +450,29 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
     return;
 
 naive_fallback:
+    ;   /* empty statement: a label must precede a statement, not a declaration */
 #endif
+    /* Alias-safety: this element-wise loop reads the input while writing the
+     * output, so if `out` overlaps `in` it would read partially-overwritten data
+     * (the BLAS im2col path above is already safe — it copies the full input into
+     * `col` before writing `out`). When the ranges overlap, work from a copy.
+     * This guards the conv-aliasing bug class (BUGS VAE-1): callers must not rely
+     * on it for correctness, but the kernel no longer silently corrupts. */
+    const float *in_src = in;
+    float *in_copy = NULL;
+    {
+        const float *in_end  = in  + (size_t)batch * in_ch * H * W;
+        const float *out_end = out + (size_t)batch * out_ch * outH * outW;
+        if (in < out_end && out < in_end) {
+            size_t n = (size_t)batch * in_ch * H * W;
+            in_copy = (float *)malloc(n * sizeof(float));
+            if (in_copy) {
+                memcpy(in_copy, in, n * sizeof(float));
+                in_src = in_copy;
+            }
+        }
+    }
+
     /* Naive implementation (fallback) */
     for (int b = 0; b < batch; b++) {
         for (int oc = 0; oc < out_ch; oc++) {
@@ -467,7 +489,7 @@ naive_fallback:
                                 if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
                                     int in_idx = b * in_ch * H * W + ic * H * W + ih * W + iw;
                                     int w_idx = oc * in_ch * kH * kW + ic * kH * kW + kh * kW + kw;
-                                    sum += in[in_idx] * weight[w_idx];
+                                    sum += in_src[in_idx] * weight[w_idx];
                                 }
                             }
                         }
@@ -479,6 +501,7 @@ naive_fallback:
             }
         }
     }
+    free(in_copy);
 }
 
 /* ========================================================================
