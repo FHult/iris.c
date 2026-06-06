@@ -884,6 +884,13 @@ Duplicates (no new action): config-parser brittleness = GROK-6; dead `.bin` VAE
 loader = GROK-2; "pending validation" already stated under PRECOMP-2; GPU-resident
 encode / scalar patch loops are perf-backlog.
 
+**Full triage of all 7 grok reports: `plans/grok-review-triage.md`** (de-duplicated +
+prioritized with disposition). Net: parser brittleness (G-5), VAE↔teacher parity (G-6),
+generic-build correctness (G-9), and dead code (G-10) are RESOLVED; live priorities are
+**G-1 (C-side IP-Adapter — the endgame: trained adapters can't yet run in the `iris`
+binary)**, **G-2 (MLOps state-machine tests — in progress via pure-core extraction)**, and
+GPU/idle-gated **G-3 (hardcoded paths) / G-4 (B-METAL-01 CPU softmax fallback)**.
+
 - **GROK-VAE-1: C VAE inference-ground-truth guard** — DONE (2026-06). Added
   `debug/test_vae.c` (wired into `make test-unit`, CPU-only, flywheel-safe): builds
   small architecturally-real Flux/Z VAEs with seeded synthetic weights and exercises
