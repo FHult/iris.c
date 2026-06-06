@@ -69,14 +69,17 @@ resolution. Add the hot cache as a first lookup tier: **hot cache → cold `curr
 complete cold version.** The content-addressing makes coherence cheap (same identity ⇒ same
 bytes); a hot entry is always a valid substitute for the cold one.
 
-## Footprint
+## Footprint (measured from the cold VAE `manifest.json`)
 
-~one iteration's precompute resident on hot. Estimate: VAE latent `[32,64,64]` f32 ≈ 512 KB
-/record × ~4.9k records/shard ≈ 2.5 GB/shard VAE, + quantized qwen3/siglip → **~3 GB/shard**,
-× ~40 shards/iter ≈ **~120 GB/iter** (confirm with a `du` on a cold version dir). That's the
-same order the pipeline already stages transiently each iter today, so an LRU-1 cache adds
-~0 steady-state hot usage — it just *keeps* what it already copies. Budget for LRU-2 (~240 GB)
-if we want the small extra reuse; both fit comfortably under the 2 TB hot tier.
+VAE latent `[32,64,64]` f32 = **0.5 MB/record exactly**. The cold VAE version manifest reports
+**747,739 records across 152 shards ≈ 4,919 records/shard → ~2.5 GB/shard VAE**. Adding the
+(4-bit-quantized, smaller) qwen3 + siglip caches → **~4–5 GB/shard all three encoders**, so a
+~42-shard iter is **~170–210 GB**. That's the same order the pipeline already stages
+transiently each iter today, so an LRU-1 cache adds ~0 steady-state hot usage — it just *keeps*
+what it already copies (peak ≈ 1.3× one iter ≈ ~260 GB). Comfortable on the 2 TB hot tier
+(~10–13%); set `hot_precompute_cache_gb` accordingly with headroom for LRU-2 if wanted.
+(qwen3/siglip per-record sizes are estimated, not exact — confirm with a `du` on a cold
+version dir at idle; the VAE figure is exact.)
 
 ## Scope / non-goals
 

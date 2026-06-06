@@ -559,8 +559,9 @@ of the benefit. Fix: in the publish step, **decouple archive-to-cold (keep) from
 rmtree-from-hot (defer)** — keep a content-addressed hot precompute cache, link recurring
 shards into the per-iter dir, copy only cache-misses, evict LRU under a hard
 `storage.hot_precompute_cache_gb` budget; add the hot cache as the first tier in
-`effective_dir`. Footprint ≈ one iter's precompute (~120 GB, the order already staged
-transiently today). Transfer-I/O win only (not encode/compute); complementary to PRECOMP-2
+`effective_dir`. Footprint ≈ one iter's precompute (~170–210 GB — VAE 0.5 MB/rec × ~4.9k
+rec/shard ≈ 2.5 GB/shard, ~4–5 GB/shard all encoders, × ~42 shards; from the cold VAE
+manifest — the order already staged transiently today). Transfer-I/O win only (not encode/compute); complementary to PRECOMP-2
 (proxy) and `--subsample-per-shard`. Touches live orchestrator publish/cleanup + DataStager
 + `effective_dir` — **land in a non-campaign window.**
 
