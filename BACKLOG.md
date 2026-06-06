@@ -199,6 +199,32 @@ threshold. See `train7_plan.md` §5.4 for the implementation sketch and ablation
 
 ## Pipeline Improvements
 
+**PERF-IO-1: Routine ops = metadata lookups, not disk scans** (Medium — keeps the cold
+HDD quiet during the flywheel). Principle: any non-troubleshooting path (status, doctor
+summary, shard selection) should answer from metadata (SQLite DBs + per-version
+`manifest.json` `record_count`/`shard_count` + sentinels/heartbeats), and full disk scans
+should sit behind an explicit `--deep` flag for when you suspect metadata↔disk drift.
+
+Audit (2026-06): the backbone is good — 5 DBs (`shard_index`, `shard_scores`,
+`flywheel_history`, `experiments`, `monitoring`), manifests already carry the counts, and the
+doctor's summary `records` is already manifest-backed. Remaining offenders that still walk the
+cold dirs on routine calls:
+- **DONE (2026-06):** `pipeline_doctor` listed the same cold precompute version dir ~2-3× per
+  encoder per run (coverage count + `.tmp.npz` + `.npz.tmp.npz` hunts) — added a
+  per-invocation memoized `_listdir_cached` so each cold dir is walked once.
+- `pipeline_doctor._count_shards_with_precomp` (per-chunk precompute coverage) still walks the
+  cold version dir — needs **per-chunk/shard coverage metadata** (extend the manifest, or
+  derive from `shard_scores.db`) to become an O(1) lookup. Gotcha: must stay chunk-scoped.
+- `pipeline_doctor._count_shards_for_chunk` → `shard_index.db` (count shard_ids in range).
+  Gotcha: DB = *indexed* shards vs listdir = shards *present on disk*; validate equivalence
+  before swapping.
+- **`.tmp.npz` / `.npz.tmp.npz` crash-artifact hunts** → move behind `--deep` (they're
+  troubleshooting, not routine — currently run on every invocation).
+- `shard_selector.scan_shard_pool` globs the cold pool → `shard_index.db`.
+- `pipeline_status._count_precomputed/_count_tars_recursive` rglob the **hot** staging dir
+  (TTL-cached, lower priority — no manifest on in-flight staging; add a per-iter staging
+  manifest if it becomes hot).
+
 **PIPE-ORCH-1: Orchestrator coverage gaps — paths not exercised by smoke run** (Low priority, code bugs fixed)
 
 Smoke run 3 (2026-05-11) validated the happy path across all 14 steps × 2 chunks. Three code bugs found in audit were fixed (commit `cdd9fb0`, 2026-05-13):

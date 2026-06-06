@@ -104,12 +104,35 @@ def _chunk_shard_range(chunk: int) -> tuple[int, int]:
     return (chunk - 1) * SHARD_BLOCK, chunk * SHARD_BLOCK
 
 
+_DIR_LISTING_CACHE: dict = {}
+
+
+def _listdir_cached(path) -> list:
+    """Per-invocation memoized os.listdir for the large cold precompute/shard dirs.
+
+    Routine doctor checks scan the same cold directory several times per run (the
+    precompute coverage count + the .tmp.npz / .npz.tmp.npz crash-artifact hunts all
+    listdir the same version dir). Memoizing collapses those to one walk of each
+    cold dir per invocation. Process-local — a fresh doctor run rebuilds it, so it
+    never goes stale across runs; within a run the dir is effectively a snapshot
+    (which also makes the multiple checks mutually consistent)."""
+    key = str(path)
+    cached = _DIR_LISTING_CACHE.get(key)
+    if cached is None:
+        try:
+            cached = os.listdir(path)
+        except OSError:
+            cached = []
+        _DIR_LISTING_CACHE[key] = cached
+    return cached
+
+
 def _count_shards_for_chunk(chunk: int) -> int:
     """Count .tar files in the flat SHARDS_DIR that belong to this chunk."""
     lo, hi = _chunk_shard_range(chunk)
     count = 0
     try:
-        for f in os.listdir(SHARDS_DIR):
+        for f in _listdir_cached(SHARDS_DIR):
             if not f.endswith(".tar"):
                 continue
             try:
@@ -136,7 +159,7 @@ def _count_precomp_for_chunk(chunk: int, subdir: str = "qwen3") -> tuple[int, in
         if resolved.is_dir():
             precomp_dir = resolved
     try:
-        for f in os.listdir(precomp_dir):
+        for f in _listdir_cached(precomp_dir):
             # Names like "200000_0012.npz"
             stem = f
             is_tmp = False
@@ -172,7 +195,7 @@ def _count_shards_with_precomp(chunk: int, subdir: str = "qwen3") -> int:
             precomp_dir = resolved
     shard_ids: set[int] = set()
     try:
-        for f in os.listdir(precomp_dir):
+        for f in _listdir_cached(precomp_dir):
             if not f.endswith(".npz") or f.endswith(".tmp.npz"):
                 continue
             try:
@@ -585,7 +608,7 @@ def _check_precompute_forensics(cfg: dict, chunks: list[int]) -> None:
             # ── double-extension crash artifacts (pre-fix atomic write) ──
             double_tmp = []
             try:
-                for f in os.listdir(PRECOMP_DIR / subdir):
+                for f in _listdir_cached(PRECOMP_DIR / subdir):
                     if f.endswith(".npz.tmp.npz"):
                         try:
                             shard_id = int(f.split("_")[0])
