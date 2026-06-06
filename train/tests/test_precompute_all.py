@@ -165,3 +165,50 @@ class TestSaveNpzAtomic:
         pa._save_npz_atomic(str(d / "000123_0007.npz"),
                             latent=np.zeros((1,), dtype=np.float32))
         assert "000123_0007" in pa._scan_existing(str(d))
+
+
+# ---------------------------------------------------------------------------
+# --subsample-per-shard  — deterministic first-N cap (model-free precompute speedup)
+# ---------------------------------------------------------------------------
+
+class TestSubsample:
+    @pytest.fixture(autouse=True)
+    def _restore_global(self):
+        saved = pa._SUBSAMPLE_PER_SHARD
+        yield
+        pa._SUBSAMPLE_PER_SHARD = saved   # never leak the cap into other tests
+
+    def _tar6(self, tmp_path):
+        tar = tmp_path / "000000.tar"
+        _make_tar(tar, {f"000000_{i:04d}": {"img": "jpg", "txt": f"cap {i}"}
+                        for i in range(6)})
+        return tar
+
+    def test_cap_zero_yields_all(self, tmp_path):
+        tar = self._tar6(tmp_path)
+        pa._SUBSAMPLE_PER_SHARD = 0
+        assert len(list(pa.iter_shard(str(tar)))) == 6
+
+    def test_cap_limits_to_first_n_deterministic(self, tmp_path):
+        tar = self._tar6(tmp_path)
+        pa._SUBSAMPLE_PER_SHARD = 3
+        ids = [s for s, _, _ in pa.iter_shard(str(tar))]
+        assert ids == ["000000_0000", "000000_0001", "000000_0002"]   # first-N, in order
+
+    def test_cap_above_total_yields_all(self, tmp_path):
+        tar = self._tar6(tmp_path)
+        pa._SUBSAMPLE_PER_SHARD = 100
+        assert len(list(pa.iter_shard(str(tar)))) == 6
+
+    def test_cap_counts_only_valid_records(self, tmp_path):
+        # image-only records are skipped and must NOT count toward the cap.
+        tar = tmp_path / "000000.tar"
+        _make_tar(tar, {
+            "000000_0000": {"img": "jpg", "txt": "a"},
+            "000000_0001": {"img": "jpg", "txt": None},   # invalid (no txt)
+            "000000_0002": {"img": "jpg", "txt": "b"},
+            "000000_0003": {"img": "jpg", "txt": "c"},
+        })
+        pa._SUBSAMPLE_PER_SHARD = 2
+        ids = [s for s, _, _ in pa.iter_shard(str(tar))]
+        assert ids == ["000000_0000", "000000_0002"]   # 2 valid, skipping the invalid one
