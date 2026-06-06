@@ -23,6 +23,11 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+/* pthread is used unconditionally for parallel transformer-shard loading (and
+ * under USE_BLAS for multi-head attention), so include it for every backend —
+ * the generic build otherwise fails to declare pthread_join. */
+#include <pthread.h>
+#include <unistd.h>
 
 /* External timing counters from iris_sample.c */
 extern double iris_timing_transformer_total;
@@ -83,8 +88,6 @@ static double tf_get_time_ms(void) {
 #else
 #include <cblas.h>
 #endif
-#include <pthread.h>
-#include <unistd.h>
 #endif
 
 /* Use Metal for GPU acceleration when available */
