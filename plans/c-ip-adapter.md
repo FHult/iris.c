@@ -9,6 +9,12 @@ lands, every trained adapter is only evaluable through the Python harness
 yields a champion checkpoint worth shipping. Phase 1 can begin earlier (it validates the
 port against precomputed features, GPU-light).
 
+## Recommendation
+
+Do **Phase 0→2 against a champion checkpoint via the precomputed-feature path first** —
+that ships in-C adapter evaluation without the SigLIP port; **Phase 3 follows for
+interactive use**. **Trigger is a quality champion from warmup-run2.**
+
 ---
 
 ## Current state (what's done, what's missing)
