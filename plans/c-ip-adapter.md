@@ -167,14 +167,21 @@ out-proj → gate → residual into `img_hidden`. The header contract says injec
 native attention+residual. So inject is called **inside** the block (where `img_q` is
 live) near the end, using the saved `img_q` and the post-residual `img_hidden`.
 
-**Open parity question to resolve first (the fiddly bit):** does training's
-`_flux_forward_with_ip` reuse the Q **before or after RoPE**? Native attention uses
-post-RoPE Q; the IP cross-attention may use the post-QK-norm pre-RoPE Q (k_ip/v_ip are
-not RoPE'd — they're SigLIP-derived, position-free). model.py `inject` takes `img_q` with
-no RoPE applied to k/v, so almost certainly **post-QK-norm, pre-RoPE**. Confirm by dumping
-both from the Python path and matching — extend the Phase-0 fixture with a block-level
-golden (img_q candidates + the IP contribution) before wiring. Getting this wrong is the
-#1 silent-divergence risk.
+**Parity question — RESOLVED (read `_flux_forward_with_ip`, train_ip_adapter.py:2996-3018
+and the single-block path 3030+):** the IP-adapter uses the **post-QK-norm, PRE-RoPE** Q.
+Training recomputes `q_ip = block.attn.to_q(norm_h)` → `norm_q(q_ip)` (no RoPE), then
+`ip_out = SDPA(q_ip, k_i, v_i, scale=head_dim**-0.5)` and `hidden += ip_scale[i]*ip_out`.
+Neither side is RoPE'd (k_ip/v_ip are SigLIP-derived, position-free). The contribution is
+added **after** the native block's own output.
+
+**Exact C hook, therefore:** in `double_block_forward`, `img_q` is post-QK-norm at
+`apply_qk_norm` (~2278) but RoPE'd in place at `apply_rope_2d` (~2284). So **save a copy of
+`img_q` between those two calls** (`q_ip`), let the native attention proceed (RoPE → joint
+attention → out-proj → gate → residual into `img_hidden`), then call
+`inject(block_idx, q_ip, img_seq, k_ip, v_ip, img_hidden)`. Single blocks (`block_ip_idx =
+n_double + j`) recompute Q from the image portion the same way. This is exactly what the
+committed `iris_ip_adapter_inject` already does (validated bit-exact) — Phase 2 is purely
+the capture-before-RoPE + call placement, no new math.
 
 **State threading.** Add to the transformer forward (and block-forward signatures, or via
 `tf->`): `iris_ip_adapter_t *ip` (nullable → no-op when absent), `const float *ip_embeds`

@@ -903,3 +903,77 @@ class TestPhantomHardExLastChunk:
         pd._check_phantom_completions(cfg, [2, 3])   # chunk 2 not last; next (3) not trained
         crit = [i for i in _by_category("phantom") if i.severity == "CRITICAL"]
         assert any("0 hard-example files" in i.title for i in crit)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cond_gap stall detector (_check_cond_gap_stall)
+# ─────────────────────────────────────────────────────────────────────────────
+import flywheel_lib  # noqa: E402
+
+
+def _install_fake_flywheel_db(monkeypatch, tmp_path, iters_by_name):
+    """Point FLYWHEEL_DB_PATH at an existing temp file and stub FlywheelDB to
+    return the given iteration dicts — no real sqlite, GPU, or campaign."""
+    dbfile = tmp_path / "flywheel_history.db"
+    dbfile.touch()
+    monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+    names = list(iters_by_name.keys())
+
+    class _FakeDB:
+        def __init__(self, path):
+            pass
+
+        def get_non_superseded_campaigns(self):
+            return [{"flywheel_name": n} for n in names]
+
+        def get_iterations(self, name):
+            return iters_by_name[name]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(flywheel_lib, "FlywheelDB", _FakeDB)
+
+
+def _it(i, cg, status="done"):
+    return {"iteration": i, "status": status, "cond_gap": cg}
+
+
+class TestCondGapStall:
+    def test_no_db_is_silent(self, doctor, tmp_path, monkeypatch):
+        monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", tmp_path / "absent.db")
+        pd._check_cond_gap_stall({})
+        assert _by_category("flywheel") == []
+
+    def test_rising_cond_gap_is_silent(self, doctor, tmp_path, monkeypatch):
+        # champion is the latest iter → still improving → no stall
+        iters = [_it(1, 0.02), _it(2, 0.03), _it(3, 0.04), _it(4, 0.05)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        assert _by_category("flywheel") == []
+
+    def test_too_few_done_iters_is_silent(self, doctor, tmp_path, monkeypatch):
+        # only 3 done iters < stall_iters(3)+1 → not enough history to judge
+        iters = [_it(1, 0.05), _it(2, 0.04), _it(3, 0.03)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        assert _by_category("flywheel") == []
+
+    def test_stalled_cond_gap_warns(self, doctor, tmp_path, monkeypatch):
+        # champion at iter 1; 3 later successes set no new high → WARNING
+        iters = [_it(1, 0.05), _it(2, 0.04), _it(3, 0.03), _it(4, 0.02)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        fw = [i for i in _by_category("flywheel") if i.severity == "WARNING"]
+        assert len(fw) == 1
+        assert "cond_gap stalled" in fw[0].title
+        assert fw[0].ctx["champion_iter"] == 1
+        assert fw[0].ctx["iters_since_high"] == 3
+
+    def test_running_trailing_iter_ignored(self, doctor, tmp_path, monkeypatch):
+        # a non-done trailing iter must not count toward the stall window
+        iters = [_it(1, 0.05), _it(2, 0.04), _it(3, 0.03),
+                 _it(4, None, status="running")]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        assert _by_category("flywheel") == []  # only 3 done → too few

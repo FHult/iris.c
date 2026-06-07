@@ -2737,6 +2737,65 @@ def _check_flywheel_failures(cfg: dict) -> None:
                   "cache_coverage": cache_cov})
 
 
+def _check_cond_gap_stall(cfg: dict) -> None:
+    """Flag a campaign that trains cleanly but has stopped improving its signal.
+
+    _check_flywheel_failures catches crashes; this catches the subtler waste where
+    every iteration succeeds yet cond_gap (loss_null - loss_cond — the adapter
+    actually using the reference) sets no new high for several iterations. The
+    warm-started checkpoint is no longer accumulating quality signal, so further
+    iterations mostly burn compute. cond_gap is exactly what FlywheelDB.get_best
+    ranks by, so a stalled champion means a stalled campaign — promote it or change
+    the recipe rather than iterating further. Mirrors debug/flywheel_refgap.py."""
+    if not FLYWHEEL_DB_PATH.exists():
+        return
+    try:
+        from flywheel_lib import FlywheelDB
+        db = FlywheelDB(FLYWHEEL_DB_PATH)
+        campaigns = db.get_non_superseded_campaigns()
+        per = {c.get("flywheel_name"): db.get_iterations(c.get("flywheel_name"))
+               for c in campaigns if c.get("flywheel_name")}
+        db.close()
+    except Exception:
+        return
+
+    health      = (cfg or {}).get("flywheel_health", {}) or {}
+    stall_iters = int(health.get("cond_gap_stall_iters", 3))
+
+    for name, iterations in per.items():
+        done = [r for r in iterations
+                if (r.get("status") or "").lower() == "done"
+                and r.get("cond_gap") is not None]
+        # Need a champion plus a full stall window of later successes before a
+        # plateau can be called — early campaigns stay silent.
+        if len(done) < stall_iters + 1:
+            continue
+        champ = max(done, key=lambda r: r["cond_gap"])
+        # Position (not iteration number) so gaps in numbering don't distort the
+        # window; identity match handles tie values cleanly.
+        champ_pos = max(i for i, r in enumerate(done) if r is champ)
+        since = (len(done) - 1) - champ_pos
+        if since < stall_iters:
+            continue
+
+        latest = done[-1]
+        cg_champ, cg_latest = champ["cond_gap"], latest["cond_gap"]
+        champ_it, latest_it = champ.get("iteration"), latest.get("iteration")
+        _add("WARNING", "flywheel",
+             f"Flywheel '{name}': cond_gap stalled — no new high in {since} done iterations",
+             detail=(f"Champion is iter {champ_it} (cond_gap={cg_champ:+.4f}); the last "
+                     f"{since} successful iterations (through iter {latest_it}, "
+                     f"cond_gap={cg_latest:+.4f}) set no new high. The warm-started "
+                     f"checkpoint has stopped accumulating quality signal — further "
+                     f"iterations mostly burn compute. Promote the champion or change "
+                     f"the recipe (data mix / lr / ip_scale) instead of iterating on."),
+             fix=(f"train/.venv/bin/python debug/flywheel_refgap.py {name}  "
+                  f"# inspect the cond_gap trajectory and champion"),
+             ctx={"campaign": name, "champion_iter": champ_it,
+                  "champion_cond_gap": cg_champ, "latest_iter": latest_it,
+                  "latest_cond_gap": cg_latest, "iters_since_high": since})
+
+
 def _check_campaign_eta(cfg: dict) -> None:
     """Estimate flywheel campaign wall-clock from live precompute speed.
 
@@ -4091,6 +4150,7 @@ def main() -> None:
         _check_ablation_health()
         _check_campaign_state()
         _check_flywheel_failures(cfg)
+        _check_cond_gap_stall(cfg)
         _check_campaign_eta(cfg)
         _check_progress_stall(cfg)
         _check_log_disk(cfg)
