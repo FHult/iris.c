@@ -70,6 +70,39 @@ def main() -> int:
             print(f"  checkpoint: {ck}  ({'present' if os.path.exists(ck) else 'missing'})")
         print("  NOTE: this is the training-internal champion. A shippable champion also "
               "needs a golden-set output-quality win (clip_i/aesthetic vs baseline).")
+
+    # Attribution warmth — is the shard bandit warm enough to ablate a recipe against?
+    # Mirrors shard_selector: a shard's attribution becomes usable once attr_confidence
+    # reaches 1.0 (≥MIN_ATTR_OBS=3 observations in BOTH the included and excluded roles).
+    # The branch trigger for run3-with-ablation is "stall detector fires AND this warm".
+    shard_db = os.path.join(os.path.dirname(os.path.abspath(db)), "shard_scores.db")
+    if os.path.exists(shard_db):
+        total = scored = attr = None
+        try:
+            sc = sqlite3.connect(f"file:{shard_db}?mode=ro", uri=True)
+            total  = sc.execute("SELECT COUNT(*) FROM shards").fetchone()[0]
+            scored = sc.execute("SELECT COUNT(*) FROM shards WHERE n_scored>0").fetchone()[0]
+            attr   = sc.execute("SELECT COUNT(*) FROM shards WHERE attr_confidence>=1.0").fetchone()[0]
+            sc.close()
+        except sqlite3.Error:
+            total = None
+        if total is not None:
+            # Readiness floor = 2 iterations' worth of fully-attributed shards, using the
+            # campaign's own median per-iter shard count (falls back to 42).
+            try:
+                ns = [r[0] for r in c.execute(
+                    "SELECT n_shards FROM iterations WHERE flywheel_name=? AND status='done'",
+                    (name,)).fetchall() if r[0]]
+            except sqlite3.Error:
+                ns = []
+            per_iter = sorted(ns)[len(ns) // 2] if ns else 42
+            floor = 2 * per_iter
+            ready = attr >= floor
+            pct = 100.0 * attr / total if total else 0.0
+            print(f"\nattribution: {attr}/{total} shards fully attributed ({pct:.1f}%) "
+                  f"[attr_confidence≥1.0 = ≥3 incl & ≥3 excl obs]; {scored} touched")
+            print(f"  ablation-ready: {'YES ✓' if ready else 'no — keep warming'} "
+                  f"({attr} {'≥' if ready else '<'} {floor} floor = 2×~{per_iter} shards/iter)")
     return 0
 
 

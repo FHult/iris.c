@@ -2737,6 +2737,27 @@ def _check_flywheel_failures(cfg: dict) -> None:
                   "cache_coverage": cache_cov})
 
 
+def _attribution_warmth() -> Optional[dict]:
+    """Shard-bandit attribution readiness from shard_scores.db (read-only, fail-open).
+
+    A shard becomes 'attributed' once attr_confidence>=1.0 — i.e. >=3 observations in
+    BOTH the included and excluded roles (shard_selector MIN_ATTR_OBS=3). Until then the
+    contrastive (causal) signal is unusable and the bandit leans on raw correlation.
+    Returns {attr,total,scored} or None when the DB is absent/unreadable."""
+    if not SHARD_SCORES_DB_PATH.exists():
+        return None
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{SHARD_SCORES_DB_PATH}?mode=ro", uri=True)
+        total  = con.execute("SELECT COUNT(*) FROM shards").fetchone()[0]
+        scored = con.execute("SELECT COUNT(*) FROM shards WHERE n_scored>0").fetchone()[0]
+        attr   = con.execute("SELECT COUNT(*) FROM shards WHERE attr_confidence>=1.0").fetchone()[0]
+        con.close()
+        return {"attr": attr, "total": total, "scored": scored}
+    except Exception:
+        return None
+
+
 def _check_cond_gap_stall(cfg: dict) -> None:
     """Flag a campaign that trains cleanly but has stopped improving its signal.
 
@@ -2781,6 +2802,25 @@ def _check_cond_gap_stall(cfg: dict) -> None:
         latest = done[-1]
         cg_champ, cg_latest = champ["cond_gap"], latest["cond_gap"]
         champ_it, latest_it = champ.get("iteration"), latest.get("iteration")
+
+        # Is the shard bandit warm enough to ablate a recipe against? This decides
+        # whether a plateau means "change the recipe" or "still finding good shards".
+        warmth = _attribution_warmth()
+        attr_detail, attr_ctx = "", {}
+        if warmth:
+            ns = sorted(r.get("n_shards") for r in done if r.get("n_shards"))
+            per_iter = ns[len(ns) // 2] if ns else 42
+            ready = warmth["attr"] >= 2 * per_iter
+            attr_ctx = {"attr_ready": warmth["attr"], "attr_total": warmth["total"],
+                        "shards_touched": warmth["scored"], "ablation_ready": ready}
+            attr_detail = (
+                f"  Shard attribution: {warmth['attr']}/{warmth['total']} fully attributed "
+                f"({warmth['scored']} touched) — "
+                + ("ABLATION-READY: branch to a recipe campaign (run3) with ablation enabled."
+                   if ready else
+                   "attribution still cold (needs >=3 incl & >=3 excl obs/shard); this plateau "
+                   "is more likely stinker-draws than a recipe ceiling — keep warming, don't "
+                   "ablate yet."))
         _add("WARNING", "flywheel",
              f"Flywheel '{name}': cond_gap stalled — no new high in {since} done iterations",
              detail=(f"Champion is iter {champ_it} (cond_gap={cg_champ:+.4f}); the last "
@@ -2788,12 +2828,13 @@ def _check_cond_gap_stall(cfg: dict) -> None:
                      f"cond_gap={cg_latest:+.4f}) set no new high. The warm-started "
                      f"checkpoint has stopped accumulating quality signal — further "
                      f"iterations mostly burn compute. Promote the champion or change "
-                     f"the recipe (data mix / lr / ip_scale) instead of iterating on."),
+                     f"the recipe (data mix / lr / ip_scale) instead of iterating on."
+                     + attr_detail),
              fix=(f"train/.venv/bin/python debug/flywheel_refgap.py {name}  "
-                  f"# inspect the cond_gap trajectory and champion"),
+                  f"# inspect cond_gap trajectory, champion, and attribution warmth"),
              ctx={"campaign": name, "champion_iter": champ_it,
                   "champion_cond_gap": cg_champ, "latest_iter": latest_it,
-                  "latest_cond_gap": cg_latest, "iters_since_high": since})
+                  "latest_cond_gap": cg_latest, "iters_since_high": since, **attr_ctx})
 
 
 def _check_campaign_eta(cfg: dict) -> None:

@@ -917,6 +917,9 @@ def _install_fake_flywheel_db(monkeypatch, tmp_path, iters_by_name):
     dbfile = tmp_path / "flywheel_history.db"
     dbfile.touch()
     monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+    # Keep the attribution read hermetic: point at a non-existent scores DB so
+    # _attribution_warmth fails open (no real machine state leaks into the test).
+    monkeypatch.setattr(pd, "SHARD_SCORES_DB_PATH", tmp_path / "no_shard_scores.db")
     names = list(iters_by_name.keys())
 
     class _FakeDB:
@@ -977,3 +980,25 @@ class TestCondGapStall:
         _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
         pd._check_cond_gap_stall({})
         assert _by_category("flywheel") == []  # only 3 done → too few
+
+    def test_stall_includes_attribution_warmth(self, doctor, tmp_path, monkeypatch):
+        # When a shard_scores.db is present, the stall alert reports ablation-readiness.
+        import sqlite3
+        scores = tmp_path / "shard_scores.db"
+        con = sqlite3.connect(scores)
+        con.execute("CREATE TABLE shards (shard_id TEXT, n_scored INT, attr_confidence REAL)")
+        for i in range(200):
+            con.execute("INSERT INTO shards VALUES (?,?,?)",
+                        (f"s{i}", 1 if i < 100 else 0, 1.0 if i < 90 else 0.0))
+        con.commit(); con.close()
+        iters = [_it(1, 0.05), _it(2, 0.04), _it(3, 0.03), _it(4, 0.02)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        monkeypatch.setattr(pd, "SHARD_SCORES_DB_PATH", scores)  # override the hermetic absent path
+        pd._check_cond_gap_stall({})
+        fw = [i for i in _by_category("flywheel") if i.severity == "WARNING"]
+        assert len(fw) == 1
+        ctx = fw[0].ctx
+        assert ctx["attr_ready"] == 90 and ctx["attr_total"] == 200
+        assert ctx["shards_touched"] == 100
+        assert ctx["ablation_ready"] is True   # 90 >= 2*42 floor
+        assert "attribution" in fw[0].detail.lower()
