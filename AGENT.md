@@ -499,6 +499,7 @@ Hard-won contracts from the warmup-run2 debugging. Violating any silently breaks
 - `train/DISPATCH.md` — pipeline operational reference; read this before any pipeline work
 - `plans/pipeline-v2-architecture.md` — V2 pipeline architecture (active design, supersedes all V1 plan docs)
 - `plans/pipeline-mlops-backlog.md` — backlog with V2 dispositions and implementation phases
+- `plans/warmup-campaign-runbook.md` — IP-Adapter flywheel runbook; Section 3 covers shard-attribution warmth (the `hmean(n_inc,n_exc)/3` rule, why full-pool attribution is unreachable, UCB head-concentration) and the run-vs-ablate decision (branch trigger = stall fires AND attribution warm)
 
 ## Pipeline Script Layout
 - `train/scripts/` — V2 active scripts (orchestrator, pipeline_lib, pipeline_status, pipeline_ctl, pipeline_doctor, and all step scripts)

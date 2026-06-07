@@ -609,6 +609,108 @@ Items 1 and 2 are highest priority — without them, warm-up phase progress is o
 
 ---
 
+## Section 3: Attribution Warmth and the Run-vs-Ablate Decision
+
+*(added 2026-06, from warmup-run2 iter 1–2 — capture so the reasoning isn't lost)*
+
+### How a shard earns attribution (and why it's slow)
+
+`ShardScoreDB` keeps two EMAs per shard: an **included** EMA (updated when the shard is
+trained on) and an **excluded** EMA (updated when an iteration runs *without* it). The
+causal/contrastive score is `included_mean − excluded_mean`, trusted only once
+`attr_confidence = hmean(n_inc, n_exc) / MIN_ATTR_OBS` reaches 1.0 (`MIN_ATTR_OBS = 3`).
+
+Because it's a **harmonic mean**, attr_confidence is dominated by the *smaller* of the two
+counts. Excluded obs pile up fast (a shard sits out most iterations), so **`n_inc` — the
+number of iterations the shard was actually *trained on* — is the binding constraint.** In
+practice attr_confidence hits 1.0 once a shard has been *included* ~2–3 times (excluded
+plentiful). So: **a shard needs to have been selected into ≈3 training iterations to be
+attributed**, and the excluded side is automatic.
+
+### Why full-pool attribution is structurally unreachable here
+
+With ~42 shards selected per iteration from a 1280-shard pool, a *uniformly* chosen shard
+expects only ≈ 15 × 42 / 1280 ≈ **0.49 inclusions over the entire 15-iteration budget.**
+Under uniform selection essentially **no shard would ever reach 3 inclusions** — attribution
+could never warm.
+
+It works at all only because selection is **UCB, not uniform**: it re-selects high-value
+shards (exploitation), so inclusions concentrate on the "good" head of the pool. Those warm
+up; the long tail never does. **This is correct, not a bug** — you only need causal
+attribution on the shards you'd actually keep. Attribution is a property the bandit *earns
+for its favourites*; full-pool coverage is neither expected nor needed within a campaign.
+Live confirmation (warmup-run2 after iter 2): `0/1280 fully attributed, 88 touched` — cold
+this early, exactly as the math predicts.
+
+### The decision: run the warmup out, or stop and ablate a recipe?
+
+Two optimisation loops, often confused:
+- **Shard bandit** (UCB over `shard_scores.db`) optimises *which data*.
+- **Ablation harness** (`ablation_sref_v1.yaml`) optimises *the recipe* (hyperparams).
+
+Ablation is **deliberately disabled** in the warmup run (`ablation_every_n: 0 — no
+attribution signal yet`) because tuning the recipe against cold, noisy shard scores tunes
+against a moving target.
+
+**So the branch trigger is NOT "iter 15" and NOT "first plateau" — it is "stall detector
+fires AND attribution is warm."**
+- Discontinuing at the first plateau would ablate against cold attribution — the exact
+  failure the config guards against.
+- Running the warmup forward warms **two** assets in parallel: the amortised precompute pool
+  **and** the shard-attribution scores ablation needs. "We may as well run it" is right — the
+  warmup is *earning* the signal that makes a later ablation meaningful, not just burning
+  compute. (Precompute is encoder-identity-keyed, so it's a shared capital investment reused
+  by every future run — see the throughput note.)
+- The **champion is always preserved** (`get_best` keeps the max-cond_gap iter), so extra
+  iterations never damage the result; a bad draw is discarded.
+
+When the trigger fires, branch to **run3 (recipe campaign)**: warm-start from the champion,
+inherit the now-warm shard scores, enable ablation (`ablation_config:
+train/configs/ablation_sref_v1.yaml`, `ablation_every_n: >0`, `ablation_max_runs: ~12`).
+Precompute amortisation makes run3's first-contact cost small.
+
+### The empirical signal so far (don't over-read one iteration)
+
+| iter | train_loss | cond_gap | note |
+|------|-----------|----------|------|
+| 1 | 1.0043 | **+0.0273** ★ champion | |
+| 2 | 0.5328 | **−0.0054** | flow loss halved but cond_gap went negative |
+
+iter-2's pattern — **flow loss falls while cond_gap (the signal that matters) drops** — is the
+classic "fitting the objective, not the conditioning." But at iter 2 it's indistinguishable
+between (a) stinker shard draws (data) and (b) a recipe ceiling, *because attribution is cold
+and you can't yet ablate to tell.* Discriminator: if iter-3/4 draw different mixes and recover
+toward +0.0273 it was data; if they keep regressing across mixes it's the recipe.
+
+### The recipe-ablation config (`ablation_sref_v1.yaml`)
+
+Already sweeps the four knobs that matter for this regression, via `strategy: bayesian`
+(Optuna) over `cross_ref_prob`, `patch_shuffle_prob`, `style_loss_weight` (the augmentation/
+loss terms shaping ref_gap/cond_gap; `style=0` isolates pure conditioning), and
+`freeze_double_stream_scales` — which **directly tests the observed `double=0.0` single-only
+injection.**
+
+**Recommended addition for the iter-2 regression:** add `learning_rate: [5e-5, 1e-4, 2e-4]`
+to `variables`. iter-2's loss-falls / cond_gap-drops is the signature of an lr too high for
+stable conditioning, and lr is currently NOT in the sweep. (Expands the grid; bayesian
+sampling absorbs it.)
+
+### Observability in place (read these to make the call)
+- `debug/flywheel_refgap.py <campaign>` — per-iter cond_gap/ref_gap + champion (★) + an
+  **attribution-warmth line** ("attribution: N/1280 fully attributed; M touched —
+  ablation-ready: yes/no", floor self-calibrated to 2× the median per-iter shard count).
+- `pipeline_doctor.py` — the `cond_gap`-stall detector fires after 3 done iters set no new
+  high, and its WARNING now states attribution-readiness inline (branch-to-ablation vs
+  keep-warming). `_attribution_warmth()` reads `shard_scores.db`, fail-open.
+
+### Open item — recalibrate the ablation-ready floor
+The floor is currently `attr ≥ 2 × per_iter` (≈84). Since only the **exploited head** warms
+(not the pool), that's probably too high — a usable warm set may be 30–40 shards. Recalibrate
+once a few iterations show how fast the head warms; tie it to "enough warm shards to fill one
+ablation training set," not a pool fraction.
+
+---
+
 ## Appendix: Key File Locations
 
 | Resource | Path |
