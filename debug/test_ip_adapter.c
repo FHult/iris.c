@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "train/export/iris_ip_adapter.h"
+#include "iris_ip_adapter.h"
 
 /* fixture dims (debug/fixtures/ip_adapter/shapes.json) */
 #define HID 256

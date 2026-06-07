@@ -157,6 +157,59 @@ feeds `[729,1152]` directly to `perceive`. This is also exactly the Phase-1 pari
   `_flux_forward_with_ip` reference within the run_test pixel tolerance; `ip_scale=0`
   reproduces the no-adapter image bit-for-bit.
 
+#### Phase 2 detailed design (execution-ready)
+
+**Exact hook point (CPU double block, `double_block_forward` ~2207).** The image Q is
+projected into `tf->work2` (~2257), QK-RMSNorm'd at `apply_qk_norm(img_q, img_k, …)`
+(~2278), then RoPE'd at `apply_rope_2d(img_q, …)` (~2284), then joint attention →
+out-proj → gate → residual into `img_hidden`. The header contract says inject takes the
+**post-QK-norm** Q and adds `ip_scale·SDPA(Q, k_ip, v_ip)` into `img_hidden` *after* the
+native attention+residual. So inject is called **inside** the block (where `img_q` is
+live) near the end, using the saved `img_q` and the post-residual `img_hidden`.
+
+**Open parity question to resolve first (the fiddly bit):** does training's
+`_flux_forward_with_ip` reuse the Q **before or after RoPE**? Native attention uses
+post-RoPE Q; the IP cross-attention may use the post-QK-norm pre-RoPE Q (k_ip/v_ip are
+not RoPE'd — they're SigLIP-derived, position-free). model.py `inject` takes `img_q` with
+no RoPE applied to k/v, so almost certainly **post-QK-norm, pre-RoPE**. Confirm by dumping
+both from the Python path and matching — extend the Phase-0 fixture with a block-level
+golden (img_q candidates + the IP contribution) before wiring. Getting this wrong is the
+#1 silent-divergence risk.
+
+**State threading.** Add to the transformer forward (and block-forward signatures, or via
+`tf->`): `iris_ip_adapter_t *ip` (nullable → no-op when absent), `const float *ip_embeds`
+(`[num_image_tokens, hidden]`, computed once per image before the denoise loop via
+`perceive`), and reusable per-block `k_ip`/`v_ip` scratch (`[num_image_tokens, hidden]`).
+Per block: `get_kv(block_idx, ip_embeds, k_ip, v_ip)` then `inject(block_idx, img_q,
+img_seq, k_ip, v_ip, img_hidden)`. Block index: double blocks `0..num_double-1`, single
+blocks `num_double..N-1`. Skip entirely when `ip == NULL` or `ip_scale[block]==0`.
+
+**Per-variant work (single inject impl; the variants only marshal Q/hidden):**
+- CPU `double_block_forward` (2207) + `single_block_forward` (3449): `img_q` and
+  `img_hidden` are already f32 in `tf->work*` — pass directly. Easiest; do first.
+- bf16 `double_block_forward_bf16` (1946) + `single_block_forward_bf16` (2967): Q is in a
+  fused bf16 kernel. Read back the post-QK-norm img_q slice to f32 (or compute inject in
+  the existing f32 readback), run inject, accumulate into the f32 hidden before re-upload.
+- MPS-resident single (`single_block_forward_gpu` 2454 / `_chained` 2702): same, reusing
+  the path's existing GPU↔CPU marshalling; no new GPU kernels needed (inject is small —
+  CPU SDPA on `[img_seq, hidden]` × `[128, hidden]`).
+
+**CLI / setup (main.c).** Add `--ip BUNDLE_DIR`, `--ip-features PATH` (precomputed SigLIP
+`[729,1152]` → skips Phase 3), `--ip-scale F` (→ `sref_strength`/`effective_scale`),
+`--ip-style-only`. Load the adapter once (like the VAE); on `--ip-features`, `perceive`
+once into `ip_embeds`; thread `ip`/`ip_embeds` into the denoise loop. Replace the
+`main.c:1273` reject for `--ip` (keep it for `--sref`).
+
+**Test gates (in order).**
+1. *Block-level CPU golden* (extend `gen_ip_adapter_fixture.py` + `test_ip_adapter.c`):
+   feed a synthetic post-norm img_q + a baseline img_hidden through the inject hook and
+   assert `img_hidden += contribution` matches the Python `_flux_forward_with_ip` IP term.
+   Resolves the pre/post-RoPE question hermetically.
+2. *End-to-end* (`debug/`): `iris --ip-features feats.bin` vs a Python reference generate
+   on the same checkpoint+features — within `run_test` pixel tolerance.
+3. *No-op invariant*: `ip_scale=0` (or no `--ip`) reproduces the baseline image
+   **bit-for-bit** (guards that the hook is truly inert when disabled).
+
 ### Phase 3 — SigLIP encoder in C/Metal (interactive `--ip ref.png`)
 - Port SigLIP-400M vision tower (patchify → ViT blocks → `[729,1152]`). Largest piece;
   mirror the Qwen3/VAE loaders (safetensors + bf16 cache + MPS GEMM). Validate features vs

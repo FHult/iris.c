@@ -1,7 +1,7 @@
 /*
  * iris_ip_adapter.c — C inference for trained IP-Adapter bundles (G-1, Phase 1).
  *
- * Implements train/export/iris_ip_adapter.h: load a bundle exported by
+ * Implements iris_ip_adapter.h: load a bundle exported by
  * export_adapter.py and run the three stages the Flux denoiser needs —
  *   perceive : SigLIP feats -> ip_embeds   (PerceiverResampler: MHA + LayerNorm)
  *   get_kv   : ip_embeds     -> k_ip,v_ip   (per-block projection)
@@ -16,8 +16,8 @@
  *   - get_kv: einsum btd,de->te  ==  ip_embeds @ ip_{k,v}_stacked[block].
  *   - inject: scale[block] * SDPA(img_q, k_ip, v_ip), no out_proj.
  *
- * Weights are dequantised to f32 at load (safetensors_get_f32 handles f16/bf16/f32);
- * int8 bundles are not yet supported. CPU path; uses iris_kernels GEMM/attention.
+ * Weights are dequantised to f32 at load: f16/bf16/f32 via safetensors_get_f32, int8
+ * via per-row scale (load_tensor_f32). CPU path; uses iris_kernels GEMM/attention.
  */
 
 #include <stdio.h>
@@ -29,7 +29,7 @@
 #include "iris_safetensors.h"
 #include "iris_kernels.h"
 #include "iris_config_parse.h"
-#include "train/export/iris_ip_adapter.h"
+#include "iris_ip_adapter.h"
 
 #define LN_EPS 1e-5f
 
