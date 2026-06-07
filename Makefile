@@ -186,6 +186,10 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_config debug/test_config_parse.c -lm
 	@/tmp/flux_test_config
 	@rm -f /tmp/flux_test_config
+	@echo "=== Safetensors parser tests ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_st debug/test_safetensors.c iris_safetensors.c -lm
+	@/tmp/flux_test_st
+	@rm -f /tmp/flux_test_st
 	@echo "=== IP-Adapter parity tests (C port vs Python goldens) ==="
 	@$(CC) -O2 -I. -o /tmp/flux_test_ip_adapter debug/test_ip_adapter.c iris_ip_adapter.c iris_kernels.c iris_safetensors.c -lm
 	@/tmp/flux_test_ip_adapter
