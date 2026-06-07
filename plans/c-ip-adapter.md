@@ -1,9 +1,14 @@
 # Plan: C-side IP-Adapter inference (G-1)
 
-**Status:** design / not started. The endgame for the whole training flywheel — it's
-the bridge from "we trained an adapter" to "it runs in the `iris` binary." Until this
-lands, every trained adapter is only evaluable through the Python harness
-(`test_ip_adapter_inference.py`), never in the shipped product.
+**Status:** **Phase 0 + Phase 1 DONE (2026-06-07)** — `iris_ip_adapter.c` (load /
+perceive / get_kv / inject) is **bit-exact** with the Python reference (corr 1.000000,
+max_abs 0.00000) on the committed synthetic fixtures, in `make test-unit`. Generator:
+`debug/gen_ip_adapter_fixture.py`; test: `debug/test_ip_adapter.c`. (Also fixed an
+iris_safetensors bug en route: mlx's `"__metadata__":null` broke the header parse.)
+**Next: Phase 2** — wire `inject` into the Flux transformer blocks (CPU → bf16 → MPS).
+The endgame for the whole training flywheel — the bridge from "we trained an adapter"
+to "it runs in the `iris` binary." Until Phase 2/3 land, adapters run in C only via this
+unit-tested module, not yet end-to-end in generation.
 
 **Trigger:** start once warmup-run2 (first campaign on the corrected VAE-Q1 convention)
 yields a champion checkpoint worth shipping. Phase 1 can begin earlier (it validates the
