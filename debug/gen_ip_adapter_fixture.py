@@ -60,6 +60,49 @@ def _save(arr, path):
     np.asarray(arr, dtype=np.float32).tofile(path)
 
 
+def _export(ckpt, bundle_dir, quant):
+    rc = subprocess.run(
+        [sys.executable, str(ROOT / "train" / "export" / "export_adapter.py"),
+         "--checkpoint", str(ckpt), "--output", str(bundle_dir), "--quant", quant,
+         "--perceiver-heads", str(HEADS)], cwd=str(ROOT)).returncode
+    if rc != 0:
+        raise SystemExit(f"export_adapter ({quant}) failed")
+
+
+def _reload_from_bundle(model, bundle_dir):
+    """Set model weights from the EXACT bundle bytes C will load — dequantising
+    int8 (q * per-row scale) so goldens match the C int8 path; f16/f32 pass through."""
+    w = mx.load(str(bundle_dir / "adapter_weights.safetensors"))
+    upd = {}
+    for ek, tk in _INV.items():
+        if ek not in w:
+            continue
+        sk = ek + ".scale"
+        if sk in w:                                    # int8: per-row dequant
+            q = w[ek].astype(mx.float32)
+            cols = q.shape[-1]
+            scale = w[sk].astype(mx.float32).reshape(-1, 1)
+            upd[tk] = (q.reshape(-1, cols) * scale).reshape(q.shape)
+        else:
+            upd[tk] = w[ek].astype(mx.float32)
+    model.update(tree_unflatten(list(upd.items())))
+    mx.eval(model.parameters())
+
+
+def _dump_goldens(model, out, suffix, siglip, img_q):
+    ip_embeds = model.get_image_embeds(siglip)
+    k_all, v_all = model.get_kv_all(ip_embeds)
+    k_ip, v_ip = k_all[:, 0], v_all[:, 0]
+    img_q4 = img_q.reshape(IMG_SEQ, HEADS, HEAD_DIM).transpose(1, 0, 2)[None]
+    contrib = model.inject(img_q4, k_ip, v_ip, 0)
+    mx.eval(ip_embeds, k_ip, v_ip, contrib)
+    _save(ip_embeds, out / f"gold_ip_embeds{suffix}.bin")
+    _save(k_ip,      out / f"gold_k_ip_b0{suffix}.bin")
+    _save(v_ip,      out / f"gold_v_ip_b0{suffix}.bin")
+    _save(contrib,   out / f"gold_inject_b0{suffix}.bin")
+    return float(ip_embeds.std()), float(contrib.std())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "debug" / "fixtures" / "ip_adapter"))
@@ -73,49 +116,27 @@ def main() -> int:
                            perceiver_heads=HEADS, num_double_blocks=N_DOUBLE)
     mx.eval(model.parameters())
 
-    # 1. Save a training-style checkpoint and export the real bundle (float16).
+    # Shared inputs (same for every quant mode so the C test reuses them).
+    siglip     = mx.random.normal((1, SIGLIP_SEQ, SIGLIP_DIM))
+    img_q_flat = mx.random.normal((IMG_SEQ, HIDDEN))
+    mx.eval(siglip, img_q_flat)
+    _save(siglip,     out / "in_siglip.bin")
+    _save(img_q_flat, out / "in_img_q.bin")
+
+    # Export the real bundle in each quant mode; compute goldens from the reloaded
+    # (quantised) weights so they match exactly what the C loader will dequantise.
     flat = dict(tree_flatten(model.parameters()))
     with tempfile.TemporaryDirectory() as td:
         ckpt = Path(td) / "step_0000001.safetensors"
         mx.save_safetensors(str(ckpt), flat)
-        rc = subprocess.run(
-            [sys.executable, str(ROOT / "train" / "export" / "export_adapter.py"),
-             "--checkpoint", str(ckpt), "--output", str(bundle), "--quant", "float16",
-             "--perceiver-heads", str(HEADS)],
-            cwd=str(ROOT)).returncode
-        if rc != 0:
-            print("export_adapter failed", file=sys.stderr); return 1
+        for sub, quant, suffix in (("bundle", "float16", ""),
+                                   ("bundle_int8", "int8", "_int8")):
+            bdir = out / sub
+            _export(ckpt, bdir, quant)
+            _reload_from_bundle(model, bdir)
+            es, cs = _dump_goldens(model, out, suffix, siglip, img_q_flat)
+            print(f"  {quant:8s}: ip_embeds std={es:.4f}  contrib std={cs:.4f}")
 
-    # 2. Reload the *bundle* weights (the exact bytes C will load) back into the model,
-    #    so goldens are computed from f16-rounded weights — tight parity with C.
-    bw = mx.load(str(bundle / "adapter_weights.safetensors"))
-    upd = {}
-    for ek, tk in _INV.items():
-        if ek in bw:
-            upd[tk] = bw[ek].astype(mx.float32)
-    model.update(tree_unflatten(list(upd.items())))
-    mx.eval(model.parameters())
-
-    # 3. Goldens via the real model forward.
-    siglip = mx.random.normal((1, SIGLIP_SEQ, SIGLIP_DIM))
-    ip_embeds = model.get_image_embeds(siglip)            # [1, N_TOKENS, HIDDEN]
-    k_all, v_all = model.get_kv_all(ip_embeds)            # [1, N_BLOCKS, N_TOKENS, HIDDEN]
-    blk = 0
-    k_ip = k_all[:, blk]                                  # [1, N_TOKENS, HIDDEN]
-    v_ip = v_all[:, blk]
-    # inject: img_q in C's flat [IMG_SEQ, HIDDEN] -> [1, HEADS, IMG_SEQ, HEAD_DIM]
-    img_q_flat = mx.random.normal((IMG_SEQ, HIDDEN))
-    img_q = img_q_flat.reshape(IMG_SEQ, HEADS, HEAD_DIM).transpose(1, 0, 2)[None]
-    contrib = model.inject(img_q, k_ip, v_ip, blk)        # [1, IMG_SEQ, HIDDEN]
-    mx.eval(ip_embeds, k_ip, v_ip, contrib)
-
-    # 4. Dump inputs + goldens (float32 raw) + shapes.
-    _save(siglip,            out / "in_siglip.bin")
-    _save(ip_embeds,         out / "gold_ip_embeds.bin")
-    _save(k_ip,              out / "gold_k_ip_b0.bin")
-    _save(v_ip,              out / "gold_v_ip_b0.bin")
-    _save(img_q_flat,        out / "in_img_q.bin")
-    _save(contrib,           out / "gold_inject_b0.bin")
     shapes = {
         "hidden": HIDDEN, "heads": HEADS, "head_dim": HEAD_DIM,
         "num_blocks": N_BLOCKS, "num_double_blocks": N_DOUBLE,

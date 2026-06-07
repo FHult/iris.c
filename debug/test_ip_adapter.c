@@ -50,44 +50,54 @@ static void compare(const char *name, const float *got, const float *gold, long 
     if (ok) passes++; else failures++;
 }
 
-int main(void) {
-    iris_ip_adapter_t *a = iris_ip_adapter_load(FIX "/bundle");
-    if (!a) { fprintf(stderr, "FAIL load\n"); return 1; }
-    printf("loaded: hidden=%d blocks=%d(%d+%d) tokens=%d siglip=%d quant=%s\n",
-           a->hidden_dim, a->num_blocks, a->num_double_blocks, a->num_single_blocks,
-           a->num_image_tokens, a->siglip_dim, a->quant);
+/* Goldens carry a quant suffix ("" for f16, "_int8" for int8); inputs are shared. */
+static void run_bundle(const char *bundle, const char *suffix, const char *label,
+                       const float *siglip, const float *img_q) {
+    char p[256];
+    printf("--- %s (%s) ---\n", label, bundle);
+    iris_ip_adapter_t *a = iris_ip_adapter_load(bundle);
+    if (!a) { fprintf(stderr, "FAIL load %s\n", bundle); failures++; return; }
     int meta_ok = (a->hidden_dim == HID && a->num_image_tokens == TOK &&
                    a->siglip_dim == SIG_DIM && a->num_blocks == 5);
-    printf("meta dims    %s\n", meta_ok ? "PASS" : "FAIL");
+    printf("meta dims  quant=%-8s %s\n", a->quant, meta_ok ? "PASS" : "FAIL");
     meta_ok ? passes++ : failures++;
 
-    float *siglip   = load_bin(FIX "/in_siglip.bin",      (long)SIG_SEQ * SIG_DIM);
-    float *img_q    = load_bin(FIX "/in_img_q.bin",       (long)IMG_SEQ * HID);
-    float *g_embeds = load_bin(FIX "/gold_ip_embeds.bin", (long)TOK * HID);
-    float *g_k      = load_bin(FIX "/gold_k_ip_b0.bin",   (long)TOK * HID);
-    float *g_v      = load_bin(FIX "/gold_v_ip_b0.bin",   (long)TOK * HID);
-    float *g_inj    = load_bin(FIX "/gold_inject_b0.bin", (long)IMG_SEQ * HID);
-    if (!siglip || !img_q || !g_embeds || !g_k || !g_v || !g_inj) return 1;
+    #define GLD(name) (snprintf(p, sizeof(p), FIX "/%s%s.bin", name, suffix), p)
+    float *g_embeds = load_bin(GLD("gold_ip_embeds"), (long)TOK * HID);
+    float *g_k      = load_bin(GLD("gold_k_ip_b0"),   (long)TOK * HID);
+    float *g_v      = load_bin(GLD("gold_v_ip_b0"),   (long)TOK * HID);
+    float *g_inj    = load_bin(GLD("gold_inject_b0"), (long)IMG_SEQ * HID);
+    #undef GLD
+    if (!g_embeds || !g_k || !g_v || !g_inj) { failures++; return; }
 
-    /* perceive: siglip -> ip_embeds */
     float *embeds = malloc((long)TOK * HID * sizeof(float));
     iris_ip_adapter_perceive(a, siglip, SIG_SEQ, embeds);
     compare("perceive", embeds, g_embeds, (long)TOK * HID);
 
-    /* get_kv: use the golden ip_embeds as input (isolates the stage) */
     float *k = malloc((long)TOK * HID * sizeof(float));
     float *v = malloc((long)TOK * HID * sizeof(float));
-    iris_ip_adapter_get_kv(a, BLK, g_embeds, k, v);
+    iris_ip_adapter_get_kv(a, BLK, g_embeds, k, v);   /* golden ip_embeds isolates the stage */
     compare("get_kv k", k, g_k, (long)TOK * HID);
     compare("get_kv v", v, g_v, (long)TOK * HID);
 
-    /* inject: use the golden k/v + input img_q; img_hidden starts at 0 so the
-     * result is exactly the contribution the golden recorded. */
     float *hidden = calloc((long)IMG_SEQ * HID, sizeof(float));
     iris_ip_adapter_inject(a, BLK, img_q, IMG_SEQ, g_k, g_v, hidden);
     compare("inject", hidden, g_inj, (long)IMG_SEQ * HID);
 
+    free(embeds); free(k); free(v); free(hidden);
+    free(g_embeds); free(g_k); free(g_v); free(g_inj);
     iris_ip_adapter_free(a);
+}
+
+int main(void) {
+    float *siglip = load_bin(FIX "/in_siglip.bin", (long)SIG_SEQ * SIG_DIM);
+    float *img_q  = load_bin(FIX "/in_img_q.bin",  (long)IMG_SEQ * HID);
+    if (!siglip || !img_q) return 1;
+
+    run_bundle(FIX "/bundle",      "",      "float16", siglip, img_q);
+    run_bundle(FIX "/bundle_int8", "_int8", "int8",    siglip, img_q);
+
+    free(siglip); free(img_q);
     printf("\n%d passed, %d failed\n", passes, failures);
     return failures ? 1 : 0;
 }

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 
 #include "iris_safetensors.h"
@@ -73,6 +74,35 @@ static int mha_sdpa(float *out, const float *q, const float *k, const float *v,
     return 0;
 }
 
+/* Load one tensor as f32. Passes f32/f16/bf16 through safetensors_get_f32; for an
+ * int8 tensor, dequantises with the companion "<name>.scale" (per-row symmetric:
+ * x[r,:] = q[r,:] * scale[r], rows = numel/last_dim) — the export's int8 format. */
+static float *load_tensor_f32(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) return NULL;
+    if (t->dtype != DTYPE_I8) return safetensors_get_f32(sf, t);
+
+    char sname[300];
+    snprintf(sname, sizeof(sname), "%s.scale", name);
+    const safetensor_t *st = safetensors_find(sf, sname);
+    if (!st) return NULL;
+    float *scale = safetensors_get_f32(sf, st);
+    const int8_t *q = (const int8_t *)safetensors_data(sf, t);
+    if (!scale || !q) { free(scale); return NULL; }
+
+    int64_t n = safetensor_numel(t);
+    int64_t cols = (t->ndim > 0) ? t->shape[t->ndim - 1] : n;
+    int64_t rows = (cols > 0) ? n / cols : 0;
+    float *out = malloc((size_t)n * sizeof(float));
+    if (out) {
+        for (int64_t r = 0; r < rows; r++)
+            for (int64_t c = 0; c < cols; c++)
+                out[r * cols + c] = (float)q[r * cols + c] * scale[r];
+    }
+    free(scale);
+    return out;
+}
+
 iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     if (!bundle_dir) return NULL;
     char path[1024];
@@ -101,10 +131,6 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
         strncpy(a->quant, q, sizeof(a->quant) - 1);
         char *e = strchr(a->quant, '"'); if (e) *e = '\0';
     }
-    if (strncmp(a->quant, "int8", 4) == 0) {
-        fprintf(stderr, "iris_ip_adapter_load: int8 bundles not yet supported\n");
-        free(a); return NULL;
-    }
     if (a->hidden_dim <= 0 || a->num_blocks <= 0) { free(a); return NULL; }
 
     /* weights (dequantised to f32) */
@@ -113,10 +139,7 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     if (!sf) { free(a); return NULL; }
     a->_sf_handle = sf;
 
-    #define LOAD(field, name) do { \
-        const safetensor_t *_t = safetensors_find(sf, name); \
-        a->field = _t ? safetensors_get_f32(sf, _t) : NULL; \
-    } while (0)
+    #define LOAD(field, name) a->field = load_tensor_f32(sf, name)
     LOAD(query_tokens, "perceiver.query_tokens");
     LOAD(query_proj,   "perceiver.query_proj");
     LOAD(key_proj,     "perceiver.key_proj");

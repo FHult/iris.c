@@ -24,6 +24,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_I8 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 

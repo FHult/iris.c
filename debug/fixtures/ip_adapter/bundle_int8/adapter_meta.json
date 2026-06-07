@@ -13,7 +13,7 @@
   "siglip_dim": 64,
   "perceiver_heads": 2,
   "style_only": false,
-  "quant": "float16",
+  "quant": "int8",
   "training_step": 1,
   "source_checkpoint": "step_0000001.safetensors",
   "export_time": "2026-06-07T18:55:00Z",
@@ -23,35 +23,59 @@
         8,
         256
       ],
-      "dtype": "F16"
+      "dtype": "F32"
     },
     "perceiver.query_proj": {
       "shape": [
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "perceiver.query_proj.scale": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
     },
     "perceiver.key_proj": {
       "shape": [
         256,
         64
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "perceiver.key_proj.scale": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
     },
     "perceiver.value_proj": {
       "shape": [
         256,
         64
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "perceiver.value_proj.scale": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
     },
     "perceiver.out_proj": {
       "shape": [
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "perceiver.out_proj.scale": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
     },
     "perceiver.norm_weight": {
       "shape": [
@@ -71,7 +95,14 @@
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "ip_k_stacked.scale": {
+      "shape": [
+        5,
+        256
+      ],
+      "dtype": "F32"
     },
     "ip_v_stacked": {
       "shape": [
@@ -79,7 +110,14 @@
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "I8"
+    },
+    "ip_v_stacked.scale": {
+      "shape": [
+        5,
+        256
+      ],
+      "dtype": "F32"
     },
     "ip_scale": {
       "shape": [
