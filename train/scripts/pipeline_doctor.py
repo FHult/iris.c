@@ -3389,7 +3389,12 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
                 }
                 break
 
-    # Orchestrator last poll
+    # Orchestrator last poll. pipeline_state.json is the V1 chunk-orchestrator's
+    # heartbeat; the flywheel orchestrator (--flywheel-config) never writes it, so
+    # during a flywheel campaign this file is stale (often days old, from a prior
+    # run) and grossly overstates the age — misleading "orchestrator dead" reads.
+    # Prefer the live flywheel signal (orchestrator.jsonl mtime) when a flywheel
+    # phase is active.
     orch_age: Optional[int] = None
     try:
         state = read_state()
@@ -3401,6 +3406,11 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
             orch_age = round((datetime.now(timezone.utc) - ts).total_seconds())
     except Exception:
         pass
+    if _flywheel_phase_active():
+        logs = _orch_log_files()
+        if logs and logs[0].exists():
+            fw_orch_age = round(time.time() - logs[0].stat().st_mtime)
+            orch_age = fw_orch_age if orch_age is None else min(orch_age, fw_orch_age)
 
     # Ablation harness heartbeat (process="ablation", no chunk)
     ablation_info: Optional[dict] = None
