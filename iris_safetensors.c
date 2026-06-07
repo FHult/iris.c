@@ -174,7 +174,8 @@ static int parse_header(safetensors_file_t *sf) {
         if (*p != ':') return -1;
         p++;
 
-        /* Skip __metadata__ entry */
+        /* Skip __metadata__ entry. Its value may be an object {...} (diffusers)
+         * or a bare null (mlx writes "__metadata__":null) — handle both. */
         if (strcmp(name, "__metadata__") == 0) {
             skip_whitespace(&p);
             if (*p == '{') {
@@ -185,6 +186,9 @@ static int parse_header(safetensors_file_t *sf) {
                     else if (*p == '}') depth--;
                     p++;
                 }
+            } else {
+                /* scalar value (e.g. null) — skip to the next ',' or '}' */
+                while (*p && *p != ',' && *p != '}') p++;
             }
             continue;
         }

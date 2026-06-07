@@ -186,6 +186,10 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_config debug/test_config_parse.c -lm
 	@/tmp/flux_test_config
 	@rm -f /tmp/flux_test_config
+	@echo "=== IP-Adapter parity tests (C port vs Python goldens) ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_ip_adapter debug/test_ip_adapter.c iris_ip_adapter.c iris_kernels.c iris_safetensors.c -lm
+	@/tmp/flux_test_ip_adapter
+	@rm -f /tmp/flux_test_ip_adapter
 	@echo "=== JPEG unit tests ==="
 	@$(MAKE) -C jpg_test test --no-print-directory
 	@echo "=== PNG tests ==="
