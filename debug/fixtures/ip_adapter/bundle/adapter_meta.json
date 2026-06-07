@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "adapter_type": "ip_adapter_klein",
+  "model_target": "flux-klein-9b",
+  "iris_version": "v2.7",
+  "num_blocks": 5,
+  "num_double_blocks": 1,
+  "num_single_blocks": 4,
+  "hidden_dim": 256,
+  "head_dim": 0,
+  "num_heads": 0,
+  "num_image_tokens": 8,
+  "siglip_dim": 64,
+  "perceiver_heads": 2,
+  "style_only": false,
+  "quant": "float16",
+  "training_step": 1,
+  "source_checkpoint": "step_0000001.safetensors",
+  "export_time": "2026-06-07T11:29:42Z",
+  "tensors": {
+    "perceiver.query_tokens": {
+      "shape": [
+        8,
+        256
+      ],
+      "dtype": "F16"
+    },
+    "perceiver.query_proj": {
+      "shape": [
+        256,
+        256
+      ],
+      "dtype": "F16"
+    },
+    "perceiver.key_proj": {
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "F16"
+    },
+    "perceiver.value_proj": {
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "F16"
+    },
+    "perceiver.out_proj": {
+      "shape": [
+        256,
+        256
+      ],
+      "dtype": "F16"
+    },
+    "perceiver.norm_weight": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
+    },
+    "perceiver.norm_bias": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
+    },
+    "ip_k_stacked": {
+      "shape": [
+        5,
+        256,
+        256
+      ],
+      "dtype": "F16"
+    },
+    "ip_v_stacked": {
+      "shape": [
+        5,
+        256,
+        256
+      ],
+      "dtype": "F16"
+    },
+    "ip_scale": {
+      "shape": [
+        5
+      ],
+      "dtype": "F32"
+    }
+  }
+}
