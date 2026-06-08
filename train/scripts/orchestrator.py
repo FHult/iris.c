@@ -2787,6 +2787,14 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     name           = fw_cfg["name"]
     max_iters      = int(fw_cfg.get("max_iterations", 20))
     steps_per_iter = int(fw_cfg.get("steps_per_iteration", 5000))
+    # resume_from_champion: warm-start every iteration from the campaign CHAMPION
+    # (best cond_gap) with a FRESH schedule (--warmstart-weights), instead of
+    # continuing the LATEST checkpoint with --resume. The default (latest + --resume)
+    # accumulates steps across iterations, so a regressed iteration compounds and the
+    # adapter over-trains (cond_gap falls while train_loss falls). Champion warm-start
+    # makes each iteration an independent re-roll on fresh data that cannot drag the
+    # working checkpoint below the champion. See plans/warmup-campaign-runbook.md §3.
+    resume_from_champion = bool(fw_cfg.get("resume_from_champion", False))
     n_shards       = int(fw_cfg.get("n_shards", 20))
     poll_interval  = int(fw_cfg.get("poll_interval", 60))
     ablation_every = int(fw_cfg.get("ablation_every_n", 0))
@@ -2847,7 +2855,16 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             except (IndexError, ValueError):
                 return 0
 
-        if not _base_ckpt_explicit_null:
+        if resume_from_champion:
+            # Always warm-start from the campaign champion (never the latest step
+            # checkpoint), so a regressed iteration can't compound. iter-1 (no best
+            # yet) falls back to base_checkpoint.
+            best = fw_db.get_best(name)
+            if best and best.get("checkpoint") and Path(best["checkpoint"]).exists():
+                resume_ckpt = best["checkpoint"]
+            else:
+                resume_ckpt = fw_cfg.get("base_checkpoint")
+        elif not _base_ckpt_explicit_null:
             # Auto-detect: use latest step checkpoint, falling back to DB best.
             ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"), key=_step_num)
             if ckpts:
@@ -3206,7 +3223,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     f"--data-root '{_fw_data_root}'"
                 )
                 if resume_ckpt and Path(resume_ckpt).exists():
-                    train_cmd += f" --resume '{resume_ckpt}'"
+                    # Champion warm-start uses a fresh schedule (start_step=0, fresh
+                    # warmup/optimizer) so steps don't accumulate across iterations.
+                    flag = "--warmstart-weights" if resume_from_champion else "--resume"
+                    train_cmd += f" {flag} '{resume_ckpt}'"
 
                 activated = (
                     f"export PIPELINE_DATA_ROOT='{_fw_data_root}' && "
@@ -3356,7 +3376,13 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     fw_db.mark_best_checkpoint(name, iteration)
                     log_orch(f"[flywheel:{name}] new best checkpoint  "
                              f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
-                resume_ckpt = ckpt_path
+                if resume_from_champion:
+                    # Next iteration warm-starts from the (possibly just-updated)
+                    # champion, not this iteration's output — no compounding.
+                    best = fw_db.get_best(name)
+                    resume_ckpt = (best.get("checkpoint") if best else None) or resume_ckpt
+                else:
+                    resume_ckpt = ckpt_path
 
             # Clean up staging symlinks
             try:
