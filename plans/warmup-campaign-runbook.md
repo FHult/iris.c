@@ -703,6 +703,17 @@ sampling absorbs it.)
   high, and its WARNING now states attribution-readiness inline (branch-to-ablation vs
   keep-warming). `_attribution_warmth()` reads `shard_scores.db`, fail-open.
 
+### Resolution (2026-06-08)
+
+The over-training was confirmed (not stinker draws): warmup-run2 resumed each iteration
+from the LATEST checkpoint via `--resume`, accumulating steps (1000→2000→3000) so the
+regression compounded. Fixed with the opt-in `resume_from_champion: true` orchestrator flag
+(warm-start from the champion each iter with a fresh schedule via `--warmstart-weights`; see
+BUGS.md PIPE-2). warmup-run2 was superseded; **warmup-run3** relaunched with the flag on,
+warm-starting from run2's preserved champion (`step1000`, cond_gap +0.0273), step budget 1000,
+ablation still off (attribution cold). The doctor's cond_gap-stall detector now flags the
+over-training signature (cond_gap declining while train_loss falls) distinctly from a plateau.
+
 ### Open item — recalibrate the ablation-ready floor
 The floor is currently `attr ≥ 2 × per_iter` (≈84). Since only the **exploited head** warms
 (not the pool), that's probably too high — a usable warm set may be 30–40 shards. Recalibrate

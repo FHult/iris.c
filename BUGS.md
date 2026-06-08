@@ -56,6 +56,29 @@
   to `build_shards.py` so each chunk occupies a disjoint shard ID space (chunk 1: 0–199999,
   chunk 2: 200000–399999, etc.), and shards are promoted without renaming to preserve the stem↔npz match.
 
+- **PIPE-2: Flywheel warm-start from LATEST checkpoint compounds regressions → over-training. FIXED 2026-06-08.**
+  - **Symptom (warmup-run2):** every iteration trained cleanly, but cond_gap declined
+    *monotonically* while train_loss fell — iter1 `+0.0273` (champion) → iter2 `-0.0054`
+    → iter3 `-0.0275`, with train_loss `1.0043 → 0.5328 → 0.3877`. The adapter was fitting
+    the flow objective harder while *losing* reference conditioning (cond_gap went negative).
+    Not stinker shards: three different shard mixes, all worse in lockstep with step count.
+  - **Root cause:** the flywheel resumed each iteration from the **latest** `step_*.safetensors`
+    via `--resume` (orchestrator `resume_ckpt = str(ckpts[-1])` for the initial pick and
+    `resume_ckpt = ckpt_path` for the per-iter carry-forward). `--resume` continues the step
+    counter, so steps *accumulated* across iterations (1000→2000→3000). A regressed iteration
+    then became the base for the next → compounding + over-training. The DB champion pointer
+    (`get_best`, kept at iter-1) was preserved for *shipping* but never used as the *training*
+    base.
+  - **Fix:** opt-in `resume_from_champion: true` (flywheel config). Each iteration warm-starts
+    from the campaign champion (best cond_gap) with a **fresh schedule** via
+    `--warmstart-weights` (start_step=0, fresh warmup/optimizer) instead of continuing the
+    latest. Each iteration is an independent re-roll on fresh data that cannot drag the working
+    checkpoint below the champion. Three gated touch points (initial pick, launch flag, carry-
+    forward). warmup-run2 was superseded and relaunched as **warmup-run3** with the flag on,
+    warm-starting from run2's preserved champion. Detector: the doctor cond_gap-stall check now
+    flags the over-training signature (cond_gap declining while train_loss falls) distinctly.
+    See plans/warmup-campaign-runbook.md §3.
+
 ## Training Anomalies (Chunk 1 — Observed, Not Actionable Now)
 
 - **ANOMALY-1: Shard-boundary stalls** — Two blocking stalls observed at step ~19,900 (55 min) and ~24,900 (2.6h). Root cause: epoch boundary + simultaneous JDB chunk 2 conversion competing for 2TBSSD I/O. Data% jumps to 100% in timing log. Both resolved automatically. Structural until pixel data is pre-cached to disk. See BACKLOG PIPELINE-3.
