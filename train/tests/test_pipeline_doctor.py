@@ -938,8 +938,11 @@ def _install_fake_flywheel_db(monkeypatch, tmp_path, iters_by_name):
     monkeypatch.setattr(flywheel_lib, "FlywheelDB", _FakeDB)
 
 
-def _it(i, cg, status="done"):
-    return {"iteration": i, "status": status, "cond_gap": cg}
+def _it(i, cg, status="done", loss=None):
+    d = {"iteration": i, "status": status, "cond_gap": cg}
+    if loss is not None:
+        d["train_loss"] = loss
+    return d
 
 
 class TestCondGapStall:
@@ -980,6 +983,36 @@ class TestCondGapStall:
         _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
         pd._check_cond_gap_stall({})
         assert _by_category("flywheel") == []  # only 3 done → too few
+
+    def test_overtraining_monotonic_decline_warns(self, doctor, tmp_path, monkeypatch):
+        # cond_gap monotonically down WHILE train_loss falls → over-training (fires at 3)
+        iters = [_it(1, 0.0273, loss=1.0043),
+                 _it(2, -0.0054, loss=0.5328),
+                 _it(3, -0.0275, loss=0.3877)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        fw = [i for i in _by_category("flywheel") if i.severity == "WARNING"]
+        assert len(fw) == 1
+        assert "over-training" in fw[0].title
+        assert fw[0].ctx["signature"] == "overtraining"
+        assert fw[0].ctx["champion_iter"] == 1
+
+    def test_decline_without_loss_fall_not_overtraining(self, doctor, tmp_path, monkeypatch):
+        # cond_gap down but train_loss RISING → not over-training; <4 done → also no stall
+        iters = [_it(1, 0.03, loss=0.4), _it(2, -0.005, loss=0.5), _it(3, -0.027, loss=0.6)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        assert _by_category("flywheel") == []
+
+    def test_overtraining_takes_precedence_over_stall(self, doctor, tmp_path, monkeypatch):
+        # 4 done, monotonic decline + falling loss → over-training (not the stall message)
+        iters = [_it(1, 0.05, loss=1.0), _it(2, 0.03, loss=0.7),
+                 _it(3, 0.01, loss=0.5), _it(4, -0.01, loss=0.4)]
+        _install_fake_flywheel_db(monkeypatch, tmp_path, {"c": iters})
+        pd._check_cond_gap_stall({})
+        fw = [i for i in _by_category("flywheel") if i.severity == "WARNING"]
+        assert len(fw) == 1
+        assert "over-training" in fw[0].title and "stalled" not in fw[0].title
 
     def test_stall_includes_attribution_warmth(self, doctor, tmp_path, monkeypatch):
         # When a shard_scores.db is present, the stall alert reports ablation-readiness.

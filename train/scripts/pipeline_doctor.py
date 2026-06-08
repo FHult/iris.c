@@ -2767,7 +2767,13 @@ def _check_cond_gap_stall(cfg: dict) -> None:
     warm-started checkpoint is no longer accumulating quality signal, so further
     iterations mostly burn compute. cond_gap is exactly what FlywheelDB.get_best
     ranks by, so a stalled champion means a stalled campaign — promote it or change
-    the recipe rather than iterating further. Mirrors debug/flywheel_refgap.py."""
+    the recipe rather than iterating further. Mirrors debug/flywheel_refgap.py.
+
+    Two signatures, over-training checked first (it's earlier and more specific):
+      - over-training: cond_gap declining monotonically WHILE train_loss falls — the
+        adapter overfits the flow objective and loses conditioning; needs a recipe /
+        warm-start-from-champion fix, not more iterations.
+      - plateau/stall: no new cond_gap high for N done iterations (flat, not falling)."""
     if not FLYWHEEL_DB_PATH.exists():
         return
     try:
@@ -2783,10 +2789,56 @@ def _check_cond_gap_stall(cfg: dict) -> None:
     health      = (cfg or {}).get("flywheel_health", {}) or {}
     stall_iters = int(health.get("cond_gap_stall_iters", 3))
 
+    overtrain_iters = int(health.get("overtrain_min_iters", 3))
+
     for name, iterations in per.items():
         done = [r for r in iterations
                 if (r.get("status") or "").lower() == "done"
                 and r.get("cond_gap") is not None]
+
+        # Over-training signature (checked first, fires earlier than the plateau):
+        # cond_gap declining monotonically WHILE train_loss also falls. The adapter
+        # is fitting the flow objective harder but losing reference conditioning —
+        # distinct from a flat plateau / stinker-draws. It tracks step count, persists
+        # across different shard mixes, and does NOT need warm attribution to diagnose.
+        if len(done) >= overtrain_iters:
+            win = done[-overtrain_iters:]
+            cgs = [r["cond_gap"] for r in win]
+            tls = [r.get("train_loss") for r in win]
+            cg_down = all(cgs[i] < cgs[i - 1] for i in range(1, len(cgs)))
+            tl_down = (all(t is not None for t in tls)
+                       and all(tls[i] <= tls[i - 1] for i in range(1, len(tls)))
+                       and tls[-1] < tls[0])
+            if cg_down and tl_down:
+                champ = max(done, key=lambda r: r["cond_gap"])
+                champ_it = champ.get("iteration")
+                cg0, cgN, tl0, tlN = cgs[0], cgs[-1], tls[0], tls[-1]
+                first_it, last_it = win[0].get("iteration"), win[-1].get("iteration")
+                _add("WARNING", "flywheel",
+                     f"Flywheel '{name}': cond_gap declining monotonically while train_loss "
+                     f"falls — over-training",
+                     detail=(f"Over the last {len(win)} done iterations (iter {first_it}->"
+                             f"{last_it}) cond_gap fell {cg0:+.4f}->{cgN:+.4f} while train_loss "
+                             f"fell {tl0:.4f}->{tlN:.4f}. The adapter is fitting the flow "
+                             f"objective harder but losing reference conditioning (cond_gap = "
+                             f"loss_null - loss_cond) — over-training, NOT bad shard draws: it "
+                             f"tracks step count and persists across different shard mixes, so "
+                             f"it needs no warm attribution to diagnose. Champion is iter "
+                             f"{champ_it} (cond_gap={champ['cond_gap']:+.4f}); the continued "
+                             f"chain is degrading it. Likely cause: warm-starting each iteration "
+                             f"from the LATEST checkpoint (steps accumulate) rather than the "
+                             f"champion, plus too long a step budget. Fix: warm-start from the "
+                             f"champion each iteration and shorten / early-stop on cond_gap; do "
+                             f"NOT keep iterating as-is."),
+                     fix=(f"train/.venv/bin/python debug/flywheel_refgap.py {name}  "
+                          f"# confirm the decline, then relaunch resume-from-champion + fewer steps"),
+                     ctx={"campaign": name, "champion_iter": champ_it,
+                          "champion_cond_gap": champ["cond_gap"],
+                          "cond_gap_first": cg0, "cond_gap_last": cgN,
+                          "train_loss_first": tl0, "train_loss_last": tlN,
+                          "window_iters": len(win), "signature": "overtraining"})
+                continue
+
         # Need a champion plus a full stall window of later successes before a
         # plateau can be called — early campaigns stay silent.
         if len(done) < stall_iters + 1:
