@@ -703,16 +703,32 @@ sampling absorbs it.)
   high, and its WARNING now states attribution-readiness inline (branch-to-ablation vs
   keep-warming). `_attribution_warmth()` reads `shard_scores.db`, fail-open.
 
-### Resolution (2026-06-08)
+### Resolution (2026-06-08 → 06-10): saturation → from-scratch data-selection
 
-The over-training was confirmed (not stinker draws): warmup-run2 resumed each iteration
-from the LATEST checkpoint via `--resume`, accumulating steps (1000→2000→3000) so the
-regression compounded. Fixed with the opt-in `resume_from_champion: true` orchestrator flag
-(warm-start from the champion each iter with a fresh schedule via `--warmstart-weights`; see
-BUGS.md PIPE-2). warmup-run2 was superseded; **warmup-run3** relaunched with the flag on,
-warm-starting from run2's preserved champion (`step1000`, cond_gap +0.0273), step budget 1000,
-ablation still off (attribution cold). The doctor's cond_gap-stall detector now flags the
-over-training signature (cond_gap declining while train_loss falls) distinctly from a plateau.
+Step 1 — **compounding fix.** warmup-run2 resumed each iteration from the LATEST checkpoint
+via `--resume`, accumulating steps (1000→2000→3000) so the regression compounded. Added the
+opt-in `resume_from_champion: true` flag (warm-start from the champion each iter with a fresh
+schedule via `--warmstart-weights`; BUGS.md PIPE-2). run2 superseded; **warmup-run3** relaunched
+with it.
+
+Step 2 — **saturation confirmed.** run3 iter-1 (champion warm-start, fresh schedule, 1000 steps)
+landed at cond_gap **−0.0057** — essentially identical to run2 iter-2's −0.0054. The warm-start
+*mechanism made no difference*: training ~1000 steps on top of the champion over-fits this data
+regardless. The only config that ever produced a positive cond_gap was the **from-scratch**
+1000-step run (run2 iter-1, +0.0273). So this is adapter saturation, not just a warm-start bug.
+
+Step 3 — **from-scratch data-selection.** Added `from_scratch_each_iter: true` (every iteration
+trains from random init). run3 superseded; **warmup-run4** relaunched with it. The flywheel is now
+a DATA-SELECTION loop: each iteration's cond_gap measures its shard mix's quality (comparable to
+the +0.0273 run), and the bandit + attribution optimize WHICH data. Output is `shard_scores.db`,
+not a shippable checkpoint — the production model comes from a final run on the selected data with
+held-out cond_gap early-stopping.
+
+The doctor's cond_gap-stall detector flags the over-training signature (cond_gap declining while
+train_loss falls) distinctly from a plateau. **Production-readiness prerequisites** from this
+finding are tracked in BACKLOG (PROD-1 held-out val set + T-05; PROD-2 cond_gap-based early-stop;
+FLYWHEEL-CKPT-1 per-iteration checkpoint archival — `resume_from_champion` is unsafe until that's
+fixed, since start_step=0 modes collide on `step_0001000`).
 
 ### Open item — recalibrate the ablation-ready floor
 The floor is currently `attr ≥ 2 × per_iter` (≈84). Since only the **exploited head** warms

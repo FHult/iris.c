@@ -1,0 +1,70 @@
+# Flywheel warm-up run 4 — from-scratch data-selection (over-training resolution)
+#
+# warmup-run2/3 established that the IP-adapter SATURATES: warm-start-and-keep-training
+# over-trains regardless of mechanism — run2 (--resume, accumulate) and run3
+# (--warmstart-weights, fresh schedule from the champion) both drove cond_gap
+# +0.0273 -> ~-0.005. The ONLY configuration that produced a positive cond_gap was the
+# from-scratch 1000-step run (run2 iter-1, +0.0273). See plans/warmup-campaign-runbook.md §3
+# and BUGS.md PIPE-2.
+#
+# This run uses from_scratch_each_iter: every iteration trains from random init on its
+# selected shard mix. cond_gap then measures THAT data's quality (comparable across iters,
+# like the +0.0273 run), and the bandit + contrastive attribution optimize WHICH data to
+# train on — the flywheel's real lever once training saturates. Output is shard_scores.db
+# (the data curation), not a shippable checkpoint; the production model comes from a final
+# run on the selected data with held-out cond_gap early-stopping (BACKLOG PROD-1/PROD-2).
+#
+# Ablation stays OFF: attribution is still cold (0/1280 fully attributed). Enable it only
+# once attribution warms (runbook §3 "run-vs-ablate"). shard_scores.db carries over from
+# run2/3 (shard-keyed), so attribution keeps accumulating.
+#
+# Launch:
+#   pipeline_ctl start-flywheel train/configs/flywheel_warmup_run4.yaml
+
+flywheel:
+  name: "warmup-run4"
+  max_iterations: 15
+  steps_per_iteration: 1000
+  n_shards: 40
+  poll_interval: 60
+  min_free_gb: 40
+
+  # Data-selection mode: every iteration trains from random init (no warm-start).
+  # base_checkpoint is irrelevant in this mode (kept null for clarity).
+  from_scratch_each_iter: true
+  base_checkpoint: null
+
+  training_config: "train/configs/stage1_512px.yaml"
+
+  # Cold shard pool (1280 tars + provenance.json). Selected shards are staged to
+  # hot per iteration.
+  shards_dir: "/Volumes/16TBCold/shards"
+
+  hyperparams:
+    cross_ref_prob: 0.35
+    style_loss_weight: 0.07
+
+  shard_selection:
+    performance_weight: 0.30   # low — few shards have reliable scores yet
+    min_diversity_pct:  0.30   # high — maximize visual diversity
+    exploration_rate:   0.40
+    recency_penalty:    0.20
+    recency_window_iters: 2
+
+    exploration_schedule:
+      - {through_iteration: 8,  rate: 0.45}
+      - {through_iteration: 15, rate: 0.35}
+
+    # Source minimums: guarantee a synthetic and a natural bucket each iter.
+    # Keys MUST match the corrected provenance-derived source labels.
+    per_source_min:
+      journeydb: 6
+      coyo:      6
+
+  min_attribution_obs: 3
+  siglip_sample_n: 50
+  shard_manifest: null
+
+  plateau_patience:   0        # disabled — too early to declare plateau
+  plateau_threshold:  0.02
+  ablation_every_n:   0        # disabled — attribution still cold (see runbook §3)
