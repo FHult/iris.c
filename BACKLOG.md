@@ -203,6 +203,19 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   trap); coverage checks read bundle key counts instead. (d) dataset.py cross-ref:
   sample a same-style reference from neighbors.sqlite, falling back to current behavior
   when the table is absent (inert until the orchestrator provides it).
+  **SREF-1W touchpoint checklist (operational surface for the fourth encoder step):**
+  orchestrator flywheel step (sentinels style.done/.error, heartbeat, retry, publish
+  bundles to cold, gated by flywheel-config `style_pairing: true`, default OFF);
+  data_stager/pipeline_setup (stage existing cold style BUNDLES hot for re-selected
+  shards — the reuse path; only first-contact shards encode); pipeline_doctor
+  (cold_precompute summary + staleness/cold checks add "style" with BUNDLE-aware
+  coverage = npz key counts; new failure modes: style step failed, neighbors.sqlite
+  missing while pairing expected; heartbeat staleness); pipeline_status (step in live
+  view + log tails); trainer (`data.style_neighbors_db` + style_pair_pct telemetry in
+  heartbeat/log); flywheel_lib (optional telemetry parse); ablation harness (inherits
+  the dataset fallback — nothing breaks; later: style_pair_prob sweep variable);
+  cache_manager (v2: register "style" encoder identity; v1 = own manifest);
+  DISPATCH.md telemetry reference (new heartbeat/sentinel/log names).
   Campaign decision: run4 may relaunch as-is (its purpose is data-selection warmth);
   the first style-paired campaign (run5) starts once SREF-1W lands.
 - **SREF-2: style-specific evaluation.** CLIP-I conflates style and content, so the
