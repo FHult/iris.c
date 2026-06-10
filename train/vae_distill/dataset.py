@@ -70,17 +70,54 @@ def build_index(
 
     Returns list of (shard_path, record_id) pairs.
     """
-    cache_dir = Path(vae_cache_dir)
+    # Resolve the 'current' symlink so the sidecar lands in the real version dir
+    cache_dir = Path(vae_cache_dir).resolve()
     if not cache_dir.exists():
         raise FileNotFoundError(f"VAE cache dir not found: {vae_cache_dir}")
 
-    # Build set of record IDs that have a cached latent
-    cached_ids: set[str] = {
-        p.stem for p in cache_dir.glob("*.npz")
-    }
+    # Enumerating ~1M flat .npz on a cold HDD takes an hour+ — never glob it
+    # per run. Build the record-ID set once, persist it as a sidecar keyed by
+    # the cache manifest's identity (version + record_count), and reload that
+    # on later runs. Any cache change produces a new manifest identity, so a
+    # stale sidecar is simply ignored (and eventually replaced).
+    sidecar: Optional[Path] = None
+    manifest_path = cache_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            import json as _json
+            _m = _json.loads(manifest_path.read_text())
+            sidecar = cache_dir / (f"_id_index_{_m.get('version', 'v')}_"
+                                   f"{int(_m.get('record_count', 0))}.txt")
+        except (OSError, ValueError):
+            sidecar = None
+
+    cached_ids: set[str] = set()
+    if sidecar is not None and sidecar.exists():
+        cached_ids = set(sidecar.read_text().split())
+        print(f"  [dataset] {len(cached_ids):,} cached latents "
+              f"(id-index sidecar {sidecar.name})")
+    else:
+        print(f"  [dataset] enumerating {cache_dir} — first run for this cache "
+              f"version; the ID index is persisted for future runs ...",
+              flush=True)
+        with os.scandir(cache_dir) as it:
+            for entry in it:
+                n = entry.name
+                # record IDs look like 000123_0456.npz; skips manifest/stats/sidecars
+                if n.endswith(".npz") and n[:6].isdigit():
+                    cached_ids.add(n[:-4])
+        if sidecar is not None and cached_ids:
+            tmp = sidecar.with_suffix(".tmp")
+            try:
+                tmp.write_text("\n".join(sorted(cached_ids)))
+                tmp.rename(sidecar)
+                print(f"  [dataset] wrote id-index sidecar {sidecar.name}")
+            except OSError as exc:
+                print(f"  [dataset] sidecar write failed ({exc}) — continuing")
+        print(f"  [dataset] {len(cached_ids):,} cached latents in {cache_dir}")
+
     if not cached_ids:
         raise RuntimeError(f"No .npz files found in {vae_cache_dir}")
-    print(f"  [dataset] {len(cached_ids):,} cached latents in {vae_cache_dir}")
 
     # Group cached IDs by shard prefix (first 6 chars = shard ID zero-padded)
     shard_to_ids: dict[str, list[str]] = defaultdict(list)
