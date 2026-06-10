@@ -2795,6 +2795,15 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     # makes each iteration an independent re-roll on fresh data that cannot drag the
     # working checkpoint below the champion. See plans/warmup-campaign-runbook.md §3.
     resume_from_champion = bool(fw_cfg.get("resume_from_champion", False))
+    # from_scratch_each_iter: train every iteration from random init (no --resume,
+    # no --warmstart-weights). Turns the flywheel into a DATA-SELECTION loop: each
+    # iteration's cond_gap measures the quality of its selected shard mix (like a
+    # fresh 1000-step run), and the bandit/attribution optimize WHICH data — without
+    # the over-training that warm-start-and-keep-training causes on a saturating
+    # adapter (warmup-run2/3: warm-start drove cond_gap +0.0273 -> ~-0.005 regardless
+    # of mechanism; only from-scratch produced a positive gap). Takes precedence over
+    # resume_from_champion. Output is shard_scores.db, not a shippable checkpoint.
+    from_scratch_each_iter = bool(fw_cfg.get("from_scratch_each_iter", False))
     n_shards       = int(fw_cfg.get("n_shards", 20))
     poll_interval  = int(fw_cfg.get("poll_interval", 60))
     ablation_every = int(fw_cfg.get("ablation_every_n", 0))
@@ -2855,7 +2864,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             except (IndexError, ValueError):
                 return 0
 
-        if resume_from_champion:
+        if from_scratch_each_iter:
+            # Data-selection mode: every iteration starts from random init.
+            resume_ckpt = None
+        elif resume_from_champion:
             # Always warm-start from the campaign champion (never the latest step
             # checkpoint), so a regressed iteration can't compound. iter-1 (no best
             # yet) falls back to base_checkpoint.
@@ -3376,7 +3388,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     fw_db.mark_best_checkpoint(name, iteration)
                     log_orch(f"[flywheel:{name}] new best checkpoint  "
                              f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
-                if resume_from_champion:
+                if from_scratch_each_iter:
+                    resume_ckpt = None          # every iteration is independent
+                elif resume_from_champion:
                     # Next iteration warm-starts from the (possibly just-updated)
                     # champion, not this iteration's output — no compounding.
                     best = fw_db.get_best(name)

@@ -154,6 +154,33 @@ Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically 
 
 Proof-of-concept validated (2026-05-11, `train/reports/ip_adapter_v1/`): the adapter architecture and training signal are sound. The model responds to the style reference with coherent, stable output (CLIP-I 0.53, no NaN, correct image structure). The gap to production quality is entirely a matter of scale and refinement — no architectural rethink is required.
 
+**PRODUCTION-READINESS PREREQUISITES (gating — from the warmup-run2/3 over-training finding, 2026-06).**
+The IP-adapter over-trains: cond_gap (held-out conditioning quality) degrades while train_loss
+falls. In the warmup flywheel this was severe (cond_gap +0.0273 → −0.0057 after ~2000 steps on
+42 shards) because tiny per-iteration data → high epochs-per-sample. Production trains over
+~200k-record chunks so the *severity* is far lower, but it shares the warm-start-and-keep-training
+structure and is **currently unguarded**. Do NOT start a production run without these:
+
+- **PROD-1: Create the held-out validation set + enable T-05.** The trainer's held-out
+  validation (`_compute_val_loss`, T-05) is wired but DISABLED because no val set exists
+  ("Validation held-out: not found — T-05 disabled"; the doctor's standing `val_set` warning).
+  Run `pipeline_ctl create-val-set` + precompute it so T-05 has `_val_shards`. Prerequisite for
+  ANY production run — without it, checkpoint selection has zero held-out signal.
+- **PROD-2: Select checkpoints + early-stop on held-out COND_GAP, never train_loss.** The core
+  lesson: train_loss (and even raw val_loss) fall while cond_gap degrades, so they are misleading
+  stop signals. Extend T-05 to compute held-out cond_gap (loss_null − loss_cond) and select/early-
+  stop at its peak. Bake the over-training signature (cond_gap down while train_loss down — already
+  in the doctor's cond_gap-stall detector) into production monitoring. Also size the per-chunk step
+  budget to chunk size (epochs-per-sample is the real overfit driver) — tune via the warmup/ablation.
+- **FLYWHEEL-CKPT-1: per-iteration checkpoint archival (start_step=0 collision).** With
+  `--warmstart-weights` (resume_from_champion) or from-scratch mode, every iteration saves
+  `step_0001000.safetensors`, so `ckpt_path = ckpts[-1]` resolves to the same clobbered file each
+  iter → get_best's recorded path points at the latest (not best) weights, reintroducing
+  compounding at iter-3+. Fix: after each iteration, move/record a unique iteration-tagged
+  checkpoint (e.g. `iter{N}_step_0001000.safetensors`) so get_best returns a stable champion file.
+  (The from-scratch data-selection flywheel doesn't depend on this — its output is shard scores —
+  but resume_from_champion is unsafe until it's fixed.)
+
 **Phased plan (full detail in memory file `train7_plan.md`):**
 
 1. **Memory profiling run** (gate, < 2 hours) — run 60 steps at 768px and 1024px with
