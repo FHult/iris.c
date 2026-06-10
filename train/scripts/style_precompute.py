@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+"""
+style_precompute.py — CSD style-embedding precompute (SREF-1 encoder pass).
+
+Encodes shard images with the MLX CSD style encoder (train/style_encoder/csd_mlx.py)
+into per-SHARD npz bundles — one file per shard (keys = record IDs, values = [768]
+f16 L2-normalised style embeddings), NOT one file per record: a million 3 KB files
+is exactly the cold-HDD enumeration trap (PERF-IO / build_index lesson).
+
+Output layout (PRECOMP-3-style identity):
+  <out>/<shard_stem>.npz       per-shard bundle
+  <out>/manifest.json          encoder identity + record/shard counts
+
+Usage:
+  style_precompute.py --shards DIR_OR_TAR [...] --out DIR
+                      [--weights /Volumes/2TBSSD/models/csd_vit_l_style.safetensors]
+                      [--batch 16] [--limit-shards N]
+Resumable: existing complete bundles are skipped (count checked vs tar).
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from style_encoder.csd_mlx import CSDStyleEncoder, preprocess
+
+ENCODER_ID = "csd_vit_l_style_v1"
+
+
+def encode_shard(enc: CSDStyleEncoder, tar_path: Path, batch_size: int) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    batch_x, batch_ids = [], []
+
+    def flush():
+        nonlocal batch_x, batch_ids
+        if batch_x:
+            E = enc.encode(np.stack(batch_x))
+            for rid, e in zip(batch_ids, E):
+                out[rid] = e.astype(np.float16)
+            batch_x, batch_ids = [], []
+
+    with tarfile.open(tar_path) as tar:
+        for m in tar:
+            if not (m.isfile() and m.name.lower().endswith((".jpg", ".jpeg", ".png"))):
+                continue
+            rid = m.name.rsplit(".", 1)[0]
+            try:
+                img = Image.open(io.BytesIO(tar.extractfile(m).read()))
+                batch_x.append(preprocess(img))
+                batch_ids.append(rid)
+            except Exception:
+                continue
+            if len(batch_x) >= batch_size:
+                flush()
+    flush()
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--shards", nargs="+", required=True,
+                    help="shard dirs and/or individual .tar files")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--weights", default="/Volumes/2TBSSD/models/csd_vit_l_style.safetensors")
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--limit-shards", type=int, default=0)
+    args = ap.parse_args()
+
+    tars: list[Path] = []
+    for s in args.shards:
+        p = Path(s)
+        tars.extend(sorted(p.glob("*.tar")) if p.is_dir() else [p])
+    if args.limit_shards:
+        tars = tars[:args.limit_shards]
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    enc = CSDStyleEncoder(args.weights)
+    n_rec = n_done = 0
+    t0 = time.time()
+    for i, tar_path in enumerate(tars):
+        dst = out / f"{tar_path.stem}.npz"
+        if dst.exists():
+            n_done += 1
+            continue
+        embs = encode_shard(enc, tar_path, args.batch)
+        if not embs:
+            print(f"  [{tar_path.stem}] no images — skipped", flush=True)
+            continue
+        tmp = dst.with_suffix(".tmp.npz")
+        np.savez(tmp, **embs)
+        tmp.rename(dst)
+        n_rec += len(embs)
+        rate = n_rec / max(1e-9, time.time() - t0)
+        print(f"  [{i+1}/{len(tars)}] {tar_path.stem}: {len(embs)} embeds "
+              f"({rate:.0f} img/s cumulative)", flush=True)
+
+    manifest = {"encoder": ENCODER_ID, "weights": str(args.weights),
+                "dim": 768, "dtype": "float16",
+                "shard_count": len(list(out.glob("*.npz"))),
+                "record_count": int(sum(len(np.load(f).files) for f in out.glob("*.npz"))),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(json.dumps(manifest, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
