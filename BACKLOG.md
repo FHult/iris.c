@@ -186,10 +186,25 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   ~0.82–0.90 pair-ratio — but **nearest-neighbor pairing meets the gate: top-1 0.591,
   top-5 0.679** vs random. Design therefore: per-record top-k style-neighbor lists (k~5),
   and cross-ref loads a NEIGHBOR's SigLIP features (dataset.py change) instead of the
-  previous loader image. Remaining: (a) style-descriptor precompute as a PRECOMP-3 encoder
-  identity — per-iteration for selected shards (~30 min/iter) or a ~10–16h full-pool
-  backfill; (b) neighbor-list builder over the style cache; (c) the dataset.py cross-ref
-  rewrite. All GPU-light except the backfill.
+  previous loader image. Both builder scripts LANDED and val-validated 2026-06-11
+  (style_precompute.py, style_neighbors.py — ratio 0.683, near-dupe exclusion working,
+  visual confirmation: Frazetta-style ref's top neighbor = same style, different content).
+  Remaining — **orchestrator wiring spec (SREF-1W, decided 2026-06-11):**
+  (a) Style runs as a FOURTH per-iteration precompute step in the ORCHESTRATOR (not
+  inside precompute_all's model juggling): after precompute_all completes, run
+  style_precompute.py over the staged shards (~30 min/42 shards), then
+  style_neighbors.py over the result — same sentinel/heartbeat/log pattern as the other
+  steps; publish bundles to cold (encoder-identity dir) for PRECOMP-3 reuse.
+  (b) **Iteration-local neighbors**: build lists WITHIN the staged shards only (~210K
+  records — the gate was met on 994, coverage is ample). The loader reads a neighbor's
+  SigLIP features from HOT staging — zero cold I/O at train time, no global neighbor
+  state to maintain. (c) Style keeps its per-SHARD bundle layout + own manifest — do NOT
+  force it into precompute_all's per-record-npz conventions (the million-tiny-files
+  trap); coverage checks read bundle key counts instead. (d) dataset.py cross-ref:
+  sample a same-style reference from neighbors.sqlite, falling back to current behavior
+  when the table is absent (inert until the orchestrator provides it).
+  Campaign decision: run4 may relaunch as-is (its purpose is data-selection warmth);
+  the first style-paired campaign (run5) starts once SREF-1W lands.
 - **SREF-2: style-specific evaluation.** CLIP-I conflates style and content, so the
   golden-set eval cannot see sref quality. Add per-generation: style similarity to ref
   (Gram-distance / CSD-like, content-invariant), content-leak from ref (subject copied?
