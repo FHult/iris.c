@@ -1,6 +1,15 @@
 # train/configs/stage2_768px.yaml
 # Stage 2 training configuration — 768px fine-tune from Stage 1 checkpoint
-# Expected wall-clock: ~1.05 days on M1 Max 32GB (scenario B)
+#
+# TRAIN-7 memory gate PASSED 2026-06-10: 768px bwd peak 19.33 GB, system <=22.4 GB,
+# measured ~9 s/step (cached) => 20K steps ~= 2.1 days on M1 Max 32GB.
+#
+# Prerequisites:
+#   1. Precompute 768px VAE latents into vae_cache_dir below (tiled path fixed
+#      2026-06-10):  precompute_all.py --image-size 768 --vae-output <dir> ...
+#      Live VAE encode is NOT a fallback — the online-encode path segfaults
+#      MLX (BUGS.md MLX-1). Train cached-only.
+#   2. Qwen3/SigLIP caches are resolution-agnostic — reuse Stage 1's.
 
 model:
   flux_model_dir: "flux-klein-model"
@@ -10,17 +19,25 @@ model:
 
 adapter:
   num_blocks: 25
+  num_double_blocks: 5
   hidden_dim: 3072
   num_image_tokens: 128
   siglip_dim: 1152
   perceiver_depth: 4
   perceiver_heads: 16
+  style_only: false
+  sref_strength: 1.0
+  freeze_double_stream_scales: true        # match Stage 1 (single-stream style)
+  block_gradient_checkpointing: false      # not needed: 19.33 GB bwd peak at 768px
 
 data:
   shard_path: "train/data/shards"
-  qwen3_cache_dir: "train/data/precomputed/qwen3"    # reuse Stage 1 cache
-  vae_cache_dir: null                      # 768px latents not pre-computed (different size)
-  siglip_cache_dir: null
+  # Pin to the precompute resolution — with cached VAE a non-matching bucket is
+  # a hard cache miss and the sample is skipped (see CLAUDE.md invariant #1).
+  bucket: [768, 768]
+  qwen3_cache_dir: "train/data/precomputed/qwen3"     # reuse Stage 1 (res-agnostic)
+  vae_cache_dir: "train/data/precomputed/vae_768"     # MUST be a separate 768px cache
+  siglip_cache_dir: "train/data/precomputed/siglip"   # reuse Stage 1 (res-agnostic)
   batch_size: 1                            # reduced at 768px (activation budget)
   prefetch_batches: 4
   num_prefetch_threads: 2
@@ -35,10 +52,16 @@ training:
   ema_update_every: 10
   image_dropout_prob: 0.30
   text_dropout_prob: 0.10
+  # Quality signals — carried over from Stage 1 (were missing here; BACKLOG TRAIN-7 #2)
+  correct_forward_q: true                  # Option C: IP-injected forward for Q extraction
+  cross_ref_prob: 0.5
+  patch_shuffle_prob: 0.5
+  style_loss_weight: 0.05                  # monitor grad_norm — reduce to 0.01 if spikes
+  style_loss_every: 1
 
 output:
   checkpoint_dir: "checkpoints/stage2"
-  checkpoint_every: 500                    # steps between checkpoints (~1h at 8s/step)
+  checkpoint_every: 500                    # ~75 min between checkpoints at 9 s/step
   keep_last_n: 5
   log_every: 50
 

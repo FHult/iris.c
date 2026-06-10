@@ -1,0 +1,79 @@
+# train/configs/stage3_1024px.yaml
+# Stage 3 — 1024 px fine-tune (high-resolution sref)
+#
+# TRAIN-7 memory gate PASSED 2026-06-10: 1024px bwd peak 21.32 GB, system <=21.5 GB
+# (~10 GB headroom on 32 GB M1 Max, NO gradient checkpointing needed), measured
+# ~18 s/step (cached) => 10K steps ~= 2.1 days. Start with a small pilot
+# (1-2K steps) before any long run.
+#
+# Prerequisites:
+#   - 768 px Stage 2 completed (or at least a strong 512 px foundation)
+#   - Precompute 1024px VAE latents into vae_cache_dir below (tiled path fixed
+#     2026-06-10):  precompute_all.py --image-size 1024 --vae-output <dir> ...
+#     Live VAE encode is NOT a fallback — online-encode segfaults MLX (MLX-1).
+#   - Shard resolution sweep — enough native 1024px (or near-native) images
+#
+# Warm-start from the best 768 px (preferred) or 512 px checkpoint.
+
+model:
+  flux_model_dir: "flux-klein-model"
+  qwen3_model_dir: "flux-klein-model"
+  siglip_model: "google/siglip-so400m-patch14-384"
+  warmstart_path: "checkpoints/stage2/best.safetensors"   # or stage1 best as fallback
+
+adapter:
+  num_blocks: 25
+  num_double_blocks: 5
+  hidden_dim: 3072
+  num_image_tokens: 128
+  siglip_dim: 1152
+  perceiver_depth: 4
+  perceiver_heads: 16
+  # 1024 px often benefits from slightly stronger style-only behaviour
+  style_only: false
+  sref_strength: 1.0
+  freeze_double_stream_scales: true
+  block_gradient_checkpointing: false      # gate measured 21.32 GB bwd — not needed
+
+data:
+  shard_path: "train/data/shards"                 # or cold_root equivalent
+  # Pin to the precompute resolution (cached-VAE bucket invariant, CLAUDE.md #1)
+  bucket: [1024, 1024]
+  # 1024 px latents must be pre-computed at native resolution (different cache dir!)
+  qwen3_cache_dir: "train/data/precomputed/qwen3" # text embeddings are resolution-agnostic
+  vae_cache_dir: "train/data/precomputed/vae_1024" # MUST be a separate 1024 px cache
+  siglip_cache_dir: "train/data/precomputed/siglip"
+  # Stronger hard-example mix at high-res if you have good mined examples
+  # (data-section key — the loader reads it from here, not training:)
+  hard_mix_ratio: 0.08
+  batch_size: 1
+  prefetch_batches: 3
+  num_prefetch_threads: 2
+
+training:
+  num_steps: 10000          # start very small; 10 k steps is already a serious pilot
+  warmup_steps: 200
+  learning_rate: 1.5e-5     # lower LR for high-res fine-tune
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  ema_update_every: 10
+  image_dropout_prob: 0.30
+  text_dropout_prob: 0.10
+
+  # Keep the best QUALITY settings discovered during the 512/768 foundation ablations
+  correct_forward_q: true   # Option C — was missing (silently off = weaker Q extraction)
+  cross_ref_prob: 0.35
+  patch_shuffle_prob: 0.25
+  style_loss_weight: 0.05
+  style_loss_every: 2
+
+output:
+  checkpoint_dir: "checkpoints/stage3_1024"
+  checkpoint_every: 500
+  keep_last_n: 5
+  log_every: 50
+
+logging:
+  wandb_project: "iris-ip-adapter"
+  wandb_run_name: "stage3-1024px-foundation"
