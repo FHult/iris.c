@@ -230,6 +230,12 @@ static int load_adapter_split_qkv(lora_adapter_t *aq, lora_adapter_t *ak, lora_a
         free(aq->lora_A); free(aq->lora_B);
         free(ak->lora_A); free(ak->lora_B);
         free(av->lora_A); free(av->lora_B);
+        /* NULL the fields: the transformer gates application on lora_A != NULL
+         * and lora_free frees them again — dangling pointers here would be a
+         * use-after-free at apply time and a double-free at teardown. */
+        aq->lora_A = aq->lora_B = NULL;
+        ak->lora_A = ak->lora_B = NULL;
+        av->lora_A = av->lora_B = NULL;
         free(down_f32); free(up_f32);
         return 0;
     }

@@ -116,9 +116,6 @@ typedef struct {
 
     /* Opaque handle to the open safetensors file (keeps mmap alive) */
     void  *_sf_handle;
-
-    /* Backing heap allocation for F32-converted weights (if not mmap direct) */
-    void  *_heap;
 } iris_ip_adapter_t;
 
 

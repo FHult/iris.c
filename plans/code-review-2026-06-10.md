@@ -233,11 +233,11 @@ budget is constant across iterations, but small deltas are noise — require rep
 | 2 | ~~P2: join/cancel stage thread in restart path~~ **FIXED same day** (join before rmtree) | Medium | done |
 | 3 | ~~M2: archive champion EMA per iteration~~ **FIXED same day** (`iterNNNN_best.safetensors` archive + iter-keyed prune) | Med-High | done |
 | 4 | M1: held-out cond_gap for the flywheel metric (wire PROD-2 + PROD-1 val set into `collect_metrics`) | High | medium |
-| 5 | C1: NULL adapter fields on `load_adapter_split_qkv` failure | Medium | trivial |
+| 5 | ~~C1: NULL adapter fields on `load_adapter_split_qkv` failure~~ **FIXED same day** | Medium | done |
 | 6 | C2: status returns (or memset+log) for silent-OOM attention/ip_adapter paths | Med-Low | small |
 | 7 | M3: watch selection concentration; tune recency penalty if head keeps growing | Medium | config |
 | 8 | P3: narrow broad excepts in orchestrator + trainer only | Hygiene | medium |
-| 9 | C3/C4/C5: shared resolution constant; size_t casts; validate int8 scale numel | Low | small |
+| 9 | C4/C5/C9 **FIXED same day** (qwen3 size_t casts ×20; int8 scale-numel validation; dead `_heap` removed); C3 (shared resolution constant) remains | Low | partial |
 | 10 | Q2: prioritize `freeze_double_stream_scales` arm when ablation unlocks | Quality | config |
 
 Items 1-2 should land before the next `pause --free-gpu` use; item 3 before any iteration

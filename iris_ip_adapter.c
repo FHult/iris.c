@@ -86,13 +86,20 @@ static float *load_tensor_f32(safetensors_file_t *sf, const char *name) {
     snprintf(sname, sizeof(sname), "%s.scale", name);
     const safetensor_t *st = safetensors_find(sf, sname);
     if (!st) return NULL;
-    float *scale = safetensors_get_f32(sf, st);
-    const int8_t *q = (const int8_t *)safetensors_data(sf, t);
-    if (!scale || !q) { free(scale); return NULL; }
 
     int64_t n = safetensor_numel(t);
     int64_t cols = (t->ndim > 0) ? t->shape[t->ndim - 1] : n;
     int64_t rows = (cols > 0) ? n / cols : 0;
+    /* The companion scale must have exactly one entry per row — a malformed
+     * bundle would otherwise read past the scale buffer. */
+    if (safetensor_numel(st) != rows) {
+        fprintf(stderr, "ip_adapter: %s.scale has %lld entries, expected %lld rows\n",
+                name, (long long)safetensor_numel(st), (long long)rows);
+        return NULL;
+    }
+    float *scale = safetensors_get_f32(sf, st);
+    const int8_t *q = (const int8_t *)safetensors_data(sf, t);
+    if (!scale || !q) { free(scale); return NULL; }
     float *out = malloc((size_t)n * sizeof(float));
     if (out) {
         for (int64_t r = 0; r < rows; r++)
