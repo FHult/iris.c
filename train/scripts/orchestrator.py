@@ -2507,8 +2507,60 @@ def _git_sha() -> str:
         return ""
 
 
-def _check_flywheel_control(name: str, fw_db: Optional[object] = None) -> None:
-    """Handle pause/stop signals from FLYWHEEL_CONTROL_FILE."""
+class _RestartIteration(Exception):
+    """Raised by _check_flywheel_control on `pause --free-gpu` after the GPU work has been
+    killed and the campaign resumed — unwinds to the iteration loop, which re-runs the
+    interrupted iteration (precompute resumes from cache; training re-runs cleanly)."""
+
+
+# Holds the currently-running flywheel GPU subprocess (precompute Popen) so a pause can
+# kill it to free the device. Training runs in TMUX_TRAIN_WIN (killed by window name).
+_FLYWHEEL_GPU_PROC: list = [None]
+
+
+def _kill_flywheel_gpu(name: str) -> None:
+    """Terminate whatever flywheel GPU work is running — the registered precompute
+    subprocess and/or the training window — so the GPU frees within seconds."""
+    proc = _FLYWHEEL_GPU_PROC[0]
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        log_orch(f"[flywheel:{name}] pause --free-gpu: killed precompute subprocess (GPU freed)")
+    if tmux_window_exists(TMUX_TRAIN_WIN):
+        subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"],
+                       check=False)
+        log_orch(f"[flywheel:{name}] pause --free-gpu: killed training window (GPU freed)")
+
+
+def _interruptible_proc_wait(proc, name: str, fw_db: Optional[object] = None,
+                             poll: int = 10) -> None:
+    """Wait for a precompute subprocess while honoring pause/stop signals (so a
+    `pause --free-gpu` can interrupt it). Registers the proc for killing for the
+    duration. Propagates _RestartIteration on free-gpu pause."""
+    _FLYWHEEL_GPU_PROC[0] = proc
+    try:
+        while proc.poll() is None:
+            _check_flywheel_control(name, fw_db)   # may raise _RestartIteration
+            time.sleep(poll)
+    finally:
+        _FLYWHEEL_GPU_PROC[0] = None
+
+
+def _check_flywheel_control(name: str, fw_db: Optional[object] = None,
+                            allow_restart: bool = True) -> None:
+    """Handle pause/stop signals from FLYWHEEL_CONTROL_FILE.
+
+    allow_restart=False at call sites BEFORE the per-iteration GPU-work try (top of loop,
+    window/lock waits): there a `pause --free-gpu` just waits in place and then proceeds —
+    no iteration to re-run, so it must not raise _RestartIteration (which would escape
+    uncaught)."""
     if not FLYWHEEL_CONTROL_FILE.exists():
         return
     try:
@@ -2520,28 +2572,40 @@ def _check_flywheel_control(name: str, fw_db: Optional[object] = None) -> None:
             release_gpu_lock()
             sys.exit(0)
         elif action == "pause":
-            log_orch(f"[flywheel:{name}] paused — waiting for resume")
+            free_gpu = bool(ctrl.get("free_gpu"))
+            if free_gpu:
+                # Kill the running GPU work now so the device frees within seconds; on
+                # resume we raise _RestartIteration so the iteration re-runs from cache.
+                _kill_flywheel_gpu(name)
+                log_orch(f"[flywheel:{name}] paused (GPU freed) — waiting for resume")
+            else:
+                log_orch(f"[flywheel:{name}] paused — waiting for resume")
+            if fw_db is not None:
+                fw_db.set_campaign_status(name, "paused")
             while True:
                 time.sleep(30)
-                if not FLYWHEEL_CONTROL_FILE.exists():
-                    log_orch(f"[flywheel:{name}] resumed (control file removed)")
-                    if fw_db is not None:
-                        fw_db.set_campaign_status(name, "active")
-                    break
-                ctrl2 = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
-                if ctrl2.get("action") == "stop":
-                    log_orch(f"[flywheel:{name}] stop signal while paused — exiting")
-                    FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
-                    release_gpu_lock()
-                    sys.exit(0)
-                if ctrl2.get("action") in ("run", "resume"):
-                    FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+                resumed = not FLYWHEEL_CONTROL_FILE.exists()
+                if not resumed:
+                    ctrl2 = json.loads(FLYWHEEL_CONTROL_FILE.read_text())
+                    if ctrl2.get("action") == "stop":
+                        log_orch(f"[flywheel:{name}] stop signal while paused — exiting")
+                        FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+                        release_gpu_lock()
+                        sys.exit(0)
+                    resumed = ctrl2.get("action") in ("run", "resume")
+                    if resumed:
+                        FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+                if resumed:
                     log_orch(f"[flywheel:{name}] resumed")
                     if fw_db is not None:
                         fw_db.set_campaign_status(name, "active")
+                    if free_gpu and allow_restart:
+                        raise _RestartIteration()
                     break
         else:
             FLYWHEEL_CONTROL_FILE.unlink(missing_ok=True)
+    except _RestartIteration:
+        raise   # not an error — must propagate to the iteration loop
     except Exception as e:
         log_orch(f"[flywheel:{name}] control file error: {e}", level="warning")
 
@@ -2905,7 +2969,8 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
         plateau_ablation_runs    = int(fw_cfg.get("plateau_ablation_runs",  0))
 
         while iteration <= max_iters:
-            _check_flywheel_control(name, fw_db)
+            _restart = False
+            _check_flywheel_control(name, fw_db, allow_restart=False)
 
             # Disk guard
             gb     = free_gb()
@@ -3116,7 +3181,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 log_orch(f"[flywheel:{name}] {TMUX_TRAIN_WIN} already running — waiting",
                          level="warning")
                 while tmux_window_exists(TMUX_TRAIN_WIN):
-                    _check_flywheel_control(name, fw_db)
+                    _check_flywheel_control(name, fw_db, allow_restart=False)
                     time.sleep(poll_interval)
 
             # Acquire the GPU lock *once* for the whole iteration's work (precompute + training).
@@ -3128,7 +3193,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 holder = gpu_lock_holder()
                 log_orch(f"[flywheel:{name}] GPU busy (holder={holder}), waiting 30s",
                          level="warning")
-                _check_flywheel_control(name, fw_db)
+                _check_flywheel_control(name, fw_db, allow_restart=False)
                 time.sleep(30)
 
             try:
@@ -3187,7 +3252,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                                 flywheel_name=name, iteration=iteration)
                 if _pass1_proc is not None:
                     log_orch(f"[flywheel:{name}] iter {iteration}: waiting for precompute pass 1")
-                    _pass1_proc.wait()
+                    _interruptible_proc_wait(_pass1_proc, name, fw_db)
                     if _pass1_proc.returncode == 0:
                         log_orch(f"[flywheel:{name}] iter {iteration}: precompute pass 1 complete")
                     else:
@@ -3201,7 +3266,8 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 log_orch(f"[flywheel:{name}] iter {iteration}: precomputing Qwen3/VAE/SigLIP "
                          f"{_pass_label} → {precomp_base}")
                 pre_full = f"({full_pre}) >> '{log_pre}' 2>&1 ; echo EXIT_CODE=$? >> '{log_pre}'"
-                subprocess.run(["bash", "-c", pre_full])
+                _pass2_proc = subprocess.Popen(["bash", "-c", pre_full])
+                _interruptible_proc_wait(_pass2_proc, name, fw_db)
                 pre_exit = last_exit_code(log_pre)
                 if pre_exit == 0:
                     log_orch(f"[flywheel:{name}] iter {iteration}: precompute complete")
@@ -3283,9 +3349,22 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                             f"[flywheel:{name}] iter {iteration}: publish of precomp npz to cold (versioned) failed: {_pub_err}",
                             level="warning",
                         )
+            except _RestartIteration:
+                # pause --free-gpu: GPU work already killed + campaign resumed; re-run
+                # this iteration (no increment). The finally releases the GPU lock.
+                _restart = True
             finally:
                 release_gpu_lock()
                 train_cfg_path.unlink(missing_ok=True)
+
+            if _restart:
+                _restart = False
+                try:
+                    shutil.rmtree(staging_dir)
+                except OSError:
+                    pass
+                log_orch(f"[flywheel:{name}] re-running iter {iteration} after pause --free-gpu")
+                continue
 
             elapsed   = int(time.time() - t_start)
             exit_code = last_exit_code(log_file)

@@ -63,8 +63,15 @@ def _write_control(action: str, **kwargs) -> None:
     print(f"Control signal written: {action}")
 
 
-def cmd_pause(_args) -> None:
-    _write_control("pause")
+def cmd_pause(args) -> None:
+    if getattr(args, "free_gpu", False):
+        # Kill the running precompute/training so the GPU frees within seconds; the
+        # interrupted iteration is re-run from cache on resume (flywheel only).
+        _write_control("pause", free_gpu=True)
+        print("Paused with --free-gpu: the orchestrator will kill the running GPU work "
+              "(precompute/training) and re-run that iteration on resume.")
+    else:
+        _write_control("pause")
 
 
 def cmd_resume(_args) -> None:
@@ -1207,7 +1214,10 @@ def main() -> None:
     p.add_argument("--yes", "-y", action="store_true",
                    help="Auto-confirm downloading the val tgz if not yet in pool")
 
-    sub.add_parser("pause",               help="Pause orchestrator")
+    p = sub.add_parser("pause",           help="Pause orchestrator")
+    p.add_argument("--free-gpu", action="store_true",
+                   help="Flywheel: kill the running precompute/training so the GPU frees "
+                        "within seconds; the iteration re-runs from cache on resume.")
     sub.add_parser("resume",              help="Clear pause signal")
     sub.add_parser("abort",               help="Abort orchestrator and prep")
     p = sub.add_parser("restart-orchestrator", help="Restart iris-orch tmux window")

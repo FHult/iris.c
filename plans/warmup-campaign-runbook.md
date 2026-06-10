@@ -738,6 +738,24 @@ ablation training set," not a pool fraction.
 
 ---
 
+## Pausing to free the GPU (daytime coding)
+
+To pause the flywheel and free the GPU promptly (e.g. for GPU-dependent coding during the
+day, resuming at night):
+
+```
+train/.venv/bin/python train/scripts/pipeline_ctl.py pause --free-gpu   # frees GPU in seconds
+# ... do your GPU work ...
+train/.venv/bin/python train/scripts/pipeline_ctl.py resume             # re-runs the iteration
+```
+
+`pause --free-gpu` kills the running precompute/training subprocess so the GPU frees within
+seconds (vs plain `pause`, which is cooperative — it waits for the current GPU step to finish,
+up to ~20h mid-precompute). On `resume`, the interrupted iteration **re-runs**: precompute
+picks up from the cache (already-encoded shards skipped — you lose only the one in-flight
+shard); training (from-scratch mode) re-runs cleanly. No corrupted state, and the campaign
+champion is untouched. Plain `pause` (no `--free-gpu`) keeps the old cooperative behavior.
+
 ## Appendix: Key File Locations
 
 | Resource | Path |
