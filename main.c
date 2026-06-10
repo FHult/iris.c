@@ -897,10 +897,10 @@ static int run_server_mode(iris_ctx *ctx) {
 
         if (!prompt || !output_path)
             EARLY_ERROR("Missing prompt or output");
-        if (width < 64 || width > 1792 || width % 16 != 0)
-            EARLY_ERROR("Width must be 64-1792 and divisible by 16");
-        if (height < 64 || height > 1792 || height % 16 != 0)
-            EARLY_ERROR("Height must be 64-1792 and divisible by 16");
+        if (width < 64 || width > IRIS_MAX_DIM || width % 16 != 0)
+            EARLY_ERROR("Width must be 64-" IRIS_STR(IRIS_MAX_DIM) " and divisible by 16");
+        if (height < 64 || height > IRIS_MAX_DIM || height % 16 != 0)
+            EARLY_ERROR("Height must be 64-" IRIS_STR(IRIS_MAX_DIM) " and divisible by 16");
         if (steps < 1 || steps > IRIS_MAX_STEPS) {
             pthread_mutex_lock(&stdout_mutex);
             printf("{\"event\":\"error\",\"message\":\"Steps must be 1-%d\"}\n", IRIS_MAX_STEPS);

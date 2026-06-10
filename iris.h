@@ -32,6 +32,14 @@ extern "C" {
 /* Model architecture constants (same across model sizes) */
 #define IRIS_LATENT_CHANNELS    128  /* Flux: 32*2*2, Z-Image: 16*2*2=64 */
 
+/* Maximum supported generation dimension (pixels). Single source of truth:
+ * main.c validates -W/-H against it, and iris_lora.c sizes its scratch from it
+ * (max tokens = (IRIS_MAX_DIM/16)^2 + text). Raising it requires re-checking
+ * VAE work-buffer sizing (~18 GB at 1792²). */
+#define IRIS_MAX_DIM            1792
+#define IRIS_STR_(x)            #x
+#define IRIS_STR(x)             IRIS_STR_(x)
+
 /* VAE architecture */
 #define IRIS_VAE_Z_CHANNELS     32   /* Flux default; Z-Image uses 16 */
 #define IRIS_VAE_BASE_CH        128

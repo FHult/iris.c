@@ -687,8 +687,15 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
                     int batch, int heads, int seq_q, int seq_k, int head_dim,
                     float scale) {
     /* Allocate attention scores */
-    float *scores = (float *)malloc(seq_q * seq_k * sizeof(float));
-    if (!scores) return;
+    float *scores = (float *)malloc((size_t)seq_q * seq_k * sizeof(float));
+    if (!scores) {
+        /* Zero the output so OOM degrades to a no-signal block instead of the
+         * caller consuming uninitialized memory; log once. */
+        memset(out, 0, (size_t)batch * heads * seq_q * head_dim * sizeof(float));
+        fprintf(stderr, "iris_attention: scores alloc failed (seq %dx%d) — output zeroed\n",
+                seq_q, seq_k);
+        return;
+    }
 
     for (int b = 0; b < batch; b++) {
         for (int h = 0; h < heads; h++) {
@@ -940,8 +947,12 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
     int k_tile_size = 64;  /* Process 64 keys at a time */
 
     /* Allocate tile scratch buffer */
-    float *tile_scores = (float *)malloc(q_tile_size * k_tile_size * sizeof(float));
-    if (!tile_scores) return;
+    float *tile_scores = (float *)malloc((size_t)q_tile_size * k_tile_size * sizeof(float));
+    if (!tile_scores) {
+        memset(out, 0, (size_t)seq_q * heads * head_dim * sizeof(float));
+        fprintf(stderr, "iris_flash_attention: tile alloc failed — output zeroed\n");
+        return;
+    }
 
     /* Process each head */
     for (int h = 0; h < heads; h++) {

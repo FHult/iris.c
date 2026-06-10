@@ -13,6 +13,7 @@
  * BFL is the native Black Forest Labs Klein LoRA format used by fal, valiantcat, etc.
  */
 
+#include "iris.h"
 #include "iris_lora.h"
 #include "iris_safetensors.h"
 #include <stdio.h>
@@ -560,9 +561,10 @@ lora_state_t *lora_load(const char *path, int num_double_blocks,
     }
 
     /* Allocate scratch buffer: large enough for max_rank × any sequence length.
-     * Max sequence: 1792×1792 image at 16x compression = 112×112 = 12544 tokens + 512 text = 13056.
-     * Extra 64 bytes guard against Apple Accelerate SIMD overreads on MALLOC_LARGE pages. */
-    lora->scratch_len = 14000;
+     * Derived from IRIS_MAX_DIM so the bound tracks the CLI resolution clamp:
+     * (1792/16)^2 = 12544 image tokens + 512 text + slack. Extra 64 bytes guard
+     * against Apple Accelerate SIMD overreads on MALLOC_LARGE pages. */
+    lora->scratch_len = (IRIS_MAX_DIM / 16) * (IRIS_MAX_DIM / 16) + 512 + 64;
     lora->scratch = malloc((size_t)lora->max_rank * lora->scratch_len * sizeof(float) + 64);
     if (!lora->scratch) {
         lora_free(lora);
