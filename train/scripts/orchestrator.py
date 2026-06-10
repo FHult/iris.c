@@ -3304,6 +3304,21 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             ckpts = sorted(_fw_ckpt_dir.glob("step_*.safetensors"))
             if ckpts:
                 ckpt_path = str(ckpts[-1])
+                # FLYWHEEL-CKPT-1: start_step=0 modes (from_scratch / resume_from_champion)
+                # save the same step_000{budget}.safetensors every iteration, so the next
+                # iteration would clobber it — and get_best()'s recorded path would then
+                # point at the wrong (latest, not best) weights, reintroducing compounding.
+                # Archive this iteration's file under a unique iter-tagged name and record
+                # THAT, so the champion file is always preserved. (Default --resume mode
+                # accumulates step numbers, so names are already unique — left untouched.)
+                if (from_scratch_each_iter or resume_from_champion) and status == "done":
+                    iter_ckpt = _fw_ckpt_dir / f"iter{iteration:04d}_{Path(ckpt_path).name}"
+                    try:
+                        os.replace(ckpt_path, iter_ckpt)   # atomic, same filesystem
+                        ckpt_path = str(iter_ckpt)
+                    except OSError as _arch_err:
+                        log_orch(f"[flywheel:{name}] iter {iteration}: checkpoint archive "
+                                 f"failed ({_arch_err}); recording live path", level="warning")
             new_ckpt_hash = _checkpoint_hash(ckpt_path)
 
             # Snapshot best-so-far BEFORE writing the current iteration's ref_gap.
@@ -3397,6 +3412,20 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     resume_ckpt = (best.get("checkpoint") if best else None) or resume_ckpt
                 else:
                     resume_ckpt = ckpt_path
+
+                # FLYWHEEL-CKPT-1: prune archived iter-tagged checkpoints, keeping only the
+                # champion's (needed by get_best / resume_from_champion) and this iteration's.
+                if from_scratch_each_iter or resume_from_champion:
+                    _best = fw_db.get_best(name)
+                    _keep = {ckpt_path}
+                    if _best and _best.get("checkpoint"):
+                        _keep.add(_best["checkpoint"])
+                    for _old in _fw_ckpt_dir.glob("iter*_step_*.safetensors"):
+                        if str(_old) not in _keep:
+                            try:
+                                _old.unlink()
+                            except OSError:
+                                pass
 
             # Clean up staging symlinks
             try:

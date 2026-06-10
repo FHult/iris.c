@@ -172,14 +172,13 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   stop at its peak. Bake the over-training signature (cond_gap down while train_loss down — already
   in the doctor's cond_gap-stall detector) into production monitoring. Also size the per-chunk step
   budget to chunk size (epochs-per-sample is the real overfit driver) — tune via the warmup/ablation.
-- **FLYWHEEL-CKPT-1: per-iteration checkpoint archival (start_step=0 collision).** With
-  `--warmstart-weights` (resume_from_champion) or from-scratch mode, every iteration saves
-  `step_0001000.safetensors`, so `ckpt_path = ckpts[-1]` resolves to the same clobbered file each
-  iter → get_best's recorded path points at the latest (not best) weights, reintroducing
-  compounding at iter-3+. Fix: after each iteration, move/record a unique iteration-tagged
-  checkpoint (e.g. `iter{N}_step_0001000.safetensors`) so get_best returns a stable champion file.
-  (The from-scratch data-selection flywheel doesn't depend on this — its output is shard scores —
-  but resume_from_champion is unsafe until it's fixed.)
+- **FLYWHEEL-CKPT-1: per-iteration checkpoint archival (start_step=0 collision). DONE 2026-06-10.**
+  With `--warmstart-weights` (resume_from_champion) or from-scratch mode, every iteration saved
+  `step_0001000.safetensors`, so `ckpt_path = ckpts[-1]` resolved to the same clobbered file each
+  iter → get_best's recorded path pointed at the latest (not best) weights, reintroducing
+  compounding at iter-3+. **Fixed:** in start_step=0 modes the orchestrator now `os.replace`s the
+  iteration's file to a unique `iter{N}_step_*.safetensors`, records that, and prunes archived
+  files to keep only the champion (get_best) + current. resume_from_champion is now safe.
 
 **Phased plan (full detail in memory file `train7_plan.md`):**
 

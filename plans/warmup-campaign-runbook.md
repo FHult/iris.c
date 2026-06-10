@@ -727,8 +727,8 @@ held-out cond_gap early-stopping.
 The doctor's cond_gap-stall detector flags the over-training signature (cond_gap declining while
 train_loss falls) distinctly from a plateau. **Production-readiness prerequisites** from this
 finding are tracked in BACKLOG (PROD-1 held-out val set + T-05; PROD-2 cond_gap-based early-stop;
-FLYWHEEL-CKPT-1 per-iteration checkpoint archival — `resume_from_champion` is unsafe until that's
-fixed, since start_step=0 modes collide on `step_0001000`).
+FLYWHEEL-CKPT-1 per-iteration checkpoint archival — DONE: start_step=0 modes now archive each
+iteration's checkpoint to a unique `iter{N}_…` name, so `resume_from_champion` is safe).
 
 ### Open item — recalibrate the ablation-ready floor
 The floor is currently `attr ≥ 2 × per_iter` (≈84). Since only the **exploited head** warms
