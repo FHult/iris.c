@@ -121,6 +121,25 @@
     the encoder-release/cache-clear sequence is fixed or MLX is upgraded past the bug;
     investigate `mx.clear_cache()` placement in the trainer's `[online-encode]` release
     step relative to pending compiled evals.
+  - **Scope correction (same day):** the proxy-VAE trainer's apparent "MLX livelock"
+    (eval_impl spin, no steps for hours) was NOT this bug — it was a legitimately
+    long-running graph (see PROXY-1 below). MLX-1 remains real only for the SIGSEGV on
+    the online-encode path. Don't conflate the two: an `eval_impl` busy-spin is how the
+    MLX main thread waits on any long eval; it is not by itself evidence of a hang.
+
+- **PROXY-1: decoded-MSE loss term costs ~75 s/step, not the documented ~20 ms (2026-06-10).**
+  - `vae_proxy_512px.yaml` shipped with `decoded_mse_weight: 0.10` and the comment "adds
+    perceptual signal; ~20ms overhead/batch" — that figure costed the decoder FORWARD only.
+    As a loss term, the backward retains the frozen 512px teacher-decoder activations at
+    batch 8: measured **74–79 s/step** vs **1.7 s/step** student-only (45×). 50K steps ⇒
+    ~46 days. Compounded by `log_every: 100`: the first progress line would take 2+ hours,
+    so three launch attempts were misread as hangs and killed (one of them minutes before
+    its first log line).
+  - **Resolution:** train latent-space-only (`decoded_mse_weight: 0.0`) — decoded quality
+    is still MEASURED at Tier-1 eval (LPIPS/PSNR), just not trained against; `log_every: 10`.
+    If Tier-1 LPIPS fails, revisit with a periodic (every-Nth-step) or low-res decoded term,
+    never per-step at 512px. **Lesson: cost loss terms with their backward, and never set
+    log_every so high that the first signal takes hours.**
 
 ## Training Anomalies (Chunk 1 — Observed, Not Actionable Now)
 

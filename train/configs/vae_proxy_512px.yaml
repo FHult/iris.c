@@ -46,7 +46,7 @@ losses:
   latent_mse_weight:   1.0
 
   # Decoded pixel MSE via VAE decoder (adds perceptual signal; ~20ms overhead/batch)
-  decoded_mse_weight:  0.10
+  decoded_mse_weight:  0.0 
 
   # Frequency-domain weighting: up-weight high spatial frequencies to counter MSE blurring
   # 0.0 = plain MSE; 0.5 = moderate high-freq emphasis (recommended)
@@ -65,7 +65,7 @@ training:
   learning_rate:   2.0e-4
   weight_decay:    1.0e-2
   grad_clip:       1.0
-  log_every:       100
+  log_every:       10 
   checkpoint_every: 2000
   keep_last_n:     3
 
