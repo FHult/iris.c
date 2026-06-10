@@ -177,6 +177,19 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   style head. Fits PRECOMP-3 cleanly as a new encoder identity ("style"). The clustering
   harness + pair-ratio gate consume it unchanged (descriptor field is versioned).
   Acceptance gate: pair-ratio <= 0.7 before wiring cross-ref to clusters.
+  **Update (same night): CSD style encoder BUILT IN MLX and gate MET.**
+  `train/style_encoder/csd_mlx.py` — official CSD ViT-L (tomg-group-umd) converted once
+  from torch to safetensors (`/Volumes/2TBSSD/models/csd_vit_l_style.safetensors`, 297
+  tensors; torch never used at runtime), reimplemented in pure MLX (~56 ms/img incl. JPEG
+  decode). Sanity: self-vs-cropped cosine 0.972, cross-image 0.03–0.46. On the 994-record
+  held-out val set: style space is a CONTINUUM (mean pairwise cos 0.184) so k-means caps at
+  ~0.82–0.90 pair-ratio — but **nearest-neighbor pairing meets the gate: top-1 0.591,
+  top-5 0.679** vs random. Design therefore: per-record top-k style-neighbor lists (k~5),
+  and cross-ref loads a NEIGHBOR's SigLIP features (dataset.py change) instead of the
+  previous loader image. Remaining: (a) style-descriptor precompute as a PRECOMP-3 encoder
+  identity — per-iteration for selected shards (~30 min/iter) or a ~10–16h full-pool
+  backfill; (b) neighbor-list builder over the style cache; (c) the dataset.py cross-ref
+  rewrite. All GPU-light except the backfill.
 - **SREF-2: style-specific evaluation.** CLIP-I conflates style and content, so the
   golden-set eval cannot see sref quality. Add per-generation: style similarity to ref
   (Gram-distance / CSD-like, content-invariant), content-leak from ref (subject copied?
