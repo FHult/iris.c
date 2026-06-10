@@ -3359,6 +3359,18 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
 
             if _restart:
                 _restart = False
+                # The cross-device staging thread may still be copying into
+                # staging_dir; let it finish before deleting the tree, or the old
+                # thread writes into a removed dir while the re-entered iteration
+                # starts a second stager against the same campaign.
+                if _stage_thread is not None and _stage_thread.is_alive():
+                    log_orch(f"[flywheel:{name}] restart: waiting for in-flight staging "
+                             f"to finish before cleanup")
+                    _stage_thread.join()
+                # Drop the aborted attempt's iterations row — the re-run inserts a
+                # fresh one for the same iteration number; without this the stale
+                # 'running' row lingers as a duplicate in get_iterations/get_best.
+                fw_db.delete_iteration(row_id)
                 try:
                     shutil.rmtree(staging_dir)
                 except OSError:
@@ -3398,6 +3410,17 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     except OSError as _arch_err:
                         log_orch(f"[flywheel:{name}] iter {iteration}: checkpoint archive "
                                  f"failed ({_arch_err}); recording live path", level="warning")
+                    # Also archive the EMA weights (best.safetensors): typically the
+                    # better-generalizing weights, but the trainer overwrites the file
+                    # every iteration — without this the champion's EMA is lost.
+                    _ema_live = _fw_ckpt_dir / "best.safetensors"
+                    if _ema_live.exists():
+                        _ema_arch = _fw_ckpt_dir / f"iter{iteration:04d}_best.safetensors"
+                        try:
+                            os.replace(_ema_live, _ema_arch)
+                        except OSError as _arch_err:
+                            log_orch(f"[flywheel:{name}] iter {iteration}: EMA archive "
+                                     f"failed ({_arch_err})", level="warning")
             new_ckpt_hash = _checkpoint_hash(ckpt_path)
 
             # Snapshot best-so-far BEFORE writing the current iteration's ref_gap.
@@ -3493,14 +3516,29 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     resume_ckpt = ckpt_path
 
                 # FLYWHEEL-CKPT-1: prune archived iter-tagged checkpoints, keeping only the
-                # champion's (needed by get_best / resume_from_champion) and this iteration's.
+                # champion's (needed by get_best / resume_from_champion) and this
+                # iteration's — both the raw step weights and the EMA archive
+                # (iterNNNN_best.safetensors, ~2 GB each; unpruned they accumulate).
                 if from_scratch_each_iter or resume_from_champion:
                     _best = fw_db.get_best(name)
                     _keep = {ckpt_path}
+                    _keep_iters = {iteration}
                     if _best and _best.get("checkpoint"):
                         _keep.add(_best["checkpoint"])
+                        if _best.get("iteration") is not None:
+                            _keep_iters.add(int(_best["iteration"]))
                     for _old in _fw_ckpt_dir.glob("iter*_step_*.safetensors"):
                         if str(_old) not in _keep:
+                            try:
+                                _old.unlink()
+                            except OSError:
+                                pass
+                    for _old in _fw_ckpt_dir.glob("iter*_best.safetensors"):
+                        try:
+                            _it = int(_old.name[4:8])
+                        except ValueError:
+                            continue
+                        if _it not in _keep_iters:
                             try:
                                 _old.unlink()
                             except OSError:

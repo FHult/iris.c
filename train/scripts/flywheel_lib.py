@@ -236,6 +236,15 @@ class FlywheelDB:
                   checkpoint, checkpoint_hash or None, ablation_run, ts, row_id))
             self._conn.commit()
 
+    def delete_iteration(self, row_id: int) -> None:
+        """Remove an iterations row by id. Used when a `pause --free-gpu` restart
+        re-runs an iteration: the aborted attempt's row would otherwise linger as a
+        duplicate (same iteration number, stale 'running' status) and pollute
+        get_iterations/get_best."""
+        with self._lock:
+            self._conn.execute("DELETE FROM iterations WHERE id=?", (row_id,))
+            self._conn.commit()
+
     # ------------------------------------------------------------------
     # Checkpoint log
 
