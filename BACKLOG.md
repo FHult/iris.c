@@ -184,15 +184,13 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   iteration's file to a unique `iter{N}_step_*.safetensors`, records that, and prunes archived
   files to keep only the champion (get_best) + current. resume_from_champion is now safe.
 
-- **PRECOMP-6: precompute resume marks a shard "fully done" that the coverage verifier
-  rejects.** Observed 2026-06-10: a run whose VAE output was 0/100 (all records skipped by
-  the tiled-VAE bug) exited 1 from the coverage check — but a rerun said "Resume: skipping 1
-  fully-done shards (0 remaining)" and exited 0 with the gap intact. The resume done-check
-  and the coverage verifier disagree on what "done" means (done-marker appears to be written
-  per-shard before/regardless of per-type coverage). Risk: a transient encode failure can
-  permanently hole a shard's cache while resume reports success; pass-2 catch-up would also
-  skip it. Fix: derive resume state from per-type record coverage (same rule as the
-  verifier), or delete the done-marker when the coverage check fails.
+- **PRECOMP-6 — FIXED 2026-06-10: precompute resume marked shards "fully done" that the
+  coverage verifier rejects.** Observed: a run whose VAE output was 0/100 (tiled-VAE bug)
+  exited 1 from the coverage check, but a rerun resumed it as "fully done" and exited 0
+  with the gap intact. **Fix (both ends):** (a) shards with per-record skips
+  (`skipped_q`/`skipped_v`) are no longer appended to `.precompute_done.json`; (b) the
+  coverage-gap exit prunes gapped shards from the resume state, so a rerun re-processes
+  exactly the holed shards.
 
 - **TRAIN-PAD-1: training text-pad convention diverges from reference inference.** The
   trainer/precompute zero-pads text embeddings to 512 (precompute stores only real-token

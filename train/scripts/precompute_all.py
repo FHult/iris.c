@@ -1339,7 +1339,11 @@ def main():
                 prefetch = io_exec.submit(_read_shard_records, work_items[seq_idx + 1][0])
 
             result = process_shard(base_item[:7] + (pre_records,))
-            if not result.get("error"):
+            # PRECOMP-6: a shard with per-record skips is NOT fully done — marking
+            # it done would make resume skip it forever with the holes intact
+            # (observed with the tiled-VAE bug: 0/100 records yet "fully done").
+            if (not result.get("error") and not result.get("skipped_q")
+                    and not result.get("skipped_v")):
                 _append_done_shard(base_item[0])
             done = seq_idx + 1
             results.append(result)
@@ -1409,6 +1413,7 @@ def main():
             _stem_counts[_od] = _sc
 
         _short: list[str] = []
+        _gap_stems: set[str] = set()
         for shard_path, *_ in work_items:
             stem = os.path.splitext(os.path.basename(shard_path))[0]
             expected = _nrec_by_shard.get(shard_path, 0)
@@ -1420,6 +1425,7 @@ def main():
                     _short.append(
                         f"  {os.path.basename(out_dir)}/{stem}: {actual}/{expected} records"
                     )
+                    _gap_stems.add(stem)
         if _short:
             print(f"  COVERAGE GAPS ({len(_short)} shard(s)):",
                   file=sys.stderr if args.ai else sys.stdout, flush=True)
@@ -1427,6 +1433,23 @@ def main():
                 print(s, file=sys.stderr if args.ai else sys.stdout, flush=True)
             print("  Rerun precompute to fill gaps — exiting with error.",
                   file=sys.stderr if args.ai else sys.stdout, flush=True)
+            # PRECOMP-6: keep the resume state consistent with the verifier — a
+            # gapped shard must not survive in .precompute_done.json, or the
+            # rerun would skip it and report success with the gap intact.
+            if _resume_state_path and _gap_stems:
+                try:
+                    with open(_resume_state_path) as _rf:
+                        _dl = set(json.load(_rf))
+                    _pruned = {b for b in _dl
+                               if os.path.splitext(b)[0] not in _gap_stems}
+                    if _pruned != _dl:
+                        with open(_resume_state_path, "w") as _wf:
+                            json.dump(sorted(_pruned), _wf)
+                        print(f"  Resume state: cleared {len(_dl) - len(_pruned)} "
+                              f"gapped shard(s) from .precompute_done.json",
+                              file=sys.stderr if args.ai else sys.stdout, flush=True)
+                except (OSError, json.JSONDecodeError):
+                    pass
             if args.ai:
                 import json as _json
                 print(_json.dumps({"ok": False, "error": "coverage gaps",
