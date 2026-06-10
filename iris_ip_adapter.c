@@ -174,9 +174,9 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
     free(a);
 }
 
-void iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
-                              const float *siglip, int n_siglip,
-                              float *ip_embeds) {
+int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
+                             const float *siglip, int n_siglip,
+                             float *ip_embeds) {
     int H = a->hidden_dim, S = a->siglip_dim;
     int T = a->num_image_tokens, hd = 128, heads = H / hd;
 
@@ -184,14 +184,17 @@ void iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
     float *K = malloc((size_t)n_siglip * H * sizeof(float));
     float *V = malloc((size_t)n_siglip * H * sizeof(float));
     float *attn = malloc((size_t)T * H * sizeof(float));
-    if (!Q || !K || !V || !attn) { free(Q); free(K); free(V); free(attn); return; }
+    if (!Q || !K || !V || !attn) { free(Q); free(K); free(V); free(attn); return -1; }
 
     /* projections: x @ W^T  (Linear, bias=False) */
     iris_matmul_t(Q, a->query_tokens, a->query_proj, T, H, H);
     iris_matmul_t(K, siglip, a->key_proj, n_siglip, S, H);
     iris_matmul_t(V, siglip, a->value_proj, n_siglip, S, H);
 
-    mha_sdpa(attn, Q, K, V, T, n_siglip, heads, hd);
+    if (mha_sdpa(attn, Q, K, V, T, n_siglip, heads, hd) != 0) {
+        free(Q); free(K); free(V); free(attn);
+        return -1;
+    }
 
     /* out_proj then LayerNorm into ip_embeds */
     iris_matmul_t(ip_embeds, attn, a->out_proj, T, H, H);
@@ -208,6 +211,7 @@ void iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
             row[i] = (row[i] - mean) * inv * a->norm_weight[i] + a->norm_bias[i];
     }
     free(Q); free(K); free(V); free(attn);
+    return 0;
 }
 
 void iris_ip_adapter_get_kv(const iris_ip_adapter_t *a, int block_idx,

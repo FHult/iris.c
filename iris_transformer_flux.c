@@ -17,6 +17,7 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_lora.h"
+#include "iris_ip_adapter.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -331,6 +332,15 @@ typedef struct iris_transformer {
 
     /* Optional LoRA adapter (NULL if no LoRA loaded) */
     lora_state_t *lora;
+
+    /* Optional IP-Adapter (G-1 Phase 2, CPU block path; NULL = inert).
+     * When set, the accelerated bf16/GPU block variants are bypassed so the
+     * inject hooks in the f32 double/single block functions always fire. */
+    iris_ip_adapter_t *ip;
+    float *ip_embeds;       /* [num_image_tokens, hidden] — perceived once per reference */
+    float *ip_q_scratch;    /* post-QK-norm pre-RoPE image-Q copy, grown on demand */
+    int    ip_q_scratch_rows;
+    float *ip_kv_scratch;   /* [2 * num_image_tokens, hidden] per-block k_ip/v_ip */
 } iris_transformer_t;
 
 /* ========================================================================
@@ -2204,6 +2214,35 @@ static void swiglu_ffn_bf16(float *out, const float *x,
  * 6 parameters: shift1, scale1, gate1 (pre-attention), shift2, scale2,
  * gate2 (pre-FFN). The gating mechanism controls information flow from
  * the attention and FFN residual paths. */
+/* Grow the IP-adapter image-Q scratch to at least `rows` rows. Returns 0 on
+ * success; on OOM the caller skips capture+inject for this block (graceful,
+ * logged once) rather than feeding garbage. */
+static int ensure_ip_scratch(iris_transformer_t *tf, int rows) {
+    if (tf->ip_q_scratch_rows >= rows) return 0;
+    float *p = realloc(tf->ip_q_scratch, (size_t)rows * tf->hidden_size * sizeof(float));
+    if (!p) {
+        static int warned = 0;
+        if (!warned) { fprintf(stderr, "IP-Adapter: scratch alloc failed — skipping injection\n"); warned = 1; }
+        return -1;
+    }
+    tf->ip_q_scratch = p;
+    tf->ip_q_scratch_rows = rows;
+    return 0;
+}
+
+/* IP-Adapter per-block contribution: k/v from ip_embeds, then
+ * hidden += ip_scale[blk] * SDPA(q_saved, k_ip, v_ip). q_saved is the
+ * post-QK-norm PRE-RoPE image Q (training parity: _flux_forward_with_ip);
+ * added after the full native block output. */
+static void ip_inject_block(iris_transformer_t *tf, int blk,
+                            const float *q_saved, int img_seq, float *img_hidden) {
+    int T = tf->ip->num_image_tokens;
+    float *k_ip = tf->ip_kv_scratch;
+    float *v_ip = k_ip + (size_t)T * tf->hidden_size;
+    iris_ip_adapter_get_kv(tf->ip, blk, tf->ip_embeds, k_ip, v_ip);
+    iris_ip_adapter_inject(tf->ip, blk, q_saved, img_seq, k_ip, v_ip, img_hidden);
+}
+
 static void double_block_forward(float *img_hidden, float *txt_hidden,
                                  const double_block_t *block,
                                  const float *img_mod, const float *txt_mod,
@@ -2277,6 +2316,13 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     /* Apply QK normalization (per-head RMSNorm) */
     apply_qk_norm(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
                   img_seq, heads, head_dim, eps);
+
+    /* IP-Adapter: save the post-QK-norm, PRE-RoPE image Q — the exact Q the
+     * training-side IP cross-attention consumes (k/v are SigLIP-derived,
+     * position-free, so neither side is RoPE'd). RoPE below mutates img_q. */
+    int ip_active = (tf->ip && tf->ip_embeds && ensure_ip_scratch(tf, img_seq) == 0);
+    if (ip_active)
+        memcpy(tf->ip_q_scratch, img_q, (size_t)img_seq * hidden * sizeof(float));
 
     /* Apply 2D RoPE to image Q, K (using h, w positions) */
     int axis_dim = 32;
@@ -2434,6 +2480,11 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                     block->txt_mlp_down_weight_bf16,
                     txt_seq, hidden, mlp_hidden, tf);
     gated_add(txt_hidden, txt_gate2, txt_proj, txt_seq, hidden);
+
+    /* IP-Adapter: add the conditioning contribution after the full native block
+     * output (training adds it to the post-block hidden state). */
+    if (ip_active)
+        ip_inject_block(tf, block_idx, tf->ip_q_scratch, img_seq, img_hidden);
 
     /* No free - using pre-allocated buffers */
 
@@ -3534,6 +3585,14 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
                   seq, heads, head_dim, eps);
 
+    /* IP-Adapter: save the post-QK-norm, PRE-RoPE image-token Q rows
+     * (layout is [txt, img]; image rows start at img_offset). */
+    int ip_img_seq = seq - img_offset;
+    int ip_active = (tf->ip && tf->ip_embeds && ensure_ip_scratch(tf, ip_img_seq) == 0);
+    if (ip_active)
+        memcpy(tf->ip_q_scratch, q + (size_t)img_offset * h_size,
+               (size_t)ip_img_seq * h_size * sizeof(float));
+
     /* Apply RoPE: layout is [txt, img]
      * - Text portion (0 to img_offset-1): RoPE in axis 3 (L dimension)
      * - Image portion (img_offset to seq-1): 2D RoPE based on H/W positions
@@ -3593,6 +3652,13 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     gated_add(hidden, gate, proj_out, seq, h_size);
     double _t8 = prof_get_time();
     prof_single_gated_add += _t8 - _t7;
+
+    /* IP-Adapter: contribution into the image rows of the post-block hidden.
+     * Single-block adapter index continues after the double blocks. */
+    if (ip_active)
+        ip_inject_block(tf, tf->num_double_layers + block_idx,
+                        tf->ip_q_scratch, ip_img_seq,
+                        hidden + (size_t)img_offset * h_size);
 
     /* No free - using pre-allocated buffers */
 }
@@ -3659,7 +3725,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
 #ifdef USE_METAL
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
         float *bf16_output = iris_transformer_forward_bf16(tf, img_transposed, img_seq,
                                                            img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
@@ -3884,7 +3950,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
     }
 
     /* Fall back to f32 GPU-chained path if bf16 path not used or failed */
-    if (!bf16_path_ok && iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap) {
+    if (!bf16_path_ok && iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap && !tf->ip) {
         /* Create persistent GPU tensor for hidden state */
         concat_hidden_gpu = iris_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (concat_hidden_gpu) {
@@ -3961,7 +4027,8 @@ float *iris_transformer_forward(iris_transformer_t *tf,
             }
 #ifdef USE_METAL
             /* Try GPU-optimized path first */
-            if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+            if (tf->ip != NULL ||
+                !single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
                                           txt_rope_cos, txt_rope_sin,
@@ -4160,7 +4227,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     /* Try BF16 GPU-accelerated path for img2img.
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
         float *bf16_output = iris_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4405,7 +4472,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
 #ifdef USE_METAL
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f)) {
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
         float *bf16_output = iris_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4683,6 +4750,12 @@ error:
 void iris_transformer_free(iris_transformer_t *tf) {
     if (!tf) return;
 
+    /* IP-Adapter state (owned by the transformer once attached) */
+    if (tf->ip) iris_ip_adapter_free(tf->ip);
+    free(tf->ip_embeds);
+    free(tf->ip_q_scratch);
+    free(tf->ip_kv_scratch);
+
     /* In mmap mode, bf16 pointers point into the mmap'd file region and must
      * NOT be freed. Clean up any cached block weights first, then only NULL
      * the bf16 pointers (don't free them). */
@@ -4829,6 +4902,27 @@ int iris_transformer_num_single_layers(iris_transformer_t *tf) { return tf->num_
 void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora) {
     lora_free(tf->lora);
     tf->lora = lora;
+}
+
+/* Attach an IP-Adapter + perceived embeddings (replaces any existing; takes
+ * ownership of both). ip=NULL detaches. Returns 0 on success. */
+int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
+                                    float *ip_embeds) {
+    if (tf->ip) iris_ip_adapter_free(tf->ip);
+    free(tf->ip_embeds);
+    free(tf->ip_kv_scratch);
+    tf->ip = NULL; tf->ip_embeds = NULL; tf->ip_kv_scratch = NULL;
+    if (!ip) return 0;
+    tf->ip_kv_scratch = malloc((size_t)2 * ip->num_image_tokens
+                               * tf->hidden_size * sizeof(float));
+    if (!tf->ip_kv_scratch) {
+        iris_ip_adapter_free(ip);
+        free(ip_embeds);
+        return -1;
+    }
+    tf->ip = ip;
+    tf->ip_embeds = ip_embeds;
+    return 0;
 }
 
 /* ========================================================================

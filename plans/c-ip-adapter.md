@@ -157,6 +157,28 @@ feeds `[729,1152]` directly to `perceive`. This is also exactly the Phase-1 pari
   `_flux_forward_with_ip` reference within the run_test pixel tolerance; `ip_scale=0`
   reproduces the no-adapter image bit-for-bit.
 
+#### Phase 2 — LANDED 2026-06-10 (CPU block path, end-to-end validated)
+
+Implemented exactly per the design below: Q captured post-QK-norm/pre-RoPE in both
+`double_block_forward` and `single_block_forward`, contribution added after the full
+native block output, accelerated bf16/GPU block variants bypassed while an adapter is
+attached (`&& !tf->ip` routing gates), CLI `--ip BUNDLE --ip-features F32FILE --ip-scale N`
+wired through `iris_load_ip_adapter` (mirrors the LoRA pattern).
+
+**Validation evidence (champion bundle + real val-set SigLIP features):**
+- No-adapter: **bit-identical** to the pre-Phase-2 binary; `--ip-scale 0`: **bit-identical**
+  to no-adapter (inertness gates).
+- Scale response is monotone and semantically correct: 0.3 keeps the prompt's composition
+  with the reference's warm painterly palette; 1.0 (as trained) is dominated by the
+  reference texture (expected for the weak +0.027 warmup champion at 64px/2-step).
+- `make test` 7/7 and all unit suites green with the wiring in.
+
+**Remaining (Phase 2.5/3):** bf16/MPS-native marshalling (adapter currently forces the
+CPU block path — ~4x slower generation while attached); strict pixel-parity vs the Python
+reference needs a matched-noise harness (C and MLX RNGs differ); img2img caveat — in-context
+ref tokens currently also receive injection (acceptable until img2img+adapter is a real use
+case); Phase 3 SigLIP-in-C for interactive `--ip ref.png`.
+
 #### Phase 2 detailed design (execution-ready)
 
 **Exact hook point (CPU double block, `double_block_forward` ~2207).** The image Q is

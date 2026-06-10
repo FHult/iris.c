@@ -156,6 +156,17 @@ int iris_load_lora(iris_ctx *ctx, const char *path, float scale);
 void iris_unload_lora(iris_ctx *ctx);
 
 /*
+ * Load an IP-Adapter bundle (export_adapter.py output) with precomputed SigLIP
+ * features (raw f32 [n, siglip_dim] file) and attach it to the Flux transformer.
+ * Image-conditioned generation runs on the CPU block path while attached
+ * (accelerated bf16/GPU block variants are bypassed — G-1 Phase 2).
+ * scale_mult multiplies the trained per-block ip_scale (1.0 = as trained).
+ * Returns 0 on success, -1 on error.
+ */
+int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
+                         const char *features_path, float scale_mult);
+
+/*
  * Check if model is Z-Image (S3-DiT architecture).
  * Returns 1 for Z-Image, 0 for Flux.
  */

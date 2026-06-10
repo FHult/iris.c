@@ -1038,6 +1038,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "LoRA options:\n");
     fprintf(stderr, "      --lora PATH       Load LoRA adapter (XLabs, Kohya, or Diffusers .safetensors)\n");
     fprintf(stderr, "      --lora-scale N    LoRA strength (default: 1.0, range: 0.0-2.0)\n");
+    fprintf(stderr, "      --ip DIR          Load IP-Adapter bundle (export_adapter.py output)\n");
+    fprintf(stderr, "      --ip-features F   Precomputed SigLIP features (raw f32 [n,siglip_dim]); required with --ip\n");
+    fprintf(stderr, "      --ip-scale N      IP-Adapter strength multiplier (default: 1.0)\n");
     fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n");
     fprintf(stderr, "  -N, --negative TEXT   Negative prompt (base models: CFG; distilled: soft guidance at 1.5)\n");
     fprintf(stderr, "      --vary-from PATH  Base image to vary (noise-injection img2img)\n");
@@ -1102,6 +1105,9 @@ int main(int argc, char *argv[]) {
         {"blas-threads",required_argument, 0, 259},
         {"lora",             required_argument, 0, 260},
         {"lora-scale",       required_argument, 0, 261},
+        {"ip",               required_argument, 0, 269},
+        {"ip-features",      required_argument, 0, 270},
+        {"ip-scale",         required_argument, 0, 271},
         {"img2img-strength", required_argument, 0, 262},
         {"negative",         required_argument, 0, 'N'},
         {"sref",             required_argument, 0, 263},
@@ -1145,6 +1151,9 @@ int main(int argc, char *argv[]) {
     int blas_threads = 0; (void)blas_threads;
     char *lora_path = NULL;
     float lora_scale = 1.0f;
+    char *ip_bundle = NULL;       /* --ip: IP-Adapter bundle dir (G-1) */
+    char *ip_features = NULL;     /* --ip-features: raw f32 SigLIP features file */
+    float ip_scale = 1.0f;        /* --ip-scale: multiplier on trained ip_scale */
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -1189,6 +1198,9 @@ int main(int argc, char *argv[]) {
             case 259: blas_threads = atoi(optarg); break;
             case 260: lora_path = optarg; break;
             case 261: lora_scale = (float)atof(optarg); break;
+            case 269: ip_bundle = optarg; break;
+            case 270: ip_features = optarg; break;
+            case 271: ip_scale = (float)atof(optarg); break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
             case 'N': params.negative_prompt = optarg; break;
             case 263:
@@ -1349,6 +1361,25 @@ int main(int argc, char *argv[]) {
         } else {
             LOG_NORMAL(" done\n");
         }
+    }
+
+    /* Load IP-Adapter if requested (G-1: image-conditioned generation).
+     * Both --ip and --ip-features are required; SigLIP runs out-of-process
+     * until Phase 3, so features come from a precomputed f32 file. */
+    if (ip_bundle || ip_features) {
+        if (!ip_bundle || !ip_features) {
+            fprintf(stderr, "Error: --ip and --ip-features must be used together\n");
+            iris_free(ctx);
+            return 1;
+        }
+        LOG_NORMAL("Loading IP-Adapter: %s (scale x%.2f)...", ip_bundle, ip_scale);
+        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+        if (iris_load_ip_adapter(ctx, ip_bundle, ip_features, ip_scale) != 0) {
+            fprintf(stderr, "\nError: failed to load IP-Adapter from %s\n", ip_bundle);
+            iris_free(ctx);
+            return 1;
+        }
+        LOG_NORMAL(" done\n");
     }
 
     /* Resolve auto-parameters now that we know the model type */

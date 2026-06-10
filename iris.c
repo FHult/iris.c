@@ -12,6 +12,7 @@
 #include "iris_config_parse.h"
 #include "iris_qwen3.h"
 #include "iris_lora.h"
+#include "iris_ip_adapter.h"
 #include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,8 @@ extern int iris_transformer_hidden_size(iris_transformer_t *tf);
 extern int iris_transformer_num_double_layers(iris_transformer_t *tf);
 extern int iris_transformer_num_single_layers(iris_transformer_t *tf);
 extern void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora);
+extern int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
+                                           float *ip_embeds);
 extern float *iris_transformer_forward(iris_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
@@ -475,6 +478,88 @@ int iris_load_lora(iris_ctx *ctx, const char *path, float scale) {
 void iris_unload_lora(iris_ctx *ctx) {
     if (!ctx || !ctx->transformer) return;
     iris_transformer_set_lora(ctx->transformer, NULL);
+}
+
+/* Load an IP-Adapter bundle (export_adapter.py output) + precomputed SigLIP
+ * features (raw f32 [n_siglip, siglip_dim], n inferred from file size), perceive
+ * once into ip_embeds, and attach to the transformer (G-1 Phase 2, CPU path).
+ * scale_mult multiplies the bundle's per-block ip_scale (1.0 = as trained). */
+int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
+                         const char *features_path, float scale_mult) {
+    if (!ctx || !bundle_dir || !*bundle_dir || !features_path || !*features_path)
+        return -1;
+    if (!iris_load_transformer_if_needed(ctx)) return -1;
+
+    iris_ip_adapter_t *ip = iris_ip_adapter_load(bundle_dir);
+    if (!ip) {
+        fprintf(stderr, "IP-Adapter: failed to load bundle from %s\n", bundle_dir);
+        return -1;
+    }
+
+    int hidden = iris_transformer_hidden_size(ctx->transformer);
+    int n_blocks = iris_transformer_num_double_layers(ctx->transformer)
+                 + iris_transformer_num_single_layers(ctx->transformer);
+    if (ip->hidden_dim != hidden || ip->num_blocks != n_blocks) {
+        fprintf(stderr, "IP-Adapter: bundle mismatch (hidden %d vs %d, blocks %d vs %d)\n",
+                ip->hidden_dim, hidden, ip->num_blocks, n_blocks);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+
+    /* SigLIP features: raw f32, row dim must match the bundle's siglip_dim */
+    FILE *ff = fopen(features_path, "rb");
+    if (!ff) {
+        fprintf(stderr, "IP-Adapter: cannot open features file %s\n", features_path);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+    fseek(ff, 0, SEEK_END);
+    long fsize = ftell(ff);
+    fseek(ff, 0, SEEK_SET);
+    size_t row_bytes = (size_t)ip->siglip_dim * sizeof(float);
+    if (fsize <= 0 || (size_t)fsize % row_bytes != 0) {
+        fprintf(stderr, "IP-Adapter: features size %ld is not a multiple of %zu "
+                "(siglip_dim=%d f32 rows)\n", fsize, row_bytes, ip->siglip_dim);
+        fclose(ff);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+    int n_siglip = (int)((size_t)fsize / row_bytes);
+    float *feats = malloc((size_t)fsize);
+    if (!feats || fread(feats, 1, (size_t)fsize, ff) != (size_t)fsize) {
+        fprintf(stderr, "IP-Adapter: failed to read features\n");
+        free(feats);
+        fclose(ff);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+    fclose(ff);
+
+    if (scale_mult != 1.0f)
+        for (int i = 0; i < ip->num_blocks; i++)
+            ip->ip_scale[i] *= scale_mult;
+
+    float *ip_embeds = malloc((size_t)ip->num_image_tokens * hidden * sizeof(float));
+    if (!ip_embeds) {
+        free(feats);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+    if (iris_ip_adapter_perceive(ip, feats, n_siglip, ip_embeds) != 0) {
+        fprintf(stderr, "IP-Adapter: perceive failed (out of memory)\n");
+        free(feats);
+        free(ip_embeds);
+        iris_ip_adapter_free(ip);
+        return -1;
+    }
+    free(feats);
+
+    if (iris_transformer_set_ip_adapter(ctx->transformer, ip, ip_embeds) != 0)
+        return -1;   /* setter freed ip + ip_embeds on failure */
+
+    fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, %d SigLIP rows, "
+            "scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, n_siglip, scale_mult);
+    return 0;
 }
 
 /* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.

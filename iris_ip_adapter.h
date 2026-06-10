@@ -157,8 +157,11 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a);
  *
  * Output:
  *   ip_embeds     caller-allocated float32 [num_image_tokens * hidden_dim]
+ *
+ * Returns 0 on success, -1 on allocation failure (ip_embeds is then
+ * unspecified and MUST NOT be consumed).
  */
-void iris_ip_adapter_perceive(
+int iris_ip_adapter_perceive(
     const iris_ip_adapter_t *a,
     const float *siglip_feats,   int n_siglip,
           float *ip_embeds        /* [num_image_tokens * hidden_dim] */
