@@ -148,6 +148,41 @@ Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically 
 
 ---
 
+## SREF Objective — Style-Reference Model (Midjourney --sref for the app)
+
+The end goal: a user uploads a reference image; generations adopt its STYLE (not
+content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
+2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
+
+- **SREF-1 (HIGHEST): style-paired training data via style clustering.** Root-cause
+  finding: `cross_ref` swaps in the PREVIOUS LOADER IMAGE's SigLIP features
+  (train_ip_adapter.py ~1780) — an arbitrary pairing. Asked to predict a target from a
+  RANDOM other image's features, the optimal policy is to ignore the reference — which is
+  exactly what ref_gap≈0 and weak cond_gap show. sref needs SAME-STYLE / DIFFERENT-CONTENT
+  pairs so the reference's style genuinely helps and content-copying genuinely hurts.
+  Plan: (a) per-image style descriptors from the EXISTING SigLIP cache (mean+std token
+  pooling v1; content-invariant style statistics), (b) cluster the pool (k-means, K~256),
+  (c) store rec_id→cluster, (d) cross-ref samples from the SAME cluster (+ small random
+  fraction as negatives). Multiplies the value of the production run — land BEFORE it.
+  Status: style_cluster.py started 2026-06-10 (sample-fit on cold SigLIP cache).
+- **SREF-2: style-specific evaluation.** CLIP-I conflates style and content, so the
+  golden-set eval cannot see sref quality. Add per-generation: style similarity to ref
+  (Gram-distance / CSD-like, content-invariant), content-leak from ref (subject copied?
+  lower=better), prompt adherence (CLIP-T). This becomes the shippable-champion criterion
+  (the held-out cond_gap remains the training-internal signal).
+- **SREF-3: app integration path (no Phase-3 blocker).** web/server.py (Python) computes
+  SigLIP features for the user upload → f32 file → `iris --ip … --ip-features …`. Ships
+  the feature with the C engine generating. Then: multi-ref (concat SigLIP rows from
+  several images into one perceive — Perceiver accepts any n_siglip), strength UX =
+  --ip-scale (validated 0/0.3/1.0), style codes = library of stored SigLIP embeddings
+  (Midjourney "--sref random"/reusable-code UX). bf16/MPS-native inject + SigLIP-in-C
+  (G-1 Phase 3) are latency work, not blockers.
+- **SREF-4: sequencing.** warmup-run4 warms attribution under the new held-out cond_gap →
+  ablation when warm (first arm: freeze_double_stream_scales — double-stream injection may
+  matter for style) → production 512 foundation (~12d) only AFTER SREF-1 lands → Stage 2/3
+  (configs ready, TRAIN-7 gate passed). Data recipe: weight natural/style-rich sources
+  (coyo ≫ journeydb for conditioning; grow wikiart-like sources — style diversity feeds sref).
+
 ## Training & Model Quality
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
