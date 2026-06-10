@@ -246,7 +246,8 @@ def _encode_vae_tiled(vae, img_chw: np.ndarray,
         x = mx.array(img_chw[np.newaxis])  # [1, 3, H, W]
         lat = vae.encode(x)
         mx.eval(lat)
-        return np.array(lat)[0]  # [32, H//8, W//8]
+        # bf16 -> f32 before numpy: bfloat16 has no numpy dtype (PEP 3118 'B' error)
+        return np.array(lat.astype(mx.float32))[0]  # [32, H//8, W//8]
 
     result  = np.zeros((lC, lH, lW), dtype=np.float32)
     weights = np.zeros((lH, lW), dtype=np.float32)
@@ -268,7 +269,7 @@ def _encode_vae_tiled(vae, img_chw: np.ndarray,
             x_t = mx.array(tile[np.newaxis])  # [1, 3, tile_size, tile_size]
             lat = vae.encode(x_t)
             mx.eval(lat)
-            lat_np = np.array(lat)[0]  # [32, lT, lT]
+            lat_np = np.array(lat.astype(mx.float32))[0]  # [32, lT, lT]
 
             # Valid latent region (clip padded edge)
             ly0, ly1 = y0 // 8, y1 // 8
