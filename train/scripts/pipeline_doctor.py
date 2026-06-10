@@ -1634,6 +1634,44 @@ def _check_proxy_vae(cfg: dict) -> None:
     proxy_path = pcfg.get("proxy_path")
     enabled    = pcfg.get("enabled", False)
 
+    # A proxy TRAINING run (train_vae_proxy.py) writes no heartbeat — without
+    # this, an overnight distillation is invisible to the doctor (and a crash
+    # looks identical to "nothing happening"). Detect it from its log + process.
+    _tlog = LOG_DIR / "proxy_vae_train.log"
+    if _tlog.exists() and (time.time() - _tlog.stat().st_mtime) < 48 * 3600:
+        try:
+            _tail = _tlog.read_text(errors="replace")[-4000:]
+        except OSError:
+            _tail = ""
+        _exit = None
+        for _ln in reversed(_tail.splitlines()):
+            if _ln.startswith("EXIT_CODE="):
+                _exit = int(_ln.split("=", 1)[1])
+                break
+        _running = subprocess.run(["pgrep", "-f", "train_vae_proxy.py"],
+                                  capture_output=True).returncode == 0
+        _last_step = None
+        for _ln in reversed(_tail.splitlines()):
+            if _ln.lstrip().startswith("step "):
+                _last_step = _ln.strip()
+                break
+        if _running:
+            _add("INFO", "proxy_vae",
+                 f"Proxy-VAE training in progress{' — ' + _last_step if _last_step else ''}",
+                 detail=f"Log: {_tlog}", ctx={"running": True, "last_step": _last_step})
+        elif _exit is None:
+            _add("CRITICAL", "proxy_vae",
+                 "Proxy-VAE training died without an exit marker (crash/kill)",
+                 detail=f"Log ends without EXIT_CODE and no process is running. "
+                        f"Inspect: tail -40 {_tlog}",
+                 ctx={"running": False, "last_step": _last_step})
+        elif _exit != 0:
+            _add("WARNING", "proxy_vae",
+                 f"Proxy-VAE training exited {_exit}",
+                 detail=f"Inspect: tail -40 {_tlog}",
+                 ctx={"exit_code": _exit, "last_step": _last_step})
+        # exit 0 → silent here; the eval-report section below carries the verdict.
+
     # Nothing configured — proxy is opt-in, so stay silent unless partially set up.
     if not proxy_path and not enabled:
         return

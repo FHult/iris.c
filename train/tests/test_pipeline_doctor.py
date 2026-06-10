@@ -36,6 +36,9 @@ def doctor(tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "DATA_ROOT", tmp_path)
     monkeypatch.setattr(pd, "SENTINEL_DIR", sent)
     monkeypatch.setattr(pipeline_lib, "SENTINEL_DIR", sent)
+    # Redirect LOG_DIR too: checks that read real logs (e.g. the proxy-VAE
+    # training-run detector) must not see the machine's live log files.
+    monkeypatch.setattr(pd, "LOG_DIR", tmp_path / "logs")
     pd._issues.clear()
     yield pd
     pd._issues.clear()
