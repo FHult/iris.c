@@ -99,6 +99,29 @@
     flags the over-training signature (cond_gap declining while train_loss falls) distinctly.
     See plans/warmup-campaign-runbook.md §3.
 
+## Known Anomalies (Open)
+
+- **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
+  (2026-06-10, observed during TRAIN-7 memory probes).**
+  - **Crash signature:** `EXC_BAD_ACCESS KERN_INVALID_ADDRESS at 0x0` in
+    `mlx::core::metal::CommandEncoder::set_input_array` ← `Compiled::eval_gpu` ←
+    `gpu::eval` ← `eval_impl` (incident 7736CCA2). Python 3.14.5 / current libmlx.
+    Reproduced twice within ~1-2 training steps at 768px with live encoders.
+  - **Trigger:** the trainer's online-encode path only — per step-window it loads
+    VAE/Qwen3 (and SigLIP), encodes, then "releases all live encoders + clears GPU
+    caches". The crash fires in the next compiled-kernel eval after that release/clear:
+    a compiled kernel's cached input buffer appears to be invalidated by the cache clear
+    (NULL input array in the command encoder). A prefetch thread doing PIL resize was
+    concurrently active.
+  - **NOT hit in production:** flywheel/production training runs fully CACHED (no live
+    encoders), which is why this never fired in weeks of campaign training. The TRAIN-7
+    probes initially used live encode for worst-case memory and hit it immediately.
+  - **Workaround:** run probes (and anything else) with precomputed caches — also more
+    production-representative. The online-encode path should be treated as broken until
+    the encoder-release/cache-clear sequence is fixed or MLX is upgraded past the bug;
+    investigate `mx.clear_cache()` placement in the trainer's `[online-encode]` release
+    step relative to pending compiled evals.
+
 ## Training Anomalies (Chunk 1 — Observed, Not Actionable Now)
 
 - **ANOMALY-1: Shard-boundary stalls** — Two blocking stalls observed at step ~19,900 (55 min) and ~24,900 (2.6h). Root cause: epoch boundary + simultaneous JDB chunk 2 conversion competing for 2TBSSD I/O. Data% jumps to 100% in timing log. Both resolved automatically. Structural until pixel data is pre-cached to disk. See BACKLOG PIPELINE-3.
