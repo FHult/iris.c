@@ -172,6 +172,10 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   stop at its peak. Bake the over-training signature (cond_gap down while train_loss down — already
   in the doctor's cond_gap-stall detector) into production monitoring. Also size the per-chunk step
   budget to chunk size (epochs-per-sample is the real overfit driver) — tune via the warmup/ablation.
+  *Progress (2026-06-10):* the pure decision logic is built + tested — `train/ip_adapter/
+  cond_gap_stop.py` (`best_point` selection, `should_stop` plateau early-stop, `is_overtraining`
+  signature; mirrors the doctor detector), `train/tests/test_cond_gap_stop.py` (14 tests). Remaining:
+  wire it into the trainer's T-05 eval loop (needs PROD-1's val set; touches the live trainer).
 - **FLYWHEEL-CKPT-1: per-iteration checkpoint archival (start_step=0 collision). DONE 2026-06-10.**
   With `--warmstart-weights` (resume_from_champion) or from-scratch mode, every iteration saved
   `step_0001000.safetensors`, so `ckpt_path = ckpts[-1]` resolved to the same clobbered file each
