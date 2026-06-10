@@ -184,6 +184,18 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   iteration's file to a unique `iter{N}_step_*.safetensors`, records that, and prunes archived
   files to keep only the champion (get_best) + current. resume_from_champion is now safe.
 
+- **TRAIN-PAD-1: training text-pad convention diverges from reference inference.** The
+  trainer/precompute zero-pads text embeddings to 512 (precompute stores only real-token
+  rows), but the reference (mflux) and C inference pass **masked-encoder outputs** at pad
+  positions (non-zero, prompt-derived — pad queries attend to real tokens). The IP-adapter
+  is therefore trained under a slightly different text-conditioning distribution than it
+  will see at C inference (relevant to G-1 Phase 2). Discovered while fixing QWEN-1
+  (BUGS.md), where the WRONG resolution — changing inference to match training — regressed
+  all generation. Options: (a) precompute/store full 512-row embeddings (storage cost),
+  (b) mask text pads out of attention in the trainer's frozen base (closer to a true mask
+  than either convention), (c) measure the adapter-quality impact first and accept if
+  negligible. Do (c) first once a golden-set eval exists.
+
 **Phased plan (full detail in memory file `train7_plan.md`):**
 
 1. **Memory profiling run** (gate, < 2 hours) — run 60 steps at 768px and 1024px with

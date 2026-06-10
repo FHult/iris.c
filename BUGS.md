@@ -21,6 +21,26 @@
     0.99906. Regression guard: `test_encode_golden` in `debug/test_vae.c` (pins the
     channel-increasing encode path; fails by diff ~118 if the aliasing returns).
 
+- **QWEN-1: text-embedding pad rows were zeroed, regressing every generation. FIXED 2026-06-10.**
+  - **Symptom:** `make test` golden comparisons failed broadly (txt2img mean_diff 43–52 vs
+    threshold 20; img2img 57.5). Bisect: green at `76564f8`, red at `ee039d6` — culprit
+    `ffecfcc` (2026-05-16, INFER-H-001), which zeroed all `qwen3_encode_text_ex` embedding
+    rows beyond the real tokens "to match training convention."
+  - **Why it's wrong:** the reference implementation (mflux `Flux2PromptEncoder` →
+    `Qwen3TextEncoder.get_prompt_embeds`) returns the stacked hidden states **unmodified** —
+    pad queries attend to real tokens under the encoder's padding mask, so pad rows carry
+    non-zero prompt-derived state that flows into the transformer. Zeroed rows are NOT a
+    mask (a zero K-row still takes softmax weight e^0), so the change altered text
+    conditioning for every prompt < 512 tokens. It is the **training** zero-pad convention
+    that diverges from the reference, not inference (tracked in BACKLOG TRAIN-PAD-1).
+  - **Why it shipped:** the mps build was simultaneously broken (`cBuffers` ARC error, fixed
+    only on 2026-06-05 by `ee75739`), so `make test` could not run between 2026-05-15 and
+    2026-06-05 — the change was never validated. **Process lesson: never land engine-numerics
+    changes while `make test` cannot run; a broken build masks regressions.**
+  - **Fix:** revert the zeroing (pad rows returned as-is); `ffecfcc`'s other hunk (strict-
+    aliasing `memcpy` in `f16_to_f32`) kept — behavior-neutral and correct. `make test`
+    7/7 with restored margins (e.g. img2img 57.5 → 8.25).
+
 ## Training Bugs (Fixed)
 
 - **VAE-Q1: IP-adapter trained in the wrong latent space (raw VAE-latent, not the

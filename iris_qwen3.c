@@ -1898,16 +1898,18 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     free(padded_tokens);
     free(attention_mask);
 
-    /* Zero pad positions to match training convention.
-     * Precompute saves only real-token rows; training zero-pads to 512.
-     * Without this, pad positions carry non-zero RMSNorm/attention output
-     * and create a systematic mismatch at every position beyond num_tokens. */
-    if (embeddings && num_tokens < QWEN3_MAX_SEQ_LEN) {
-        int text_dim = enc->model->text_dim;
-        memset(embeddings + (size_t)num_tokens * text_dim, 0,
-               (size_t)(QWEN3_MAX_SEQ_LEN - num_tokens) * text_dim * sizeof(float));
-    }
-
+    /* Pad rows are returned AS-IS (masked-encoder outputs), NOT zeroed.
+     * This matches the reference implementation: mflux Flux2PromptEncoder /
+     * Qwen3TextEncoder.get_prompt_embeds returns the stacked hidden states
+     * unmodified — pad QUERIES still attend to real tokens, so pad rows carry
+     * non-zero prompt-derived state that flows into the transformer.
+     *
+     * Do NOT zero these rows "to match training convention" (INFER-H-001,
+     * reverted): that change inverted the relationship — the trainer's zero-pad
+     * convention is the one that diverges from the reference, and zeroing here
+     * regressed every generation vs the parity-validated goldens (mean_diff
+     * 5→52; zero K-rows are not a mask, they still take softmax weight e^0).
+     * The training-side divergence is tracked separately in BACKLOG. */
     return embeddings;
 }
 
