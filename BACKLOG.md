@@ -208,13 +208,20 @@ structure and is **currently unguarded**. Do NOT start a production run without 
 
 **Phased plan (full detail in memory file `train7_plan.md`):**
 
-1. **Memory profiling run** (gate, < 2 hours) — run 60 steps at 768px and 1024px with
-   `memory_profile: true` to measure actual per-fence peaks. The plans doc cited ~12 GB
-   activation at 1024px, but that estimate predates the split-forward architecture
-   (`train/train_ip_adapter.py:1476`) which materializes and frees all Flux intermediates
-   before backward. Corrected estimate: retained `flux_state` at 1024px is only ~654 MB
-   (Q vectors + h_final); estimated system peak ~21–22 GB vs 28 GB theoretical.
-   See `train7_plan.md` §2 for exact probe config, run commands, and decision thresholds.
+1. **Memory profiling run — GATE PASSED 2026-06-10.** 60 cached steps at each resolution
+   (val-set shard, `memory_profile: true`):
+   | | 768px | 1024px |
+   |---|---|---|
+   | fwd / bwd+param / ema peak (GB) | 16.86 / 19.33 / 16.99 | 17.13 / **21.32** / 17.26 |
+   | system peak (GB) | ≤22.4 | ≤21.5 |
+   | step time | ~9 s | ~18 s |
+   System peak at 1024px ≈ 21.5 GB — matches the corrected ~21–22 GB estimate, ~10 GB
+   headroom on 32 GB, **no gradient checkpointing needed → Stage 2 AND Stage 3 unblocked.**
+   Caveats: probes ran style_loss off / batch 1 / cached encoders (production adds margin
+   but stays well inside budget). Probe logs: /tmp/probe_{768,1024}px.log. Getting here
+   flushed out MLX-1 (online-encode segfault, BUGS.md), the tiled-VAE bf16→numpy bug
+   (fixed — PRECOMP-1 had never produced a real latent), and PRECOMP-6 (resume/coverage
+   disagreement).
 
 2. **Stage 2: 768px fine-tune** (20K steps, ~1 day) — `train/configs/stage2_768px.yaml`
    exists but is missing quality signals from Stage 1: `correct_forward_q`, `cross_ref_prob`,
