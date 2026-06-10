@@ -164,7 +164,19 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   pooling v1; content-invariant style statistics), (b) cluster the pool (k-means, K~256),
   (c) store rec_id→cluster, (d) cross-ref samples from the SAME cluster (+ small random
   fraction as negatives). Multiplies the value of the production run — land BEFORE it.
-  Status: style_cluster.py started 2026-06-10 (sample-fit on cold SigLIP cache).
+  **Status 2026-06-10: harness built; cheap descriptors RULED OUT by measurement.**
+  `style_cluster.py` (sidecar sampling, descriptor build, k-means, persistence,
+  pair-quality metric) works end-to-end. But on a 20K sample, same-cluster vs random
+  pair-distance ratios: pooled mean+std 0.86, centered 0.86, PCA-whitened 0.90 (worse —
+  amplifies quantization noise), low-rank Gram-of-patch-tokens 0.96 (worst). Conclusion:
+  the 4-BIT-QUANTIZED SigLIP cache does not carry usable style signal for hand-crafted
+  descriptors — 4-bit noise destroys the second-order statistics style lives in, and
+  SigLIP's semantic objective concentrates style weakly. **Required: a dedicated
+  style-descriptor precompute pass** (GPU window): preferred = a style-trained encoder
+  (CSD-class, trained for style retrieval); fallback = unquantized SigLIP + a learned
+  style head. Fits PRECOMP-3 cleanly as a new encoder identity ("style"). The clustering
+  harness + pair-ratio gate consume it unchanged (descriptor field is versioned).
+  Acceptance gate: pair-ratio <= 0.7 before wiring cross-ref to clusters.
 - **SREF-2: style-specific evaluation.** CLIP-I conflates style and content, so the
   golden-set eval cannot see sref quality. Add per-generation: style similarity to ref
   (Gram-distance / CSD-like, content-invariant), content-leak from ref (subject copied?
