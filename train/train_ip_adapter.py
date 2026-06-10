@@ -1273,8 +1273,14 @@ def train(config: dict) -> None:
         return loss_val, grad_norm
 
     # ── T-05: validation loss on held-out set ─────────────────────────────────
-    def _compute_val_loss() -> Optional[float]:
-        """Run a no-grad forward on up to 64 held-out records. Returns mean loss or None."""
+    def _compute_val_loss(with_cond_gap: bool = False):
+        """Run a no-grad forward on up to 64 held-out records. Returns mean loss or None.
+
+        with_cond_gap=True additionally evaluates every SigLIP-bearing record TWICE
+        with the SAME noise/timestep — conditioned and null — and returns a dict
+        {loss, loss_cond, loss_null, cond_gap, n_pairs}. The paired design makes the
+        held-out cond_gap low-variance; it is the metric the flywheel should rank by
+        (the in-training gap is a train-batch statistic — see code review M1)."""
         if not _val_shards:
             return None
         from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed, _load_siglip_embed
@@ -1288,6 +1294,20 @@ def train(config: dict) -> None:
         _val_vae    = str(_vbase / "vae")    if (_vbase / "vae").is_dir()    else dcfg.get("vae_cache_dir")
         _val_siglip = str(_vbase / "siglip") if (_vbase / "siglip").is_dir() else None
         losses = []
+        _pair_cond: list = []
+        _pair_null: list = []
+
+        def _one_loss(_siglip, _use_null, _noisy, _txt, _t, _target):
+            if _use_block_injection:
+                _l = loss_fn_with_ip(_siglip, _use_null, _noisy, _txt, _t, _target)
+            else:
+                _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
+                mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
+                _l = loss_fn(_siglip, _use_null, _fs, _target)
+                del _fs
+            mx.eval(_l)
+            return float(_l.item())
+
         for _shard in _val_shards[:2]:
             try:
                 import tarfile as _tf
@@ -1317,29 +1337,38 @@ def train(config: dict) -> None:
                 _noise = mx.random.normal(_lat.shape, dtype=_lat.dtype)
                 _alpha, _sigma = get_schedule_values(_t)
                 _noisy, _target = fused_flow_noise(_lat, _noise, _alpha, _sigma)
-                if _siglip_np is not None:
-                    _siglip   = mx.array(_siglip_np[None], dtype=mx.bfloat16)
-                    _use_null = mx.array(False)
-                else:
-                    _siglip   = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
-                    _use_null = mx.array(True)
                 if _use_block_injection:
                     mx.eval(_target)
-                    _loss = loss_fn_with_ip(_siglip, _use_null, _noisy, _txt, _t, _target)
+                if _siglip_np is not None:
+                    _siglip = mx.array(_siglip_np[None], dtype=mx.bfloat16)
+                    _lc = _one_loss(_siglip, mx.array(False), _noisy, _txt, _t, _target)
+                    losses.append(_lc)
+                    if with_cond_gap:
+                        # Paired null pass: SAME noise/timestep, conditioning off —
+                        # the difference isolates what the adapter contributes.
+                        _ln = _one_loss(_siglip, mx.array(True), _noisy, _txt, _t, _target)
+                        _pair_cond.append(_lc)
+                        _pair_null.append(_ln)
                 else:
-                    _fs = _flux_forward_no_ip(flux, _noisy, _txt, _t)
-                    mx.eval(_fs["qs"], _fs["h_final"], _fs["temb"], _target)
-                    _loss = loss_fn(_siglip, _use_null, _fs, _target)
-                    del _fs
-                mx.eval(_loss)
-                losses.append(float(_loss.item()))
-                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip, _loss, _noisy, _target
+                    _siglip = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+                    losses.append(_one_loss(_siglip, mx.array(True), _noisy, _txt, _t, _target))
+                del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip, _noisy, _target
                 mx.clear_cache()
                 if len(losses) >= 64:
                     break
             if len(losses) >= 64:
                 break
-        return sum(losses) / len(losses) if losses else None
+
+        _mean = sum(losses) / len(losses) if losses else None
+        if not with_cond_gap:
+            return _mean
+        if not _pair_cond:
+            return {"loss": _mean, "loss_cond": None, "loss_null": None,
+                    "cond_gap": None, "n_pairs": 0}
+        _lc = sum(_pair_cond) / len(_pair_cond)
+        _ln = sum(_pair_null) / len(_pair_null)
+        return {"loss": _mean, "loss_cond": _lc, "loss_null": _ln,
+                "cond_gap": _ln - _lc, "n_pairs": len(_pair_cond)}
 
     # ── Live encoder load/unload for online (no-cache) mode ───────────────────
     # These keep Qwen3/VAE/SigLIP resident only during the ~100 ms feature-
@@ -2342,6 +2371,28 @@ def train(config: dict) -> None:
         print(f"\nTraining complete. EMA weights: {ocfg['checkpoint_dir']}/best.safetensors")
     else:
         print(f"\nTraining complete. (skip_checkpoint_save=true — no weights written)")
+
+    # ── Held-out cond_gap (code review M1) ────────────────────────────────────
+    # Paired conditioned/null eval on the held-out val set. This line is parsed
+    # by flywheel_lib.collect_metrics_from_log (RE_VAL_COND) and, when present,
+    # REPLACES the in-training cond_gap for champion selection and shard
+    # attribution — the train-batch gap measures fit to the trained shards, not
+    # generalization. ~2x N forwards; runs once, at the very end.
+    try:
+        _val_final = _compute_val_loss(with_cond_gap=True)
+        if isinstance(_val_final, dict) and _val_final.get("cond_gap") is not None:
+            print(f"VAL loss_cond={_val_final['loss_cond']:.4f} "
+                  f"loss_null={_val_final['loss_null']:.4f} "
+                  f"cond_gap={_val_final['cond_gap']:+.4f} "
+                  f"[n={_val_final['n_pairs']}] (held-out)", flush=True)
+        else:
+            print("VAL held-out cond_gap unavailable (no val set or no SigLIP pairs)",
+                  flush=True)
+    except Exception as _val_exc:  # noqa: BLE001 — the checkpoint is already saved;
+        # a val-eval failure must degrade to "no held-out signal" (downstream falls
+        # back to the train-batch gap), never fail the whole iteration.
+        print(f"VAL held-out eval failed ({_val_exc}) — falling back to train-batch gap",
+              flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

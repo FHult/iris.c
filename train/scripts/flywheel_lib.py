@@ -38,6 +38,9 @@ RE_STEP  = re.compile(r"^step\s+([\d,]+)/([\d,]+)\s+loss\s+([\d.]+)\s+\(avg\s+([
 RE_COND  = re.compile(r"loss_cond=([\d.]+)\s+loss_null=([\d.]+)\s+gap=([+-][\d.]+)")
 RE_REF   = re.compile(r"loss_ref:.*?self=([\d.]+)(?:.*?cross=([\d.]+).*?gap=([+-][\d.]+))?")
 RE_SCALE = re.compile(r"ip_scale:\s+mean=([\d.]+).*?double=([\d.]+).*?single=([\d.]+)")
+# Held-out paired cond/null eval printed once at training end (code review M1).
+RE_VAL_COND = re.compile(r"^VAL\s+loss_cond=([\d.]+)\s+loss_null=([\d.]+)\s+"
+                         r"cond_gap=([+-][\d.]+)\s+\[n=(\d+)\]")
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +634,23 @@ def collect_metrics_from_log(log_path: Path) -> dict:
                 "ip_scale_double": float(m.group(2)),
                 "ip_scale_single": float(m.group(3)),
             })
+            continue
+        m = RE_VAL_COND.search(line)
+        if m:
+            metrics.update({
+                "val_loss_cond": float(m.group(1)),
+                "val_loss_null": float(m.group(2)),
+                "val_cond_gap":  float(m.group(3)),
+                "val_n_pairs":   int(m.group(4)),
+            })
+
+    # Held-out cond_gap supersedes the in-training (train-batch) gap for everything
+    # downstream — champion selection, shard attribution, plateau detection. The
+    # train-batch value is preserved under cond_gap_train for diagnostics.
+    if metrics.get("val_cond_gap") is not None:
+        if metrics.get("cond_gap") is not None:
+            metrics["cond_gap_train"] = metrics["cond_gap"]
+        metrics["cond_gap"] = metrics["val_cond_gap"]
     return metrics
 
 

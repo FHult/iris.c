@@ -232,7 +232,7 @@ budget is constant across iterations, but small deltas are noise — require rep
 | 1 | ~~P1: dedupe `iterations` row on `--free-gpu` restart~~ **FIXED same day** (`delete_iteration` + restart-path cleanup) | Medium | done |
 | 2 | ~~P2: join/cancel stage thread in restart path~~ **FIXED same day** (join before rmtree) | Medium | done |
 | 3 | ~~M2: archive champion EMA per iteration~~ **FIXED same day** (`iterNNNN_best.safetensors` archive + iter-keyed prune) | Med-High | done |
-| 4 | M1: held-out cond_gap for the flywheel metric (wire PROD-2 + PROD-1 val set into `collect_metrics`) | High | medium |
+| 4 | ~~M1: held-out cond_gap for the flywheel metric~~ **WIRED same day**: trainer prints a paired held-out `VAL … cond_gap=` line at training end (same-noise cond/null per record); `collect_metrics` parses it and it SUPERSEDES the train-batch gap for champion/attribution (train value kept as `cond_gap_train`). Val-eval failure degrades to the train gap, never fails the iteration. Remaining: one GPU smoke of the end-of-run eval at next window. | High | wired |
 | 5 | ~~C1: NULL adapter fields on `load_adapter_split_qkv` failure~~ **FIXED same day** | Medium | done |
 | 6 | C2: status returns (or memset+log) for silent-OOM attention/ip_adapter paths | Med-Low | small |
 | 7 | M3: watch selection concentration; tune recency penalty if head keeps growing | Medium | config |
