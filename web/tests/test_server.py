@@ -1506,3 +1506,54 @@ class TestHiresFixIntermediate:
         loaded = srv.history_by_id.get(job_id)
         assert loaded is not None
         assert loaded.hires_fix_intermediate is True
+
+
+class TestSrefRouting:
+    """SREF-3: style-mode slots route through the IP-Adapter ONLY when a bundle
+    is configured; otherwise the legacy path must handle them (fail-open)."""
+
+    _PNG_1x1 = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
+                "FcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+    def test_style_slot_without_bundle_falls_through(self, client, monkeypatch):
+        import server as srv
+        monkeypatch.setattr(srv, "IP_BUNDLE", None)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG_1x1, "strength": 0.8,
+                                  "mode": "style"}],
+        })
+        assert r.status_code == 200
+        assert r.get_json().get("sref") is None   # legacy path, not the sref branch
+
+    def test_style_slot_with_bundle_routes_to_sref(self, client, monkeypatch, tmp_path):
+        import server as srv
+        bundle = tmp_path / "bundle"; bundle.mkdir()
+        feats = tmp_path / "feats.bin"; feats.write_bytes(b"\0" * 16)
+        monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
+        called = {}
+        monkeypatch.setattr(srv, "run_generation_sref",
+                            lambda *a, **k: called.setdefault("args", a))
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG_1x1, "strength": 0.8,
+                                  "mode": "style"}],
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body.get("sref") is True
+        with srv.jobs_lock:
+            assert body["job_id"] in srv.jobs
+
+    def test_composition_slot_never_routes_to_sref(self, client, monkeypatch, tmp_path):
+        import server as srv
+        bundle = tmp_path / "bundle"; bundle.mkdir()
+        monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG_1x1, "strength": 1.0,
+                                  "mode": "composition"}],
+        })
+        assert r.status_code == 200
+        assert r.get_json().get("sref") is None

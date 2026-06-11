@@ -479,6 +479,46 @@ static void test_vae_config_parse(void) {
     #undef RESET
 }
 
+/* ------------------------------------------------------------------------- */
+/* Resolved-config golden against the REAL shipped vae/config.json files      */
+/* (grok C-2, "golden the resolved config"): a vendor format change on a      */
+/* model update must fail here, not silently flip the normalization branch.   */
+/* Skips (with a notice) when a model dir is absent — keeps the suite hermetic.*/
+/* ------------------------------------------------------------------------- */
+static void test_vae_config_golden_real(void) {
+    static const struct {
+        const char *path;
+        int   want_z;
+        float want_scaling, want_shift;   /* 0,0 = batch-norm branch */
+    } goldens[] = {
+        /* Flux.2 Klein: explicit latent_channels 32, NO scaling/shift -> BN. */
+        { "flux-klein-model/vae/config.json",    32, 0.0f,    0.0f    },
+        { "flux-klein-4b-base/vae/config.json",  32, 0.0f,    0.0f    },
+        /* Z-Image-Turbo: 16 channels + explicit (x-shift)*scale.             */
+        { "zimage-turbo/vae/config.json",        16, 0.3611f, 0.1159f },
+    };
+    for (size_t i = 0; i < sizeof(goldens) / sizeof(goldens[0]); i++) {
+        FILE *f = fopen(goldens[i].path, "r");
+        if (!f) {
+            printf("SKIP config golden (%s not present)\n", goldens[i].path);
+            continue;
+        }
+        char buf[8192];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        int z = IRIS_VAE_Z_CHANNELS; float sc = 0.0f, sh = 0.0f;
+        iris_parse_vae_config(buf, &z, &sc, &sh);
+        char name[256];
+        snprintf(name, sizeof(name), "config golden %s z", goldens[i].path);
+        check_true(name, z == goldens[i].want_z);
+        snprintf(name, sizeof(name), "config golden %s scaling", goldens[i].path);
+        check_f(name, sc, goldens[i].want_scaling, 1e-5f);
+        snprintf(name, sizeof(name), "config golden %s shift", goldens[i].path);
+        check_f(name, sh, goldens[i].want_shift, 1e-5f);
+    }
+}
+
 int main(void) {
     printf("=== VAE white-box tests (CPU, synthetic weights) ===\n");
     test_flux_encode_shape_finite();
@@ -489,6 +529,7 @@ int main(void) {
     test_normalization_branch();
     test_encode_golden();
     test_vae_config_parse();
+    test_vae_config_golden_real();
 
     printf("\n%d passed, %d failed\n", passes, failures);
     return failures ? 1 : 0;

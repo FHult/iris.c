@@ -13,6 +13,7 @@ Requirements:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -37,6 +38,16 @@ DEFAULT_MODEL_DIR = next(
 )
 DEFAULT_IRIS_BINARY = PROJECT_DIR / "iris"
 OUTPUT_DIR = SCRIPT_DIR / "output"
+
+# ── SREF-3: style-reference (IP-Adapter) sidecar ─────────────────────────────
+# A reference slot with mode "style" routes through the trained IP-Adapter when
+# a bundle is configured; otherwise the legacy half-weight img2img heuristic
+# applies (fail-open). Features are computed out-of-process by the training
+# venv (mlx_vlm SigLIP) until G-1 Phase 3 brings SigLIP into the C engine.
+SREF_DIR = OUTPUT_DIR / "sref"
+IP_BUNDLE = os.environ.get("IRIS_IP_BUNDLE")  # exported adapter bundle dir
+TRAIN_VENV_PY = PROJECT_DIR / "train" / ".venv" / "bin" / "python"
+SIGLIP_FEATURES_SCRIPT = PROJECT_DIR / "train" / "scripts" / "siglip_features.py"
 
 # Known model slots. The startup model dir is prepended dynamically in main().
 # sh_arg: argument to pass to download_model.sh; None means not downloadable via UI.
@@ -1028,6 +1039,83 @@ def run_generation_server_mode(job, prompt, width, height, steps, seed, input_im
     queue_generation(job, prompt, width, height, steps, seed, input_image_path, reference_image_paths, show_steps, guidance, schedule, lora_name, lora_scale, img2img_strength, negative_prompt)
 
 
+def compute_sref_features(image_bytes: bytes) -> Path:
+    """Image bytes -> cached raw-f32 SigLIP features file for `iris --ip-features`.
+
+    Content-hash keyed under web/output/sref/ so re-using a style reference
+    (style codes, repeated generations) never re-encodes. Raises on failure —
+    the caller surfaces the error to the UI."""
+    sha = hashlib.sha256(image_bytes).hexdigest()[:24]
+    SREF_DIR.mkdir(parents=True, exist_ok=True)
+    out = SREF_DIR / f"{sha}.bin"
+    if out.exists():
+        return out
+    tmp_img = SREF_DIR / f"{sha}_src.png"
+    tmp_img.write_bytes(image_bytes)
+    try:
+        proc = subprocess.run(
+            [str(TRAIN_VENV_PY), str(SIGLIP_FEATURES_SCRIPT),
+             str(tmp_img), "--out", str(out)],
+            capture_output=True, text=True, timeout=300, cwd=str(PROJECT_DIR))
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError(
+                (proc.stderr or "").strip()[-400:] or "siglip_features failed")
+        return out
+    finally:
+        tmp_img.unlink(missing_ok=True)
+
+
+def run_generation_sref(job, prompt, width, height, steps, seed,
+                        features_path, ip_scale, guidance=None):
+    """One-shot `iris --ip` run for a style-reference generation (SREF-3 v1).
+
+    The persistent server loads --ip at startup only, so style generations use
+    a dedicated process. Slower (model load per image) and memory-additive to
+    the resident server — acceptable v1; the latency track (bf16 inject, G-1
+    Phase 3, per-request features in server mode) is in BACKLOG SREF-3."""
+    job.status = "running"
+    out_path = OUTPUT_DIR / f"{job.id}.png"
+    cmd = [str(iris_server.iris_binary), "-d", str(iris_server.model_dir),
+           "-p", prompt, "-o", str(out_path),
+           "-W", str(width), "-H", str(height), "--steps", str(steps),
+           "--ip", str(IP_BUNDLE), "--ip-features", str(features_path),
+           "--ip-scale", str(ip_scale)]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
+    if guidance:
+        cmd += ["--guidance", str(guidance)]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              cwd=str(PROJECT_DIR), timeout=1800)
+        if proc.returncode != 0 or not out_path.exists():
+            raise RuntimeError(
+                (proc.stderr or "").strip()[-400:] or f"iris exited {proc.returncode}")
+        job.status = "complete"
+        job.output_path = out_path
+        job.progress = job.total_steps
+        job.generation_time = time.time() - t0
+        job.cleanup_temp_files()
+        threading.Thread(target=generate_thumbnail,
+                         args=(job.id, out_path), daemon=True).start()
+        with history_lock:
+            history.insert(0, job)
+            history_by_id[job.id] = job
+            if len(history) > MAX_HISTORY:
+                old_job = history.pop()
+                history_by_id.pop(old_job.id, None)
+            mark_history_dirty()
+        job.put_event(("complete", {"image_url": f"/image/{job.id}",
+                                    "total_time": job.generation_time}))
+        job.put_event(("done", None))
+    except Exception as e:
+        job.status = "error"
+        job.error = str(e)
+        job.cleanup_temp_files()
+        job.put_event(("error", {"message": job.error}))
+        job.put_event(("done", None))
+
+
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -1092,6 +1180,33 @@ def generate():
         return {"data": r, "strength": 1.0, "mode": "composition"}
 
     reference_slots = [_normalise_ref(r) for r in raw_refs if r]
+
+    # SREF-3: a "style"-mode slot routes through the trained IP-Adapter when a
+    # bundle is configured (IRIS_IP_BUNDLE env). v1: single style reference,
+    # txt2img only (other slots ignored on this path). Without a bundle, the
+    # legacy half-weight img2img heuristic below still applies (fail-open).
+    style_slots = [s for s in reference_slots if s.get("mode") == "style"]
+    if style_slots and IP_BUNDLE and Path(IP_BUNDLE).exists():
+        slot = style_slots[0]
+        try:
+            sref_bytes = base64.b64decode(slot["data"].split(",")[-1])
+            sref_bytes = convert_image_to_png(sref_bytes)
+            features_path = compute_sref_features(sref_bytes)
+        except Exception as e:
+            return jsonify({"error": f"Style reference encoding failed: {e}"}), 400
+        job_id = uuid.uuid4().hex[:12]
+        job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
+        job.batch_id = batch_id
+        job.style = style if (style and style in STYLE_PRESETS) else None
+        with jobs_lock:
+            jobs[job_id] = job
+        ip_scale = float(slot.get("strength", 1.0))
+        threading.Thread(
+            target=run_generation_sref,
+            args=(job, generation_prompt, width, height, steps, seed,
+                  features_path, ip_scale, guidance),
+            daemon=True).start()
+        return jsonify({"job_id": job_id, "status": "started", "sref": True})
 
     # Derive effective img2img_strength: take the minimum slot strength so the
     # most-constrained slot drives the global noise level (C backend uses one value).
