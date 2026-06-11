@@ -338,6 +338,22 @@ precompute step after Qwen3/VAE/SigLIP: CSD style encoding of the staged shards
 - FAIL-OPEN at every level: step failure → iteration continues with legacy cross-ref;
   missing `neighbors.sqlite` → dataset falls back silently.
 - doctor: `cold_precompute.style` in the `--ai` summary (bundle manifest).
+- doctor `_check_fail_open_fallbacks`: WARNING when the silent fallback ENGAGED —
+  config requests `style_pairing` but the latest done iteration (≤72 h old) has no
+  `style_pair` telemetry, or `style_pair_pct == 0`, or the held-out `VAL` line is
+  absent (champion ranking silently fell back to the train-batch gap).
+- heartbeat: trainer writes `style_pair_pct` per log window and a final
+  `status: "val_done"` heartbeat carrying `val_cond_gap` / `val_n_pairs`.
+
+### Nightly health run (GPU-free early warning)
+
+`train/scripts/nightly_health.sh` (launchd `com.iris.nightly-health`, daily 05:30;
+plist in `train/launchd/`) runs pytest + the `make mps` compile + `make test-unit` —
+no GPU, no model weights — and writes `$DATA_ROOT/health/nightly_health.json`.
+Doctor `_check_nightly_health`: result stale >48 h → WARNING (the early-warning
+system itself is down); `build_failed` → CRITICAL (the QWEN-1 failure mode: a
+broken build hides every other regression); pytest/unit failures → WARNING.
+Run manually any time: `./train/scripts/nightly_health.sh` (~80 s).
 
 ### Source of Truth Hierarchy
 
