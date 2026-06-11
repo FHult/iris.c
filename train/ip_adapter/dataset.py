@@ -449,15 +449,28 @@ def make_prefetch_loader(
             import sqlite3 as _sql
             _con = _sql.connect(f"file:{style_neighbors_db}?mode=ro", uri=True)
             _nbr_map = {}
+            _n_no_sig = 0
             for _r, _n, _c in _con.execute(
                     "SELECT rec_id, neighbor_ids, neighbor_cos FROM neighbors"):
                 _kept = [nid for nid, cc in zip(_json.loads(_n), _json.loads(_c))
                          if cc >= _STYLE_NBR_MIN_COS][:5]
+                # Keep only neighbors whose SigLIP features actually exist in
+                # the hot cache — style bundles may cover MORE records than the
+                # subsampled SigLIP precompute (e.g. reused 200-record pool-map
+                # bundles vs a 100-record iteration). Probing here turns silent
+                # per-sample misses (smoke3: style_pair=0% despite 192 mapped
+                # records) into an honest, smaller map.
+                if _kept and siglip_cache_dir:
+                    _have = [nid for nid in _kept if os.path.exists(
+                        os.path.join(siglip_cache_dir, f"{nid}.npz"))]
+                    _n_no_sig += len(_kept) - len(_have)
+                    _kept = _have
                 if _kept:
                     _nbr_map[_r] = _kept
             _con.close()
             print(f"  [dataset] style neighbors loaded: {len(_nbr_map):,} records "
-                  f"with >= 1 neighbor at cos>={_STYLE_NBR_MIN_COS} "
+                  f"with >= 1 usable neighbor at cos>={_STYLE_NBR_MIN_COS} "
+                  f"({_n_no_sig} neighbor slots dropped for missing SigLIP) "
                   f"({style_neighbors_db})", flush=True)
         except Exception as _exc:
             print(f"  [dataset] style neighbors unavailable ({_exc}) — "

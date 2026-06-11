@@ -75,6 +75,11 @@ class _SiglipAdherence:
                            return_tensors="pt").to(self.dev)
             t = self.model.get_text_features(**ti)
             v = self.model.get_image_features(**ii)
+            # transformers 5.x returns output objects; 4.x returned tensors.
+            if hasattr(t, "pooler_output"):
+                t = t.pooler_output
+            if hasattr(v, "pooler_output"):
+                v = v.pooler_output
             t = t / t.norm(dim=-1, keepdim=True)
             v = v / v.norm(dim=-1, keepdim=True)
             return float((t * v).sum())
