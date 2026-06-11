@@ -154,6 +154,10 @@ def main() -> int:
     (out / "report.json").write_text(json.dumps(report, indent=2))
 
     # ── persist ────────────────────────────────────────────────────────────────
+    # Raw descriptors + ids too: descriptor/clustering variants must iterate
+    # OFFLINE, never by re-reading 20K files off the cold disk.
+    np.save(out / "descriptors.npy", descs)
+    (out / "descriptor_ids.json").write_text(json.dumps(kept))
     np.savez(out / "centroids.npz", centroids=km.cluster_centers_.astype(np.float32),
              k=args.k, descriptor="siglip_mean_std_l2_v1", seed=args.seed)
     db = sqlite3.connect(out / "assignments.sqlite")
