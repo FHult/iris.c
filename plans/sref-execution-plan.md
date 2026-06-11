@@ -48,17 +48,29 @@ Owner's coding work has priority. Idle slices, in value order:
 3. Style backfill for already-precomputed shards (~10-16h full pool — overnight-class;
    partial backfill of high-value shards is fine, reuse makes it incremental).
 
-### DP-2b (next free GPU night): style backfill of the PRECOMPUTED pool → shard signal
-Before run5, style-encode the **206 already-precomputed shards (~1M records, ~16h at
-56 ms/img)** — these are the only shards run5 can train on anyway. (The full 1280-shard
-pool is ~4 days — backfill incrementally later; the SREF-1W step encodes new shards
-per-iteration regardless.) Then run `style_shard_report.py` over the bundles:
-per-shard **diversity** (distinct styles contributed), **pair_rich** (fraction of
-records with ≥3 strong style neighbors — isolated styles can't form training pairs),
-and **cross-shard connectivity** (which shards to CO-STAGE so iteration-local neighbor
-lists are rich). Baseline from the val sample: pair_rich ≈ 44%. Payoffs: run5 selects/
-stages style-kin shards together, every run5 iteration skips style encoding entirely
-(bundle reuse), and SREF-2 gets its embeddings for free.
+### DP-2b (next free GPU window): style-map the WHOLE pool (~4h), then targeted backfill
+Style encoding needs only the IMAGES (tars), not the qwen3/vae precompute — so the map
+is not bound to the trainable subset. **Sample-encode ~200 records/shard across ALL
+1280 shards (~4h at 56 ms/img)**, then `style_shard_report.py` ranks the entire pool:
+per-shard **diversity**, **pair_rich** (records with ≥3 strong style neighbors —
+isolated styles can't form training pairs), **cross-shard connectivity** (which shards
+to CO-STAGE for rich iteration-local neighbor lists). Baseline (val sample): ≈44%.
+The pool is already style-rich — 413 coyo + 95 coyo+laion+wikiart + 28
+journeydb+wikiart ≈ 42% non-pure-journeydb — so NO data acquisition is needed; the
+lever is SELECTION: run5 raises per_source_min for wikiart/coyo sources and co-stages
+style kin per the connectivity map. Full style encode happens on demand for staged
+shards only (per-iteration SREF-1W step + bundle reuse). With subsampled precompute
+(DP-2c below), first-contact on never-precomputed wikiart/coyo shards is cheap (~1-2h),
+so the style-rich 42% becomes genuinely trainable immediately.
+
+### DP-2c: subsampled flywheel precompute (~5-10x iteration throughput)
+At batch 1 × 1000 steps an iteration TRAINS on ~1K records but precomputes ~210K.
+Pass `--subsample-per-shard ~200` (flag exists; deterministic, shared across encoders;
+add the same flag to style_precompute) through a flywheel-config key → precompute
+phase drops ~20h → ~1-2h, i.e. several iterations per GPU-night. Training signal is
+unchanged (it never consumed more); full cache coverage is only needed before the
+PRODUCTION run. This compresses run5's style-pairing verdict from weeks to days and
+lets run5 warm attribution itself — making run4 largely redundant (see DP-3).
 
 ### DP-3 (night): which campaign?
 - **Default: relaunch warmup-run4 as-is** (`pipeline_ctl start-flywheel
