@@ -650,6 +650,17 @@ flywheel-gated items. Migration: `plans/proxy-vae-v3.19-migration.md`.
     an 85 s Tier-1 verdict on the same 994 pairs. Not on the SREF critical path
     (run5 uses DP-2c subsampling with the real VAE); needed before the
     full-coverage production precompute.
+  - **Sizing by extrapolation, not bisection (if medium overshoots):** fit the
+    scaling law `1−cosine ≈ a·N^(−b)` through small (N=3.4M, err=0.140) and
+    medium's result, solve for the N where err crosses the 0.05 gate, add ~25%
+    parameter margin (two-point fits don't validate the exponent). Fit on cosine
+    only — ch_std_ratio is a capacity *symptom* that snaps to ~1.0 once adequate;
+    verify it + fft on the candidate. Free helpers: (a) the DEFAULT 6.0M variant
+    is a third trainable point (or may simply BE the answer); (b) speed(N) needs
+    no training — benchmark_vae_proxy on random weights maps the throughput curve
+    in minutes, so pick N maximizing speedup subject to predicted gate-pass;
+    (c) Tier-1 is 85 s on any 2K-step checkpoint — eval the fitted candidate
+    mid-training and stop early once all three gates clear.
   - **Two BLOCKING pre-trust items (must land before any proxy latent ships), from
     `grok_proxy_vae_analysis.md`:** (C-1) no golden test that C `iris_vae` encode/decode
     matches the teacher VAE the proxy is trained against — proxy can pass Tier-1/2 vs
