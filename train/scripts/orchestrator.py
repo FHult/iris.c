@@ -2885,7 +2885,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     _stager = DataStager(_pipeline_cfg)
 
     fw_db    = FlywheelDB()
-    score_db = ShardScoreDB()
+    # min_attribution_obs: config-tunable attribution-confidence threshold
+    # (was silently ignored before — bug check 2026-06-11 M-6).
+    score_db = ShardScoreDB(
+        min_attr_obs=int(fw_cfg.get("min_attribution_obs", 3)))
 
     try:
         reports_dir = FLYWHEEL_REPORTS_DIR / name
@@ -3162,7 +3165,8 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             # 1000-step iteration but full-shard precompute builds ~210K — subsampling
             # (deterministic "first N valid", shared across encoders) cuts the dominant
             # per-iteration cost ~10x. Published npz are a permanent prefix of the full
-            # cache: raising N or a later full pass encodes only the complement.
+            # cache: raising N (or a full pass) re-encodes affected shards once and the
+            # larger bundles replace the cold ones — growth is monotonic per shard.
             _subsample_n = int(fw_cfg.get("precompute_subsample_per_shard", 0) or 0)
             _sub_arg = f"--subsample-per-shard {_subsample_n} " if _subsample_n > 0 else ""
             pre_cmd = (
@@ -3325,15 +3329,36 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                             _style_nbr_db = str(_style_out / "neighbors.sqlite")
                             log_orch(f"[flywheel:{name}] iter {iteration}: style step "
                                      f"complete — neighbors ready")
-                            # Publish new bundles to cold for cross-iteration reuse.
+                            # Publish new OR UPGRADED bundles to cold for
+                            # cross-iteration reuse. A bundle with more keys
+                            # (subsample raised, or full pass) must replace the
+                            # smaller cold one — otherwise the shard re-encodes
+                            # every future iteration (DP-2c monotonic growth).
                             try:
+                                import zipfile as _zf
+
+                                def _nkeys(_p):
+                                    """npz key count (an npz is a zip; header-only read)."""
+                                    try:
+                                        with _zf.ZipFile(_p) as _z:
+                                            return len(_z.namelist())
+                                    except Exception:
+                                        return -1   # unreadable -> always replace
+
                                 _style_cold.mkdir(parents=True, exist_ok=True)
                                 _n_pub = 0
                                 for _b in _style_out.glob("*.npz"):
+                                    if ".tmp" in _b.name:
+                                        continue
                                     _dst = _style_cold / _b.name
-                                    if not _dst.exists():
-                                        shutil.copy2(_b, _dst)
-                                        _n_pub += 1
+                                    if _dst.exists() and _nkeys(_b) <= _nkeys(_dst):
+                                        continue
+                                    # Atomic-ish: never leave a partial bundle
+                                    # at the canonical cold name.
+                                    _dtmp = _dst.with_name(_dst.name + ".tmp")
+                                    shutil.copy2(_b, _dtmp)
+                                    os.replace(_dtmp, _dst)
+                                    _n_pub += 1
                                 if _n_pub:
                                     log_orch(f"[flywheel:{name}] iter {iteration}: "
                                              f"published {_n_pub} style bundles to cold")

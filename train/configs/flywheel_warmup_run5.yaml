@@ -78,8 +78,6 @@ flywheel:
   # shard_manifest: "/Volumes/2TBSSD/style_clusters/run5_manifest.json"
   shard_manifest: null
 
-  min_attribution_obs: 3
-  siglip_sample_n: 50
 
   plateau_patience:   0          # data-selection mode; doctor detectors cover health
   plateau_threshold:  0.02

@@ -39,6 +39,9 @@ def main() -> int:
     ap.add_argument("--tau", type=float, default=0.6,
                     help="cosine threshold for a 'strong' style neighbor")
     ap.add_argument("--min-nbrs", type=int, default=3)
+    ap.add_argument("--dedup-cos", type=float, default=0.95,
+                    help="cosines above this are near-duplicates, not style "
+                         "neighbors (match style_neighbors --dedup-cos)")
     ap.add_argument("--sample-per-shard", type=int, default=400,
                     help="cap per-shard rows in the global matrix (keeps 1M-pool RAM sane)")
     ap.add_argument("--chunk", type=int, default=2048)
@@ -52,6 +55,8 @@ def main() -> int:
     shard_of: list[int] = []
     mats: list[np.ndarray] = []
     for f in sorted(cache.glob("*.npz")):
+        if ".tmp" in f.name:        # crash-orphaned temp from style_precompute
+            continue
         d = np.load(f)
         keys = list(d.files)
         if len(keys) > args.sample_per_shard:
@@ -80,7 +85,7 @@ def main() -> int:
             cos[r, s + r] = -2.0
         strong = cos >= args.tau
         # drop near-duplicates from the neighbor counts (same-job variants)
-        strong &= cos <= 0.95
+        strong &= cos <= args.dedup_cos
         nbr_count[s:e] = strong.sum(axis=1)
         rows, cols = np.nonzero(strong)
         for r, c in zip(shard_of_a[s + rows], shard_of_a[cols]):

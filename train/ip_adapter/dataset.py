@@ -437,16 +437,27 @@ def make_prefetch_loader(
     # SREF-1: load the style-neighbor map once (rec_id -> top-k neighbor ids).
     # Iteration-local DBs are ~200K rows; reading into a dict keeps the decoder
     # thread free of per-sample sqlite. Fail-open on any problem.
+    # Cosine floor for a usable style neighbor: below this the "neighbor" is
+    # just the nearest record in a sparse pool, not the same style — pairing it
+    # would re-introduce the arbitrary-pairing gradient (and inflate the
+    # style_pair telemetry). Matches style_shard_report's strong-neighbor tau.
+    _STYLE_NBR_MIN_COS = 0.6
     _nbr_map: Optional[dict] = None
     if style_neighbors_db and os.path.exists(style_neighbors_db):
         try:
             import json as _json
             import sqlite3 as _sql
             _con = _sql.connect(f"file:{style_neighbors_db}?mode=ro", uri=True)
-            _nbr_map = {r: _json.loads(n) for r, n in
-                        _con.execute("SELECT rec_id, neighbor_ids FROM neighbors")}
+            _nbr_map = {}
+            for _r, _n, _c in _con.execute(
+                    "SELECT rec_id, neighbor_ids, neighbor_cos FROM neighbors"):
+                _kept = [nid for nid, cc in zip(_json.loads(_n), _json.loads(_c))
+                         if cc >= _STYLE_NBR_MIN_COS][:5]
+                if _kept:
+                    _nbr_map[_r] = _kept
             _con.close()
             print(f"  [dataset] style neighbors loaded: {len(_nbr_map):,} records "
+                  f"with >= 1 neighbor at cos>={_STYLE_NBR_MIN_COS} "
                   f"({style_neighbors_db})", flush=True)
         except Exception as _exc:
             print(f"  [dataset] style neighbors unavailable ({_exc}) — "
@@ -509,14 +520,17 @@ def make_prefetch_loader(
                 siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
 
                 # SREF-1: same-style/different-content reference features. Pick a
-                # random top-k style neighbor and load ITS SigLIP features from the
-                # same (hot) cache. Any miss -> None (trainer falls back).
+                # random neighbor (pre-filtered to cos >= _STYLE_NBR_MIN_COS at
+                # map load) and load ITS SigLIP features from the same (hot)
+                # cache. Any miss -> None (trainer falls back). NOTE: the batch
+                # emit below is all-or-nothing — one miss drops style refs for
+                # the whole batch. Fine at batch_size 1; revisit if batch grows.
                 style_ref_feat = None
                 if _nbr_map is not None and siglip_cache_dir:
                     _nbrs = _nbr_map.get(rec["id"])
                     if _nbrs:
                         style_ref_feat = _load_siglip_embed(
-                            rng.choice(_nbrs[:5]), siglip_cache_dir)
+                            rng.choice(_nbrs), siglip_cache_dir)
 
                 imgs_buf.append(_normalize(img))
                 caps_buf.append(caption)

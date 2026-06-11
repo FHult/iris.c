@@ -38,10 +38,20 @@ ENCODER_ID = "csd_vit_l_style_v1"
 
 
 def encode_shard(enc: CSDStyleEncoder, tar_path: Path, batch_size: int,
-                 subsample: int = 0) -> dict[str, np.ndarray]:
-    """subsample>0: encode only the FIRST N valid images (deterministic prefix —
-    same rule as precompute_all --subsample-per-shard, so neighbor records have
-    SigLIP features in the cache)."""
+                 subsample: int = 0,
+                 existing_keys: int = 0) -> Optional[dict[str, np.ndarray]]:
+    """Encode a shard's records into {rec_id: [768] f16}.
+
+    Record eligibility and prefix MUST mirror precompute_all.iter_shard exactly
+    (img AND txt member present; counted toward the subsample cap regardless of
+    whether the image later decodes) — diverging rules would give style
+    neighbors no SigLIP features in the hot cache.
+
+    existing_keys: key count of an already-present bundle. Returns None (skip)
+    when it covers >= 98% of this run's target — the tolerance absorbs
+    undecodable images, which never produce keys (without it, a shard with one
+    corrupt jpg would re-encode forever). A smaller bundle is re-encoded in
+    full (DP-2c upgrade)."""
     out: dict[str, np.ndarray] = {}
     batch_x, batch_ids = [], []
 
@@ -54,37 +64,45 @@ def encode_shard(enc: CSDStyleEncoder, tar_path: Path, batch_size: int,
             batch_x, batch_ids = [], []
 
     with tarfile.open(tar_path) as tar:
-        for m in tar:
-            if not (m.isfile() and m.name.lower().endswith((".jpg", ".jpeg", ".png"))):
-                continue
-            rid = m.name.rsplit(".", 1)[0]
+        members = {m.name: m for m in tar.getmembers() if m.isfile()}
+        keys: dict[str, dict] = {}
+        for name in members:
+            stem, _, ext = name.rpartition(".")
+            keys.setdefault(stem, {})[ext.lower()] = name
+        eligible = []
+        for stem, exts in keys.items():
+            jpg_key = exts.get("jpg") or exts.get("jpeg") or exts.get("png")
+            txt_key = exts.get("txt") or exts.get("caption")
+            if jpg_key and txt_key:
+                eligible.append((stem, jpg_key))
+        n_target = min(subsample, len(eligible)) if subsample else len(eligible)
+        if n_target > 0 and existing_keys >= int(n_target * 0.98):
+            return None
+        n_seen = 0
+        for stem, jpg_key in eligible:
+            n_seen += 1
             try:
-                img = Image.open(io.BytesIO(tar.extractfile(m).read()))
+                img = Image.open(io.BytesIO(tar.extractfile(members[jpg_key]).read()))
                 batch_x.append(preprocess(img))
-                batch_ids.append(rid)
+                batch_ids.append(stem)
             except Exception:
-                continue
-            if subsample and (len(out) + len(batch_x)) >= subsample:
-                flush()
-                break
+                pass
             if len(batch_x) >= batch_size:
                 flush()
+            if subsample and n_seen >= subsample:
+                break
     flush()
-    if subsample and len(out) > subsample:
-        out = dict(list(out.items())[:subsample])
     return out
 
 
-def bundle_complete(dst: Path, n_target: int) -> bool:
-    """An existing bundle satisfies this run only if it holds >= n_target keys —
-    a plain exists() check would block upgrading a subsampled bundle to a fuller
-    one (DP-2c monotonic-growth rule). Unreadable bundle -> re-encode."""
+def bundle_keys(dst: Path) -> int:
+    """Key count of an existing bundle; 0 if absent or unreadable (-> re-encode)."""
     if not dst.exists():
-        return False
+        return 0
     try:
-        return len(np.load(dst).files) >= n_target
+        return len(np.load(dst).files)
     except Exception:
-        return False
+        return 0
 
 
 def main() -> int:
@@ -109,37 +127,38 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Clear stale temp files from interrupted runs (incl. the legacy *.tmp.npz
+    # naming, which matched *.npz globs and could poison neighbors/publish).
+    for stale in list(out.glob("*.npz.tmp")) + list(out.glob("*.tmp.npz")):
+        stale.unlink(missing_ok=True)
+
     enc = CSDStyleEncoder(args.weights)
     n_rec = n_done = 0
     t0 = time.time()
     for i, tar_path in enumerate(tars):
         dst = out / f"{tar_path.stem}.npz"
-        # Upgrade-aware skip: a subsampled bundle must not block a fuller pass.
-        # n_target for a full run (subsample=0) is unknowable without reading the
-        # tar, so full runs only trust bundles previously written by a full run
-        # (marked via the manifest-free heuristic: >= subsample when set, else
-        # re-encode unless the bundle came from a full pass — cheap tar-count).
-        if args.subsample_per_shard > 0:
-            if bundle_complete(dst, args.subsample_per_shard):
-                n_done += 1
-                continue
-        elif dst.exists():
-            with tarfile.open(tar_path) as _t:
-                _n_imgs = sum(1 for m in _t
-                              if m.isfile() and m.name.lower().endswith(
-                                  (".jpg", ".jpeg", ".png")))
-            # 2% tolerance: undecodable images never produce keys; without slack a
-            # shard with one corrupt jpg would re-encode forever.
-            if bundle_complete(dst, int(_n_imgs * 0.98)):
-                n_done += 1
-                continue
-        embs = encode_shard(enc, tar_path, args.batch, args.subsample_per_shard)
-        if not embs:
-            print(f"  [{tar_path.stem}] no images — skipped", flush=True)
+        # Upgrade-aware skip happens inside encode_shard (it knows the eligible
+        # count): an existing bundle covering >=98% of this run's target -> None.
+        embs = encode_shard(enc, tar_path, args.batch, args.subsample_per_shard,
+                            existing_keys=bundle_keys(dst))
+        if embs is None:
+            n_done += 1
             continue
-        tmp = dst.with_suffix(".tmp.npz")
-        np.savez(tmp, **embs)
-        tmp.rename(dst)
+        if not embs:
+            print(f"  [{tar_path.stem}] no usable records — skipped", flush=True)
+            continue
+        # Atomic write. The temp name must NOT match *.npz (a crash-orphaned
+        # temp would otherwise be loaded by style_neighbors / published to cold
+        # as a junk bundle). np.savez appends .npz to bare paths, so write
+        # through an open file handle to keep the exact .npz.tmp name.
+        tmp = dst.with_name(dst.name + ".tmp")
+        try:
+            with open(tmp, "wb") as _f:
+                np.savez(_f, **embs)
+            tmp.rename(dst)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         n_rec += len(embs)
         rate = n_rec / max(1e-9, time.time() - t0)
         print(f"  [{i+1}/{len(tars)}] {tar_path.stem}: {len(embs)} embeds "

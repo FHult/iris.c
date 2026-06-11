@@ -690,7 +690,7 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
     float *scores = (float *)malloc((size_t)seq_q * seq_k * sizeof(float));
     if (!scores) {
         /* Zero the output so OOM degrades to a no-signal block instead of the
-         * caller consuming uninitialized memory; log once. */
+         * caller consuming uninitialized memory. */
         memset(out, 0, (size_t)batch * heads * seq_q * head_dim * sizeof(float));
         fprintf(stderr, "iris_attention: scores alloc failed (seq %dx%d) — output zeroed\n",
                 seq_q, seq_k);

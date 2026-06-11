@@ -597,6 +597,12 @@ def write_campaign_summary_json(name: str, db: "FlywheelDB", cold_root: "Path") 
 # Metric parsing
 # ---------------------------------------------------------------------------
 
+# Minimum held-out pairs before the VAL cond_gap may supersede the train-batch
+# gap: with very thin val SigLIP coverage a near-meaningless 1-pair gap would
+# otherwise silently outrank a 1000-step train statistic.
+VAL_MIN_PAIRS = 16
+
+
 def collect_metrics_from_log(log_path: Path) -> dict:
     """Parse trainer log; return the last-seen snapshot of each metric."""
     metrics: dict = {}
@@ -605,6 +611,7 @@ def collect_metrics_from_log(log_path: Path) -> dict:
     except OSError:
         return metrics
 
+    _sp_n = _sp_k = 0   # style-pair counts accumulated across ALL log windows
     for line in text.splitlines():
         m = RE_STEP.search(line)
         if m:
@@ -648,12 +655,20 @@ def collect_metrics_from_log(log_path: Path) -> dict:
             continue
         m = RE_STYLE_PAIR.search(line)
         if m:
-            metrics["style_pair_pct"] = float(m.group(1))
+            # Accumulate raw counts: each print is a per-window snapshot
+            # (counters reset between windows); the iteration-level pct is the
+            # ratio of the sums, not the last window's tail sample.
+            _sp_n += int(m.group(2))
+            _sp_k += int(m.group(3))
+    if _sp_k > 0:
+        metrics["style_pair_pct"] = round(100.0 * _sp_n / _sp_k, 1)
 
     # Held-out cond_gap supersedes the in-training (train-batch) gap for everything
     # downstream — champion selection, shard attribution, plateau detection. The
     # train-batch value is preserved under cond_gap_train for diagnostics.
-    if metrics.get("val_cond_gap") is not None:
+    # Gated on a minimum pair count (the val_* fields are always populated).
+    if (metrics.get("val_cond_gap") is not None
+            and metrics.get("val_n_pairs", 0) >= VAL_MIN_PAIRS):
         if metrics.get("cond_gap") is not None:
             metrics["cond_gap_train"] = metrics["cond_gap"]
         metrics["cond_gap"] = metrics["val_cond_gap"]

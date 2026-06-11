@@ -242,12 +242,16 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 class ShardScoreDB:
     """Persistent per-shard quality scores. Thread-safe."""
 
-    def __init__(self, db_path: Path = SHARD_SCORES_DB_PATH) -> None:
+    def __init__(self, db_path: Path = SHARD_SCORES_DB_PATH,
+                 min_attr_obs: int = MIN_ATTR_OBS) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        # Attribution-confidence threshold (flywheel.min_attribution_obs).
+        # Lower = attribution trusted sooner but noisier.
+        self.min_attr_obs = max(1, int(min_attr_obs))
         self._conn.executescript(_SCHEMA_V2)
         _migrate_schema(self._conn)
 
@@ -442,10 +446,10 @@ class ShardScoreDB:
                 raw_comp = row["composite_score"]
 
                 # Attribution confidence: harmonic mean of observation counts,
-                # normalised by MIN_ATTR_OBS, capped at 1.0
-                if n_inc >= MIN_ATTR_OBS and n_exc >= MIN_ATTR_OBS:
+                # normalised by min_attr_obs, capped at 1.0
+                if n_inc >= self.min_attr_obs and n_exc >= self.min_attr_obs:
                     hmean = 2 * n_inc * n_exc / (n_inc + n_exc)
-                    conf = min(1.0, hmean / MIN_ATTR_OBS)
+                    conf = min(1.0, hmean / self.min_attr_obs)
                 else:
                     conf = 0.0
 

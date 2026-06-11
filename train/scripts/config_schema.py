@@ -51,6 +51,23 @@ NESTED_KNOWN = {
         "stall_precompute_secs", "stall_train_secs", "logs_max_gb",
         "max_campaign_days", "consecutive_fail_warn", "consecutive_fail_crit",
     },
+    # Every key the orchestrator's flywheel loop reads (fw_cfg.get/[]). The
+    # SREF chain is fail-open by design, so a typo here (style_paring,
+    # precompute_subsample_pershard, ...) would otherwise silently run as a
+    # legacy campaign with nothing downstream complaining.
+    "flywheel": {
+        "ablation_config", "ablation_every_n", "ablation_max_runs",
+        "ablation_warmstart_arms", "base_checkpoint", "data_root",
+        "from_scratch_each_iter", "hyperparams", "max_iterations",
+        "min_attribution_obs", "min_free_gb", "n_shards", "name",
+        "pipeline_config",
+        "plateau_ablation_runs", "plateau_patience", "plateau_threshold",
+        "poll_interval", "precomp_trigger_shards",
+        "precompute_subsample_per_shard", "quality_gate",
+        "resume_from_champion", "shard_manifest", "shard_selection",
+        "shards_dir", "steps_per_iteration", "storage", "style_cold_dir",
+        "style_pairing", "temporal_decay", "training_config",
+    },
 }
 
 

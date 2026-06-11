@@ -39,8 +39,12 @@ from style_encoder.csd_mlx import CSDStyleEncoder, preprocess
 def load_pairs(args) -> list[dict]:
     if args.pairs:
         return json.loads(Path(args.pairs).read_text())
-    refs = {p.stem: p for p in Path(args.ref_dir).iterdir()
-            if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
+    # setdefault on a sorted listing: when a stem exists with multiple
+    # extensions (x.jpg + x.png), the alphabetically first wins, deterministically.
+    refs: dict = {}
+    for p in sorted(Path(args.ref_dir).iterdir()):
+        if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+            refs.setdefault(p.stem, p)
     pairs = []
     for g in sorted(Path(args.gen_dir).iterdir()):
         if g.suffix.lower() in (".jpg", ".jpeg", ".png") and g.stem in refs:

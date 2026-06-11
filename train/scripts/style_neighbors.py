@@ -37,6 +37,8 @@ def load_cache(cache_dir: Path) -> tuple[list[str], np.ndarray]:
     ids: list[str] = []
     mats: list[np.ndarray] = []
     for f in sorted(cache_dir.glob("*.npz")):
+        if ".tmp" in f.name:        # crash-orphaned temp from style_precompute
+            continue
         d = np.load(f)
         for rid in d.files:
             ids.append(rid)
@@ -61,7 +63,11 @@ def main() -> int:
     n = len(ids)
     print(f"{n:,} embeddings loaded ({E.nbytes/1e6:.0f} MB f32)", flush=True)
 
-    k = args.k
+    # argpartition needs kth < n; tiny (smoke) caches must not crash.
+    k = min(args.k, n - 1)
+    if k < 1:
+        print("fewer than 2 embeddings — no neighbor lists possible", file=sys.stderr)
+        return 1
     top_idx = np.empty((n, k), dtype=np.int64)
     top_cos = np.empty((n, k), dtype=np.float32)
     n_deduped = 0
@@ -84,12 +90,16 @@ def main() -> int:
             print(f"  {e:,}/{n:,} ({100*done:.0f}%)  ETA {((time.time()-t0)/max(done,1e-9))*(1-done):.0f}s",
                   flush=True)
 
-    # acceptance metric: NN-pair vs random-pair distance (euclidean on unit sphere)
+    # acceptance metric: NN-pair vs random-pair distance (euclidean on unit sphere).
+    # Sentinel slots (cos=-2: record had fewer than k eligible candidates) are
+    # excluded — they are not neighbors and would inflate nn_d.
     rng = np.random.RandomState(0)
     i, j = rng.randint(0, n, 8000), rng.randint(0, n, 8000)
     m = i != j
     rand_d = np.linalg.norm(E[i[m]] - E[j[m]], axis=1).mean()
-    nn_d = np.sqrt(np.maximum(2 - 2 * top_cos[:, :5], 0)).mean()
+    _t5 = top_cos[:, : min(5, k)]
+    _valid = _t5 > -1.0
+    nn_d = np.sqrt(np.maximum(2 - 2 * _t5[_valid], 0)).mean() if _valid.any() else float("nan")
     ratio = float(nn_d / rand_d)
     print(f"top-5 NN/random distance ratio: {ratio:.3f}  (gate <= 0.7)", flush=True)
     print(f"near-duplicate exclusions: {n_deduped:,}", flush=True)
@@ -99,10 +109,15 @@ def main() -> int:
     db.execute("CREATE TABLE IF NOT EXISTS neighbors "
                "(rec_id TEXT PRIMARY KEY, neighbor_ids TEXT, neighbor_cos TEXT)")
     db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-    rows = ((ids[r],
-             json.dumps([ids[c] for c in top_idx[r]]),
-             json.dumps([round(float(c), 4) for c in top_cos[r]]))
-            for r in range(n))
+    # Drop sentinel slots (cos <= -1): argpartition fills them with arbitrary
+    # indices when fewer than k eligible candidates exist — storing those would
+    # hand the loader arbitrary records as "style neighbors".
+    def _row(r):
+        valid = [c for c in range(k) if top_cos[r, c] > -1.0]
+        return (ids[r],
+                json.dumps([ids[top_idx[r, c]] for c in valid]),
+                json.dumps([round(float(top_cos[r, c]), 4) for c in valid]))
+    rows = (_row(r) for r in range(n))
     db.executemany("INSERT OR REPLACE INTO neighbors VALUES (?,?,?)", rows)
     for kk, vv in {"k": k, "dedup_cos": args.dedup_cos, "n_records": n,
                    "nn5_random_ratio": round(ratio, 4),

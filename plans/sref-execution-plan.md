@@ -114,8 +114,10 @@ Then Stage 2 (768, ~2.1d) → Stage 3 (1024, ~2.1d) fine-tunes per TRAIN-7.
 ```bash
 # 1. DP-1: distillation verdict (doctor shows the run + step count)
 train/.venv/bin/python train/scripts/pipeline_doctor.py --ai | head -40
-#    Stop-early (default once >=20K steps):
+#    Stop-early (default once >=20K steps). The EXIT_CODE marker tells the
+#    doctor this was deliberate (else it reports a crash until the eval runs):
 tmux kill-session -t iris; pkill -f train_vae_proxy
+sleep 2; echo "EXIT_CODE=130" >> /Volumes/2TBSSD/logs/proxy_vae_train.log
 CKPT=$(ls -t /Volumes/2TBSSD/checkpoints/vae_proxy/*.safetensors | head -1)
 train/.venv/bin/python train/scripts/evaluate_vae_proxy.py --proxy "$CKPT" --tier 1 \
   --shards /Volumes/16TBCold/validation/held_out \

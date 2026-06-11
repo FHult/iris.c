@@ -454,14 +454,14 @@ class TestStyleNeighborRef:
             np.savez(d / f"{stem}.npz", q=q, scale=np.ones((729, 1), dtype=np.float16))
         return str(d)
 
-    def _neighbors_db(self, tmp_path, mapping):
+    def _neighbors_db(self, tmp_path, mapping, cos=0.7):
         import sqlite3, json as _json
         p = tmp_path / "neighbors.sqlite"
         db = sqlite3.connect(p)
         db.execute("CREATE TABLE neighbors (rec_id TEXT PRIMARY KEY, neighbor_ids TEXT, neighbor_cos TEXT)")
         for rid, nbrs in mapping.items():
             db.execute("INSERT INTO neighbors VALUES (?,?,?)",
-                       (rid, _json.dumps(nbrs), _json.dumps([0.7] * len(nbrs))))
+                       (rid, _json.dumps(nbrs), _json.dumps([cos] * len(nbrs))))
         db.commit(); db.close()
         return str(p)
 
@@ -479,6 +479,22 @@ class TestStyleNeighborRef:
         assert style_ref.shape == siglip.shape
         # neighbor is a DIFFERENT record -> different constant fill value
         assert not np.allclose(style_ref, siglip)
+
+    def test_below_cos_floor_falls_back(self, tmp_path):
+        # Neighbors below the 0.6 cosine floor are nearest-in-a-sparse-pool,
+        # not same-style — they must be dropped so the trainer falls back to
+        # legacy cross-ref instead of training on an arbitrary pair.
+        shard = str(tmp_path / "shard_000.tar")
+        _make_synthetic_shard(shard, n_records=4)
+        stems = [f"rec_{i:04d}" for i in range(4)]
+        sig = self._siglip_cache(tmp_path, stems)
+        ndb = self._neighbors_db(tmp_path,
+                                 {s: [stems[(i + 1) % 4]] for i, s in enumerate(stems)},
+                                 cos=0.3)
+        loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
+                                      siglip_cache_dir=sig, style_neighbors_db=ndb)
+        *_, style_ref, _bk = next(iter(loader))
+        assert style_ref is None, "cos<0.6 neighbors must not be used as style refs"
 
     def test_no_db_yields_none(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")

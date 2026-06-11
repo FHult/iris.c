@@ -31,8 +31,6 @@ flywheel:
     per_source_min:
       coyo: 1
       journeydb: 1
-  min_attribution_obs: 3
-  siglip_sample_n: 50
   shard_manifest: null
   plateau_patience: 0
   plateau_threshold: 0.02

@@ -76,6 +76,60 @@ class TestCheckProxyVae:
         assert issues[0].severity == "WARNING"
         assert issues[0].ctx.get("exists") is False
 
+    # -- training-run detector (log + process heuristics) -------------------
+
+    def _train_log(self, doctor, tmp_path, text, monkeypatch, eval_newer=False):
+        """Write a fresh proxy train log; force pgrep to 'not running';
+        optionally write an eval json with mtime after the log's."""
+        import os as _os
+        import subprocess as _sub
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        tlog = log_dir / "proxy_vae_train.log"
+        tlog.write_text(text)
+        if eval_newer:
+            ej = tmp_path / "proxy_vae_eval.json"
+            ej.write_text("{}")
+            _os.utime(ej, (tlog.stat().st_mtime + 60,) * 2)
+
+        class _NotRunning:
+            returncode = 1
+            stdout = b""
+            stderr = b""
+
+        monkeypatch.setattr(doctor.subprocess, "run",
+                            lambda *a, **k: _NotRunning())
+        doctor._check_proxy_vae({})
+        return _by_category("proxy_vae")
+
+    def test_train_log_no_exit_marker_is_critical(self, doctor, tmp_path, monkeypatch):
+        issues = self._train_log(doctor, tmp_path, "step 100: loss=0.5\n", monkeypatch)
+        assert len(issues) == 1
+        assert issues[0].severity == "CRITICAL"
+        assert "without an exit marker" in issues[0].title
+
+    def test_train_log_stop_early_with_eval_is_info(self, doctor, tmp_path, monkeypatch):
+        # DP-1 morning-checklist stop: no EXIT_CODE, but the Tier-1 eval json
+        # was written after the log went quiet -> intentional, not a crash.
+        issues = self._train_log(doctor, tmp_path, "step 100: loss=0.5\n",
+                                 monkeypatch, eval_newer=True)
+        assert len(issues) == 1
+        assert issues[0].severity == "INFO"
+        assert issues[0].ctx.get("stopped_early") is True
+
+    def test_train_log_sigint_exit_is_info(self, doctor, tmp_path, monkeypatch):
+        issues = self._train_log(doctor, tmp_path,
+                                 "step 100: loss=0.5\nEXIT_CODE=130\n", monkeypatch)
+        assert len(issues) == 1
+        assert issues[0].severity == "INFO"
+        assert issues[0].ctx.get("exit_code") == 130
+
+    def test_train_log_real_failure_warns(self, doctor, tmp_path, monkeypatch):
+        issues = self._train_log(doctor, tmp_path,
+                                 "Traceback\nEXIT_CODE=1\n", monkeypatch)
+        assert len(issues) == 1
+        assert issues[0].severity == "WARNING"
+
     def test_configured_but_no_eval_report_is_info(self, doctor, tmp_path):
         proxy = tmp_path / "proxy.safetensors"
         proxy.touch()

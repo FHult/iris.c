@@ -1655,16 +1655,38 @@ def _check_proxy_vae(cfg: dict) -> None:
             if _ln.lstrip().startswith("step "):
                 _last_step = _ln.strip()
                 break
+        # A deliberate stop-early (DP-1 morning checklist: tmux kill-session +
+        # pkill) also leaves no EXIT_CODE — distinguish it from a crash by the
+        # presence of an eval verdict written AFTER the log went quiet.
+        _eval_json = DATA_ROOT / "proxy_vae_eval.json"
+        _stopped_for_eval = (_eval_json.exists()
+                             and _eval_json.stat().st_mtime > _tlog.stat().st_mtime)
         if _running:
             _add("INFO", "proxy_vae",
                  f"Proxy-VAE training in progress{' — ' + _last_step if _last_step else ''}",
                  detail=f"Log: {_tlog}", ctx={"running": True, "last_step": _last_step})
+        elif _exit is None and _stopped_for_eval:
+            _add("INFO", "proxy_vae",
+                 "Proxy-VAE training stopped early — eval verdict available",
+                 detail=f"No EXIT_CODE but {_eval_json} is newer than the log "
+                        f"(intentional stop-early; see the eval report section).",
+                 ctx={"running": False, "stopped_early": True,
+                      "last_step": _last_step})
         elif _exit is None:
             _add("CRITICAL", "proxy_vae",
                  "Proxy-VAE training died without an exit marker (crash/kill)",
                  detail=f"Log ends without EXIT_CODE and no process is running. "
-                        f"Inspect: tail -40 {_tlog}",
+                        f"Inspect: tail -40 {_tlog}. If this was a deliberate "
+                        f"stop-early, run the Tier-1 eval (its report clears this).",
                  ctx={"running": False, "last_step": _last_step})
+        elif _exit in (130, 143):
+            # SIGINT/SIGTERM exit codes — the checklist's deliberate stop-early
+            # appends EXIT_CODE=130 after killing the run.
+            _add("INFO", "proxy_vae",
+                 f"Proxy-VAE training stopped by operator (exit {_exit})",
+                 detail=f"Log: {_tlog}",
+                 ctx={"exit_code": _exit, "stopped_early": True,
+                      "last_step": _last_step})
         elif _exit != 0:
             _add("WARNING", "proxy_vae",
                  f"Proxy-VAE training exited {_exit}",

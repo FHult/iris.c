@@ -58,9 +58,26 @@ def test_val_cond_gap_supersedes_train_gap(tmp_path):
 
 
 def test_val_negative_gap_parses(tmp_path):
-    m = _parse(tmp_path, "VAL loss_cond=0.5000 loss_null=0.4800 cond_gap=-0.0200 [n=10] (held-out)\n")
+    m = _parse(tmp_path, "VAL loss_cond=0.5000 loss_null=0.4800 cond_gap=-0.0200 [n=20] (held-out)\n")
     assert m["cond_gap"] == -0.02
     assert "cond_gap_train" not in m        # no train gap in this log
+
+
+def test_val_below_min_pairs_does_not_supersede(tmp_path):
+    # n=5 < VAL_MIN_PAIRS: the val_* fields are populated but the thin held-out
+    # gap must NOT replace the train-batch gap for champion selection.
+    m = _parse(tmp_path, LOG_BODY +
+               "VAL loss_cond=0.5000 loss_null=0.4800 cond_gap=-0.0200 [n=5] (held-out)\n")
+    assert m["val_cond_gap"] == -0.02
+    assert m["val_n_pairs"] == 5
+    assert m["cond_gap"] == 0.0003          # train-batch gap retained
+    assert "cond_gap_train" not in m
+
+
+def test_val_ema_suffix_parses(tmp_path):
+    # The trainer now labels the line "(held-out, EMA)" — must still parse.
+    m = _parse(tmp_path, "VAL loss_cond=0.4012 loss_null=0.4391 cond_gap=+0.0379 [n=58] (held-out, EMA)\n")
+    assert m["val_cond_gap"] == 0.0379
 
 
 def test_val_unavailable_line_is_ignored(tmp_path):
@@ -73,3 +90,12 @@ def test_style_pair_pct_parses(tmp_path):
     m = _parse(tmp_path, LOG_BODY + "  style_pair=62% (31/50 cross-ref steps)\n")
     assert m["style_pair_pct"] == 62.0
     assert m["cond_gap"] == 0.0003          # unrelated metrics unaffected
+
+
+def test_style_pair_pct_accumulates_across_windows(tmp_path):
+    # Per-window prints reset their counters; the iteration metric is the
+    # ratio of summed counts, not the last window's tail sample.
+    m = _parse(tmp_path, LOG_BODY +
+               "  style_pair=100% (10/10 cross-ref steps)\n" +
+               "  style_pair=0% (0/10 cross-ref steps)\n")
+    assert m["style_pair_pct"] == 50.0

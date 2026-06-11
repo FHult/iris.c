@@ -2413,13 +2413,19 @@ def train(config: dict) -> None:
     # REPLACES the in-training cond_gap for champion selection and shard
     # attribution — the train-batch gap measures fit to the trained shards, not
     # generalization. ~2x N forwards; runs once, at the very end.
+    #
+    # Evaluate the EMA weights (bug check 2026-06-11 M-1): the promoted artifact
+    # is best.safetensors = EMA, so ranking iterations by the online weights
+    # would rank a model we don't ship. Training is over — no restore needed.
     try:
+        adapter.update(mx_utils.tree_unflatten(list(_flatten(ema_params))))
+        mx.eval(adapter.parameters())
         _val_final = _compute_val_loss(with_cond_gap=True)
         if isinstance(_val_final, dict) and _val_final.get("cond_gap") is not None:
             print(f"VAL loss_cond={_val_final['loss_cond']:.4f} "
                   f"loss_null={_val_final['loss_null']:.4f} "
                   f"cond_gap={_val_final['cond_gap']:+.4f} "
-                  f"[n={_val_final['n_pairs']}] (held-out)", flush=True)
+                  f"[n={_val_final['n_pairs']}] (held-out, EMA)", flush=True)
         else:
             print("VAL held-out cond_gap unavailable (no val set or no SigLIP pairs)",
                   flush=True)

@@ -45,11 +45,6 @@ flywheel:
   # Lowered to 2 for faster convergence; still requires evidence on both sides.
   min_attribution_obs: 2
 
-  # SigLIP mean embedding
-  # siglip_sample_n: images sampled per shard when computing mean embedding.
-  # Larger = more accurate diversity but slower scan.
-  siglip_sample_n: 50
-
   # Shard manifest JSON path: {shard_id: {source: str, ...}}
   # If set, overrides the heuristic _infer_source() for source tagging.
   # Leave null to use the built-in heuristic.

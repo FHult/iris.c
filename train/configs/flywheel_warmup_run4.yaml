@@ -61,8 +61,6 @@ flywheel:
       journeydb: 6
       coyo:      6
 
-  min_attribution_obs: 3
-  siglip_sample_n: 50
   shard_manifest: null
 
   plateau_patience:   0        # disabled — too early to declare plateau
