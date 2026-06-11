@@ -79,8 +79,24 @@ class CSDStyleEncoder:
         x = x + self._linear(h, f"{p}.mlp.c_proj")
         return x
 
-    def encode(self, batch_chw: np.ndarray) -> np.ndarray:
-        """[B, 3, 224, 224] f32 (preprocessed) -> [B, 768] L2-normalised style embeds."""
+    def encode_both(self, batch_chw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """[B,3,224,224] -> (style [B,768], content [B,768]), both L2-normalised.
+
+        CSD trains TWO heads on the shared tower: last_layer_style (style
+        retrieval) and last_layer_content (content). The content head is what
+        makes a CONTENT-LEAK metric possible for sref evaluation: a generation
+        should be style-close but content-FAR from its reference (SREF-2)."""
+        cls_out = self._tower(batch_chw)
+        outs = []
+        for head in ("last_layer_style", "last_layer_content"):
+            e = cls_out @ self.w[head]
+            e = e / mx.maximum(mx.linalg.norm(e, axis=-1, keepdims=True), 1e-8)
+            mx.eval(e)
+            outs.append(np.array(e))
+        return outs[0], outs[1]
+
+    def _tower(self, batch_chw: np.ndarray) -> mx.array:
+        """Shared ViT tower: [B, 3, 224, 224] -> ln_post(cls) [B, 1024]."""
         x = mx.array(batch_chw)
         B = x.shape[0]
         # patch embed: conv stride 14 == unfold + matmul
@@ -94,7 +110,11 @@ class CSDStyleEncoder:
         x = self._ln(x, "backbone.ln_pre")
         for i in range(LAYERS):
             x = self._block(x, i)
-        cls_out = self._ln(x[:, 0], "backbone.ln_post")    # [B, 1024]
+        return self._ln(x[:, 0], "backbone.ln_post")       # [B, 1024]
+
+    def encode(self, batch_chw: np.ndarray) -> np.ndarray:
+        """[B, 3, 224, 224] f32 (preprocessed) -> [B, 768] L2-normalised style embeds."""
+        cls_out = self._tower(batch_chw)
         style = cls_out @ self.w["last_layer_style"]       # [B, 768]
         style = style / mx.maximum(mx.linalg.norm(style, axis=-1, keepdims=True), 1e-8)
         mx.eval(style)
