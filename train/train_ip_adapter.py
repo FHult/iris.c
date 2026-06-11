@@ -1106,6 +1106,7 @@ def train(config: dict) -> None:
     _grad_clip          = float(tcfg["grad_clip"])
     _ema_update_every   = int(tcfg["ema_update_every"])
     _ema_decay_factor   = float(tcfg["ema_decay"]) ** _ema_update_every
+    _ema_n              = 0   # EMA updates so far — drives the decay warmup ramp
     # n_grad_steps_per_fwd>1 runs N optimizer updates on the SAME forward pass
     # result (same noise, latent, text embeds). This is NOT gradient accumulation —
     # effective LR is multiplied by N. Only useful without block-injection.
@@ -1887,9 +1888,19 @@ def train(config: dict) -> None:
             # EMA update (every 10 steps saves ~23 minutes; plans §3.11)
             # Built lazily here so it references the same lazy adapter.parameters()
             # that Fence 2 will concretize — Fence 3 then evaluates only the new EMA.
+            #
+            # Decay warmup (timm-style): a fixed 0.9999 decay has a ~10,000-step
+            # averaging horizon — at flywheel-iteration length (1,000 steps) the
+            # EMA stays ~90% random init, so the promoted best.safetensors was
+            # mostly initialization noise (exposed by the smoke's held-out EMA
+            # eval: cond_gap=-5.07). min(decay, (1+n)/(10+n)) makes early EMA
+            # track the online weights closely and converges to the configured
+            # decay for long (production) runs.
             _do_ema = (step % _ema_update_every == 0)
             if _do_ema:
-                ema_params = update_ema(ema_params, adapter, decay=_ema_decay_factor)
+                _ema_n += 1
+                _decay_eff = min(_ema_decay_factor, (1.0 + _ema_n) / (10.0 + _ema_n))
+                ema_params = update_ema(ema_params, adapter, decay=_decay_eff)
 
             # Synchronous eval in two fences to bound peak Metal allocation.
             #
@@ -2377,6 +2388,27 @@ def train(config: dict) -> None:
             del flux_state
         del target
 
+
+    # Final telemetry window: runs shorter than log_every (the smoke config,
+    # short ablation arms) would otherwise record NOTHING — no step line for
+    # collect_metrics_from_log, no style_pair share. Emit the remainder once,
+    # in the exact formats the parsers match (RE_STEP / RE_STYLE_PAIR). The
+    # style counters were reset by the last full window, so this prints only
+    # the unreported tail — no double-counting in the accumulated pct.
+    if step % log_interval != 0:
+        try:
+            _final_loss = float(loss_val.item())
+            loss_history.append(_final_loss)
+            loss_smooth = sum(loss_history[-20:]) / len(loss_history[-20:])
+            print(f"step {step:>7,}/{_end_step:,}  loss {_final_loss:.4f} "
+                  f"(avg {loss_smooth:.4f})  [final window]", flush=True)
+        except Exception:
+            pass
+        if _cross_ref_steps_total > 0:
+            _sp = round(100 * _style_pair_steps / _cross_ref_steps_total, 1)
+            print(f"  style_pair={_sp:.0f}% "
+                  f"({_style_pair_steps}/{_cross_ref_steps_total} cross-ref steps)",
+                  flush=True)
 
     # Final checkpoint + EMA export
     # skip_checkpoint_save=true suppresses all final writes (used by ablation harness
