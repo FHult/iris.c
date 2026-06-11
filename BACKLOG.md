@@ -291,6 +291,17 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   (b) mask text pads out of attention in the trainer's frozen base (closer to a true mask
   than either convention), (c) measure the adapter-quality impact first and accept if
   negligible. Do (c) first once a golden-set eval exists.
+  - **Probe recipe for (c)** (sized 2026-06-11; one GPU hour, no trainer surgery):
+    take a trained champion + ~32 val records. For each, build BOTH text variants —
+    cached zero-pad rows (training convention) and a live Qwen3 encode of the padded
+    sequence keeping pad-position outputs (inference convention) — then run the
+    paired held-out loss (same noise/timestep per record, mirroring
+    `_compute_val_loss`) under each. Report Δloss_cond and Δcond_gap. If |Δ| is
+    within the val noise band → accept (c) and close; else implement (b) behind a
+    config flag and ablate it. Implementation note: do this as a standalone script
+    importing the trainer's loss pieces is NOT currently possible (`_compute_val_loss`
+    is nested in main) — either hoist it module-level first, or add a
+    `--pad-probe` early-exit mode to train_ip_adapter.py.
 
 **Phased plan (full detail in memory file `train7_plan.md`):**
 
