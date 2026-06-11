@@ -1,0 +1,39 @@
+# SREF-1W smoke — tiny end-to-end validation of the style-paired pipeline.
+# Exercises in ONE ~30-min run: subsampled precompute, the style step (encode +
+# neighbors), style-paired cross-ref + style_pair telemetry, and the end-of-run
+# VAL held-out cond_gap eval (unsmoked path). NOT a quality run.
+#   pipeline_ctl start-flywheel train/configs/flywheel_smoke_style.yaml
+# Pass criteria: iteration completes; style step log shows neighbors written;
+# trainer log shows style_pair>0%; VAL line present; doctor shows no CRITICALs.
+flywheel:
+  name: "smoke-style"
+  max_iterations: 1
+  steps_per_iteration: 50
+  n_shards: 3
+  poll_interval: 30
+  min_free_gb: 40
+  from_scratch_each_iter: true
+  base_checkpoint: null
+  style_pairing: true
+  style_cold_dir: "/Volumes/16TBCold/precomputed/style/v1_csd"
+  precompute_subsample_per_shard: 100
+  training_config: "train/configs/stage1_512px.yaml"
+  shards_dir: "/Volumes/16TBCold/shards"
+  hyperparams:
+    cross_ref_prob: 0.5
+    style_loss_weight: 0.07
+  shard_selection:
+    performance_weight: 0.30
+    min_diversity_pct: 0.30
+    exploration_rate: 0.40
+    recency_penalty: 0.20
+    recency_window_iters: 2
+    per_source_min:
+      coyo: 1
+      journeydb: 1
+  min_attribution_obs: 3
+  siglip_sample_n: 50
+  shard_manifest: null
+  plateau_patience: 0
+  plateau_threshold: 0.02
+  ablation_every_n: 0

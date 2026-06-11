@@ -109,6 +109,38 @@ Then Stage 2 (768, ~2.1d) → Stage 3 (1024, ~2.1d) fine-tunes per TRAIN-7.
 - Latency track when it matters: bf16/MPS-native inject (adapter currently forces CPU
   blocks, ~4x slower), G-1 Phase 3 (SigLIP/CSD in C) for a Python-free engine.
 
+## Morning checklist (push-button DP-1 → run5)
+
+```bash
+# 1. DP-1: distillation verdict (doctor shows the run + step count)
+train/.venv/bin/python train/scripts/pipeline_doctor.py --ai | head -40
+#    Stop-early (default once >=20K steps):
+tmux kill-session -t iris; pkill -f train_vae_proxy
+CKPT=$(ls -t /Volumes/2TBSSD/checkpoints/vae_proxy/*.safetensors | head -1)
+train/.venv/bin/python train/scripts/evaluate_vae_proxy.py --proxy "$CKPT" --tier 1 \
+  --shards /Volumes/16TBCold/validation/held_out \
+  --vae-cache /Volumes/16TBCold/validation/precomputed/vae \
+  --flux-model flux-klein-model --out /Volumes/2TBSSD/proxy_vae_eval.json \
+  --report /Volumes/2TBSSD/proxy_vae_eval.html
+
+# 2. SREF-1W + VAL-eval smoke (~30 min, one combined run)
+train/.venv/bin/python train/scripts/pipeline_ctl.py start-flywheel \
+  train/configs/flywheel_smoke_style.yaml
+#    pass: style step log shows neighbors; trainer log shows style_pair>0% + VAL line
+
+# 3. DP-2b: whole-pool style map (~4h, can run unattended)
+train/.venv/bin/python train/scripts/style_precompute.py \
+  --shards /Volumes/16TBCold/shards --out /Volumes/16TBCold/precomputed/style/v1_csd \
+  --subsample-per-shard 200
+train/.venv/bin/python train/scripts/style_shard_report.py \
+  --style-cache /Volumes/16TBCold/precomputed/style/v1_csd \
+  --out /Volumes/2TBSSD/style_clusters/pool_report.json
+
+# 4. Launch run5 (optionally set shard_manifest from the report first)
+train/.venv/bin/python train/scripts/pipeline_ctl.py start-flywheel \
+  train/configs/flywheel_warmup_run5.yaml
+```
+
 ## Standing constraints
 - Never start a production run without PROD-1/PROD-2 active (they are now).
 - Style precompute/backfill and proxy training are GPU-window tasks — schedule against
