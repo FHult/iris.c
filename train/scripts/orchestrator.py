@@ -3158,11 +3158,18 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             _sig_flag = "--siglip"
 
             _proxy_arg = _resolve_proxy_vae_args(_pipeline_cfg, campaign=name)
+            # DP-2c: subsampled flywheel precompute. Training consumes ~1K records per
+            # 1000-step iteration but full-shard precompute builds ~210K — subsampling
+            # (deterministic "first N valid", shared across encoders) cuts the dominant
+            # per-iteration cost ~10x. Published npz are a permanent prefix of the full
+            # cache: raising N or a later full pass encodes only the complement.
+            _subsample_n = int(fw_cfg.get("precompute_subsample_per_shard", 0) or 0)
+            _sub_arg = f"--subsample-per-shard {_subsample_n} " if _subsample_n > 0 else ""
             pre_cmd = (
                 f"caffeinate -dim python -u '{SCRIPTS_DIR}/precompute_all.py' "
                 f"--shards '{staging_dir}' "
                 f"--qwen3-output '{q_out}' --vae-output '{v_out}' --siglip-output '{s_out}' "
-                f"{_flux_arg} {_proxy_arg}{_sig_flag}"
+                f"{_sub_arg}{_flux_arg} {_proxy_arg}{_sig_flag}"
             )
             # PIPELINE_ORCHESTRATED=1: precompute_all skips GPU lock acquisition because
             # the orchestrator already holds the lock for the whole iteration.
@@ -3298,10 +3305,14 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                         write_heartbeat("flywheel", status="style",
                                         flywheel_name=name, iteration=iteration)
                         _style_log = LOG_DIR / f"flywheel_{name}_style_iter{iteration:04d}.log"
+                        # Match the precompute subsample so neighbor records have
+                        # SigLIP features in the hot cache (misses fail open anyway).
+                        _style_sub = (f"--subsample-per-shard {_subsample_n} "
+                                      if _subsample_n > 0 else "")
                         _style_cmd = (
                             f"source '{TRAIN_DIR}/.venv/bin/activate' && "
                             f"python -u '{SCRIPTS_DIR}/style_precompute.py' "
-                            f"--shards '{staging_dir}' --out '{_style_out}' && "
+                            f"--shards '{staging_dir}' --out '{_style_out}' {_style_sub}&& "
                             f"python -u '{SCRIPTS_DIR}/style_neighbors.py' "
                             f"--style-cache '{_style_out}' "
                             f"--out '{_style_out}/neighbors.sqlite'"
