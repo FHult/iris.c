@@ -6,6 +6,25 @@ analysis + wiring specs) and plans/warmup-campaign-runbook.md §3 (campaign mech
 Written 2026-06-11, immediately after SREF-1W landed (style step + neighbor pairing,
 config-gated, fail-open).
 
+## Status update 2026-06-11 (evening) — checklist executed through DP-2b
+
+- DP-1 CLOSED: distillation stopped at 27K (loss flat from ~18K); Tier-1 on the
+  26K ckpt FAILED decisively (cos 0.860 / std 0.868 / fft 0.918) = small-variant
+  capacity ceiling. Medium retrain + scaling-law sizing in BACKLOG PRECOMP-2;
+  NOT run5-blocking.
+- Combined smoke PASSED all criteria (style_pair=47%, VAL parsed, cold reuse) and
+  exposed + fixed the EMA-lag bug (decay warmup ramp — prior champions were ~90%
+  random init at 1000 steps). Val set staged to hot; final-window telemetry added.
+- DP-2b DONE: whole-pool style map — 1280/1280 shards, 255,987 CSD embeddings,
+  pool report `/Volumes/2TBSSD/style_clusters/pool_report.json`:
+  **pair_rich 86.4%** pool-wide (vs 44% val sample) → shard_manifest NOT needed;
+  free selection + per_source_min suffices. Every run5 style step is now a copy.
+- SREF-2 triad complete: style_sim + content_leak (CSD heads) + prompt_adherence
+  (SigLIP text tower, --prompt-adherence).
+- DP-6 started: web/server.py style-mode slots route through the IP-Adapter when
+  IRIS_IP_BUNDLE is set (siglip_features.py sidecar, one-shot iris --ip path).
+- run5: cleared pending smoke3 (EMA-ramp GPU validation, in flight); launches tonight.
+
 ## Current state (what is DONE)
 
 - C inference: G-1 Phase 2 — `iris --ip BUNDLE --ip-features F [--ip-scale N]` runs
