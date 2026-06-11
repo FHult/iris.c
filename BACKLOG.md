@@ -635,6 +635,21 @@ flywheel-gated items. Migration: `plans/proxy-vae-v3.19-migration.md`.
   - **Validation runbook: `plans/proxy-vae-validation-runbook.md`** — train→Tier1→
     benchmark→Tier2 with pass gates, fallback-threshold tuning, subsampling alt arm,
     and sequencing against flywheel-idle / M5 bring-up.
+  - **Tier-1 verdict (2026-06-11): SMALL variant FAILS on capacity.** 27K steps
+    (latent-only after PROXY-1), loss flat from ~18K; on 994 held-out pairs:
+    cosine 0.860 (>0.95), ch_std_ratio 0.868 (0.95–1.05, under-dispersed),
+    fft_corr 0.918 (>0.98). Flat-loss + wide misses + under-dispersion = capacity
+    ceiling, not under-training. Checkpoint kept at
+    `/Volumes/2TBSSD/checkpoints/vae_proxy/proxy_step_0026000.safetensors`;
+    report `/Volumes/2TBSSD/proxy_vae_eval.json|.html`.
+  - **Next: MEDIUM variant overnight retrain** (same recipe, 9.3M params) at the
+    next free GPU night. **Capacity bisection plan:** small (3.4M, fails) and
+    medium now bracket the threshold; if medium passes Tier-1 with large margins
+    (e.g. cosine ≥0.98), train an intermediate size — the proxy's value is speed,
+    so the smallest PASSING model wins; each candidate costs one overnight run +
+    an 85 s Tier-1 verdict on the same 994 pairs. Not on the SREF critical path
+    (run5 uses DP-2c subsampling with the real VAE); needed before the
+    full-coverage production precompute.
   - **Two BLOCKING pre-trust items (must land before any proxy latent ships), from
     `grok_proxy_vae_analysis.md`:** (C-1) no golden test that C `iris_vae` encode/decode
     matches the teacher VAE the proxy is trained against — proxy can pass Tier-1/2 vs
