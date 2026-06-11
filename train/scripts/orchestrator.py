@@ -3276,6 +3276,71 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                              f"training will use produced caches + live fallback for any misses",
                              level="warning")
 
+                # ── SREF-1W: style step (config-gated, fail-open) ──────────────────
+                # Encode staged shards with the CSD style encoder, then build
+                # ITERATION-LOCAL neighbor lists. Any failure degrades to legacy
+                # cross-ref (the trainer/dataset fall back when the db is absent) —
+                # it must never fail the iteration.
+                _style_nbr_db: Optional[str] = None
+                if fw_cfg.get("style_pairing"):
+                    _style_out = precomp_base / "style"
+                    _style_cold = Path(fw_cfg.get(
+                        "style_cold_dir", "/Volumes/16TBCold/precomputed/style/v1_csd"))
+                    try:
+                        # Reuse: copy existing cold bundles for staged shards (the
+                        # resumable skip in style_precompute does the rest).
+                        _style_out.mkdir(parents=True, exist_ok=True)
+                        if _style_cold.is_dir():
+                            for _tar in staging_dir.glob("*.tar"):
+                                _b = _style_cold / f"{_tar.stem}.npz"
+                                if _b.exists() and not (_style_out / _b.name).exists():
+                                    shutil.copy2(_b, _style_out / _b.name)
+                        write_heartbeat("flywheel", status="style",
+                                        flywheel_name=name, iteration=iteration)
+                        _style_log = LOG_DIR / f"flywheel_{name}_style_iter{iteration:04d}.log"
+                        _style_cmd = (
+                            f"source '{TRAIN_DIR}/.venv/bin/activate' && "
+                            f"python -u '{SCRIPTS_DIR}/style_precompute.py' "
+                            f"--shards '{staging_dir}' --out '{_style_out}' && "
+                            f"python -u '{SCRIPTS_DIR}/style_neighbors.py' "
+                            f"--style-cache '{_style_out}' "
+                            f"--out '{_style_out}/neighbors.sqlite'"
+                        )
+                        _style_proc = subprocess.Popen(
+                            ["bash", "-c", f"({_style_cmd}) >> '{_style_log}' 2>&1"])
+                        _interruptible_proc_wait(_style_proc, name, fw_db)
+                        if _style_proc.returncode == 0 and \
+                                (_style_out / "neighbors.sqlite").exists():
+                            _style_nbr_db = str(_style_out / "neighbors.sqlite")
+                            log_orch(f"[flywheel:{name}] iter {iteration}: style step "
+                                     f"complete — neighbors ready")
+                            # Publish new bundles to cold for cross-iteration reuse.
+                            try:
+                                _style_cold.mkdir(parents=True, exist_ok=True)
+                                _n_pub = 0
+                                for _b in _style_out.glob("*.npz"):
+                                    _dst = _style_cold / _b.name
+                                    if not _dst.exists():
+                                        shutil.copy2(_b, _dst)
+                                        _n_pub += 1
+                                if _n_pub:
+                                    log_orch(f"[flywheel:{name}] iter {iteration}: "
+                                             f"published {_n_pub} style bundles to cold")
+                            except OSError as _pub_e:
+                                log_orch(f"[flywheel:{name}] style publish failed: "
+                                         f"{_pub_e}", level="warning")
+                        else:
+                            log_orch(f"[flywheel:{name}] iter {iteration}: style step "
+                                     f"exited {_style_proc.returncode} — continuing "
+                                     f"WITHOUT style pairing (legacy cross-ref)",
+                                     level="warning")
+                    except _RestartIteration:
+                        raise
+                    except Exception as _style_exc:
+                        log_orch(f"[flywheel:{name}] iter {iteration}: style step error "
+                                 f"({_style_exc}) — continuing without style pairing",
+                                 level="warning")
+
                 # Override the (possibly "online") config so this training iter uses the caches we just ensured.
                 # This forces the efficient cached path (only Flux+adapter resident) for the step loop.
                 with open(train_cfg_path) as _f:
@@ -3284,6 +3349,8 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                 _d["qwen3_cache_dir"] = str(q_out)
                 _d["vae_cache_dir"] = str(v_out)
                 _d["siglip_cache_dir"] = str(s_out)
+                if _style_nbr_db:
+                    _d["style_neighbors_db"] = _style_nbr_db
                 train_cfg_path.write_text(yaml.dump(_tcfg, default_flow_style=False))
 
                 # Capture the final config (with model/data for versioning) before launch.

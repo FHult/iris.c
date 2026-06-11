@@ -41,6 +41,8 @@ RE_SCALE = re.compile(r"ip_scale:\s+mean=([\d.]+).*?double=([\d.]+).*?single=([\
 # Held-out paired cond/null eval printed once at training end (code review M1).
 RE_VAL_COND = re.compile(r"^VAL\s+loss_cond=([\d.]+)\s+loss_null=([\d.]+)\s+"
                          r"cond_gap=([+-][\d.]+)\s+\[n=(\d+)\]")
+# SREF-1: share of cross-ref steps that used a style-paired neighbor.
+RE_STYLE_PAIR = re.compile(r"style_pair=([\d.]+)%\s+\((\d+)/(\d+)")
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +645,10 @@ def collect_metrics_from_log(log_path: Path) -> dict:
                 "val_cond_gap":  float(m.group(3)),
                 "val_n_pairs":   int(m.group(4)),
             })
+            continue
+        m = RE_STYLE_PAIR.search(line)
+        if m:
+            metrics["style_pair_pct"] = float(m.group(1))
 
     # Held-out cond_gap supersedes the in-training (train-batch) gap for everything
     # downstream — champion selection, shard attribution, plateau detection. The

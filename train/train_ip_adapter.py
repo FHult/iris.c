@@ -900,6 +900,7 @@ def train(config: dict) -> None:
         hard_example_dir=dcfg.get("hard_example_dir"),
         hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
         bucket=_fixed_bucket,
+        style_neighbors_db=dcfg.get("style_neighbors_db"),
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before
@@ -1568,6 +1569,10 @@ def train(config: dict) -> None:
     _self_ref_loss_count = 0
     _cross_ref_loss_sum   = 0.0
     _cross_ref_loss_count = 0
+    # SREF-1 telemetry: of the cross-ref steps in each log window, how many used a
+    # style-paired neighbor (vs the legacy arbitrary buffer swap).
+    _style_pair_steps      = 0
+    _cross_ref_steps_total = 0
 
     # QUALITY-1: single-step feature buffer — stores siglip_feats from the previous
     # conditioned step so cross-ref works at batch_size=1 (no within-batch permutation).
@@ -1642,7 +1647,7 @@ def train(config: dict) -> None:
     _SKIP_WINDOW       = 500
     _SKIP_RATE_LIMIT   = 0.50
 
-    for images_np, captions, text_np, vae_np, siglip_np, bucket_hw in loader:
+    for images_np, captions, text_np, vae_np, siglip_np, style_ref_np, bucket_hw in loader:
         if step >= _end_step:
             break
 
@@ -1777,17 +1782,32 @@ def train(config: dict) -> None:
                 _perm_sf = mx.argsort(mx.random.uniform(shape=(siglip_feats.shape[1],)))
                 siglip_feats = siglip_feats[:, _perm_sf, :]
 
-        # QUALITY-1: cross-ref swap — replace current SigLIP features with the
-        # previous conditioned step's features. Forces style/content separation:
-        # the model must match the target latent using a *different* image's style.
-        # Buffer-based approach works at any batch size including batch_size=1.
+        # Cross-ref: replace current SigLIP features with a DIFFERENT image's
+        # features, forcing style/content separation.
+        #   SREF-1 (preferred): the loader supplies a SAME-STYLE different-content
+        #   neighbor (style_ref_np) — the reference's style genuinely predicts the
+        #   target, so the adapter is rewarded for style transfer, not for ignoring
+        #   the reference.
+        #   Legacy fallback (QUALITY-1): the previous conditioned step's features —
+        #   an arbitrary pairing, kept only for when no neighbor is available.
         is_cross_ref = False
+        is_style_pair = False
         if _cross_ref_prob > 0.0 and not null_image:
-            if _cross_ref_buffer is not None and random.random() < _cross_ref_prob:
-                siglip_feats, _cross_ref_buffer = _cross_ref_buffer, siglip_feats
-                is_cross_ref = True
+            if random.random() < _cross_ref_prob:
+                if style_ref_np is not None:
+                    siglip_feats = mx.array(style_ref_np, dtype=mx.bfloat16)
+                    is_cross_ref = is_style_pair = True
+                elif _cross_ref_buffer is not None:
+                    siglip_feats, _cross_ref_buffer = _cross_ref_buffer, siglip_feats
+                    is_cross_ref = True
+                else:
+                    _cross_ref_buffer = siglip_feats
             else:
                 _cross_ref_buffer = siglip_feats
+        if is_style_pair:
+            _style_pair_steps += 1
+        if is_cross_ref:
+            _cross_ref_steps_total += 1
 
         _t_prep += time.time() - _t0
 
@@ -2115,6 +2135,15 @@ def train(config: dict) -> None:
                         print("  WARNING: loss_cond ≈ loss_null — adapter may not be learning", flush=True)
                 _cond_loss_sum = _cond_loss_count = 0
                 _null_loss_sum = _null_loss_count = 0
+
+                # SREF-1: style-paired share of cross-ref steps this window.
+                if _cross_ref_steps_total > 0:
+                    _sp_pct = round(100 * _style_pair_steps / _cross_ref_steps_total, 1)
+                    print(f"  style_pair={_sp_pct:.0f}% "
+                          f"({_style_pair_steps}/{_cross_ref_steps_total} cross-ref steps)",
+                          flush=True)
+                _style_pair_steps = 0
+                _cross_ref_steps_total = 0
 
                 # Style loss (Gram matrix term)
                 if _style_weight > 0.0 and _style_loss_count > 0:

@@ -67,3 +67,9 @@ def test_val_unavailable_line_is_ignored(tmp_path):
     m = _parse(tmp_path, LOG_BODY + "VAL held-out cond_gap unavailable (no val set or no SigLIP pairs)\n")
     assert m["cond_gap"] == 0.0003          # falls back to the train-batch gap
     assert "val_cond_gap" not in m
+
+
+def test_style_pair_pct_parses(tmp_path):
+    m = _parse(tmp_path, LOG_BODY + "  style_pair=62% (31/50 cross-ref steps)\n")
+    assert m["style_pair_pct"] == 62.0
+    assert m["cond_gap"] == 0.0003          # unrelated metrics unaffected

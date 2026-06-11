@@ -313,6 +313,7 @@ def make_prefetch_loader(
     anchor_mix_ratio: float = 0.20,
     hard_example_dir: Optional[str] = None,
     hard_mix_ratio: float = 0.05,
+    style_neighbors_db: Optional[str] = None,
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -339,7 +340,15 @@ def make_prefetch_loader(
       text_embeds: float16 numpy [B, seq, 7680] or None (if no Qwen3 cache)
       vae_latents: float32 numpy [B, 32, H/8, W/8] or None (if no VAE cache)
       siglip_feats:float16 numpy [B, 729, 1152] or None (if no SigLIP cache)
+      style_ref:   float16 numpy [B, 729, 1152] or None — a SAME-STYLE different-content
+                   neighbor's SigLIP features (SREF-1), present only when
+                   style_neighbors_db is set AND every sample resolved a neighbor.
       bucket_hw:   (H, W) tuple for this batch
+
+    style_neighbors_db: path to neighbors.sqlite from style_neighbors.py. When set,
+    each sample also carries a style neighbor's SigLIP features for style-paired
+    cross-ref training. Fail-open: absent db / missing neighbor / missing features
+    simply yields style_ref=None and the trainer falls back to legacy behavior.
     """
     if anchor_mix_ratio + hard_mix_ratio >= 1.0:
         raise ValueError(
@@ -425,6 +434,25 @@ def make_prefetch_loader(
                     consecutive_errors = 0
 
     # ---- Level 2: sample decoder + batch builder thread -------------------
+    # SREF-1: load the style-neighbor map once (rec_id -> top-k neighbor ids).
+    # Iteration-local DBs are ~200K rows; reading into a dict keeps the decoder
+    # thread free of per-sample sqlite. Fail-open on any problem.
+    _nbr_map: Optional[dict] = None
+    if style_neighbors_db and os.path.exists(style_neighbors_db):
+        try:
+            import json as _json
+            import sqlite3 as _sql
+            _con = _sql.connect(f"file:{style_neighbors_db}?mode=ro", uri=True)
+            _nbr_map = {r: _json.loads(n) for r, n in
+                        _con.execute("SELECT rec_id, neighbor_ids FROM neighbors")}
+            _con.close()
+            print(f"  [dataset] style neighbors loaded: {len(_nbr_map):,} records "
+                  f"({style_neighbors_db})", flush=True)
+        except Exception as _exc:
+            print(f"  [dataset] style neighbors unavailable ({_exc}) — "
+                  f"falling back to legacy cross-ref", flush=True)
+            _nbr_map = None
+
     def sample_decoder():
         tj = _make_jpeg()
         rng = random.Random()
@@ -449,6 +477,7 @@ def make_prefetch_loader(
 
             imgs_buf, caps_buf = [], []
             temb_buf, vlat_buf, sfeat_buf = [], [], []
+            sref_buf = []
 
             for rec in records:
                 # Decode image
@@ -472,11 +501,22 @@ def make_prefetch_loader(
                 )
                 siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
 
+                # SREF-1: same-style/different-content reference features. Pick a
+                # random top-k style neighbor and load ITS SigLIP features from the
+                # same (hot) cache. Any miss -> None (trainer falls back).
+                style_ref_feat = None
+                if _nbr_map is not None and siglip_cache_dir:
+                    _nbrs = _nbr_map.get(rec["id"])
+                    if _nbrs:
+                        style_ref_feat = _load_siglip_embed(
+                            rng.choice(_nbrs[:5]), siglip_cache_dir)
+
                 imgs_buf.append(_normalize(img))
                 caps_buf.append(caption)
                 temb_buf.append(text_emb)
                 vlat_buf.append(vae_lat)
                 sfeat_buf.append(siglip_feat)
+                sref_buf.append(style_ref_feat)
 
                 if len(imgs_buf) == batch_size:
                     # Stack arrays; keep None for missing caches.
@@ -499,6 +539,7 @@ def make_prefetch_loader(
                         t_arr = None
                     v_arr = np.stack(vlat_buf) if all(v is not None for v in vlat_buf) else None
                     s_arr = np.stack(sfeat_buf) if all(s is not None for s in sfeat_buf) else None
+                    r_arr = np.stack(sref_buf) if all(r is not None for r in sref_buf) else None
 
                     sample_q.put((
                         np.stack(imgs_buf),     # [B, C, H+32, W+32]
@@ -506,10 +547,12 @@ def make_prefetch_loader(
                         t_arr,
                         v_arr,
                         s_arr,
+                        r_arr,
                         (bH, bW),
                     ))
                     imgs_buf, caps_buf = [], []
                     temb_buf, vlat_buf, sfeat_buf = [], [], []
+                    sref_buf = []
 
     # Shared crash-message slot: workers write their exception here before dying
     # so the main thread can surface the root cause instead of a generic timeout.

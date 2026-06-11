@@ -323,6 +323,22 @@ logs/                       All pipeline logs (orchestrator.log, *_chunk*.log)
 
 This section is the definitive map of every file the pipeline reads and writes for state, progress, and alerting. Understanding it prevents the recurring "why is status wrong?" and "what is the orchestrator actually doing?" confusion.
 
+### Style step (SREF-1W, flywheel-only, config-gated)
+
+When the flywheel config sets `style_pairing: true`, each iteration runs a fourth
+precompute step after Qwen3/VAE/SigLIP: CSD style encoding of the staged shards
+(`style_precompute.py`) followed by iteration-local neighbor lists
+(`style_neighbors.py`). Telemetry:
+- heartbeat: `flywheel.json` `status: "style"` during the step.
+- log: `/Volumes/2TBSSD/logs/flywheel_{name}_style_iter{NNNN}.log`.
+- output: `staging/.../precomputed/style/*.npz` (per-SHARD bundles) +
+  `neighbors.sqlite`; bundles published to cold `precomputed/style/v1_csd/` for reuse.
+- trainer telemetry: `style_pair=NN% (n/k cross-ref steps)` log line, parsed into
+  `style_pair_pct` by `collect_metrics_from_log`.
+- FAIL-OPEN at every level: step failure → iteration continues with legacy cross-ref;
+  missing `neighbors.sqlite` → dataset falls back silently.
+- doctor: `cold_precompute.style` in the `--ai` summary (bundle manifest).
+
 ### Source of Truth Hierarchy
 
 ```

@@ -3643,6 +3643,21 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
                 except Exception:
                     pass
                 cold_precomp[encoder] = entry
+        # Style encoder (SREF-1W): per-SHARD bundles + its own manifest — no
+        # 'current' symlink machinery; report straight from the version dir.
+        style_dir = COLD_PRECOMPUTE_DIR / "style" / "v1_csd"
+        style_manifest = style_dir / "manifest.json"
+        if style_manifest.exists():
+            try:
+                m = json.loads(style_manifest.read_text())
+                cold_precomp["style"] = {"version": "v1_csd",
+                                         "shards": m.get("shard_count"),
+                                         "records": m.get("record_count")}
+            except Exception:
+                pass
+        elif style_dir.is_dir():
+            cold_precomp["style"] = {"version": "v1_csd",
+                                     "shards": len(list(style_dir.glob("*.npz")))}
         if cold_precomp:
             summary["cold_precompute"] = cold_precomp
 

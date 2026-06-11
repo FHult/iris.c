@@ -385,7 +385,7 @@ class TestMakePrefetchLoader:
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
         batch = next(iter(loader))
-        assert len(batch) == 6
+        assert len(batch) == 7   # +style_ref (SREF-1)
 
     def test_image_batch_shape(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")
@@ -393,7 +393,7 @@ class TestMakePrefetchLoader:
 
         bH, bW = 512, 512
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(bH, bW))
-        images, captions, text_embs, vae_lats, siglip, bucket_hw = next(iter(loader))
+        images, captions, text_embs, vae_lats, siglip, style_ref, bucket_hw = next(iter(loader))
 
         assert images.shape == (2, 3, bH + 32, bW + 32)
         assert images.dtype == np.float32
@@ -422,7 +422,7 @@ class TestMakePrefetchLoader:
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
-        _, _, text_embs, vae_lats, siglip, _ = next(iter(loader))
+        _, _, text_embs, vae_lats, siglip, _, _ = next(iter(loader))
         assert text_embs is None
         assert vae_lats is None
         assert siglip is None
@@ -436,3 +436,64 @@ class TestMakePrefetchLoader:
         images, *_ = next(iter(loader))
         assert images.min() >= -1.0 - 1e-4
         assert images.max() <=  1.0 + 1e-4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SREF-1: style-neighbor reference features in the loader
+# ─────────────────────────────────────────────────────────────────────────────
+class TestStyleNeighborRef:
+    def _siglip_cache(self, tmp_path, stems):
+        """Write a 4-bit-quantized siglip npz per stem (the canonical cache format)."""
+        d = tmp_path / "siglip"
+        d.mkdir()
+        for i, stem in enumerate(stems):
+            full = np.full((729, 1152), i + 1, dtype=np.int8)   # distinct per record
+            lo = full[:, 0::2] & 0x0F
+            hi = (full[:, 1::2] & 0x0F) << 4
+            q = (lo | hi).astype(np.int8)
+            np.savez(d / f"{stem}.npz", q=q, scale=np.ones((729, 1), dtype=np.float16))
+        return str(d)
+
+    def _neighbors_db(self, tmp_path, mapping):
+        import sqlite3, json as _json
+        p = tmp_path / "neighbors.sqlite"
+        db = sqlite3.connect(p)
+        db.execute("CREATE TABLE neighbors (rec_id TEXT PRIMARY KEY, neighbor_ids TEXT, neighbor_cos TEXT)")
+        for rid, nbrs in mapping.items():
+            db.execute("INSERT INTO neighbors VALUES (?,?,?)",
+                       (rid, _json.dumps(nbrs), _json.dumps([0.7] * len(nbrs))))
+        db.commit(); db.close()
+        return str(p)
+
+    def test_style_ref_present_with_db(self, tmp_path):
+        shard = str(tmp_path / "shard_000.tar")
+        _make_synthetic_shard(shard, n_records=4)
+        stems = [f"rec_{i:04d}" for i in range(4)]
+        sig = self._siglip_cache(tmp_path, stems)
+        ndb = self._neighbors_db(tmp_path, {s: [stems[(i + 1) % 4]] for i, s in enumerate(stems)})
+        loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
+                                      siglip_cache_dir=sig, style_neighbors_db=ndb)
+        _, _, _, _, siglip, style_ref, _ = next(iter(loader))
+        assert siglip is not None
+        assert style_ref is not None, "neighbor features must be supplied"
+        assert style_ref.shape == siglip.shape
+        # neighbor is a DIFFERENT record -> different constant fill value
+        assert not np.allclose(style_ref, siglip)
+
+    def test_no_db_yields_none(self, tmp_path):
+        shard = str(tmp_path / "shard_000.tar")
+        _make_synthetic_shard(shard, n_records=4)
+        stems = [f"rec_{i:04d}" for i in range(4)]
+        sig = self._siglip_cache(tmp_path, stems)
+        loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
+                                      siglip_cache_dir=sig)
+        *_, style_ref, _bk = next(iter(loader))
+        assert style_ref is None
+
+    def test_missing_db_path_fails_open(self, tmp_path):
+        shard = str(tmp_path / "shard_000.tar")
+        _make_synthetic_shard(shard, n_records=4)
+        loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
+                                      style_neighbors_db=str(tmp_path / "absent.sqlite"))
+        *_, style_ref, _bk = next(iter(loader))
+        assert style_ref is None   # no crash, legacy behavior
