@@ -48,6 +48,18 @@ Owner's coding work has priority. Idle slices, in value order:
 3. Style backfill for already-precomputed shards (~10-16h full pool — overnight-class;
    partial backfill of high-value shards is fine, reuse makes it incremental).
 
+### DP-2b (next free GPU night): style backfill of the PRECOMPUTED pool → shard signal
+Before run5, style-encode the **206 already-precomputed shards (~1M records, ~16h at
+56 ms/img)** — these are the only shards run5 can train on anyway. (The full 1280-shard
+pool is ~4 days — backfill incrementally later; the SREF-1W step encodes new shards
+per-iteration regardless.) Then run `style_shard_report.py` over the bundles:
+per-shard **diversity** (distinct styles contributed), **pair_rich** (fraction of
+records with ≥3 strong style neighbors — isolated styles can't form training pairs),
+and **cross-shard connectivity** (which shards to CO-STAGE so iteration-local neighbor
+lists are rich). Baseline from the val sample: pair_rich ≈ 44%. Payoffs: run5 selects/
+stages style-kin shards together, every run5 iteration skips style encoding entirely
+(bundle reuse), and SREF-2 gets its embeddings for free.
+
 ### DP-3 (night): which campaign?
 - **Default: relaunch warmup-run4 as-is** (`pipeline_ctl start-flywheel
   train/configs/flywheel_warmup_run4.yaml`): data-selection warmth, now ranked by the
