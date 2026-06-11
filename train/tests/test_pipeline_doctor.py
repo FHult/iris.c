@@ -1092,3 +1092,132 @@ class TestCondGapStall:
         assert ctx["shards_touched"] == 100
         assert ctx["ablation_ready"] is True   # 90 >= 2*42 floor
         assert "attribution" in fw[0].detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# _check_fail_open_fallbacks / _check_nightly_health
+# ---------------------------------------------------------------------------
+
+def _install_fake_db_with_campaigns(monkeypatch, tmp_path, campaigns, iters_by_name):
+    dbfile = tmp_path / "flywheel_history.db"
+    dbfile.touch()
+    monkeypatch.setattr(pd, "FLYWHEEL_DB_PATH", dbfile)
+
+    class _FakeDB:
+        def __init__(self, path): pass
+        def get_non_superseded_campaigns(self): return campaigns
+        def get_iterations(self, name): return iters_by_name.get(name, [])
+        def close(self): pass
+
+    monkeypatch.setattr(flywheel_lib, "FlywheelDB", _FakeDB)
+
+
+class TestFailOpenFallbacks:
+    """The fail-open SREF mechanisms must become VISIBLE when they degrade."""
+
+    _GOOD_LOG = (
+        "step 1,000/1,000 loss 0.61 (avg 0.6096)\n"
+        "  style_pair=62% (31/50 cross-ref steps)\n"
+        "VAL loss_cond=0.4012 loss_null=0.4391 cond_gap=+0.0379 [n=58] (held-out, EMA)\n"
+    )
+    _NO_STYLE_LOG = (
+        "step 1,000/1,000 loss 0.61 (avg 0.6096)\n"
+        "  loss_cond=0.4960  loss_null=0.4963  gap=+0.0003 (+0.1%)  [n=333/167]\n"
+        "VAL loss_cond=0.4012 loss_null=0.4391 cond_gap=+0.0379 [n=58] (held-out, EMA)\n"
+    )
+
+    def _wire(self, monkeypatch, tmp_path, log_text, style_pairing=True):
+        cfg_path = tmp_path / "campaign.yaml"
+        cfg_path.write_text(f"flywheel:\n  name: c\n  style_pairing: {str(style_pairing).lower()}\n")
+        _install_fake_db_with_campaigns(
+            monkeypatch, tmp_path,
+            [{"flywheel_name": "c", "status": "active", "config_path": str(cfg_path)}],
+            {"c": [{"iteration": 3, "status": "done"}]})
+        logs = tmp_path / "logs"
+        logs.mkdir(exist_ok=True)
+        monkeypatch.setattr(pd, "LOG_DIR", logs)
+        (logs / "flywheel_c_iter0003.log").write_text(log_text)
+
+    def test_healthy_iteration_is_silent(self, doctor, tmp_path, monkeypatch):
+        self._wire(monkeypatch, tmp_path, self._GOOD_LOG)
+        pd._check_fail_open_fallbacks({})
+        assert _by_category("flywheel") == []
+
+    def test_style_requested_but_absent_warns(self, doctor, tmp_path, monkeypatch):
+        self._wire(monkeypatch, tmp_path, self._NO_STYLE_LOG)
+        pd._check_fail_open_fallbacks({})
+        fw = _by_category("flywheel")
+        assert len(fw) == 1
+        assert fw[0].severity == "WARNING"
+        assert "WITHOUT style pairs" in fw[0].title
+
+    def test_style_not_requested_is_silent(self, doctor, tmp_path, monkeypatch):
+        self._wire(monkeypatch, tmp_path, self._NO_STYLE_LOG, style_pairing=False)
+        pd._check_fail_open_fallbacks({})
+        assert _by_category("flywheel") == []
+
+    def test_missing_val_eval_warns(self, doctor, tmp_path, monkeypatch):
+        log = ("step 1,000/1,000 loss 0.61 (avg 0.6096)\n"
+               "  loss_cond=0.4960  loss_null=0.4963  gap=+0.0003 (+0.1%)  [n=333/167]\n"
+               "  style_pair=62% (31/50 cross-ref steps)\n"
+               "VAL held-out eval failed (boom) — falling back to train-batch gap\n")
+        self._wire(monkeypatch, tmp_path, log)
+        pd._check_fail_open_fallbacks({})
+        fw = _by_category("flywheel")
+        assert len(fw) == 1
+        assert "no held-out VAL eval" in fw[0].title
+
+    def test_old_log_is_ignored(self, doctor, tmp_path, monkeypatch):
+        import os as _os
+        self._wire(monkeypatch, tmp_path, self._NO_STYLE_LOG)
+        log = tmp_path / "logs" / "flywheel_c_iter0003.log"
+        old = pd.time.time() - 80 * 3600
+        _os.utime(log, (old, old))
+        pd._check_fail_open_fallbacks({})
+        assert _by_category("flywheel") == []
+
+
+class TestNightlyHealth:
+    def _write(self, tmp_path, status="ok", age_h=1.0, **extra):
+        import os as _os
+        hd = tmp_path / "health"
+        hd.mkdir(exist_ok=True)
+        p = hd / "nightly_health.json"
+        payload = {"ts": "2026-06-11T05:30:00", "status": status,
+                   "pytest_passed": 709, "pytest_failed": 0,
+                   "git_sha": "abc1234", "log": "/tmp/x.log"}
+        payload.update(extra)
+        p.write_text(json.dumps(payload))
+        mt = pd.time.time() - age_h * 3600
+        _os.utime(p, (mt, mt))
+        return p
+
+    def test_absent_is_info(self, doctor):
+        pd._check_nightly_health({})
+        issues = _by_category("nightly_health")
+        assert len(issues) == 1 and issues[0].severity == "INFO"
+
+    def test_ok_and_fresh_is_silent(self, doctor, tmp_path):
+        self._write(tmp_path, status="ok", age_h=2)
+        pd._check_nightly_health({})
+        assert _by_category("nightly_health") == []
+
+    def test_stale_warns(self, doctor, tmp_path):
+        self._write(tmp_path, status="ok", age_h=60)
+        pd._check_nightly_health({})
+        issues = _by_category("nightly_health")
+        assert len(issues) == 1 and issues[0].severity == "WARNING"
+        assert "stale" in issues[0].title
+
+    def test_build_failure_is_critical(self, doctor, tmp_path):
+        self._write(tmp_path, status="build_failed", age_h=2)
+        pd._check_nightly_health({})
+        issues = _by_category("nightly_health")
+        assert len(issues) == 1 and issues[0].severity == "CRITICAL"
+        assert "BROKEN" in issues[0].title
+
+    def test_pytest_failure_warns(self, doctor, tmp_path):
+        self._write(tmp_path, status="pytest_failed", age_h=2, pytest_failed=3)
+        pd._check_nightly_health({})
+        issues = _by_category("nightly_health")
+        assert len(issues) == 1 and issues[0].severity == "WARNING"

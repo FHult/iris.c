@@ -292,7 +292,9 @@ class TestLoadVaeLatent:
         self._save_int8(tmpdir, "lat_0", channels=32, lh=64, lw=64)
         result = _load_vae_latent("lat_0", tmpdir)
         assert result is not None
-        assert result.dtype == np.float16
+        # Contract: float32, matching the live VAE encode dtype (the float16
+        # assertion predated that change).
+        assert result.dtype == np.float32
         assert result.shape == (32, 64, 64)
         # 10 * 0.5 = 5.0
         assert np.allclose(result, 5.0, atol=0.01)

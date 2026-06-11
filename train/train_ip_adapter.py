@@ -2143,9 +2143,12 @@ def train(config: dict) -> None:
                 _null_loss_sum = _null_loss_count = 0
 
                 # SREF-1: style-paired share of cross-ref steps this window.
+                # _sp_pct_for_hb survives the reset so the heartbeat (written
+                # below) carries the same window's value for live doctor view.
+                _sp_pct_for_hb = None
                 if _cross_ref_steps_total > 0:
-                    _sp_pct = round(100 * _style_pair_steps / _cross_ref_steps_total, 1)
-                    print(f"  style_pair={_sp_pct:.0f}% "
+                    _sp_pct_for_hb = round(100 * _style_pair_steps / _cross_ref_steps_total, 1)
+                    print(f"  style_pair={_sp_pct_for_hb:.0f}% "
                           f"({_style_pair_steps}/{_cross_ref_steps_total} cross-ref steps)",
                           flush=True)
                 _style_pair_steps = 0
@@ -2257,6 +2260,7 @@ def train(config: dict) -> None:
                             ip_scale_mean=_scale_all_mean,
                             ip_scale_double=_scale_double_mean,
                             ip_scale_single=_scale_single_mean,
+                            style_pair_pct=_sp_pct_for_hb,
                         )
                 except Exception:
                     pass
@@ -2426,6 +2430,14 @@ def train(config: dict) -> None:
                   f"loss_null={_val_final['loss_null']:.4f} "
                   f"cond_gap={_val_final['cond_gap']:+.4f} "
                   f"[n={_val_final['n_pairs']}] (held-out, EMA)", flush=True)
+            # Final heartbeat carries the held-out verdict for live doctor view.
+            try:
+                from pipeline_lib import write_heartbeat as _whb_final
+                _whb_final(_hb_process, _pipeline_chunk, status="val_done",
+                           val_cond_gap=round(_val_final["cond_gap"], 4),
+                           val_n_pairs=_val_final["n_pairs"])
+            except Exception:
+                pass
         else:
             print("VAL held-out cond_gap unavailable (no val set or no SigLIP pairs)",
                   flush=True)

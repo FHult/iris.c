@@ -77,11 +77,13 @@ def test_import_ip_adapter_modules():
 
 
 def test_import_convert_journeydb():
+    # Archived to scripts/v1/ — import still guarded so a resurrection starts green.
     import importlib.util
     import os
     spec = importlib.util.spec_from_file_location(
         "convert_journeydb",
-        os.path.join(os.path.dirname(__file__), "..", "scripts", "convert_journeydb.py"),
+        os.path.join(os.path.dirname(__file__), "..", "scripts", "v1",
+                     "convert_journeydb.py"),
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -98,8 +100,8 @@ def test_import_clip_dedup():
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert callable(mod.run_embed)
-    assert callable(mod.run_dedup)
+    assert callable(mod.cmd_embed)
+    assert callable(mod.cmd_find_dups)
 
 
 # ---------------------------------------------------------------------------

@@ -2949,6 +2949,163 @@ def _check_cond_gap_stall(cfg: dict) -> None:
                   "latest_cond_gap": cg_latest, "iters_since_high": since, **attr_ctx})
 
 
+def _check_nightly_health(cfg: dict) -> None:
+    """Surface the scheduled GPU-free health run (nightly_health.sh via launchd).
+
+    The QWEN-1 regression shipped because the mps build was broken for three
+    weeks and nothing ran make test in between. The nightly run executes
+    pytest + the mps compile + make test-unit and writes a verdict here; this
+    check turns silence (job not running / wedged) and failure into issues:
+      - result stale > 48h  -> WARNING (the early-warning system itself is down)
+      - build failed        -> CRITICAL (exactly the QWEN-1 failure mode)
+      - pytest/unit failed  -> WARNING
+      - file absent         -> INFO (not installed yet / first night pending)
+    """
+    res_path = DATA_ROOT / "health" / "nightly_health.json"
+    if not res_path.exists():
+        _add("INFO", "nightly_health",
+             "Nightly health run has not reported yet",
+             detail="No result file. Either the launchd job isn't installed or the "
+                    "first 05:30 run hasn't happened.",
+             fix="cp train/launchd/com.iris.nightly-health.plist ~/Library/LaunchAgents/ && "
+                 "launchctl bootstrap gui/$(id -u) "
+                 "~/Library/LaunchAgents/com.iris.nightly-health.plist",
+             ctx={"result_path": str(res_path)})
+        return
+    try:
+        res = json.loads(res_path.read_text())
+    except Exception as exc:
+        _add("WARNING", "nightly_health",
+             f"Nightly health result unreadable ({exc})",
+             detail=f"Corrupt {res_path} — the run may have died mid-write.",
+             ctx={"result_path": str(res_path)})
+        return
+
+    age_h = (time.time() - res_path.stat().st_mtime) / 3600
+    status = res.get("status", "unknown")
+    ctx = {"status": status, "age_hours": round(age_h, 1),
+           "pytest_passed": res.get("pytest_passed"),
+           "pytest_failed": res.get("pytest_failed"),
+           "git_sha": res.get("git_sha"), "log": res.get("log")}
+
+    if age_h > 48:
+        _add("WARNING", "nightly_health",
+             f"Nightly health run stale ({age_h:.0f}h old) — early-warning system down",
+             detail=f"Last result {res.get('ts')} (status={status}). The launchd job "
+                    f"is not firing (unloaded? machine asleep at 05:30?).",
+             fix="launchctl list | grep com.iris.nightly-health  # then re-bootstrap if absent",
+             ctx=ctx)
+        return
+    if status == "build_failed":
+        _add("CRITICAL", "nightly_health",
+             "Nightly health: the mps build is BROKEN",
+             detail=f"make mps failed in last night's run ({res.get('ts')}). A broken "
+                    f"build hides every other regression (QWEN-1 lesson). "
+                    f"Inspect: tail -60 {res.get('log')}",
+             ctx=ctx)
+    elif status in ("pytest_failed", "unit_failed"):
+        _add("WARNING", "nightly_health",
+             f"Nightly health: {status.replace('_', ' ')} "
+             f"({res.get('pytest_failed', '?')} pytest failures)",
+             detail=f"Run of {res.get('ts')} at {res.get('git_sha')}. "
+                    f"Inspect: tail -60 {res.get('log')}",
+             ctx=ctx)
+    # status == ok -> silent (summary still shows the heartbeat-style fields via ctx)
+
+
+def _check_fail_open_fallbacks(cfg: dict) -> None:
+    """Surface SREF fail-open mechanisms that silently degraded (bug check M-6 class).
+
+    The style-pairing chain and the held-out VAL eval degrade to legacy behavior
+    by DESIGN when anything is missing — which means a run5-style campaign whose
+    style step fails every iteration executes perfectly as... run4, and the only
+    symptom is the ABSENCE of telemetry. Nothing else watches for absence; this
+    check does. Parses the latest done iteration's trainer log with the canonical
+    collect_metrics_from_log:
+      - config has style_pairing: true but no style_pair lines  -> WARNING
+      - style_pair_pct == 0 (neighbors resolved nothing)        -> WARNING
+      - no VAL held-out line (champion ranking falls back to the
+        train-batch gap)                                        -> WARNING
+    """
+    if not FLYWHEEL_DB_PATH.exists():
+        return
+    try:
+        from flywheel_lib import FlywheelDB, collect_metrics_from_log
+        db = FlywheelDB(FLYWHEEL_DB_PATH)
+        campaigns = db.get_non_superseded_campaigns()
+        per = {c.get("flywheel_name"): (c, db.get_iterations(c.get("flywheel_name")))
+               for c in campaigns if c.get("flywheel_name")}
+        db.close()
+    except Exception:
+        return
+
+    for name, (camp, iterations) in per.items():
+        if (camp.get("status") or "active") not in ("active", "running"):
+            continue
+        done = [r for r in iterations if (r.get("status") or "").lower() == "done"]
+        if not done:
+            continue
+        it_n = done[-1].get("iteration")
+        if it_n is None:
+            continue
+        log_path = LOG_DIR / f"flywheel_{name}_iter{int(it_n):04d}.log"
+        if not log_path.exists():
+            continue
+        # Freshness guard: only judge recent iterations — logs written before
+        # these telemetry lines existed would otherwise warn forever on a
+        # paused campaign.
+        if time.time() - log_path.stat().st_mtime > 72 * 3600:
+            continue
+        m = collect_metrics_from_log(log_path)
+
+        # Style pairing requested?
+        style_requested = False
+        cfg_path = camp.get("config_path")
+        if cfg_path and Path(cfg_path).exists():
+            try:
+                import yaml as _yaml
+                with open(cfg_path) as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                style_requested = bool((_raw.get("flywheel", _raw) or {})
+                                       .get("style_pairing"))
+            except Exception:
+                pass
+
+        style_log = LOG_DIR / f"flywheel_{name}_style_iter{int(it_n):04d}.log"
+        if style_requested and m.get("style_pair_pct") is None:
+            _add("WARNING", "flywheel",
+                 f"Flywheel '{name}': style_pairing requested but iter {it_n} "
+                 f"trained WITHOUT style pairs (fail-open fallback engaged)",
+                 detail=("The config sets style_pairing: true but the trainer log has "
+                         "no style_pair telemetry — the style step failed or produced "
+                         "no neighbors, and the iteration silently ran with legacy "
+                         "arbitrary cross-ref. The campaign is effectively running "
+                         "without its defining feature."),
+                 fix=f"tail -40 {style_log}  # style step log for this iteration",
+                 ctx={"campaign": name, "iteration": it_n,
+                      "style_log": str(style_log)})
+        elif style_requested and m.get("style_pair_pct") == 0.0:
+            _add("WARNING", "flywheel",
+                 f"Flywheel '{name}': style_pair_pct=0 at iter {it_n} — neighbors "
+                 f"resolved no usable pairs",
+                 detail=("The style step ran but every cross-ref step fell back: "
+                         "neighbor SigLIP misses or all neighbors below the cos>=0.6 "
+                         "floor. Check subsample alignment and the neighbor DB."),
+                 fix=f"tail -40 {style_log}",
+                 ctx={"campaign": name, "iteration": it_n})
+
+        if m.get("val_cond_gap") is None and m.get("cond_gap") is not None:
+            _add("WARNING", "flywheel",
+                 f"Flywheel '{name}': no held-out VAL eval at iter {it_n} — champion "
+                 f"ranking fell back to the train-batch gap",
+                 detail=("The end-of-run paired VAL eval (the metric champion selection "
+                         "should rank by) is absent from the trainer log — it failed or "
+                         "found no SigLIP pairs in the val set. Rankings from the "
+                         "train-batch gap measure fit, not generalization."),
+                 fix=f"grep -n 'VAL ' {log_path}  # look for the failure line",
+                 ctx={"campaign": name, "iteration": it_n})
+
+
 def _check_campaign_eta(cfg: dict) -> None:
     """Estimate flywheel campaign wall-clock from live precompute speed.
 
@@ -4329,6 +4486,8 @@ def main() -> None:
         _check_campaign_state()
         _check_flywheel_failures(cfg)
         _check_cond_gap_stall(cfg)
+        _check_fail_open_fallbacks(cfg)
+        _check_nightly_health(cfg)
         _check_campaign_eta(cfg)
         _check_progress_stall(cfg)
         _check_log_disk(cfg)

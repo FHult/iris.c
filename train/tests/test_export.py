@@ -58,11 +58,16 @@ def _make_synthetic_weights() -> dict[str, np.ndarray]:
 
 
 def _write_synthetic_checkpoint(path: str, weights: dict[str, np.ndarray]) -> None:
-    """Save synthetic weights as a safetensors file using MLX."""
+    """Save synthetic weights as a safetensors file using MLX, plus the lineage
+    sidecar JSON that save_checkpoint writes in production — export() requires
+    perceiver_heads from the sidecar (or an explicit flag)."""
     import mlx.core as mx
     mlx_w = {k: mx.array(v) for k, v in weights.items()}
     mx.eval(*mlx_w.values())
     mx.save_safetensors(path, mlx_w)
+    sidecar = path.replace(".safetensors", ".json")
+    with open(sidecar, "w") as f:
+        json.dump({"config": {"adapter": {"perceiver_heads": 4}}}, f)
 
 
 # ---------------------------------------------------------------------------

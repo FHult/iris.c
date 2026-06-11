@@ -21,7 +21,12 @@ import pytest
 
 def _load_script(name: str):
     scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
-    spec = importlib.util.spec_from_file_location(name, os.path.join(scripts_dir, f"{name}.py"))
+    path = os.path.join(scripts_dir, f"{name}.py")
+    if not os.path.exists(path):
+        # V1 scripts were archived to scripts/v1/ — their logic tests still run
+        # against the archive so a resurrection starts from a green baseline.
+        path = os.path.join(scripts_dir, "v1", f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -247,9 +252,9 @@ class TestClipDedupDevice:
         assert mod._clip_device() == "mps"
 
     def test_command_list_completeness(self):
-        """All expected CLI commands are present."""
+        """All expected CLI entry points are present (current cmd_* API)."""
         mod = _load_script("clip_dedup")
-        assert callable(mod.run_embed)
-        assert callable(mod.run_dedup)
-        assert callable(mod.run_build_index)
-        assert callable(mod.run_incremental)
+        assert callable(mod.cmd_embed)
+        assert callable(mod.cmd_build_index)
+        assert callable(mod.cmd_find_dups)
+        assert callable(mod.dedup_wds_tar)
