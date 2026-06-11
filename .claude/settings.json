@@ -13,7 +13,11 @@
       "Bash(train/.venv/bin/python train/scripts/data_explorer.py *)",
       "Bash(PIPELINE_DATA_ROOT=/Volumes/2TBSSD/smoke train/.venv/bin/python train/scripts/data_explorer.py *)",
       "Bash(tmux list-sessions *)",
-      "Bash(tmux ls *)"
+      "Bash(tmux ls *)",
+      "Bash(train/.venv/bin/python debug/flywheel_refgap.py *)",
+      "Bash(train/.venv/bin/python train/scripts/config_schema.py *)",
+      "Bash(iostat *)",
+      "Bash(diskutil info *)"
     ]
   }
 }
