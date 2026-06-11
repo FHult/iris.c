@@ -1777,10 +1777,12 @@ def train(config: dict) -> None:
         # spatial layout while preserving per-patch texture/color statistics.
         # Applied before cross-ref permutation so the shuffled features are what
         # the model receives; only on conditioned (non-null) steps.
+        _shuffle_perm = None
         if _patch_shuffle_prob > 0.0 and not null_image:
             if random.random() < _patch_shuffle_prob:
                 _perm_sf = mx.argsort(mx.random.uniform(shape=(siglip_feats.shape[1],)))
                 siglip_feats = siglip_feats[:, _perm_sf, :]
+                _shuffle_perm = _perm_sf   # re-applied if a style neighbor swaps in below
 
         # Cross-ref: replace current SigLIP features with a DIFFERENT image's
         # features, forcing style/content separation.
@@ -1796,6 +1798,10 @@ def train(config: dict) -> None:
             if random.random() < _cross_ref_prob:
                 if style_ref_np is not None:
                     siglip_feats = mx.array(style_ref_np, dtype=mx.bfloat16)
+                    # Keep augmentation consistent: the neighbor receives the same
+                    # patch-shuffle the original features got this step.
+                    if _shuffle_perm is not None:
+                        siglip_feats = siglip_feats[:, _shuffle_perm, :]
                     is_cross_ref = is_style_pair = True
                 elif _cross_ref_buffer is not None:
                     siglip_feats, _cross_ref_buffer = _cross_ref_buffer, siglip_feats

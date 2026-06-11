@@ -1,0 +1,86 @@
+# Flywheel warm-up run 5 — FIRST STYLE-PAIRED campaign (SREF-1) + subsampled precompute (DP-2c)
+#
+# What changes vs run4 (from-scratch data-selection, unchanged here):
+#   - style_pairing: cross-ref now uses SAME-STYLE/different-content neighbors (CSD
+#     encoder + iteration-local neighbors.sqlite) instead of arbitrary buffer swaps —
+#     the fix for ref_gap≈0 (training previously rewarded reference-IGNORING).
+#   - precompute_subsample_per_shard: 200 — a 1000-step iteration trains on ~1K records;
+#     precomputing 200/shard (deterministic prefix, published to cold, monotonically
+#     upgradeable) cuts the per-iteration precompute ~10x → several iterations/night.
+#   - per_source_min raised for the style-rich sources we already own (42% of the pool
+#     is coyo/laion/wikiart-bearing; journeydb conditions weakest: +0.0026 vs coyo
+#     +0.0139). After the DP-2b style map, optionally add shard_manifest with the
+#     top pair_rich/connectivity shards for fully style-informed selection.
+#
+# Signals to watch (debug/flywheel_refgap.py + doctor):
+#   - style_pair_pct per iteration (should be ~near cross_ref_prob×100 when neighbors
+#     resolve; low values = neighbor misses, check the style step log)
+#   - VAL held-out cond_gap (the ranking signal) and ref_gap: THE question this campaign
+#     answers is whether style pairing moves them where arbitrary pairing could not.
+#
+# Prerequisites before launch:
+#   1. SREF-1W live smoke passed (tiny style_pairing run, DP-2 #2).
+#   2. VAL held-out eval GPU-smoked (end-of-run path, unsmoked as of 2026-06-11).
+#   3. (Recommended) DP-2b whole-pool style map → set shard_manifest.
+#
+# Launch:
+#   pipeline_ctl start-flywheel train/configs/flywheel_warmup_run5.yaml
+
+flywheel:
+  name: "warmup-run5"
+  max_iterations: 30             # iterations are ~10x cheaper — budget more of them
+  steps_per_iteration: 1000
+  n_shards: 40
+  poll_interval: 60
+  min_free_gb: 40
+
+  # From-scratch data-selection mode (the validated regime from run2-4 analysis):
+  # each iteration trains from random init; cond_gap measures the shard mix.
+  from_scratch_each_iter: true
+  base_checkpoint: null
+
+  # SREF-1: style-paired cross-ref (fail-open at every level)
+  style_pairing: true
+  style_cold_dir: "/Volumes/16TBCold/precomputed/style/v1_csd"
+
+  # DP-2c: subsampled precompute — deterministic 200-record prefix per shard,
+  # published to cold, upgradeable to full coverage before the production run.
+  precompute_subsample_per_shard: 200
+
+  training_config: "train/configs/stage1_512px.yaml"
+  shards_dir: "/Volumes/16TBCold/shards"
+
+  hyperparams:
+    cross_ref_prob: 0.5          # raised: style-paired refs are informative, not noise
+    style_loss_weight: 0.07
+
+  shard_selection:
+    performance_weight: 0.30
+    min_diversity_pct:  0.30
+    exploration_rate:   0.40
+    recency_penalty:    0.20
+    recency_window_iters: 2
+
+    exploration_schedule:
+      - {through_iteration: 15, rate: 0.45}
+      - {through_iteration: 30, rate: 0.35}
+
+    # Style-rich sources prioritized (labels = provenance-derived source names).
+    # journeydb minimum kept low deliberately — it conditions weakest and dominates
+    # the pool anyway via exploration.
+    per_source_min:
+      coyo: 10
+      coyo+laion+wikiart: 6
+      journeydb+wikiart: 4
+      journeydb: 4
+
+  # After DP-2b, optionally restrict the pool to the style map's top shards:
+  # shard_manifest: "/Volumes/2TBSSD/style_clusters/run5_manifest.json"
+  shard_manifest: null
+
+  min_attribution_obs: 3
+  siglip_sample_n: 50
+
+  plateau_patience:   0          # data-selection mode; doctor detectors cover health
+  plateau_threshold:  0.02
+  ablation_every_n:   0          # attribution still warming

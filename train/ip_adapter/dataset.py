@@ -480,6 +480,13 @@ def make_prefetch_loader(
             sref_buf = []
 
             for rec in records:
+                # Subsampled-cache fast path (DP-2c): in cached mode a record
+                # without a VAE latent is dropped anyway — skip BEFORE the JPEG
+                # decode. At subsample 200/5000 this avoids ~96% wasted decodes.
+                # Online mode (vae_cache_dir=None) is unaffected.
+                if vae_cache_dir and not os.path.exists(
+                        os.path.join(vae_cache_dir, f"{rec['id']}.npz")):
+                    continue
                 # Decode image
                 img = _decode_jpeg(rec["jpg"], tj, rec_id=rec["id"])
                 if img is None:
