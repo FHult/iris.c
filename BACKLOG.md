@@ -1334,3 +1334,10 @@ that mandates the `data.bucket` pin). Guards the 4th warmup-run2 blocker; see PR
   separately); an "untested modules" grep gate.
 
 Original report retained as `grok_testing_bug_report.md` (untracked) for full detail.
+
+**CKPT-PRUNE-1: per-iteration checkpoint pruning orphans .json lineage sidecars** (Low —
+cosmetic but noisy). The FLYWHEEL-CKPT-1 iter-keyed prune deletes step_*.safetensors but
+leaves the matching .json sidecars, so every flywheel iteration accrues "incomplete write?"
+doctor WARNINGs (7 after run5's first 3 iters; cleaned manually 2026-06-12). Fix: prune the
+sidecar with its checkpoint (orchestrator + save_checkpoint keep_last_n path); takes effect
+on next orchestrator restart.
