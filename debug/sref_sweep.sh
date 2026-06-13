@@ -12,13 +12,15 @@
 # and resume after:
 #   train/.venv/bin/python train/scripts/pipeline_ctl.py resume
 #
-# Usage: ./debug/sref_sweep.sh [BUNDLE_DIR]   (default: iter0002 export)
+# Usage: ./debug/sref_sweep.sh [BUNDLE_DIR]   (default: current champion export)
 # ~18 generations x ~35 s ≈ 12 min + eval. Output: /Volumes/2TBSSD/sref_sweep/
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SWEEP=/Volumes/2TBSSD/sref_sweep
-BUNDLE="${1:-$SWEEP/bundle_iter0002}"
+# Default = newest exported champion bundle (re-export before a sweep to track
+# the current get_best iter; see debug/flywheel_refgap.py warmup-run5).
+BUNDLE="${1:-$(ls -dt "$SWEEP"/bundle_iter* 2>/dev/null | head -1)}"
 PY="$ROOT/train/.venv/bin/python"
 GEN="$SWEEP/gen"
 mkdir -p "$GEN"
