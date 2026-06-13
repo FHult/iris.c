@@ -1352,3 +1352,14 @@ iteration), so contrastive cond_gap can't A/B them; the clean signal is the sele
 (journeydb 23%→49% over the campaign — reverting toward its 58% pool share). **Open follow-up:**
 clean per-source quality requires an ablation arm that HOLDS A SOURCE OUT (rides on DP-4); only
 then does `per_source_min` / the production data recipe get evidence rather than a prior.
+
+**SMOKE-ISOLATION (DONE 2026-06-13): smoke/test campaigns must not write the production shard_scores.db.**
+Smoke runs score ALL 1280 shards per iteration (excluded-EMA), so the EMA-lag smoke's cond_gap -5.066
+contaminated every shard's excluded mean in the cross-campaign KB, corrupting run5's selection
+(non-uniformly → distorted rankings). Fix: orchestrator routes campaigns with `ephemeral_scores: true`
+(auto for names starting smoke/test) to `shard_scores_scratch.db`. Cleanup tool
+`train/scripts/rescope_shard_scores.py --keep-campaign <name> --apply` rebuilds the shards-table EMAs
+from one campaign's score_updates (single convention; backs up first; requires a pause). Applied to run5
+2026-06-13: dropped run2/run3/smoke-style2/smoke-style3 rows (8960), 0 contaminated shards remain.
+Also fixed: `pipeline_ctl pause-flywheel` lacked `--free-gpu` (the documented flywheel-pause command
+silently targeted the chunk-pipeline control file) — now exposed.

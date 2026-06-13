@@ -2887,7 +2887,22 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     fw_db    = FlywheelDB()
     # min_attribution_obs: config-tunable attribution-confidence threshold
     # (was silently ignored before — bug check 2026-06-11 M-6).
+    # ephemeral_scores: smoke/test campaigns MUST NOT write into the production
+    # cross-campaign shard_scores.db — they score all 1280 shards per iteration
+    # (excluded-EMA) and a bad/test cond_gap (e.g. the EMA-lag smoke's -5.066)
+    # contaminates real selection. Route them to a scratch DB. (SMOKE-ISOLATION,
+    # 2026-06-13; auto-enabled for names starting 'smoke'/'test' as a safety net.)
+    _name_l = str(fw_cfg.get("name", "")).lower()
+    _ephemeral = bool(fw_cfg.get("ephemeral_scores")) or \
+        _name_l.startswith(("smoke", "test"))
+    from shard_selector import SHARD_SCORES_DB_PATH as _SCORES_DB
+    _scores_path = (_SCORES_DB.with_name("shard_scores_scratch.db")
+                    if _ephemeral else _SCORES_DB)
+    if _ephemeral:
+        log_orch(f"[flywheel:{name}] ephemeral campaign — scores → "
+                 f"{_scores_path.name} (production shard_scores.db untouched)")
     score_db = ShardScoreDB(
+        db_path=_scores_path,
         min_attr_obs=int(fw_cfg.get("min_attribution_obs", 3)))
 
     try:

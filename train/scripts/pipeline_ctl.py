@@ -776,10 +776,17 @@ def cmd_stop_flywheel(_args) -> None:
     print(f"  control file: {FLYWHEEL_CONTROL_FILE}")
 
 
-def cmd_pause_flywheel(_args) -> None:
+def cmd_pause_flywheel(args) -> None:
     FLYWHEEL_CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FLYWHEEL_CONTROL_FILE.write_text(json.dumps({"action": "pause", "ts": now_iso()}))
-    print("Pause signal written — flywheel will pause after the current training window exits")
+    free_gpu = bool(getattr(args, "free_gpu", False))
+    FLYWHEEL_CONTROL_FILE.write_text(json.dumps(
+        {"action": "pause", "free_gpu": free_gpu, "ts": now_iso()}))
+    if free_gpu:
+        print("Pause signal written (--free-gpu) — the orchestrator kills the running "
+              "GPU work within one poll and re-runs that iteration on resume-flywheel.")
+    else:
+        print("Pause signal written — flywheel will pause after the current "
+              "training window exits (use --free-gpu to interrupt it now)")
 
 
 def cmd_resume_flywheel(_args) -> None:
@@ -1295,7 +1302,10 @@ def main() -> None:
                    help="Flywheel config YAML (flywheel: name/max_iterations/...)")
 
     sub.add_parser("stop-flywheel",          help="Stop flywheel after current iteration")
-    sub.add_parser("pause-flywheel",         help="Pause flywheel (resumes on resume-flywheel)")
+    _pf = sub.add_parser("pause-flywheel",   help="Pause flywheel (resumes on resume-flywheel)")
+    _pf.add_argument("--free-gpu", action="store_true",
+                     help="kill the running GPU work now (re-runs the iteration on resume) "
+                          "instead of waiting for the training window to finish")
     sub.add_parser("resume-flywheel",        help="Resume a paused flywheel")
     sub.add_parser("force-continue-flywheel",
                    help="Clear auto-pause (plateau) and resume flywheel immediately")
