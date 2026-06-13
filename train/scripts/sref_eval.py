@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -95,6 +96,9 @@ def main() -> int:
                     help="add cos(SigLIP-text(prompt), SigLIP-image(gen)) for "
                          "pairs that carry a 'prompt' field")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--report", default=None,
+                    help="write an HTML contact sheet (ref + gens + scores) — the "
+                         "readable visual verdict for a champion sweep")
     args = ap.parse_args()
     if not args.pairs and not (args.ref_dir and args.gen_dir):
         ap.error("need --pairs or --ref-dir + --gen-dir")
@@ -147,7 +151,94 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2))
         print(f"wrote {args.out}")
+    if args.report:
+        _write_html_report(Path(args.report), rows, agg)
+        print(f"wrote {args.report}")
     return 0
+
+
+def _write_html_report(path: Path, rows: list[dict], agg: dict) -> None:
+    """Contact sheet grouped by reference: each row is ref thumbnail + the gens
+    (ascending ip-scale when present) with per-image scores. Image paths are
+    relative to the report so it's portable next to the gen/ dir.
+
+    Colour cues encode the sref reading: style_sim green-high, content_leak
+    red-high (want LOW), prompt_adherence green-high."""
+    import html as _html
+    base = path.parent
+
+    def _rel(p):
+        try:
+            return os.path.relpath(p, base)
+        except Exception:
+            return p
+
+    def _chip(label, val, good_high=True):
+        if val is None:
+            return f'<span class="chip na">{label} —</span>'
+        # 0..1 cosine → hue: good=green(120), bad=red(0)
+        g = val if good_high else (1.0 - val)
+        hue = max(0.0, min(120.0, g * 120.0))
+        return (f'<span class="chip" style="background:hsl({hue:.0f},65%,88%)">'
+                f'{label} {val:+.3f}</span>')
+
+    from collections import OrderedDict
+    by_ref: "OrderedDict[str, list]" = OrderedDict()
+    for r in rows:
+        by_ref.setdefault(r.get("ref", "?"), []).append(r)
+
+    cards = []
+    for ref, items in by_ref.items():
+        items = sorted(items, key=lambda r: r.get("scale", 0))
+        gens = []
+        for r in items:
+            if "error" in r:
+                gens.append(f'<div class="gen err">{_html.escape(r["error"][:120])}</div>')
+                continue
+            sc = r.get("scale")
+            scl = f'scale {sc}' if sc is not None else ''
+            gens.append(
+                f'<div class="gen"><img src="{_rel(r["gen"])}" loading="lazy">'
+                f'<div class="cap">{scl}'
+                f'<div class="prompt">{_html.escape((r.get("prompt") or "")[:48])}</div>'
+                f'{_chip("style", r.get("style_sim"), True)}'
+                f'{_chip("leak", r.get("content_leak"), False)}'
+                f'{_chip("prompt", r.get("prompt_adherence"), True)}'
+                f'</div></div>')
+        cards.append(
+            f'<section class="card"><div class="ref">'
+            f'<img src="{_rel(ref)}" loading="lazy"><div>REFERENCE</div></div>'
+            f'<div class="gens">{"".join(gens)}</div></section>')
+
+    def _agg_line(k, label, good_high=True):
+        a = agg.get(k)
+        if not a:
+            return ""
+        return (f'<div class="agg">{label}: mean <b>{a["mean"]:+.3f}</b> '
+                f'(p10 {a["p10"]:+.3f} / p90 {a["p90"]:+.3f}) '
+                f'{"↑higher=better" if good_high else "↓lower=better"}</div>')
+
+    summary = (
+        _agg_line("style_sim", "style_sim", True) +
+        _agg_line("content_leak", "content_leak", False) +
+        _agg_line("sref_score", "sref_score (style − leak)", True) +
+        _agg_line("prompt_adherence", "prompt_adherence", True))
+
+    css = (
+        "body{font:13px -apple-system,sans-serif;margin:18px;background:#fafafa;color:#222}"
+        "h1{font-size:18px} .agg{margin:2px 0} .card{display:flex;gap:14px;align-items:flex-start;"
+        "background:#fff;border:1px solid #e2e2e2;border-radius:8px;padding:12px;margin:12px 0}"
+        ".ref{flex:0 0 180px;text-align:center;font-weight:600;color:#666}"
+        ".ref img,.gen img{width:180px;height:180px;object-fit:cover;border-radius:6px}"
+        ".gens{display:flex;flex-wrap:wrap;gap:12px} .gen{width:180px} .gen.err{color:#b00}"
+        ".cap{font-size:11px;margin-top:3px} .prompt{color:#888;margin:2px 0}"
+        ".chip{display:inline-block;padding:1px 5px;margin:1px 2px 1px 0;border-radius:4px;"
+        "font-size:10px} .chip.na{background:#eee;color:#999}")
+    body = (f"<h1>SREF evaluation — visual verdict</h1><div class='summary'>{summary}</div>"
+            f"<p style='color:#888'>style high + leak low + prompt steady = clean style "
+            f"transfer. {len(by_ref)} references.</p>{''.join(cards)}")
+    path.write_text(f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    f"<style>{css}</style></head><body>{body}</body></html>")
 
 
 if __name__ == "__main__":

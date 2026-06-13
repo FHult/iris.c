@@ -64,8 +64,8 @@ mv "$PAIRS.tmp" "$PAIRS"
 
 echo "== scoring with sref_eval (style_sim / content_leak / prompt_adherence)"
 "$PY" "$ROOT/train/scripts/sref_eval.py" --pairs "$PAIRS" \
-  --prompt-adherence --out "$SWEEP/report.json"
+  --prompt-adherence --out "$SWEEP/report.json" --report "$SWEEP/report.html"
 echo
-echo "Report: $SWEEP/report.json   Images: $GEN/"
+echo "Report: $SWEEP/report.html (open it)   JSON: $SWEEP/report.json   Images: $GEN/"
 echo "Read:   per-scale style_sim should RISE with scale; content_leak should stay low;"
 echo "        prompt_adherence should stay roughly flat (style transfers, prompt holds)."
