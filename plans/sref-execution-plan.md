@@ -122,7 +122,9 @@ Then Stage 2 (768, ~2.1d) → Stage 3 (1024, ~2.1d) fine-tunes per TRAIN-7.
 
 ### DP-6: app integration (parallel track, not gated on training)
 - web/server.py SigLIP sidecar → `--ip-features` (ships with ANY checkpoint; quality
-  improves as checkpoints do).
+  improves as checkpoints do). DONE (SREF-3 v1) + style codes: save a reference as a
+  reusable short code (POST/GET/DELETE /sref/codes, generate via {style_code}); saved-
+  styles gallery in the UI. Gated on IRIS_IP_BUNDLE.
 - Multi-ref (concat SigLIP rows), strength = `--ip-scale`, style codes = stored
   embedding library.
 - Latency track when it matters: bf16/MPS-native inject (adapter currently forces CPU

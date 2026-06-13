@@ -275,6 +275,16 @@
                         </div>
                     </div>
 
+                    <!-- SREF-3: saved-styles gallery (populated by app.js when the
+                         IP-Adapter bundle is configured; hidden otherwise). -->
+                    <div class="form-group" id="saved-styles-group" style="display:none">
+                        <label>Saved Styles
+                            <button type="button" id="save-style-btn" class="prompt-action-btn"
+                                    title="Save the first style reference as a reusable code">+ Save current</button>
+                        </label>
+                        <div id="saved-styles-grid" class="saved-styles-grid"></div>
+                        <span class="style-hint" id="active-style-hint"></span>
+                    </div>
                     <div class="form-group" id="reference-images-group">
                         <label>Reference Images (up to 4)</label>
                         <div class="reference-images-grid">

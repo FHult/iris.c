@@ -1284,6 +1284,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     seed: seed ? parseInt(seed) : null,
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
+                    style_code: window._activeStyleCode || null,
                     style: style || null,
                     guidance: guidance || null,
                     schedule: schedule || null,
@@ -2192,6 +2193,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     seed: seed ? parseInt(seed) : null,
                     reference_images: referenceImages,
                     show_steps: showStepsCheckbox.checked,
+                    style_code: window._activeStyleCode || null,
                     style: style || null,
                     guidance: guidance || null,
                     schedule: schedule || null,
@@ -3939,3 +3941,74 @@ document.addEventListener('DOMContentLoaded', () => {
     // Load user templates on startup
     loadUserTemplates();
 });
+
+// ── SREF-3: saved-styles gallery ─────────────────────────────────────────────
+// Self-contained + defensive: any failure no-ops, never breaking the main UI.
+// Reuses an uploaded style reference as a short code (Midjourney --sref model).
+(function () {
+    'use strict';
+    window._activeStyleCode = window._activeStyleCode || null;
+    const grid = document.getElementById('saved-styles-grid');
+    const group = document.getElementById('saved-styles-group');
+    const hint = document.getElementById('active-style-hint');
+    const saveBtn = document.getElementById('save-style-btn');
+    if (!grid || !group) return;
+
+    function setActive(code, label) {
+        window._activeStyleCode = code;
+        if (hint) hint.textContent = code ? `Active style: ${label || code}` : '';
+        grid.querySelectorAll('.saved-style').forEach(el =>
+            el.classList.toggle('active', el.dataset.code === code));
+    }
+
+    async function refresh() {
+        let data;
+        try {
+            const r = await fetch('/sref/codes');
+            data = await r.json();
+        } catch (e) { return; }
+        if (!data.sref_enabled) { group.style.display = 'none'; return; }
+        group.style.display = '';
+        grid.innerHTML = '';
+        (data.codes || []).forEach(c => {
+            const el = document.createElement('div');
+            el.className = 'saved-style';
+            el.dataset.code = c.code;
+            el.title = (c.label ? c.label + ' · ' : '') + c.code;
+            el.innerHTML = `<img src="${c.thumb_url}" alt="${c.code}">` +
+                `<span class="saved-style-x" title="Delete">×</span>`;
+            el.querySelector('img').addEventListener('click', () =>
+                setActive(window._activeStyleCode === c.code ? null : c.code, c.label));
+            el.querySelector('.saved-style-x').addEventListener('click', async (ev) => {
+                ev.stopPropagation();
+                try { await fetch('/sref/codes/' + c.code, { method: 'DELETE' }); } catch (e) {}
+                if (window._activeStyleCode === c.code) setActive(null);
+                refresh();
+            });
+            grid.appendChild(el);
+        });
+        setActive(window._activeStyleCode);
+    }
+
+    if (saveBtn) saveBtn.addEventListener('click', async () => {
+        // Grab the first reference slot's image data (slot 0 preview img).
+        const img = document.querySelector('.ref-preview[data-slot="0"] img');
+        const src = img && img.src;
+        if (!src || src.indexOf('data:') !== 0) {
+            alert('Add a reference image to slot 1 first, then Save current.');
+            return;
+        }
+        const label = (prompt('Name this style (optional):') || '').trim();
+        try {
+            const r = await fetch('/sref/codes', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: src, label })
+            });
+            const j = await r.json();
+            if (j.code) { await refresh(); setActive(j.code, label); }
+            else alert(j.error || 'Could not save style');
+        } catch (e) { alert('Could not save style'); }
+    });
+
+    refresh();
+})();

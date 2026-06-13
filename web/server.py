@@ -24,6 +24,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
@@ -1065,6 +1066,70 @@ def compute_sref_features(image_bytes: bytes) -> Path:
         tmp_img.unlink(missing_ok=True)
 
 
+# ── Style codes: a saved-style library (Midjourney --sref <code> model) ──────
+# A style code is a short stable id for a reference's computed features, so a
+# look can be reused without re-uploading the image. Registry maps code ->
+# {sha, label, created}; features live at SREF_DIR/<sha>.bin (shared with the
+# content-hash cache) and a thumbnail at SREF_DIR/<sha>_thumb.png.
+SREF_CODES_FILE = SREF_DIR / "codes.json"
+_sref_codes_lock = threading.Lock()
+
+
+def _load_style_codes() -> dict:
+    if not SREF_CODES_FILE.exists():
+        return {}
+    try:
+        return json.loads(SREF_CODES_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_style_codes(codes: dict) -> None:
+    SREF_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SREF_CODES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(codes, indent=2))
+    tmp.replace(SREF_CODES_FILE)
+
+
+def _write_style_thumb(image_bytes: bytes, sha: str) -> None:
+    """Best-effort 160px thumbnail for the saved-styles gallery."""
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((160, 160))
+        im.save(SREF_DIR / f"{sha}_thumb.png")
+    except Exception:
+        pass
+
+
+def save_style_code(image_bytes: bytes, label: str = "") -> dict:
+    """Compute features for a reference, register a short code, return its record.
+    Idempotent on identical images (same sha → same code)."""
+    features_path = compute_sref_features(image_bytes)            # raises on failure
+    sha = features_path.stem                                      # SREF_DIR/<sha>.bin
+    code = sha[:8]
+    _write_style_thumb(image_bytes, sha)
+    with _sref_codes_lock:
+        codes = _load_style_codes()
+        rec = codes.get(code, {})
+        rec.update({"code": code, "sha": sha,
+                    "label": label or rec.get("label", ""),
+                    "created": rec.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S")})
+        codes[code] = rec
+        _save_style_codes(codes)
+    return rec
+
+
+def resolve_style_code(code: str) -> Optional[Path]:
+    """code -> features .bin path, or None if unknown / features missing."""
+    rec = _load_style_codes().get(code)
+    if not rec:
+        return None
+    p = SREF_DIR / f"{rec['sha']}.bin"
+    return p if p.exists() else None
+
+
 def run_generation_sref(job, prompt, width, height, steps, seed,
                         features_path, ip_scale, guidance=None):
     """One-shot `iris --ip` run for a style-reference generation (SREF-3 v1).
@@ -1185,28 +1250,43 @@ def generate():
     # bundle is configured (IRIS_IP_BUNDLE env). v1: single style reference,
     # txt2img only (other slots ignored on this path). Without a bundle, the
     # legacy half-weight img2img heuristic below still applies (fail-open).
+    # SREF-3: a "style"-mode reference slot OR a saved style_code routes through
+    # the trained IP-Adapter when a bundle is configured. style_code reuses a
+    # saved look with no image upload (Midjourney --sref <code> model).
     style_slots = [s for s in reference_slots if s.get("mode") == "style"]
-    if style_slots and IP_BUNDLE and Path(IP_BUNDLE).exists():
-        slot = style_slots[0]
-        try:
-            sref_bytes = base64.b64decode(slot["data"].split(",")[-1])
-            sref_bytes = convert_image_to_png(sref_bytes)
-            features_path = compute_sref_features(sref_bytes)
-        except Exception as e:
-            return jsonify({"error": f"Style reference encoding failed: {e}"}), 400
+    style_code = (data.get("style_code") or "").strip()
+    if (style_slots or style_code) and IP_BUNDLE and Path(IP_BUNDLE).exists():
+        ip_scale = 1.0
+        if style_code:
+            features_path = resolve_style_code(style_code)
+            if features_path is None:
+                return jsonify({"error": f"Unknown style code: {style_code}"}), 400
+            if style_slots:
+                ip_scale = float(style_slots[0].get("strength", 1.0))
+            elif "img2img_strength" in data:
+                ip_scale = float(data["img2img_strength"])
+        else:
+            slot = style_slots[0]
+            try:
+                sref_bytes = base64.b64decode(slot["data"].split(",")[-1])
+                sref_bytes = convert_image_to_png(sref_bytes)
+                features_path = compute_sref_features(sref_bytes)
+            except Exception as e:
+                return jsonify({"error": f"Style reference encoding failed: {e}"}), 400
+            ip_scale = float(slot.get("strength", 1.0))
         job_id = uuid.uuid4().hex[:12]
         job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
         job.batch_id = batch_id
         job.style = style if (style and style in STYLE_PRESETS) else None
         with jobs_lock:
             jobs[job_id] = job
-        ip_scale = float(slot.get("strength", 1.0))
         threading.Thread(
             target=run_generation_sref,
             args=(job, generation_prompt, width, height, steps, seed,
                   features_path, ip_scale, guidance),
             daemon=True).start()
-        return jsonify({"job_id": job_id, "status": "started", "sref": True})
+        return jsonify({"job_id": job_id, "status": "started", "sref": True,
+                        "style_code": style_code or None})
 
     # Derive effective img2img_strength: take the minimum slot strength so the
     # most-constrained slot drives the global noise level (C backend uses one value).
@@ -1654,6 +1734,59 @@ def outpaint_prep():
         "orig_x": pad_left,
         "orig_y": pad_top,
     })
+
+
+@app.route("/sref/codes", methods=["GET"])
+def list_style_codes():
+    """List saved style codes (the saved-styles gallery). Newest first."""
+    codes = sorted(_load_style_codes().values(),
+                   key=lambda r: r.get("created", ""), reverse=True)
+    sref_enabled = bool(IP_BUNDLE and Path(IP_BUNDLE).exists())
+    return jsonify({"sref_enabled": sref_enabled, "codes": [
+        {"code": r["code"], "label": r.get("label", ""),
+         "created": r.get("created", ""),
+         "thumb_url": f"/sref/thumb/{r['code']}"} for r in codes]})
+
+
+@app.route("/sref/codes", methods=["POST"])
+def create_style_code():
+    """Save a reference image as a reusable style code. body: {image, label?}."""
+    if not (IP_BUNDLE and Path(IP_BUNDLE).exists()):
+        return jsonify({"error": "Style transfer not configured (IRIS_IP_BUNDLE unset)"}), 400
+    data = request.json or {}
+    img_b64 = data.get("image")
+    if not img_b64:
+        return jsonify({"error": "image is required"}), 400
+    try:
+        img_bytes = convert_image_to_png(base64.b64decode(img_b64.split(",")[-1]))
+        rec = save_style_code(img_bytes, label=(data.get("label") or "").strip())
+    except Exception as e:
+        return jsonify({"error": f"Could not save style: {e}"}), 400
+    return jsonify({"code": rec["code"], "label": rec.get("label", ""),
+                    "thumb_url": f"/sref/thumb/{rec['code']}"})
+
+
+@app.route("/sref/codes/<code>", methods=["DELETE"])
+def delete_style_code(code):
+    """Remove a saved style code from the registry (features file left for cache)."""
+    with _sref_codes_lock:
+        codes = _load_style_codes()
+        if code not in codes:
+            return jsonify({"error": "unknown code"}), 404
+        codes.pop(code)
+        _save_style_codes(codes)
+    return jsonify({"deleted": code})
+
+
+@app.route("/sref/thumb/<code>")
+def style_code_thumb(code):
+    """Serve a saved style's thumbnail."""
+    rec = _load_style_codes().get(code)
+    if rec:
+        thumb = SREF_DIR / f"{rec['sha']}_thumb.png"
+        if thumb.exists():
+            return send_file(thumb, mimetype="image/png")
+    return jsonify({"error": "not found"}), 404
 
 
 @app.route("/server-status")

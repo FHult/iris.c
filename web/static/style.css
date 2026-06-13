@@ -2863,3 +2863,12 @@ footer a:hover {
 .prompt-tips li {
     margin-bottom: 0.15rem;
 }
+
+/* SREF-3 saved-styles gallery */
+.saved-styles-grid { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.saved-style { position: relative; width: 56px; height: 56px; border-radius: 6px;
+    overflow: hidden; cursor: pointer; border: 2px solid transparent; }
+.saved-style img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.saved-style.active { border-color: #4a90d9; }
+.saved-style-x { position: absolute; top: 0; right: 2px; color: #fff;
+    text-shadow: 0 0 3px #000; font-size: 14px; line-height: 1; cursor: pointer; }

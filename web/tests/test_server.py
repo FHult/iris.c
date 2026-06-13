@@ -1557,3 +1557,79 @@ class TestSrefRouting:
         })
         assert r.status_code == 200
         assert r.get_json().get("sref") is None
+
+
+class TestStyleCodes:
+    """SREF-3 style codes: save a reference as a reusable code, list/delete,
+    and drive generation from a code with no image upload."""
+
+    _PNG = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
+            "FcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+    def _wire(self, srv, tmp_path, monkeypatch):
+        import hashlib
+        sref = tmp_path / "sref"; sref.mkdir(exist_ok=True)
+        monkeypatch.setattr(srv, "SREF_DIR", sref)
+        monkeypatch.setattr(srv, "SREF_CODES_FILE", sref / "codes.json")
+        bundle = tmp_path / "bundle"; bundle.mkdir(exist_ok=True)
+        monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+
+        # Stub feature computation: mirror real sha keying, no torch/SigLIP.
+        def _fake_feats(image_bytes):
+            sha = hashlib.sha256(image_bytes).hexdigest()[:24]
+            p = sref / f"{sha}.bin"; p.write_bytes(b"\0" * 32)
+            return p
+        monkeypatch.setattr(srv, "compute_sref_features", _fake_feats)
+        return sref
+
+    def test_save_list_delete(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/sref/codes", json={"image": self._PNG, "label": "moody blue"})
+        assert r.status_code == 200
+        code = r.get_json()["code"]
+        assert len(code) == 8
+
+        lst = client.get("/sref/codes").get_json()
+        assert lst["sref_enabled"] is True
+        assert any(c["code"] == code and c["label"] == "moody blue" for c in lst["codes"])
+
+        d = client.delete(f"/sref/codes/{code}")
+        assert d.status_code == 200
+        assert all(c["code"] != code for c in client.get("/sref/codes").get_json()["codes"])
+
+    def test_save_is_idempotent(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        c1 = client.post("/sref/codes", json={"image": self._PNG}).get_json()["code"]
+        c2 = client.post("/sref/codes", json={"image": self._PNG}).get_json()["code"]
+        assert c1 == c2   # same image -> same code, not a duplicate
+        assert len(client.get("/sref/codes").get_json()["codes"]) == 1
+
+    def test_generate_from_code_routes_sref(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        code = client.post("/sref/codes", json={"image": self._PNG}).get_json()["code"]
+        called = {}
+        monkeypatch.setattr(srv, "run_generation_sref",
+                            lambda *a, **k: called.setdefault("ok", True))
+        r = client.post("/generate", json={"prompt": "a castle", "style_code": code})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body.get("sref") is True and body.get("style_code") == code
+        assert called.get("ok") is True
+
+    def test_unknown_code_errors(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={"prompt": "x", "style_code": "deadbeef"})
+        assert r.status_code == 400
+        assert "Unknown style code" in r.get_json()["error"]
+
+    def test_save_blocked_without_bundle(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        monkeypatch.setattr(srv, "IP_BUNDLE", None)
+        r = client.post("/sref/codes", json={"image": self._PNG})
+        assert r.status_code == 400
+        assert client.get("/sref/codes").get_json()["sref_enabled"] is False
