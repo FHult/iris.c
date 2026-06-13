@@ -165,5 +165,5 @@ train/.venv/bin/python train/scripts/pipeline_ctl.py start-flywheel \
 ## Standing constraints
 - Never start a production run without PROD-1/PROD-2 active (they are now).
 - Style precompute/backfill and proxy training are GPU-window tasks — schedule against
-  the owner's day/night cycle (`pause --free-gpu` handles the flywheel side).
+  the owner's day/night cycle (`pause-flywheel --free-gpu` handles the flywheel side).
 - Every SREF mechanism is fail-open; a missing artifact must degrade, never crash.

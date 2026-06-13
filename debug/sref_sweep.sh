@@ -8,9 +8,9 @@
 # this says whether you can SEE it.
 #
 # GPU-exclusive: PAUSE THE FLYWHEEL FIRST —
-#   train/.venv/bin/python train/scripts/pipeline_ctl.py pause --free-gpu
+#   train/.venv/bin/python train/scripts/pipeline_ctl.py pause-flywheel --free-gpu
 # and resume after:
-#   train/.venv/bin/python train/scripts/pipeline_ctl.py resume
+#   train/.venv/bin/python train/scripts/pipeline_ctl.py resume-flywheel
 #
 # Usage: ./debug/sref_sweep.sh [BUNDLE_DIR]   (default: current champion export)
 # ~18 generations x ~35 s ≈ 12 min + eval. Output: /Volumes/2TBSSD/sref_sweep/
