@@ -867,12 +867,40 @@ def _resolve_exploration_rate(cfg: dict, iteration: int, unscored_frac: float) -
     return rate
 
 
+def resolve_source_holdout(holdout_cfg: Optional[dict], iteration: int) -> set:
+    """Which source(s) to hold out of selection THIS iteration (SRC-ATTR-1
+    follow-up). Pure function so it is unit-testable and the orchestrator stays
+    thin.
+
+    holdout_cfg (flywheel.source_holdout), all keys optional:
+      sources: [src, ...]   rotation pool of sources to probe (required to do anything)
+      every:   N            hold one source out every N iterations (default 1)
+      start:   K            first iteration holdout is active (default 1)
+    On a holdout iteration, picks sources[(active_index) % len(sources)] so each
+    source is cycled through equally — after ~MIN_ATTR_OBS rotations per source,
+    source_attribution() can separate it. Returns an empty set on non-holdout
+    iterations (normal selection).
+    """
+    if not holdout_cfg:
+        return set()
+    sources = holdout_cfg.get("sources") or []
+    if not sources:
+        return set()
+    every = max(1, int(holdout_cfg.get("every", 1)))
+    start = int(holdout_cfg.get("start", 1))
+    if iteration < start or (iteration - start) % every != 0:
+        return set()
+    idx = (iteration - start) // every
+    return {sources[idx % len(sources)]}
+
+
 def select_shards(
     db: ShardScoreDB,
     n_shards: int,
     cfg: dict,
     flywheel_name: str = "",
     iteration: int = 0,
+    exclude_sources: Optional[set] = None,
 ) -> list[str]:
     """
     Select n_shards paths for the next training iteration.
@@ -887,6 +915,14 @@ def select_shards(
 
     Recency penalty discounts shards selected in the last recency_window iters.
     Unscored shards carry a UCB-style optimism bonus so they eventually get explored.
+
+    exclude_sources: drop every shard of these sources from the candidate pool
+    BEFORE selection (source-holdout, SRC-ATTR-1 follow-up). Because the
+    orchestrator's post-training excluded-scoring covers the WHOLE pool, the
+    held-out source's shards then accrue 'excluded' observations — which is the
+    clean excluded baseline that lets source_attribution() finally separate that
+    source's contrastive cond_gap. per_source_min for an excluded source is
+    ignored (the holdout wins).
     """
     performance_weight = float(cfg.get("performance_weight", 0.60))
     min_diversity_pct  = float(cfg.get("min_diversity_pct",  0.20))
@@ -896,6 +932,14 @@ def select_shards(
     # (schedule override + adaptive boost) — see _resolve_exploration_rate.
 
     all_shards = db.get_all_shards()
+    if exclude_sources:
+        _before = len(all_shards)
+        all_shards = [s for s in all_shards
+                      if (s.get("source") or "unknown") not in exclude_sources]
+        if len(all_shards) < _before:
+            print(f"source-holdout: excluded {_before - len(all_shards)} shards "
+                  f"of {sorted(exclude_sources)} from selection "
+                  f"({len(all_shards)} candidates remain)", file=sys.stderr)
     if not all_shards:
         print("WARNING: no shards in DB — returning empty selection", file=sys.stderr)
         return []

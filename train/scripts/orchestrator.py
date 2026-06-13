@@ -2881,7 +2881,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
     )
 
     from shard_selector import (
-        ShardScoreDB, scan_shard_pool, select_shards,
+        ShardScoreDB, scan_shard_pool, select_shards, resolve_source_holdout,
         stage_shards_for_iteration, render_shard_report,
     )
 
@@ -3045,9 +3045,17 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
             # Register any new shards (with SigLIP embeddings and manifest if configured)
             scan_shard_pool(score_db, shards_dir, manifest_path=manifest_path, verbose=False)
 
-            # Select shards
+            # Select shards. source_holdout (default off): rotate one source out
+            # of selection per schedule so it accrues 'excluded' observations —
+            # the clean baseline that lets source_attribution() separate per-source
+            # cond_gap (SRC-ATTR-1 follow-up). debug/source_attribution.py reports it.
             shard_cfg = dict(fw_cfg.get("shard_selection", {}))
-            selected_paths = select_shards(score_db, n_shards, shard_cfg, name, iteration)
+            _holdout = resolve_source_holdout(fw_cfg.get("source_holdout"), iteration)
+            if _holdout:
+                log_orch(f"[flywheel:{name}] iter {iteration}: source-holdout — "
+                         f"excluding {sorted(_holdout)} from selection")
+            selected_paths = select_shards(score_db, n_shards, shard_cfg, name,
+                                           iteration, exclude_sources=_holdout)
 
             if len(selected_paths) < 2:
                 msg = f"only {len(selected_paths)} shards available in {shards_dir}"

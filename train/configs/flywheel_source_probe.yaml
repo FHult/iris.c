@@ -1,0 +1,67 @@
+# Flywheel SOURCE-PROBE campaign (SRC-ATTR-1 follow-up) — measure which DATA
+# SOURCES condition the adapter best, by holding each out in rotation.
+#
+# WHY: in a normal campaign per_source_min keeps every source in every iteration
+# (ubiquity 1.0), so contrastive attribution has no clean excluded baseline and
+# source_attribution() cannot separate sources. This campaign deliberately
+# EXCLUDES one source per iteration on a rotation, generating the excluded
+# observations the attribution needs. After ~MIN_ATTR_OBS (3) rotations per
+# source, debug/source_attribution.py reports separable per-source cond_gap.
+#
+# This is a MEASUREMENT campaign, not a quality-seeking one — its champions are
+# not meant to ship; it exists to inform the production data recipe (DP-5) and
+# per_source_min. Run it on its own (don't interleave into a quality campaign —
+# excluding a dominant source perturbs that campaign's trajectory).
+#
+# Launch:  pipeline_ctl start-flywheel train/configs/flywheel_source_probe.yaml
+# Read:    debug/source_attribution.py --campaign source-probe
+#          (look for trust=trusted + ubiquity<0.85 + ★ separable per source)
+
+flywheel:
+  name: "source-probe"
+  max_iterations: 24            # 4 sources × 6 rotations → ~6 excluded obs each
+  steps_per_iteration: 1000
+  n_shards: 40
+  poll_interval: 60
+  min_free_gb: 40
+
+  from_scratch_each_iter: true  # each iter independent — the contrast is across iters
+  base_checkpoint: null
+
+  # The rotation that creates the excluded baseline. One source held out per
+  # iteration, cycling through the list. Labels = provenance source names.
+  source_holdout:
+    sources:
+      - journeydb
+      - coyo
+      - "coyo+laion+wikiart"
+      - "journeydb+wikiart"
+    every: 1                    # hold one out EVERY iteration
+    start: 1
+
+  # Style pairing OFF: this campaign measures source conditioning, not style
+  # transfer — keep the variable count at one (which source is absent).
+  style_pairing: false
+  precompute_subsample_per_shard: 200
+
+  training_config: "train/configs/stage1_512px.yaml"
+  shards_dir: "/Volumes/16TBCold/shards"
+
+  hyperparams:
+    cross_ref_prob: 0.5
+    style_loss_weight: 0.07
+
+  shard_selection:
+    performance_weight: 0.30
+    min_diversity_pct:  0.30
+    exploration_rate:   0.40
+    recency_penalty:    0.20
+    recency_window_iters: 2
+    # NO per_source_min — it would fight the holdout (the holdout wins anyway,
+    # but leaving it out keeps the included mix natural).
+
+  min_attribution_obs: 3
+  shard_manifest: null
+  plateau_patience:   0
+  plateau_threshold:  0.02
+  ablation_every_n:   0

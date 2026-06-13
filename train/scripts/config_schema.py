@@ -65,8 +65,9 @@ NESTED_KNOWN = {
         "poll_interval", "precomp_trigger_shards",
         "precompute_subsample_per_shard", "quality_gate",
         "resume_from_champion", "shard_manifest", "shard_selection",
-        "shards_dir", "steps_per_iteration", "storage", "style_cold_dir",
-        "style_pairing", "temporal_decay", "training_config",
+        "shards_dir", "source_holdout", "steps_per_iteration", "storage",
+        "style_cold_dir", "style_pairing", "temporal_decay", "training_config",
+        "ephemeral_scores",
     },
 }
 

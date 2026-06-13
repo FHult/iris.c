@@ -1350,8 +1350,14 @@ block in the doctor `--ai` summary. Campaign-scoped from `score_updates` to dodg
 cross-campaign). Run5 finding (iter 13): NO source separable — all sources ubiquitous (every
 iteration), so contrastive cond_gap can't A/B them; the clean signal is the selection-MIX drift
 (journeydb 23%→49% over the campaign — reverting toward its 58% pool share). **Open follow-up:**
-clean per-source quality requires an ablation arm that HOLDS A SOURCE OUT (rides on DP-4); only
-then does `per_source_min` / the production data recipe get evidence rather than a prior.
+clean per-source quality requires HOLDING A SOURCE OUT — BUILT 2026-06-13: not an ablation-harness
+arm (that varies hyperparams on fixed data) but a flywheel selection feature.
+`select_shards(exclude_sources)` + `resolve_source_holdout(cfg,iter)` + orchestrator wiring
+(`flywheel.source_holdout`, default off) drop one source/iter on a rotation; the existing
+whole-pool excluded-scoring then gives that source the clean excluded baseline
+`source_attribution()` needs. Ready campaign: `train/configs/flywheel_source_probe.yaml`
+(24 iters, 4 sources × 6 rotations); read with `debug/source_attribution.py --campaign source-probe`.
+This informs `per_source_min` / the production data recipe (DP-5) with evidence, not a prior.
 
 **SMOKE-ISOLATION (DONE 2026-06-13): smoke/test campaigns must not write the production shard_scores.db.**
 Smoke runs score ALL 1280 shards per iteration (excluded-EMA), so the EMA-lag smoke's cond_gap -5.066

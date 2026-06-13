@@ -192,3 +192,47 @@ class TestSourceAttribution:
         mix = db.source_iteration_mix("c5")
         it1 = {m["source"]: m["n"] for m in mix if m["it"] == 1}
         assert it1 == {"coyo": 2, "journeydb": 5}
+
+
+class TestSourceHoldout:
+    """resolve_source_holdout: pure schedule fn; select_shards(exclude_sources)
+    drops a source from the candidate pool (SRC-ATTR-1 follow-up)."""
+
+    def test_no_config_holds_nothing(self):
+        from shard_selector import resolve_source_holdout
+        assert resolve_source_holdout(None, 5) == set()
+        assert resolve_source_holdout({"sources": []}, 5) == set()
+
+    def test_rotation_cycles_sources(self):
+        from shard_selector import resolve_source_holdout
+        cfg = {"sources": ["coyo", "journeydb", "wikiart"]}
+        got = [next(iter(resolve_source_holdout(cfg, it))) for it in range(1, 7)]
+        assert got == ["coyo", "journeydb", "wikiart", "coyo", "journeydb", "wikiart"]
+
+    def test_every_and_start(self):
+        from shard_selector import resolve_source_holdout
+        cfg = {"sources": ["coyo", "journeydb"], "every": 2, "start": 3}
+        # active on iters 3,5,7…; off on 1,2,4,6
+        assert resolve_source_holdout(cfg, 1) == set()
+        assert resolve_source_holdout(cfg, 2) == set()
+        assert resolve_source_holdout(cfg, 3) == {"coyo"}
+        assert resolve_source_holdout(cfg, 4) == set()
+        assert resolve_source_holdout(cfg, 5) == {"journeydb"}
+        assert resolve_source_holdout(cfg, 7) == {"coyo"}
+
+    def test_excluded_source_never_selected(self, db):
+        _populate(db, {"coyo": 10, "journeydb": 30})
+        sel = select_shards(db, 20, {"performance_weight": 0.3,
+                                     "exploration_rate": 0.5}, "c", 1,
+                            exclude_sources={"coyo"})
+        srcs = {db._conn.execute("SELECT source FROM shards WHERE path=?",
+                                 (p,)).fetchone()[0] for p in sel}
+        assert "coyo" not in srcs
+        assert srcs == {"journeydb"}
+
+    def test_no_exclusion_includes_all_sources(self, db):
+        _populate(db, {"coyo": 10, "journeydb": 30})
+        sel = select_shards(db, 20, {"performance_weight": 0.3}, "c", 1)
+        srcs = {db._conn.execute("SELECT source FROM shards WHERE path=?",
+                                 (p,)).fetchone()[0] for p in sel}
+        assert srcs == {"coyo", "journeydb"}   # both present when nothing excluded
