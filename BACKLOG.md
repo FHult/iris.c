@@ -296,6 +296,38 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
     validity gate (SREF-METRIC-1) is the conspicuous gap. The two next steps that
     sharpen the picture without DP-4: the source-probe and the first visual sweep.
 
+- **SREF-DATA-1: image-level curation + hero shards (strategic — value real, but gated
+  and split-in-two).** Shards are arbitrary I/O packaging; a shard's average quality
+  masks large within-shard variance, and we already compute rich PER-IMAGE signal that
+  selection discards (CSD style embedding, strong-neighbor/pair-richness count, aesthetic
+  / light scores, dedup). Going granular has real value — but only in one of its two
+  forms, with real risks, and not yet:
+  - **DO: image-level CURATION by cheap OFFLINE proxies** (style coherence, pair-richness,
+    aesthetic, caption quality) — tractable, ingredients mostly already computed.
+  - **DON'T: image-level cond_gap ATTRIBUTION** — cond_gap is a per-iteration whole-adapter
+    metric; attributing it needs the noisy incl/excl contrastive machinery over many
+    iterations. The SHARD is roughly the finest grain at which cond_gap attribution has
+    any SNR; per-image is statistically hopeless (millions of images × multiple obs each).
+  - **Hero-shard risk = proxy-optimal ≠ optimal** (the SREF-METRIC-1 surrogate trap one
+    level down): harvesting "the best images" by a proxy risks (a) diversity collapse →
+    fails the long tail of real user references; (b) overfitting the proxy. Mitigation:
+    high-signal CORE blended with diversity, never a pool replacement; ADDITIVE new shards
+    (re-sharding the pool breaks the carry-forward cache + scores — PRECOMP-4 lesson).
+  - **SEQUENCING (load-bearing): gated behind SREF-METRIC-1.** Granularity amplifies
+    whatever the search currency rewards — if cond_gap is misaligned with style (content-
+    leak hint), finer selection just concentrates the misalignment (hero shards optimised
+    for content-copying). Validate the signal (the sweep) BEFORE harvesting to it.
+  - **Cheap first step (captures most value, no re-shard): a style-signal-weighted SAMPLER
+    in the loader.** At batch 1 × 1000 steps the trainer already sees only ~1K of the
+    staged ~40 shards' images — essentially at random. Sampling the highest-pair-richness /
+    most-style-coherent staged images instead of random ones captures most of the
+    "train on the best signal" benefit using data we already compute, with no re-shard, no
+    cache breakage, reversible. Hero shards (curated re-sharding) is the heavier follow-on
+    IF the sampler proves the gain. Groundwork already laid: source-probe + pool-wide
+    pair-richness map + CSD embeddings are exactly the image-level signals this consumes.
+  - **Secondary benefit if it works:** denser per-iteration signal also raises cond_gap
+    SNR (less dilution from junk images), improving the SEARCH itself, not just the ceiling.
+
 ## Training & Model Quality
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
