@@ -1378,3 +1378,14 @@ shard-score rescope required a real free-gpu pause and the trainer had to be pki
 Fix: `_reap_proc_tree(pattern)` SIGTERM→(10s)→SIGKILL-reaps the chain by campaign-scoped cmdline
 (trainer config path / precompute staging path — never touches an unrelated trainer) and verifies
 the device is clear. Hermetic test confirms reap + scoping. Takes effect on next orchestrator restart.
+
+**FLYWHEEL-CHAIN (DONE 2026-06-13): unattended campaign auto-chaining + launchd /Volumes gotcha.**
+The orchestrator has no campaign queue, so `train/scripts/flywheel_chain.sh` watches the active
+flywheel's tmux window and launches the next config when it closes (debounced 2×, settle 90s,
+sentinel-idempotent, MAX_WAIT_H cap that refuses to stack onto a hung run). MUST run in TMUX, not
+launchd: **launchd LaunchAgents cannot write the external /Volumes mount without Full Disk Access**
+(fails EX_CONFIG/Operation-not-permitted) — discovered when the launchd chain exited 78 and its
+/Volumes log writes were denied. tmux runs in the user session (full access) with the same durability
+as the flywheel it chains. Same bug fixed in nightly_health.sh: results now go to
+`$HOME/Library/iris-health/` (boot volume), doctor reads there first, /Volumes second; launchd plist
+stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywheel_source_probe.yaml (18 iters).

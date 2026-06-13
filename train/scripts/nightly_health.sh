@@ -18,9 +18,13 @@
 set -u
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_ROOT="${PIPELINE_DATA_ROOT:-/Volumes/2TBSSD}"
-OUT_DIR="$DATA_ROOT/health"
-LOG="$DATA_ROOT/logs/nightly_health.log"
-mkdir -p "$OUT_DIR" "$(dirname "$LOG")"
+# Results go on the BOOT VOLUME, not /Volumes: launchd agents cannot write an
+# external mount without Full Disk Access (Operation-not-permitted), so a
+# /Volumes result path silently fails every 05:30 run. The doctor reads here
+# first (HEALTH_DIR), /Volumes second.
+OUT_DIR="${IRIS_HEALTH_DIR:-$HOME/Library/iris-health}"
+LOG="$OUT_DIR/nightly_health.log"
+mkdir -p "$OUT_DIR"
 
 cd "$REPO" || exit 1
 T0=$(date +%s)

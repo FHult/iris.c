@@ -23,10 +23,12 @@
     </dict>
     <key>WorkingDirectory</key>
     <string>/Users/fredrikhult/src/iris.c</string>
+    <!-- stdio on the boot volume: launchd fails EX_CONFIG(78) opening these on an
+         external /Volumes mount at load. The script logs to /Volumes itself. -->
     <key>StandardOutPath</key>
-    <string>/Volumes/2TBSSD/logs/nightly_health_launchd.log</string>
+    <string>/Users/fredrikhult/Library/Logs/iris-nightly-health.log</string>
     <key>StandardErrorPath</key>
-    <string>/Volumes/2TBSSD/logs/nightly_health_launchd.log</string>
+    <string>/Users/fredrikhult/Library/Logs/iris-nightly-health.log</string>
     <key>ProcessType</key>
     <string>Background</string>
     <key>LowPriorityIO</key>

@@ -2961,7 +2961,11 @@ def _check_nightly_health(cfg: dict) -> None:
       - pytest/unit failed  -> WARNING
       - file absent         -> INFO (not installed yet / first night pending)
     """
-    res_path = DATA_ROOT / "health" / "nightly_health.json"
+    # Boot-volume path first (where launchd can actually write), /Volumes second
+    # (legacy / manual runs). See nightly_health.sh.
+    _home_res = Path.home() / "Library" / "iris-health" / "nightly_health.json"
+    _vol_res = DATA_ROOT / "health" / "nightly_health.json"
+    res_path = _home_res if _home_res.exists() else _vol_res
     if not res_path.exists():
         _add("INFO", "nightly_health",
              "Nightly health run has not reported yet",

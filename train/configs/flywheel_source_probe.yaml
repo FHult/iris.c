@@ -19,7 +19,7 @@
 
 flywheel:
   name: "source-probe"
-  max_iterations: 24            # 4 sources × 6 rotations → ~6 excluded obs each
+  max_iterations: 18            # 4 sources × ~4-5 rotations → enough to separate; ~2.1 GPU-days
   steps_per_iteration: 1000
   n_shards: 40
   poll_interval: 60
