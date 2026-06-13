@@ -236,6 +236,66 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   (configs ready, TRAIN-7 gate passed). Data recipe: weight natural/style-rich sources
   (coyo ≫ journeydb for conditioning; grow wikiart-like sources — style diversity feeds sref).
 
+- **SREF-METRIC-1 (FOUNDATIONAL — read before trusting any cond_gap-ranked result).**
+  The whole optimisation stack ranks by **cond_gap, which is a SEARCH SURROGATE, not a
+  style metric.** Stated plainly so it is not forgotten:
+  - **What cond_gap is:** loss_null − loss_cond — "does the reference help the diffusion
+    loss." Chosen as the primary ranking signal because it is the only per-iteration
+    signal that is both STABLE (low-variance/monotone at 1000-step budgets) and CHEAP
+    (straight from the loss, no image generation). It was NOT discounted — what was
+    discounted is CLIP-I (conflates style+content, useless for sref) and ref_gap
+    (theoretically the right "uses-the-reference" signal but too noisy to RANK by at
+    this budget; kept only as a weak secondary).
+  - **The catch:** cond_gap is a GENERIC conditioning metric. An adapter lowers it just
+    as well by copying the reference's CONTENT/composition as by transferring its STYLE.
+    It is structurally blind to the style-vs-content distinction — which is the entire
+    objective of an sref model. So cond_gap is NECESSARY-BUT-INSUFFICIENT: failing it
+    means the adapter ignores the reference; passing it does NOT mean it used the
+    reference for style.
+  - **Evidence the two diverge (not hypothetical):** the `sref_eval` ip-scale sweep on a
+    champion showed content_leak rising 0.28→0.49 as ip-scale increases — i.e. what
+    cond_gap rewards includes content-copying, the exact failure mode.
+  - **The discipline:** cheap surrogate for the SEARCH (cond_gap — rank thousands of
+    iterations / ablation arms), expensive truth for the VERDICT (`sref_eval` triad:
+    style_sim↑, content_leak↓, prompt_adherence — run on demand on a champion). Champion
+    cond_gaps reported in status updates are SEARCH numbers, not ship numbers.
+  - **Therefore the sref sweep is a VALIDITY GATE on the search currency, not a nicety.**
+    `debug/sref_sweep.sh` tests whether cond_gap is even pointed at style. Branch:
+    (a) sweep shows clean style transfer → cond_gap is a valid surrogate, the stack is
+    sound; (b) sweep shows content-copying → cond_gap is misaligned: either fold a
+    style-aware term into the ranking objective, or demote cond_gap to a mere gate and
+    rank champions by an occasional `sref_eval` pass. Run ONE sweep before leaning
+    further on any cond_gap-ranked conclusion. A true per-iteration style metric is
+    rejected on cost (needs decode + CSD-encode every step).
+
+- **SREF-OPT-1: the optimisation framework (how the pieces compose into the production run).**
+  Two complementary AXES, each explored by the same hold-one-out methodology, sharing
+  cond_gap as the currency that makes their findings stackable:
+  - **Data axis** — which shards/sources. CORRELATIONAL: flywheel champions
+    (`debug/champions.py`). CAUSAL: the source-holdout campaign
+    (`flywheel_source_probe.yaml` — a DATA ablation, structurally identical to the
+    hyperparameter ablation, just on the data source instead of a hparam).
+  - **Hyperparameter/architecture axis** — cross_ref_prob, style_loss_weight,
+    freeze-double-stream, lr. CAUSAL: the ablation harness (DP-4).
+  - **Composability** rests on the shared cond_gap yardstick — which is why the
+    cross-campaign convention mixing mattered (`rescope_shard_scores.py`; `champions.py`
+    tags eras and refuses to rank cond_gap across the held-out-EMA boundary).
+  - **Separability caveat:** the axes are explored INDEPENDENTLY (ablation fixes data,
+    champions/source-probe fix hparams) — neither explores the data×hparam INTERACTION.
+    The stacked result is a strong, evidence-backed STARTING config for the production
+    run (DP-5), NOT a proven joint optimum; the production run (or a final confirmation
+    ablation on the chosen data) validates the combination.
+  - **Compounding knowledge base (the meta-flywheel):** flywheel_history.db +
+    shard_scores.db + ablation_history.db ACCUMULATE; every reader (`champions.py
+    --seeds`, `source_attribution.py`, ablation warm-start/ABL-3) starts from prior
+    learning instead of cold. The picture of the optimal run sharpens with every
+    campaign and each new experiment inherits the priors.
+  - **Today's state (keep grounded):** one data-axis campaign (run5), source-probe
+    QUEUED (causal data evidence, runs during the 2026-06-15 absence), ablation axis
+    LOCKED (DP-4, gated on attribution warmth), `sref_eval` BUILT-BUT-UNRUN — so the
+    validity gate (SREF-METRIC-1) is the conspicuous gap. The two next steps that
+    sharpen the picture without DP-4: the source-probe and the first visual sweep.
+
 ## Training & Model Quality
 
 **TRAIN-7: IP-Adapter production quality roadmap** (High priority, next major release)
