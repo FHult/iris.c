@@ -1363,3 +1363,12 @@ from one campaign's score_updates (single convention; backs up first; requires a
 2026-06-13: dropped run2/run3/smoke-style2/smoke-style3 rows (8960), 0 contaminated shards remain.
 Also fixed: `pipeline_ctl pause-flywheel` lacked `--free-gpu` (the documented flywheel-pause command
 silently targeted the chunk-pipeline control file) — now exposed.
+
+**FW-PAUSE-1 (DONE 2026-06-13): free-gpu pause left an orphaned trainer process tree.**
+`_kill_flywheel_gpu` killed the tmux training window / wrapper Popen but not the descendant
+chain (bash -c → caffeinate → python → MLX), which survived holding GPU memory — silently
+defeating --free-gpu on an UNATTENDED pause (the day/night sharing use case). Found when the
+shard-score rescope required a real free-gpu pause and the trainer had to be pkill'd by hand.
+Fix: `_reap_proc_tree(pattern)` SIGTERM→(10s)→SIGKILL-reaps the chain by campaign-scoped cmdline
+(trainer config path / precompute staging path — never touches an unrelated trainer) and verifies
+the device is clear. Hermetic test confirms reap + scoping. Takes effect on next orchestrator restart.

@@ -2518,9 +2518,38 @@ class _RestartIteration(Exception):
 _FLYWHEEL_GPU_PROC: list = [None]
 
 
+def _reap_proc_tree(pattern: str, label: str, name: str) -> bool:
+    """SIGTERM then (after a grace period) SIGKILL every process whose full
+    cmdline matches `pattern`; return True once none remain.
+
+    Killing the tmux window / the wrapper Popen does NOT reap the descendant
+    chain (bash -c → caffeinate → python → MLX) — those survive as orphans
+    holding GPU memory, silently defeating --free-gpu on an unattended pause
+    (found 2026-06-13). This matches the whole chain by its campaign-scoped
+    cmdline and verifies the device is actually free before returning."""
+    if subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode != 0:
+        return True   # nothing matched — already clear
+    subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
+    for _ in range(10):                       # up to ~10s for a graceful exit
+        time.sleep(1)
+        if subprocess.run(["pgrep", "-f", pattern],
+                          capture_output=True).returncode != 0:
+            log_orch(f"[flywheel:{name}] pause --free-gpu: reaped {label} (GPU freed)")
+            return True
+    subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
+    time.sleep(1)
+    clear = subprocess.run(["pgrep", "-f", pattern],
+                           capture_output=True).returncode != 0
+    log_orch(f"[flywheel:{name}] pause --free-gpu: {label} "
+             f"{'force-killed (GPU freed)' if clear else 'STILL ALIVE after SIGKILL'}",
+             level="info" if clear else "warning")
+    return clear
+
+
 def _kill_flywheel_gpu(name: str) -> None:
     """Terminate whatever flywheel GPU work is running — the registered precompute
-    subprocess and/or the training window — so the GPU frees within seconds."""
+    subprocess and/or the training window — AND reap their descendant process
+    trees so the GPU frees within seconds (not just the wrapper/window)."""
     proc = _FLYWHEEL_GPU_PROC[0]
     if proc is not None and proc.poll() is None:
         proc.terminate()
@@ -2537,6 +2566,14 @@ def _kill_flywheel_gpu(name: str) -> None:
         subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION}:{TMUX_TRAIN_WIN}"],
                        check=False)
         log_orch(f"[flywheel:{name}] pause --free-gpu: killed training window (GPU freed)")
+    # Reap orphaned descendant chains the window/Popen kill left behind. Scoped to
+    # this campaign by the cmdline so an unrelated trainer is never touched:
+    #   trainer  cmdline carries the config '…/flywheel_{name}_iter…_train.yaml'
+    #   precompute cmdline carries the staging path '…/flywheel_staging/{name}/iter…'
+    _reap_proc_tree(rf"train_ip_adapter\.py.*flywheel_{re.escape(name)}_iter",
+                    "training process tree", name)
+    _reap_proc_tree(rf"precompute_all\.py.*flywheel_staging/{re.escape(name)}/",
+                    "precompute process tree", name)
 
 
 def _interruptible_proc_wait(proc, name: str, fw_db: Optional[object] = None,
