@@ -3840,6 +3840,38 @@ def _build_summary(cfg: dict, chunks: list[int]) -> dict:
         if cold_precomp:
             summary["cold_precompute"] = cold_precomp
 
+    # Per-source data-selection signal for the active campaign (autonomous: every
+    # doctor run surfaces it). Campaign-scoped + confound-aware — see
+    # shard_selector.source_attribution / debug/source_attribution.py.
+    try:
+        if SHARD_SCORES_DB_PATH.exists():
+            from shard_selector import ShardScoreDB
+            _sdb = ShardScoreDB(SHARD_SCORES_DB_PATH)
+            _camp = None
+            _row = _sdb._conn.execute(
+                "SELECT flywheel_name FROM score_updates "
+                "WHERE flywheel_name IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+            if _row:
+                _camp = _row[0]
+            if _camp:
+                _roll = _sdb.source_attribution(_camp)
+                _sep = [r for r in _roll
+                        if r["trust"] == "trusted" and r["ubiquity"] < 0.85
+                        and r["attr_cond_gap_mean"] is not None
+                        and abs(r["attr_cond_gap_mean"]) > (r["attr_cond_gap_std"] or 0)]
+                summary["source_attribution"] = {
+                    "campaign": _camp,
+                    "separable": bool(_sep),
+                    "sources": [{"source": r["source"], "n_shards": r["n_shards"],
+                                 "n_attributed": r["n_attributed"],
+                                 "attr_cond_gap": r["attr_cond_gap_mean"],
+                                 "ubiquity": r["ubiquity"], "trust": r["trust"]}
+                                for r in _roll],
+                }
+            _sdb.close()
+    except Exception:
+        pass
+
     return summary
 
 

@@ -124,3 +124,71 @@ class TestSelectShards:
 
     def test_empty_pool_returns_empty(self, db):
         assert select_shards(db, 10, {}, "run", 1) == []
+
+
+class TestSourceAttribution:
+    """Per-source rollup must be campaign-scoped, single-convention, and honest
+    about confidence/ubiquity (debug/source_attribution.py + doctor consume this)."""
+
+    def _campaign(self, db, name, n_iters, sources):
+        """sources: {src: n_shards}. Every shard included every iter (ubiquity 1),
+        with iteration-level cond_gap (same for all shards in an iter)."""
+        _populate(db, sources)
+        ids_by_src = {}
+        sid = 0
+        for src, n in sources.items():
+            ids_by_src[src] = [f"{sid+i:06d}" for i in range(n)]
+            sid += n
+        for it in range(1, n_iters + 1):
+            cg = 0.05 + 0.001 * it
+            for src, ids in ids_by_src.items():
+                for shard in ids:
+                    db.update_scores(shard, ref_gap=0.01, cond_gap=cg, loss=0.5,
+                                     flywheel_name=name, iteration=it)
+        return ids_by_src
+
+    def test_campaign_scoped_and_ubiquitous(self, db):
+        self._campaign(db, "c1", 6, {"coyo": 4, "journeydb": 6})
+        roll = db.source_attribution("c1")
+        srcs = {r["source"]: r for r in roll}
+        assert set(srcs) == {"coyo", "journeydb"}
+        # every shard included every iteration, never excluded -> ubiquity 1.0,
+        # and NO attributed shards (needs >=3 excluded obs too).
+        assert srcs["coyo"]["ubiquity"] == 1.0
+        assert srcs["journeydb"]["n_attributed"] == 0
+        assert srcs["journeydb"]["attr_cond_gap_mean"] is None
+
+    def test_excluded_observations_enable_attribution(self, db):
+        ids = self._campaign(db, "c2", 4, {"coyo": 4, "journeydb": 4})
+        all_ids = ids["coyo"] + ids["journeydb"]
+        keep = set(ids["journeydb"])   # exclude all coyo
+        # Exclude every coyo shard in 3 extra iterations at a LOWER cond_gap, so
+        # coyo's contrast (incl ~0.05 vs excl 0.02) is positive & separable.
+        for it in range(5, 8):
+            db.update_excluded_scores(all_ids, keep, ref_gap=0.0, cond_gap=0.02,
+                                      flywheel_name="c2", iteration=it)
+        roll = {r["source"]: r for r in db.source_attribution("c2")}
+        assert roll["coyo"]["n_attributed"] == 4          # 4 incl & 3 excl each
+        assert roll["coyo"]["attr_cond_gap_mean"] > 0.02  # ~0.05 - 0.02
+        assert roll["coyo"]["ubiquity"] < 1.0             # excluded in some iters
+        # journeydb still always-included -> not attributed
+        assert roll["journeydb"]["n_attributed"] == 0
+
+    def test_other_campaign_isolated(self, db):
+        # One shared pool scored under two campaigns; the rollup must count only
+        # the requested campaign's updates (cross-campaign convention isolation).
+        self._campaign(db, "c3", 4, {"coyo": 3})
+        for it in range(1, 5):
+            for shard in ("000000", "000001", "000002"):   # same shards
+                db.update_scores(shard, ref_gap=0.01, cond_gap=0.9, loss=0.5,
+                                 flywheel_name="c4", iteration=it)
+        c3 = db.source_attribution("c3")[0]
+        c4 = db.source_attribution("c4")[0]
+        assert c3["incl_cond_gap_mean"] < 0.1    # c3's ~0.05x, not c4's 0.9
+        assert c4["incl_cond_gap_mean"] > 0.8    # c4's 0.9, isolated
+
+    def test_iteration_mix_reconstructs(self, db):
+        self._campaign(db, "c5", 3, {"coyo": 2, "journeydb": 5})
+        mix = db.source_iteration_mix("c5")
+        it1 = {m["source"]: m["n"] for m in mix if m["it"] == 1}
+        assert it1 == {"coyo": 2, "journeydb": 5}

@@ -355,6 +355,34 @@ system itself is down); `build_failed` → CRITICAL (the QWEN-1 failure mode: a
 broken build hides every other regression); pytest/unit failures → WARNING.
 Run manually any time: `./train/scripts/nightly_health.sh` (~80 s).
 
+### Per-source data-selection attribution
+
+"Which DATA SOURCES (journeydb / coyo / laion / wikiart mixes) condition best?"
+— behind `per_source_min` and the production recipe. Single source of truth:
+`ShardScoreDB.source_attribution(flywheel_name)` (shard_selector.py). Read-out:
+`debug/source_attribution.py [--campaign NAME] [--json]`; the doctor `--ai`
+summary carries a compact `source_attribution` block (autonomous — every run).
+
+Two correctness traps it is built to avoid (do NOT reintroduce a naive version):
+1. **cond_gap is per-ITERATION** (the whole adapter's held-out gap, identical for
+   every shard that iteration) → a per-source cond_gap MEAN is confounded by which
+   iterations a source appeared in. Use the CONTRASTIVE signal (incl − excl).
+2. **shard_scores.db is cross-campaign append-only** → its cumulative EMAs blend
+   cond_gap conventions (run5 held-out-EMA vs old train-batch; excl-means as low
+   as −1.6 seen). So attribution MUST be campaign-scoped, recomputed from
+   `score_updates` filtered by `flywheel_name` (single convention) — never the
+   `shards`-table EMAs.
+
+`ubiquity` (fraction of iterations a source appeared in) gates the residual
+confound: a near-ubiquitous source (≈1.0) is rarely excluded → thin excluded
+baseline → unreliable regardless of `n_attributed`. A source is only called
+"separable" when trusted (≥SOURCE_TRUST_FLOOR attributed shards), `ubiquity<0.85`,
+and `|attr_cond_gap| > std`. Until then the **selection-mix drift** (the read-out's
+clean, unconfounded section — included-shards-per-source per iteration) is the
+actionable signal. NOTE: while `per_source_min` keeps every source in every
+iteration, sources stay ubiquitous and never separate — clean source A/B needs an
+ablation arm that holds a source out (DP-4).
+
 ### Source of Truth Hierarchy
 
 ```

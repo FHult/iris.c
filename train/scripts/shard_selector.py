@@ -64,6 +64,7 @@ from shard_source import source_for_tar
 # ---------------------------------------------------------------------------
 
 MIN_ATTR_OBS   = 3     # min observations in BOTH included and excluded before using attribution
+SOURCE_TRUST_FLOOR = 5  # min attributed shards before a SOURCE's rollup is "trusted" (else warming)
 SIGLIP_SAMPLE_N = 50   # images to sample per shard when computing mean embedding
 SIGLIP_DIM_PACKED = 576  # nibble-packed bytes per embedding
 SIGLIP_DIM = 1152        # unpacked float32 dimensions
@@ -665,6 +666,111 @@ class ShardScoreDB:
             d["flip"] = (raw < 0.5) != (eff < 0.5) if raw is not None else False
             report.append(d)
         return report
+
+    def source_attribution(self, flywheel_name: Optional[str] = None,
+                            min_obs: int = MIN_ATTR_OBS) -> list[dict]:
+        """Per-source data-selection rollup — the single source of truth for
+        'which DATA SOURCES condition best' (consumed by debug/source_attribution.py
+        and pipeline_doctor).
+
+        CAMPAIGN-SCOPED BY DESIGN. Two correctness traps make the cumulative
+        `shards` table EMAs unusable for this:
+          1. cond_gap is a per-ITERATION metric (the whole adapter's held-out gap),
+             identical for every shard in that iteration — so a naive per-source
+             cond_gap MEAN just reflects which iterations a source appeared in.
+          2. shard_scores.db is the cross-campaign knowledge base (append-only), so
+             its EMAs BLEND conventions — run5's held-out-EMA cond_gaps with the
+             old train-batch cond_gaps of runs 2–4/sref-v1 (excl-means as low as
+             −1.6 were observed, impossible under the current metric). Absolute
+             cross-campaign attribution is therefore meaningless.
+        So we recompute from score_updates filtered to ONE campaign (single
+        convention): per shard, contrast mean(included cond_gap) − mean(excluded
+        cond_gap) once it has ≥min_obs of EACH within the campaign; roll those up
+        per source. `ubiquity` (fraction of campaign iterations a source appeared
+        in) flags the residual confound: a pool-dominating source is rarely
+        excluded, so its contrast rests on a thin, unusual excluded baseline —
+        read its number with suspicion regardless of n_attributed.
+
+        Returns one dict per source sorted by attr_cond_gap_mean desc (trusted
+        first): source, n_shards, n_touched, n_attributed, attr_cond_gap_mean/std,
+        incl_cond_gap_mean (the CONFOUNDED reference), ubiquity, trust.
+        """
+        # Static pool composition (source -> total shards in the pool).
+        with self._lock:
+            pool = self._conn.execute(
+                "SELECT COALESCE(source,'unknown') AS source, COUNT(*) n "
+                "FROM shards GROUP BY source").fetchall()
+            uq = ("SELECT su.shard_id, COALESCE(s.source,'unknown') AS source, "
+                  "su.role, su.cond_gap, su.iteration "
+                  "FROM score_updates su JOIN shards s USING(shard_id) "
+                  "WHERE su.cond_gap IS NOT NULL ")
+            args: list = []
+            if flywheel_name:
+                uq += "AND su.flywheel_name=? "
+                args.append(flywheel_name)
+            updates = self._conn.execute(uq, args).fetchall()
+
+        n_shards_by_src = {r["source"]: r["n"] for r in pool}
+        # Per shard within the campaign: collect incl / excl cond_gap observations.
+        per_shard: dict[str, dict] = {}
+        all_iters: set = set()
+        iters_by_src: dict[str, set] = {}
+        for u in updates:
+            all_iters.add(u["iteration"])
+            sd = per_shard.setdefault(u["shard_id"],
+                                      {"source": u["source"], "incl": [], "excl": []})
+            sd[("incl" if u["role"] == "included" else "excl")].append(u["cond_gap"])
+            if u["role"] == "included":
+                iters_by_src.setdefault(u["source"], set()).add(u["iteration"])
+
+        agg: dict[str, dict] = {}
+        for sd in per_shard.values():
+            src = sd["source"]
+            d = agg.setdefault(src, {"source": src, "n_touched": 0,
+                                     "_attr": [], "_incl": []})
+            d["n_touched"] += 1
+            if sd["incl"]:
+                d["_incl"].append(sum(sd["incl"]) / len(sd["incl"]))
+            if len(sd["incl"]) >= min_obs and len(sd["excl"]) >= min_obs:
+                d["_attr"].append(sum(sd["incl"]) / len(sd["incl"])
+                                  - sum(sd["excl"]) / len(sd["excl"]))
+
+        n_iters = max(1, len(all_iters))
+        out = []
+        for src, d in agg.items():
+            av, iv = d.pop("_attr"), d.pop("_incl")
+            mean = (sum(av) / len(av)) if av else None
+            d["n_shards"] = n_shards_by_src.get(src, d["n_touched"])
+            d["n_attributed"] = len(av)
+            d["attr_cond_gap_mean"] = round(mean, 4) if mean is not None else None
+            d["attr_cond_gap_std"] = (
+                round((sum((x - mean) ** 2 for x in av) / len(av)) ** 0.5, 4)
+                if len(av) > 1 else (0.0 if av else None))
+            d["incl_cond_gap_mean"] = round(sum(iv) / len(iv), 4) if iv else None
+            d["ubiquity"] = round(len(iters_by_src.get(src, set())) / n_iters, 2)
+            d["trust"] = "trusted" if len(av) >= SOURCE_TRUST_FLOOR else "warming"
+            out.append(d)
+        out.sort(key=lambda d: (d["trust"] != "trusted",
+                                -(d["attr_cond_gap_mean"] if d["attr_cond_gap_mean"]
+                                  is not None else -9)))
+        return out
+
+    def source_iteration_mix(self, flywheel_name: Optional[str] = None) -> list[dict]:
+        """Per-iteration selection MIX by source (clean, unconfounded): how many
+        shards of each source were INCLUDED each iteration. Shows whether the
+        meta-flywheel is drifting selection toward better sources over the
+        campaign. Reconstructed from score_updates — no extra write path."""
+        q = ("SELECT su.iteration AS it, COALESCE(s.source,'unknown') AS source, "
+             "COUNT(*) AS n FROM score_updates su JOIN shards s USING(shard_id) "
+             "WHERE su.role='included' ")
+        args: list = []
+        if flywheel_name:
+            q += "AND su.flywheel_name=? "
+            args.append(flywheel_name)
+        q += "GROUP BY su.iteration, source ORDER BY su.iteration"
+        with self._lock:
+            rows = self._conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         self._conn.close()

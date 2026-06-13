@@ -1341,3 +1341,14 @@ leaves the matching .json sidecars, so every flywheel iteration accrues "incompl
 doctor WARNINGs (7 after run5's first 3 iters; cleaned manually 2026-06-12). Fix: prune the
 sidecar with its checkpoint (orchestrator + save_checkpoint keep_last_n path); takes effect
 on next orchestrator restart.
+
+**SRC-ATTR-1: per-source data-selection attribution — read-out + autonomous surfacing (DONE 2026-06-13).**
+`ShardScoreDB.source_attribution(flywheel_name)` + `source_iteration_mix` (shard_selector.py,
+single source of truth, 5 tests), `debug/source_attribution.py` CLI, and a `source_attribution`
+block in the doctor `--ai` summary. Campaign-scoped from `score_updates` to dodge two traps
+(cond_gap is per-iteration → naive mean confounded; shard_scores.db blends cond_gap conventions
+cross-campaign). Run5 finding (iter 13): NO source separable — all sources ubiquitous (every
+iteration), so contrastive cond_gap can't A/B them; the clean signal is the selection-MIX drift
+(journeydb 23%→49% over the campaign — reverting toward its 58% pool share). **Open follow-up:**
+clean per-source quality requires an ablation arm that HOLDS A SOURCE OUT (rides on DP-4); only
+then does `per_source_min` / the production data recipe get evidence rather than a prior.
