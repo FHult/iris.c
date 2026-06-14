@@ -45,15 +45,31 @@ def main() -> int:
     from precompute_all import _preprocess_siglip
     img = _preprocess_siglip(raw)                       # [1,3,384,384] f32
 
-    import mlx.core as mx
-    from mlx_vlm import load as vlm_load
-    model, _ = vlm_load(SIGLIP_MODEL)
-    model.eval()
-    feats = model.vision_model(mx.array(img))           # [1,729,1152]
-    mx.eval(feats)
-    feats_np = np.array(feats)[0].astype(np.float32)
-    if feats_np.shape != (TOKENS, DIM):
-        print(f"unexpected feature shape {feats_np.shape}", file=sys.stderr)
+    # Same load + encode as precompute_all (the parity-critical path): try the
+    # MLX vision tower, fall back to torch/transformers. mlx_vlm currently has no
+    # 'siglip' model module, so the torch path is what actually runs — but keep
+    # the MLX try so this tracks precompute if mlx_vlm gains siglip support.
+    feats_np = None
+    try:
+        import mlx.core as mx
+        from mlx_vlm import load as vlm_load
+        model, _ = vlm_load(SIGLIP_MODEL)
+        model.eval()
+        feats = model.vision_model(mx.array(img))       # [1,729,1152]
+        mx.eval(feats)
+        feats_np = np.array(feats)[0].astype(np.float32)
+    except Exception:
+        import torch
+        from transformers import AutoModel
+        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+        hf = AutoModel.from_pretrained(SIGLIP_MODEL).vision_model.eval().to(dev)
+        with torch.no_grad():
+            out_t = hf(pixel_values=torch.from_numpy(img).to(dev))
+        feats_np = out_t.last_hidden_state[0].float().cpu().numpy()
+
+    if feats_np is None or feats_np.shape != (TOKENS, DIM):
+        print(f"unexpected feature shape "
+              f"{None if feats_np is None else feats_np.shape}", file=sys.stderr)
         return 1
 
     out = Path(args.out)
