@@ -254,6 +254,19 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
     reimplementation, same parity discipline. Effort ~1 day incl. parity. Do when app
     latency matters or alongside G-1 Phase 3; not urgent (the 2026-06-14 torch fallback
     is correct and in use).
+  - **PRECOMPUTE adoption (the bigger prize, but a gated training-pipeline change).**
+    Today precompute AND the sidecar both use torch-SigLIP → train/infer are CONSISTENT.
+    Adopting MLX for the sidecar ONLY would *introduce* a small train/infer mismatch
+    (cos≈0.999, tolerable but deliberate); the clean end-state is MLX on BOTH sides.
+    Precompute is also where MLX pays off most — the flywheel is precompute-dominated
+    (millions of encodes), so a faster batch SigLIP speeds every iteration, far more than
+    one-image app latency. BUT switching the precompute encoder is a high-risk
+    training-data-pipeline change (VAE-Q1 / encoder-identity lesson): the existing pool
+    SigLIP cache is torch-built, so either (a) treat MLX as the same identity and reuse it
+    (only if drift is acceptably small) or (b) bump ENCODER_CODE_VERSION (PRECOMP-3) and
+    RE-PRECOMPUTE the whole pool's SigLIP — clean, expensive. Never mid-campaign; only at a
+    clean boundary (e.g. before the production foundation run), parity-gated, and ideally
+    AFTER a benchmark confirms MLX actually beats torch-MPS for batch SigLIP (not a given).
 - **SREF-4: sequencing.** warmup-run4 warms attribution under the new held-out cond_gap →
   ablation when warm (first arm: freeze_double_stream_scales — double-stream injection may
   matter for style) → production 512 foundation (~12d) only AFTER SREF-1 lands → Stage 2/3
