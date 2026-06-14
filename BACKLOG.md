@@ -230,6 +230,30 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   --ip-scale (validated 0/0.3/1.0), style codes = library of stored SigLIP embeddings
   (Midjourney "--sref random"/reusable-code UX). bf16/MPS-native inject + SigLIP-in-C
   (G-1 Phase 3) are latency work, not blockers.
+
+- **SIGLIP-MLX-1: pure-MLX SigLIP vision encoder (drop the torch fallback) — mirrors
+  csd_mlx.py** (Low priority — latency/cleanliness, NOT correctness; the torch fallback
+  works). The app's style sidecar (`train/scripts/siglip_features.py`) and precompute
+  both encode references with **torch/transformers** because `mlx_vlm` has no siglip
+  module (`vlm_load('...siglip-so400m...')` → "Model type siglip not supported"). torch
+  load is ~seconds + ~GB; an MLX-native encoder is faster/lighter for web serving.
+  - **Right form:** NOT a patch to the pip-installed mlx_vlm (lost on upgrade; whole VLM
+    class for just the vision tower). Write `train/style_encoder/siglip_mlx.py`, a sibling
+    to `csd_mlx.py` (121-line pure-MLX ViT that loads converted weights, no torch). We
+    output `last_hidden_state` patch tokens `[729, 1152]` — skip the attention-pool head.
+  - **SigLIP-so400m specifics vs CLIP ViT-L (csd_mlx):** larger tower; NO CLS token;
+    `gelu_pytorch_tanh` activation; learned position embeds for 729 patches; check the
+    LN placement. One-time weight conversion (torch checkpoint → safetensors, like CSD).
+  - **HARD PARITY GATE (the real cost, same lesson as VAE-teacher / CSD parity):** run5's
+    adapter was TRAINED on torch-SigLIP features (precompute uses the torch path), so a
+    pure-MLX SigLIP MUST validate bit-close vs torch-SigLIP (`debug/siglip_parity`,
+    cos ≥ 0.999 on real images) BEFORE replacing it — else inference features diverge from
+    training and conditioning silently degrades.
+  - **Scope note:** this is the PYTHON app-sidecar target (MLX). The C-engine target
+    (SigLIP in C for a Python-free engine) is the separate G-1 Phase 3 — different
+    reimplementation, same parity discipline. Effort ~1 day incl. parity. Do when app
+    latency matters or alongside G-1 Phase 3; not urgent (the 2026-06-14 torch fallback
+    is correct and in use).
 - **SREF-4: sequencing.** warmup-run4 warms attribution under the new held-out cond_gap →
   ablation when warm (first arm: freeze_double_stream_scales — double-stream injection may
   matter for style) → production 512 foundation (~12d) only AFTER SREF-1 lands → Stage 2/3
