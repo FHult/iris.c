@@ -258,15 +258,22 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
     Today precompute AND the sidecar both use torch-SigLIP → train/infer are CONSISTENT.
     Adopting MLX for the sidecar ONLY would *introduce* a small train/infer mismatch
     (cos≈0.999, tolerable but deliberate); the clean end-state is MLX on BOTH sides.
-    Precompute is also where MLX pays off most — the flywheel is precompute-dominated
-    (millions of encodes), so a faster batch SigLIP speeds every iteration, far more than
-    one-image app latency. BUT switching the precompute encoder is a high-risk
-    training-data-pipeline change (VAE-Q1 / encoder-identity lesson): the existing pool
-    SigLIP cache is torch-built, so either (a) treat MLX as the same identity and reuse it
-    (only if drift is acceptably small) or (b) bump ENCODER_CODE_VERSION (PRECOMP-3) and
-    RE-PRECOMPUTE the whole pool's SigLIP — clean, expensive. Never mid-campaign; only at a
-    clean boundary (e.g. before the production foundation run), parity-gated, and ideally
-    AFTER a benchmark confirms MLX actually beats torch-MPS for batch SigLIP (not a given).
+    Precompute is *potentially* where MLX pays off most — the flywheel is precompute-
+    dominated (millions of encodes), so IF MLX batch-encodes faster it speeds every
+    iteration, far more than one-image app latency. BUT switching the precompute encoder is
+    a high-risk training-data-pipeline change (VAE-Q1 / encoder-identity lesson): the
+    existing pool SigLIP cache is torch-built, so either (a) treat MLX as the same identity
+    and reuse it (only if drift is acceptably small) or (b) bump ENCODER_CODE_VERSION
+    (PRECOMP-3) and RE-PRECOMPUTE the whole pool's SigLIP — clean, expensive. Never
+    mid-campaign; only at a clean boundary (e.g. before the production foundation run).
+  - **PREREQUISITE A/B BENCHMARK — do NOT assume MLX is faster.** MLX-vs-torch-MPS speed
+    for batch SigLIP is UNKNOWN; torch on MPS is well-optimised and may match or beat MLX.
+    Before any precompute switch, run a head-to-head A/B on the SAME batch (e.g. 1–2K real
+    images): wall-clock img/s for MLX vs the current torch path, on the production batch
+    size, warm. The precompute adoption is justified ONLY if MLX wins by a margin that
+    outweighs the re-precompute cost; a tie or loss means keep torch for precompute and use
+    MLX for the sidecar only (accepting the small train/infer cos≈0.999 drift). The parity
+    gate (cos≥0.999) governs CORRECTNESS; this A/B governs whether the switch is WORTH it.
 - **SREF-4: sequencing.** warmup-run4 warms attribution under the new held-out cond_gap →
   ablation when warm (first arm: freeze_double_stream_scales — double-stream injection may
   matter for style) → production 512 foundation (~12d) only AFTER SREF-1 lands → Stage 2/3
