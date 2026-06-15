@@ -101,6 +101,40 @@
 
 ## Known Anomalies (Open)
 
+- **IP-ADAPTER-INFER-1: `iris --ip` C inference degenerates into a patch-periodic GRID
+  at ip-scale > 0 (2026-06-14, found by the first visual sref sweep).**
+  - **Signature:** base generation perfect; `--ip-scale 0.0` bit-identical to base
+    (inertness correct); but with the adapter ACTIVE the output degrades monotonically
+    with scale — 0.4: coherent image + colour tint + faint patch-striping; 0.8:
+    checkerboard; 1.2: a clean regular grid of dots, NO subject, in the REFERENCE's
+    dominant colour (e.g. sage-green ref → green-dot grid). All 18 sweep generations
+    affected; sref_eval scores on them are therefore meaningless.
+  - **It is an INFERENCE bug, not a bad/undertrained adapter — three independent tells:**
+    (1) the artifact is a crisp PATCH-PERIODIC grid (structural), not the blur an
+    undertrained adapter produces; (2) the held-out **cond_gap is POSITIVE (+0.0727)** —
+    the very weights that grid in C inference IMPROVE the loss in the Python training
+    forward, so the weights are fine and the C forward differs; (3) the grid carries the
+    reference's pooled COLOUR, i.e. the IP contribution is being injected with wrong
+    spatial structure (patch-aligned broadcast) that grows with scale.
+  - **Why G-1 Phase 2 missed it:** it validated adapter MATH (k/v projection, perceive)
+    bit-exact vs Python goldens on synthetic fixtures, and the inertness gate (scale 0).
+    It NEVER generated a full image with a real trained adapter at scale > 0 — necessary
+    but not sufficient. (Lesson mirrors the "smoke before a long run" rule: unit-parity ≠
+    end-to-end coherence.)
+  - **Impact:** blocks the SREF-METRIC-1 validity gate (cannot visually assess whether
+    cond_gap tracks style until generation works), AND the app style feature uses the same
+    `iris --ip` path → it does not produce usable styled images yet. Does NOT affect
+    training (run5/flywheel only train adapters; cond_gap is a latent-space loss metric).
+  - **Disambiguation / next step (GPU):** generate with the SAME adapter+features via the
+    Python/mflux inference path. Clean styled image there + grid in C ⇒ confirmed C
+    injection bug (then audit the IP contribution's spatial mapping in
+    iris_transformer_flux.c — patch alignment of the 128 image tokens / k_ip,v_ip add).
+    Grid in both ⇒ adapter pathology (unlikely given the positive cond_gap). Repro:
+    `./iris -d flux-klein-model -p "a cat on a windowsill" --ip
+    /Volumes/2TBSSD/sref_sweep/bundle_iter0024 --ip-features
+    /Volumes/2TBSSD/sref_sweep/refs/000181_0002.bin --ip-scale 1.2 --seed 42 --steps 4
+    -W 512 -H 512 -o /tmp/grid.png`.
+
 - **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
   (2026-06-10, observed during TRAIN-7 memory probes).**
   - **Crash signature:** `EXC_BAD_ACCESS KERN_INVALID_ADDRESS at 0x0` in

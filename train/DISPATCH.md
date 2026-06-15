@@ -92,7 +92,61 @@ Complements the doctor: shows the live progress line (step within chunk, loss, E
 ```bash
 tmux list-windows -t iris 2>/dev/null || echo "not running"
 ```
-Active runs use the `iris` tmux session. `iris-orch` is the orchestrator window; `iris-prep` is the current prep step; `iris-train` is the trainer.
+Active runs use the `iris` tmux session. `iris-orch` is the orchestrator window; `iris-prep` is the current prep step; `iris-train` is the trainer. The flywheel runs in `iris-flywheel`; an auto-chain watcher (if armed) runs in `iris-chain`.
+
+---
+
+## Live Campaigns & How to Manage Them (keep current)
+
+> Snapshot updated 2026-06-15. Always confirm against `pipeline_doctor.py --ai` +
+> `tmux list-windows -a` — this section is a map, not the source of truth.
+
+**What is running right now:**
+- **`warmup-run5`** — the FIRST style-paired flywheel campaign (30 iters, ~2.87h/iter,
+  ~iter 28/30 as of this snapshot; champion = max held-out-EMA cond_gap, currently
+  iter 24 +0.0727). tmux window `iris-flywheel`, log `/Volumes/2TBSSD/logs/flywheel.log`.
+- **`iris-chain`** — an AUTO-CHAIN watcher (tmux window, `train/scripts/flywheel_chain.sh`)
+  that launches the NEXT campaign when `iris-flywheel` closes. Currently armed to launch
+  **`flywheel_source_probe.yaml`** (18-iter source-holdout measurement campaign) when run5
+  ends. Log `/Volumes/2TBSSD/logs/flywheel_chain.log`; one-shot sentinel
+  `/Volumes/2TBSSD/.flywheel_chain.done`.
+
+**Managing the flywheel (the campaign in `iris-flywheel`):**
+```bash
+P=train/.venv/bin/python; C=train/scripts/pipeline_ctl.py
+$P $C pause-flywheel --free-gpu   # kill GPU work NOW, re-runs the iteration on resume
+$P $C pause-flywheel              # pause AFTER the current training window finishes
+$P $C resume-flywheel             # resume
+$P $C stop-flywheel               # stop after the current iteration
+debug/flywheel_refgap.py <name>   # cond_gap trajectory + champion + attribution warmth
+debug/champions.py                # cross-campaign champions (shard mix, hparams, era)
+debug/source_attribution.py --campaign <name>   # per-source signal (once holdout runs)
+```
+NOTE: `pause`/`resume` (no `-flywheel`) target the CHUNK pipeline's control file, NOT the
+flywheel — for the flywheel you MUST use the `-flywheel` variants. A `--free-gpu` pause keeps
+the `iris-flywheel` window OPEN (orchestrator waits), so it does NOT trip the chain watcher.
+
+**Managing the auto-chain:**
+```bash
+# ARM (tmux, NOT launchd — launchd can't write /Volumes without Full Disk Access):
+tmux new-window -t iris -n iris-chain \
+  "caffeinate -dims env CHAIN_NEXT_CONFIG=$PWD/train/configs/<next>.yaml \
+   PIPELINE_DATA_ROOT=/Volumes/2TBSSD bash $PWD/train/scripts/flywheel_chain.sh"
+# DISARM:
+tmux kill-window -t iris:iris-chain ; rm -f /Volumes/2TBSSD/.flywheel_chain.done
+```
+The watcher fires when `iris-flywheel` closes (completion / crash / stop), is sentinel-
+idempotent, and has a 72h cap that refuses to stack onto a hung run. To change what runs
+next, disarm and re-arm with a different `CHAIN_NEXT_CONFIG`.
+
+**Starting a campaign manually** (only when `iris-flywheel` is NOT already running):
+```bash
+$P $C start-flywheel train/configs/<config>.yaml
+```
+Ephemeral/test campaigns: name them `smoke*`/`test*` or set `ephemeral_scores: true` so
+they write `shard_scores_scratch.db`, NEVER the production `shard_scores.db`
+(SMOKE-ISOLATION — a test run once contaminated real selection; cleaned with
+`rescope_shard_scores.py`).
 
 ---
 
