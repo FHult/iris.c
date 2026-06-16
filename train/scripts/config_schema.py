@@ -57,7 +57,8 @@ NESTED_KNOWN = {
     # legacy campaign with nothing downstream complaining.
     "flywheel": {
         "ablation_config", "ablation_every_n", "ablation_max_runs",
-        "ablation_warmstart_arms", "base_checkpoint", "data_root",
+        "ablation_warmstart_arms", "archive_best_to_cold",
+        "base_checkpoint", "data_root",
         "from_scratch_each_iter", "hyperparams", "max_iterations",
         "min_attribution_obs", "min_free_gb", "n_shards", "name",
         "pipeline_config",

@@ -2507,6 +2507,70 @@ def _git_sha() -> str:
         return ""
 
 
+def _archive_flywheel_champion(name: str, fw_db, fw_cfg: dict) -> Optional[str]:
+    """Copy the DB-recorded champion (best held-out cond_gap, is_best=1) to cold storage.
+
+    The chunk pipeline archives champions via DataStager._archive_checkpoints(); the
+    flywheel path had no equivalent, so a campaign's best weights only ever lived on hot
+    storage. This copies (never moves) step.safetensors plus its EMA sibling into
+    cold_root/weights/flywheel-{name}-{YYYYMMDD}/ and writes a manifest.json.
+
+    Fault-tolerant: logs and returns None on any failure rather than raising — a failed
+    archive must never abort a successful campaign. Returns the cold dir path on success.
+    """
+    from datetime import datetime, timezone
+    try:
+        best = fw_db.get_best(name)
+        if not best or not best.get("checkpoint"):
+            log_orch(f"[flywheel:{name}] champion archive skipped — no DB champion "
+                     f"with a recorded checkpoint", level="warning")
+            return None
+        step_src = Path(best["checkpoint"])
+        if not step_src.exists():
+            log_orch(f"[flywheel:{name}] champion archive skipped — checkpoint missing "
+                     f"on disk: {step_src}", level="warning")
+            return None
+
+        cold_root = Path(fw_cfg.get("storage", {}).get("cold_root", str(
+            __import__("pipeline_lib").COLD_ROOT
+        )))
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        cold_dir = cold_root / "weights" / f"flywheel-{name}-{date_str}"
+        cold_dir.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(step_src, cold_dir / "step.safetensors")
+
+        # EMA sibling lives alongside the step file: iter-tagged name in
+        # from_scratch/resume_from_champion modes, plain best.safetensors in default
+        # --resume mode. Copy it if present; it is typically the better-generalizing weights.
+        iteration = best.get("iteration")
+        ema_candidates: list[Path] = []
+        if iteration is not None:
+            ema_candidates.append(step_src.parent / f"iter{int(iteration):04d}_best.safetensors")
+        ema_candidates.append(step_src.parent / "best.safetensors")
+        ema_src = next((c for c in ema_candidates if c.exists()), None)
+        if ema_src is not None:
+            shutil.copy2(ema_src, cold_dir / "best.safetensors")
+
+        manifest = {
+            "flywheel_name": name,
+            "iteration":     iteration,
+            "cond_gap":      best.get("cond_gap"),
+            "source_path":   str(step_src),
+            "archived_at":   now_iso(),
+            "git_sha":       _git_sha(),
+        }
+        (cold_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+        log_orch(f"[flywheel:{name}] archived champion (iter {iteration}, "
+                 f"cond_gap={best.get('cond_gap')}) → {cold_dir}"
+                 + ("" if ema_src is not None else "  [no EMA sibling found]"))
+        return str(cold_dir)
+    except Exception as e:
+        log_orch(f"[flywheel:{name}] champion archive failed: {e}", level="warning")
+        return None
+
+
 class _RestartIteration(Exception):
     """Raised by _check_flywheel_control on `pause --free-gpu` after the GPU work has been
     killed and the campaign resumed — unwinds to the iteration loop, which re-runs the
@@ -3668,6 +3732,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     fw_db.mark_best_checkpoint(name, iteration)
                     log_orch(f"[flywheel:{name}] new best checkpoint  "
                              f"cond_gap={new_cond:.4f}  hash={new_ckpt_hash}")
+                    # Belt-and-suspenders: progressively archive each new champion to
+                    # cold so the current best always survives a mid-campaign crash.
+                    if fw_cfg.get("archive_best_to_cold", True):
+                        _archive_flywheel_champion(name, fw_db, fw_cfg)
                 if from_scratch_each_iter:
                     resume_ckpt = None          # every iteration is independent
                 elif resume_from_champion:
@@ -3813,6 +3881,10 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
         superseded = fw_db.mark_superseded_by(name)
         if superseded:
             log_orch(f"[flywheel:{name}] superseded campaigns: {superseded}")
+        # Copy the champion to cold storage before writing the summary, so the new
+        # flywheel-{name}-{date} dir is in place when write_campaign_summary_json globs
+        # for the most-recent campaign dir to drop summary.json into.
+        _archive_flywheel_champion(name, fw_db, fw_cfg)
         cold_root = Path(fw_cfg.get("storage", {}).get("cold_root", str(
             __import__("pipeline_lib").COLD_ROOT
         )))
