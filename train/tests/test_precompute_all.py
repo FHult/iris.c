@@ -212,3 +212,65 @@ class TestSubsample:
         pa._SUBSAMPLE_PER_SHARD = 2
         ids = [s for s, _, _ in pa.iter_shard(str(tar))]
         assert ids == ["000000_0000", "000000_0002"]   # 2 valid, skipping the invalid one
+
+
+# ---------------------------------------------------------------------------
+# iter_shard_ids  — cheap (no-decode) id iterator backing the model-load probe
+# ---------------------------------------------------------------------------
+
+class TestIterShardIds:
+    """iter_shard_ids must select EXACTLY the same records as iter_shard (so the
+    model-load probe sees the true set of records each run will process), but
+    without decoding image/text bytes.  This is the primitive the pass-2 probe
+    fix relies on: the probe must detect an uncached record in ANY pending shard,
+    not just one sampled shard."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_global(self):
+        saved = pa._SUBSAMPLE_PER_SHARD
+        yield
+        pa._SUBSAMPLE_PER_SHARD = saved
+
+    def test_matches_iter_shard_stem_selection(self, tmp_path):
+        tar = tmp_path / "000000.tar"
+        _make_tar(tar, {
+            "000000_0000": {"img": "jpg", "txt": "a"},
+            "000000_0001": {"img": "jpg", "txt": None},   # image only → skipped by both
+            "000000_0002": {"img": None, "txt": "c"},     # text only  → skipped by both
+            "000000_0003": {"img": "png", "txt": "d"},    # png accepted by both
+        })
+        pa._SUBSAMPLE_PER_SHARD = 0
+        from_bytes = [s for s, _, _ in pa.iter_shard(str(tar))]
+        from_ids   = list(pa.iter_shard_ids(str(tar)))
+        assert from_ids == from_bytes == ["000000_0000", "000000_0003"]
+
+    def test_honors_subsample_cap(self, tmp_path):
+        tar = tmp_path / "000000.tar"
+        _make_tar(tar, {f"000000_{i:04d}": {"img": "jpg", "txt": f"c{i}"}
+                        for i in range(6)})
+        pa._SUBSAMPLE_PER_SHARD = 3
+        assert list(pa.iter_shard_ids(str(tar))) == \
+            ["000000_0000", "000000_0001", "000000_0002"]
+
+    def test_corrupt_tar_warns_not_raises(self, tmp_path):
+        bad = tmp_path / "000000.tar"
+        bad.write_bytes(b"not a tar at all")
+        assert list(pa.iter_shard_ids(str(bad))) == []
+
+    def test_probe_detects_uncached_shard_behind_a_cached_one(self, tmp_path):
+        # Regression: a fully-cached shard must NOT mask a pending uncached shard.
+        # Mirrors the pass-2 catch-up bug — pass 1 cached some shards, pass 2 saw
+        # the whole list, and a single-shard sample concluded "all done", skipping
+        # the encoder load and dropping every uncached shard.
+        pa._SUBSAMPLE_PER_SHARD = 0
+        done = tmp_path / "000100.tar"
+        _make_tar(done, {"000100_0000": {"img": "jpg", "txt": "x"}})
+        pending = tmp_path / "000200.tar"
+        _make_tar(pending, {"000200_0000": {"img": "jpg", "txt": "y"}})
+
+        existing = {"000100_0000"}   # only the first shard's records are cached
+        # The probe's core decision: load iff any record across all shards is uncached.
+        need = any(rid not in existing
+                   for sh in (str(done), str(pending))
+                   for rid in pa.iter_shard_ids(sh))
+        assert need is True

@@ -153,6 +153,35 @@ def iter_shard(shard_path: str):
         print(f"Warning: {shard_path}: {e}", file=sys.stderr)
 
 
+def iter_shard_ids(shard_path: str):
+    """Yield record ids (stems) for records with both image and text, honoring
+    the _SUBSAMPLE_PER_SHARD cap — the SAME selection iter_shard makes, but
+    reading only tar member names (no image/text byte extraction).
+
+    Used by the model-load probe to decide, cheaply, whether any record this run
+    will process is still uncached."""
+    cap = _SUBSAMPLE_PER_SHARD
+    try:
+        with tarfile.open(shard_path) as tar:
+            keys = {}
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                stem, _, ext = m.name.rpartition(".")
+                keys.setdefault(stem, set()).add(ext.lower())
+
+            n = 0
+            for stem, exts in keys.items():
+                if not (exts & {"jpg", "jpeg", "png"}) or not (exts & {"txt", "caption"}):
+                    continue
+                yield stem
+                n += 1
+                if cap and n >= cap:
+                    break
+    except Exception as e:
+        print(f"Warning: {shard_path}: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Image preprocessing
 # ---------------------------------------------------------------------------
@@ -1202,28 +1231,44 @@ def main():
           + (f"   SigLIP batch: {args.siglip_batch}" if siglip_out else ""))
     print()
 
-    # Sample the LAST shard to check whether qwen3/vae are already fully cached.
-    # Avoids loading 8+ GB of model weights that would be immediately discarded —
-    # which caused jetsam to kill the subsequent training process on 32 GB systems
-    # when precompute and training started within seconds of each other.
+    # Decide whether the Qwen3 / VAE encoders must be loaded.  Loading 8+ GB of
+    # weights only to discard them caused jetsam to kill the subsequent training
+    # process on 32 GB systems when precompute and training started within seconds
+    # of each other — so skip the load when the cache already covers every record
+    # this run will process.
     #
-    # We sample the last shard (not the first) because precompute processes shards
-    # in sorted order; after a partial run the first N shards are cached but later
-    # shards are not.  Sampling shards[0] incorrectly concludes "all done" when only
-    # a prefix is cached, causing all remaining shards to be silently skipped.
+    # Correctness: the decision must consider ALL pending shards, not a single
+    # sampled one.  Sampling one shard (e.g. shards[-1]) is unsound — in a
+    # pipelined pass-2 "catch-up" the shards already finished by pass 1 can sit
+    # anywhere in the list, so a lone sample can land on a fully-cached shard and
+    # wrongly conclude "all done", silently skipping the load and dropping every
+    # remaining (uncached) shard's encodings.  We therefore scan record ids across
+    # every shard (member names only, no image decode) and load an encoder if ANY
+    # record is uncached, short-circuiting as soon as both encoders are known to be
+    # needed.  We err toward loading: a needless load only wastes time, whereas a
+    # false skip silently drops data.
     _load_qwen3 = True
     _load_vae   = True
     if shards and args.qwen3_output and args.vae_output:
         try:
-            import itertools as _itools
-            _sample_shard = shards[-1]  # last shard = least likely cached in a partial run
-            _sample = [(r, None, None) for r, _, _ in _itools.islice(iter_shard(_sample_shard), 20)]
-            _existing_q_sample = _scan_existing(args.qwen3_output)
-            _existing_v_sample = _scan_existing(args.vae_output)
-            _load_qwen3 = any(r not in _existing_q_sample for r, _, _ in _sample)
-            _load_vae   = any(r not in _existing_v_sample for r, _, _ in _sample)
+            _existing_q = _scan_existing(args.qwen3_output)
+            _existing_v = _scan_existing(args.vae_output)
+            _need_q = False
+            _need_v = False
+            for _sh in shards:
+                for _rid in iter_shard_ids(_sh):
+                    if _rid not in _existing_q:
+                        _need_q = True
+                    if _rid not in _existing_v:
+                        _need_v = True
+                    if _need_q and _need_v:
+                        break
+                if _need_q and _need_v:
+                    break
+            _load_qwen3 = _need_q
+            _load_vae   = _need_v
         except Exception:
-            pass  # can't sample → load both models to be safe
+            pass  # can't probe → load both models to be safe
     if not _load_qwen3:
         print("  Qwen3: sample shard fully cached — skipping model load")
     if not _load_vae:
