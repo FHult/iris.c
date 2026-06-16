@@ -225,6 +225,19 @@ sleep "$SETTLE"
 archive_champion "source-probe" "source-probe" \
   || log "WARN: source-probe archive failed — continuing to launch replay so the GPU is not wasted. Investigate $LOG."
 
+# Capture source-attribution analysis for the source-probe campaign (non-fatal:
+# the chain proceeds to replay regardless of whether the analysis succeeds).
+mkdir -p /Volumes/16TBCold/analysis
+ATTR_DATE=$(date +%Y%m%d_%H%M%S)
+log "[ATTRIBUTION] Running source attribution analysis..."
+python debug/source_attribution.py --campaign source-probe \
+  > "/Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.txt" 2>&1 \
+  && log "[ATTRIBUTION] Saved to /Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.txt" \
+  || log "[ATTRIBUTION] WARN: attribution script failed (non-fatal)"
+python debug/source_attribution.py --campaign source-probe --json \
+  > "/Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.json" 2>&1 \
+  || true
+
 # Replay prereq: a stale ephemeral scratch DB would widen the pinned 40-shard pool.
 if [ -f "$SCRATCH_DB" ]; then
   if [ "$DELETE_SCRATCH" = "1" ] && [ "$DRY_RUN" != "1" ]; then
