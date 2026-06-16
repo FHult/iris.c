@@ -49,6 +49,10 @@ from pipeline_lib import (
     read_dispatch_issues,
 )
 
+# Boot-volume location of the nightly health verdict (where launchd writes it).
+# A module global so tests can redirect it to a tempdir; see _check_nightly_health.
+NIGHTLY_HEALTH_HOME_DIR = Path.home() / "Library" / "iris-health"
+
 # ── colour codes ─────────────────────────────────────────────────────────────
 _RED    = "\033[91m"
 _YELLOW = "\033[93m"
@@ -2963,7 +2967,7 @@ def _check_nightly_health(cfg: dict) -> None:
     """
     # Boot-volume path first (where launchd can actually write), /Volumes second
     # (legacy / manual runs). See nightly_health.sh.
-    _home_res = Path.home() / "Library" / "iris-health" / "nightly_health.json"
+    _home_res = NIGHTLY_HEALTH_HOME_DIR / "nightly_health.json"
     _vol_res = DATA_ROOT / "health" / "nightly_health.json"
     res_path = _home_res if _home_res.exists() else _vol_res
     if not res_path.exists():

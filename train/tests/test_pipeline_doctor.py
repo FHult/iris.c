@@ -1178,6 +1178,13 @@ class TestFailOpenFallbacks:
 
 
 class TestNightlyHealth:
+    @pytest.fixture(autouse=True)
+    def _isolate_home_health(self, tmp_path, monkeypatch):
+        """Redirect the boot-volume health dir to an empty tempdir so the checks
+        never see the machine's real ~/Library/iris-health verdict (the _vol_res
+        path is already isolated via the `doctor` fixture's DATA_ROOT patch)."""
+        monkeypatch.setattr(pd, "NIGHTLY_HEALTH_HOME_DIR", tmp_path / "iris-health")
+
     def _write(self, tmp_path, status="ok", age_h=1.0, **extra):
         import os as _os
         hd = tmp_path / "health"
