@@ -436,6 +436,16 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   (b) mask text pads out of attention in the trainer's frozen base (closer to a true mask
   than either convention), (c) measure the adapter-quality impact first and accept if
   negligible. Do (c) first once a golden-set eval exists.
+  - **Re-encode cost if (a):** Qwen3 only — h8 is fused with h17+h26 into one
+    7680-dim quantized blob, so there is no partial re-encode; all 482,054 files
+    (73 GB on `/Volumes/2TBSSD/precomputed/qwen3/`) regenerate. VAE (237 GB) and
+    SigLIP (192 GB) live in separate dirs and are unaffected. Bumps the encoder
+    version (PRECOMP-3 cache key); the old `v_*` dir stays until manually pruned.
+    Wall-clock ≈ 5h (range ~4.5–6h), single worker / batch 16 — estimate from
+    observed throughput: 604 probe shards averaged 8.5s per ~200-record subsample
+    (~24 rec/s including per-shard warmup; steady-state ~29 rec/s as warmup
+    amortizes over full shards). Caveat: probe captions averaged seq≈36; a
+    longer-caption mix in the full set would push toward the upper end.
   - **Probe recipe for (c)** (sized 2026-06-11; one GPU hour, no trainer surgery):
     take a trained champion + ~32 val records. For each, build BOTH text variants —
     cached zero-pad rows (training convention) and a live Qwen3 encode of the padded
