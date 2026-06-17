@@ -1480,9 +1480,19 @@ that mandates the `data.bucket` pin). Guards the 4th warmup-run2 blocker; see PR
 
 ### Maintainability (nice-to-have)
 
-- **GROK-TEST-8: pytest markers** (slow / requires_shards / requires_mps / quality) +
-  a `make test-ci` (fast units + smoke + validate + C + run_test, data-req tests noted
-  separately); an "untested modules" grep gate.
+- **GROK-TEST-8: pytest markers (DONE 2026-06-17).** Markers `slow` / `requires_shards` /
+  `requires_mps` / `quality` registered in `train/tests/conftest.py` (via `pytest_configure`,
+  each with a description). `make test-ci` runs the fast, dependency-free subset:
+  `pytest tests/ -x -q -m "not slow and not requires_shards and not requires_mps and not quality"`
+  (582 pass / 163 deselected). The deselected set = the MLX/Metal-GPU modules
+  (`test_smoke`, `test_dataset`, `test_ema`, `test_export`, `test_loss`, `test_model`) marked
+  `requires_mps`, plus `test_training_loop` (`requires_mps` + `slow`). No current test does real
+  shard I/O, so `requires_shards` has no users yet; `quality` is reserved for golden-set GPU eval
+  (the existing `test_quality_gate` / `test_golden_gate` are pure logic and stay in CI).
+  Untested-modules gate: `train/scripts/check_untested_modules.py` (also `make check-untested`)
+  flags source modules >50 lines in `train/scripts/`, `train/ip_adapter/`, `debug/` that have no
+  `test_<stem>.py` and are not referenced from any test; warn-only by default (48 current gaps),
+  `--strict` to fail CI, `--min-lines` to tune the threshold.
 
 Original report retained as `grok_testing_bug_report.md` (untracked) for full detail.
 

@@ -13,6 +13,8 @@ Tests correctness of:
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.requires_mps  # exercises MLX arrays / Metal GPU runtime
+
 import mlx.core as mx
 
 import sys, os

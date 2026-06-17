@@ -21,6 +21,8 @@ import tempfile
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.requires_mps  # ip_adapter.dataset pulls in the MLX runtime
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ip_adapter.dataset import (
     BUCKETS,

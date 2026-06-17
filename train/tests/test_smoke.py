@@ -9,6 +9,10 @@ import importlib
 import sys
 import pytest
 
+# Verifies the training environment: MLX/Metal GPU, torch-MPS, and the wider ML
+# dependency stack must all be importable. Not part of the dependency-free CI cut.
+pytestmark = pytest.mark.requires_mps
+
 
 # ---------------------------------------------------------------------------
 # Core ML dependencies

@@ -14,6 +14,8 @@ import tempfile
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.requires_mps  # export_adapter pulls in the MLX runtime
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from export.export_adapter import (
     _KEY_MAP,

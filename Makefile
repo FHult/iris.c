@@ -21,7 +21,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test test-unit test-quick web-tests pngtest help generic blas mps
+.PHONY: all clean debug lib install info test test-unit test-quick test-ci check-untested web-tests pngtest help generic blas mps
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -153,6 +153,19 @@ test: test-unit web-tests
 
 test-quick:
 	@web/venv/bin/python3 run_test.py --iris-binary ./$(TARGET) --quick
+
+# Fast, dependency-free CI subset of the training tests. Excludes tests that need
+# the MLX/Metal GPU runtime, real shard/dataset files, or golden-set quality eval
+# (markers registered in train/tests/conftest.py). See BACKLOG GROK-TEST-8.
+test-ci:
+	@echo "=== Training tests (CI subset: not slow/requires_shards/requires_mps/quality) ==="
+	@cd train && .venv/bin/python -m pytest tests/ -x -q \
+		-m "not slow and not requires_shards and not requires_mps and not quality"
+	@$(MAKE) check-untested --no-print-directory
+
+# Warn (do not fail) on source modules above the line threshold that have no test.
+check-untested:
+	@train/.venv/bin/python train/scripts/check_untested_modules.py
 
 # Web server API tests (no model or binary required)
 web-tests:

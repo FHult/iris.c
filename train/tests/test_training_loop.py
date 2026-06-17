@@ -26,6 +26,9 @@ import sys
 import numpy as np
 import pytest
 
+# Mini end-to-end training loops on the MLX/Metal GPU: slow and GPU-bound.
+pytestmark = [pytest.mark.requires_mps, pytest.mark.slow]
+
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
