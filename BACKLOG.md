@@ -143,8 +143,24 @@ This layout is the target state. Current hot-storage paths under `/Volumes/2TBSS
 
 ### Hardware scaling roadmap
 
-Current: M1 Max, 32 GB unified memory, 2 TB hot + 16 TB cold.
-Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically higher compute). The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change. The accumulated knowledge base (shard scores, ablation history, weight archive) carries forward directly to any new hardware.
+Current: M1 Max, 32 GB unified memory, ~400 GB/s bandwidth, 2 TB hot + 16 TB cold.
+Future: M5 Max Mac Studio. The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change. The accumulated knowledge base (shard scores, ablation history, weight archive) carries forward directly to any new hardware.
+
+**Key M5 Max facts (researched 2026-06-17; Apple M5 Pro/Max announced 2026-03-03).**
+The HW-M5 items below are grounded in these — re-verify on the actual device.
+- **GPU: 40 cores, each with a dedicated Neural Accelerator** (matrix-multiply hardware,
+  Apple's tensor-core equivalent) → **"more than 4× peak GPU AI compute vs M4 Pro/Max"**,
+  i.e. roughly **~6–8× vs this M1 Max** for matmul-heavy work (transformer GEMM/attention).
+  This — not the memory — is the headline lever.
+- **Memory: up to 128 GB unified.** NB the trainer's MLX cap ALREADY auto-scales with RAM
+  (`mx.set_memory_limit(_ram_bytes * 0.44)`, train_ip_adapter.py:713-721 → 56 GB on 128 GB);
+  the only hard-pinned bottleneck is `batch_size: 1`.
+- **Bandwidth: ~614 GB/s (40-core) — only ~1.5× M1 Max's ~400.** So I/O-bound model LOAD
+  improves only modestly → warm-resident models matter MORE than faster RAM (corrects an
+  earlier assumption that load would speed up a lot).
+- **Metal 4 era; native `bfloat` + simdgroup matrix intrinsics** (Apple9+, present since M3).
+- Refs: en.wikipedia.org/wiki/Apple_M5 ; apple.com/newsroom/2026/03 (M5 Pro/Max debut) ;
+  appleinsider.com/articles/26/03/03 (>4× GPU AI compute vs M4) ; notebookcheck.net M5 Max.
 
 - **HW-M5-1: precompute model-load + per-iteration reload cost (defer to M5 Max 128 GB).**
   Observation (M1 Max, 2026-06): during the flywheel precompute's MODEL-LOAD phase the 2
@@ -164,7 +180,98 @@ Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically 
   With 128 GB they can COEXIST → a persistent precompute server keeps encoders warm across
   iterations, eliminating per-iteration load+compile entirely (far more than the E/P-core
   tweak). Revisit the whole item on M5 Max; the QoS A/B is only worth it if a persistent
-  server isn't adopted.
+  server isn't adopted. (See HW-M5-5 for the warm-server-vs-cache-free decision.)
+
+- **HW-M5-2: bigger-batch + longer training → narrow the warmup-vs-PRODUCTION validity gap
+  (highest training-quality lever).** Every stage config pins `batch_size: 1`
+  (stage1/2/3_*.yaml) — NOT for I/O but for the **20.44 GB activation peak** at 512px
+  batch-1 (train_ip_adapter.py:1911 fence comment; 1024px = 21.32 GB per TRAIN-7), which is
+  right at the M1 ~21.5 GB ceiling. Activations scale ~linearly with batch (the FROZEN base's
+  full forward is retained to backprop into the adapter), so 128 GB enables **batch ~8–12 at
+  512px**, and 6–8× compute fits more steps in the same wall-clock. **The deep point (not
+  just "better adapters"):** the flywheel ranks every shard mix by the cond_gap of a CRUDELY
+  undertrained batch-1×1000-step from-scratch adapter — a proxy (cond_gap, see SREF-METRIC-1)
+  measured on a proxy (undertrained adapter) for the production regime. Training the warmup at
+  near-production batch/steps makes the **entire data-selection + ablation search more
+  PREDICTIVE of the real outcome** — it shrinks the doubly-removed-proxy gap. Effort: loader/
+  sampler for batch>1 (today's batch emit + style-pair logic assume batch 1) + LR re-scaling.
+  Cross-refs: SREF-METRIC-1, SREF-DATA-1 (the style-signal sampler compounds at batch>1),
+  TRAIN-7 (memory numbers), HW-M5-6 (the flywheel rethink this feeds).
+
+- **HW-M5-3: production foundation run at M5 scale — the time-to-SHIP lever.** DP-5 (the
+  ~12-day 512px foundation run on M1, then Stage 2 ~2.1d + Stage 3 ~2.1d per TRAIN-7) drops
+  to **~2 days at 512px** at 6–8× compute. This is arguably the single biggest M5 benefit for
+  actually SHIPPING — it converts "a 2-week run done once on faith" into "a 2-day run you can
+  iterate." Re-derive the chunk/step budget from M5 throughput (PROD-2). Gate unchanged: only
+  start once SREF-1 (style pairing validated), SREF-2 (style eval), and the data recipe are
+  settled — M5 makes the run cheap, not the prerequisites optional. Cross-refs: DP-5, PROD-2,
+  TRAIN-7, HW-M5-2 (batch/res it runs at).
+
+- **HW-M5-4: GPU-native bf16 + matrix-accelerated IP-adapter inject — the app --sref latency.**
+  The bf16 single-block inject is HARD-DISABLED today (`if (0 && …)` at
+  iris_transformer_flux.c:3853) because on M1 "MPS GEMM doesn't support bf16, custom bf16
+  kernel ~4× slower" → the adapter forces the slow CPU-block path. On M5 this inverts twice:
+  (1) native `bfloat` (Metal 4) removes the penalty; (2) the per-core Neural Accelerators are
+  PURPOSE-BUILT for this GEMM/attention. Re-enable the bf16 GPU inject and bring BL-004
+  (simdgroup_matrix for attention GEMM tiles) + BL-005 (native `bfloat` MSL type) — both filed
+  "P3, M3+ only, NOT for M1 Max" (MEMORY.md:69-70,129) — into the matmul-heavy paths. **High
+  PRODUCT value** (the app's core path runs GPU-native). DEPENDENCY: fix IP-ADAPTER-INFER-1
+  FIRST (BUGS.md — `iris --ip` currently grids at scale>0); do not speed up broken generation.
+  Must be developed/validated on real M5 (Metal kernels). Cross-refs: IP-ADAPTER-INFER-1,
+  BL-004, BL-005, G-1 Phase 3.
+
+- **HW-M5-5: precompute architecture DECISION — warm-resident server vs cache-free online
+  (pick one; they're competing designs).** Today precompute and training are SPLIT into
+  separate processes purely to fit 32 GB (encoders ~10 GB + Flux/adapter ~20 GB). 128 GB lets
+  them coexist, opening two mutually-exclusive paths:
+  - **(A) Warm-encoder precompute server** (extends HW-M5-1): keep Qwen3/VAE/SigLIP resident
+    across iterations, kill the per-step `_ensure/_release_live_encoders` churn
+    (train_ip_adapter.py:1376) and the 30×-per-campaign model reload. KEEPS the cache (and its
+    cross-iteration reuse of re-staged shards) but removes reload/compile overhead.
+  - **(B) Cache-free online-encode**: encode in the training loop, DELETE the precompute cache
+    layer entirely — eliminating the whole cache-convention-bug class (VAE-Q1 BN-pack, the
+    shard-score cross-campaign contamination, version/identity management, the
+    precompute↔train resolution contract). HONEST TRADE: this is a SIMPLICITY/CORRECTNESS play,
+    NOT a speed one — it MOVES encode into training and LOSES the cache's cross-iteration reuse
+    (the flywheel re-stages high-scoring shards repeatedly; online re-encodes each time), so net
+    compute can be WORSE for high-overlap campaigns. M5's 6–8× compute is what makes the
+    re-encode affordable enough to consider. DEPENDENCY: MLX-1 (the online-encode SIGSEGV,
+    BUGS.md) must be fixed — the online path is currently a known crash.
+  - **Decision criterion:** if the cache-bug class keeps costing engineering time, (B) for
+    correctness; if throughput dominates, (A). Don't build both. Cross-refs: HW-M5-1, MLX-1,
+    VAE-Q1, PRECOMP-3, the "precompute↔train resolution contract" invariant.
+
+- **HW-M5-6: rethink the flywheel DESIGN for the cheap-iteration regime (architecture, not
+  scaling).** The flywheel's defining choices — subsample (DP-2c), from-scratch each iter,
+  many short cheap iterations — are ADAPTATIONS to expensive iterations on constrained
+  hardware (see memory `flywheel_throughput_strategy`). When iterations are no longer
+  expensive-by-necessity (6–8× compute, batch>1 via HW-M5-2), the optimal shape may differ:
+  fewer/larger/more-REPRESENTATIVE iterations, warm-start instead of from-scratch (the
+  from-scratch regime exists partly because short runs warm-start poorly — re-examine with
+  longer runs), or a more direct curate-then-train-once flow. This is a deliberate
+  re-evaluation of whether the meta-flywheel's assumptions still hold, NOT a parameter bump.
+  Do it AFTER HW-M5-2 lands (need the batch>1 regime to judge). Cross-refs: HW-M5-2, DP-2c,
+  SREF-OPT-1 (the optimisation framework this restructures), from_scratch_each_iter.
+
+- **HW-M5-7: retire the M1-era throughput workarounds (proxy-VAE + subsampling) — partly a
+  DON'T-BUILD.** The proxy-VAE (PRECOMP-2; small variant FAILED Tier-1 on capacity, medium
+  retrain PENDING) and subsampled precompute (DP-2c, `precompute_subsample_per_shard`) exist
+  ONLY to make precompute affordable on M1. At 6–8× compute, full real-VAE precompute at full
+  coverage is cheap → the proxy is likely MOOT. **Actionable now: do NOT sink a GPU-night into
+  the medium proxy if M5 is near** — M5 obsoletes it. On M5: drop subsampling (full signal every
+  iteration, removing the prefix-coverage bookkeeping) and re-evaluate whether the proxy path
+  is ever worth its parity risk. Cross-refs: PRECOMP-2 (incl. the C-1/C-2 pre-trust gates that
+  also become moot if the proxy is dropped), DP-2c, SREF-DATA-1 (subsampling interacts with
+  curation).
+
+- **HW-M5-8: parallel campaigns/ablation + multi-model residency (incremental memory wins).**
+  A single GPU lock serializes everything today (one campaign/ablation arm at a time;
+  ablation_harness.py acquires the lock). 128 GB fits 2+ concurrent ~20 GB runs → run multiple
+  ablation arms / a source-probe + a quality campaign concurrently, multiplying the
+  hyperparameter axis (SREF-OPT-1) throughput; needs GPU-lock redesign + contention handling.
+  Also: keep multiple models resident (4B + 9B both, several adapters for ensemble/A-B,
+  teacher-VAE + proxy together) for multi-adapter serving and inference A/B. Lowest priority of
+  the set. Cross-refs: SREF-OPT-1, ablation_harness GPU lock, the dual-flywheel design.
 
 ---
 
