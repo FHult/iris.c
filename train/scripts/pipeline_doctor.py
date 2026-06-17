@@ -3273,9 +3273,8 @@ def _check_log_disk(cfg: dict) -> None:
         _add("WARNING", "environment",
              f"logs/ is {gb:.1f} GB across {n} files (> {max_gb:.0f} GB budget)",
              detail=("Fixed-name logs accumulate across runs and bloat logs/ (and slow "
-                     "log-tail reads). Prune logs older than a week — active logs are kept."),
-             fix=f"find {LOG_DIR} -maxdepth 1 \\( -name '*.log' -o -name '*.jsonl' \\) "
-                 f"-mtime +7 -delete",
+                     "log-tail reads). Archive logs older than a week — active logs are kept."),
+             fix=f"{TRAIN_DIR}/.venv/bin/python {SCRIPTS_DIR}/rotate_logs.py --days 7",
              ctx={"logs_gb": round(gb, 2), "n_files": n, "max_gb": max_gb})
 
 
