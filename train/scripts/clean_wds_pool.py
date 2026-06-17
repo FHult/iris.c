@@ -43,6 +43,33 @@ from pipeline_lib import (
 from clip_dedup import dedup_wds_tar, DUP_THRESHOLD
 
 
+def _truncate_index(index, count: int):
+    """Return an IndexFlatIP holding only the first ``count`` vectors of ``index``
+    in insertion order. Used to roll a partially-indexed tar's vectors back out
+    of the cumulative index (DEDUP-3). Returns ``index`` unchanged when it is None
+    or already at/below ``count``."""
+    import faiss
+    if index is None or count >= index.ntotal:
+        return index
+    truncated = faiss.IndexFlatIP(index.d)
+    if count > 0:
+        truncated.add(index.reconstruct_n(0, count))
+    return truncated
+
+
+def _truncate_ids(ids_path: Path, count: int) -> None:
+    """Truncate the ``.ids`` sidecar to its first ``count`` lines so it stays in
+    1:1 correspondence with a truncated index (DEDUP-3)."""
+    if not ids_path.exists():
+        return
+    lines = ids_path.read_text().splitlines()
+    if len(lines) <= count:
+        return
+    with open(ids_path, "w") as f:
+        for fid in lines[:count]:
+            f.write(fid + "\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Retroactive WDS pool deduplication (DEDUP-1 Track 2)"
@@ -172,6 +199,48 @@ def main() -> None:
             os.fsync(_f.fileno())
         os.replace(str(tmp), str(index_path))
 
+    # DEDUP-3 recovery. If a previous run was interrupted after a tar's vectors
+    # were added to the index but before the tar was marked .deduped, the
+    # interrupt-time flush may have persisted those partial vectors to disk.
+    # Reprocessing that tar would then search its own vectors and flag every
+    # record as a self-duplicate (score ≈ 1.0 ≥ threshold). The .processing
+    # marker records the index size *before* the in-flight tar's add, so we roll
+    # the index (and .ids sidecar) back to that count and force the tar to be
+    # reprocessed cleanly.
+    processing_path = index_path.with_suffix(".processing")
+    if processing_path.exists():
+        lines = processing_path.read_text().splitlines()
+        try:
+            saved_n = int(lines[0].strip())
+        except (IndexError, ValueError):
+            saved_n = None
+        saved_tar = lines[1].strip() if len(lines) > 1 else None
+        if saved_n is not None:
+            before_n = index.ntotal if index is not None else 0
+            if index is not None and index.ntotal > saved_n:
+                index = _truncate_index(index, saved_n)
+                _flush_index()
+            # Keep the sidecar aligned even when the index itself was not flushed
+            # ahead (the .ids append happens before the periodic index flush).
+            _truncate_ids(ids_path, saved_n)
+            # Force the interrupted tar back into the pending set so its vectors
+            # are re-added after the rollback.
+            if saved_tar:
+                stale_sentinel = pool_dir / (saved_tar + ".deduped")
+                if stale_sentinel.exists():
+                    stale_sentinel.unlink()
+            print(f"DEDUP-3 recovery: rolled index back {before_n:,} -> {saved_n:,} "
+                  f"vectors ({saved_tar or 'in-flight tar'} will be reprocessed)",
+                  flush=True)
+            log_orch(f"clean_wds_pool: DEDUP-3 recovery, index {before_n} -> "
+                     f"{saved_n}, reprocess {saved_tar}")
+        processing_path.unlink()
+        # The pending set was computed before this rollback; recompute it so a
+        # sentinel removed above is picked up.
+        pending = [t for t in tars if not t.with_suffix(".tar.deduped").exists()]
+        _total = len(pending)
+        _done[0] = 0
+
     try:
         for i, tar_path in enumerate(pending, 1):
             sentinel = tar_path.with_suffix(".tar.deduped")
@@ -179,8 +248,19 @@ def main() -> None:
             print(f"[{i}/{_total}] {tar_path.name} ({tar_size_mb:.0f} MB) ...",
                   end=" ", flush=True)
             t0 = time.time()
+            # DEDUP-3: record the index size before this tar's vectors are added.
+            # If the run is interrupted after the add (and the partial vectors get
+            # flushed to disk), startup recovery rolls the index back to this count
+            # so the tar is not deduplicated against its own vectors on restart.
+            prior_n = index.ntotal if index is not None else 0
+            processing_path.write_text(f"{prior_n}\n{tar_path.name}\n")
             last_err = None
             for attempt in range(1, _RETRY_ATTEMPTS + 1):
+                # Roll back any vectors a previous failed attempt added before
+                # retrying, so the retry never searches this tar's own vectors.
+                if index is not None and index.ntotal > prior_n:
+                    index = _truncate_index(index, prior_n)
+                    _truncate_ids(ids_path, prior_n)
                 try:
                     rec_in, rec_out, index = dedup_wds_tar(
                         tar_path=tar_path,
@@ -204,6 +284,12 @@ def main() -> None:
                         print(f"FAILED ({elapsed:.0f}s): {e}", file=sys.stderr, flush=True)
                         log_orch(f"clean_wds_pool: failed {tar_path.name}: {e}", level="error")
             if last_err is not None:
+                # Drop any partial vectors the failed tar added so neither the next
+                # tar nor a restart deduplicates against an un-rewritten tar.
+                if index is not None and index.ntotal > prior_n:
+                    index = _truncate_index(index, prior_n)
+                    _truncate_ids(ids_path, prior_n)
+                processing_path.unlink(missing_ok=True)
                 _done[0] += 1
                 continue
 
@@ -232,8 +318,10 @@ def main() -> None:
                 f" ({dups} removed, {dup_pct:.1f}%)  {elapsed:.0f}s  index={idx_sz}"
             )
 
-            # Write sentinel to mark this tar as deduped.
+            # Write sentinel to mark this tar as deduped, then clear the in-flight
+            # marker — this tar is now fully committed (DEDUP-3).
             sentinel.touch()
+            processing_path.unlink(missing_ok=True)
             _done[0] += 1
 
             # Periodic FAISS index persistence (every _INDEX_FLUSH_EVERY tars).

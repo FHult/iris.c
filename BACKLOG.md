@@ -189,7 +189,12 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   previous loader image. Both builder scripts LANDED and val-validated 2026-06-11
   (style_precompute.py, style_neighbors.py — ratio 0.683, near-dupe exclusion working,
   visual confirmation: Frazetta-style ref's top neighbor = same style, different content).
-  Remaining — **orchestrator wiring spec (SREF-1W, decided 2026-06-11):**
+  **SREF-1W: DONE (2026-06-17, commit a82514c + follow-ups).** The orchestrator wiring
+  for the fourth (style) encoder step is fully landed across every touchpoint below.
+  The ONE remaining item — cache_manager **v2** style-encoder identity registration —
+  is explicitly DEFERRED/future (v1 ships with style's own per-shard manifest, which is
+  sufficient for the run5 campaign); see the cache_manager line in the checklist.
+  Implemented spec (**orchestrator wiring, decided 2026-06-11**):
   (a) Style runs as a FOURTH per-iteration precompute step in the ORCHESTRATOR (not
   inside precompute_all's model juggling): after precompute_all completes, run
   style_precompute.py over the staged shards (~30 min/42 shards), then
@@ -214,7 +219,8 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   view + log tails); trainer (`data.style_neighbors_db` + style_pair_pct telemetry in
   heartbeat/log); flywheel_lib (optional telemetry parse); ablation harness (inherits
   the dataset fallback — nothing breaks; later: style_pair_prob sweep variable);
-  cache_manager (v2: register "style" encoder identity; v1 = own manifest);
+  cache_manager (v2: register "style" encoder identity — DEFERRED/future; v1 = own
+  manifest, shipped);
   DISPATCH.md telemetry reference (new heartbeat/sentinel/log names).
   Campaign decision: run4 may relaunch as-is (its purpose is data-selection warmth);
   the first style-paired campaign (run5) starts once SREF-1W lands.
@@ -553,7 +559,7 @@ Currently `download_convert.py` downloads each JDB tgz to disk, then reads it ba
 
 ~~**DEDUP-1: Clean the converted pool at source + retroactive pool cleaning script** — Done. See COMPLETED_BACKLOG.md.~~
 
-**DEDUP-3: clean_wds_pool self-dupe false positives on interrupted restart** (Medium — correctness)
+**DEDUP-3: clean_wds_pool self-dupe false positives on interrupted restart** — Done (2026-06-17). Structural fix landed.
 
 When `clean_wds_pool.py` is killed mid-tar (after FAISS index is written to disk but before the `.deduped` sentinel is written), the FAISS index on disk contains vectors from the partially-processed tar. On restart, that tar has no sentinel so it is reprocessed — its images search against the index and find themselves, scoring similarity ≈ 1.0 above the 0.95 threshold, causing false-positive duplicate removal.
 
@@ -576,7 +582,16 @@ Then run: `train/.venv/bin/python train/scripts/clean_wds_pool.py --tgz-range 3 
 
 Note: trim must be done AFTER the 4-49 batch completes, as the 4-49 batch uses the current index as its duplicate reference. Trimming during that run would break its dedup consistency.
 
-**Structural fix (future):** Before adding vectors for a new tar, write a `.processing` sentinel with the tar name and the current `index.ntotal`. On startup, if a `.processing` sentinel exists, truncate the index to the saved `ntotal` and remove the sentinel. This makes interrupted runs automatically safe to restart.
+**Structural fix (DONE 2026-06-17):** `clean_wds_pool.py` now writes a `.processing`
+marker (`{index.ntotal}\n{tar_name}`) before each tar's vectors are added. On startup,
+if the marker exists, the index is truncated back to the saved `ntotal` (rebuilding the
+`IndexFlatIP` over the first-N reconstructed vectors, in insertion order), the `.ids`
+sidecar is truncated to match, the interrupted tar's `.deduped` sentinel (if any) is
+removed so it is reprocessed cleanly, and the marker is deleted. The same rollback
+(`_truncate_index` / `_truncate_ids`) also runs between retry attempts and after a
+tar's final failure, so a partially-added tar never pollutes the next tar or a restart.
+Interrupted runs are now automatically safe to restart. Guarded by
+`TestCleanWdsPoolRollback` in `train/tests/test_scripts.py`.
 
 ---
 

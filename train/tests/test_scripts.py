@@ -258,3 +258,78 @@ class TestClipDedupDevice:
         assert callable(mod.cmd_build_index)
         assert callable(mod.cmd_find_dups)
         assert callable(mod.dedup_wds_tar)
+
+
+# ---------------------------------------------------------------------------
+# clean_wds_pool — DEDUP-3 interrupted-restart rollback helpers
+# ---------------------------------------------------------------------------
+
+class TestCleanWdsPoolRollback:
+    """The .processing-marker recovery rolls a partially-indexed tar back out of
+    the cumulative FAISS index + .ids sidecar so a restart does not deduplicate a
+    tar against its own vectors (false-positive self-dupes)."""
+
+    def _index(self, n: int, dim: int = 8):
+        import faiss
+        rng = np.random.default_rng(0)
+        vecs = rng.standard_normal((n, dim)).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        idx = faiss.IndexFlatIP(dim)
+        idx.add(vecs)
+        return idx, vecs
+
+    def test_truncate_index_preserves_prefix_in_order(self):
+        mod = _load_script("clean_wds_pool")
+        idx, vecs = self._index(10)
+        out = mod._truncate_index(idx, 7)
+        assert out.ntotal == 7
+        kept = out.reconstruct_n(0, 7)
+        # Insertion order of the first 7 vectors is preserved exactly.
+        np.testing.assert_allclose(kept, vecs[:7], rtol=0, atol=1e-6)
+
+    def test_truncate_index_noop_when_count_ge_total(self):
+        mod = _load_script("clean_wds_pool")
+        idx, _ = self._index(5)
+        assert mod._truncate_index(idx, 5) is idx
+        assert mod._truncate_index(idx, 9) is idx
+        assert mod._truncate_index(None, 3) is None
+
+    def test_truncate_index_to_zero_is_empty(self):
+        mod = _load_script("clean_wds_pool")
+        idx, _ = self._index(4)
+        out = mod._truncate_index(idx, 0)
+        assert out.ntotal == 0
+        assert out.d == idx.d
+
+    def test_truncate_ids_keeps_first_n_lines(self, tmp_path):
+        mod = _load_script("clean_wds_pool")
+        ids_path = tmp_path / "dedup_index.ids"
+        ids_path.write_text("".join(f"id{i}\n" for i in range(10)))
+        mod._truncate_ids(ids_path, 7)
+        lines = ids_path.read_text().splitlines()
+        assert lines == [f"id{i}" for i in range(7)]
+
+    def test_truncate_ids_noop_when_short_or_missing(self, tmp_path):
+        mod = _load_script("clean_wds_pool")
+        ids_path = tmp_path / "dedup_index.ids"
+        ids_path.write_text("a\nb\n")
+        mod._truncate_ids(ids_path, 5)
+        assert ids_path.read_text().splitlines() == ["a", "b"]
+        # Missing sidecar must not raise.
+        mod._truncate_ids(tmp_path / "absent.ids", 3)
+
+    def test_rollback_clears_self_dupe_for_restart(self):
+        """End-to-end: a tar's vectors flushed to disk by an interrupt-time flush
+        must be removed so the reprocessed tar finds no self-matches."""
+        mod = _load_script("clean_wds_pool")
+        idx, vecs = self._index(12)
+        prior_n = 8  # 4 vectors (indices 8..11) belong to the interrupted tar
+        # Before rollback: those 4 vectors self-match at score 1.0 ≥ 0.95.
+        tar_batch = vecs[prior_n:]
+        D, _ = idx.search(tar_batch, 1)
+        assert (D[:, 0] >= 0.95).all()
+        # After rollback they are gone, so a reprocess sees no self-dupes.
+        rolled = mod._truncate_index(idx, prior_n)
+        assert rolled.ntotal == prior_n
+        D2, _ = rolled.search(tar_batch, 1)
+        assert (D2[:, 0] < 0.95).all()
