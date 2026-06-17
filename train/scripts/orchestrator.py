@@ -3762,6 +3762,9 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                         if str(_old) not in _keep:
                             try:
                                 _old.unlink()
+                                # CKPT-PRUNE-1: drop the companion .json lineage
+                                # sidecar so it doesn't orphan into doctor WARNINGs.
+                                _old.with_suffix(".json").unlink(missing_ok=True)
                             except OSError:
                                 pass
                     for _old in _fw_ckpt_dir.glob("iter*_best.safetensors"):
@@ -3772,6 +3775,7 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                         if _it not in _keep_iters:
                             try:
                                 _old.unlink()
+                                _old.with_suffix(".json").unlink(missing_ok=True)
                             except OSError:
                                 pass
 

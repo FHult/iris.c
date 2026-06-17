@@ -422,7 +422,10 @@ structure and is **currently unguarded**. Do NOT start a production run without 
   coverage-gap exit prunes gapped shards from the resume state, so a rerun re-processes
   exactly the holed shards.
 
-- **TRAIN-PAD-1: training text-pad convention diverges from reference inference.** The
+- **TRAIN-PAD-1 (DEFERRED 2026-06-17): training text-pad convention diverges from reference inference.**
+  GPU measurement required before picking fix strategy (a/b/c). Precompute slices to [:sl],
+  training zero-pads, inference keeps non-zero pads — confirmed mismatch, unknown loss delta.
+  The
   trainer/precompute zero-pads text embeddings to 512 (precompute stores only real-token
   rows), but the reference (mflux) and C inference pass **masked-encoder outputs** at pad
   positions (non-zero, prompt-derived — pad queries attend to real tokens). The IP-adapter
@@ -1496,12 +1499,14 @@ that mandates the `data.bucket` pin). Guards the 4th warmup-run2 blocker; see PR
 
 Original report retained as `grok_testing_bug_report.md` (untracked) for full detail.
 
-**CKPT-PRUNE-1: per-iteration checkpoint pruning orphans .json lineage sidecars** (Low —
-cosmetic but noisy). The FLYWHEEL-CKPT-1 iter-keyed prune deletes step_*.safetensors but
-leaves the matching .json sidecars, so every flywheel iteration accrues "incomplete write?"
-doctor WARNINGs (7 after run5's first 3 iters; cleaned manually 2026-06-12). Fix: prune the
-sidecar with its checkpoint (orchestrator + save_checkpoint keep_last_n path); takes effect
-on next orchestrator restart.
+**CKPT-PRUNE-1 (DONE 2026-06-17): per-iteration checkpoint pruning orphans .json lineage sidecars** (Low —
+cosmetic but noisy). The FLYWHEEL-CKPT-1 iter-keyed prune deleted step_*.safetensors but
+left the matching .json sidecars, so every flywheel iteration accrued "incomplete write?"
+doctor WARNINGs (7 after run5's first 3 iters; cleaned manually 2026-06-12). Fixed: both
+deletion sites now drop the companion sidecar with its checkpoint — `_purge_old_checkpoints`
+(train_ip_adapter.py keep_last_n path) and the orchestrator's FLYWHEEL-CKPT-1 iter-tagged
+prune (`_run_flywheel_loop`, both the `iter*_step_*` and `iter*_best` globs). Takes effect on
+next orchestrator restart. Guard: `train/tests/test_checkpoint_prune.py`.
 
 **SRC-ATTR-1: per-source data-selection attribution — read-out + autonomous surfacing (DONE 2026-06-13).**
 `ShardScoreDB.source_attribution(flywheel_name)` + `source_iteration_mix` (shard_selector.py,
