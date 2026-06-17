@@ -1518,6 +1518,16 @@ deletion sites now drop the companion sidecar with its checkpoint — `_purge_ol
 prune (`_run_flywheel_loop`, both the `iter*_step_*` and `iter*_best` globs). Takes effect on
 next orchestrator restart. Guard: `train/tests/test_checkpoint_prune.py`.
 
+**COLD-CHAMPION-PRUNE-1 (DONE 2026-06-17): cold champion archive accumulated unbounded** (Low —
+silent disk creep). `_archive_flywheel_champion` copies the champion into
+`cold_root/weights/flywheel-{name}-{YYYYMMDD}/` (~2-4 GB). Same-day improvements overwrite the
+date-keyed dir, but across days these dirs were never pruned — one per campaign-day a champion
+improved, so a long campaign accrued unbounded cold dirs. Fixed: after a successful archive the
+function globs `flywheel-{name}-*`, sorts by name (YYYYMMDD sorts chronologically), and
+`shutil.rmtree`s all but the newest `keep_cold_champions` (new config key, default 5; set in
+`flywheel_source_probe.yaml`). Other flywheel names are untouched. Guard:
+`train/tests/test_cold_champion_prune.py`.
+
 **SRC-ATTR-1: per-source data-selection attribution — read-out + autonomous surfacing (DONE 2026-06-13).**
 `ShardScoreDB.source_attribution(flywheel_name)` + `source_iteration_mix` (shard_selector.py,
 single source of truth, 5 tests), `debug/source_attribution.py` CLI, and a `source_attribution`

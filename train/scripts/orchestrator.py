@@ -2565,6 +2565,24 @@ def _archive_flywheel_champion(name: str, fw_db, fw_cfg: dict) -> Optional[str]:
         log_orch(f"[flywheel:{name}] archived champion (iter {iteration}, "
                  f"cond_gap={best.get('cond_gap')}) → {cold_dir}"
                  + ("" if ema_src is not None else "  [no EMA sibling found]"))
+
+        # COLD-CHAMPION-PRUNE-1: same-day champions overwrite the date-keyed dir, but
+        # across days the flywheel-{name}-{YYYYMMDD} dirs (~2-4 GB each) accumulate
+        # unbounded over a long campaign. Keep only the newest `keep_cold_champions`.
+        # YYYYMMDD names sort chronologically, so a lexical sort is a date sort.
+        keep_cold = int(fw_cfg.get("keep_cold_champions", 5))
+        if keep_cold > 0:
+            existing = sorted(
+                d for d in (cold_root / "weights").glob(f"flywheel-{name}-*")
+                if d.is_dir()
+            )
+            for _old in existing[:-keep_cold]:
+                try:
+                    shutil.rmtree(_old)
+                    log_orch(f"[flywheel:{name}] pruned old cold champion → {_old}")
+                except OSError as _e:
+                    log_orch(f"[flywheel:{name}] could not prune cold champion "
+                             f"{_old}: {_e}", level="warning")
         return str(cold_dir)
     except Exception as e:
         log_orch(f"[flywheel:{name}] champion archive failed: {e}", level="warning")

@@ -24,6 +24,7 @@ flywheel:
   n_shards: 40
   poll_interval: 60
   min_free_gb: 40
+  keep_cold_champions: 5        # retain newest N cold champion dirs (flywheel-{name}-{date}); prune older
 
   from_scratch_each_iter: true  # each iter independent — the contrast is across iters
   base_checkpoint: null
