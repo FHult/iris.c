@@ -1255,19 +1255,8 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    function blobToDataURL(blob) {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(reader.result);
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-    }
-
-    async function fetchImageAsBase64(url) {
-        const resp = await fetch(url.split('?')[0]);
-        return blobToDataURL(await resp.blob());
-    }
+    // blobToDataURL() and fetchImageAsBase64() now live in /static/util.js
+    // (loaded before app.js) so they can be shared across frontend modules.
 
     async function addToQueue(params) {
         // Submit to server immediately — it will queue the job if busy
