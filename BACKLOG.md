@@ -146,6 +146,26 @@ This layout is the target state. Current hot-storage paths under `/Volumes/2TBSS
 Current: M1 Max, 32 GB unified memory, 2 TB hot + 16 TB cold.
 Future: M5 Max Mac Studio (projected ~128–192 GB unified memory, dramatically higher compute). The dual-flywheel architecture, cold storage layout, and versioned precompute design are all intended to scale without structural changes — only config and scale parameters change. The accumulated knowledge base (shard scores, ablation history, weight archive) carries forward directly to any new hardware.
 
+- **HW-M5-1: precompute model-load + per-iteration reload cost (defer to M5 Max 128 GB).**
+  Observation (M1 Max, 2026-06): during the flywheel precompute's MODEL-LOAD phase the 2
+  efficiency cores saturate while the 8 performance cores sit idle. Two causes with
+  opposite fixability: (a) weight loading (~10 GB Qwen3+VAE+SigLIP) is I/O-bound → E-cores
+  issue reads, P-cores idle, NOT CPU-limited → core choice irrelevant; (b) MLX/MPSGraph
+  kernel COMPILE is CPU-bound and may run at a low QoS (E-cores) → a `taskpolicy -c
+  userinitiated` launch *might* speed it (uncertain — MLX threads may self-tag; needs an
+  A/B). The flywheel precompute is NOT throttled by us (plain `caffeinate`; the
+  `nice -n 10 taskpolicy -d throttle` wrap is chunk-pipeline only). Payoff on M1 is small:
+  load is partly masked (pass-1 pipelines during staging) and is a minor fraction of the
+  ~2.87h iteration.
+  **The real lever, unblocked by 128 GB:** the flywheel relaunches a FRESH precompute
+  process every iteration → reloads ~10 GB of models + recompiles kernels 30× per campaign.
+  Today precompute and training are SPLIT into separate processes precisely to fit the
+  32 GB budget (precompute ~10 GB encoders + training ~20 GB Flux/adapter would blow it).
+  With 128 GB they can COEXIST → a persistent precompute server keeps encoders warm across
+  iterations, eliminating per-iteration load+compile entirely (far more than the E/P-core
+  tweak). Revisit the whole item on M5 Max; the QoS A/B is only worth it if a persistent
+  server isn't adopted.
+
 ---
 
 ## SREF Objective — Style-Reference Model (Midjourney --sref for the app)
