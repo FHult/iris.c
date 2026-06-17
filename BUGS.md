@@ -134,6 +134,26 @@
     /Volumes/2TBSSD/sref_sweep/bundle_iter0024 --ip-features
     /Volumes/2TBSSD/sref_sweep/refs/000181_0002.bin --ip-scale 1.2 --seed 42 --steps 4
     -W 512 -H 512 -o /tmp/grid.png`.
+  - **ROOT CAUSE + FIX (2026-06-17):** the PerceiverResampler cross-attention in
+    `iris_ip_adapter_perceive` hardcoded its head count as `hidden_dim/128` (the Flux
+    block invariant → 24 heads of 128 for a 3072-dim adapter). The perceiver was
+    actually trained with its OWN head count `perceiver_heads` (16 for iter0024 →
+    head_dim 192), which is independent of the Flux block grouping. The wrong grouping
+    mis-pairs Q/K features AND applies the wrong softmax scale (1/√128 vs 1/√192),
+    collapsing the perceiver attention toward near-uniform → `ip_embeds` becomes an
+    almost per-token-constant (pooled) vector → `k_ip`/`v_ip` carry the reference's
+    pooled colour with no spatial variation → every image token receives ~the same
+    injected contribution → after unpatchify, a regular grid of identical patch-dots
+    growing with scale. The `inject` cross-attention (image-Q × k_ip/v_ip) correctly
+    uses the Flux block grouping `hidden/128` and was never wrong. Fix: parse
+    `perceiver_heads` from `adapter_meta.json` into `iris_ip_adapter_t` and use it
+    (head_dim = hidden/perceiver_heads) in `perceive`; legacy bundles missing the key
+    fall back to `hidden/128`. **Why G-1 Phase 2's parity test missed it:** the synthetic
+    fixture set `perceiver_heads == HID/128` (2), so the buggy and correct groupings
+    coincided. Hardened: `debug/gen_ip_adapter_fixture.py` now uses `PERCEIVER_HEADS=4`
+    (≠ HID/128) and `debug/test_ip_adapter.c` asserts the parsed value + checks perceive
+    at a tight (1e-3) tolerance, which the old grouping fails. (Visual GPU confirmation
+    still pending, but the parity path is now correct end-to-end.)
 
 - **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
   (2026-06-10, observed during TRAIN-7 memory probes).**

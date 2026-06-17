@@ -131,6 +131,12 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     a->hidden_dim        = cfg_int(meta, "hidden_dim", 0);
     a->num_image_tokens  = cfg_int(meta, "num_image_tokens", 0);
     a->siglip_dim        = cfg_int(meta, "siglip_dim", 0);
+    /* PerceiverResampler head count is INDEPENDENT of the Flux block head count.
+     * The perceiver was trained with perceiver_heads (e.g. 16) and head_dim =
+     * hidden_dim/perceiver_heads (e.g. 192), NOT the Flux invariant head_dim 128.
+     * Fall back to hidden_dim/128 only for legacy bundles that predate this key
+     * (where the trained perceiver happened to use that grouping). */
+    a->perceiver_heads   = cfg_int(meta, "perceiver_heads", 0);
     a->style_only        = cfg_bool(meta, "style_only", 0);
     if (cfg_find_value(meta, "quant")) {
         const char *q = cfg_find_value(meta, "quant");
@@ -139,6 +145,8 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
         char *e = strchr(a->quant, '"'); if (e) *e = '\0';
     }
     if (a->hidden_dim <= 0 || a->num_blocks <= 0) { free(a); return NULL; }
+    if (a->perceiver_heads <= 0 || a->hidden_dim % a->perceiver_heads != 0)
+        a->perceiver_heads = a->hidden_dim / 128;   /* legacy fallback */
 
     /* weights (dequantised to f32) */
     snprintf(path, sizeof(path), "%s/adapter_weights.safetensors", bundle_dir);
@@ -185,7 +193,13 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
                              const float *siglip, int n_siglip,
                              float *ip_embeds) {
     int H = a->hidden_dim, S = a->siglip_dim;
-    int T = a->num_image_tokens, hd = 128, heads = H / hd;
+    /* PerceiverResampler MHA: head count is perceiver_heads, head_dim = H/heads.
+     * This is NOT the Flux block head_dim (128) — the perceiver was trained with
+     * its own grouping (e.g. 16 heads of 192 for a 3072-dim adapter). Using the
+     * wrong head_dim here mis-groups Q/K/V and applies the wrong softmax scale,
+     * collapsing ip_embeds toward a per-token-constant (pooled) vector — the
+     * root cause of the patch-periodic grid in C inference (IP-ADAPTER-INFER-1). */
+    int T = a->num_image_tokens, heads = a->perceiver_heads, hd = H / heads;
 
     float *Q = malloc((size_t)T * H * sizeof(float));
     float *K = malloc((size_t)n_siglip * H * sizeof(float));

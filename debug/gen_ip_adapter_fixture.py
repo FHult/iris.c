@@ -34,12 +34,16 @@ mx.set_default_device(mx.cpu)                      # no GPU contention with the 
 from mlx.utils import tree_flatten, tree_unflatten
 from ip_adapter.model import IPAdapterKlein
 
-# Small-but-real dims (head_dim stays 128 — the inference invariant). Tiny fixtures.
-HIDDEN, HEADS = 256, 2                              # head_dim = 128 (inference invariant), 2 heads
+# Small-but-real dims (Flux block head_dim stays 128 — the inference invariant).
+# PERCEIVER_HEADS is deliberately != HIDDEN/128 so the goldens exercise the real
+# perceiver grouping (head_dim = HIDDEN/PERCEIVER_HEADS), not the Flux block's 128.
+# A fixture with PERCEIVER_HEADS == HIDDEN/128 would mask IP-ADAPTER-INFER-1.
+HIDDEN, HEADS = 256, 2                              # Flux block: head_dim = 128, 2 heads
+PERCEIVER_HEADS = 4                                 # != HIDDEN/128 (=2); perceiver head_dim = 64
 N_BLOCKS, N_DOUBLE = 5, 1                           # export sets num_double = num_blocks//5 = 1; small bundle
 N_TOKENS, SIGLIP_DIM, SIGLIP_SEQ = 8, 64, 16
 IMG_SEQ = 12
-HEAD_DIM = HIDDEN // HEADS                          # = 128
+HEAD_DIM = HIDDEN // HEADS                          # = 128 (Flux block / inject path)
 
 # export key -> training param key (inverse of export_adapter._KEY_MAP)
 _INV = {
@@ -64,7 +68,7 @@ def _export(ckpt, bundle_dir, quant):
     rc = subprocess.run(
         [sys.executable, str(ROOT / "train" / "export" / "export_adapter.py"),
          "--checkpoint", str(ckpt), "--output", str(bundle_dir), "--quant", quant,
-         "--perceiver-heads", str(HEADS)], cwd=str(ROOT)).returncode
+         "--perceiver-heads", str(PERCEIVER_HEADS)], cwd=str(ROOT)).returncode
     if rc != 0:
         raise SystemExit(f"export_adapter ({quant}) failed")
 
@@ -113,7 +117,7 @@ def main() -> int:
     mx.random.seed(1234)
     model = IPAdapterKlein(num_blocks=N_BLOCKS, hidden_dim=HIDDEN,
                            num_image_tokens=N_TOKENS, siglip_dim=SIGLIP_DIM,
-                           perceiver_heads=HEADS, num_double_blocks=N_DOUBLE)
+                           perceiver_heads=PERCEIVER_HEADS, num_double_blocks=N_DOUBLE)
     mx.eval(model.parameters())
 
     # Shared inputs (same for every quant mode so the C test reuses them).
@@ -139,9 +143,10 @@ def main() -> int:
 
     shapes = {
         "hidden": HIDDEN, "heads": HEADS, "head_dim": HEAD_DIM,
+        "perceiver_heads": PERCEIVER_HEADS,
         "num_blocks": N_BLOCKS, "num_double_blocks": N_DOUBLE,
         "num_image_tokens": N_TOKENS, "siglip_dim": SIGLIP_DIM, "siglip_seq": SIGLIP_SEQ,
-        "img_seq": IMG_SEQ, "block": blk,
+        "img_seq": IMG_SEQ, "block": 0,
         "in_siglip": [1, SIGLIP_SEQ, SIGLIP_DIM],
         "gold_ip_embeds": [1, N_TOKENS, HIDDEN],
         "gold_k_ip_b0": [1, N_TOKENS, HIDDEN], "gold_v_ip_b0": [1, N_TOKENS, HIDDEN],
@@ -149,7 +154,6 @@ def main() -> int:
     }
     (out / "shapes.json").write_text(json.dumps(shapes, indent=2))
     print(f"wrote fixtures + bundle to {out}")
-    print(f"  ip_embeds std={float(ip_embeds.std()):.4f}  contrib std={float(contrib.std()):.4f}")
     return 0
 
 

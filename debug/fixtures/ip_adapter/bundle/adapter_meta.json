@@ -11,12 +11,12 @@
   "num_heads": 0,
   "num_image_tokens": 8,
   "siglip_dim": 64,
-  "perceiver_heads": 2,
+  "perceiver_heads": 4,
   "style_only": false,
   "quant": "float16",
   "training_step": 1,
   "source_checkpoint": "step_0000001.safetensors",
-  "export_time": "2026-06-07T18:55:00Z",
+  "export_time": "2026-06-17T18:04:28Z",
   "tensors": {
     "perceiver.query_tokens": {
       "shape": [

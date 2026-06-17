@@ -23,6 +23,10 @@
 #define SIG_SEQ 16
 #define IMG_SEQ 12
 #define BLK 0
+/* PerceiverResampler head count (debug/gen_ip_adapter_fixture.py PERCEIVER_HEADS).
+ * Deliberately != HID/128 (=2): the perceiver head_dim is HID/PHEADS, NOT the Flux
+ * block's 128. A bundle where these coincide masks IP-ADAPTER-INFER-1. */
+#define PHEADS 4
 #define FIX "debug/fixtures/ip_adapter"
 
 static int failures = 0, passes = 0;
@@ -37,7 +41,8 @@ static float *load_bin(const char *path, long n) {
     return p;
 }
 
-static void compare(const char *name, const float *got, const float *gold, long n) {
+static void compare_tol(const char *name, const float *got, const float *gold, long n,
+                        double max_tol) {
     double dot = 0, na = 0, nb = 0, maxabs = 0;
     for (long i = 0; i < n; i++) {
         double a = got[i], b = gold[i], d = fabs(a - b);
@@ -45,9 +50,13 @@ static void compare(const char *name, const float *got, const float *gold, long 
         dot += a * b; na += a * a; nb += b * b;
     }
     double corr = (na > 0 && nb > 0) ? dot / (sqrt(na) * sqrt(nb)) : 0.0;
-    int ok = (corr > 0.999 && maxabs < 0.05);
+    int ok = (corr > 0.999 && maxabs < max_tol);
     printf("%-10s corr=%.6f max_abs=%.5f  %s\n", name, corr, maxabs, ok ? "PASS" : "FAIL");
     if (ok) passes++; else failures++;
+}
+
+static void compare(const char *name, const float *got, const float *gold, long n) {
+    compare_tol(name, got, gold, n, 0.05);
 }
 
 /* Goldens carry a quant suffix ("" for f16, "_int8" for int8); inputs are shared. */
@@ -58,8 +67,10 @@ static void run_bundle(const char *bundle, const char *suffix, const char *label
     iris_ip_adapter_t *a = iris_ip_adapter_load(bundle);
     if (!a) { fprintf(stderr, "FAIL load %s\n", bundle); failures++; return; }
     int meta_ok = (a->hidden_dim == HID && a->num_image_tokens == TOK &&
-                   a->siglip_dim == SIG_DIM && a->num_blocks == 5);
-    printf("meta dims  quant=%-8s %s\n", a->quant, meta_ok ? "PASS" : "FAIL");
+                   a->siglip_dim == SIG_DIM && a->num_blocks == 5 &&
+                   a->perceiver_heads == PHEADS);
+    printf("meta dims  quant=%-8s pheads=%d %s\n", a->quant, a->perceiver_heads,
+           meta_ok ? "PASS" : "FAIL");
     meta_ok ? passes++ : failures++;
 
     #define GLD(name) (snprintf(p, sizeof(p), FIX "/%s%s.bin", name, suffix), p)
@@ -72,7 +83,10 @@ static void run_bundle(const char *bundle, const char *suffix, const char *label
 
     float *embeds = malloc((long)TOK * HID * sizeof(float));
     iris_ip_adapter_perceive(a, siglip, SIG_SEQ, embeds);
-    compare("perceive", embeds, g_embeds, (long)TOK * HID);
+    /* Tight tolerance: the perceiver head grouping (PHEADS, head_dim=HID/PHEADS)
+     * must match exactly. The buggy HID/128 grouping diverges here (and only here);
+     * a loose tolerance would let it pass — that is IP-ADAPTER-INFER-1. */
+    compare_tol("perceive", embeds, g_embeds, (long)TOK * HID, 1e-3);
 
     float *k = malloc((long)TOK * HID * sizeof(float));
     float *v = malloc((long)TOK * HID * sizeof(float));

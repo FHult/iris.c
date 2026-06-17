@@ -55,6 +55,8 @@ typedef struct {
     int hidden_dim;           /* Flux transformer hidden dim (3072 for 4B)      */
     int num_image_tokens;     /* PerceiverResampler output tokens (Q)           */
     int siglip_dim;           /* SigLIP feature dim (1152 for SigLIP-400M)      */
+    int perceiver_heads;      /* PerceiverResampler MHA head count (NOT hidden  */
+                              /* /128 — perceiver head_dim = hidden/this)       */
     int style_only;           /* 1 = double-stream ip_scale zeroed at export    */
 
     /* Quantisation mode: "bfloat16" | "float16" | "int8" */
