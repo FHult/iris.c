@@ -68,7 +68,7 @@ NESTED_KNOWN = {
         "resume_from_champion", "shard_manifest", "shard_selection",
         "shards_dir", "source_holdout", "steps_per_iteration", "storage",
         "style_cold_dir", "style_pairing", "temporal_decay", "training_config",
-        "ephemeral_scores",
+        "ephemeral_scores", "stall_restart_secs", "max_stall_restarts",
     },
 }
 
