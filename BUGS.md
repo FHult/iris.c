@@ -194,6 +194,52 @@
     the online-encode path. Don't conflate the two: an `eval_impl` busy-spin is how the
     MLX main thread waits on any long eval; it is not by itself evidence of a hang.
 
+- **MLX-2: non-deterministic trainer wedge in `mlx::core::eval` — likely an allocator
+  reclaim livelock from the MLX memory-limit sitting BELOW the working set (2026-06-18).**
+  - **Signature:** during a from-scratch flywheel iteration (cached path, 512px) the
+    trainer froze at ~step 10 — process alive at ~1.2 cores, tmux window open, ZERO step
+    progress for 40 min. `sample` of the main thread: stuck in `mlx::core::eval_impl`,
+    the majority of samples in `std::mutex::lock`/`pthread_mutex_lock` plus
+    `get_memory_limit` / `get_active_memory` / `metal::allocator` — i.e. **lock-bound on
+    the allocator, not compute-bound on kernels.** No memory pressure (61% free), no
+    external GPU contention.
+  - **NOT the dequant fix, NOT numerical instability:** an identical-config diagnostic
+    run (log_every=1) completed all steps cleanly — early steps finite (volatile
+    from-scratch loss spikes to 291 but recover; grad-clip fires; converges), no NaN/Inf,
+    EXIT_CODE=0. Same regime, ran fine ⇒ the wedge is non-deterministic. The prior 48
+    flywheel iterations (run5/source-probe/iter24-replay, the last ~2 h earlier) all
+    completed at ~7–9 s/step, so it is genuinely intermittent, not a constant slowdown.
+  - **Distinguished from PROXY-1 / the MLX-1 scope-correction caveat:** an `eval_impl`
+    spin alone is NOT proof of a hang — it is also how MLX waits on a long graph (PROXY-1
+    was a real 75 s/step graph misread as a hang). The differentiator here is the profile
+    is **lock/allocator-bound, not kernel-bound**, AND the same graph runs in ~1–9 s in
+    the diag. That is consistent with contention, not honest compute. (Residual
+    uncertainty remains until an all-threads dump confirms it — see capture below.)
+  - **Leading (avoidable) hypothesis — memory limit below working set:** the trainer caps
+    MLX at `training.mlx_memory_pct` (default 0.44 → **14 GB** on 32 GB) with
+    `set_cache_limit` ≈ 2 GB, but the measured 512px backward **working set is 20.44 GB**
+    (TRAIN-7). MLX runs ~6 GB *above* its own soft limit on every heavy step, forcing
+    continuous cache reclaim with little buffer cache to reuse → exactly the
+    allocator-mutex churn the sample shows. Usually just overhead; occasionally the
+    reclaim path + Metal stream thread livelock. **Lever to test:** raise
+    `training.mlx_memory_pct` to ~0.66–0.70 (≈ 21–22 GB, above the 20.4 GB working set,
+    below the ~jetsam threshold) and/or raise the cache limit — now SAFE to try because
+    the stall-recovery turns a residual jetsam into a clean restart. Tradeoff (why it was
+    capped low): without the cap, jetsam kills the process during `mx.compile`'s
+    first-backward transient peaks. Alternatives if memory isn't it: MLX 0.31.2 →
+    upstream version bump; the trainer also pre-compiles graphs for ALL aspect buckets at
+    startup though `data.bucket` is pinned to [512,512] — a reducible compile surface.
+  - **Mitigation IN PLACE (commit pending):** the flywheel monitor had NO trainer-stale
+    detection (orchestrator.py — only polled the control file + tmux-window-open), so a
+    wedge hung the iteration forever. Added: stale-trainer-heartbeat (>`stall_restart_secs`,
+    default 2× HEARTBEAT_STALE_SECS = 1800 s) ⇒ `_capture_stall_diagnostics()` (all-threads
+    `sample` of every train_ip_adapter.py PID + trainer log tail → `logs/stall_<name>_iter
+    <N>_*.txt`) then kill + re-run the iteration, bounded by `max_stall_restarts` (default
+    2) then record failed + dispatch an alert. **The capture is the root-cause path:** the
+    all-threads dump on the NEXT wedge settles allocator-livelock (main thread in
+    eval_impl+allocator) vs a GPU command-buffer hang (a Metal stream/driver thread in
+    `waitUntilCompleted`). Until then the memory-limit hypothesis is leading but unproven.
+
 - **PROXY-1: decoded-MSE loss term costs ~75 s/step, not the documented ~20 ms (2026-06-10).**
   - `vae_proxy_512px.yaml` shipped with `decoded_mse_weight: 0.10` and the comment "adds
     perceptual signal; ~20ms overhead/batch" — that figure costed the decoder FORWARD only.

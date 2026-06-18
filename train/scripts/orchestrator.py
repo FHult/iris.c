@@ -2658,6 +2658,41 @@ def _kill_flywheel_gpu(name: str) -> None:
                     "precompute process tree", name)
 
 
+def _capture_stall_diagnostics(name: str, iteration: int, log_file: Path) -> None:
+    """Forensic capture of a wedged trainer BEFORE killing it, so the root cause of the
+    non-deterministic MLX eval hang (BUGS.md MLX-2) accumulates instead of being lost.
+
+    Writes an all-threads `sample` of every train_ip_adapter.py process — which thread
+    holds the contended mutex distinguishes the hypotheses: main thread stuck in
+    mlx::core::eval_impl + the Metal allocator => the memory-limit-below-working-set
+    reclaim livelock (avoidable: raise training.mlx_memory_pct); a Metal stream/driver
+    thread blocked in waitUntilCompleted => a GPU command-buffer hang (an MLX/Metal bug
+    to report upstream). Saved to logs/stall_<name>_iter<N>_<epoch>.txt with the trainer
+    log tail for the last step before the freeze."""
+    try:
+        out = LOG_DIR / f"stall_{name}_iter{iteration:04d}_{int(time.time())}.txt"
+        pids = subprocess.run(["pgrep", "-f", r"train_ip_adapter\.py"],
+                              capture_output=True, text=True).stdout.split()
+        with open(out, "w") as f:
+            f.write(f"# stall diagnostics: flywheel={name} iter={iteration} "
+                    f"ts={now_iso()} trainer_pids={pids}\n\n")
+            for pid in pids:
+                f.write(f"===== sample (all threads) pid {pid} =====\n")
+                try:
+                    s = subprocess.run(["sample", pid, "5", "-allThreads"],
+                                       capture_output=True, text=True, timeout=30)
+                    f.write((s.stdout or s.stderr or "(no output)") + "\n")
+                except Exception as _e:
+                    f.write(f"(sample failed: {_e})\n")
+            if log_file.exists():
+                f.write("\n===== trainer log tail (last step before freeze) =====\n")
+                f.write("\n".join(log_file.read_text(errors="replace").splitlines()[-60:]))
+        log_orch(f"[flywheel:{name}] iter {iteration}: stall diagnostics → {out.name}")
+    except Exception as _e:
+        log_orch(f"[flywheel:{name}] iter {iteration}: stall diagnostics capture failed: {_e}",
+                 level="warning")
+
+
 def _interruptible_proc_wait(proc, name: str, fw_db: Optional[object] = None,
                              poll: int = 10) -> None:
     """Wait for a precompute subprocess while honoring pause/stop signals (so a
@@ -3104,6 +3139,18 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
         # Allows one targeted hyperparameter search before the campaign pauses,
         # so the operator resumes with fresh tuning rather than stale config defaults.
         plateau_ablation_runs    = int(fw_cfg.get("plateau_ablation_runs",  0))
+
+        # Stall recovery: the trainer can wedge in a non-deterministic MLX evaluator
+        # hang (libmlx scheduler/allocator mutex livelock — BUGS.md MLX-2) — process
+        # alive, tmux window open, ZERO step progress. The flywheel monitor (unlike the
+        # chunk pipeline) had no stale-restart, so one hang stalled the iteration forever.
+        # A stale trainer heartbeat past _stall_restart_secs ⇒ kill + re-run the iteration,
+        # bounded by _max_stall_restarts per iteration (then record failed + move on).
+        # Threshold defaults generous (2× HEARTBEAT_STALE_SECS) so a merely-slow step rate
+        # never false-positives — a real wedge sits stale indefinitely.
+        _stall_restart_secs = int(fw_cfg.get("stall_restart_secs", 2 * HEARTBEAT_STALE_SECS))
+        _max_stall_restarts = int(fw_cfg.get("max_stall_restarts", 2))
+        _stall_restarts: dict[int, int] = {}
 
         while iteration <= max_iters:
             _restart = False
@@ -3556,18 +3603,62 @@ def _run_flywheel_loop(fw_cfg: dict, fw_cfg_path: Optional[str] = None) -> None:
                     f"source '{TRAIN_DIR}/.venv/bin/activate' && {train_cmd}"
                 )
                 tmux_new_window(TMUX_TRAIN_WIN, activated, log_file)
+                # Reset the trainer heartbeat to now so stall detection doesn't flag a
+                # stale heartbeat left by the previous iteration's trainer before this
+                # one has booted (model load is several minutes). Mirrors the chunk
+                # pipeline's _start_training reset.
+                write_heartbeat("trainer", status="booting", step=0)
                 write_heartbeat("flywheel", status="training",
                                 flywheel_name=name, iteration=iteration)
                 log_orch(f"[flywheel:{name}] iter {iteration}: training started (using precomputed caches) → {log_file.name}")
                 t_start = time.time()
 
-                # Monitor training window
+                # Monitor training window. Besides honouring pause/stop, watch the
+                # trainer's own heartbeat: a wedged trainer (MLX eval hang) keeps the
+                # window open while making no progress, so window-open alone never breaks.
                 while True:
                     time.sleep(poll_interval)
                     _check_flywheel_control(name, fw_db)
                     write_heartbeat("flywheel", status="training",
                                     flywheel_name=name, iteration=iteration)
                     if not tmux_window_exists(TMUX_TRAIN_WIN):
+                        break
+                    # ── trainer stall detection ───────────────────────────────────
+                    _hb_age = heartbeat_age_secs("trainer")
+                    if _hb_age is not None and _hb_age > _stall_restart_secs:
+                        _n = _stall_restarts.get(iteration, 0)
+                        if _n < _max_stall_restarts:
+                            _stall_restarts[iteration] = _n + 1
+                            log_orch(
+                                f"[flywheel:{name}] iter {iteration}: trainer heartbeat "
+                                f"stale {_hb_age:.0f}s > {_stall_restart_secs}s — wedged "
+                                f"(likely MLX eval hang); capturing diagnostics, then "
+                                f"killing + re-running iteration "
+                                f"(attempt {_n + 1}/{_max_stall_restarts})",
+                                level="warning")
+                            _capture_stall_diagnostics(name, iteration, log_file)
+                            _kill_flywheel_gpu(name)
+                            raise _RestartIteration()
+                        # Retries exhausted: a persistent wedge won't self-heal. Kill it,
+                        # alert the operator, and fall through so the iteration records as
+                        # failed (no EXIT_CODE=0) and the campaign moves on rather than
+                        # looping forever on the same bad iteration.
+                        log_orch(
+                            f"[flywheel:{name}] iter {iteration}: trainer wedged again after "
+                            f"{_max_stall_restarts} restarts — giving up on this iteration",
+                            level="error")
+                        dispatch_issue(
+                            f"flywheel_stall_{name}_{iteration}", "error",
+                            f"Flywheel '{name}' iter {iteration} trainer wedged "
+                            f"(stale heartbeat {_hb_age:.0f}s) through {_max_stall_restarts} "
+                            f"restarts — likely a non-deterministic MLX eval hang.",
+                            process="flywheel",
+                            suggested_action="Read the stall_<name>_iter<N>_*.txt sample in "
+                            "logs/ (which thread holds the mutex tells allocator-livelock "
+                            "vs GPU command-buffer hang); re-launch the campaign (it resumes "
+                            "after the last recorded iteration).")
+                        _capture_stall_diagnostics(name, iteration, log_file)
+                        _kill_flywheel_gpu(name)
                         break
 
                 # Post-training publish: use PrecomputeCache + encoder_config_subset + version_hash
