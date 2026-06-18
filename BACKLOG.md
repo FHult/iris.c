@@ -1672,6 +1672,25 @@ whole-pool excluded-scoring then gives that source the clean excluded baseline
 (24 iters, 4 sources × 6 rotations); read with `debug/source_attribution.py --campaign source-probe`.
 This informs `per_source_min` / the production data recipe (DP-5) with evidence, not a prior.
 
+**SRC-ATTR-2: source-holdout result needs a CORRECTED confidence model + dominant-source
+fix (from the 2026-06-18 source-probe, 18 iters).** The holdout ran and produced PARTIAL,
+heavily-caveated results — DO NOT act on them as-is:
+- **Statistical artifact (the trust gate is FOOLED):** source-level holdout excludes ALL of
+  a source's shards in the SAME iterations, so every shard of that source gets an IDENTICAL
+  per-shard attributed_cond_gap (std reported as ±0.0000). So `n_attributed=12` is really ~12
+  copies of ONE source-level measurement; effective n = number of ROTATIONS (~4-5 over 18
+  iters), not 12. The `★ separable` flag (≥5 attributed shards) overstates confidence. FIX:
+  `source_attribution()` should compute effective-n from distinct holdout iterations (or do
+  the contrast at SOURCE level directly), and gate trust on that, not shard count.
+- **Dominant source unanswerable per-shard:** `journeydb` (744 shards, 58% of pool — the key
+  question) never separated because its shards are spread too thin to each reach ≥3 incl &
+  ≥3 excl. Per-shard rollup structurally can't attribute big sources; need source-level
+  contrast or far more rotations.
+- **Validity-gated (SREF-METRIC-1):** results are cond_gap (conditioning), not style. The raw
+  verdict (journeydb+wikiart +0.0054 helps, coyo+laion+wikiart −0.0138 hurts) is NOT a recipe
+  signal — "hurts cond_gap" may mean "harder to condition on" = possibly better for style.
+  Re-run / re-interpret only AFTER IP-ADAPTER-INFER-1 + a valid sweep settle the validity gate.
+
 **SMOKE-ISOLATION (DONE 2026-06-13): smoke/test campaigns must not write the production shard_scores.db.**
 Smoke runs score ALL 1280 shards per iteration (excluded-EMA), so the EMA-lag smoke's cond_gap -5.066
 contaminated every shard's excluded mean in the cross-campaign KB, corrupting run5's selection
