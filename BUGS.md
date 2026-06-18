@@ -134,26 +134,39 @@
     /Volumes/2TBSSD/sref_sweep/bundle_iter0024 --ip-features
     /Volumes/2TBSSD/sref_sweep/refs/000181_0002.bin --ip-scale 1.2 --seed 42 --steps 4
     -W 512 -H 512 -o /tmp/grid.png`.
-  - **ROOT CAUSE + FIX (2026-06-17):** the PerceiverResampler cross-attention in
-    `iris_ip_adapter_perceive` hardcoded its head count as `hidden_dim/128` (the Flux
-    block invariant → 24 heads of 128 for a 3072-dim adapter). The perceiver was
-    actually trained with its OWN head count `perceiver_heads` (16 for iter0024 →
-    head_dim 192), which is independent of the Flux block grouping. The wrong grouping
-    mis-pairs Q/K features AND applies the wrong softmax scale (1/√128 vs 1/√192),
-    collapsing the perceiver attention toward near-uniform → `ip_embeds` becomes an
-    almost per-token-constant (pooled) vector → `k_ip`/`v_ip` carry the reference's
-    pooled colour with no spatial variation → every image token receives ~the same
-    injected contribution → after unpatchify, a regular grid of identical patch-dots
-    growing with scale. The `inject` cross-attention (image-Q × k_ip/v_ip) correctly
-    uses the Flux block grouping `hidden/128` and was never wrong. Fix: parse
-    `perceiver_heads` from `adapter_meta.json` into `iris_ip_adapter_t` and use it
-    (head_dim = hidden/perceiver_heads) in `perceive`; legacy bundles missing the key
-    fall back to `hidden/128`. **Why G-1 Phase 2's parity test missed it:** the synthetic
-    fixture set `perceiver_heads == HID/128` (2), so the buggy and correct groupings
-    coincided. Hardened: `debug/gen_ip_adapter_fixture.py` now uses `PERCEIVER_HEADS=4`
-    (≠ HID/128) and `debug/test_ip_adapter.c` asserts the parsed value + checks perceive
-    at a tight (1e-3) tolerance, which the old grouping fails. (Visual GPU confirmation
-    still pending, but the parity path is now correct end-to-end.)
+  - **FALSE LEAD (2026-06-17), superseded:** the `perceiver_heads` grouping in
+    `iris_ip_adapter_perceive` (hardcoded `hidden/128` vs the trained `perceiver_heads`)
+    was *hypothesised* to be the root cause and was fixed. It is a legitimate
+    correctness improvement (kept), but it is NOT what caused the grid: the 2026-06-18
+    visual confirmation still produced a clean grid at scale 1.2, and the Python/MLX
+    perceiver collapses IDENTICALLY at both 16 and 24 heads (`ip_embeds` cross-token
+    ratio 0.0068 vs 0.0062). The parity fixture passed because it only exercised
+    synthetic math, never the real feature distribution.
+  - **TRUE ROOT CAUSE + FIX (2026-06-18):** a 4-bit nibble DEQUANTISATION SIGN BUG in
+    the training cache loaders, NOT a C inference bug. `precompute_all._quantize_4bit`
+    stores TWO'S-COMPLEMENT signed nibbles (`clip(round(x/scale), -8, 7)` then
+    `(q & 0x0F) | ((q & 0x0F) << 4)`), but `ip_adapter.dataset._load_siglip_embed` and
+    `_load_qwen3_embed` unpacked with a plain `& 0x0F` and NO sign-extension — so every
+    negative quantised value `[-8,-1]` was read back as a large positive `[8,15]`. The
+    round-trip of real signed SigLIP features through the production pack→unpack gives
+    range `[0, 171]` (all non-negative) and **correlation −0.52** with the original
+    (anti-correlated); the sign-extended fix gives `[-22, 80]` and **+0.85**. The
+    IP-Adapter therefore trained on sign-corrupted, anti-correlated SigLIP *and* Qwen3
+    conditioning; at inference the perceiver — tuned to that corrupted distribution —
+    collapses to a near-constant pooled vector on correct full-precision features →
+    `k_ip`/`v_ip` carry the reference's pooled colour with no spatial variation → every
+    image token gets ~the same injected contribution → after unpatchify, the periodic
+    grid of identical patch-dots growing with scale. `iris_ip_adapter.c` is faithful to
+    the Python model (perceive matches MLX bit-for-bit) and needs NO change. The diffusion
+    TARGET (VAE latents, stored as direct int8 at dataset.py:237) and C `embcache.c`
+    (unsigned affine `q*scale+offset`) were never affected. **Fix:** `_unpack_signed_nibbles`
+    sign-extends both loaders (dataset.py); the stored caches are byte-correct so NO
+    re-precompute is needed. Guard: `train/tests/test_nibble_dequant.py` (hermetic,
+    round-trip corr + known-nibble decode). **CAMPAIGN IMPACT:** every adapter trained
+    before this fix (run5, source-probe, all warmup runs) was trained on corrupted
+    conditioning — their cond_gap rankings are invalid and they must be RETRAINED on the
+    corrected cache before any sweep/interpretation. Validity gate (SREF-METRIC-1)
+    remains open until a freshly-trained adapter generates a coherent styled image.
 
 - **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
   (2026-06-10, observed during TRAIN-7 memory probes).**

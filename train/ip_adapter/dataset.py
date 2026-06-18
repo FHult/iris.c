@@ -179,6 +179,34 @@ def augment_mlx(img, bucket_h: int, bucket_w: int):
 # Pre-computed embed loaders
 # ---------------------------------------------------------------------------
 
+def _unpack_signed_nibbles(q: np.ndarray) -> np.ndarray:
+    """Unpack a uint8 nibble-packed array back to signed int8 in [-8, 7].
+
+    The packer (precompute_all._quantize_4bit) stores TWO'S-COMPLEMENT 4-bit
+    values: q = clip(round(arr/scale), -8, 7) then (lo & 0x0F) | ((hi & 0x0F)<<4).
+    The unpack therefore MUST sign-extend nibbles >= 8 back to negative
+    ([8,15] -> [-8,-1]); a plain `& 0x0F` reads every negative quantised value
+    [-8,-1] as a large positive [8,15], flipping signs and producing features
+    ANTI-correlated with the original (round-trip corr ~ -0.5 vs +0.85 fixed).
+    That corruption poisoned the SigLIP image features AND the Qwen3 text
+    embeddings the IP-Adapter trained on — the true root cause of the
+    patch-periodic grid (BUGS.md IP-ADAPTER-INFER-1), NOT a C inference bug.
+    The stored caches are byte-correct, so fixing the unpack is sufficient —
+    no re-precompute — but any adapter trained before this fix is poisoned.
+
+    Returns int8 [rows, cols*2] with even columns = low nibble, odd = high.
+    """
+    q = q.astype(np.uint8, copy=False)
+    lo = (q & 0x0F).astype(np.int8)
+    hi = (q >> 4).astype(np.int8)
+    lo = np.where(lo >= 8, lo - 16, lo).astype(np.int8)
+    hi = np.where(hi >= 8, hi - 16, hi).astype(np.int8)
+    full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
+    full[:, 0::2] = lo
+    full[:, 1::2] = hi
+    return full
+
+
 def _load_qwen3_embed(rec_id: str, qwen3_dir: Optional[str]) -> Optional[np.ndarray]:
     """
     Load 4-bit quantised Qwen3 text embedding.
@@ -191,19 +219,8 @@ def _load_qwen3_embed(rec_id: str, qwen3_dir: Optional[str]) -> Optional[np.ndar
         return None
     try:
         d = np.load(path)
-        q, scale = d["q"], d["scale"]
-        # Use explicit out= buffers to prevent numpy's refcount-based in-place
-        # ufunc optimisation from reusing q's memory for the first operation,
-        # which would corrupt q before the second nibble can be extracted.
-        lo = np.empty(q.shape, dtype=np.int8)
-        hi = np.empty(q.shape, dtype=np.int8)
-        np.bitwise_and(q, np.int8(0x0F), out=lo)
-        np.right_shift(q, 4, out=hi)
-        np.bitwise_and(hi, np.int8(0x0F), out=hi)
-        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
-        full[:, 0::2] = lo
-        full[:, 1::2] = hi
-        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+        full = _unpack_signed_nibbles(d["q"])
+        return (full.astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
     except Exception:
         return None
 
@@ -255,16 +272,8 @@ def _load_siglip_embed(rec_id: str, siglip_dir: Optional[str]) -> Optional[np.nd
         return None
     try:
         d = np.load(path)
-        q, scale = d["q"], d["scale"]
-        lo = np.empty(q.shape, dtype=np.int8)
-        hi = np.empty(q.shape, dtype=np.int8)
-        np.bitwise_and(q, np.int8(0x0F), out=lo)
-        np.right_shift(q, 4, out=hi)
-        np.bitwise_and(hi, np.int8(0x0F), out=hi)
-        full = np.empty((q.shape[0], q.shape[1] * 2), dtype=np.int8)
-        full[:, 0::2] = lo
-        full[:, 1::2] = hi
-        return (full.astype(np.float32) * scale.astype(np.float32)).astype(np.float16)
+        full = _unpack_signed_nibbles(d["q"])
+        return (full.astype(np.float32) * d["scale"].astype(np.float32)).astype(np.float16)
     except Exception:
         return None
 
