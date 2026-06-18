@@ -66,7 +66,8 @@ ORCH_PID="${CHAIN_ORCH_PID:-9929}"
 DB="$DATA_ROOT/flywheel_history.db"
 SCRATCH_DB="$DATA_ROOT/shard_scores_scratch.db"
 LOG="$DATA_ROOT/logs/flywheel_chain_iter24.log"
-CTL="$REPO/train/.venv/bin/python $REPO/train/scripts/pipeline_ctl.py"
+PY="$REPO/train/.venv/bin/python"
+CTL="$PY $REPO/train/scripts/pipeline_ctl.py"
 mkdir -p "$(dirname "$LOG")"
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG"; }
@@ -230,11 +231,11 @@ archive_champion "source-probe" "source-probe" \
 mkdir -p /Volumes/16TBCold/analysis
 ATTR_DATE=$(date +%Y%m%d_%H%M%S)
 log "[ATTRIBUTION] Running source attribution analysis..."
-python debug/source_attribution.py --campaign source-probe \
+"$PY" "$REPO/debug/source_attribution.py" --campaign source-probe \
   > "/Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.txt" 2>&1 \
   && log "[ATTRIBUTION] Saved to /Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.txt" \
   || log "[ATTRIBUTION] WARN: attribution script failed (non-fatal)"
-python debug/source_attribution.py --campaign source-probe --json \
+"$PY" "$REPO/debug/source_attribution.py" --campaign source-probe --json \
   > "/Volumes/16TBCold/analysis/source_probe_attribution_${ATTR_DATE}.json" 2>&1 \
   || true
 
@@ -276,6 +277,19 @@ log "iter24-replay ended. Settling ${SETTLE}s…"
 sleep "$SETTLE"
 
 if archive_champion "iter24-replay" "iter24-replay"; then
+  # Capture source-attribution analysis for the iter24-replay campaign (non-fatal:
+  # the sentinel is still written regardless of whether the analysis succeeds).
+  mkdir -p /Volumes/16TBCold/analysis
+  ATTR_DATE=$(date +%Y%m%d_%H%M%S)
+  log "[ATTRIBUTION] Running source attribution analysis for iter24-replay..."
+  "$PY" "$REPO/debug/source_attribution.py" --campaign iter24-replay \
+    > "/Volumes/16TBCold/analysis/iter24_replay_attribution_${ATTR_DATE}.txt" 2>&1 \
+    && log "[ATTRIBUTION] Saved to /Volumes/16TBCold/analysis/iter24_replay_attribution_${ATTR_DATE}.txt" \
+    || log "[ATTRIBUTION] WARN: attribution script failed (non-fatal)"
+  "$PY" "$REPO/debug/source_attribution.py" --campaign iter24-replay --json \
+    > "/Volumes/16TBCold/analysis/iter24_replay_attribution_${ATTR_DATE}.json" 2>&1 \
+    || true
+
   date -u +%Y-%m-%dT%H:%M:%SZ > "$SENTINEL"
   log "CHAIN COMPLETE — both champions archived; sentinel written ($SENTINEL). Re-arm by removing it."
   exit 0
