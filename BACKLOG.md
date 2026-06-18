@@ -1046,6 +1046,21 @@ a usable warm-start. Quality cost: geometric distortion + square output bias.
 Relates to PRECOMP-1 (tiling for large buckets) and PRECOMP-2 (proxy). The re-shard is
 the big one-time data job; everything else composes on top.
 
+**PRECOMP-4b: Make the startup warmup's bucket set configurable (small, do with PRECOMP-4).**
+The trainer's multi-bucket *machinery* still exists end-to-end — the 6-shape `BUCKETS`
+table (train/ip_adapter/dataset.py / bucketing.py), `_select_bucket`, the aspect-aware
+loader path, and the per-bucket graph warmup loops in train_ip_adapter.py — so distortion-
+free multi-aspect training is a config flip away once PRECOMP-4's per-bucket precompute
+lands. As of commit 38c1d69 the three startup warmup loops compile **only the pinned
+`data.bucket`** (`_warmup_buckets = [_fixed_bucket] if _fixed_bucket else BUCKETS`), because
+training is single-bucket-pinned today and warming all 6 inflated the Metal PSO/allocator
+surface ~6x at startup (MLX-2 lever-1). That fallback already does the right thing when
+`data.bucket` is unset (warms all `BUCKETS`), but the *intended* future state is to drive
+the warmup set from the **actual set of buckets training will use** — e.g. a
+`training.warmup_buckets` config list or a `--warmup-buckets` CLI flag — so a multi-aspect
+run warms exactly its active shapes (not necessarily all 6, not just one). Wire this when
+PRECOMP-4 removes the 512² pin; until then the single-bucket restriction is correct.
+
 **PRECOMP-5: Hot precompute cache (defer-rmtree LRU) — cut ~30% of cold↔hot transfers**
 (Medium — pipeline throughput) — full plan: [plans/hot-precompute-cache.md](plans/hot-precompute-cache.md).
 Each iter currently archives precompute to cold then `rmtree`s it from hot, so recurring
