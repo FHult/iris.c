@@ -2784,6 +2784,15 @@ def _build_flywheel_train_config(
     # Override shard path with the staged symlink dir (absolute — not prefixed by --data-root)
     cfg.setdefault("data", {})["shard_path"] = str(staging_dir)
 
+    # Point the cache dirs at THIS iteration's precompute tree (where stage_iteration_shards
+    # symlinked the cache + precompute_all wrote any new records) — NOT the base config's
+    # standard tree. The standard tree's `current` symlink may resolve to a version that does
+    # not cover the selected shards → a per-record cache MISS at train time → the trainer
+    # falls back to LIVE ENCODING, which wedges MLX (BUGS.md MLX-1). The per-iter tree has
+    # full coverage for the selected shards, so the trainer stays on the cached path.
+    for _enc in ("qwen3", "vae", "siglip"):
+        cfg["data"][f"{_enc}_cache_dir"] = str(staging_dir / "precomputed" / _enc)
+
     # Scale warmup_steps to at most 10% of the iteration steps so we never hit
     # decay_steps=0 when steps_per_iteration is small (e.g. 1000 with warmup=1000).
     cfg.setdefault("training", {})
