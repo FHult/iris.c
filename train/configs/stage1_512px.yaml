@@ -54,6 +54,14 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip: 1.0
+  # MLX soft memory limit (fraction of system RAM). Raised from the 0.44 default
+  # (14 GB on 32 GB) to 0.6 (19.2 GB): the measured 512px backward working set is
+  # 20.44 GB (TRAIN-7), so 0.44 ran ~6 GB BELOW the working set → perpetual MLX cache
+  # reclaim → the allocator-mutex churn implicated in the non-deterministic eval
+  # wedge (BUGS.md MLX-2). 0.6 sits just under the working set with headroom below the
+  # jetsam threshold; validated to survive mx.compile's first backward without OOM
+  # (2026-06-18, two clean direct-trainer runs). Online-encode mode may still want 0.55.
+  mlx_memory_pct: 0.6
   ema_decay: 0.9999
   ema_update_every: 10                     # update EMA every N steps (saves ~23min total)
   n_grad_steps_per_fwd: 1                  # adapter backward steps per Flux forward (1=disabled; 2=~1.47x throughput)
