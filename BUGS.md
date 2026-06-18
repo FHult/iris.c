@@ -256,6 +256,25 @@
     all-threads dump on the NEXT wedge settles allocator-livelock (main thread in
     eval_impl+allocator) vs a GPU command-buffer hang (a Metal stream/driver thread in
     `waitUntilCompleted`). Until then the memory-limit hypothesis is leading but unproven.
+  - **INVESTIGATION (2026-06-18, capture working).** The forensic dump fired: main thread
+    blocked in `eval_impl → condition_variable::wait` (waiting, not spinning); the GPU/stream
+    thread NOT in `waitUntilCompleted` but actively grinding a flood of tiny ops
+    (`binary_op_gpu`/`concatenate_gpu`/`copy_gpu_inplace`/`reshape_gpu` + Metal buffer
+    malloc/dealloc + `IOGPUMetalFence` create). So it is **a pathologically huge graph eval,
+    not a deadlock or GPU-driver hang** — one `mx.eval` explodes into millions of tiny ops and
+    the per-op allocator/fence overhead makes it effectively never finish (the PROXY-1 class,
+    but extreme). Fires at the FIRST step (after compile + "Validation held-out", before step 1).
+  - **RULED OUT:** style-pairing (wedges with `style_pairing:false` too); cache-miss/live-encode
+    (MLX-1) — the wedged run logged "skipping model load … using precomputed cache", i.e. cache
+    HIT, and it still wedged; memory-limit 0.6 (wedges at 0.6). **Correlation:** flywheel wedges
+    ~4/4 at the first step; single-process DIRECT runs (same model/config family) ~3/4 clean —
+    so it is non-deterministic with the flywheel context raising the hit rate, NOT a deterministic
+    config bug. A bug fixed along the way (commit bdd7e00): the flywheel trainer config pointed
+    cache_dir at the stale standard tree, not the per-iter staged cache — real (live-encode risk +
+    unused stager symlinks) but NOT this wedge. **Open.** Leading remaining theory: a
+    non-deterministic MLX 0.31.2 graph-eval/compile pathology; next steps = try an MLX version
+    bump, or reduce graph size (lower seq/ops) on the IP `correct_forward_q` path. Workaround: the
+    stall-recovery retries; direct single-process runs hit it far less.
 
 - **PROXY-1: decoded-MSE loss term costs ~75 s/step, not the documented ~20 ms (2026-06-10).**
   - `vae_proxy_512px.yaml` shipped with `decoded_mse_weight: 0.10` and the comment "adds
