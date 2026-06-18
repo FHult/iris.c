@@ -142,31 +142,40 @@
     perceiver collapses IDENTICALLY at both 16 and 24 heads (`ip_embeds` cross-token
     ratio 0.0068 vs 0.0062). The parity fixture passed because it only exercised
     synthetic math, never the real feature distribution.
-  - **TRUE ROOT CAUSE + FIX (2026-06-18):** a 4-bit nibble DEQUANTISATION SIGN BUG in
-    the training cache loaders, NOT a C inference bug. `precompute_all._quantize_4bit`
+  - **SECOND LEAD, REAL BUG but NOT the grid's cause (2026-06-18):** a 4-bit nibble
+    DEQUANTISATION SIGN BUG in the training cache loaders. `precompute_all._quantize_4bit`
     stores TWO'S-COMPLEMENT signed nibbles (`clip(round(x/scale), -8, 7)` then
     `(q & 0x0F) | ((q & 0x0F) << 4)`), but `ip_adapter.dataset._load_siglip_embed` and
     `_load_qwen3_embed` unpacked with a plain `& 0x0F` and NO sign-extension — so every
-    negative quantised value `[-8,-1]` was read back as a large positive `[8,15]`. The
-    round-trip of real signed SigLIP features through the production pack→unpack gives
-    range `[0, 171]` (all non-negative) and **correlation −0.52** with the original
-    (anti-correlated); the sign-extended fix gives `[-22, 80]` and **+0.85**. The
-    IP-Adapter therefore trained on sign-corrupted, anti-correlated SigLIP *and* Qwen3
-    conditioning; at inference the perceiver — tuned to that corrupted distribution —
-    collapses to a near-constant pooled vector on correct full-precision features →
-    `k_ip`/`v_ip` carry the reference's pooled colour with no spatial variation → every
-    image token gets ~the same injected contribution → after unpatchify, the periodic
-    grid of identical patch-dots growing with scale. `iris_ip_adapter.c` is faithful to
-    the Python model (perceive matches MLX bit-for-bit) and needs NO change. The diffusion
-    TARGET (VAE latents, stored as direct int8 at dataset.py:237) and C `embcache.c`
-    (unsigned affine `q*scale+offset`) were never affected. **Fix:** `_unpack_signed_nibbles`
-    sign-extends both loaders (dataset.py); the stored caches are byte-correct so NO
-    re-precompute is needed. Guard: `train/tests/test_nibble_dequant.py` (hermetic,
-    round-trip corr + known-nibble decode). **CAMPAIGN IMPACT:** every adapter trained
-    before this fix (run5, source-probe, all warmup runs) was trained on corrupted
-    conditioning — their cond_gap rankings are invalid and they must be RETRAINED on the
-    corrected cache before any sweep/interpretation. Validity gate (SREF-METRIC-1)
-    remains open until a freshly-trained adapter generates a coherent styled image.
+    negative quantised value `[-8,-1]` was read back as a large positive `[8,15]`
+    (round-trip corr **−0.52**; sign-extended fix **+0.85**). This is a genuine bug worth
+    fixing (every prior adapter trained on sign-corrupted SigLIP+Qwen3 conditioning),
+    fixed in `_unpack_signed_nibbles` (commit 6333e24, guard `test_nibble_dequant.py`;
+    stored caches byte-correct → no re-precompute). BUT it is **NOT** what causes the
+    grid: a confirmation adapter trained 1000 steps on the CORRECTED cache STILL collapses
+    (`ip_embeds` cross-token ratio 0.0033) and STILL generates a degenerate image (a brown
+    texture, no subject) — so feature-sign correctness does not prevent the collapse. The
+    earlier "TRUE ROOT CAUSE" claim was premature. `iris_ip_adapter.c` is still faithful to
+    the MLX model and needs no change.
+  - **ACTUAL ROOT CAUSE (2026-06-18, confirmed mechanistically):** the `PerceiverResampler`
+    (train/ip_adapter/model.py:59) feeds RAW SigLIP features into cross-attention with **NO
+    input normalization** — `out = cross_attn(q, siglip_features, siglip_features)`; only
+    the OUTPUT is LayerNorm'd. SigLIP has a few "massive-activation" feature DIMENSIONS
+    whose magnitude dominates the Q·K dot products, so every learned query attends to the
+    same dominant SigLIP token → near-identical output tokens → `k_ip`/`v_ip` carry a
+    pooled, spatially-constant signal → constant per-patch injection → the grid/texture.
+    **Mechanistic proof** (`/tmp/perceive_diag.py`): on the confirm-fix adapter all **128
+    queries peak on the same key (token 352)** — "1 distinct top-key across 128 queries";
+    and per-dim z-score standardization of the SigLIP input BREAKS the collapse — `ip_embeds`
+    ratio jumps 0.0068→**1.6171** for iter0024 (238×) and 0.0033→0.0135 for the undertrained
+    confirm-fix. Per-TOKEN LayerNorm does NOT help (it's per-DIMENSION outliers). The standard
+    IP-Adapter Resampler normalizes its input features before attention; ours omits it.
+    **Fix (requires retrain):** add input normalization to the PerceiverResampler — a learned
+    `nn.LayerNorm(siglip_dim)` on the features before `cross_attn` (and the same at inference
+    in `iris_ip_adapter_perceive`), or per-dim standardization with fixed corpus statistics.
+    Independent of the dequant fix. Validity gate (SREF-METRIC-1) stays open until a
+    retrain-with-input-norm generates a coherent styled image (ratio jump is a proxy, not
+    yet proven through generation).
 
 - **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
   (2026-06-10, observed during TRAIN-7 memory probes).**
