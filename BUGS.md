@@ -272,9 +272,14 @@
     config bug. A bug fixed along the way (commit bdd7e00): the flywheel trainer config pointed
     cache_dir at the stale standard tree, not the per-iter staged cache — real (live-encode risk +
     unused stager symlinks) but NOT this wedge. **Open.** Leading remaining theory: a
-    non-deterministic MLX 0.31.2 graph-eval/compile pathology; next steps = try an MLX version
-    bump, or reduce graph size (lower seq/ops) on the IP `correct_forward_q` path. Workaround: the
-    stall-recovery retries; direct single-process runs hit it far less.
+    non-deterministic MLX graph-eval/compile pathology. **MLX version RULED OUT (2026-06-19):**
+    0.31.2 is already the latest on PyPI (no forward bump), and a DOWNGRADE test to 0.30.6 STILL
+    wedged in the flywheel → not a 0.31 regression. So the only remaining lever is **reducing the
+    graph** (lower seq/ops on the IP `correct_forward_q` path so one `mx.eval` can't explode), or
+    pinning down the exact flywheel-vs-direct difference (orchestrator-subprocess context — the
+    last unruled-out axis; direct-run-of-flywheel-config tests were inconclusive/killed early).
+    Workaround for now: stall-recovery retries; run experiments via direct single-process trainer
+    (hits it far less, ~3/4 clean vs flywheel ~5/5 wedge).
 
 - **PROXY-1: decoded-MSE loss term costs ~75 s/step, not the documented ~20 ms (2026-06-10).**
   - `vae_proxy_512px.yaml` shipped with `decoded_mse_weight: 0.10` and the comment "adds
