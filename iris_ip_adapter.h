@@ -79,6 +79,14 @@ typedef struct {
     float *norm_weight;       /* [hidden_dim]  float32 always */
     float *norm_bias;         /* [hidden_dim]  float32 always */
 
+    /* Input normalization on the SigLIP features (IP-ADAPTER-INFER-1 fix). When
+     * present, perceive() standardizes each SigLIP DIMENSION across the token axis
+     * then applies this learned affine, before the K/V projections — taming the
+     * massive-activation dimensions that otherwise collapse the cross-attention.
+     * NULL for legacy bundles trained before the fix (perceive() then uses raw input). */
+    float *in_gamma;          /* [siglip_dim]  float32, or NULL (legacy) */
+    float *in_beta;           /* [siglip_dim]  float32, or NULL (legacy) */
+
     /* -----------------------------------------------------------------
      * IP-Adapter projections (stacked across all num_blocks blocks)
      * ---------------------------------------------------------------- */

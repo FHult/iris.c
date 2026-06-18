@@ -49,14 +49,32 @@ class PerceiverResampler(nn.Module):
             bias=False,  # explicit: C inference loader expects no bias weights
         )
         self.norm = nn.LayerNorm(hidden_dim)
+        # Input normalization on the SigLIP features (IP-ADAPTER-INFER-1 root cause).
+        # SigLIP has a few massive-activation DIMENSIONS that otherwise dominate the
+        # cross-attention dot products, so every query attends to the same token →
+        # the perceiver pools → constant injection → the grid. We standardize each
+        # feature DIMENSION across the token sequence (per-image), then apply a learned
+        # affine. NOTE: this is token-axis standardization, NOT a per-token LayerNorm —
+        # the diagnostic showed per-token LayerNorm does not help; per-dim across tokens
+        # lifts ip_embeds cross-token ratio 0.0068→1.6. Matched in iris_ip_adapter_perceive.
+        self.in_gamma = mx.ones((siglip_dim,))
+        self.in_beta = mx.zeros((siglip_dim,))
+
+    def _norm_input(self, f: mx.array) -> mx.array:
+        # f: [B, n_tokens, siglip_dim] — standardize each dim across the token axis.
+        mean = f.mean(axis=1, keepdims=True)
+        var = f.var(axis=1, keepdims=True)
+        f = (f - mean) * mx.rsqrt(var + 1e-5)
+        return f * self.in_gamma + self.in_beta
 
     def __call__(self, siglip_features: mx.array) -> mx.array:
         # siglip_features: [B, 729, 1152]
         B = siglip_features.shape[0]
+        f = self._norm_input(siglip_features)
         q = mx.broadcast_to(
             self.query_tokens[None], (B,) + self.query_tokens.shape
         )  # [B, 128, 3072]
-        out = self.cross_attn(q, siglip_features, siglip_features)
+        out = self.cross_attn(q, f, f)
         return self.norm(out)  # [B, 128, 3072]
 
 

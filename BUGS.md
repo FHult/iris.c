@@ -170,12 +170,20 @@
     ratio jumps 0.0068→**1.6171** for iter0024 (238×) and 0.0033→0.0135 for the undertrained
     confirm-fix. Per-TOKEN LayerNorm does NOT help (it's per-DIMENSION outliers). The standard
     IP-Adapter Resampler normalizes its input features before attention; ours omits it.
-    **Fix (requires retrain):** add input normalization to the PerceiverResampler — a learned
-    `nn.LayerNorm(siglip_dim)` on the features before `cross_attn` (and the same at inference
-    in `iris_ip_adapter_perceive`), or per-dim standardization with fixed corpus statistics.
-    Independent of the dequant fix. Validity gate (SREF-METRIC-1) stays open until a
-    retrain-with-input-norm generates a coherent styled image (ratio jump is a proxy, not
-    yet proven through generation).
+    **FIX IMPLEMENTED + VALIDATED (2026-06-18):** input normalization added to the
+    PerceiverResampler — `_norm_input` standardizes each SigLIP DIMENSION across the token
+    axis (per-image), then a learned affine (`in_gamma`/`in_beta`), before `cross_attn`
+    (train/ip_adapter/model.py). Mirrored in C `iris_ip_adapter_perceive` (in_gamma/in_beta
+    loaded optionally → legacy bundles without them keep the old no-norm path, enabling
+    same-binary A/B). Exporter carries the two new tensors (optional for legacy checkpoints).
+    NOTE: it is per-DIM-across-tokens standardization, NOT a per-token LayerNorm (that doesn't
+    help). **Validated end-to-end:** a 600-step retrain on the corrected cache lifts `ip_embeds`
+    cross-token ratio 0.0033→**0.4308** (130×, collapse broken), and `iris --ip` A/B (same
+    binary) shows legacy iter0024 = the dot grid while the new bundle at ip-scale 0.6 generates
+    a COHERENT cat-on-windowsill with the reference's style applied (subject survives, style
+    transfers). scale 1.2 over-saturates (high strength) and the 600-step result is hazy —
+    undertraining, not a mechanism flaw; a full style-paired campaign will sharpen it.
+    Independent of the dequant fix. SREF grid is FIXED at the root-cause level.
 
 - **MLX-1: SIGSEGV in MLX compiled-kernel GPU eval on the trainer's ONLINE-ENCODE path
   (2026-06-10, observed during TRAIN-7 memory probes).**

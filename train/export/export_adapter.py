@@ -79,6 +79,8 @@ _KEY_MAP = {
     "image_proj.cross_attn.out_proj.weight":   "perceiver.out_proj",
     "image_proj.norm.weight":                  "perceiver.norm_weight",
     "image_proj.norm.bias":                    "perceiver.norm_bias",
+    "image_proj.in_gamma":                     "perceiver.in_gamma",
+    "image_proj.in_beta":                      "perceiver.in_beta",
     "to_k_ip_stacked":                         "ip_k_stacked",
     "to_v_ip_stacked":                         "ip_v_stacked",
     "scale":                                   "ip_scale",
@@ -98,11 +100,14 @@ _QUANTISED_TENSORS = {
 _ALWAYS_F32 = {
     "perceiver.norm_weight",
     "perceiver.norm_bias",
+    "perceiver.in_gamma",
+    "perceiver.in_beta",
     "ip_scale",
 }
 
 # Small tensors kept in F32 even for float16/bfloat16 export
-_F32_OVERRIDE = {"perceiver.norm_weight", "perceiver.norm_bias", "ip_scale"}
+_F32_OVERRIDE = {"perceiver.norm_weight", "perceiver.norm_bias",
+                 "perceiver.in_gamma", "perceiver.in_beta", "ip_scale"}
 
 
 # ---------------------------------------------------------------------------
@@ -228,13 +233,17 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
         else:
             prefix = ""
 
+    # Optional keys: the perceiver input-norm (in_gamma/in_beta) is absent in legacy
+    # checkpoints trained before IP-ADAPTER-INFER-1's fix; skip rather than error so
+    # those still export (the C loader falls back to no input-norm when they're missing).
+    _OPTIONAL = {"image_proj.in_gamma", "image_proj.in_beta"}
     weights: dict[str, np.ndarray] = {}
     missing = []
     for ckpt_key, export_key in _KEY_MAP.items():
         lookup = prefix + ckpt_key
         if lookup in raw:
             weights[export_key] = raw[lookup]
-        else:
+        elif ckpt_key not in _OPTIONAL:
             missing.append(ckpt_key)
 
     if missing:
@@ -493,8 +502,9 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
 
     loaded = mx.load(weights_path)
 
-    # Check all expected tensors are present
-    expected = set(_KEY_MAP.values())
+    # Check all expected tensors are present (perceiver input-norm is optional —
+    # absent in legacy pre-input-norm bundles).
+    expected = set(_KEY_MAP.values()) - {"perceiver.in_gamma", "perceiver.in_beta"}
     if quant == "int8":
         scale_keys = {f"{n}.scale" for n in _QUANTISED_TENSORS}
         expected = expected | scale_keys

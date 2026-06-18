@@ -162,6 +162,8 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     LOAD(out_proj,     "perceiver.out_proj");
     LOAD(norm_weight,  "perceiver.norm_weight");
     LOAD(norm_bias,    "perceiver.norm_bias");
+    LOAD(in_gamma,     "perceiver.in_gamma");   /* optional (legacy bundles lack it) */
+    LOAD(in_beta,      "perceiver.in_beta");    /* optional */
     LOAD(ip_k_stacked, "ip_k_stacked");
     LOAD(ip_v_stacked, "ip_v_stacked");
     LOAD(ip_scale,     "ip_scale");
@@ -184,7 +186,7 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
     free(a->query_tokens); free(a->query_proj); free(a->key_proj);
     free(a->value_proj); free(a->out_proj); free(a->norm_weight);
     free(a->norm_bias); free(a->ip_k_stacked); free(a->ip_v_stacked);
-    free(a->ip_scale);
+    free(a->ip_scale); free(a->in_gamma); free(a->in_beta);
     if (a->_sf_handle) safetensors_close((safetensors_file_t *)a->_sf_handle);
     free(a);
 }
@@ -207,13 +209,39 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
     float *attn = malloc((size_t)T * H * sizeof(float));
     if (!Q || !K || !V || !attn) { free(Q); free(K); free(V); free(attn); return -1; }
 
+    /* Input normalization (IP-ADAPTER-INFER-1 fix): standardize each SigLIP DIMENSION
+     * across the token axis, then learned affine. Mirrors PerceiverResampler._norm_input
+     * (train/ip_adapter/model.py). Skipped for legacy bundles (in_gamma/in_beta NULL),
+     * which expect raw input. NOTE: per-DIM across tokens, not a per-token LayerNorm. */
+    const float *sig_in = siglip;
+    float *sig_n = NULL;
+    if (a->in_gamma && a->in_beta) {
+        sig_n = malloc((size_t)n_siglip * S * sizeof(float));
+        if (!sig_n) { free(Q); free(K); free(V); free(attn); return -1; }
+        for (int d = 0; d < S; d++) {
+            float mean = 0.0f;
+            for (int t = 0; t < n_siglip; t++) mean += siglip[(size_t)t * S + d];
+            mean /= n_siglip;
+            float var = 0.0f;
+            for (int t = 0; t < n_siglip; t++) {
+                float e = siglip[(size_t)t * S + d] - mean; var += e * e;
+            }
+            var /= n_siglip;
+            float inv = 1.0f / sqrtf(var + LN_EPS);
+            float g = a->in_gamma[d], b = a->in_beta[d];
+            for (int t = 0; t < n_siglip; t++)
+                sig_n[(size_t)t * S + d] = (siglip[(size_t)t * S + d] - mean) * inv * g + b;
+        }
+        sig_in = sig_n;
+    }
+
     /* projections: x @ W^T  (Linear, bias=False) */
     iris_matmul_t(Q, a->query_tokens, a->query_proj, T, H, H);
-    iris_matmul_t(K, siglip, a->key_proj, n_siglip, S, H);
-    iris_matmul_t(V, siglip, a->value_proj, n_siglip, S, H);
+    iris_matmul_t(K, sig_in, a->key_proj, n_siglip, S, H);
+    iris_matmul_t(V, sig_in, a->value_proj, n_siglip, S, H);
 
     if (mha_sdpa(attn, Q, K, V, T, n_siglip, heads, hd) != 0) {
-        free(Q); free(K); free(V); free(attn);
+        free(Q); free(K); free(V); free(attn); free(sig_n);
         return -1;
     }
 
@@ -231,7 +259,7 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
         for (int i = 0; i < H; i++)
             row[i] = (row[i] - mean) * inv * a->norm_weight[i] + a->norm_bias[i];
     }
-    free(Q); free(K); free(V); free(attn);
+    free(Q); free(K); free(V); free(attn); free(sig_n);
     return 0;
 }
 
