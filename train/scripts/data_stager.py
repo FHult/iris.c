@@ -233,45 +233,49 @@ class DataStager:
                 dst.unlink()
             shard_tasks.append((src, dst))
 
-        # ── 2. Collect precomputed npz tasks (for all available encoders) ────
-        npz_tasks: list = []
+        # ── 2. Reuse precomputed npz — SYMLINK existing cache into the PER-ITERATION
+        # precompute tree (staging_dir/precomputed/{enc}/) where precompute_all skip-scans.
+        # FIX (2026-06-18): the old code staged into the STANDARD hot tree
+        # (hot_precomp/{enc}/{ver}/), where the npz already exist → it copied 0, and the
+        # per-iteration precompute_all read a SEPARATE (empty) tree and re-encoded everything.
+        # We now deposit symlinks where precompute_all actually looks, so covered shards skip
+        # encode entirely. Symlinks (not copies) → instant + no extra disk; the loader
+        # prefetches, so cross-device per-npz reads (~0.1s) are hidden. We probe per shard by
+        # record index (fast: ~stat calls) instead of globbing the whole 1.1M-file cache dir.
+        import os as _os
+        npz_reused = 0
         for encoder in ("qwen3", "vae", "siglip"):
             cold_enc = self._cold_precomp / encoder
-            hot_enc  = self._hot_precomp / encoder
             if not cold_enc.exists():
                 continue
-            # Handle versioned layout (current symlink)
             cur_link = cold_enc / "current"
-            if cur_link.is_symlink():
-                import os as _os
-                ver = _os.path.basename(_os.readlink(str(cur_link)))
-                cold_ver = cold_enc / ver
-                hot_ver  = hot_enc / ver
-            else:
-                cold_ver = cold_enc
-                hot_ver  = hot_enc
+            ver = _os.path.basename(_os.readlink(str(cur_link))) if cur_link.is_symlink() else None
+            cold_ver = (cold_enc / ver) if ver else cold_enc
             if not cold_ver.exists():
                 continue
-            hot_ver.mkdir(parents=True, exist_ok=True)
-            # Stage npz files whose shard prefix matches the selection
-            for npz in cold_ver.glob("*.npz"):
-                try:
-                    shard_prefix = f"{int(npz.stem.split('_')[0]):06d}"
-                except (ValueError, IndexError):
-                    continue
-                if shard_prefix not in selected_ids:
-                    continue
-                dst_npz = hot_ver / npz.name
-                if not dst_npz.exists() and not dst_npz.is_symlink():
-                    npz_tasks.append((npz, dst_npz))
-            # Propagate/update current symlink on hot to match cold
-            if cur_link.is_symlink():
-                hot_cur = hot_enc / "current"
-                if not hot_cur.exists() and not hot_cur.is_symlink():
-                    import os as _os
-                    hot_enc.mkdir(parents=True, exist_ok=True)
-                    _os.symlink(ver, str(hot_cur))
+            per_iter = staging_dir / "precomputed" / encoder
+            per_iter.mkdir(parents=True, exist_ok=True)
+            for sid in selected_ids:
+                miss = 0
+                for idx in range(100000):           # record index; break on a run of gaps
+                    name = f"{sid}_{idx:04d}.npz"
+                    src = cold_ver / name
+                    if not src.exists():
+                        miss += 1
+                        if miss >= 100:
+                            break
+                        continue
+                    miss = 0
+                    dst = per_iter / name
+                    if dst.exists() or dst.is_symlink():
+                        continue
+                    try:
+                        _os.symlink(str(src), str(dst))
+                        npz_reused += 1
+                    except OSError:
+                        pass
 
+        npz_tasks: list = []   # npz are symlinked above (no copy); only tars are staged here
         all_tasks = shard_tasks + npz_tasks
 
         # Disk-space preflight (cross-device only)
@@ -306,7 +310,7 @@ class DataStager:
 
         return {
             "shards_staged":     shards_staged,
-            "npz_staged":        npz_staged,
+            "npz_staged":        npz_staged + npz_reused,   # reused = symlinked cache
             "bytes_transferred": total_bytes,
         }
 

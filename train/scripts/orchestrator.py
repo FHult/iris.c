@@ -2679,7 +2679,9 @@ def _capture_stall_diagnostics(name: str, iteration: int, log_file: Path) -> Non
             for pid in pids:
                 f.write(f"===== sample (all threads) pid {pid} =====\n")
                 try:
-                    s = subprocess.run(["sample", pid, "5", "-allThreads"],
+                    # `sample` dumps ALL threads by default; there is no -allThreads flag
+                    # (the original invocation errored out → no useful capture).
+                    s = subprocess.run(["sample", pid, "5", "-mayDie"],
                                        capture_output=True, text=True, timeout=30)
                     f.write((s.stdout or s.stderr or "(no output)") + "\n")
                 except Exception as _e:
