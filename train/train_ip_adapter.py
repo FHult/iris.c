@@ -887,6 +887,13 @@ def train(config: dict) -> None:
     if _fixed_bucket:
         print(f"Training pinned to single bucket {_fixed_bucket} "
               f"(matches fixed-resolution VAE precompute).")
+    # Warmup compile surface: when training is pinned to a single bucket (the only
+    # supported mode — every other bucket is a 100% cache-miss skip), warming all 6
+    # BUCKETS compiles 5 Flux-forward graphs that will never run, inflating startup
+    # time and the Metal PSO/allocator state ~6x at the most fragile moment (just
+    # before the first step). Restrict warmup to the pinned shape. (MLX-2 graph-surface
+    # reduction.)
+    _warmup_buckets = [_fixed_bucket] if _fixed_bucket else list(BUCKETS)
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -918,8 +925,8 @@ def train(config: dict) -> None:
     _txt_warmup = mx.zeros((1, 64, flux.transformer.context_embedder.weight.shape[1]),
                            dtype=mx.bfloat16)
     _t_warmup   = mx.array([500], dtype=mx.int32)
-    print("Warming up Flux training graphs (all bucket shapes)...")
-    for _bH, _bW in BUCKETS:
+    print(f"Warming up Flux training graphs ({len(_warmup_buckets)} bucket shape(s))...")
+    for _bH, _bW in _warmup_buckets:
         _lat_H, _lat_W = _bH // 8, _bW // 8          # VAE latent spatial dims
         _dummy_lat = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
         print(f"  [{_bH}x{_bW}] compiling...", flush=True)
@@ -1011,8 +1018,8 @@ def train(config: dict) -> None:
         _ip_embs_wu = adapter.get_image_embeds(_siglip_warmup_cq)
         _k_wu, _v_wu = adapter.get_kv_all(_ip_embs_wu)
         mx.eval(_k_wu, _v_wu, adapter.scale)
-        print("Warming up correct-forward-Q graphs (all bucket shapes)...")
-        for _bH, _bW in BUCKETS:
+        print(f"Warming up correct-forward-Q graphs ({len(_warmup_buckets)} bucket shape(s))...")
+        for _bH, _bW in _warmup_buckets:
             _lat_H, _lat_W = _bH // 8, _bW // 8
             _dummy_lat_cq = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
             print(f"  [{_bH}x{_bW}] compiling...", flush=True)
@@ -1589,8 +1596,8 @@ def train(config: dict) -> None:
         _txt_dim_wu = flux.transformer.context_embedder.weight.shape[1]
         _txt_wu   = mx.zeros((1, 64, _txt_dim_wu), dtype=mx.bfloat16)
         _t_wu     = mx.array([500], dtype=mx.int32)
-        print("Warming up IP Adapter training graphs (all bucket shapes)...")
-        for _bH, _bW in BUCKETS:
+        print(f"Warming up IP Adapter training graphs ({len(_warmup_buckets)} bucket shape(s))...")
+        for _bH, _bW in _warmup_buckets:
             _lat_H, _lat_W = _bH // 8, _bW // 8
             _dummy_lat    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
             _dummy_tgt    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)

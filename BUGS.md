@@ -280,6 +280,19 @@
     last unruled-out axis; direct-run-of-flywheel-config tests were inconclusive/killed early).
     Workaround for now: stall-recovery retries; run experiments via direct single-process trainer
     (hits it far less, ~3/4 clean vs flywheel ~5/5 wedge).
+  - **MITIGATION (2026-06-19, lever-1 partial): startup warmup graph-surface reduction.**
+    The three startup warmup loops in `train_ip_adapter.py` (Flux-forward, correct-forward-Q,
+    and the `--warmup-only` path) compiled the Flux graph for ALL 6 BUCKETS even though
+    training is hard-pinned to a single `data.bucket` ([512,512]; every other bucket is a
+    100% cache-miss skip). That built 5 unused large graphs and inflated the Metal PSO/
+    allocator state ~6x at startup — the fragile moment right before the wedge fires. Fixed:
+    `_warmup_buckets = [_fixed_bucket] if _fixed_bucket else BUCKETS`, used by all three loops.
+    Validated by a 5-step direct smoke (warmup 6→1 shapes, ~2 s each; ran clean to completion,
+    peak 21.52 GB > the 19 GB limit — i.e. the allocator-pressure condition was present and it
+    still did not wedge, one data point). NOT a proven wedge fix — the per-step
+    `_flux_forward_with_ip_collect_q` graph (the one the forensic dump showed exploding) is
+    unchanged — but a clear, safe surface reduction and faster startup regardless. Next levers
+    unchanged: per-step IP-forward graph reduction, or pinning the orchestrator-vs-direct axis.
 
 - **PROXY-1: decoded-MSE loss term costs ~75 s/step, not the documented ~20 ms (2026-06-10).**
   - `vae_proxy_512px.yaml` shipped with `decoded_mse_weight: 0.10` and the comment "adds
