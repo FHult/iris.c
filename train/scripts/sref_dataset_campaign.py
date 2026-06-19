@@ -49,7 +49,9 @@ BASE_CFG = REPO / "train" / "configs" / "stage1_512px.yaml"
 TRAINER = REPO / "train" / "train_ip_adapter.py"
 EXPORTER = REPO / "train" / "export" / "export_adapter.py"
 SWEEP = REPO / "train" / "scripts" / "sref_sweep_eval.py"
-POOL = Path("/Volumes/2TBSSD/baseline_pool")
+POOL = Path("/Volumes/2TBSSD/baseline_pool_hot")  # tars MUST be on hot SSD: the loader
+# enumerates every shard tar before the first sample, and a cold-storage scan is ~31s/shard
+# (vs ~0.8s hot). >3 cold shards blows past the loader's 120s sample_q timeout (BUGS/anchor).
 CACHE = {
     "vae": "/Volumes/2TBSSD/precomputed/vae/v_2232c1",
     "qwen3": "/Volumes/2TBSSD/precomputed/qwen3/v_059443",
@@ -199,6 +201,7 @@ def eval_arm(n: int, bundle: Path, name: str, scales: str, seeds: str) -> dict |
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pool", default=str(POOL), help="shard pool dir (tars MUST be on hot SSD)")
     ap.add_argument("--arms", default="4,22,12,8,16", help="shard counts, evaluated in this order")
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--scales", default="0.3,0.5,0.7")
@@ -209,9 +212,10 @@ def main() -> int:
     args = ap.parse_args()
 
     ROOT.mkdir(parents=True, exist_ok=True)
-    all_shards = sorted(str(p) for p in POOL.glob("*.tar"))
+    pool_dir = Path(args.pool)
+    all_shards = sorted(str(p) for p in pool_dir.glob("*.tar"))
     if not all_shards:
-        log(f"FATAL: no shards in {POOL}")
+        log(f"FATAL: no shards in {pool_dir}")
         return 1
     arms = [int(x) for x in args.arms.split(",") if x.strip()]
     arms = [a for a in arms if a <= len(all_shards)]
