@@ -98,18 +98,53 @@ Active runs use the `iris` tmux session. `iris-orch` is the orchestrator window;
 
 ## Live Campaigns & How to Manage Them (keep current)
 
-> Snapshot updated 2026-06-15. Always confirm against `pipeline_doctor.py --ai` +
+> Snapshot updated 2026-06-19. Always confirm against `pipeline_doctor.py --ai` +
 > `tmux list-windows -a` — this section is a map, not the source of truth.
 
-**What is running right now:**
-- **`warmup-run5`** — the FIRST style-paired flywheel campaign (30 iters, ~2.87h/iter,
-  ~iter 28/30 as of this snapshot; champion = max held-out-EMA cond_gap, currently
-  iter 24 +0.0727). tmux window `iris-flywheel`, log `/Volumes/2TBSSD/logs/flywheel.log`.
-- **`iris-chain`** — an AUTO-CHAIN watcher (tmux window, `train/scripts/flywheel_chain.sh`)
-  that launches the NEXT campaign when `iris-flywheel` closes. Currently armed to launch
-  **`flywheel_source_probe.yaml`** (18-iter source-holdout measurement campaign) when run5
-  ends. Log `/Volumes/2TBSSD/logs/flywheel_chain.log`; one-shot sentinel
-  `/Volumes/2TBSSD/.flywheel_chain.done`.
+**CURRENT DIRECTION (2026-06-19): SREF v4 shipped; dataset experiments run via the DIRECT
+trainer, NOT the flywheel.**
+- The SREF grid bug is FIXED (perceiver input-norm, released v4.0.0). Working adapter:
+  `/Volumes/2TBSSD/sref_sweep/bundle_inputnorm`. v4 is the first end-to-end-working but still
+  WEAK adapter — narrow `--ip-scale` window, and its baseline sref_score is NEGATIVE at every
+  scale (style_sim ~0.02–0.09, content_leak ~0.35–0.47). Improving this is the point of the
+  dataset experiments.
+- **The flywheel/orchestrator is BLOCKED by the MLX wedge (BUGS.md MLX-2):** the flywheel
+  trainer hangs at step 0 (~5/5). DO NOT run dataset science through the flywheel until MLX-2
+  is fixed. **All PRIOR flywheel results are INVALID** (warmup-run5, source_probe, shard_scores,
+  attribution) — they measured broken pre-v4 adapters. The single-process DIRECT trainer is
+  ~3/4 clean and is the path for now.
+- **Active experiment:** dataset-quantity ladder via `train/scripts/sref_dataset_campaign.py`
+  (5 from-scratch arms — 4/8/12/16/22 shards, 3000 steps each), each exported and scored as an
+  `--ip-scale` FRONTIER via `sref_sweep_eval.py` (see BACKLOG SREF-EVAL-PARAMS: ip-scale
+  dominates the eval, compare at a matched content_leak budget — never one fixed scale). Goal:
+  does more data improve CSD style_sim, and does held-out cond_gap track it (SREF-METRIC-1).
+
+**What is running right now (DIRECT campaign — a standalone process, NOT the orchestrator/tmux):**
+- It is NOT managed by `pipeline_ctl` or the flywheel commands below. Monitor / manage it with:
+```bash
+# status (per-arm cond_gap + ip-scale frontier):
+cat /Volumes/2TBSSD/sref_eval/campaign/campaign_report.json
+# live logs:
+tail -f /tmp/overnight_campaign.log     # top-level orchestration (build/test/commit + which arm)
+tail -f /tmp/campaign.log               # campaign runner (train/export/eval per arm)
+tail -f /Volumes/2TBSSD/sref_eval/campaign/arm_<n>/train.log   # one arm's trainer
+# v4 baseline + per-arm visual verdicts (open in browser):
+#   /Volumes/2TBSSD/sref_eval/v4_baseline/report.html  + frontier.json
+#   /Volumes/2TBSSD/sref_eval/campaign_arm<n>/report.html
+# stop (resumable — a re-run skips finished arms, reuses checkpoints):
+pkill -f sref_dataset_campaign
+# (re)launch:
+caffeinate -i train/.venv/bin/python train/scripts/sref_dataset_campaign.py \
+  --arms 4,22,12,8,16 --steps 3000 --pool /Volumes/2TBSSD/baseline_pool_hot
+```
+- **HOT-STORAGE RULE (AGENT.md invariant #6, non-negotiable):** the campaign `--pool` MUST be
+  real tars on hot SSD (`/Volumes/2TBSSD/baseline_pool_hot`), never cold symlinks — a cold-tar
+  scan (~31 s/shard) times out the loader at step 0. The whole first overnight run died on this.
+
+**Flywheel (currently BLOCKED — mechanics kept for when MLX-2 is fixed):**
+The flywheel commands below still work mechanically, but the flywheel itself wedges (MLX-2), so
+nothing flywheel-based should be running now. The prior `warmup-run5` / `iris-chain` /
+`flywheel_source_probe` campaigns are retired and their results invalid.
 
 **Managing the flywheel (the campaign in `iris-flywheel`):**
 ```bash
