@@ -10,8 +10,8 @@
  *   -d, --dir PATH        Path to model directory (safetensors)
  *   -p, --prompt TEXT     Text prompt for generation
  *   -o, --output PATH     Output image path
- *   -W, --width N         Output width (default: 256)
- *   -H, --height N        Output height (default: 256)
+ *   -W, --width N         Output width (default: 512)
+ *   -H, --height N        Output height (default: 512)
  *   -s, --steps N         Number of sampling steps (default: 4)
  *   -S, --seed N          Random seed (-1 for random)
  *   -i, --input PATH      Input image for img2img
@@ -213,8 +213,8 @@ static double timer_end(void) {
  * Default Values
  * ======================================================================== */
 
-#define DEFAULT_WIDTH 256
-#define DEFAULT_HEIGHT 256
+#define DEFAULT_WIDTH 512
+#define DEFAULT_HEIGHT 512
 #define DEFAULT_STEPS 4
 #define MAX_INPUT_IMAGES 16
 
