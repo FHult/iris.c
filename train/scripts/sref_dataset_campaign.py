@@ -152,22 +152,34 @@ def parse_cond_gap(n: int) -> float | None:
 
 
 def export_arm(n: int, ck: Path) -> Path | None:
-    best = ck / "best.safetensors"
-    if not best.exists():
-        log(f"arm {n}: no best.safetensors to export")
-        return None
     bundle = ROOT / f"arm_{n}" / "bundle"
-    r = subprocess.run(
-        [str(VENV), str(EXPORTER), "--checkpoint", str(best), "--output", str(bundle),
-         "--perceiver-heads", str(PERCEIVER_HEADS), "--validate"],
-        cwd=str(REPO), capture_output=True, text=True,
-    )
-    (ROOT / f"arm_{n}" / "export.log").write_text(r.stdout + "\n" + r.stderr)
-    if r.returncode != 0 or not (bundle / "adapter_meta.json").exists():
-        log(f"arm {n}: export FAILED (rc={r.returncode}) — see export.log")
+    # Try best.safetensors (bare EMA keys) first; fall back to the final step
+    # checkpoint with --use-ema (loads ema.-prefixed weights). Either yields the EMA.
+    attempts: list[tuple[Path, list[str]]] = []
+    best = ck / "best.safetensors"
+    if best.exists():
+        attempts.append((best, []))
+    steps = sorted(ck.glob("step_*.safetensors"))
+    if steps:
+        attempts.append((steps[-1], ["--use-ema"]))
+    if not attempts:
+        log(f"arm {n}: no checkpoint to export")
         return None
-    log(f"arm {n}: exported bundle")
-    return bundle
+    logf = ROOT / f"arm_{n}" / "export.log"
+    for ckpt, extra in attempts:
+        r = subprocess.run(
+            [str(VENV), str(EXPORTER), "--checkpoint", str(ckpt), "--output", str(bundle),
+             "--perceiver-heads", str(PERCEIVER_HEADS), "--validate", *extra],
+            cwd=str(REPO), capture_output=True, text=True,
+        )
+        with open(logf, "a") as fh:
+            fh.write(f"\n=== export {ckpt.name} {extra} rc={r.returncode} ===\n{r.stdout}\n{r.stderr}\n")
+        if r.returncode == 0 and (bundle / "adapter_meta.json").exists():
+            log(f"arm {n}: exported bundle from {ckpt.name} {extra}")
+            return bundle
+        log(f"arm {n}: export from {ckpt.name} {extra} failed (rc={r.returncode}) — trying next")
+    log(f"arm {n}: export FAILED on all checkpoints — see export.log")
+    return None
 
 
 def eval_arm(n: int, bundle: Path, name: str, scales: str, seeds: str) -> dict | None:
