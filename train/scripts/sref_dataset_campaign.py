@@ -91,9 +91,15 @@ def build_cfg(n: int, pool: Path, steps: int) -> tuple[Path, Path]:
     ck = ROOT / f"arm_{n}" / "ckpt"
     ck.mkdir(parents=True, exist_ok=True)
     cfg["output"]["checkpoint_dir"] = str(ck)
-    cfg["output"]["checkpoint_every"] = steps
-    cfg["output"]["keep_last_n"] = 1
-    cfg["output"]["log_every"] = 100
+    # Periodic checkpoints so a mid-run MLX wedge (BUGS MLX-2 hits the direct trainer too,
+    # observed at step ~900) costs only the steps since the last save — train_arm resumes
+    # from the latest step_*.safetensors on retry instead of restarting from 0.
+    cfg["output"]["checkpoint_every"] = 250
+    cfg["output"]["keep_last_n"] = 3
+    # log_every must be well BELOW the stall window: the monitor flags a wedge when no new
+    # "step N/" line appears for --stall-secs. At ~4.5 s/step, log_every=25 => ~110 s/line,
+    # a clean margin under the 420 s default stall window (false-stall otherwise).
+    cfg["output"]["log_every"] = 25
     cfg.setdefault("eval", {})["enabled"] = False
     p = ROOT / f"arm_{n}" / "config.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -103,12 +109,26 @@ def build_cfg(n: int, pool: Path, steps: int) -> tuple[Path, Path]:
 
 def train_arm(n: int, cfg: Path, steps: int, stall_secs: int, retries: int) -> bool:
     log_f = ROOT / f"arm_{n}" / "train.log"
+    ck = ROOT / f"arm_{n}" / "ckpt"
     for attempt in range(retries + 1):
-        log(f"arm {n}: train attempt {attempt + 1}/{retries + 1}  (steps={steps}) -> {log_f}")
+        # Resume from the latest periodic checkpoint if one exists (wedge recovery /
+        # campaign resumability) so a retry continues instead of restarting from step 0.
+        resume_args: list[str] = []
+        ckpts = sorted(ck.glob("step_*.safetensors"))
+        if ckpts:
+            resume_args = ["--resume", str(ckpts[-1])]
+        log(f"arm {n}: train attempt {attempt + 1}/{retries + 1}  (steps={steps})"
+            f"{' resume ' + ckpts[-1].name if ckpts else ''} -> {log_f}")
+        # Truncate per attempt so the stall monitor's step-progress check starts clean from
+        # this attempt's resume point (a prior attempt's higher step number would defeat it).
         fh = open(log_f, "w")
         proc = subprocess.Popen(
+            # --chunk-base-step 0 pins _end_step = 0 + num_steps = `steps` ABSOLUTE, so a
+            # resumed arm stops at `steps` TOTAL (not start_step + steps). Without it every
+            # wedge-resume would extend the horizon and arms would train unequal totals.
             [str(VENV), "-u", str(TRAINER), "--config", str(cfg),
-             "--max-steps", str(steps), "--run-name", f"campaign_arm{n}"],
+             "--max-steps", str(steps), "--chunk-base-step", "0",
+             "--run-name", f"campaign_arm{n}", *resume_args],
             stdout=fh, stderr=subprocess.STDOUT, cwd=str(REPO),
             preexec_fn=os.setsid,
         )
