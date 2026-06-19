@@ -493,6 +493,19 @@ Hard-won contracts from the warmup-run2 debugging. Violating any silently breaks
    (`max(in_ch,out_ch)*spatial` offset) AND hardened in the kernel (copy-on-overlap). Guard:
    `test_encode_golden` in `debug/test_vae.c`.
 
+6. **NEVER train (or precompute) directly from COLD storage — shard tars MUST be on hot SSD.**
+   The data loader enumerates every shard tar's members BEFORE yielding the first sample, and
+   a cold-storage scan (`/Volumes/16TBCold`, external HDD) is ~31 s/shard vs ~0.8 s on hot SSD
+   (`/Volumes/2TBSSD`). With >3 cold shards the loader blows past its 120 s `sample_q` timeout
+   (`dataset.py make_prefetch_loader`) and the trainer dies at step 0 with "sample_q timeout —
+   worker likely crashed", BEFORE any training. This has recurred repeatedly. **Rule:** any
+   training/precompute run must point `data.shard_path` (and pool/staging dirs) at REAL tars on
+   `/Volumes/2TBSSD` (or another SSD), never at `/Volumes/16TBCold` nor at symlinks that resolve
+   to cold. Copy the selected shards to a hot pool first (the stager does this; `data_stager.py`
+   and `sref_dataset_campaign.py` enforce a hot pool). The npz precompute cache being hot is NOT
+   sufficient — the loader still opens the tars. A 1-shard run can deceptively pass (31 s < 120 s);
+   multi-shard runs fail. Cold storage is for archival/source only.
+
 ## Project docs
 - `BACKLOG.md` — improvement items, pipeline fixes, and training quality items
 - `BUGS.md` — known anomalies and observed issues (training, pipeline)
