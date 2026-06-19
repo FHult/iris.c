@@ -356,6 +356,41 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   (Gram-distance / CSD-like, content-invariant), content-leak from ref (subject copied?
   lower=better), prompt adherence (CLIP-T). This becomes the shippable-champion criterion
   (the held-out cond_gap remains the training-internal signal).
+- **SREF-EVAL-PARAMS (read before any recipe/dataset comparison).** The sref eval is NOT a
+  single number per adapter — its outcome is dominated by inference-time knobs that are
+  ORTHOGONAL to the training recipe, so an unmatched comparison silently mis-ranks recipes.
+  Measured 2026-06-19 on the v4 adapter (`bundle_inputnorm`, input-norm fix), 4-step
+  distilled, seed 42, CSD refs from `/Volumes/2TBSSD/sref_eval`:
+  - **`--ip-scale` is the dominant axis.** It multiplies the trained per-block `ip_scale`.
+    The transition from "no effect" to "collapse" is SHARP and depends on BOTH the reference
+    AND the prompt/content. Measured matrix:
+    - cubism-stilllife ref + "cat on a windowsill": **0.4** clean cat, ~zero style → **0.5**
+      cat + muddy texture (transitional) → **0.6/1.0** content-free collapse.
+    - impressionism-landscape ref + "cat on a windowsill": **0.6** already collapsed to the
+      SAME brown texture as cubism@0.6.
+    - expressionism-portrait ref + "portrait of a woman": **0.6** still semi-coherent
+      (stylized sepia portrait, content survives).
+    Two consequences: (a) the coherent scale is **reference- AND prompt-dependent** — a
+    portrait tolerates higher scale than a cat-on-windowsill; a single fixed scale is
+    coherent for some pairs and collapsed for others. (b) The high-scale failure is a
+    **generic, reference-INDEPENDENT brown texture** (cubism@0.6 ≈ impressionism@0.6), i.e.
+    v4's style SPECIFICITY is weak — at the strength where it does anything, it collapses to
+    a non-specific mush rather than transferring THIS reference's style. That collapse-
+    specificity (does a stronger injection still look like the reference?) is itself a
+    primary thing the dataset/recipe experiments must MOVE, and the eval must reward it.
+  - **Consequence for recipe experimentation:** sweep `--ip-scale` per arm (e.g.
+    {0.3,0.5,0.7,0.9}) and compare the **style_sim ↔ content_leak frontier** (the sref_score
+    envelope), not a single point. Pick the operating point by a FIXED budget — a
+    content_leak ceiling or a prompt_adherence floor — then compare style_sim at that matched
+    point across arms. This decouples the recipe effect from the scale effect. Single-scale
+    scoring is only valid if every arm is coherent at that one scale (verify, don't assume).
+  - **Secondary axes to PIN (hold constant across all arms):** seed (high per-image variance
+    at 4 distilled steps — use a fixed seed set, ≥2 seeds/pair, report mean), step count,
+    prompt set, reference set, and `freeze_double_stream_scales` (v4 trains style via
+    single-stream only, so double-stream scale changes are inert — don't sweep them).
+  - Wire this into the harness (SREF-2): a per-arm scale sweep + frontier/matched-budget
+    comparison, not a scalar. The current `sref_eval.py` scores a fixed pair set; the
+    missing piece is the scale-sweep driver and the frontier aggregation.
 - **SREF-3: app integration path (no Phase-3 blocker).** web/server.py (Python) computes
   SigLIP features for the user upload → f32 file → `iris --ip … --ip-features …`. Ships
   the feature with the C engine generating. Then: multi-ref (concat SigLIP rows from
