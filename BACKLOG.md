@@ -322,6 +322,42 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   the trainer's thousands-separator (`step 1,025/…`), false-killing healthy runs at ~step 975
   — the phantom that masqueraded as an "MLX wedge at step 1000" (there was no wedge).
 
+- **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
+  tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset
+  experiments ran through bespoke scripts (`sref_dataset_campaign.py`, `sref_sweep_eval.py`,
+  manual `style_precompute`/`style_neighbors`, hand-built symlink pools) that DUPLICATE a thin
+  slice of infrastructure that already exists — and lose everything that makes it science:
+  - **Selection:** arms were arbitrary nested symlink subsets. The right substrate is
+    `campaign_manager.py` — reproducible, score-ranked shard MANIFESTS with boolean
+    composition (`source(wikiart)`, `top_pct(50)`, `balanced`, `… AND NOT source(laion)`),
+    backed by `shard_scores.db`. This is exactly the per-source / curated / quantity
+    composition lever the recipe ablations need. USE IT instead of ad-hoc pools.
+  - **Tracking/championing:** the ad-hoc runner writes a flat `campaign_report.json`; the
+    flywheel/ablation path has persistent champions + ablation DBs (cross-run comparison,
+    `quality_gate.py`, attribution). Recipe arms should land there.
+  - **Pipeline reuse:** the orchestrator already does select→stage→precompute→**style-index
+    (SREF-1W, the style_neighbors step is wired)**→train→eval→score→champion, with hot-pool
+    staging and an existing `ablation_sref_v1.yaml`. The ad-hoc path re-implements staging
+    (badly at first — the cold-tar bug) and skips the style index entirely (→ the `style_pair=0%`
+    unpaired arms).
+  - **Why the detour happened (and the ONE enabling fix):** the flywheel WEDGES (BUGS MLX-2)
+    and its prior results were invalid (pre-v4 adapters), so a working path was stood up fast.
+    The missing primitive that forced the fork is a **non-flywheel, direct-single-process
+    execution mode** for campaign/ablation arms — same selection + staging + DB + eval, but the
+    arm trains via a plain `train_ip_adapter.py` subprocess (≈ what the ad-hoc runner does)
+    instead of the wedging flywheel loop. Add that mode, then recipe experiments get
+    `campaign_manager` selection + ablation/champion DBs + orchestrator staging/style-index
+    WITHOUT the wedge.
+  - **Also fold in** the genuinely-new good parts of the ad-hoc tooling so they aren't lost:
+    the ip-scale **frontier** eval (`sref_sweep_eval.py`, SREF-EVAL-PARAMS) as a first-class
+    campaign eval step that ranks arms by **sref_score** (the real metric) not just cond_gap;
+    and hot-pool enforcement (AGENT.md invariant #6).
+  - **Sequencing:** do this when promoting the post-platform recipe ablations (see SESSION
+    INSIGHTS above + memory `sref-platform-strategy`) — i.e. AFTER one working style-paired
+    platform adapter exists. Until then the ad-hoc path is an acceptable bring-up shim, but it
+    should not become the permanent home for recipe science. Relates to ABL-FIDELITY,
+    SREF-OPT-1, SREF-DATA-1.
+
 - **SREF-1 (HIGHEST): style-paired training data via style clustering.** Root-cause
   finding: `cross_ref` swaps in the PREVIOUS LOADER IMAGE's SigLIP features
   (train_ip_adapter.py ~1780) — an arbitrary pairing. Asked to predict a target from a
