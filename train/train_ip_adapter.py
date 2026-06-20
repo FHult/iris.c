@@ -120,9 +120,12 @@ def make_lr_schedule(lr_max: float, warmup_steps: int, total_steps: int,
         # making the slope ~2× steeper than the original schedule at mid-decay.
         decay_done = start_step - warmup_steps
         decay_total = max(1, total_steps - warmup_steps)
-        def _resumed_cosine(step: int) -> float:
-            t = min(step + decay_done, decay_total)
-            return eta_min + 0.5 * (lr_max - eta_min) * (1.0 + math.cos(math.pi * t / decay_total))
+        def _resumed_cosine(step):
+            # `step` is the optimizer's mx.array step counter. MUST return an mx.array:
+            # MLX's optimizer does `learning_rate.astype(...)`, which a Python float lacks
+            # (AttributeError crashes AdamW on the first update after any resume/warmstart).
+            t = mx.minimum(step + decay_done, decay_total)
+            return eta_min + 0.5 * (lr_max - eta_min) * (1.0 + mx.cos((math.pi / decay_total) * t))
         return _resumed_cosine
 
 
