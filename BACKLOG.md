@@ -357,10 +357,13 @@ has nothing to do with the reference. Results (CSD, 512px, seed 42, 10 pairs):
 5. **Quantity, pairing — both ruled out as the lever.** Everything sits at injection-ratio
    ~0.6. The lever is content–style DISENTANGLEMENT, not data treatment.
 
-**Eval tooling change (done):** `sref_sweep_eval.py` gains `--null <scores.json>` to report
-Δstyle/Δleak/Δsref + injection ratio per scale against the no-adapter baseline. Null baseline
-lives at `/Volumes/2TBSSD/sref_eval/noadapter/` (regen: plain `iris` over `eval_set.json`
-prompts → `sref_eval.py`). All future SREF arms MUST be read null-relative.
+**Eval tooling change (done + validated):** `sref_sweep_eval.py` gains `--null <scores.json>` to
+report Δstyle/Δleak/Δsref + injection ratio per scale against the no-adapter baseline. Null
+baseline lives at `/Volumes/2TBSSD/sref_eval/noadapter/` (regen: plain `iris` over
+`eval_set.json` prompts → `sref_eval.py`). All future SREF arms MUST be read null-relative.
+Validated on the style arm — per-scale injection ratio (Δstyle/Δleak): **0.3 → 0.05** (barely
+injects), **0.5 → 0.59** (best), **0.7 → 0.45**. So the operating point is ~0.5 and the number
+to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 to clear the null.
 
 - **SREF-LEAK-1: reduce content leakage (the actual objective — maximize Δstyle − Δleak).**
   The adapter injects style but leaks the reference's content harder (ratio ~0.6). Levers,
@@ -377,9 +380,14 @@ prompts → `sref_eval.py`). All future SREF arms MUST be read null-relative.
     steps (e.g. 15–20k). Expensive; gate behind the cheap levers first.
   - **Inference-side**: the ip-scale frontier already shows leak rises with scale — the
     matched-budget operating point (fixed leak ceiling) is the deployment lever, separate from
-    training. First experiment recommended: patch_shuffle 0.5 vs 1.0 (± token compression) on
-    the style-paired config, 3000 steps, compared by Δstyle − Δleak. Relates to SREF-1 (pairing),
-    QUALITY-3 (patch-shuffle), QUALITY-2 (freeze double-stream — already on; double ip_scale=0).
+    training. Relates to SREF-1 (pairing), QUALITY-3 (patch-shuffle), QUALITY-2 (freeze
+    double-stream — already on; double ip_scale=0).
+  - **First arm LAUNCHED 2026-06-20: `leak1_pshuf`** — style-paired config, ONLY change
+    `patch_shuffle_prob` 0.5→1.0 (one variable), from scratch, 3000 steps, hot pool + the
+    CSD `neighbors.sqlite`. Config `/Volumes/2TBSSD/sref_eval/leak1_pshuf/`. **Success = injection
+    ratio (Δstyle/Δleak @ best scale) beats the style arm's 0.59**, ideally toward 1.0. Score
+    with `sref_sweep_eval.py --null` (NOT raw sref_score). If patch-shuffle alone doesn't move
+    it, next is token compression, then the CSD content-leak loss term, then longer training.
 
 - **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
   tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset

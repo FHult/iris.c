@@ -70,6 +70,11 @@ This project implements three targets:
 - Keep code simple and understandable; leave no dead code.
 - If you optimize one backend, verify others were not regressed.
 - Stick to standard C; avoid compiler-specific tricks/pragmas unless strictly required.
+- **Log learnings as you get them.** Whenever an experiment, measurement, or debugging session
+  yields a finding (a result, a ruled-out hypothesis, a metric caveat, a recurring bug, a
+  corrected assumption), write it to `BACKLOG.md` (or `BUGS.md` for defects) immediately — with
+  numbers and the date — rather than only reporting it in chat. Mark superseded entries rather
+  than deleting them; keep the trail. The backlog is the durable record of what we know.
 
 # How To Run
 
