@@ -281,6 +281,47 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### SESSION INSIGHTS — 2026-06-20 (direct-trainer dataset experiments; read first)
+- **No adapter yet transfers style.** v4 (`bundle_inputnorm`, the grid-fixed input-norm
+  release) AND every from-scratch direct-trainer arm score NEGATIVE sref_score at every
+  ip-scale on the CSD eval (style_sim ~0.02–0.10 < content_leak ~0.35–0.47). The grid bug is
+  fixed but the model still doesn't do `--sref`. This is the bar to beat: cross sref_score
+  into positive territory.
+- **Root cause = the training SIGNAL, not capacity/length/quantity.** All those arms ran with
+  `style_pair=0%` — the direct campaign never wired `data.style_neighbors_db`, so cross-ref
+  used ARBITRARY pairing (SREF-1's exact failure mode → optimal policy is ignore the
+  reference → weak/negative cond_gap). NOTE the gap: SREF-1W wired style pairing into the
+  FLYWHEEL/orchestrator path, but the direct trainer needs `style_neighbors_db` set in its
+  config explicitly — easy to forget, and it silently produces unpaired (weak) adapters.
+- **Style pairing is VIABLE at scale (gate re-confirmed).** Built the CSD style index on the
+  real 22-shard hot pool (`baseline_pool_hot`, 109,253 records): `style_neighbors.py` top-5
+  NN/random ratio = **0.569** (gate ≤ 0.7; the ruled-out 4-bit SigLIP descriptors were
+  0.86–0.96; the val-set CSD number was 0.679). 7,536 near-dup exclusions. 93% of records got
+  a usable neighbor. So the SREF-1 substrate genuinely works — the blocker was always the
+  descriptor, now solved by CSD.
+- **The data-QUANTITY ladder result is a CONFOUNDED RED HERRING.** 4-shard ≈ 22-shard (no
+  benefit from more data) is valid ONLY for the broken-signal (unpaired) regime, on nested
+  ARBITRARY subsets — not meaningful composition. Do not treat "quantity doesn't help" as
+  general. **Re-run quantity AND composition (per-source, curated-vs-random, style-coverage)
+  on the working style-paired platform** — that's the first recipe ablation once the platform
+  lands. The ladder still earned its keep: backed the intuition and flushed out the infra bugs.
+- **Sequencing (load-bearing): platform FIRST, ablate SECOND.** Get one working style-paired
+  adapter (positive sref_score) → freeze that config as the reference platform → run recipe
+  ablations branching from it. Ablating recipes on a broken-signal adapter measures noise.
+  Memory: `sref-platform-strategy`. Active run config: `/Volumes/2TBSSD/sref_eval/style_arm/`.
+- **Eval method (SREF-EVAL-PARAMS, below):** an adapter is a style_sim↔content_leak FRONTIER
+  over `--ip-scale`, not a scalar; compare arms at a MATCHED content_leak budget. Harness:
+  `sref_sweep_eval.py` + `sref_eval.py` (CSD) on the fixed WikiArt eval set in
+  `/Volumes/2TBSSD/sref_eval/`.
+- **Infra lessons (all fixed/committed this session — guard against recurrence):**
+  (1) NEVER train/precompute from COLD storage — the loader enumerates every shard tar before
+  the first sample at ~31 s/shard cold vs ~0.8 s hot, so >3 cold shards exceed the 120 s
+  `sample_q` timeout and the trainer dies at step 0 (AGENT.md invariant #6). (2) `--resume`
+  crashed AdamW: `make_lr_schedule`'s resume branch returned a Python float, MLX does
+  `learning_rate.astype()` (commit fixed). (3) A campaign stall-monitor regex `\d+` choked on
+  the trainer's thousands-separator (`step 1,025/…`), false-killing healthy runs at ~step 975
+  — the phantom that masqueraded as an "MLX wedge at step 1000" (there was no wedge).
+
 - **SREF-1 (HIGHEST): style-paired training data via style clustering.** Root-cause
   finding: `cross_ref` swaps in the PREVIOUS LOADER IMAGE's SigLIP features
   (train_ip_adapter.py ~1780) — an arbitrary pairing. Asked to predict a target from a
