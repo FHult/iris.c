@@ -134,6 +134,10 @@ def main() -> int:
     ap.add_argument("--scales", default="0.3,0.5,0.7")
     ap.add_argument("--seeds", default="42")
     ap.add_argument("--csd-weights", default="/Volumes/2TBSSD/models/csd_vit_l_style.safetensors")
+    ap.add_argument("--null", default="/Volumes/2TBSSD/sref_eval/noadapter/scores.json",
+                    help="no-adapter null-baseline scores.json. Raw sref_score is FLOOR-"
+                         "confounded (content_leak ~0.32 even for unrelated images); deltas vs "
+                         "this null are the real metric (BACKLOG NULL-FLOOR REFRAME).")
     args = ap.parse_args()
 
     spec = json.loads(Path(args.eval_set).read_text())
@@ -166,15 +170,57 @@ def main() -> int:
 
     scores = json.loads(scores_path.read_text())
     fr = frontier(scores)
+
+    # Null-relative deltas: raw sref_score is floor-confounded (content_leak ~0.32 even for
+    # unrelated images). The real signal is Δstyle − Δleak vs the no-adapter null, and the
+    # injection ratio Δstyle/Δleak (need > 1.0 to beat the null). See BACKLOG NULL-FLOOR REFRAME.
+    null = None
+    if args.null and Path(args.null).exists():
+        try:
+            _na = json.loads(Path(args.null).read_text()).get("aggregate", {})
+            null = {"style_sim": _na["style_sim"]["mean"],
+                    "content_leak": _na["content_leak"]["mean"]}
+        except Exception as _e:
+            print(f"  (null baseline unreadable: {_e})", file=sys.stderr)
+    if null is not None:
+        for sc, a in fr.items():
+            if a.get("style_sim") is None or a.get("content_leak") is None:
+                continue
+            d_style = round(a["style_sim"] - null["style_sim"], 4)
+            d_leak = round(a["content_leak"] - null["content_leak"], 4)
+            a["d_style"] = d_style
+            a["d_leak"] = d_leak
+            a["d_sref"] = round(d_style - d_leak, 4)            # the real objective
+            a["inj_ratio"] = round(d_style / d_leak, 3) if d_leak else None  # want > 1.0
+
+    # Keep frontier.json a FLAT scale->agg dict (delta fields added in-place per scale) for
+    # backward compatibility with readers that iterate scales; null baseline goes to a sibling.
     (run_dir / "frontier.json").write_text(json.dumps(fr, indent=2))
+    if null is not None:
+        (run_dir / "null_baseline.json").write_text(json.dumps(null, indent=2))
 
     print(f"\n=== sref frontier: {args.name} ===")
-    print(f"{'scale':>6} {'n':>3} {'style_sim':>10} {'leak':>8} {'sref':>8} {'prompt':>8}")
-    for sc, a in fr.items():
-        def f(x):
-            return f"{x:+.4f}" if isinstance(x, (int, float)) else "   —  "
-        print(f"{sc:>6} {a['n']:>3} {f(a['style_sim']):>10} {f(a['content_leak']):>8} "
-              f"{f(a['sref_score']):>8} {f(a['prompt_adherence']):>8}")
+    if null is not None:
+        print(f"null baseline: style_sim={null['style_sim']:+.4f}  content_leak={null['content_leak']:+.4f}")
+        print(f"{'scale':>6} {'n':>3} {'Δstyle':>8} {'Δleak':>8} {'Δsref':>8} {'ratio':>6} "
+              f"{'(style':>8} {'leak':>7} {'sref)':>8} {'prompt':>8}")
+        for sc, a in fr.items():
+            def f(x):
+                return f"{x:+.4f}" if isinstance(x, (int, float)) else "   —  "
+            def g(x):
+                return f"{x:.3f}" if isinstance(x, (int, float)) else "  —  "
+            print(f"{sc:>6} {a['n']:>3} {f(a.get('d_style')):>8} {f(a.get('d_leak')):>8} "
+                  f"{f(a.get('d_sref')):>8} {g(a.get('inj_ratio')):>6} {f(a.get('style_sim')):>8} "
+                  f"{f(a.get('content_leak')):>7} {f(a.get('sref_score')):>8} {f(a.get('prompt_adherence')):>8}")
+        print("  (Δsref = Δstyle − Δleak is the real objective; inj_ratio = Δstyle/Δleak, want > 1.0)")
+    else:
+        print(f"{'scale':>6} {'n':>3} {'style_sim':>10} {'leak':>8} {'sref':>8} {'prompt':>8}")
+        for sc, a in fr.items():
+            def f(x):
+                return f"{x:+.4f}" if isinstance(x, (int, float)) else "   —  "
+            print(f"{sc:>6} {a['n']:>3} {f(a['style_sim']):>10} {f(a['content_leak']):>8} "
+                  f"{f(a['sref_score']):>8} {f(a['prompt_adherence']):>8}")
+        print("  (no --null baseline → raw scores only; these are FLOOR-confounded, see BACKLOG)")
     print(f"\nwrote {scores_path}\nwrote {report_path}\nwrote {run_dir/'frontier.json'}")
     return 0
 

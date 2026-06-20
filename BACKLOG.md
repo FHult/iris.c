@@ -282,15 +282,15 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
 ### SESSION INSIGHTS — 2026-06-20 (direct-trainer dataset experiments; read first)
-- **No adapter yet transfers style.** v4 (`bundle_inputnorm`, the grid-fixed input-norm
-  release) AND every from-scratch direct-trainer arm score NEGATIVE sref_score at every
-  ip-scale on the CSD eval (style_sim ~0.02–0.10 < content_leak ~0.35–0.47). The grid bug is
-  fixed but the model still doesn't do `--sref`. This is the bar to beat: cross sref_score
-  into positive territory.
-- **Root cause = the training SIGNAL, not capacity/length/quantity.** All those arms ran with
-  `style_pair=0%` — the direct campaign never wired `data.style_neighbors_db`, so cross-ref
-  used ARBITRARY pairing (SREF-1's exact failure mode → optimal policy is ignore the
-  reference → weak/negative cond_gap). NOTE the gap: SREF-1W wired style pairing into the
+- **[PARTLY SUPERSEDED — see "NULL-FLOOR REFRAME" below.]** Earlier read: "no adapter
+  transfers style — all NEGATIVE sref_score (style_sim ~0.02–0.10 < content_leak ~0.35–0.47)."
+  The negative *absolute* sref_score turned out to be FLOOR-confounded; measured vs a
+  no-adapter null, the adapters DO inject style. The failure is content LEAKAGE, not absent
+  style. Keep reading.
+- **[SUPERSEDED — style pairing was TESTED and did NOT help; see NULL-FLOOR REFRAME.]** Earlier
+  hypothesis: the arms were weak only because they ran with `style_pair=0%` (the direct
+  campaign never wired `data.style_neighbors_db` → arbitrary pairing → ignore the reference).
+  That wiring GAP is real and worth knowing — SREF-1W wired style pairing into the
   FLYWHEEL/orchestrator path, but the direct trainer needs `style_neighbors_db` set in its
   config explicitly — easy to forget, and it silently produces unpaired (weak) adapters.
 - **Style pairing is VIABLE at scale (gate re-confirmed).** Built the CSD style index on the
@@ -321,6 +321,65 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
   `learning_rate.astype()` (commit fixed). (3) A campaign stall-monitor regex `\d+` choked on
   the trainer's thousands-separator (`step 1,025/…`), false-killing healthy runs at ~step 975
   — the phantom that masqueraded as an "MLX wedge at step 1000" (there was no wedge).
+
+#### NULL-FLOOR REFRAME — the most important SREF finding so far (2026-06-20, later)
+
+After the style-paired arm ALSO scored ≈ the same negative sref_score as the unpaired arms,
+ran the missing control: a **no-adapter plain-Flux** generation for the same 10 prompts,
+scored against the same WikiArt refs. This is the NULL — a generation that, by construction,
+has nothing to do with the reference. Results (CSD, 512px, seed 42, 10 pairs):
+
+| config | style_sim | content_leak | sref_score | Δstyle vs null | Δleak vs null |
+|---|---|---|---|---|---|
+| **null (no adapter)** | **+0.004** | **+0.323** | **−0.319** | — | — |
+| v4 baseline @0.5 | +0.091 | +0.468 | −0.376 | **+0.087** | **+0.145** |
+| arm_4 (4sh, unpaired) @0.5 | +0.104 | +0.466 | −0.362 | +0.100 | +0.143 |
+| style arm (paired) @0.5 | +0.089 | +0.466 | −0.377 | +0.085 | +0.143 |
+
+**Conclusions (these correct earlier bullets):**
+1. **Absolute sref_score is FLOOR-confounded — stop using it raw.** A generation unrelated to
+   the reference already scores content_leak **0.32** and sref **−0.32**. CSD's content head
+   has a high baseline cosine (~0.32) between any two natural images; style_sim's baseline is
+   ~0 (0.004). So "−0.33 = bad" was a metric artifact, not model failure. **Report DELTAS over
+   the no-adapter null**, per scale: Δstyle_sim, Δcontent_leak, and the real objective
+   **Δstyle − Δleak** (and the injection ratio Δstyle/Δleak).
+2. **The adapters are NOT inert — they DO inject style.** style_sim 0.004 → ~0.09 is a ~20× lift
+   (Δstyle ≈ +0.086). The model genuinely does style transfer. The earlier "no adapter
+   transfers style" read was wrong; it was reading the floor.
+3. **The real failure mode is CONTENT LEAKAGE.** The adapter pulls the reference's *content*
+   in even harder than its style: Δleak ≈ +0.144 > Δstyle ≈ +0.086. Injection ratio
+   Δstyle/Δleak ≈ **0.6** (need > 1.0 to beat null). The objective is to **raise that ratio /
+   maximize Δstyle − Δleak**, i.e. keep the style, kill the content bleed.
+4. **Style pairing did NOT change the tradeoff at 3000 steps.** v4 (unpaired) and the style arm
+   (paired, gate 0.569, 75% engaged) have ~identical Δstyle and Δleak. Pairing was *supposed*
+   to reduce leak (different-content ref → copying it should hurt) but didn't at this budget.
+   Real negative for pairing-at-3000-from-scratch — but now we know the metric to move.
+5. **Quantity, pairing — both ruled out as the lever.** Everything sits at injection-ratio
+   ~0.6. The lever is content–style DISENTANGLEMENT, not data treatment.
+
+**Eval tooling change (done):** `sref_sweep_eval.py` gains `--null <scores.json>` to report
+Δstyle/Δleak/Δsref + injection ratio per scale against the no-adapter baseline. Null baseline
+lives at `/Volumes/2TBSSD/sref_eval/noadapter/` (regen: plain `iris` over `eval_set.json`
+prompts → `sref_eval.py`). All future SREF arms MUST be read null-relative.
+
+- **SREF-LEAK-1: reduce content leakage (the actual objective — maximize Δstyle − Δleak).**
+  The adapter injects style but leaks the reference's content harder (ratio ~0.6). Levers,
+  cheap→expensive, to test as small arms on the working harness, each scored by Δstyle − Δleak
+  null-relative (NOT raw sref_score):
+  - **Aggressive reference content-destruction** (cheapest, highest-leverage): `patch_shuffle_prob`
+    is only 0.5 — raise to ~1.0 and/or shuffle harder. Patch-shuffle scrambles the reference's
+    spatial layout (content) while preserving local texture (style) — directly targets leak.
+  - **Token compression** in the PerceiverResampler: fewer `num_image_tokens` (128 → 64/32)
+    forces the resampler to drop fine content detail, keep gist/style. Architecture knob.
+  - **Content-leak penalty in the loss**: add a CSD-content-distance term (push content(gen)
+    AWAY from content(ref)); CSD encoder already in-repo. The principled fix; more work.
+  - **Longer training WITH pairing**: pairing's content-invariance may only emerge past 3000
+    steps (e.g. 15–20k). Expensive; gate behind the cheap levers first.
+  - **Inference-side**: the ip-scale frontier already shows leak rises with scale — the
+    matched-budget operating point (fixed leak ceiling) is the deployment lever, separate from
+    training. First experiment recommended: patch_shuffle 0.5 vs 1.0 (± token compression) on
+    the style-paired config, 3000 steps, compared by Δstyle − Δleak. Relates to SREF-1 (pairing),
+    QUALITY-3 (patch-shuffle), QUALITY-2 (freeze double-stream — already on; double ip_scale=0).
 
 - **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
   tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset
