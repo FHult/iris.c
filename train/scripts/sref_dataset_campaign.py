@@ -139,8 +139,11 @@ def train_arm(n: int, cfg: Path, steps: int, stall_secs: int, retries: int) -> b
             if "Training complete" in txt:
                 ok = True
                 break
-            m = re.findall(r"step\s+(\d+)/", txt)
-            cur = int(m[-1]) if m else 0
+            # Trainer formats the step with a thousands separator ("step 1,025/3,000"),
+            # so the digit class MUST include the comma — otherwise steps >= 1000 parse as
+            # "1", read as a regression, and a healthy run is false-killed at ~step 975.
+            m = re.findall(r"step\s+([\d,]+)/", txt)
+            cur = int(m[-1].replace(",", "")) if m else 0
             if cur > last_step:
                 last_step, last_prog = cur, time.time()
             if rc is not None:
