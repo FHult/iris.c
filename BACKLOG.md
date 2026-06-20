@@ -352,6 +352,16 @@ content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap anal
     the ip-scale **frontier** eval (`sref_sweep_eval.py`, SREF-EVAL-PARAMS) as a first-class
     campaign eval step that ranks arms by **sref_score** (the real metric) not just cond_gap;
     and hot-pool enforcement (AGENT.md invariant #6).
+  - **DB schema gap (required for this):** `ablation_harness.py`'s `experiments` table records
+    only `cond_gap`/`ref_gap`/`final_loss` and a cond_gap-weighted `score` — there is NO
+    `sref_score`/`style_sim`/`content_leak` column, so it cannot rank SREF arms by the real
+    metric. Add those columns (+ make `score` selectable to a sref_score-based objective).
+    Corollary: do NOT back-import the 2026-06-20 ad-hoc arms — the quantity arms are invalid
+    (unpaired) and would pollute champion selection, and all of them lack campaign provenance
+    (no manifest, frontier-not-cond_gap) so DB rows would imply a false comparability with
+    future proper-campaign arms. Keep them as documented reference (frontier JSONs + the
+    SESSION INSIGHTS block), not DB rows. The working style platform adapter is better
+    registered via a clean proper-tooling re-run than imported.
   - **Sequencing:** do this when promoting the post-platform recipe ablations (see SESSION
     INSIGHTS above + memory `sref-platform-strategy`) — i.e. AFTER one working style-paired
     platform adapter exists. Until then the ad-hoc path is an acceptable bring-up shim, but it
