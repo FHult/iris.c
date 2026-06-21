@@ -440,6 +440,33 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     - Root-cause option (big): condition on CSD STYLE embeddings (content-invariant by
       construction — that's why the neighbor gate passed at 0.569) instead of/with SigLIP.
 
+  #### CSD-CONDITIONING BUILD LOG (SREF-LEAK-2, 2026-06-21 — running design notes)
+  Chose the root-cause fix (condition on CSD, not SigLIP). Decisions + reasoning as built:
+  - **Architecture: `CSDImageProj` (FiLM-modulated learned queries), NOT a perceiver.** CSD is
+    ONE 768-d vector, not a token set, so cross-attention/resampling is meaningless (128 queries
+    over 1 kv → all identical → collapse). Instead: 128 learned query tokens, FiLM-modulated by
+    the CSD vector (`tokens = q*(1+scale)+shift`, scale/shift = Linear(768→2·3072)), then
+    LayerNorm. The 128 distinct queries carry diversity, the CSD vector carries style → cannot
+    pool/collapse. Chose FiLM over self-attention deliberately: (a) simplest to MIRROR in C
+    inference (Linear+FiLM+LN, no new attention kernel), (b) lowest collapse risk. If
+    under-expressive, add a self-attn block later (also portable). **Validated** (phase 1a,
+    commit 2f74871): cross-token std/|mean| 0.843 (vs grid ~0.007 = healthy/no-collapse),
+    responsive to different CSD inputs (Δ 0.657), correct K/V shapes. `IPAdapterKlein` gains
+    `cond_mode` "siglip"|"csd" (default siglip — SigLIP path untouched).
+  - **NO eval signal until the C port lands.** The eval generates with `iris` (C); the trainer
+    has no standalone image-generation path. So this is a full Python-train + C-infer build
+    before any sref_score. Accepted (user: keep going).
+  - **Primary RISK being tracked: 768-d fidelity bottleneck.** CSD's 768 numbers vs SigLIP's
+    729×1152 ≈ 840k — a huge compression. CSD may reduce leak but also cap STYLE fidelity (low
+    leak + low style = wash). First eval decides; if style is too weak, fall back to the
+    contrastive style-invariance loss on SigLIP (keeps the rich signal) — option (ii) above.
+  - **Phases:** 1a module ✓ · 1b CSD dataset loader (per-SHARD npz bundles, not per-record;
+    neighbor CSD; coverage filter) + trainer guards (warmup/miss/val zero-shapes → [B,768]; skip
+    patch-shuffle in csd mode — no tokens to shuffle) + smoke · 2 C inference (mirror in
+    `iris_ip_adapter.c`, `--ip-features` → 768-d, `csd_features.py` producer) · 3 retrain + eval.
+  - Cache: CSD features already precomputed at `/Volumes/2TBSSD/sref_eval/style_cache/*.npz`
+    ([768] f16 per record, keyed by rec_id, per-shard bundles).
+
 - **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
   tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset
   experiments ran through bespoke scripts (`sref_dataset_campaign.py`, `sref_sweep_eval.py`,
