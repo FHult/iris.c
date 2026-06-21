@@ -76,6 +76,40 @@ This project implements three targets:
   numbers and the date — rather than only reporting it in chat. Mark superseded entries rather
   than deleting them; keep the trail. The backlog is the durable record of what we know.
 
+# Training→Inference Correctness Protocol (mandatory for the train↔infer boundary)
+
+Any computation implemented in Python training AND re-implemented for C inference (IP-adapter
+perceive, VAE, transformer blocks, feature encoders) is a mismatch hazard. Silent train↔infer
+shape/math divergences have cost days here (IP-ADAPTER-INFER-1: wrong perceiver head grouping;
+VAE-Q1: latent-space convention). Before declaring such code correct, ALL of the following:
+
+1. **Golden-fixture parity test (the guard).** The PYTHON module computes the golden; the C
+   reproduces it to a TIGHT tolerance (corr > 0.999, max_abs ≤ 1e-3). Commit it to `make test`
+   as a regression guard (e.g. `debug/test_ip_adapter.c` + `gen_ip_adapter_fixture.py`). The
+   fixture MUST exercise the real math — randomise any zero-/identity-initialised params
+   (e.g. FiLM-zero, adaLN-zero) so the matmul is actually tested, not a trivial case. Use dims
+   that break degenerate groupings (e.g. perceiver_heads ≠ hidden/128).
+2. **Compile-check under FULL PRODUCTION flags.** A green parity test under plain `-O2` is
+   necessary but NOT sufficient — re-compile the test with the exact production flags
+   (`-O3 -march=native -ffast-math -flto -DUSE_BLAS -DACCELERATE_NEW_LAPACK -framework Accelerate`)
+   and re-run. `-ffast-math` reorders float ops; confirm the delta is noise (≤ ~1e-5), not a
+   mismatch. Bit-identical is not required; "noise not mismatch" is.
+3. **Rebuild the SHIPPED binary — `make mps`, not `make`.** Bare `make` only prints help. The
+   parity test compiles the `.c` from source, so a GREEN TEST DOES NOT PROVE the `iris`
+   executable is current. After ANY C inference change, `make mps` and confirm the binary
+   relinks (timestamp changes, no errors). The eval/generation runs the binary, not the test.
+4. **Encoder/preprocessing parity (the fixture CANNOT catch this).** A parity fixture feeds the
+   SAME bytes to both sides, so it never checks that inference PRODUCES the same input the model
+   trained on. The inference feature producer must call the IDENTICAL preprocessing + encoder as
+   the training precompute (same function: same resize/crop/normalisation, same encode, same
+   L2-norm). Verify by reading BOTH callers. (Training-cache quantisation vs f32 inference is an
+   accepted precision convention — see siglip_features.py — not a mismatch.)
+5. **Source-level shape/convention audit.** Cross-check every tensor's shape, dtype, and
+   orientation: nn.Linear weight is `[out, in]` (C matmul_t expects that); `mx.split` half-order
+   (scale before shift); LayerNorm uses BIASED variance + matching eps; einsum contraction axes.
+6. **Name deferred/expected gaps** (export key maps for a new mode, a disabled val path) in the
+   commit/BACKLOG so they are not later mistaken for bugs.
+
 # How To Run
 
 Flux examples:
