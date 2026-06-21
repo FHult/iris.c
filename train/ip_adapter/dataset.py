@@ -278,6 +278,24 @@ def _load_siglip_embed(rec_id: str, siglip_dir: Optional[str]) -> Optional[np.nd
         return None
 
 
+def _load_csd_bundles(csd_dir: Optional[str]) -> dict:
+    """SREF-LEAK-2: load all per-shard CSD style-embedding bundles into {rec_id: [csd_dim] f16}.
+    style_precompute.py writes <dir>/<shard>.npz with keys=rec_ids (NOT per-record files — the
+    cold-HDD enumeration trap). ~168 MB for 109K records; held in memory for the loader's life."""
+    out: dict = {}
+    if not csd_dir or not os.path.isdir(csd_dir):
+        return out
+    import glob as _glob
+    for p in sorted(_glob.glob(os.path.join(csd_dir, "*.npz"))):
+        try:
+            with np.load(p) as d:   # context-manager closes the NpzFile handle
+                for k in d.files:
+                    out[k] = d[k].astype(np.float16)
+        except Exception:
+            continue
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Shard content iteration
 # ---------------------------------------------------------------------------
@@ -323,6 +341,8 @@ def make_prefetch_loader(
     hard_example_dir: Optional[str] = None,
     hard_mix_ratio: float = 0.05,
     style_neighbors_db: Optional[str] = None,
+    cond_mode: str = "siglip",          # "siglip" (per-record npz) | "csd" (per-shard bundles)
+    csd_cache_dir: Optional[str] = None,  # SREF-LEAK-2: CSD style-embedding cache (style_precompute.py)
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -450,6 +470,21 @@ def make_prefetch_loader(
     # just the nearest record in a sparse pool, not the same style — pairing it
     # would re-introduce the arbitrary-pairing gradient (and inflate the
     # style_pair telemetry). Matches style_shard_report's strong-neighbor tau.
+    # SREF-LEAK-2: CSD conditioning loads one content-invariant [csd_dim] vector per record from
+    # in-memory per-shard bundles (vs SigLIP's per-record [729,1152] npz). Both feed the same
+    # sfeat_buf/sref_buf slots; the adapter's cond_mode decides how to project them.
+    _csd_map: dict = {}
+    if cond_mode == "csd":
+        _csd_map = _load_csd_bundles(csd_cache_dir)
+        print(f"  [dataset] CSD conditioning: {len(_csd_map):,} records loaded from "
+              f"{csd_cache_dir}", flush=True)
+
+    def _load_cond(rec_id: str):
+        """Conditioning features for a record: CSD [csd_dim] or SigLIP [729,1152]."""
+        if cond_mode == "csd":
+            return _csd_map.get(rec_id)
+        return _load_siglip_embed(rec_id, siglip_cache_dir)
+
     _STYLE_NBR_MIN_COS = 0.6
     _nbr_map: Optional[dict] = None
     if style_neighbors_db and os.path.exists(style_neighbors_db):
@@ -469,7 +504,11 @@ def make_prefetch_loader(
                 # bundles vs a 100-record iteration). Probing here turns silent
                 # per-sample misses (smoke3: style_pair=0% despite 192 mapped
                 # records) into an honest, smaller map.
-                if _kept and siglip_cache_dir:
+                if _kept and cond_mode == "csd":
+                    _have = [nid for nid in _kept if nid in _csd_map]
+                    _n_no_sig += len(_kept) - len(_have)
+                    _kept = _have
+                elif _kept and siglip_cache_dir:
                     _have = [nid for nid in _kept if os.path.exists(
                         os.path.join(siglip_cache_dir, f"{nid}.npz"))]
                     _n_no_sig += len(_kept) - len(_have)
@@ -539,20 +578,19 @@ def make_prefetch_loader(
                 vae_lat = _load_vae_latent(
                     rec["id"], vae_cache_dir, expected_hw=(bH // 8, bW // 8)
                 )
-                siglip_feat = _load_siglip_embed(rec["id"], siglip_cache_dir)
+                siglip_feat = _load_cond(rec["id"])
 
                 # SREF-1: same-style/different-content reference features. Pick a
                 # random neighbor (pre-filtered to cos >= _STYLE_NBR_MIN_COS at
-                # map load) and load ITS SigLIP features from the same (hot)
-                # cache. Any miss -> None (trainer falls back). NOTE: the batch
-                # emit below is all-or-nothing — one miss drops style refs for
-                # the whole batch. Fine at batch_size 1; revisit if batch grows.
+                # map load) and load ITS conditioning features (SigLIP or CSD) from
+                # the same (hot) cache. Any miss -> None (trainer falls back). NOTE:
+                # the batch emit below is all-or-nothing — one miss drops style refs
+                # for the whole batch. Fine at batch_size 1; revisit if batch grows.
                 style_ref_feat = None
-                if _nbr_map is not None and siglip_cache_dir:
+                if _nbr_map is not None and (siglip_cache_dir or cond_mode == "csd"):
                     _nbrs = _nbr_map.get(rec["id"])
                     if _nbrs:
-                        style_ref_feat = _load_siglip_embed(
-                            rng.choice(_nbrs), siglip_cache_dir)
+                        style_ref_feat = _load_cond(rng.choice(_nbrs))
 
                 imgs_buf.append(_normalize(img))
                 caps_buf.append(caption)

@@ -466,6 +466,21 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     `iris_ip_adapter.c`, `--ip-features` → 768-d, `csd_features.py` producer) · 3 retrain + eval.
   - Cache: CSD features already precomputed at `/Volumes/2TBSSD/sref_eval/style_cache/*.npz`
     ([768] f16 per record, keyed by rec_id, per-shard bundles).
+  - **PEDANTIC BUG SWEEP (2026-06-21, phase-1 complete) — findings + fixes:**
+    1. **CRITICAL — CSD loss DIVERGED in the first smoke (2.5→129).** Root cause: `CSDImageProj.film`
+       used default `nn.Linear` init → random scale/shift at step 0 → unstable. Fix: FiLM-ZERO init
+       (zero film weight AND bias) so tokens = query_tokens at init (adaLN-zero identity start);
+       gradients still flow so it learns. Re-smoke: loss bounded ~1–4 across the LR ramp (no spike).
+       The original 2.5→129 vs SigLIP smokes staying <1.2 is what flagged it as CSD-specific.
+    2. `use_siglip_live` was `siglip_cache_dir is None` — a CSD config without a siglip cache would
+       load SigLIP and could feed [729,1152] to a CSD adapter. Fix: `... and _cond_mode != "csd"`.
+    3. `_load_csd_bundles` left `NpzFile` handles open → `with np.load(p) as d:`.
+    4. `warmstart_path` + `cond_mode="csd"` would silently build a SigLIP perceiver → now raises.
+    5. Stale `get_image_embeds` docstring (siglip-only) → generalized. Validated end-to-end:
+       CSD map (109,253) loads, neighbors resolve via CSD map, warmup compiles with the [1,768]
+       dummy, trains 20 steps bounded, best.safetensors writes. **Deferred to phase 2/3 (NOT bugs,
+       expected):** `export_adapter.py` + iris C have no CSD key mapping yet (image_proj.film.* vs
+       perceiver.*); the held-out cond_gap val is disabled in CSD mode (no CSD for val shards).
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.

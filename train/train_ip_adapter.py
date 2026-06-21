@@ -743,7 +743,18 @@ def train(config: dict) -> None:
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
 
-    use_siglip_live = dcfg.get("siglip_cache_dir") is None
+    # SREF-LEAK-2: conditioning mode (defined early — gates use_siglip_live, the loader, and
+    # the adapter). "siglip" = PerceiverResampler over 729 patch tokens; "csd" = CSDImageProj
+    # over a single content-invariant CSD style vector (csd_dim).
+    _cond_mode = dcfg.get("cond_mode", acfg.get("cond_mode", "siglip"))
+    _csd_dim = int(acfg.get("csd_dim", 768))
+    _cond_dummy_shape = ((1, _csd_dim) if _cond_mode == "csd"
+                         else (1, 729, acfg["siglip_dim"]))  # for warmup/null dummies
+
+    # CSD mode NEVER uses the live SigLIP encoder (it conditions on precomputed CSD vectors);
+    # force it off so a csd config without siglip_cache_dir can't load SigLIP and feed
+    # [729,1152] to a CSD adapter.
+    use_siglip_live = (dcfg.get("siglip_cache_dir") is None) and _cond_mode != "csd"
     vae_cache_available = bool(dcfg.get("vae_cache_dir"))
     text_cache_available = bool(dcfg.get("qwen3_cache_dir"))
 
@@ -911,6 +922,8 @@ def train(config: dict) -> None:
         hard_mix_ratio=dcfg.get("hard_mix_ratio", 0.05),
         bucket=_fixed_bucket,
         style_neighbors_db=dcfg.get("style_neighbors_db"),
+        cond_mode=_cond_mode,
+        csd_cache_dir=dcfg.get("csd_cache_dir"),
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before
@@ -959,6 +972,10 @@ def train(config: dict) -> None:
     # ── Build IP-Adapter (trainable) ──────────────────────────────────────────
     print("Building IPAdapterKlein ...")
     warmstart = mcfg.get("warmstart_path")
+    if warmstart and os.path.isdir(warmstart) and _cond_mode == "csd":
+        raise ValueError("model.warmstart_path is set but cond_mode='csd' — the InstantX "
+                         "warmstart builds a SigLIP PerceiverResampler, incompatible with CSD "
+                         "conditioning. Unset warmstart_path for CSD runs.")
     if warmstart and os.path.isdir(warmstart):
         # Warmstart Perceiver Resampler from InstantX Flux.1-dev weights
         adapter = IPAdapterKlein.from_pretrained_warmstart(
@@ -978,6 +995,8 @@ def train(config: dict) -> None:
             num_image_tokens=acfg["num_image_tokens"],
             siglip_dim=acfg["siglip_dim"],
             perceiver_heads=acfg["perceiver_heads"],
+            cond_mode=_cond_mode,
+            csd_dim=_csd_dim,
         )
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
@@ -1017,7 +1036,7 @@ def train(config: dict) -> None:
         _txt_warmup_cq = mx.zeros(
             (1, 64, flux.transformer.context_embedder.weight.shape[1]), dtype=mx.bfloat16)
         _t_warmup_cq = mx.array([500], dtype=mx.int32)
-        _siglip_warmup_cq = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+        _siglip_warmup_cq = mx.zeros(_cond_dummy_shape, dtype=mx.bfloat16)
         _ip_embs_wu = adapter.get_image_embeds(_siglip_warmup_cq)
         _k_wu, _v_wu = adapter.get_kv_all(_ip_embs_wu)
         mx.eval(_k_wu, _v_wu, adapter.scale)
@@ -1295,6 +1314,12 @@ def train(config: dict) -> None:
         (the in-training gap is a train-batch statistic — see code review M1)."""
         if not _val_shards:
             return None
+        # SREF-LEAK-2: the held-out val path is SigLIP-shaped (loads [729,1152] per record);
+        # CSD conditioning has no precomputed CSD for the held-out shards and a different
+        # feature shape, so disable held-out val in CSD mode. cond_gap is only the weak
+        # surrogate anyway — the real metric is the null-relative CSD frontier (sref_sweep_eval).
+        if _cond_mode == "csd":
+            return None
         from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed, _load_siglip_embed
         import pipeline_lib as _plib
         # Val precomputed embeddings: check ultrahot tier first (staged there when
@@ -1362,7 +1387,7 @@ def train(config: dict) -> None:
                         _pair_cond.append(_lc)
                         _pair_null.append(_ln)
                 else:
-                    _siglip = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+                    _siglip = mx.zeros(_cond_dummy_shape, dtype=mx.bfloat16)
                     losses.append(_one_loss(_siglip, mx.array(True), _noisy, _txt, _t, _target))
                 del _lat, _txt, _t, _noise, _alpha, _sigma, _siglip, _noisy, _target
                 mx.clear_cache()
@@ -1604,7 +1629,7 @@ def train(config: dict) -> None:
             _lat_H, _lat_W = _bH // 8, _bW // 8
             _dummy_lat    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
             _dummy_tgt    = mx.zeros((1, 32, _lat_H, _lat_W), dtype=mx.bfloat16)
-            _dummy_siglip = mx.zeros((1, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            _dummy_siglip = mx.zeros(_cond_dummy_shape, dtype=mx.bfloat16)
             print(f"  [{_bH}x{_bW}] compiling...", flush=True)
             _t0_wu = time.time()
             if _use_block_injection:
@@ -1767,7 +1792,7 @@ def train(config: dict) -> None:
                     _siglip_first_miss_logged = True
                 _siglip_miss_steps += 1  # T-10: counts forced-null only, not intended dropout
             B_miss = images.shape[0]
-            siglip_feats = mx.zeros((B_miss, 729, acfg["siglip_dim"]), dtype=mx.bfloat16)
+            siglip_feats = mx.zeros((B_miss,) + _cond_dummy_shape[1:], dtype=mx.bfloat16)
             null_image = True
             use_null_image = _MX_TRUE
 
@@ -1788,8 +1813,10 @@ def train(config: dict) -> None:
         # spatial layout while preserving per-patch texture/color statistics.
         # Applied before cross-ref permutation so the shuffled features are what
         # the model receives; only on conditioned (non-null) steps.
+        # CSD mode: conditioning is a single [csd_dim] vector, not a token set — there is
+        # nothing to patch-shuffle (shuffling feature dims would corrupt the vector). Skip.
         _shuffle_perm = None
-        if _patch_shuffle_prob > 0.0 and not null_image:
+        if _patch_shuffle_prob > 0.0 and not null_image and _cond_mode != "csd":
             if random.random() < _patch_shuffle_prob:
                 _perm_sf = mx.argsort(mx.random.uniform(shape=(siglip_feats.shape[1],)))
                 siglip_feats = siglip_feats[:, _perm_sf, :]

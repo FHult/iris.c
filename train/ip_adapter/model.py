@@ -96,6 +96,12 @@ class CSDImageProj(nn.Module):
         super().__init__()
         self.query_tokens = mx.random.normal((num_queries, hidden_dim)) * 0.02
         self.film = nn.Linear(csd_dim, 2 * hidden_dim, bias=True)  # → (scale, shift)
+        # FiLM-ZERO init (adaLN-zero style): zero the film weight AND bias so scale=shift=0 at
+        # init → tokens = query_tokens (a clean, stable identity start), then the module LEARNS
+        # modulation. With the default nn.Linear init the random scale/shift made the loss
+        # diverge (smoke: 2.5→129). Gradients still flow through W from step 0, so it trains.
+        self.film.weight = mx.zeros_like(self.film.weight)
+        self.film.bias = mx.zeros_like(self.film.bias)
         self.norm = nn.LayerNorm(hidden_dim)
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
@@ -175,12 +181,12 @@ class IPAdapterKlein(nn.Module):
         # Per-block learnable scale: start at 1.0
         self.scale = mx.ones((num_blocks,))
 
-    def get_image_embeds(self, siglip_features: mx.array) -> mx.array:
+    def get_image_embeds(self, cond_features: mx.array) -> mx.array:
         """
-        siglip_features: [B, 729, 1152]
-        Returns image_tokens: [B, 128, 3072]
+        cond_features: SigLIP [B, 729, 1152] (cond_mode="siglip") or CSD [B, csd_dim] ("csd").
+        Returns image_tokens: [B, num_image_tokens, hidden_dim]  (e.g. [B, 128, 3072])
         """
-        return self.image_proj(siglip_features)
+        return self.image_proj(cond_features)
 
     def get_kv_all(self, ip_embeds: mx.array):
         """
