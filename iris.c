@@ -563,8 +563,12 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
     if (iris_transformer_set_ip_adapter(ctx->transformer, ip, ip_embeds) != 0)
         return -1;   /* setter freed ip + ip_embeds on failure */
 
-    fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, %d SigLIP rows, "
-            "scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, n_siglip, scale_mult);
+    if (is_csd)
+        fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, CSD style vector "
+                "[%d], scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, ip->csd_dim, scale_mult);
+    else
+        fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, %d SigLIP rows, "
+                "scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, n_siglip, scale_mult);
     return 0;
 }
 

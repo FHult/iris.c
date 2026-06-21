@@ -497,6 +497,22 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     a committed regression guard against the IP-ADAPTER-INFER-1 mismatch class. `make test-unit`
     green; SigLIP path unaffected. Remaining = Phase 3 (train a real 3000-step CSD arm + null-
     relative eval vs the 0.65 SigLIP plateau; watch the 768-d fidelity risk).
+  - **DEEP SWEEP (2026-06-21) — beyond the parity test:**
+    1. **Encoder/preprocess parity VERIFIED** (the real train↔infer risk, not covered by the
+       fixture which feeds the same bytes both sides): training precompute (`style_precompute.py`)
+       and inference (`csd_features.py`) both call the IDENTICAL `csd_mlx.preprocess` (deterministic
+       resize-short-side-224 BICUBIC + center-crop + CLIP mean/std) and `enc.encode` (→ L2-normed
+       768-d). So the inference CSD vector matches what the adapter trained on. f16-cache (training)
+       vs f32 (inference) is the same accepted convention as SigLIP (siglip_features is f32 too).
+    2. **BUILD-TARGET CATCH (important):** bare `make` only prints help — it does NOT build. The
+       parity test passed on a STALE iris binary because `make test-unit` compiles `iris_ip_adapter.c`
+       directly. The generation binary needs **`make mps`** (rebuilt clean, links iris_ip_adapter.mps.o,
+       no errors). Always `make mps` after touching the C inference, or the eval runs the old binary.
+    3. **Eval-harness CSD integration:** `sref_sweep_eval.py` now reads the bundle's `cond_mode`
+       and uses CSD reference features (`csd_feat_dir`, default `…/refs_feat_csd`) for csd bundles
+       instead of SigLIP `--ip-features`. `eval_set.json` gains `csd_feat_dir`. (CSD ref features
+       are produced by `csd_features.py` post-training, when the GPU is free.)
+    4. iris attach-log now reports "CSD style vector [768]" vs "729 SigLIP rows" (was misleading).
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.

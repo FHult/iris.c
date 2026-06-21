@@ -53,7 +53,20 @@ def generate(spec: dict, bundle: str, scales: list[float], seeds: list[int],
     """Generate every (pair × scale × seed) gen, skipping existing files.
     Returns the flat pair list for sref_eval (each carries ref/gen/prompt/scale)."""
     refs_dir = Path(spec["refs_dir"])
-    feat_dir = Path(spec["feat_dir"])
+    # SREF-LEAK-2: a CSD-conditioned bundle needs CSD reference features (768-d), not SigLIP.
+    # Detect the bundle's cond_mode and pick the matching precomputed feature dir.
+    cond_mode = "siglip"
+    try:
+        cond_mode = json.loads((Path(bundle) / "adapter_meta.json").read_text()).get(
+            "cond_mode", "siglip")
+    except Exception:
+        pass
+    if cond_mode == "csd":
+        feat_dir = Path(spec.get("csd_feat_dir") or
+                        (Path(spec["feat_dir"]).parent / "refs_feat_csd"))
+        print(f"  cond_mode=csd → CSD features from {feat_dir}")
+    else:
+        feat_dir = Path(spec["feat_dir"])
     model = spec.get("model_dir", "flux-klein-model")
     W = int(spec.get("width", 512))
     H = int(spec.get("height", 512))
