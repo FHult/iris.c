@@ -513,6 +513,13 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
        instead of SigLIP `--ip-features`. `eval_set.json` gains `csd_feat_dir`. (CSD ref features
        are produced by `csd_features.py` post-training, when the GPU is free.)
     4. iris attach-log now reports "CSD style vector [768]" vs "729 SigLIP rows" (was misleading).
+    5. **Extra robustness checks (while Phase-3 trained):** (a) switched the CSD parity fixture to
+       **bf16** — the real arm's export format — so `make test` now guards the bf16 dequant/load
+       path (was only f16/int8); 15/15 still exact. (b) **AddressSanitizer**: the C perceive +
+       adapter path is memory-clean (no overrun/use-after-free). (c) **UBSan** surfaced a real,
+       PRE-EXISTING (not-CSD) UB in the `exp2` kernel (`iris_kernels.h:30` left-shift of a
+       negative) — fixed with a numerically-identical unsigned shift; UBSan now clean, parity
+       intact, `make test-unit` all-green, iris rebuilt.
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.

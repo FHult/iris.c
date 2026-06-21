@@ -177,7 +177,7 @@ def main() -> int:
         ckpt = Path(td) / "step_0000001.safetensors"
         mx.save_safetensors(str(ckpt), flat_csd)
         bdir = out / "bundle_csd"
-        _export(ckpt, bdir, "float16")
+        _export(ckpt, bdir, "bfloat16")   # the REAL arm exports bf16 — guard that load path
         _reload_from_bundle(csd_model, bdir, inv=_INV_CSD)
         es, cs = _dump_goldens(csd_model, out, "_csd", csd_vec, img_q_flat)
         print(f"  csd     : ip_embeds std={es:.4f}  contrib std={cs:.4f}")

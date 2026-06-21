@@ -27,7 +27,10 @@ static inline float fast_expf(float x) {
               r * (0.04166667f + r * 0.00833333f))));
     union { float f; int32_t i; } v;
     v.f = p;
-    v.i += (int32_t)n << 23;
+    /* Poke the float exponent (fast exp2). Shift as UNSIGNED then reinterpret: a left shift
+     * of a negative (int32_t)n is undefined behaviour (UBSan); the unsigned shift is defined
+     * and bit-identical on 2's-complement, so the result is unchanged. */
+    v.i += (int32_t)((uint32_t)(int32_t)n << 23);
     return v.f;
 }
 

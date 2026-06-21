@@ -15,17 +15,17 @@
   "csd_dim": 32,
   "perceiver_heads": 4,
   "style_only": false,
-  "quant": "float16",
+  "quant": "bfloat16",
   "training_step": 1,
   "source_checkpoint": "step_0000001.safetensors",
-  "export_time": "2026-06-21T21:43:01Z",
+  "export_time": "2026-06-21T22:14:35Z",
   "tensors": {
     "perceiver.query_tokens": {
       "shape": [
         8,
         256
       ],
-      "dtype": "F16"
+      "dtype": "BF16"
     },
     "perceiver.norm_weight": {
       "shape": [
@@ -44,7 +44,7 @@
         512,
         32
       ],
-      "dtype": "F16"
+      "dtype": "BF16"
     },
     "perceiver.film_bias": {
       "shape": [
@@ -58,7 +58,7 @@
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "BF16"
     },
     "ip_v_stacked": {
       "shape": [
@@ -66,7 +66,7 @@
         256,
         256
       ],
-      "dtype": "F16"
+      "dtype": "BF16"
     },
     "ip_scale": {
       "shape": [
