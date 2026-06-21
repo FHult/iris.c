@@ -403,6 +403,30 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
       the TASK (not just input augmentation) to demand content-invariance, but WITHOUT the
       collapse risk of an explicit embedding loss (below). Safe, on-target. Success = injection
       ratio > leak1's 0.647 @0.5.
+      **RESULT (2026-06-21): REGRESSED to 0.506 (best @0.7) — cross_ref 1.0 HURT.** Both Δstyle
+      (0.119→0.046) and Δleak (0.185→0.091) dropped: pure cross-ref makes the adapter inject
+      LESS overall (no self-ref grounding) without improving selectivity. cond_gap −0.0011 (vs
+      leak1 +0.0031). The 50/50 self/cross mix is better than 1.0 — there's a sweet spot, not a
+      monotone.
+    - **PLATEAU CONCLUSION (2026-06-21): the data/augmentation dimension is EXHAUSTED at ratio
+      ~0.65.** Four arms (style 0.59, leak1 0.65, leak2 0.51) — very different data treatments —
+      all pin the injection ratio at **0.5–0.65** (need ~1.0; Δsref stuck at −0.05 to −0.07).
+      That stability means the style/content entanglement is a property of the **conditioning
+      SIGNAL (SigLIP, 729×1152 content-laden patch tokens) + the architecture**, NOT the
+      training. No data/augmentation knob will clear it. **Next moves are STRUCTURAL** (pick
+      one, not more knobs):
+        (i) **Condition on CSD STYLE embeddings instead of/with SigLIP** — root-cause fix. CSD's
+            768-d style embedding is content-invariant BY CONSTRUCTION (that's why the neighbor
+            gate passed at 0.569); SigLIP is not. The content simply isn't in the signal. We
+            already have CSD embeddings precomputed (`style_cache`). Cost: new conditioning
+            pipeline + perceiver input dim change + retrain; biggest change, highest expected
+            payoff. NOTE inference parity: iris would need a CSD encoder (or precomputed CSD
+            features) for `--sref`, replacing/augmenting the SigLIP `--ip-features` path.
+        (ii) **Contrastive style-invariance loss** on ip_embeds (same-style close, diff-style
+            FAR — needs negatives + collapse guard; see caveat above). Operates on the same
+            SigLIP input so may be limited by (i)'s root issue, but cheaper than (i).
+        (iii) Token compression (128→32) — cheap structural knob, limits content capacity but
+            also style capacity; a quick probe, lower expected payoff.
     - **Style-INVARIANCE loss on ip_embeds (principled, cheap/no-decode — BUT collapse-prone, do
       NOT implement naively):** the tempting form `1 − cos(ip_embeds(ref), ip_embeds(neighbor))`
       pulls same-style embeddings together — with NO negatives this COLLAPSES the embedding space
