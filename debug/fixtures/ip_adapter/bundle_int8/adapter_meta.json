@@ -11,12 +11,14 @@
   "num_heads": 0,
   "num_image_tokens": 8,
   "siglip_dim": 64,
+  "cond_mode": "siglip",
+  "csd_dim": 0,
   "perceiver_heads": 4,
   "style_only": false,
   "quant": "int8",
   "training_step": 1,
   "source_checkpoint": "step_0000001.safetensors",
-  "export_time": "2026-06-17T18:04:28Z",
+  "export_time": "2026-06-21T21:43:01Z",
   "tensors": {
     "perceiver.query_tokens": {
       "shape": [
@@ -86,6 +88,18 @@
     "perceiver.norm_bias": {
       "shape": [
         256
+      ],
+      "dtype": "F32"
+    },
+    "perceiver.in_gamma": {
+      "shape": [
+        64
+      ],
+      "dtype": "F32"
+    },
+    "perceiver.in_beta": {
+      "shape": [
+        64
       ],
       "dtype": "F32"
     },

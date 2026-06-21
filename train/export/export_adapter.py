@@ -81,6 +81,9 @@ _KEY_MAP = {
     "image_proj.norm.bias":                    "perceiver.norm_bias",
     "image_proj.in_gamma":                     "perceiver.in_gamma",
     "image_proj.in_beta":                      "perceiver.in_beta",
+    # CSD conditioning (SREF-LEAK-2, cond_mode="csd"): FiLM weights instead of cross_attn
+    "image_proj.film.weight":                  "perceiver.film_weight",
+    "image_proj.film.bias":                    "perceiver.film_bias",
     "to_k_ip_stacked":                         "ip_k_stacked",
     "to_v_ip_stacked":                         "ip_v_stacked",
     "scale":                                   "ip_scale",
@@ -102,12 +105,14 @@ _ALWAYS_F32 = {
     "perceiver.norm_bias",
     "perceiver.in_gamma",
     "perceiver.in_beta",
+    "perceiver.film_bias",
     "ip_scale",
 }
 
 # Small tensors kept in F32 even for float16/bfloat16 export
 _F32_OVERRIDE = {"perceiver.norm_weight", "perceiver.norm_bias",
-                 "perceiver.in_gamma", "perceiver.in_beta", "ip_scale"}
+                 "perceiver.in_gamma", "perceiver.in_beta",
+                 "perceiver.film_bias", "ip_scale"}
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +242,22 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
     # checkpoints trained before IP-ADAPTER-INFER-1's fix; skip rather than error so
     # those still export (the C loader falls back to no input-norm when they're missing).
     _OPTIONAL = {"image_proj.in_gamma", "image_proj.in_beta"}
+    # SREF-LEAK-2: a checkpoint is EITHER siglip (cross_attn + in_gamma/beta) or csd (film.*).
+    # Detect the mode from the presence of the FiLM weight, and treat the OTHER mode's keys as
+    # not-applicable (skip, don't flag missing).
+    _CSD_ONLY = {"image_proj.film.weight", "image_proj.film.bias"}
+    _SIGLIP_ONLY = {"image_proj.cross_attn.query_proj.weight",
+                    "image_proj.cross_attn.key_proj.weight",
+                    "image_proj.cross_attn.value_proj.weight",
+                    "image_proj.cross_attn.out_proj.weight",
+                    "image_proj.in_gamma", "image_proj.in_beta"}
+    is_csd = (prefix + "image_proj.film.weight") in raw
+    _skip = _SIGLIP_ONLY if is_csd else _CSD_ONLY
     weights: dict[str, np.ndarray] = {}
     missing = []
     for ckpt_key, export_key in _KEY_MAP.items():
+        if ckpt_key in _skip:
+            continue   # wrong conditioning mode for this checkpoint
         lookup = prefix + ckpt_key
         if lookup in raw:
             weights[export_key] = raw[lookup]
@@ -264,14 +282,21 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
 def _infer_dims(weights: dict[str, np.ndarray]) -> dict[str, int]:
     """Infer model dimensions from tensor shapes."""
     qt = weights["perceiver.query_tokens"]  # [num_image_tokens, hidden_dim]
-    kp = weights["perceiver.key_proj"]      # [hidden_dim, siglip_dim]
     ks = weights["ip_k_stacked"]            # [num_blocks, hidden_dim, hidden_dim]
     sc = weights["ip_scale"]               # [num_blocks]
 
     hidden_dim       = qt.shape[1]
     num_image_tokens = qt.shape[0]
-    siglip_dim       = kp.shape[1]
     num_blocks       = ks.shape[0]
+    # SREF-LEAK-2: CSD mode has no key_proj; the conditioning dim is csd_dim from film_weight
+    # [2*hidden, csd_dim]. SigLIP mode infers siglip_dim from key_proj [hidden, siglip_dim].
+    is_csd = "perceiver.film_weight" in weights
+    if is_csd:
+        siglip_dim = 0
+        csd_dim    = int(weights["perceiver.film_weight"].shape[1])
+    else:
+        siglip_dim = int(weights["perceiver.key_proj"].shape[1])
+        csd_dim    = 0
     # head_dim: standard Flux Klein 4B value; can't infer without num_heads
     num_heads        = 24 if hidden_dim == 3072 else (32 if hidden_dim == 4096 else 0)
     head_dim         = hidden_dim // num_heads if num_heads else 0
@@ -289,6 +314,8 @@ def _infer_dims(weights: dict[str, np.ndarray]) -> dict[str, int]:
         "num_heads":         num_heads,
         "num_image_tokens":  num_image_tokens,
         "siglip_dim":        siglip_dim,
+        "cond_mode":         "csd" if is_csd else "siglip",
+        "csd_dim":           csd_dim,
     }
 
 
@@ -615,6 +642,11 @@ def export(
                     print(f"  perceiver_heads={perceiver_heads} (from checkpoint sidecar)")
             except Exception as e:
                 print(f"  WARNING: could not read sidecar {sidecar}: {e}")
+    if perceiver_heads is None and dims.get("cond_mode") == "csd":
+        # CSD conditioning has no PerceiverResampler/cross-attention, so perceiver_heads is
+        # unused by the C csd path; write a harmless value instead of requiring the flag.
+        perceiver_heads = dims["hidden_dim"] // 128
+        print(f"  perceiver_heads={perceiver_heads} (unused in CSD mode; default)")
     if perceiver_heads is None:
         raise ValueError(
             "perceiver_heads could not be determined: no --perceiver-heads flag and no "

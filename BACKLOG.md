@@ -481,6 +481,22 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
        dummy, trains 20 steps bounded, best.safetensors writes. **Deferred to phase 2/3 (NOT bugs,
        expected):** `export_adapter.py` + iris C have no CSD key mapping yet (image_proj.film.* vs
        perceiver.*); the held-out cond_gap val is disabled in CSD mode (no CSD for val shards).
+  - **PHASE 2 — C inference + parity PROVEN (2026-06-21).** Mirrored `CSDImageProj` in
+    `iris_ip_adapter.c`: struct gains `cond_mode`/`csd_dim`/`film_weight`/`film_bias`; load
+    branches on cond_mode; `perceive` runs the FiLM path for csd (film = film_weight @ csd +
+    film_bias → scale/shift → token = query_tokens*(1+scale)+shift → LayerNorm; NO cross-attn).
+    `iris.c` `--ip-features` reads a [csd_dim] vector (one row) in csd mode. `export_adapter.py`
+    maps `image_proj.film.{weight,bias}` → `perceiver.film_*`, branches required keys by mode,
+    infers csd_dim, writes cond_mode/csd_dim to meta, and defaults the (unused) perceiver_heads.
+    New producer `train/scripts/csd_features.py` (image → 768-d CSD → raw f32, the csd analogue
+    of siglip_features.py). **Train↔infer parity is GUARDED, not assumed:** extended the fixture
+    harness (`debug/gen_ip_adapter_fixture.py` builds a synthetic csd bundle + Python goldens
+    from the real `CSDImageProj`, FiLM RANDOMISED so the matmul is exercised) and
+    `debug/test_ip_adapter.c` (new `run_csd_bundle`). Result: **15/15 PASS, csd perceive
+    corr=1.000000 max_abs=0.00000** vs the Python golden — the FiLM math/shape mirror is exact,
+    a committed regression guard against the IP-ADAPTER-INFER-1 mismatch class. `make test-unit`
+    green; SigLIP path unaffected. Remaining = Phase 3 (train a real 3000-step CSD arm + null-
+    relative eval vs the 0.65 SigLIP plateau; watch the 768-d fidelity risk).
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.

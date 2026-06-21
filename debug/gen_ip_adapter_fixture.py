@@ -34,6 +34,20 @@ mx.set_default_device(mx.cpu)                      # no GPU contention with the 
 from mlx.utils import tree_flatten, tree_unflatten
 from ip_adapter.model import IPAdapterKlein
 
+CSD_DIM = 32                                       # synthetic CSD style dim (cond_mode="csd")
+
+# CSD-mode export key -> training param key (FiLM instead of cross_attn; in_gamma/beta absent).
+_INV_CSD = {
+    "perceiver.query_tokens": "image_proj.query_tokens",
+    "perceiver.film_weight":  "image_proj.film.weight",
+    "perceiver.film_bias":    "image_proj.film.bias",
+    "perceiver.norm_weight":  "image_proj.norm.weight",
+    "perceiver.norm_bias":    "image_proj.norm.bias",
+    "ip_k_stacked":           "to_k_ip_stacked",
+    "ip_v_stacked":           "to_v_ip_stacked",
+    "ip_scale":               "scale",
+}
+
 # Small-but-real dims (Flux block head_dim stays 128 — the inference invariant).
 # PERCEIVER_HEADS is deliberately != HIDDEN/128 so the goldens exercise the real
 # perceiver grouping (head_dim = HIDDEN/PERCEIVER_HEADS), not the Flux block's 128.
@@ -73,12 +87,12 @@ def _export(ckpt, bundle_dir, quant):
         raise SystemExit(f"export_adapter ({quant}) failed")
 
 
-def _reload_from_bundle(model, bundle_dir):
+def _reload_from_bundle(model, bundle_dir, inv=_INV):
     """Set model weights from the EXACT bundle bytes C will load — dequantising
     int8 (q * per-row scale) so goldens match the C int8 path; f16/f32 pass through."""
     w = mx.load(str(bundle_dir / "adapter_weights.safetensors"))
     upd = {}
-    for ek, tk in _INV.items():
+    for ek, tk in inv.items():
         if ek not in w:
             continue
         sk = ek + ".scale"
@@ -141,6 +155,33 @@ def main() -> int:
             es, cs = _dump_goldens(model, out, suffix, siglip, img_q_flat)
             print(f"  {quant:8s}: ip_embeds std={es:.4f}  contrib std={cs:.4f}")
 
+    # ── CSD-mode fixture (cond_mode="csd"): FiLM over a content-invariant [CSD_DIM] vector ──
+    mx.random.seed(4321)
+    csd_model = IPAdapterKlein(num_blocks=N_BLOCKS, hidden_dim=HIDDEN,
+                               num_image_tokens=N_TOKENS, num_double_blocks=N_DOUBLE,
+                               cond_mode="csd", csd_dim=CSD_DIM)
+    # FiLM is ZERO-initialised in the module (stable training start) → goldens would be trivial
+    # (csd input ignored, all tokens = LN(query_tokens)). Randomise FiLM so the fixture actually
+    # exercises the C FiLM matmul + scale/shift split (the train↔infer parity surface).
+    fw = mx.random.normal((2 * HIDDEN, CSD_DIM)) * 0.1
+    fb = mx.random.normal((2 * HIDDEN,)) * 0.1
+    csd_model.update(tree_unflatten([("image_proj.film.weight", fw),
+                                     ("image_proj.film.bias", fb)]))
+    mx.eval(csd_model.parameters())
+    csd_vec = mx.random.normal((1, CSD_DIM))
+    csd_vec = csd_vec / mx.linalg.norm(csd_vec, axis=-1, keepdims=True)   # L2-normed, like real CSD
+    mx.eval(csd_vec)
+    _save(csd_vec, out / "in_csd.bin")
+    flat_csd = dict(tree_flatten(csd_model.parameters()))
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = Path(td) / "step_0000001.safetensors"
+        mx.save_safetensors(str(ckpt), flat_csd)
+        bdir = out / "bundle_csd"
+        _export(ckpt, bdir, "float16")
+        _reload_from_bundle(csd_model, bdir, inv=_INV_CSD)
+        es, cs = _dump_goldens(csd_model, out, "_csd", csd_vec, img_q_flat)
+        print(f"  csd     : ip_embeds std={es:.4f}  contrib std={cs:.4f}")
+
     shapes = {
         "hidden": HIDDEN, "heads": HEADS, "head_dim": HEAD_DIM,
         "perceiver_heads": PERCEIVER_HEADS,
@@ -151,6 +192,10 @@ def main() -> int:
         "gold_ip_embeds": [1, N_TOKENS, HIDDEN],
         "gold_k_ip_b0": [1, N_TOKENS, HIDDEN], "gold_v_ip_b0": [1, N_TOKENS, HIDDEN],
         "in_img_q": [IMG_SEQ, HIDDEN], "gold_inject_b0": [1, IMG_SEQ, HIDDEN],
+        "csd_dim": CSD_DIM, "in_csd": [1, CSD_DIM],
+        "gold_ip_embeds_csd": [1, N_TOKENS, HIDDEN],
+        "gold_k_ip_b0_csd": [1, N_TOKENS, HIDDEN], "gold_v_ip_b0_csd": [1, N_TOKENS, HIDDEN],
+        "gold_inject_b0_csd": [1, IMG_SEQ, HIDDEN],
     }
     (out / "shapes.json").write_text(json.dumps(shapes, indent=2))
     print(f"wrote fixtures + bundle to {out}")

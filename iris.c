@@ -506,7 +506,10 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
         return -1;
     }
 
-    /* SigLIP features: raw f32, row dim must match the bundle's siglip_dim */
+    /* Conditioning features: raw f32. SigLIP mode = [n_siglip, siglip_dim] rows; CSD mode
+     * (SREF-LEAK-2) = a single [csd_dim] content-invariant style vector. */
+    int is_csd = (strcmp(ip->cond_mode, "csd") == 0);
+    int feat_dim = is_csd ? ip->csd_dim : ip->siglip_dim;
     FILE *ff = fopen(features_path, "rb");
     if (!ff) {
         fprintf(stderr, "IP-Adapter: cannot open features file %s\n", features_path);
@@ -516,15 +519,18 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
     fseek(ff, 0, SEEK_END);
     long fsize = ftell(ff);
     fseek(ff, 0, SEEK_SET);
-    size_t row_bytes = (size_t)ip->siglip_dim * sizeof(float);
+    size_t row_bytes = (size_t)feat_dim * sizeof(float);
     if (fsize <= 0 || (size_t)fsize % row_bytes != 0) {
         fprintf(stderr, "IP-Adapter: features size %ld is not a multiple of %zu "
-                "(siglip_dim=%d f32 rows)\n", fsize, row_bytes, ip->siglip_dim);
+                "(%s_dim=%d f32 rows)\n", fsize, row_bytes,
+                is_csd ? "csd" : "siglip", feat_dim);
         fclose(ff);
         iris_ip_adapter_free(ip);
         return -1;
     }
     int n_siglip = (int)((size_t)fsize / row_bytes);
+    if (is_csd && n_siglip != 1)
+        fprintf(stderr, "IP-Adapter: CSD features have %d vectors; using the first.\n", n_siglip);
     float *feats = malloc((size_t)fsize);
     if (!feats || fread(feats, 1, (size_t)fsize, ff) != (size_t)fsize) {
         fprintf(stderr, "IP-Adapter: failed to read features\n");

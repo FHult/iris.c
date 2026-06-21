@@ -27,6 +27,7 @@
  * Deliberately != HID/128 (=2): the perceiver head_dim is HID/PHEADS, NOT the Flux
  * block's 128. A bundle where these coincide masks IP-ADAPTER-INFER-1. */
 #define PHEADS 4
+#define CSD_DIM 32          /* SREF-LEAK-2: synthetic CSD style dim (cond_mode="csd") */
 #define FIX "debug/fixtures/ip_adapter"
 
 static int failures = 0, passes = 0;
@@ -103,6 +104,50 @@ static void run_bundle(const char *bundle, const char *suffix, const char *label
     iris_ip_adapter_free(a);
 }
 
+/* CSD-mode parity (SREF-LEAK-2): cond_mode="csd" — FiLM over a single [CSD_DIM] vector
+ * instead of cross-attention. Same get_kv/inject stages (ip_embeds is [TOK,HID] in both
+ * modes). The tight 1e-3 perceive tolerance guards the train↔infer FiLM math/shape mirror. */
+static void run_csd_bundle(const float *img_q) {
+    const char *bundle = FIX "/bundle_csd";
+    char p[256];
+    printf("--- csd (%s) ---\n", bundle);
+    iris_ip_adapter_t *a = iris_ip_adapter_load(bundle);
+    if (!a) { fprintf(stderr, "FAIL load %s\n", bundle); failures++; return; }
+    int meta_ok = (a->hidden_dim == HID && a->num_image_tokens == TOK &&
+                   a->num_blocks == 5 && strcmp(a->cond_mode, "csd") == 0 &&
+                   a->csd_dim == CSD_DIM);
+    printf("meta dims  cond_mode=%-6s csd_dim=%d %s\n", a->cond_mode, a->csd_dim,
+           meta_ok ? "PASS" : "FAIL");
+    meta_ok ? passes++ : failures++;
+
+    float *csd = load_bin(FIX "/in_csd.bin", (long)CSD_DIM);
+    #define GLD(name) (snprintf(p, sizeof(p), FIX "/%s_csd.bin", name), p)
+    float *g_embeds = load_bin(GLD("gold_ip_embeds"), (long)TOK * HID);
+    float *g_k      = load_bin(GLD("gold_k_ip_b0"),   (long)TOK * HID);
+    float *g_v      = load_bin(GLD("gold_v_ip_b0"),   (long)TOK * HID);
+    float *g_inj    = load_bin(GLD("gold_inject_b0"), (long)IMG_SEQ * HID);
+    #undef GLD
+    if (!csd || !g_embeds || !g_k || !g_v || !g_inj) { failures++; return; }
+
+    float *embeds = malloc((long)TOK * HID * sizeof(float));
+    iris_ip_adapter_perceive(a, csd, 1, embeds);   /* n_siglip ignored in csd mode */
+    compare_tol("perceive", embeds, g_embeds, (long)TOK * HID, 1e-3);
+
+    float *k = malloc((long)TOK * HID * sizeof(float));
+    float *v = malloc((long)TOK * HID * sizeof(float));
+    iris_ip_adapter_get_kv(a, BLK, g_embeds, k, v);
+    compare("get_kv k", k, g_k, (long)TOK * HID);
+    compare("get_kv v", v, g_v, (long)TOK * HID);
+
+    float *hidden = calloc((long)IMG_SEQ * HID, sizeof(float));
+    iris_ip_adapter_inject(a, BLK, img_q, IMG_SEQ, g_k, g_v, hidden);
+    compare("inject", hidden, g_inj, (long)IMG_SEQ * HID);
+
+    free(csd); free(embeds); free(k); free(v); free(hidden);
+    free(g_embeds); free(g_k); free(g_v); free(g_inj);
+    iris_ip_adapter_free(a);
+}
+
 int main(void) {
     float *siglip = load_bin(FIX "/in_siglip.bin", (long)SIG_SEQ * SIG_DIM);
     float *img_q  = load_bin(FIX "/in_img_q.bin",  (long)IMG_SEQ * HID);
@@ -110,6 +155,7 @@ int main(void) {
 
     run_bundle(FIX "/bundle",      "",      "float16", siglip, img_q);
     run_bundle(FIX "/bundle_int8", "_int8", "int8",    siglip, img_q);
+    run_csd_bundle(img_q);
 
     free(siglip); free(img_q);
     printf("\n%d passed, %d failed\n", passes, failures);

@@ -10,9 +10,9 @@
   "head_dim": 0,
   "num_heads": 0,
   "num_image_tokens": 8,
-  "siglip_dim": 64,
-  "cond_mode": "siglip",
-  "csd_dim": 0,
+  "siglip_dim": 0,
+  "cond_mode": "csd",
+  "csd_dim": 32,
   "perceiver_heads": 4,
   "style_only": false,
   "quant": "float16",
@@ -23,34 +23,6 @@
     "perceiver.query_tokens": {
       "shape": [
         8,
-        256
-      ],
-      "dtype": "F16"
-    },
-    "perceiver.query_proj": {
-      "shape": [
-        256,
-        256
-      ],
-      "dtype": "F16"
-    },
-    "perceiver.key_proj": {
-      "shape": [
-        256,
-        64
-      ],
-      "dtype": "F16"
-    },
-    "perceiver.value_proj": {
-      "shape": [
-        256,
-        64
-      ],
-      "dtype": "F16"
-    },
-    "perceiver.out_proj": {
-      "shape": [
-        256,
         256
       ],
       "dtype": "F16"
@@ -67,15 +39,16 @@
       ],
       "dtype": "F32"
     },
-    "perceiver.in_gamma": {
+    "perceiver.film_weight": {
       "shape": [
-        64
+        512,
+        32
       ],
-      "dtype": "F32"
+      "dtype": "F16"
     },
-    "perceiver.in_beta": {
+    "perceiver.film_bias": {
       "shape": [
-        64
+        512
       ],
       "dtype": "F32"
     },

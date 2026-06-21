@@ -59,6 +59,18 @@ typedef struct {
                               /* /128 — perceiver head_dim = hidden/this)       */
     int style_only;           /* 1 = double-stream ip_scale zeroed at export    */
 
+    /* Conditioning mode (SREF-LEAK-2): "siglip" (PerceiverResampler over 729 patch
+     * tokens) | "csd" (CSDImageProj: FiLM-modulate query tokens by a single content-
+     * invariant CSD style vector). Default "siglip" for legacy/unset bundles. */
+    char cond_mode[16];
+    int  csd_dim;             /* CSD style-embedding dim (768) — cond_mode=="csd" only */
+
+    /* CSDImageProj weights (cond_mode=="csd" only; NULL otherwise). FiLM maps the CSD
+     * vector → (scale, shift): film = film_weight @ csd + film_bias, then
+     * token = query_tokens * (1 + scale) + shift, then the shared norm_weight/bias. */
+    float *film_weight;       /* [2*hidden_dim, csd_dim]  (nn.Linear: [out, in]) */
+    float *film_bias;         /* [2*hidden_dim] */
+
     /* Quantisation mode: "bfloat16" | "float16" | "int8" */
     char quant[16];
 

@@ -138,6 +138,15 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
      * (where the trained perceiver happened to use that grouping). */
     a->perceiver_heads   = cfg_int(meta, "perceiver_heads", 0);
     a->style_only        = cfg_bool(meta, "style_only", 0);
+    /* Conditioning mode (SREF-LEAK-2): default "siglip" when the key is absent. */
+    strncpy(a->cond_mode, "siglip", sizeof(a->cond_mode) - 1);
+    if (cfg_find_value(meta, "cond_mode")) {
+        const char *c = cfg_find_value(meta, "cond_mode");
+        while (*c == ' ' || *c == '"') c++;
+        strncpy(a->cond_mode, c, sizeof(a->cond_mode) - 1);
+        char *e = strchr(a->cond_mode, '"'); if (e) *e = '\0';
+    }
+    a->csd_dim = cfg_int(meta, "csd_dim", 768);
     if (cfg_find_value(meta, "quant")) {
         const char *q = cfg_find_value(meta, "quant");
         while (*q == ' ' || *q == '"') q++;
@@ -155,23 +164,31 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     a->_sf_handle = sf;
 
     #define LOAD(field, name) a->field = load_tensor_f32(sf, name)
-    LOAD(query_tokens, "perceiver.query_tokens");
-    LOAD(query_proj,   "perceiver.query_proj");
-    LOAD(key_proj,     "perceiver.key_proj");
-    LOAD(value_proj,   "perceiver.value_proj");
-    LOAD(out_proj,     "perceiver.out_proj");
+    int is_csd = (strcmp(a->cond_mode, "csd") == 0);
+    LOAD(query_tokens, "perceiver.query_tokens");   /* shared by both modes */
     LOAD(norm_weight,  "perceiver.norm_weight");
     LOAD(norm_bias,    "perceiver.norm_bias");
-    LOAD(in_gamma,     "perceiver.in_gamma");   /* optional (legacy bundles lack it) */
-    LOAD(in_beta,      "perceiver.in_beta");    /* optional */
+    if (is_csd) {
+        LOAD(film_weight, "perceiver.film_weight");
+        LOAD(film_bias,   "perceiver.film_bias");
+    } else {
+        LOAD(query_proj,   "perceiver.query_proj");
+        LOAD(key_proj,     "perceiver.key_proj");
+        LOAD(value_proj,   "perceiver.value_proj");
+        LOAD(out_proj,     "perceiver.out_proj");
+        LOAD(in_gamma,     "perceiver.in_gamma");   /* optional (legacy bundles lack it) */
+        LOAD(in_beta,      "perceiver.in_beta");    /* optional */
+    }
     LOAD(ip_k_stacked, "ip_k_stacked");
     LOAD(ip_v_stacked, "ip_v_stacked");
     LOAD(ip_scale,     "ip_scale");
     #undef LOAD
 
-    if (!a->query_tokens || !a->query_proj || !a->key_proj || !a->value_proj ||
-        !a->out_proj || !a->norm_weight || !a->norm_bias ||
-        !a->ip_k_stacked || !a->ip_v_stacked || !a->ip_scale) {
+    int ok = a->query_tokens && a->norm_weight && a->norm_bias &&
+             a->ip_k_stacked && a->ip_v_stacked && a->ip_scale &&
+             (is_csd ? (a->film_weight && a->film_bias)
+                     : (a->query_proj && a->key_proj && a->value_proj && a->out_proj));
+    if (!ok) {
         iris_ip_adapter_free(a);
         return NULL;
     }
@@ -187,6 +204,7 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
     free(a->value_proj); free(a->out_proj); free(a->norm_weight);
     free(a->norm_bias); free(a->ip_k_stacked); free(a->ip_v_stacked);
     free(a->ip_scale); free(a->in_gamma); free(a->in_beta);
+    free(a->film_weight); free(a->film_bias);
     if (a->_sf_handle) safetensors_close((safetensors_file_t *)a->_sf_handle);
     free(a);
 }
@@ -194,6 +212,36 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
 int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
                              const float *siglip, int n_siglip,
                              float *ip_embeds) {
+    /* CSD conditioning (SREF-LEAK-2): `siglip` is the single content-invariant CSD style
+     * vector [csd_dim] (n_siglip ignored). No cross-attention — FiLM-modulate the learned
+     * query tokens: film = film_weight @ csd + film_bias → (scale, shift);
+     * token = query_tokens * (1 + scale) + shift; then LayerNorm. Mirrors CSDImageProj
+     * (train/ip_adapter/model.py). */
+    if (strcmp(a->cond_mode, "csd") == 0) {
+        int H = a->hidden_dim, T = a->num_image_tokens, C = a->csd_dim;
+        float *film = malloc((size_t)2 * H * sizeof(float));
+        if (!film) return -1;
+        /* film[1,2H] = csd[1,C] @ film_weight[2H,C]^T */
+        iris_matmul_t(film, siglip, a->film_weight, 1, C, 2 * H);
+        for (int i = 0; i < 2 * H; i++) film[i] += a->film_bias[i];
+        const float *scale = film;       /* [H] */
+        const float *shift = film + H;   /* [H] */
+        for (int t = 0; t < T; t++) {
+            float *row = ip_embeds + (size_t)t * H;
+            const float *q = a->query_tokens + (size_t)t * H;
+            for (int d = 0; d < H; d++) row[d] = q[d] * (1.0f + scale[d]) + shift[d];
+            float mean = 0.0f, var = 0.0f;
+            for (int d = 0; d < H; d++) mean += row[d];
+            mean /= H;
+            for (int d = 0; d < H; d++) { float e = row[d] - mean; var += e * e; }
+            var /= H;
+            float inv = 1.0f / sqrtf(var + LN_EPS);
+            for (int d = 0; d < H; d++)
+                row[d] = (row[d] - mean) * inv * a->norm_weight[d] + a->norm_bias[d];
+        }
+        free(film);
+        return 0;
+    }
     int H = a->hidden_dim, S = a->siglip_dim;
     /* PerceiverResampler MHA: head count is perceiver_heads, head_dim = H/heads.
      * This is NOT the Flux block head_dim (128) — the perceiver was trained with
