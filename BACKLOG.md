@@ -467,6 +467,45 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
   - Cache: CSD features already precomputed at `/Volumes/2TBSSD/sref_eval/style_cache/*.npz`
     ([768] f16 per record, keyed by rec_id, per-shard bundles).
 
+- **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
+  next major architecture experiment after the CSD-only test).** Status: PROPOSED.
+  **Rationale:** the two signals fail in opposite ways, so combine them.
+  - Pure SigLIP leaks content — each of the 729 patch tokens is heavily content-laden — which
+    is the structural cause of the injection-ratio ceiling (~0.5–0.65) measured across the
+    leak-reduction campaign (style/leak/cross-ref arms; see NULL-FLOOR REFRAME + SREF-LEAK-1).
+  - Pure CSD is content-invariant by construction (768-d style head; that's why the neighbor
+    gate passed at 0.569 and SigLIP descriptors failed at 0.86–0.96) → low leak, but its big
+    compression likely caps STYLE FIDELITY / fine texture (the SREF-LEAK-2 768-d-bottleneck
+    risk being tested now).
+  - **Hybrid = CSD for the primary, content-free style DIRECTION + SigLIP for local detail/
+    texture.** Likely pushes Δstyle higher while holding Δleak (and prompt adherence) down —
+    a STRUCTURAL fix, consistent with the finding that data/augmentation knobs are exhausted
+    (the lever is the conditioning signal + architecture, not training).
+  **Implementation ideas (build on SREF-LEAK-2's `cond_mode`; add `cond_mode="hybrid"`):**
+  - Concatenate into the PerceiverResampler: feed the 729 SigLIP patch tokens AND the CSD
+    global vector (as an extra token, or FiLM-modulating the perceiver queries by CSD) so the
+    resampler reads both. Reuses the existing perceiver (and its C inference path).
+  - Learned gating / weighting between the two signals (a scalar or per-channel gate, init
+    biased toward CSD so it starts content-safe).
+  - Optional hierarchical injection: CSD into the early/double-stream blocks (global style),
+    SigLIP into the later/single-stream blocks (detail) — the per-block `to_k_ip/to_v_ip` and
+    `ip_scale` already support per-block control.
+  - Start with a smoke on the current champion to validate the pipeline (collapse guard:
+    cross-token std ratio, as in IP-ADAPTER-INFER-1), then a short 3000-step arm comparing
+    pure-CSD vs hybrid, scored null-relative (`sref_sweep_eval.py --null`).
+  **Acceptance criteria:**
+  - Injection ratio (Δstyle/Δleak @ best scale) **> 0.75** with LOWER content_leak than pure
+    SigLIP (vs the 0.65 SigLIP plateau).
+  - Visibly stronger style transfer than the current best without prompt collapse
+    (prompt_adherence not tanking).
+  - A clear comparison table — pure SigLIP vs pure CSD vs hybrid — on the SREF eval triad
+    (style_sim / content_leak / prompt_adherence, all null-relative).
+  **Cross-refs:** NULL-FLOOR REFRAME (deltas-over-null is the metric), SREF-LEAK-1 (the ~0.65
+  plateau + why), SREF-LEAK-2 / CSD-CONDITIONING BUILD LOG (the `cond_mode` machinery + the
+  768-d fidelity risk this addresses), SREF-EVAL-PARAMS (ip-scale frontier), SREF-1 (style
+  pairing substrate — reused unchanged). Gate the GO on the CSD-only eval: if pure CSD already
+  beats 0.65, hybrid is the upgrade path; if pure CSD tanks style fidelity, hybrid is the fix.
+
 - **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
   tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset
   experiments ran through bespoke scripts (`sref_dataset_campaign.py`, `sref_sweep_eval.py`,
