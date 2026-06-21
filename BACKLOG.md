@@ -388,6 +388,29 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     ratio (Δstyle/Δleak @ best scale) beats the style arm's 0.59**, ideally toward 1.0. Score
     with `sref_sweep_eval.py --null` (NOT raw sref_score). If patch-shuffle alone doesn't move
     it, next is token compression, then the CSD content-leak loss term, then longer training.
+  - **RESULT (2026-06-21): patch-shuffle 1.0 helped only modestly — config-knob augmentation
+    looks like diminishing returns.** leak1 vs style arm @ best scale 0.5: injection ratio
+    0.593 → **0.647** (+0.05). But Δstyle (0.085→0.120) AND Δleak (0.143→0.185) BOTH rose ~40% —
+    the adapter got LOUDER, only slightly more SELECTIVE; Δsref actually went −0.058→−0.065.
+    Held-out cond_gap crossed positive for the first time (+0.0031 vs style arm −0.0016). Read:
+    scrambling patch ORDER doesn't remove content because each SigLIP patch still carries its
+    local content. **Hypothesis update:** the leak is structural — the conditioning signal
+    (SigLIP, content-laden) is the source, so per-token augmentation can't fix it. Higher-leverage
+    levers than more config knobs:
+    - **`cross_ref_prob` 0.5 → ~1.0** (cheap, next arm `leak2_xref`): force ALMOST every step to
+      use a different-content same-style neighbor → content-copying is penalized nearly always.
+      More directly on-target than patch-shuffle. ONE-variable change from leak1.
+    - **Style-INVARIANCE loss on the adapter's image embeddings (principled, cheap, NO decode —
+      avoids PROXY-1):** penalize `1 − cos(ip_embeds(ref), ip_embeds(style_neighbor))` for a
+      same-style/different-content pair from the existing `neighbors.sqlite`. Forces the
+      Perceiver bottleneck to encode what the two share (STYLE) and drop what differs (CONTENT).
+      Operates on SigLIP features + adapter forward only → no teacher decode. Needs a loss-term
+      add in `train_ip_adapter.py`. **Likely the real fix** — attacks the bottleneck, not the
+      symptom. (A decoded CSD content-leak loss is the obvious alternative but is PROXY-1-class
+      expensive, ~75 s/step; avoid.)
+    - Token compression (128→64/32 tokens) and longer training remain, lower priority.
+    - Root-cause option (big): condition on CSD STYLE embeddings (content-invariant by
+      construction — that's why the neighbor gate passed at 0.569) instead of/with SigLIP.
 
 - **SREF-CAMPAIGN-1: unify SREF recipe experiments into the standard orchestrator/campaign
   tooling (stop maintaining the ad-hoc direct-trainer path).** The 2026-06-20 dataset
