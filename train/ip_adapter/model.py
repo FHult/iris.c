@@ -78,6 +78,39 @@ class PerceiverResampler(nn.Module):
         return self.norm(out)  # [B, 128, 3072]
 
 
+class CSDImageProj(nn.Module):
+    """
+    Content-invariant conditioning (SREF-LEAK-1 structural fix): a single CSD style
+    embedding [B, csd_dim] → [B, num_queries, hidden_dim] image tokens.
+
+    CSD's style vector is content-invariant BY CONSTRUCTION (the style head), unlike SigLIP's
+    729 content-laden patch tokens — so the content can't leak (it isn't in the signal). CSD is
+    ONE vector, not a set, so there's nothing to cross-attend/resample; instead FiLM-modulate
+    128 learned query tokens by the (L2-normalised) CSD vector. The 128 distinct queries carry
+    the diversity, the CSD vector the style → cannot pool/collapse the way the SigLIP perceiver
+    did (IP-ADAPTER-INFER-1). Deliberately simple (Linear + FiLM + LayerNorm) to mirror in C
+    inference (iris_ip_adapter.c) without a new attention kernel.
+    """
+
+    def __init__(self, hidden_dim: int = 3072, num_queries: int = 128, csd_dim: int = 768):
+        super().__init__()
+        self.query_tokens = mx.random.normal((num_queries, hidden_dim)) * 0.02
+        self.film = nn.Linear(csd_dim, 2 * hidden_dim, bias=True)  # → (scale, shift)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+
+    def __call__(self, csd: mx.array) -> mx.array:
+        # csd: [B, csd_dim] (L2-normalised CSD style embedding)
+        if csd.ndim == 3:  # tolerate [B, 1, csd_dim]
+            csd = csd.reshape(csd.shape[0], -1)
+        scale, shift = mx.split(self.film(csd), 2, axis=-1)  # each [B, hidden]
+        q = mx.broadcast_to(self.query_tokens[None],
+                            (csd.shape[0], self.num_queries, self.hidden_dim))
+        out = q * (1.0 + scale[:, None, :]) + shift[:, None, :]
+        return self.norm(out)  # [B, num_queries, hidden_dim]
+
+
 class IPAdapterKlein(nn.Module):
     """
     IP-Adapter companion model for Flux Klein 4B.
@@ -104,20 +137,29 @@ class IPAdapterKlein(nn.Module):
         siglip_dim: int = 1152,
         perceiver_heads: int = 24,
         num_double_blocks: int = 5,
+        cond_mode: str = "siglip",   # "siglip" (PerceiverResampler) | "csd" (CSDImageProj)
+        csd_dim: int = 768,
     ):
         super().__init__()
         self.num_blocks = num_blocks
         self.hidden_dim = hidden_dim
         self.num_image_tokens = num_image_tokens
         self.num_double_blocks = num_double_blocks
+        self.cond_mode = cond_mode
 
-        # Image projection: SigLIP patch tokens → 128 conditioning tokens
-        self.image_proj = PerceiverResampler(
-            hidden_dim=hidden_dim,
-            num_heads=perceiver_heads,
-            num_queries=num_image_tokens,
-            siglip_dim=siglip_dim,
-        )
+        # Image projection: conditioning features → 128 conditioning tokens.
+        # SigLIP path = PerceiverResampler (cross-attn over 729 patch tokens).
+        # CSD path = CSDImageProj (FiLM-modulated queries; content-invariant, SREF-LEAK-1).
+        if cond_mode == "csd":
+            self.image_proj = CSDImageProj(
+                hidden_dim=hidden_dim, num_queries=num_image_tokens, csd_dim=csd_dim)
+        else:
+            self.image_proj = PerceiverResampler(
+                hidden_dim=hidden_dim,
+                num_heads=perceiver_heads,
+                num_queries=num_image_tokens,
+                siglip_dim=siglip_dim,
+            )
 
         # Per-block K/V weights stacked for 2-dispatch batched einsum.
         # Shape: [num_blocks, hidden_dim, hidden_dim]
