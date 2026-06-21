@@ -397,17 +397,21 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     local content. **Hypothesis update:** the leak is structural — the conditioning signal
     (SigLIP, content-laden) is the source, so per-token augmentation can't fix it. Higher-leverage
     levers than more config knobs:
-    - **`cross_ref_prob` 0.5 → ~1.0** (cheap, next arm `leak2_xref`): force ALMOST every step to
-      use a different-content same-style neighbor → content-copying is penalized nearly always.
-      More directly on-target than patch-shuffle. ONE-variable change from leak1.
-    - **Style-INVARIANCE loss on the adapter's image embeddings (principled, cheap, NO decode —
-      avoids PROXY-1):** penalize `1 − cos(ip_embeds(ref), ip_embeds(style_neighbor))` for a
-      same-style/different-content pair from the existing `neighbors.sqlite`. Forces the
-      Perceiver bottleneck to encode what the two share (STYLE) and drop what differs (CONTENT).
-      Operates on SigLIP features + adapter forward only → no teacher decode. Needs a loss-term
-      add in `train_ip_adapter.py`. **Likely the real fix** — attacks the bottleneck, not the
-      symptom. (A decoded CSD content-leak loss is the obvious alternative but is PROXY-1-class
-      expensive, ~75 s/step; avoid.)
+    - **`cross_ref_prob` 0.5 → 1.0** (cheap; LAUNCHED 2026-06-21 as `leak2_xref`, one-variable
+      change from leak1, patch_shuffle stays 1.0): force ~every conditioned step to predict from
+      a different-content same-style neighbor → content-copying penalized nearly always. Changes
+      the TASK (not just input augmentation) to demand content-invariance, but WITHOUT the
+      collapse risk of an explicit embedding loss (below). Safe, on-target. Success = injection
+      ratio > leak1's 0.647 @0.5.
+    - **Style-INVARIANCE loss on ip_embeds (principled, cheap/no-decode — BUT collapse-prone, do
+      NOT implement naively):** the tempting form `1 − cos(ip_embeds(ref), ip_embeds(neighbor))`
+      pulls same-style embeddings together — with NO negatives this COLLAPSES the embedding space
+      (every image → one embedding), exactly the failure the perceiver input-norm fix cured
+      (constant injection → grid). Needs a CONTRASTIVE formulation (same-style close AND
+      different-style far) with negatives; at batch_size=1 negatives must come from the cross-ref
+      buffer / a random pool. Only attempt with collapse guards (monitor cross-token std of
+      ip_embeds, the same ratio used to detect the grid). The decoded CSD content-leak loss is
+      the obvious alternative but is PROXY-1-class expensive (~75 s/step); avoid.
     - Token compression (128→64/32 tokens) and longer training remain, lower priority.
     - Root-cause option (big): condition on CSD STYLE embeddings (content-invariant by
       construction — that's why the neighbor gate passed at 0.569) instead of/with SigLIP.
