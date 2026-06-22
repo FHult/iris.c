@@ -84,6 +84,14 @@ _KEY_MAP = {
     # CSD conditioning (SREF-LEAK-2, cond_mode="csd"): FiLM weights instead of cross_attn
     "image_proj.film.weight":                  "perceiver.film_weight",
     "image_proj.film.bias":                    "perceiver.film_bias",
+    # Hybrid conditioning (SREF-COMBINE-1, cond_mode="hybrid"): the SigLIP PerceiverResampler
+    # lives under image_proj.* (above) AND the CSD module under csd_proj.* → csd.* (separate
+    # query tokens + FiLM + LayerNorm, kept distinct from the perceiver's).
+    "csd_proj.query_tokens":                   "csd.query_tokens",
+    "csd_proj.film.weight":                    "csd.film_weight",
+    "csd_proj.film.bias":                      "csd.film_bias",
+    "csd_proj.norm.weight":                    "csd.norm_weight",
+    "csd_proj.norm.bias":                      "csd.norm_bias",
     "to_k_ip_stacked":                         "ip_k_stacked",
     "to_v_ip_stacked":                         "ip_v_stacked",
     "scale":                                   "ip_scale",
@@ -106,13 +114,18 @@ _ALWAYS_F32 = {
     "perceiver.in_gamma",
     "perceiver.in_beta",
     "perceiver.film_bias",
+    "csd.norm_weight",       # hybrid CSD module norm/bias (SREF-COMBINE-1)
+    "csd.norm_bias",
+    "csd.film_bias",
     "ip_scale",
 }
 
 # Small tensors kept in F32 even for float16/bfloat16 export
 _F32_OVERRIDE = {"perceiver.norm_weight", "perceiver.norm_bias",
                  "perceiver.in_gamma", "perceiver.in_beta",
-                 "perceiver.film_bias", "ip_scale"}
+                 "perceiver.film_bias",
+                 "csd.norm_weight", "csd.norm_bias", "csd.film_bias",
+                 "ip_scale"}
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +264,18 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
                     "image_proj.cross_attn.value_proj.weight",
                     "image_proj.cross_attn.out_proj.weight",
                     "image_proj.in_gamma", "image_proj.in_beta"}
-    is_csd = (prefix + "image_proj.film.weight") in raw
-    _skip = _SIGLIP_ONLY if is_csd else _CSD_ONLY
+    _HYBRID_ONLY = {"csd_proj.query_tokens", "csd_proj.film.weight", "csd_proj.film.bias",
+                    "csd_proj.norm.weight", "csd_proj.norm.bias"}
+    # SREF-COMBINE-1: hybrid = SigLIP perceiver (image_proj.cross_attn.*) + a SEPARATE CSD
+    # module (csd_proj.*). Detect by the csd_proj FiLM; pure-csd by image_proj's own FiLM.
+    is_hybrid = (prefix + "csd_proj.film.weight") in raw
+    is_csd    = (prefix + "image_proj.film.weight") in raw
+    if is_hybrid:
+        _skip = _CSD_ONLY                       # has perceiver + csd_proj; no image_proj.film
+    elif is_csd:
+        _skip = _SIGLIP_ONLY | _HYBRID_ONLY
+    else:
+        _skip = _CSD_ONLY | _HYBRID_ONLY
     weights: dict[str, np.ndarray] = {}
     missing = []
     for ckpt_key, export_key in _KEY_MAP.items():
@@ -288,10 +311,17 @@ def _infer_dims(weights: dict[str, np.ndarray]) -> dict[str, int]:
     hidden_dim       = qt.shape[1]
     num_image_tokens = qt.shape[0]
     num_blocks       = ks.shape[0]
-    # SREF-LEAK-2: CSD mode has no key_proj; the conditioning dim is csd_dim from film_weight
-    # [2*hidden, csd_dim]. SigLIP mode infers siglip_dim from key_proj [hidden, siglip_dim].
-    is_csd = "perceiver.film_weight" in weights
-    if is_csd:
+    # SREF-LEAK-2/COMBINE-1: csd mode has no key_proj (conditioning dim = csd_dim from
+    # film_weight [2*hidden, csd_dim]); siglip infers siglip_dim from key_proj; hybrid has
+    # BOTH (perceiver.key_proj for siglip_dim AND csd.film_weight for csd_dim).
+    is_hybrid = "csd.film_weight" in weights
+    is_csd    = "perceiver.film_weight" in weights
+    if is_hybrid:
+        siglip_dim = int(weights["perceiver.key_proj"].shape[1])
+        csd_dim    = int(weights["csd.film_weight"].shape[1])
+        # Total image tokens = SigLIP half (perceiver.query_tokens) + CSD half (csd.query_tokens).
+        num_image_tokens = int(qt.shape[0]) + int(weights["csd.query_tokens"].shape[0])
+    elif is_csd:
         siglip_dim = 0
         csd_dim    = int(weights["perceiver.film_weight"].shape[1])
     else:
@@ -314,7 +344,7 @@ def _infer_dims(weights: dict[str, np.ndarray]) -> dict[str, int]:
         "num_heads":         num_heads,
         "num_image_tokens":  num_image_tokens,
         "siglip_dim":        siglip_dim,
-        "cond_mode":         "csd" if is_csd else "siglip",
+        "cond_mode":         "hybrid" if is_hybrid else ("csd" if is_csd else "siglip"),
         "csd_dim":           csd_dim,
     }
 
@@ -535,15 +565,20 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
     # both modes' tensors and can never pass. Perceiver input-norm (in_gamma/in_beta)
     # is optional — absent in legacy pre-input-norm bundles.
     cond_mode = meta.get("cond_mode", "siglip")
+    _SIGLIP_TENSORS = {"perceiver.query_tokens", "perceiver.query_proj",
+                       "perceiver.key_proj", "perceiver.value_proj", "perceiver.out_proj",
+                       "perceiver.norm_weight", "perceiver.norm_bias",
+                       "ip_k_stacked", "ip_v_stacked", "ip_scale"}
     if cond_mode == "csd":
         expected = {"perceiver.query_tokens", "perceiver.norm_weight",
                     "perceiver.norm_bias", "perceiver.film_weight",
                     "perceiver.film_bias", "ip_k_stacked", "ip_v_stacked", "ip_scale"}
+    elif cond_mode == "hybrid":
+        # SigLIP perceiver + the separate CSD module (csd.*)
+        expected = _SIGLIP_TENSORS | {"csd.query_tokens", "csd.film_weight",
+                                      "csd.film_bias", "csd.norm_weight", "csd.norm_bias"}
     else:
-        expected = {"perceiver.query_tokens", "perceiver.query_proj",
-                    "perceiver.key_proj", "perceiver.value_proj", "perceiver.out_proj",
-                    "perceiver.norm_weight", "perceiver.norm_bias",
-                    "ip_k_stacked", "ip_v_stacked", "ip_scale"}
+        expected = _SIGLIP_TENSORS
     if quant == "int8":
         scale_keys = {f"{n}.scale" for n in (_QUANTISED_TENSORS & expected)}
         expected = expected | scale_keys

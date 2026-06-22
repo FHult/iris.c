@@ -65,6 +65,12 @@ def generate(spec: dict, bundle: str, scales: list[float], seeds: list[int],
         feat_dir = Path(spec.get("csd_feat_dir") or
                         (Path(spec["feat_dir"]).parent / "refs_feat_csd"))
         print(f"  cond_mode=csd → CSD features from {feat_dir}")
+    elif cond_mode == "hybrid":
+        # SREF-COMBINE-1: packed [730,1152] features (SigLIP rows + CSD row), produced by
+        # hybrid_features.py. Default dir refs_feat_hybrid alongside the SigLIP feat_dir.
+        feat_dir = Path(spec.get("hybrid_feat_dir") or
+                        (Path(spec["feat_dir"]).parent / "refs_feat_hybrid"))
+        print(f"  cond_mode=hybrid → hybrid features from {feat_dir}")
     else:
         feat_dir = Path(spec["feat_dir"])
     model = spec.get("model_dir", "flux-klein-model")

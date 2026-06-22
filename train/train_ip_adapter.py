@@ -743,17 +743,22 @@ def train(config: dict) -> None:
     flux = Flux2Klein(model_path=mcfg["flux_model_dir"], quantize=None)
     flux.freeze()
 
-    # SREF-LEAK-2: conditioning mode (defined early — gates use_siglip_live, the loader, and
-    # the adapter). "siglip" = PerceiverResampler over 729 patch tokens; "csd" = CSDImageProj
-    # over a single content-invariant CSD style vector (csd_dim).
+    # SREF-LEAK-2 / SREF-COMBINE-1: conditioning mode (defined early — gates use_siglip_live, the
+    # loader, and the adapter). "siglip" = PerceiverResampler over 729 patch tokens; "csd" =
+    # CSDImageProj over a single content-invariant CSD vector; "hybrid" = BOTH, with the loader
+    # packing a single [730,1152] feature (rows 0..728 = SigLIP, row 729 = CSD zero-padded).
     _cond_mode = dcfg.get("cond_mode", acfg.get("cond_mode", "siglip"))
     _csd_dim = int(acfg.get("csd_dim", 768))
-    _cond_dummy_shape = ((1, _csd_dim) if _cond_mode == "csd"
-                         else (1, 729, acfg["siglip_dim"]))  # for warmup/null dummies
+    if _cond_mode == "csd":
+        _cond_dummy_shape = (1, _csd_dim)
+    elif _cond_mode == "hybrid":
+        _cond_dummy_shape = (1, 730, acfg["siglip_dim"])   # 729 SigLIP + 1 CSD-carrier row
+    else:
+        _cond_dummy_shape = (1, 729, acfg["siglip_dim"])
 
-    # CSD mode NEVER uses the live SigLIP encoder (it conditions on precomputed CSD vectors);
-    # force it off so a csd config without siglip_cache_dir can't load SigLIP and feed
-    # [729,1152] to a CSD adapter.
+    # CSD mode NEVER uses the live SigLIP encoder. hybrid DOES need SigLIP (cached or live).
+    # Force live-SigLIP off for pure csd so a csd config without siglip_cache_dir can't load
+    # SigLIP and feed [729,1152] to a CSD adapter.
     use_siglip_live = (dcfg.get("siglip_cache_dir") is None) and _cond_mode != "csd"
     vae_cache_available = bool(dcfg.get("vae_cache_dir"))
     text_cache_available = bool(dcfg.get("qwen3_cache_dir"))
@@ -972,10 +977,13 @@ def train(config: dict) -> None:
     # ── Build IP-Adapter (trainable) ──────────────────────────────────────────
     print("Building IPAdapterKlein ...")
     warmstart = mcfg.get("warmstart_path")
-    if warmstart and os.path.isdir(warmstart) and _cond_mode == "csd":
-        raise ValueError("model.warmstart_path is set but cond_mode='csd' — the InstantX "
-                         "warmstart builds a SigLIP PerceiverResampler, incompatible with CSD "
-                         "conditioning. Unset warmstart_path for CSD runs.")
+    if warmstart and os.path.isdir(warmstart) and _cond_mode in ("csd", "hybrid"):
+        raise ValueError(f"model.warmstart_path is set but cond_mode='{_cond_mode}' — the InstantX "
+                         "warmstart builds a SigLIP-only PerceiverResampler, incompatible with the "
+                         "CSD/hybrid module layout. Unset warmstart_path for these runs.")
+    if _cond_mode == "hybrid" and not dcfg.get("csd_cache_dir"):
+        raise ValueError("cond_mode='hybrid' requires data.csd_cache_dir (the CSD style-embedding "
+                         "cache) AND a SigLIP source (siglip_cache_dir or live encoder).")
     if warmstart and os.path.isdir(warmstart):
         # Warmstart Perceiver Resampler from InstantX Flux.1-dev weights
         adapter = IPAdapterKlein.from_pretrained_warmstart(
@@ -1314,11 +1322,11 @@ def train(config: dict) -> None:
         (the in-training gap is a train-batch statistic — see code review M1)."""
         if not _val_shards:
             return None
-        # SREF-LEAK-2: the held-out val path is SigLIP-shaped (loads [729,1152] per record);
-        # CSD conditioning has no precomputed CSD for the held-out shards and a different
-        # feature shape, so disable held-out val in CSD mode. cond_gap is only the weak
-        # surrogate anyway — the real metric is the null-relative CSD frontier (sref_sweep_eval).
-        if _cond_mode == "csd":
+        # SREF-LEAK-2 / SREF-COMBINE-1: the held-out val path is SigLIP-shaped (loads [729,1152]
+        # per record); csd/hybrid condition on CSD vectors the held-out shards have no precompute
+        # for, and a different feature shape, so disable held-out val for both. cond_gap is only
+        # the weak surrogate anyway — the real metric is the null-relative frontier (sref_sweep_eval).
+        if _cond_mode in ("csd", "hybrid"):
             return None
         from ip_adapter.dataset import _load_vae_latent, _load_qwen3_embed, _load_siglip_embed
         import pipeline_lib as _plib

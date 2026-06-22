@@ -73,6 +73,26 @@ _INV = {
     "ip_scale":               "scale",
 }
 
+# Hybrid (cond_mode="hybrid", SREF-COMBINE-1): SigLIP perceiver (image_proj.*) + the separate
+# CSD module (csd_proj.*). Export key -> training param key for the reload.
+_INV_HYBRID = {
+    "perceiver.query_tokens": "image_proj.query_tokens",
+    "perceiver.query_proj":   "image_proj.cross_attn.query_proj.weight",
+    "perceiver.key_proj":     "image_proj.cross_attn.key_proj.weight",
+    "perceiver.value_proj":   "image_proj.cross_attn.value_proj.weight",
+    "perceiver.out_proj":     "image_proj.cross_attn.out_proj.weight",
+    "perceiver.norm_weight":  "image_proj.norm.weight",
+    "perceiver.norm_bias":    "image_proj.norm.bias",
+    "csd.query_tokens":       "csd_proj.query_tokens",
+    "csd.film_weight":        "csd_proj.film.weight",
+    "csd.film_bias":          "csd_proj.film.bias",
+    "csd.norm_weight":        "csd_proj.norm.weight",
+    "csd.norm_bias":          "csd_proj.norm.bias",
+    "ip_k_stacked":           "to_k_ip_stacked",
+    "ip_v_stacked":           "to_v_ip_stacked",
+    "ip_scale":               "scale",
+}
+
 
 def _save(arr, path):
     np.asarray(arr, dtype=np.float32).tofile(path)
@@ -182,6 +202,39 @@ def main() -> int:
         es, cs = _dump_goldens(csd_model, out, "_csd", csd_vec, img_q_flat)
         print(f"  csd     : ip_embeds std={es:.4f}  contrib std={cs:.4f}")
 
+    # ── Hybrid-mode fixture (cond_mode="hybrid", SREF-COMBINE-1): SigLIP perceiver (first half)
+    #    + CSD FiLM (second half), concatenated → 2*N_TOKENS image tokens. Input is the packed
+    #    [SIGLIP_SEQ+1, SIGLIP_DIM] feature (rows 0..SIGLIP_SEQ-1 = SigLIP, last row = CSD padded). ──
+    mx.random.seed(7777)
+    HYB_TOKENS = 2 * N_TOKENS
+    hyb_model = IPAdapterKlein(num_blocks=N_BLOCKS, hidden_dim=HIDDEN,
+                               num_image_tokens=HYB_TOKENS, siglip_dim=SIGLIP_DIM,
+                               perceiver_heads=PERCEIVER_HEADS, num_double_blocks=N_DOUBLE,
+                               cond_mode="hybrid", csd_dim=CSD_DIM)
+    # Randomise the CSD FiLM (ZERO-initialised in the module) so the CSD half is non-trivial.
+    fw_h = mx.random.normal((2 * HIDDEN, CSD_DIM)) * 0.1
+    fb_h = mx.random.normal((2 * HIDDEN,)) * 0.1
+    hyb_model.update(tree_unflatten([("csd_proj.film.weight", fw_h),
+                                     ("csd_proj.film.bias", fb_h)]))
+    mx.eval(hyb_model.parameters())
+    # Packed feature: SigLIP rows + one CSD row (L2-normed CSD in the first CSD_DIM slots, rest 0).
+    sig_h = mx.random.normal((1, SIGLIP_SEQ, SIGLIP_DIM))
+    csd_h = mx.random.normal((1, CSD_DIM))
+    csd_h = csd_h / mx.linalg.norm(csd_h, axis=-1, keepdims=True)
+    csd_row = mx.concatenate([csd_h, mx.zeros((1, SIGLIP_DIM - CSD_DIM))], axis=-1)[:, None, :]
+    hyb_feat = mx.concatenate([sig_h, csd_row], axis=1)            # [1, SIGLIP_SEQ+1, SIGLIP_DIM]
+    mx.eval(hyb_feat)
+    _save(hyb_feat, out / "in_hybrid.bin")
+    flat_hyb = dict(tree_flatten(hyb_model.parameters()))
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = Path(td) / "step_0000001.safetensors"
+        mx.save_safetensors(str(ckpt), flat_hyb)
+        bdir = out / "bundle_hybrid"
+        _export(ckpt, bdir, "bfloat16")
+        _reload_from_bundle(hyb_model, bdir, inv=_INV_HYBRID)
+        es, cs = _dump_goldens(hyb_model, out, "_hybrid", hyb_feat, img_q_flat)
+        print(f"  hybrid  : ip_embeds std={es:.4f}  contrib std={cs:.4f}")
+
     shapes = {
         "hidden": HIDDEN, "heads": HEADS, "head_dim": HEAD_DIM,
         "perceiver_heads": PERCEIVER_HEADS,
@@ -196,6 +249,13 @@ def main() -> int:
         "gold_ip_embeds_csd": [1, N_TOKENS, HIDDEN],
         "gold_k_ip_b0_csd": [1, N_TOKENS, HIDDEN], "gold_v_ip_b0_csd": [1, N_TOKENS, HIDDEN],
         "gold_inject_b0_csd": [1, IMG_SEQ, HIDDEN],
+        # Hybrid: 2*N_TOKENS image tokens; packed input has SIGLIP_SEQ+1 rows.
+        "hybrid_tokens": 2 * N_TOKENS, "hybrid_seq": SIGLIP_SEQ + 1,
+        "in_hybrid": [1, SIGLIP_SEQ + 1, SIGLIP_DIM],
+        "gold_ip_embeds_hybrid": [1, 2 * N_TOKENS, HIDDEN],
+        "gold_k_ip_b0_hybrid": [1, 2 * N_TOKENS, HIDDEN],
+        "gold_v_ip_b0_hybrid": [1, 2 * N_TOKENS, HIDDEN],
+        "gold_inject_b0_hybrid": [1, IMG_SEQ, HIDDEN],
     }
     (out / "shapes.json").write_text(json.dumps(shapes, indent=2))
     print(f"wrote fixtures + bundle to {out}")

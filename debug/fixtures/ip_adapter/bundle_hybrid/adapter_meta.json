@@ -9,9 +9,9 @@
   "hidden_dim": 256,
   "head_dim": 0,
   "num_heads": 0,
-  "num_image_tokens": 8,
-  "siglip_dim": 0,
-  "cond_mode": "csd",
+  "num_image_tokens": 16,
+  "siglip_dim": 64,
+  "cond_mode": "hybrid",
   "csd_dim": 32,
   "perceiver_heads": 4,
   "style_only": false,
@@ -23,6 +23,34 @@
     "perceiver.query_tokens": {
       "shape": [
         8,
+        256
+      ],
+      "dtype": "BF16"
+    },
+    "perceiver.query_proj": {
+      "shape": [
+        256,
+        256
+      ],
+      "dtype": "BF16"
+    },
+    "perceiver.key_proj": {
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    "perceiver.value_proj": {
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    "perceiver.out_proj": {
+      "shape": [
+        256,
         256
       ],
       "dtype": "BF16"
@@ -39,16 +67,47 @@
       ],
       "dtype": "F32"
     },
-    "perceiver.film_weight": {
+    "perceiver.in_gamma": {
+      "shape": [
+        64
+      ],
+      "dtype": "F32"
+    },
+    "perceiver.in_beta": {
+      "shape": [
+        64
+      ],
+      "dtype": "F32"
+    },
+    "csd.query_tokens": {
+      "shape": [
+        8,
+        256
+      ],
+      "dtype": "BF16"
+    },
+    "csd.film_weight": {
       "shape": [
         512,
         32
       ],
       "dtype": "BF16"
     },
-    "perceiver.film_bias": {
+    "csd.film_bias": {
       "shape": [
         512
+      ],
+      "dtype": "F32"
+    },
+    "csd.norm_weight": {
+      "shape": [
+        256
+      ],
+      "dtype": "F32"
+    },
+    "csd.norm_bias": {
+      "shape": [
+        256
       ],
       "dtype": "F32"
     },

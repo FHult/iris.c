@@ -507,8 +507,11 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
     }
 
     /* Conditioning features: raw f32. SigLIP mode = [n_siglip, siglip_dim] rows; CSD mode
-     * (SREF-LEAK-2) = a single [csd_dim] content-invariant style vector. */
-    int is_csd = (strcmp(ip->cond_mode, "csd") == 0);
+     * (SREF-LEAK-2) = a single [csd_dim] style vector; hybrid mode (SREF-COMBINE-1) = packed
+     * [730, siglip_dim] (rows 0..728 SigLIP, row 729 = CSD zero-padded to siglip_dim). Both
+     * siglip and hybrid read siglip_dim-wide rows. */
+    int is_csd    = (strcmp(ip->cond_mode, "csd") == 0);
+    int is_hybrid = (strcmp(ip->cond_mode, "hybrid") == 0);
     int feat_dim = is_csd ? ip->csd_dim : ip->siglip_dim;
     FILE *ff = fopen(features_path, "rb");
     if (!ff) {
@@ -566,6 +569,10 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
     if (is_csd)
         fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, CSD style vector "
                 "[%d], scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, ip->csd_dim, scale_mult);
+    else if (is_hybrid)
+        fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, hybrid: %d SigLIP rows "
+                "+ CSD [%d], scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens,
+                n_siglip - 1, ip->csd_dim, scale_mult);
     else
         fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, %d SigLIP rows, "
                 "scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, n_siglip, scale_mult);

@@ -474,15 +474,27 @@ def make_prefetch_loader(
     # in-memory per-shard bundles (vs SigLIP's per-record [729,1152] npz). Both feed the same
     # sfeat_buf/sref_buf slots; the adapter's cond_mode decides how to project them.
     _csd_map: dict = {}
-    if cond_mode == "csd":
+    if cond_mode in ("csd", "hybrid"):
         _csd_map = _load_csd_bundles(csd_cache_dir)
-        print(f"  [dataset] CSD conditioning: {len(_csd_map):,} records loaded from "
+        print(f"  [dataset] CSD conditioning ({cond_mode}): {len(_csd_map):,} records loaded from "
               f"{csd_cache_dir}", flush=True)
 
     def _load_cond(rec_id: str):
-        """Conditioning features for a record: CSD [csd_dim] or SigLIP [729,1152]."""
+        """Conditioning features for a record:
+          - "csd":    CSD [csd_dim]
+          - "siglip": SigLIP [729, 1152]
+          - "hybrid": packed [730, 1152] — rows 0..728 = SigLIP, row 729 = CSD zero-padded to 1152
+                      (SREF-COMBINE-1). Returns None if EITHER signal is missing (sample skipped)."""
         if cond_mode == "csd":
             return _csd_map.get(rec_id)
+        if cond_mode == "hybrid":
+            sig = _load_siglip_embed(rec_id, siglip_cache_dir)   # [729,1152] f16
+            csd = _csd_map.get(rec_id)                            # [csd_dim] f16
+            if sig is None or csd is None:
+                return None
+            row = np.zeros((1, sig.shape[1]), dtype=np.float16)   # [1,1152]
+            row[0, : csd.shape[0]] = csd.astype(np.float16)       # CSD in the first csd_dim slots
+            return np.concatenate([sig.astype(np.float16), row], axis=0)  # [730,1152]
         return _load_siglip_embed(rec_id, siglip_cache_dir)
 
     _STYLE_NBR_MIN_COS = 0.6
@@ -506,6 +518,12 @@ def make_prefetch_loader(
                 # records) into an honest, smaller map.
                 if _kept and cond_mode == "csd":
                     _have = [nid for nid in _kept if nid in _csd_map]
+                    _n_no_sig += len(_kept) - len(_have)
+                    _kept = _have
+                elif _kept and cond_mode == "hybrid":
+                    # hybrid needs BOTH the CSD bundle entry AND the SigLIP npz present.
+                    _have = [nid for nid in _kept if nid in _csd_map and os.path.exists(
+                        os.path.join(siglip_cache_dir, f"{nid}.npz"))]
                     _n_no_sig += len(_kept) - len(_have)
                     _kept = _have
                 elif _kept and siglip_cache_dir:
@@ -587,7 +605,7 @@ def make_prefetch_loader(
                 # the batch emit below is all-or-nothing — one miss drops style refs
                 # for the whole batch. Fine at batch_size 1; revisit if batch grows.
                 style_ref_feat = None
-                if _nbr_map is not None and (siglip_cache_dir or cond_mode == "csd"):
+                if _nbr_map is not None and (siglip_cache_dir or cond_mode in ("csd", "hybrid")):
                     _nbrs = _nbr_map.get(rec["id"])
                     if _nbrs:
                         style_ref_feat = _load_cond(rng.choice(_nbrs))

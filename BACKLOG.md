@@ -569,7 +569,36 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
       hybrid training run without confirming the plan first.
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
-  next major architecture experiment after the CSD-only test).** Status: PROPOSED.
+  next major architecture experiment after the CSD-only test).** Status: IMPLEMENTED + inference
+  parity-proven; training RECIPE needs tuning (smoke showed early instability). Released v4.1.0.
+  - **IMPLEMENTATION (2026-06-22, cond_mode="hybrid").** Design = dual-module concat with a
+    PACKED single feature so the trainer's `mx.compile`d step stays untouched. The conditioning
+    is one `[B, 730, 1152]` array (rows 0..728 = SigLIP, row 729 = the 768-d CSD vector zero-padded
+    to 1152). `IPAdapterKlein.get_image_embeds` slices it → runs the SigLIP `PerceiverResampler`
+    (→128 tokens) AND the CSD `CSDImageProj` FiLM (→128 tokens) → concatenates to **256** image
+    tokens. Both sub-modules are the EXISTING parity-proven modules, reused verbatim; the only new
+    math is the concat + slice. `to_k_ip/to_v_ip/ip_scale` shapes are unchanged (per-channel).
+    Surface: model.py (hybrid branch + slice), dataset.py (`_load_cond` packs siglip+csd row;
+    needs BOTH caches; neighbor probe requires both), trainer (`_cond_dummy_shape=(1,730,1152)`,
+    csd_cache+warmstart guards, val gate), iris_ip_adapter.c/.h (refactored perceive into
+    `perceive_siglip_mha` + `perceive_csd_film` helpers + a hybrid path that writes the two halves;
+    new `csd_*` struct fields), iris.c (`--ip-features` reads packed [730,1152]; attach log),
+    export_adapter.py (`csd_proj.*`→`csd.*` key map, mode detect, `_infer_dims` total tokens =
+    siglip-half + csd-half, validate hybrid expected-set), sref_sweep_eval.py (hybrid feat dir),
+    `train/scripts/hybrid_features.py` (NEW producer: composes siglip_features.py + csd_features.py
+    → packed [730,1152], guaranteeing identical preprocess/encode to training).
+  - **PARITY PROVEN: 20/20** (`debug/test_ip_adapter.c` `run_hybrid_bundle`, fixture FiLM randomised),
+    hybrid perceive corr=1.000000 max_abs=1e-5 vs the Python golden, through the REAL bf16 export/load
+    path; green under full production flags (`-O3 -march=native -ffast-math -flto -DUSE_BLAS`);
+    `make test-unit` all-green; `iris` relinked (`make mps`). Both halves + the concat order are guarded.
+  - **SMOKE (40 steps) — trainer runs end-to-end but RECIPE IS HOT.** Caches overlap well (109K CSD
+    records, 101K with usable style neighbors, 0 dropped for missing SigLIP). BUT loss ~4.2 (not
+    falling), grad_norm 100–1700, **100% grad-clipped**, loss_null 1.98 (other arms ~0.4),
+    loss_cond−loss_null gap −2.9. Cause is structural, not a code bug (inference is parity-exact):
+    doubling to 256 injected tokens at ip_scale≈1.0 perturbs the frozen Flux ~2×. **NEXT TUNING
+    LEVERS for the full run:** lower ip_scale init (e.g. 0.5) and/or per-module gate, longer warmup,
+    lower LR. Re-smoke until grad settles before the 3000-step arm; then null-relative eval vs the
+    0.65 plateau (acceptance: inj ratio >0.75 with lower leak than SigLIP).
   **Rationale:** the two signals fail in opposite ways, so combine them.
   - Pure SigLIP leaks content — each of the 729 patch tokens is heavily content-laden — which
     is the structural cause of the injection-ratio ceiling (~0.5–0.65) measured across the

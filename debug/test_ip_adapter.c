@@ -148,6 +148,53 @@ static void run_csd_bundle(const float *img_q) {
     iris_ip_adapter_free(a);
 }
 
+/* Hybrid-mode parity (SREF-COMBINE-1): cond_mode="hybrid" — the SigLIP PerceiverResampler
+ * produces the first num_image_tokens/2 tokens and the CSD FiLM the next, concatenated. The
+ * input is the packed [SIG_SEQ+1, SIG_DIM] feature (last row = CSD padded). Guards BOTH halves
+ * AND the concat order against the Python golden (1e-3). */
+static void run_hybrid_bundle(const float *img_q) {
+    const char *bundle = FIX "/bundle_hybrid";
+    char p[256];
+    const long HTOK = 2L * TOK;
+    printf("--- hybrid (%s) ---\n", bundle);
+    iris_ip_adapter_t *a = iris_ip_adapter_load(bundle);
+    if (!a) { fprintf(stderr, "FAIL load %s\n", bundle); failures++; return; }
+    int meta_ok = (a->hidden_dim == HID && a->num_image_tokens == HTOK &&
+                   a->num_blocks == 5 && strcmp(a->cond_mode, "hybrid") == 0 &&
+                   a->csd_dim == CSD_DIM && a->siglip_dim == SIG_DIM &&
+                   a->perceiver_heads == PHEADS);
+    printf("meta dims  cond_mode=%-6s csd_dim=%d toks=%d %s\n", a->cond_mode, a->csd_dim,
+           a->num_image_tokens, meta_ok ? "PASS" : "FAIL");
+    meta_ok ? passes++ : failures++;
+
+    float *feat = load_bin(FIX "/in_hybrid.bin", (long)(SIG_SEQ + 1) * SIG_DIM);
+    #define GLD(name) (snprintf(p, sizeof(p), FIX "/%s_hybrid.bin", name), p)
+    float *g_embeds = load_bin(GLD("gold_ip_embeds"), HTOK * HID);
+    float *g_k      = load_bin(GLD("gold_k_ip_b0"),   HTOK * HID);
+    float *g_v      = load_bin(GLD("gold_v_ip_b0"),   HTOK * HID);
+    float *g_inj    = load_bin(GLD("gold_inject_b0"), (long)IMG_SEQ * HID);
+    #undef GLD
+    if (!feat || !g_embeds || !g_k || !g_v || !g_inj) { failures++; return; }
+
+    float *embeds = malloc(HTOK * HID * sizeof(float));
+    iris_ip_adapter_perceive(a, feat, SIG_SEQ + 1, embeds);   /* packed: last row = CSD */
+    compare_tol("perceive", embeds, g_embeds, HTOK * HID, 1e-3);
+
+    float *k = malloc(HTOK * HID * sizeof(float));
+    float *v = malloc(HTOK * HID * sizeof(float));
+    iris_ip_adapter_get_kv(a, BLK, g_embeds, k, v);
+    compare("get_kv k", k, g_k, HTOK * HID);
+    compare("get_kv v", v, g_v, HTOK * HID);
+
+    float *hidden = calloc((long)IMG_SEQ * HID, sizeof(float));
+    iris_ip_adapter_inject(a, BLK, img_q, IMG_SEQ, g_k, g_v, hidden);
+    compare("inject", hidden, g_inj, (long)IMG_SEQ * HID);
+
+    free(feat); free(embeds); free(k); free(v); free(hidden);
+    free(g_embeds); free(g_k); free(g_v); free(g_inj);
+    iris_ip_adapter_free(a);
+}
+
 int main(void) {
     float *siglip = load_bin(FIX "/in_siglip.bin", (long)SIG_SEQ * SIG_DIM);
     float *img_q  = load_bin(FIX "/in_img_q.bin",  (long)IMG_SEQ * HID);
@@ -156,6 +203,7 @@ int main(void) {
     run_bundle(FIX "/bundle",      "",      "float16", siglip, img_q);
     run_bundle(FIX "/bundle_int8", "_int8", "int8",    siglip, img_q);
     run_csd_bundle(img_q);
+    run_hybrid_bundle(img_q);
 
     free(siglip); free(img_q);
     printf("\n%d passed, %d failed\n", passes, failures);

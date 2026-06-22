@@ -143,7 +143,7 @@ class IPAdapterKlein(nn.Module):
         siglip_dim: int = 1152,
         perceiver_heads: int = 24,
         num_double_blocks: int = 5,
-        cond_mode: str = "siglip",   # "siglip" (PerceiverResampler) | "csd" (CSDImageProj)
+        cond_mode: str = "siglip",   # "siglip" | "csd" | "hybrid"
         csd_dim: int = 768,
     ):
         super().__init__()
@@ -152,13 +152,26 @@ class IPAdapterKlein(nn.Module):
         self.num_image_tokens = num_image_tokens
         self.num_double_blocks = num_double_blocks
         self.cond_mode = cond_mode
+        self.csd_dim = csd_dim
 
-        # Image projection: conditioning features → 128 conditioning tokens.
+        # Image projection: conditioning features → num_image_tokens conditioning tokens.
         # SigLIP path = PerceiverResampler (cross-attn over 729 patch tokens).
-        # CSD path = CSDImageProj (FiLM-modulated queries; content-invariant, SREF-LEAK-1).
+        # CSD path = CSDImageProj (FiLM-modulated queries; content-invariant, SREF-LEAK-2).
+        # hybrid (SREF-COMBINE-1) = BOTH: PerceiverResampler over SigLIP (local detail/texture) +
+        #   CSDImageProj over the content-invariant CSD vector (global style direction), each
+        #   producing num_image_tokens//2 tokens, concatenated. The two parity-proven modules are
+        #   reused verbatim; get_image_embeds slices a single packed [B,730,1152] feature so the
+        #   trainer threads ONE conditioning array (rows 0..728 = SigLIP, row 729 = CSD padded).
         if cond_mode == "csd":
             self.image_proj = CSDImageProj(
                 hidden_dim=hidden_dim, num_queries=num_image_tokens, csd_dim=csd_dim)
+        elif cond_mode == "hybrid":
+            half = num_image_tokens // 2
+            self.image_proj = PerceiverResampler(
+                hidden_dim=hidden_dim, num_heads=perceiver_heads,
+                num_queries=half, siglip_dim=siglip_dim)
+            self.csd_proj = CSDImageProj(
+                hidden_dim=hidden_dim, num_queries=half, csd_dim=csd_dim)
         else:
             self.image_proj = PerceiverResampler(
                 hidden_dim=hidden_dim,
@@ -183,9 +196,21 @@ class IPAdapterKlein(nn.Module):
 
     def get_image_embeds(self, cond_features: mx.array) -> mx.array:
         """
-        cond_features: SigLIP [B, 729, 1152] (cond_mode="siglip") or CSD [B, csd_dim] ("csd").
-        Returns image_tokens: [B, num_image_tokens, hidden_dim]  (e.g. [B, 128, 3072])
+        cond_features:
+          - "siglip": SigLIP [B, 729, 1152]
+          - "csd":    CSD [B, csd_dim]
+          - "hybrid": packed [B, 730, 1152] — rows 0..728 = SigLIP, row 729 = CSD vector
+                      zero-padded to 1152 (the carrier; sliced back to csd_dim here).
+        Returns image_tokens: [B, num_image_tokens, hidden_dim]
+          (siglip/csd → [B,128,3072]; hybrid → [B,256,3072]).
         """
+        if self.cond_mode == "hybrid":
+            n = cond_features.shape[1] - 1                 # SigLIP token count (729)
+            sig = cond_features[:, :n, :]                  # [B, 729, 1152]
+            csd = cond_features[:, n, : self.csd_dim]      # [B, csd_dim]
+            sig_tok = self.image_proj(sig)                 # [B, 128, 3072]
+            csd_tok = self.csd_proj(csd)                   # [B, 128, 3072]
+            return mx.concatenate([sig_tok, csd_tok], axis=1)  # [B, 256, 3072]
         return self.image_proj(cond_features)
 
     def get_kv_all(self, ip_embeds: mx.array):

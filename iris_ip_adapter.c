@@ -164,14 +164,16 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
     a->_sf_handle = sf;
 
     #define LOAD(field, name) a->field = load_tensor_f32(sf, name)
-    int is_csd = (strcmp(a->cond_mode, "csd") == 0);
-    LOAD(query_tokens, "perceiver.query_tokens");   /* shared by both modes */
+    int is_csd    = (strcmp(a->cond_mode, "csd") == 0);
+    int is_hybrid = (strcmp(a->cond_mode, "hybrid") == 0);
+    LOAD(query_tokens, "perceiver.query_tokens");   /* csd: CSD queries; siglip/hybrid: perceiver */
     LOAD(norm_weight,  "perceiver.norm_weight");
     LOAD(norm_bias,    "perceiver.norm_bias");
     if (is_csd) {
         LOAD(film_weight, "perceiver.film_weight");
         LOAD(film_bias,   "perceiver.film_bias");
     } else {
+        /* siglip OR hybrid: the SigLIP PerceiverResampler */
         LOAD(query_proj,   "perceiver.query_proj");
         LOAD(key_proj,     "perceiver.key_proj");
         LOAD(value_proj,   "perceiver.value_proj");
@@ -179,15 +181,28 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
         LOAD(in_gamma,     "perceiver.in_gamma");   /* optional (legacy bundles lack it) */
         LOAD(in_beta,      "perceiver.in_beta");    /* optional */
     }
+    if (is_hybrid) {
+        /* hybrid: the CSD module's OWN weights (separate from the perceiver above) */
+        LOAD(csd_query_tokens, "csd.query_tokens");
+        LOAD(csd_film_weight,  "csd.film_weight");
+        LOAD(csd_film_bias,    "csd.film_bias");
+        LOAD(csd_norm_weight,  "csd.norm_weight");
+        LOAD(csd_norm_bias,    "csd.norm_bias");
+    }
     LOAD(ip_k_stacked, "ip_k_stacked");
     LOAD(ip_v_stacked, "ip_v_stacked");
     LOAD(ip_scale,     "ip_scale");
     #undef LOAD
 
     int ok = a->query_tokens && a->norm_weight && a->norm_bias &&
-             a->ip_k_stacked && a->ip_v_stacked && a->ip_scale &&
-             (is_csd ? (a->film_weight && a->film_bias)
-                     : (a->query_proj && a->key_proj && a->value_proj && a->out_proj));
+             a->ip_k_stacked && a->ip_v_stacked && a->ip_scale;
+    if (is_csd)
+        ok = ok && a->film_weight && a->film_bias;
+    else
+        ok = ok && a->query_proj && a->key_proj && a->value_proj && a->out_proj;
+    if (is_hybrid)
+        ok = ok && a->csd_query_tokens && a->csd_film_weight && a->csd_film_bias &&
+             a->csd_norm_weight && a->csd_norm_bias;
     if (!ok) {
         iris_ip_adapter_free(a);
         return NULL;
@@ -205,51 +220,53 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
     free(a->norm_bias); free(a->ip_k_stacked); free(a->ip_v_stacked);
     free(a->ip_scale); free(a->in_gamma); free(a->in_beta);
     free(a->film_weight); free(a->film_bias);
+    free(a->csd_query_tokens); free(a->csd_film_weight); free(a->csd_film_bias);
+    free(a->csd_norm_weight); free(a->csd_norm_bias);
     if (a->_sf_handle) safetensors_close((safetensors_file_t *)a->_sf_handle);
     free(a);
 }
 
-int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
-                             const float *siglip, int n_siglip,
-                             float *ip_embeds) {
-    /* CSD conditioning (SREF-LEAK-2): `siglip` is the single content-invariant CSD style
-     * vector [csd_dim] (n_siglip ignored). No cross-attention — FiLM-modulate the learned
-     * query tokens: film = film_weight @ csd + film_bias → (scale, shift);
-     * token = query_tokens * (1 + scale) + shift; then LayerNorm. Mirrors CSDImageProj
-     * (train/ip_adapter/model.py). */
-    if (strcmp(a->cond_mode, "csd") == 0) {
-        int H = a->hidden_dim, T = a->num_image_tokens, C = a->csd_dim;
-        float *film = malloc((size_t)2 * H * sizeof(float));
-        if (!film) return -1;
-        /* film[1,2H] = csd[1,C] @ film_weight[2H,C]^T */
-        iris_matmul_t(film, siglip, a->film_weight, 1, C, 2 * H);
-        for (int i = 0; i < 2 * H; i++) film[i] += a->film_bias[i];
-        const float *scale = film;       /* [H] */
-        const float *shift = film + H;   /* [H] */
-        for (int t = 0; t < T; t++) {
-            float *row = ip_embeds + (size_t)t * H;
-            const float *q = a->query_tokens + (size_t)t * H;
-            for (int d = 0; d < H; d++) row[d] = q[d] * (1.0f + scale[d]) + shift[d];
-            float mean = 0.0f, var = 0.0f;
-            for (int d = 0; d < H; d++) mean += row[d];
-            mean /= H;
-            for (int d = 0; d < H; d++) { float e = row[d] - mean; var += e * e; }
-            var /= H;
-            float inv = 1.0f / sqrtf(var + LN_EPS);
-            for (int d = 0; d < H; d++)
-                row[d] = (row[d] - mean) * inv * a->norm_weight[d] + a->norm_bias[d];
-        }
-        free(film);
-        return 0;
+/* CSDImageProj FiLM path → out[T*H]. Generic over the weight set so cond_mode=="csd"
+ * (whole adapter) and cond_mode=="hybrid" (the CSD half) share one implementation.
+ * film = film_weight @ csd + film_bias → (scale, shift); token = qtok*(1+scale)+shift;
+ * then per-token LayerNorm (biased var, LN_EPS). Mirrors CSDImageProj. */
+static int perceive_csd_film(int H, int T, int C, const float *csd,
+                             const float *qtok, const float *fw, const float *fb,
+                             const float *nw, const float *nb, float *out) {
+    float *film = malloc((size_t)2 * H * sizeof(float));
+    if (!film) return -1;
+    iris_matmul_t(film, csd, fw, 1, C, 2 * H);            /* [1,2H] = csd[1,C] @ fw[2H,C]^T */
+    for (int i = 0; i < 2 * H; i++) film[i] += fb[i];
+    const float *scale = film;       /* [H] */
+    const float *shift = film + H;   /* [H] */
+    for (int t = 0; t < T; t++) {
+        float *row = out + (size_t)t * H;
+        const float *q = qtok + (size_t)t * H;
+        for (int d = 0; d < H; d++) row[d] = q[d] * (1.0f + scale[d]) + shift[d];
+        float mean = 0.0f, var = 0.0f;
+        for (int d = 0; d < H; d++) mean += row[d];
+        mean /= H;
+        for (int d = 0; d < H; d++) { float e = row[d] - mean; var += e * e; }
+        var /= H;
+        float inv = 1.0f / sqrtf(var + LN_EPS);
+        for (int d = 0; d < H; d++)
+            row[d] = (row[d] - mean) * inv * nw[d] + nb[d];
     }
+    free(film);
+    return 0;
+}
+
+/* SigLIP PerceiverResampler cross-attention → out[T*H] from n_siglip rows. Uses the
+ * SigLIP perceiver weights (query_tokens/query_proj/key_proj/value_proj/out_proj/norm_*
+ * + optional in_gamma/in_beta). T = output token count (num_image_tokens for siglip mode,
+ * num_image_tokens/2 for the hybrid SigLIP half). */
+static int perceive_siglip_mha(const iris_ip_adapter_t *a, const float *siglip,
+                               int n_siglip, int T, float *out) {
     int H = a->hidden_dim, S = a->siglip_dim;
     /* PerceiverResampler MHA: head count is perceiver_heads, head_dim = H/heads.
-     * This is NOT the Flux block head_dim (128) — the perceiver was trained with
-     * its own grouping (e.g. 16 heads of 192 for a 3072-dim adapter). Using the
-     * wrong head_dim here mis-groups Q/K/V and applies the wrong softmax scale,
-     * collapsing ip_embeds toward a per-token-constant (pooled) vector — the
-     * root cause of the patch-periodic grid in C inference (IP-ADAPTER-INFER-1). */
-    int T = a->num_image_tokens, heads = a->perceiver_heads, hd = H / heads;
+     * This is NOT the Flux block head_dim (128) — using the wrong head_dim mis-groups
+     * Q/K/V and collapses ip_embeds toward a pooled vector (IP-ADAPTER-INFER-1). */
+    int heads = a->perceiver_heads, hd = H / heads;
 
     float *Q = malloc((size_t)T * H * sizeof(float));
     float *K = malloc((size_t)n_siglip * H * sizeof(float));
@@ -258,9 +275,7 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
     if (!Q || !K || !V || !attn) { free(Q); free(K); free(V); free(attn); return -1; }
 
     /* Input normalization (IP-ADAPTER-INFER-1 fix): standardize each SigLIP DIMENSION
-     * across the token axis, then learned affine. Mirrors PerceiverResampler._norm_input
-     * (train/ip_adapter/model.py). Skipped for legacy bundles (in_gamma/in_beta NULL),
-     * which expect raw input. NOTE: per-DIM across tokens, not a per-token LayerNorm. */
+     * across the token axis, then learned affine. Skipped for legacy bundles (NULL). */
     const float *sig_in = siglip;
     float *sig_n = NULL;
     if (a->in_gamma && a->in_beta) {
@@ -293,10 +308,10 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
         return -1;
     }
 
-    /* out_proj then LayerNorm into ip_embeds */
-    iris_matmul_t(ip_embeds, attn, a->out_proj, T, H, H);
+    /* out_proj then per-token LayerNorm into out */
+    iris_matmul_t(out, attn, a->out_proj, T, H, H);
     for (int t = 0; t < T; t++) {
-        float *row = ip_embeds + (size_t)t * H;
+        float *row = out + (size_t)t * H;
         float mean = 0.0f;
         for (int i = 0; i < H; i++) mean += row[i];
         mean /= H;
@@ -309,6 +324,41 @@ int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
     }
     free(Q); free(K); free(V); free(attn); free(sig_n);
     return 0;
+}
+
+int iris_ip_adapter_perceive(const iris_ip_adapter_t *a,
+                             const float *siglip, int n_siglip,
+                             float *ip_embeds) {
+    int H = a->hidden_dim;
+
+    /* CSD conditioning (SREF-LEAK-2): `siglip` is the single CSD style vector [csd_dim]
+     * (n_siglip ignored). FiLM the learned query tokens (reuses query_tokens/norm_*). */
+    if (strcmp(a->cond_mode, "csd") == 0)
+        return perceive_csd_film(H, a->num_image_tokens, a->csd_dim, siglip,
+                                 a->query_tokens, a->film_weight, a->film_bias,
+                                 a->norm_weight, a->norm_bias, ip_embeds);
+
+    /* Hybrid conditioning (SREF-COMBINE-1): `siglip` is the packed feature [n_siglip, S]
+     * where the last row is the CSD vector zero-padded to S. The SigLIP perceiver consumes
+     * the first (n_siglip-1) rows → first half of ip_embeds; the CSD FiLM module consumes
+     * the last row's first csd_dim values → second half. Matches the Python concat order
+     * [sig_tok, csd_tok] in IPAdapterKlein.get_image_embeds. */
+    if (strcmp(a->cond_mode, "hybrid") == 0) {
+        int half = a->num_image_tokens / 2;
+        int n_sig = n_siglip - 1;                                   /* SigLIP rows (729) */
+        const float *csd = siglip + (size_t)n_sig * a->siglip_dim;  /* last row, first csd_dim */
+        if (perceive_siglip_mha(a, siglip, n_sig, half, ip_embeds) != 0)
+            return -1;
+        if (perceive_csd_film(H, half, a->csd_dim, csd,
+                              a->csd_query_tokens, a->csd_film_weight, a->csd_film_bias,
+                              a->csd_norm_weight, a->csd_norm_bias,
+                              ip_embeds + (size_t)half * H) != 0)
+            return -1;
+        return 0;
+    }
+
+    /* SigLIP-only PerceiverResampler. */
+    return perceive_siglip_mha(a, siglip, n_siglip, a->num_image_tokens, ip_embeds);
 }
 
 void iris_ip_adapter_get_kv(const iris_ip_adapter_t *a, int block_idx,

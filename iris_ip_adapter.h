@@ -59,17 +59,30 @@ typedef struct {
                               /* /128 — perceiver head_dim = hidden/this)       */
     int style_only;           /* 1 = double-stream ip_scale zeroed at export    */
 
-    /* Conditioning mode (SREF-LEAK-2): "siglip" (PerceiverResampler over 729 patch
-     * tokens) | "csd" (CSDImageProj: FiLM-modulate query tokens by a single content-
-     * invariant CSD style vector). Default "siglip" for legacy/unset bundles. */
+    /* Conditioning mode: "siglip" (PerceiverResampler over 729 patch tokens) | "csd"
+     * (CSDImageProj: FiLM-modulate query tokens by a single content-invariant CSD style
+     * vector) | "hybrid" (SREF-COMBINE-1: BOTH — the SigLIP perceiver produces the first
+     * num_image_tokens/2 tokens, the CSD module the next num_image_tokens/2, concatenated;
+     * the input feature is packed [730, siglip_dim] with rows 0..728 = SigLIP and row 729
+     * = the CSD vector zero-padded to siglip_dim). Default "siglip" for legacy bundles. */
     char cond_mode[16];
-    int  csd_dim;             /* CSD style-embedding dim (768) — cond_mode=="csd" only */
+    int  csd_dim;             /* CSD style-embedding dim (768) — csd/hybrid only */
 
-    /* CSDImageProj weights (cond_mode=="csd" only; NULL otherwise). FiLM maps the CSD
-     * vector → (scale, shift): film = film_weight @ csd + film_bias, then
-     * token = query_tokens * (1 + scale) + shift, then the shared norm_weight/bias. */
+    /* CSDImageProj weights. cond_mode=="csd": these hold the (only) CSD module and reuse
+     * query_tokens/norm_weight/norm_bias below for its query tokens + LayerNorm. FiLM maps
+     * the CSD vector → (scale, shift): film = film_weight @ csd + film_bias, then
+     * token = query_tokens * (1 + scale) + shift, then LayerNorm. NULL otherwise. */
     float *film_weight;       /* [2*hidden_dim, csd_dim]  (nn.Linear: [out, in]) */
     float *film_bias;         /* [2*hidden_dim] */
+
+    /* cond_mode=="hybrid" ONLY: the CSD module's OWN query tokens + FiLM + LayerNorm,
+     * kept separate from the SigLIP perceiver's query_tokens/norm_* (which the hybrid
+     * SigLIP half uses). NULL for siglip/csd bundles. */
+    float *csd_query_tokens;  /* [num_image_tokens/2, hidden_dim] */
+    float *csd_film_weight;   /* [2*hidden_dim, csd_dim] */
+    float *csd_film_bias;     /* [2*hidden_dim] */
+    float *csd_norm_weight;   /* [hidden_dim] */
+    float *csd_norm_bias;     /* [hidden_dim] */
 
     /* Quantisation mode: "bfloat16" | "float16" | "int8" */
     char quant[16];

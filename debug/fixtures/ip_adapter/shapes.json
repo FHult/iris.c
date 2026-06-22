@@ -63,5 +63,32 @@
     1,
     12,
     256
+  ],
+  "hybrid_tokens": 16,
+  "hybrid_seq": 17,
+  "in_hybrid": [
+    1,
+    17,
+    64
+  ],
+  "gold_ip_embeds_hybrid": [
+    1,
+    16,
+    256
+  ],
+  "gold_k_ip_b0_hybrid": [
+    1,
+    16,
+    256
+  ],
+  "gold_v_ip_b0_hybrid": [
+    1,
+    16,
+    256
+  ],
+  "gold_inject_b0_hybrid": [
+    1,
+    12,
+    256
   ]
 }
