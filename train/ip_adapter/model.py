@@ -145,6 +145,8 @@ class IPAdapterKlein(nn.Module):
         num_double_blocks: int = 5,
         cond_mode: str = "siglip",   # "siglip" | "csd" | "hybrid"
         csd_dim: int = 768,
+        ip_scale_init: float = 1.0,  # per-block learned scale init; <1 tames early injection
+                                     # (SREF-COMBINE-1: hybrid injects 2 token sets → use 0.5)
     ):
         super().__init__()
         self.num_blocks = num_blocks
@@ -192,7 +194,7 @@ class IPAdapterKlein(nn.Module):
         ) * scale
 
         # Per-block learnable scale: start at 1.0
-        self.scale = mx.ones((num_blocks,))
+        self.scale = mx.ones((num_blocks,)) * ip_scale_init
 
     def get_image_embeds(self, cond_features: mx.array) -> mx.array:
         """

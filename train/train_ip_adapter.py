@@ -1005,6 +1005,7 @@ def train(config: dict) -> None:
             perceiver_heads=acfg["perceiver_heads"],
             cond_mode=_cond_mode,
             csd_dim=_csd_dim,
+            ip_scale_init=float(acfg.get("ip_scale_init", 1.0)),
         )
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
