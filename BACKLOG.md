@@ -520,6 +520,30 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
        PRE-EXISTING (not-CSD) UB in the `exp2` kernel (`iris_kernels.h:30` left-shift of a
        negative) — fixed with a numerically-identical unsigned shift; UBSan now clean, parity
        intact, `make test-unit` all-green, iris rebuilt.
+  - **PHASE 3 (2026-06-22) — CSD arm TRAINED; verdict eval BLOCKED on disk access:**
+    The real CSD arm finished (3000 steps, `…/csd_arm/ckpt/best.safetensors`, EMA). Config =
+    `style_arm` with only `cond_mode=csd` (cross-ref style pairing on; 768-d CSD). Training health:
+    loss avg 0.378, style_loss 0.0058→0.0048 (falling), ip_scale mean 0.69 (double 0.0 / single 0.86),
+    grad_norm ~0.4. cond_gap was NOISY per-25-step window (n≈16/9): negative early (−11%), +16…+19%
+    mid/late, −12.7% on the final window with a "loss_cond≈loss_null" warning — too small-n to read as
+    a verdict; the null-relative sweep is the arbiter. Export OK → bf16 bundle (csd tensors, csd_dim=768,
+    siglip_dim=0). 5 CSD ref features built (`refs_feat_csd/*.bin`, 768 f32 each).
+    - **EXPORT-VALIDATOR BUG (found + fixed, `export_adapter.py`):** after FiLM keys were added to
+      `_KEY_MAP`, `validate_bundle` built `expected = set(_KEY_MAP.values())` = the UNION of SigLIP
+      (query/key/value/out_proj) AND CSD (film_*) tensors, so `--validate` could NEVER pass for EITHER
+      mode (CSD bundle missing the siglip projs → false FAIL). The write path already branched on
+      `is_csd`; the validator now branches on `meta["cond_mode"]` to the mode-specific expected-set, the
+      int8 scale-key set is intersected with it, and the int8 dequant spot-check is guarded for the
+      siglip-only `query_proj`. Re-export → "Validation PASSED (8 tensors, bfloat16)". (Self-contained
+      export fix; does not touch the C inference or the parity-proven path.)
+    - **BLOCKER (environment, not code): `/Volumes/2TBSSD` went EPERM mid-session.** The export +
+      feature-build read/wrote the SSD fine, then the WHOLE volume became unreadable (`ls` → EPERM,
+      incl. with the Bash sandbox disabled → not a sandbox issue; volume still mounted+healthy per
+      `mount`/`df`, owned by user). Consistent with a macOS removable-volume access grant (TCC/Full
+      Disk Access) lapsing after the external SSD slept/remounted. Resume the sanity-gen + verdict
+      sweep once the grant is restored (re-approve Full Disk Access for the terminal/Claude, or
+      remount). Verdict question unchanged: does the CSD injection ratio Δstyle/Δleak beat the 0.65
+      SigLIP plateau, or does the 768-d bottleneck wash style fidelity (→ SREF-COMBINE-1)?
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.

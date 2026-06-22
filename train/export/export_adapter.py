@@ -529,11 +529,23 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
 
     loaded = mx.load(weights_path)
 
-    # Check all expected tensors are present (perceiver input-norm is optional —
-    # absent in legacy pre-input-norm bundles).
-    expected = set(_KEY_MAP.values()) - {"perceiver.in_gamma", "perceiver.in_beta"}
+    # Check all expected tensors are present, branching on cond_mode exactly as the
+    # write path does (is_csd). A CSD bundle has FiLM weights and NO cross-attn projs;
+    # a SigLIP bundle the reverse. Using the full _KEY_MAP would require the union of
+    # both modes' tensors and can never pass. Perceiver input-norm (in_gamma/in_beta)
+    # is optional — absent in legacy pre-input-norm bundles.
+    cond_mode = meta.get("cond_mode", "siglip")
+    if cond_mode == "csd":
+        expected = {"perceiver.query_tokens", "perceiver.norm_weight",
+                    "perceiver.norm_bias", "perceiver.film_weight",
+                    "perceiver.film_bias", "ip_k_stacked", "ip_v_stacked", "ip_scale"}
+    else:
+        expected = {"perceiver.query_tokens", "perceiver.query_proj",
+                    "perceiver.key_proj", "perceiver.value_proj", "perceiver.out_proj",
+                    "perceiver.norm_weight", "perceiver.norm_bias",
+                    "ip_k_stacked", "ip_v_stacked", "ip_scale"}
     if quant == "int8":
-        scale_keys = {f"{n}.scale" for n in _QUANTISED_TENSORS}
+        scale_keys = {f"{n}.scale" for n in (_QUANTISED_TENSORS & expected)}
         expected = expected | scale_keys
 
     missing_tensors = expected - set(loaded.keys())
@@ -578,8 +590,9 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
                     print(f"FAIL: {skey} has non-positive values", file=sys.stderr)
                     return False
 
-    # Quick dequant spot-check for int8: first perceiver weight
-    if quant == "int8":
+    # Quick dequant spot-check for int8: first perceiver weight (SigLIP-only tensor;
+    # CSD bundles have no cross-attn projection to spot-check here).
+    if quant == "int8" and "perceiver.query_proj" in loaded:
         q8 = np.array(loaded["perceiver.query_proj"])
         sc8 = np.array(loaded["perceiver.query_proj.scale"].astype(mx.float32))
         dq = q8.astype(np.float32) * sc8[:, None]
