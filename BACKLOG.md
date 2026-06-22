@@ -536,14 +536,37 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
       int8 scale-key set is intersected with it, and the int8 dequant spot-check is guarded for the
       siglip-only `query_proj`. Re-export → "Validation PASSED (8 tensors, bfloat16)". (Self-contained
       export fix; does not touch the C inference or the parity-proven path.)
-    - **BLOCKER (environment, not code): `/Volumes/2TBSSD` went EPERM mid-session.** The export +
-      feature-build read/wrote the SSD fine, then the WHOLE volume became unreadable (`ls` → EPERM,
-      incl. with the Bash sandbox disabled → not a sandbox issue; volume still mounted+healthy per
-      `mount`/`df`, owned by user). Consistent with a macOS removable-volume access grant (TCC/Full
-      Disk Access) lapsing after the external SSD slept/remounted. Resume the sanity-gen + verdict
-      sweep once the grant is restored (re-approve Full Disk Access for the terminal/Claude, or
-      remount). Verdict question unchanged: does the CSD injection ratio Δstyle/Δleak beat the 0.65
-      SigLIP plateau, or does the 768-d bottleneck wash style fidelity (→ SREF-COMBINE-1)?
+    - (env note) `/Volumes/2TBSSD` (and 16TBCold) went EPERM mid-session — macOS **TCC
+      removable-volume** protection (stat works, data read fails, EXTERNAL volumes only; sandbox-off
+      didn't help). A newly-granted Full Disk Access only applies to processes started AFTER the grant,
+      so the fix was to fully restart the VS Code `claude` native binary (Cmd-Q + reopen). After
+      restart, reads worked again and the verdict ran. Keep this for next time the SSD sleeps/remounts.
+  - **PHASE 3 VERDICT (2026-06-22) — CSD-only does NOT beat the 0.65 SigLIP plateau. Decision:
+    proceed to SREF-COMBINE-1 (hybrid).** Sanity gens first: scale 0.15 = clean coherent "cat on a
+    windowsill" (content intact, ~no style); scale 0.5 = content-free purple wash. So the CSD adapter
+    is a smooth dial but FAR more potent than SigLIP — usable band is low scales. Null-relative sweep
+    (`csd_arm`, scales 0.2/0.3/0.4, 10 prompts × 5 styles, seed 42; null style_sim +0.0042 / leak
+    +0.3231):
+    | scale | Δstyle | Δleak | inj_ratio Δstyle/Δleak | prompt_adh |
+    |------:|-------:|------:|----------------------:|-----------:|
+    | 0.2  | −0.0009 | +0.0094 | −0.10 | +0.152 |
+    | 0.3  | +0.0113 | +0.0520 |  0.22 | +0.144 |
+    | 0.4  | +0.0695 | +0.1103 |  0.63 | +0.079 |
+    Injection ratio rises with scale but TOPS OUT ~0.63 at 0.4 — at/below the SigLIP best (0.65, leak1/
+    patch_shuffle). And it's a false 0.63: **eyeballing the images shows NO faithful style at any scale**
+    — impressionism_landscape 0.3 = sharp PHOTO (no style) → 0.4 = blue-grey wash (content gone);
+    expressionism violinist 0.3 = clean PHOTO → 0.4 = dark scratchy smear (subject destroyed). The
+    +0.07 Δstyle at 0.4 is wash-texture raising the SigLIP style cosine, not real style. **No scale has
+    both coherent content AND faithful style** → the 768-d-bottleneck fidelity risk CONFIRMED.
+    - **ROOT CAUSE (architectural, log it):** `CSDImageProj` FiLM-modulates 128 SHARED query tokens
+      with a single per-channel (scale, shift) → the whole injection is ONE global modulation direction
+      (rank-limited). Structurally it can only apply a global color/texture shift, never spatial/textural
+      style — hence the wash. A richer CSD head (768 → 128 DISTINCT tokens via small MLP/attn) might
+      help, but the cleaner next step is the already-scoped hybrid.
+    - **NEXT = SREF-COMBINE-1** (`cond_mode="hybrid"`): CSD supplies the content-free style DIRECTION,
+      SigLIP's 729→128 cross-attention supplies the local detail the single vector can't carry. The two
+      arms fail in opposite ways (SigLIP leaks-with-style; CSD washes), so combine. Do NOT start the
+      hybrid training run without confirming the plan first.
 
 - **SREF-COMBINE-1: hybrid SigLIP + CSD conditioning for stronger style transfer (High —
   next major architecture experiment after the CSD-only test).** Status: PROPOSED.
