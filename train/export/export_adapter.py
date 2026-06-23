@@ -592,8 +592,17 @@ def validate_bundle(out_dir: str, quant: str) -> bool:
     dims = meta
     errors = []
 
+    # perceiver.query_tokens holds num_image_tokens queries for siglip/csd, but only HALF
+    # for hybrid (the SigLIP half; the CSD half is csd.query_tokens). Check both halves sum.
     qt = loaded["perceiver.query_tokens"]
-    if qt.shape != (dims["num_image_tokens"], dims["hidden_dim"]):
+    if cond_mode == "hybrid":
+        ct = loaded.get("csd.query_tokens")
+        n_q = qt.shape[0] + (ct.shape[0] if ct is not None else 0)
+        if qt.shape[1] != dims["hidden_dim"] or n_q != dims["num_image_tokens"]:
+            errors.append(f"hybrid query tokens {qt.shape} + "
+                          f"{None if ct is None else ct.shape} != "
+                          f"({dims['num_image_tokens']}, {dims['hidden_dim']})")
+    elif qt.shape != (dims["num_image_tokens"], dims["hidden_dim"]):
         errors.append(f"perceiver.query_tokens shape {qt.shape}")
 
     ks = loaded["ip_k_stacked"]

@@ -599,6 +599,31 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     LEVERS for the full run:** lower ip_scale init (e.g. 0.5) and/or per-module gate, longer warmup,
     lower LR. Re-smoke until grad settles before the 3000-step arm; then null-relative eval vs the
     0.65 plateau (acceptance: inj ratio >0.75 with lower leak than SigLIP).
+  - **VERDICT (2026-06-23) — hybrid is the BEST arm; marginal quantitative win, CLEAR qualitative
+    win.** Trained 3000 steps at ip_scale_init=0.5 (loss settled 0.34, grad ~0.4, healthy; cond_gap
+    ended ≈0 with the "may not be learning" warning — but that surrogate is MISLEADING here, the eval
+    shows real style injection). Null-relative sweep (scales 0.3/0.5/0.7, 10 prompts × 5 styles; null
+    style +0.0042 / leak +0.3231):
+    | scale | Δstyle | Δleak | inj_ratio | prompt_adh |
+    |------:|-------:|------:|----------:|-----------:|
+    | 0.3  | +0.0069 | +0.0306 | 0.225 | +0.149 |
+    | 0.5  | +0.1076 | +0.1567 | **0.687** | +0.113 |
+    | 0.7  | +0.1191 | +0.1770 | 0.673 | −0.006 |
+    Inj ratio peaks **0.687 at scale 0.5 — above the 0.65 SigLIP plateau AND the 0.63 CSD-only**, and
+    Δstyle +0.108 is the **HIGHEST absolute style injection of any arm** (CSD +0.07, SigLIP arms ~+0.086).
+    **The decisive result is QUALITATIVE:** at scale 0.5 the hybrid keeps CONTENT intact AND applies REAL
+    style across all 5 styles — violinist = recognizable figure + scratchy expressionist brushwork;
+    baroque = portrait + chiaroscuro; impressionism = landscape + painterly haze — where CSD-only at 0.5
+    was a content-free WASH and SigLIP-low had no style. The two failure modes (no-style / wash) are GONE.
+    This is the first usable style adapter: the SigLIP half holds structure, the CSD half adds the
+    content-free style direction. **But it does NOT clear the >0.75 acceptance bar, and leak (+0.157) is
+    NOT lower than SigLIP** — leak still tracks style (ratio <1.0). So: a working PLATFORM, an incremental
+    metric win, not the decisive leak-reduction. Released v4.1.0 (code); validator query_tokens hybrid fix
+    follow-up. **NEXT LEVERS to push past 0.75 (reduce leak at fixed style):** (a) widen style-only block
+    zeroing / push CSD into early blocks + SigLIP into late (hierarchical, the per-block ip_scale already
+    supports it); (b) down-weight or subsample the SigLIP half (it carries the leak); (c) per-module gate
+    biased toward CSD; (d) longer training. Also: cond_gap is a POOR surrogate for style adapters (ended
+    ≈0 while the eval shows +0.108 Δstyle) — trust the null-relative frontier, not cond_gap.
   **Rationale:** the two signals fail in opposite ways, so combine them.
   - Pure SigLIP leaks content — each of the 729 patch tokens is heavily content-laden — which
     is the structural cause of the injection-ratio ceiling (~0.5–0.65) measured across the
