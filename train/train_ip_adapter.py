@@ -929,6 +929,8 @@ def train(config: dict) -> None:
         style_neighbors_db=dcfg.get("style_neighbors_db"),
         cond_mode=_cond_mode,
         csd_cache_dir=dcfg.get("csd_cache_dir"),
+        seed=dcfg.get("seed"),
+        records_per_shard_visit=dcfg.get("records_per_shard_visit"),
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before

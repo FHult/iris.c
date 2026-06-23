@@ -343,6 +343,12 @@ def make_prefetch_loader(
     style_neighbors_db: Optional[str] = None,
     cond_mode: str = "siglip",          # "siglip" (per-record npz) | "csd" (per-shard bundles)
     csd_cache_dir: Optional[str] = None,  # SREF-LEAK-2: CSD style-embedding cache (style_precompute.py)
+    seed: Optional[int] = None,         # seed the shard-order + record RNGs (reproducible data
+                                        # across runs — needed for clean A/B arm comparisons)
+    records_per_shard_visit: Optional[int] = None,  # cap records taken per shard before rotating
+                                        # to the next — interleaves across shards within a short run
+                                        # (else a 3k-step run drains ONE ~5k-record shard, never
+                                        # reaching the others; the single-shard confound, 2026-06-23)
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -411,7 +417,7 @@ def make_prefetch_loader(
 
     # ---- Level 1: shard decompressor thread --------------------------------
     def shard_loader():
-        rng = random.Random()
+        rng = random.Random(seed)   # seeded → identical shard order across runs
         consecutive_errors = 0
         while True:
             # Build this epoch's shard list:
@@ -545,7 +551,9 @@ def make_prefetch_loader(
 
     def sample_decoder():
         tj = _make_jpeg()
-        rng = random.Random()
+        # Decorrelated from the shard-order rng but still seeded → identical record
+        # shuffle/bucket/dropout/neighbor choices across runs.
+        rng = random.Random(None if seed is None else seed + 1)
 
         while True:
             contents = shard_q.get()
@@ -555,6 +563,11 @@ def make_prefetch_loader(
                 return
             records = _iter_shard_contents(contents)
             rng.shuffle(records)
+            # Cap records taken from this shard before rotating to the next (interleaving):
+            # take a seeded-random subset so a short run spans many shards. Applied AFTER the
+            # shuffle so the subset is representative, not the tar's on-disk order.
+            if records_per_shard_visit is not None:
+                records = records[:records_per_shard_visit]
 
             # Pick bucket for this shard
             if bucket is not None:
