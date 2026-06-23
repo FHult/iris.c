@@ -1116,11 +1116,13 @@ def train(config: dict) -> None:
     _freeze_double_stream = acfg.get("freeze_double_stream_scales", False)
     _nd = adapter.num_double_blocks  # number of double-stream blocks (default 5)
 
-    # SREF-COMBINE-1: keep a STRUCTURAL injection gate fixed (fixed/hierarchical modes) by
-    # zeroing its grad before optimizer.update — same pattern as the double-stream freeze.
-    # "learned" trains it; "none" leaves it at all-ones (grad is a harmless no-op either way).
+    # SREF-COMBINE-1: keep the injection gate FIXED for every mode except "learned" by zeroing
+    # its grad before optimizer.update (same pattern as the double-stream freeze). This pins
+    # fixed/hierarchical at their structural init AND keeps "none" a true all-ones no-op — without
+    # the freeze, "none"'s ones-gate is a trainable param the optimizer would drift away from ones,
+    # silently turning the ungated baseline into a learned gate. Only "learned" trains it.
     _freeze_gate = (_cond_mode == "hybrid"
-                    and acfg.get("injection_gate", "none") in ("fixed", "hierarchical"))
+                    and acfg.get("injection_gate", "none") != "learned")
 
     # QUALITY-2: zero double-stream scales after checkpoint load so content-injecting
     # blocks stay silent for the entire run (grad zeroing in compiled_step keeps them zero).
@@ -1572,6 +1574,15 @@ def train(config: dict) -> None:
     val_loss_last: Optional[float] = None
     val_loss_log_path = os.path.join(ocfg["checkpoint_dir"], "val_loss.jsonl")
     _val_every = tcfg.get("val_every", 1000)
+
+    # Per-record conditioned-vs-null loss attribution (opt-in, near-zero cost): one JSONL
+    # line per step with {step, id, shard (=id prefix), null, cross_ref, loss}. Aggregate
+    # offline per shard/record to see which data the adapter reconstructs best when
+    # conditioned. NOT a paired cond_gap (cond/null fall on different samples by the
+    # image_dropout coin flip) — it's a per-shard conditioned-loss vs null-loss signal.
+    _cond_attrib_fh = None
+    if tcfg.get("log_cond_attrib", False):
+        _cond_attrib_fh = open(os.path.join(ocfg["checkpoint_dir"], "cond_attrib.jsonl"), "a")
     try:
         from pathlib import Path as _P
         import pipeline_lib as _plib
@@ -1705,7 +1716,7 @@ def train(config: dict) -> None:
     _SKIP_WINDOW       = 500
     _SKIP_RATE_LIMIT   = 0.50
 
-    for images_np, captions, text_np, vae_np, siglip_np, style_ref_np, bucket_hw in loader:
+    for images_np, captions, text_np, vae_np, siglip_np, style_ref_np, bucket_hw, ids_np in loader:
         if step >= _end_step:
             break
 
@@ -2014,6 +2025,18 @@ def train(config: dict) -> None:
             bucket_stats[_bk]["steps"]    += 1
             bucket_stats[_bk]["loss_sum"] += _step_loss_val
             bucket_stats[_bk]["time_sum"] += _t_eval_end - _t_inner_start
+
+            # Per-record cond-vs-null loss attribution (opt-in). Only when the step maps to
+            # exactly ONE record — at batch_size>1 the loss is a batch mean and can't be
+            # attributed to a single id, so skip rather than mislabel.
+            if _cond_attrib_fh is not None and len(ids_np) == 1:
+                _rid = ids_np[0]
+                _cond_attrib_fh.write(json.dumps({
+                    "step": step, "id": _rid, "shard": _rid.rsplit("_", 1)[0],
+                    "null": bool(null_image), "cross_ref": bool(is_cross_ref),
+                    "loss": _step_loss_val,
+                }) + "\n")
+                _cond_attrib_fh.flush()
 
             # T-12: conditioned vs unconditioned loss split
             if null_image:

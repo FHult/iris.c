@@ -568,6 +568,7 @@ def make_prefetch_loader(
             imgs_buf, caps_buf = [], []
             temb_buf, vlat_buf, sfeat_buf = [], [], []
             sref_buf = []
+            ids_buf = []   # record ids ({shard_stem}_{idx}) for per-shard loss attribution
 
             for rec in records:
                 # Subsampled-cache fast path (DP-2c): in cached mode a record
@@ -616,6 +617,7 @@ def make_prefetch_loader(
                 vlat_buf.append(vae_lat)
                 sfeat_buf.append(siglip_feat)
                 sref_buf.append(style_ref_feat)
+                ids_buf.append(rec["id"])
 
                 if len(imgs_buf) == batch_size:
                     # Stack arrays; keep None for missing caches.
@@ -648,10 +650,12 @@ def make_prefetch_loader(
                         s_arr,
                         r_arr,
                         (bH, bW),
+                        list(ids_buf),          # record ids (per-shard loss attribution)
                     ))
                     imgs_buf, caps_buf = [], []
                     temb_buf, vlat_buf, sfeat_buf = [], [], []
                     sref_buf = []
+                    ids_buf = []
 
     # Shared crash-message slot: workers write their exception here before dying
     # so the main thread can surface the root cause instead of a generic timeout.
