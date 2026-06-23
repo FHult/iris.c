@@ -84,6 +84,12 @@ typedef struct {
     float *csd_norm_weight;   /* [hidden_dim] */
     float *csd_norm_bias;     /* [hidden_dim] */
 
+    /* cond_mode=="hybrid" leak-reduction gate (SREF-COMBINE-1), optional. Per-block,
+     * per-group weight [num_blocks, 2] = (siglip_weight, csd_weight) applied to each token
+     * group's V in get_kv (SigLIP = first num_image_tokens/2 tokens, CSD = the rest). NULL =
+     * no gate (all ones), so legacy v4.1.0 hybrid bundles without it inject ungated. */
+    float *group_gate;        /* [num_blocks * 2], or NULL */
+
     /* Quantisation mode: "bfloat16" | "float16" | "int8" */
     char quant[16];
 

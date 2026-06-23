@@ -92,6 +92,7 @@ _KEY_MAP = {
     "csd_proj.film.bias":                      "csd.film_bias",
     "csd_proj.norm.weight":                    "csd.norm_weight",
     "csd_proj.norm.bias":                      "csd.norm_bias",
+    "group_gate":                              "group_gate",   # hybrid leak gate [num_blocks,2]
     "to_k_ip_stacked":                         "ip_k_stacked",
     "to_v_ip_stacked":                         "ip_v_stacked",
     "scale":                                   "ip_scale",
@@ -117,6 +118,7 @@ _ALWAYS_F32 = {
     "csd.norm_weight",       # hybrid CSD module norm/bias (SREF-COMBINE-1)
     "csd.norm_bias",
     "csd.film_bias",
+    "group_gate",            # hybrid leak gate [num_blocks,2] (SREF-COMBINE-1)
     "ip_scale",
 }
 
@@ -125,6 +127,7 @@ _F32_OVERRIDE = {"perceiver.norm_weight", "perceiver.norm_bias",
                  "perceiver.in_gamma", "perceiver.in_beta",
                  "perceiver.film_bias",
                  "csd.norm_weight", "csd.norm_bias", "csd.film_bias",
+                 "group_gate",
                  "ip_scale"}
 
 
@@ -254,7 +257,7 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
     # Optional keys: the perceiver input-norm (in_gamma/in_beta) is absent in legacy
     # checkpoints trained before IP-ADAPTER-INFER-1's fix; skip rather than error so
     # those still export (the C loader falls back to no input-norm when they're missing).
-    _OPTIONAL = {"image_proj.in_gamma", "image_proj.in_beta"}
+    _OPTIONAL = {"image_proj.in_gamma", "image_proj.in_beta", "group_gate"}
     # SREF-LEAK-2: a checkpoint is EITHER siglip (cross_attn + in_gamma/beta) or csd (film.*).
     # Detect the mode from the presence of the FiLM weight, and treat the OTHER mode's keys as
     # not-applicable (skip, don't flag missing).
@@ -265,7 +268,7 @@ def load_checkpoint(path: str, use_ema: bool) -> dict[str, np.ndarray]:
                     "image_proj.cross_attn.out_proj.weight",
                     "image_proj.in_gamma", "image_proj.in_beta"}
     _HYBRID_ONLY = {"csd_proj.query_tokens", "csd_proj.film.weight", "csd_proj.film.bias",
-                    "csd_proj.norm.weight", "csd_proj.norm.bias"}
+                    "csd_proj.norm.weight", "csd_proj.norm.bias", "group_gate"}
     # SREF-COMBINE-1: hybrid = SigLIP perceiver (image_proj.cross_attn.*) + a SEPARATE CSD
     # module (csd_proj.*). Detect by the csd_proj FiLM; pure-csd by image_proj's own FiLM.
     is_hybrid = (prefix + "csd_proj.film.weight") in raw

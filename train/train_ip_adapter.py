@@ -1006,6 +1006,9 @@ def train(config: dict) -> None:
             cond_mode=_cond_mode,
             csd_dim=_csd_dim,
             ip_scale_init=float(acfg.get("ip_scale_init", 1.0)),
+            injection_gate=acfg.get("injection_gate", "none"),
+            siglip_gate=float(acfg.get("siglip_gate", 1.0)),
+            csd_gate=float(acfg.get("csd_gate", 1.0)),
         )
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
@@ -1112,6 +1115,12 @@ def train(config: dict) -> None:
     # them at zero forces the adapter to learn style via single-stream blocks only.
     _freeze_double_stream = acfg.get("freeze_double_stream_scales", False)
     _nd = adapter.num_double_blocks  # number of double-stream blocks (default 5)
+
+    # SREF-COMBINE-1: keep a STRUCTURAL injection gate fixed (fixed/hierarchical modes) by
+    # zeroing its grad before optimizer.update — same pattern as the double-stream freeze.
+    # "learned" trains it; "none" leaves it at all-ones (grad is a harmless no-op either way).
+    _freeze_gate = (_cond_mode == "hybrid"
+                    and acfg.get("injection_gate", "none") in ("fixed", "hierarchical"))
 
     # QUALITY-2: zero double-stream scales after checkpoint load so content-injecting
     # blocks stay silent for the entire run (grad zeroing in compiled_step keeps them zero).
@@ -1258,6 +1267,8 @@ def train(config: dict) -> None:
                 mx.zeros((_nd,), dtype=grads["scale"].dtype),
                 grads["scale"][_nd:],
             ])
+        if _freeze_gate:
+            grads["group_gate"] = mx.zeros_like(grads["group_gate"])
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=_grad_clip)
         optimizer.update(adapter, grads)
         # Return all lazy. Eval is split into two fences in the caller AFTER
@@ -1308,6 +1319,8 @@ def train(config: dict) -> None:
                 mx.zeros((_nd,), dtype=grads["scale"].dtype),
                 grads["scale"][_nd:],
             ])
+        if _freeze_gate:
+            grads["group_gate"] = mx.zeros_like(grads["group_gate"])
         grads, grad_norm = optim.clip_grad_norm(grads, max_norm=_grad_clip)
         optimizer.update(adapter, grads)
         return loss_val, grad_norm

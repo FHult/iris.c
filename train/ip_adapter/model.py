@@ -147,8 +147,13 @@ class IPAdapterKlein(nn.Module):
         csd_dim: int = 768,
         ip_scale_init: float = 1.0,  # per-block learned scale init; <1 tames early injection
                                      # (SREF-COMBINE-1: hybrid injects 2 token sets → use 0.5)
+        injection_gate: str = "none",        # hybrid leak-reduction lever (SREF-COMBINE-1):
+                                             #   none|fixed|hierarchical|learned
+        siglip_gate: float = 1.0,            # fixed mode: SigLIP-half V weight
+        csd_gate: float = 1.0,               # fixed mode: CSD-half V weight
     ):
         super().__init__()
+        self.injection_gate = injection_gate
         self.num_blocks = num_blocks
         self.hidden_dim = hidden_dim
         self.num_image_tokens = num_image_tokens
@@ -196,6 +201,34 @@ class IPAdapterKlein(nn.Module):
         # Per-block learnable scale: start at 1.0
         self.scale = mx.ones((num_blocks,)) * ip_scale_init
 
+        # SREF-COMBINE-1 leak-reduction: per-block, per-group injection gate [num_blocks, 2]
+        # = (siglip_weight, csd_weight), multiplying each token group's V contribution per
+        # block (K unscaled → attention pattern preserved; V scaled → contribution weighted).
+        # hybrid only; leak comes from the SigLIP half, so down-weighting it structurally cuts
+        # leak. Modes: none (ones, no-op) | fixed (constant siglip_gate/csd_gate) | hierarchical
+        # (CSD in double/early blocks, SigLIP in single/late blocks) | learned (trained per block,
+        # init biased to CSD). fixed/hierarchical are grad-zeroed by the trainer (structural).
+        if cond_mode == "hybrid":
+            nd = num_double_blocks
+            if injection_gate == "fixed":
+                g = mx.stack([mx.full((num_blocks,), siglip_gate),
+                              mx.full((num_blocks,), csd_gate)], axis=1)
+            elif injection_gate == "hierarchical":
+                # Ramp across blocks: CSD-dominant early (the content-free style direction),
+                # SigLIP-dominant late (fine detail). Robust to freeze_double_stream (early
+                # blocks may already be silent — the ramp then shapes the active later blocks):
+                # SigLIP weight 0.3→1.0, CSD weight 1.0→0.5 across blocks 0..num_blocks-1.
+                t = mx.arange(num_blocks).astype(mx.float32) / max(num_blocks - 1, 1)
+                sig = 0.3 + 0.7 * t
+                csd = 1.0 - 0.5 * t
+                g = mx.stack([sig, csd], axis=1)
+            elif injection_gate == "learned":
+                g = mx.stack([mx.full((num_blocks,), 0.5), mx.ones((num_blocks,))], axis=1)
+            else:  # "none"
+                g = mx.ones((num_blocks, 2))
+            self.group_gate = g
+        # (non-hybrid adapters have no group_gate attribute)
+
     def get_image_embeds(self, cond_features: mx.array) -> mx.array:
         """
         cond_features:
@@ -230,6 +263,15 @@ class IPAdapterKlein(nn.Module):
         """
         k = mx.einsum("btd,nde->bnte", ip_embeds, self.to_k_ip_stacked)
         v = mx.einsum("btd,nde->bnte", ip_embeds, self.to_v_ip_stacked)
+        # SREF-COMBINE-1 per-block per-group injection gate: scale each group's V (SigLIP first
+        # half, CSD second half) by its per-block weight. K unscaled. No-op when all gates = 1.
+        if self.cond_mode == "hybrid":
+            half = self.num_image_tokens // 2
+            mult = mx.concatenate([                                  # [num_blocks, num_image_tokens]
+                mx.broadcast_to(self.group_gate[:, 0:1], (self.num_blocks, half)),
+                mx.broadcast_to(self.group_gate[:, 1:2], (self.num_blocks, half)),
+            ], axis=1)
+            v = v * mult[None, :, :, None]
         return k, v
 
     def effective_scale(

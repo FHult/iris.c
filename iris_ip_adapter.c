@@ -188,6 +188,7 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
         LOAD(csd_film_bias,    "csd.film_bias");
         LOAD(csd_norm_weight,  "csd.norm_weight");
         LOAD(csd_norm_bias,    "csd.norm_bias");
+        LOAD(group_gate,       "group_gate");   /* optional leak-reduction gate (SREF-COMBINE-1) */
     }
     LOAD(ip_k_stacked, "ip_k_stacked");
     LOAD(ip_v_stacked, "ip_v_stacked");
@@ -221,7 +222,7 @@ void iris_ip_adapter_free(iris_ip_adapter_t *a) {
     free(a->ip_scale); free(a->in_gamma); free(a->in_beta);
     free(a->film_weight); free(a->film_bias);
     free(a->csd_query_tokens); free(a->csd_film_weight); free(a->csd_film_bias);
-    free(a->csd_norm_weight); free(a->csd_norm_bias);
+    free(a->csd_norm_weight); free(a->csd_norm_bias); free(a->group_gate);
     if (a->_sf_handle) safetensors_close((safetensors_file_t *)a->_sf_handle);
     free(a);
 }
@@ -368,6 +369,17 @@ void iris_ip_adapter_get_kv(const iris_ip_adapter_t *a, int block_idx,
     /* einsum btd,de->te : ip_embeds @ stacked[block] (no transpose) */
     iris_matmul(k_ip, ip_embeds, a->ip_k_stacked + off, T, H, H);
     iris_matmul(v_ip, ip_embeds, a->ip_v_stacked + off, T, H, H);
+    /* SREF-COMBINE-1 hybrid leak gate: scale each group's V by its per-block weight.
+     * SigLIP = first T/2 tokens, CSD = the rest. K unscaled. Mirrors get_kv_all. */
+    if (a->group_gate) {
+        int half = T / 2;
+        float gs = a->group_gate[(size_t)block_idx * 2 + 0];
+        float gc = a->group_gate[(size_t)block_idx * 2 + 1];
+        for (int t = 0; t < half; t++)
+            for (int d = 0; d < H; d++) v_ip[(size_t)t * H + d] *= gs;
+        for (int t = half; t < T; t++)
+            for (int d = 0; d < H; d++) v_ip[(size_t)t * H + d] *= gc;
+    }
 }
 
 void iris_ip_adapter_inject(const iris_ip_adapter_t *a, int block_idx,

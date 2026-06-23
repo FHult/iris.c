@@ -88,6 +88,7 @@ _INV_HYBRID = {
     "csd.film_bias":          "csd_proj.film.bias",
     "csd.norm_weight":        "csd_proj.norm.weight",
     "csd.norm_bias":          "csd_proj.norm.bias",
+    "group_gate":             "group_gate",
     "ip_k_stacked":           "to_k_ip_stacked",
     "ip_v_stacked":           "to_v_ip_stacked",
     "ip_scale":               "scale",
@@ -214,8 +215,12 @@ def main() -> int:
     # Randomise the CSD FiLM (ZERO-initialised in the module) so the CSD half is non-trivial.
     fw_h = mx.random.normal((2 * HIDDEN, CSD_DIM)) * 0.1
     fb_h = mx.random.normal((2 * HIDDEN,)) * 0.1
+    # Non-trivial per-block per-group injection gate (default is all-ones = no-op) so the
+    # parity test exercises the get_kv V-scaling path. Distinct per block AND per group.
+    gate_h = mx.random.uniform(low=0.2, high=1.0, shape=(N_BLOCKS, 2))
     hyb_model.update(tree_unflatten([("csd_proj.film.weight", fw_h),
-                                     ("csd_proj.film.bias", fb_h)]))
+                                     ("csd_proj.film.bias", fb_h),
+                                     ("group_gate", gate_h)]))
     mx.eval(hyb_model.parameters())
     # Packed feature: SigLIP rows + one CSD row (L2-normed CSD in the first CSD_DIM slots, rest 0).
     sig_h = mx.random.normal((1, SIGLIP_SEQ, SIGLIP_DIM))
