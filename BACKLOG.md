@@ -624,6 +624,20 @@ to beat is **injection ratio 0.59** (Δstyle 0.085 / Δleak 0.143); need > 1.0 t
     supports it); (b) down-weight or subsample the SigLIP half (it carries the leak); (c) per-module gate
     biased toward CSD; (d) longer training. Also: cond_gap is a POOR surrogate for style adapters (ended
     ≈0 while the eval shows +0.108 Δstyle) — trust the null-relative frontier, not cond_gap.
+  - **LEAK-REDUCTION SWEEP (2026-06-23) — per-block per-group injection gate.** Built a
+    [num_blocks,2] gate scaling each group's V per block (parity 20/20, commit 60ae70d). Arms vs
+    the 0.687 hybrid baseline (inj ratio @ best scale; null style +0.0042 / leak +0.3231):
+    - **(b) hybrid_siglipdown** (fixed SigLIP V×0.3): peak **0.575 @ 0.5** (Δstyle +0.084, Δleak
+      +0.146) — WORSE than 0.687. Down-weighting SigLIP cut leak (0.146<0.157) but cut STYLE more
+      (0.084<0.108). **Key negative: style and leak are ENTANGLED within the SigLIP signal** — a V-gate
+      trades the group's TOTAL contribution, it can't disentangle, so scaling SigLIP down loses both.
+      This undercuts the other V-gate arms (a/c are gate variations on the same entangled signal).
+    - (a) hierarchical (SigLIP 0.3→1.0 / CSD 1.0→0.5 ramp across blocks): RUNNING — the one
+      genuinely different hypothesis (per-block selectivity, not uniform down-weight). (c) learned
+      and (d) longer DEFERRED given (b)'s negative (decided 2026-06-23): (c) is a gate variation on
+      the same entangled signal with no leak penalty (weakest); (d)'s base already converged. Run
+      only if (a) shows promise. If (a) also fails → the V-gate lever is exhausted; next lever is a
+      LEAK PENALTY in the loss or fewer/curated SigLIP tokens (disentangle the signal, don't scale it).
   **Rationale:** the two signals fail in opposite ways, so combine them.
   - Pure SigLIP leaks content — each of the 729 patch tokens is heavily content-laden — which
     is the structural cause of the injection-ratio ceiling (~0.5–0.65) measured across the
