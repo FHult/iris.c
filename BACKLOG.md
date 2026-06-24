@@ -2211,3 +2211,13 @@ launchd: **launchd LaunchAgents cannot write the external /Volumes mount without
 as the flywheel it chains. Same bug fixed in nightly_health.sh: results now go to
 `$HOME/Library/iris-health/` (boot volume), doctor reads there first, /Volumes second; launchd plist
 stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywheel_source_probe.yaml (18 iters).
+
+  - **CLEAN RE-RUN (2026-06-24) — single-shard confound fixed (seed + interleave).** The cond-attrib
+    JSONL exposed that every 3k-step arm trained on ONE random shard (unseeded shuffle + drain-one-
+    shard); fixed with data.seed + records_per_shard_visit (commit). Clean baseline (hybrid, no gate,
+    seed=42, cap=135 → all 22 shards × 135 records): inj ratio **0.576 @ 0.5, 0.634 @ 0.7** — vs the
+    old single-shard 0.687. So the HONEST baseline is ~0.58–0.63; the 0.687 was ~0.07–0.11 inflated by
+    a lucky shard. The confounded arm-b (0.575) == clean baseline @ 0.5, i.e. down-weighting SigLIP is
+    likely ~NEUTRAL not negative on honest footing. Clean gate arms (siglipdn, hier; same seed+data)
+    running next for a trustworthy A/B. NOTE: earlier CSD/SigLIP/hybrid METRIC numbers share this
+    single-shard confound (qualitative content+style win stands — it was visual).
