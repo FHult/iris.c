@@ -2221,3 +2221,11 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     likely ~NEUTRAL not negative on honest footing. Clean gate arms (siglipdn, hier; same seed+data)
     running next for a trustworthy A/B. NOTE: earlier CSD/SigLIP/hybrid METRIC numbers share this
     single-shard confound (qualitative content+style win stands — it was visual).
+
+  - **CLEAN GATE A/B (2026-06-24, identical seeded data — gate is the ONLY difference):**
+    clean_base: 0.576 @0.5 / **0.634 @0.7**.  clean_siglipdn (SigLIP V×0.3): **0.629 @0.5** / 0.603 @0.7.
+    Down-weighting SigLIP is NOT negative (reverses the confounded arm-b 0.575 — that was the shard):
+    it improves @0.5 and ties at the peak (~0.63). Both cap at ~0.63 — the V-gate shifts the usable
+    scale but can't break the ceiling (can't disentangle style/leak, only trade total contribution).
+    hier arm pending. If hier also caps ~0.63 → V-gate lever exhausted; next = leak penalty in the
+    loss or curated/fewer SigLIP tokens (disentangle the signal, not scale it).
