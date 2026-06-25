@@ -2229,3 +2229,19 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     scale but can't break the ceiling (can't disentangle style/leak, only trade total contribution).
     hier arm pending. If hier also caps ~0.63 → V-gate lever exhausted; next = leak penalty in the
     loss or curated/fewer SigLIP tokens (disentangle the signal, not scale it).
+
+  - **FINAL CLEAN GATE VERDICT (2026-06-25) — V-gate lever EXHAUSTED; ~0.65 is a hard ceiling.**
+    All three clean arms (identical seeded multi-shard data, gate the only difference):
+      clean_base 0.576/**0.634**,  clean_siglipdn **0.629**/0.603,  clean_hier 0.555/**0.648**.
+    All cap ~0.63–0.65, within n=10 noise — NO gate config beats the baseline meaningfully, none
+    nears 0.75. Scaling SigLIP's V (uniform or per-block) shifts the peak SCALE but can't break the
+    ceiling: it trades the entangled signal's total contribution, it does not disentangle style from
+    leak. ~0.65 is the SAME ceiling as the original SigLIP leak campaign → a fundamental property of
+    conditioning on entangled SigLIP patches, robust across SigLIP / CSD / hybrid / all gate variants.
+    (clean_hier @0.3 drives leak≈0 but style≈0 too — CSD-early routing suppresses leak but not
+    usefully.) **NEXT LEVER — disentangle the SIGNAL, don't scale it:** (1) explicit LEAK PENALTY in
+    the training loss (penalize gen↔ref content-head cosine, or an adversarial/contrastive content
+    term) so the adapter is trained to inject style WITHOUT content; (2) CURATE/REDUCE SigLIP tokens
+    (drop content-laden patches, keep style-salient ones / use a style-pooled descriptor). Gate code
+    + cond-attrib + seeded loader all retained as infrastructure. (d) longer-training NOT run — base
+    converged by 3k and the ceiling is signal-bound, not training-bound.
