@@ -49,6 +49,37 @@ def gram_style_loss(x0_pred: mx.array, x0_ref: mx.array) -> mx.array:
     return mx.mean((gram_matrix(x0_pred) - gram_matrix(x0_ref)) ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Content-leak loss (SREF-COMBINE-1 leak penalty) — the complement of Gram style
+# ---------------------------------------------------------------------------
+
+def instance_norm(x: mx.array, eps: float = 1e-5) -> mx.array:
+    """Per-(B,C) spatial normalization. x: float32 [B, C, H, W] → same shape.
+
+    Subtracts each channel's spatial mean and divides by its spatial std, removing the
+    per-channel statistics (mean, std) that ENCODE STYLE (the same stats Gram captures as
+    covariance) and leaving the normalized spatial pattern that encodes CONTENT. This is the
+    AdaIN decomposition: style = per-channel (mean, std); content = instance-normalized map.
+    """
+    mu  = x.mean(axis=(2, 3), keepdims=True)
+    var = ((x - mu) ** 2).mean(axis=(2, 3), keepdims=True)
+    return (x - mu) * mx.rsqrt(var + eps)
+
+
+def content_leak_loss(x0_cond: mx.array, x0_null: mx.array) -> mx.array:
+    """Penalize CONTENT drift between the conditioned and null (prompt-only) predictions.
+
+    Both are unbiased clean-latent estimates (reconstruct_x0) of the SAME noisy latent — one
+    with the style reference injected (x0_cond), one with conditioning zeroed (x0_null). MSE on
+    their instance-normalized maps penalizes the style reference for CHANGING WHAT IS DEPICTED
+    (content/spatial structure) while leaving per-channel style stats free to change. Minimizing
+    it trains the adapter to inject STYLE WITHOUT leaking the reference's CONTENT — attacking the
+    style/leak entanglement directly (vs the V-gate, which only scaled the entangled signal and
+    capped at ~0.65). Both float32 [B, C, H, W]. Naturally ~0 on null steps (x0_cond == x0_null).
+    """
+    return mx.mean((instance_norm(x0_cond) - instance_norm(x0_null)) ** 2)
+
+
 def reconstruct_x0(
     noisy:   mx.array,
     v_pred:  mx.array,

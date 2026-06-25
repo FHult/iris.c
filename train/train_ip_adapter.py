@@ -47,7 +47,8 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
-from ip_adapter.loss import fused_flow_noise, get_schedule_values, gram_style_loss, reconstruct_x0
+from ip_adapter.loss import (fused_flow_noise, get_schedule_values, gram_style_loss,
+                             reconstruct_x0, content_leak_loss)
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 from ip_adapter.constants import SIGLIP_IMAGE_SIZE
@@ -1140,6 +1141,14 @@ def train(config: dict) -> None:
     # Written by loss_fn on conditioned steps; read after eval for logging.
     _style_loss_accum: list = [mx.array(0.0)]
 
+    # SREF-COMBINE-1 leak penalty (the disentangling lever after the V-gate capped ~0.65):
+    # penalize the conditioned prediction's CONTENT drift vs a null/prompt-only forward, so the
+    # adapter learns to inject STYLE without leaking the reference's CONTENT. Costs ONE extra
+    # (zeroed-conditioning) forward per step → off by default; enable via training.leak_loss_weight.
+    # Only wired into the TRAIN-6 loss_fn_with_ip path (the path the real runs use).
+    _leak_weight = float(tcfg.get("leak_loss_weight", 0.0))
+    _leak_loss_accum: list = [mx.array(0.0)]
+
     # TRAIN-5 Stage 0: per-fence peak memory profiling.
     # Gate behind memory_profile: true in training config. Resets peak counter
     # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
@@ -1303,12 +1312,30 @@ def train(config: dict) -> None:
             ckpt_double, ckpt_single,
         )
         flow_loss = mx.mean((pred - target) ** 2)
-        if _style_weight > 0.0 and x0_ref is not None:
-            x0_pred = reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
+        total = flow_loss
+        # x0_pred (clean-latent estimate) is shared by the style and leak terms.
+        x0_pred = (reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
+                   if (_style_weight > 0.0 or _leak_weight > 0.0) and noisy_in is not None
+                   else None)
+        if _style_weight > 0.0 and x0_ref is not None and x0_pred is not None:
             style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
             _style_loss_accum[0] = style_term
-            return flow_loss + _style_weight * style_term
-        return flow_loss
+            total = total + _style_weight * style_term
+        if _leak_weight > 0.0 and x0_pred is not None:
+            # Null (prompt-only) forward = SAME noisy latent with conditioning ZEROED — the
+            # content anchor. On a real null step siglip_feats is already zeroed so this equals
+            # the cond forward and the leak term is ~0 (correct).
+            ip_embeds_null = adapter.get_image_embeds(mx.zeros_like(siglip_feats))
+            k_null, v_null = adapter.get_kv_all(ip_embeds_null)
+            pred_null = _flux_forward_with_ip(
+                flux, noisy, text_embeds, t_int,
+                k_null, v_null, adapter.scale, ckpt_double, ckpt_single,
+            )
+            x0_null = reconstruct_x0(noisy_in, pred_null, alpha_in, sigma_in)
+            leak_term = content_leak_loss(x0_pred, x0_null)
+            _leak_loss_accum[0] = leak_term
+            total = total + _leak_weight * leak_term
+        return total
 
     loss_and_grad_with_ip = nn.value_and_grad(adapter, loss_fn_with_ip)
 
@@ -1634,6 +1661,8 @@ def train(config: dict) -> None:
     # Style loss tracking (Gram matrix term when style_loss_weight > 0)
     _style_loss_sum = 0.0
     _style_loss_count = 0
+    _leak_loss_sum = 0.0
+    _leak_loss_count = 0
 
     # QUALITY-6: cross-ref vs self-ref loss split (populated by QUALITY-1 permutation)
     _self_ref_loss_sum   = 0.0
@@ -1936,8 +1965,11 @@ def train(config: dict) -> None:
 
             _t0 = time.time()
             _do_style = _style_weight > 0.0 and not null_image and step % _style_every == 0
+            # Leak penalty (block-injection path only) needs the same aux args (x0/noisy/alpha/
+            # sigma). Run on every conditioned step; when on, style runs every cond step too.
+            _do_leak  = _leak_weight > 0.0 and not null_image
             if _use_block_injection:
-                if _do_style:
+                if _do_style or _do_leak:
                     loss_val, grad_norm_val = compiled_step_with_ip(
                         siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
                         latents, noisy, alpha_t, sigma_t,
@@ -2007,6 +2039,9 @@ def train(config: dict) -> None:
             if _do_style:
                 _style_loss_sum += float(_style_loss_accum[0].item())
                 _style_loss_count += 1
+            if _do_leak:
+                _leak_loss_sum += float(_leak_loss_accum[0].item())
+                _leak_loss_count += 1
 
             # T-01: grad norm EMA + spike alert
             _gn = float(grad_norm_val.item())
@@ -2260,6 +2295,16 @@ def train(config: dict) -> None:
                 else:
                     _style_loss_avg = None
                 _style_loss_sum = _style_loss_count = 0
+
+                # Leak penalty (content-preservation vs null) — SREF-COMBINE-1
+                if _leak_weight > 0.0 and _leak_loss_count > 0:
+                    _leak_loss_avg = round(_leak_loss_sum / _leak_loss_count, 6)
+                    print(
+                        f"  leak_loss={_leak_loss_avg:.6f}"
+                        f"  (weight={_leak_weight}, {_leak_loss_count}/{log_interval} steps)",
+                        flush=True,
+                    )
+                _leak_loss_sum = _leak_loss_count = 0
 
                 # QUALITY-6: cross-ref vs self-ref loss split
                 _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None
