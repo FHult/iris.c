@@ -349,6 +349,9 @@ def make_prefetch_loader(
                                         # to the next — interleaves across shards within a short run
                                         # (else a 3k-step run drains ONE ~5k-record shard, never
                                         # reaching the others; the single-shard confound, 2026-06-23)
+    skip_shards: int = 0,               # on RESUME: skip the first N shards of the (seeded) order
+                                        # so the resumed run CONTINUES onto the unseen shards instead
+                                        # of re-covering the start (set to start_step//cap by caller)
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -419,6 +422,7 @@ def make_prefetch_loader(
     def shard_loader():
         rng = random.Random(seed)   # seeded → identical shard order across runs
         consecutive_errors = 0
+        _first_epoch = True
         while True:
             # Build this epoch's shard list:
             #   - anchor shards at anchor_mix_ratio (forgetting prevention)
@@ -432,6 +436,12 @@ def make_prefetch_loader(
                 n_hard = max(1, int(len(epoch_paths) * hard_mix_ratio / max(remaining_ratio, 0.01)))
                 epoch_paths += rng.choices(hard_paths, k=n_hard)
             rng.shuffle(epoch_paths)
+            # Resume continuation: on the FIRST epoch only, skip shards already covered before a
+            # crash so the resumed run trains on the UNSEEN shards. Done AFTER the shuffle (which
+            # advances the rng identically), so later epochs are unchanged vs a non-skipped run.
+            if _first_epoch and skip_shards > 0:
+                epoch_paths = epoch_paths[skip_shards:]
+            _first_epoch = False
             for path in epoch_paths:
                 contents = None
                 for attempt in range(_SHARD_MAX_RETRIES + 1):

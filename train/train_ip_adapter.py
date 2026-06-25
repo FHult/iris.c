@@ -914,6 +914,18 @@ def train(config: dict) -> None:
     # before the first step). Restrict warmup to the pinned shape. (MLX-2 graph-surface
     # reduction.)
     _warmup_buckets = [_fixed_bucket] if _fixed_bucket else list(BUCKETS)
+
+    # Resume continuation: when warm-starting from a step checkpoint under an interleave cap,
+    # skip the shards the previous session already covered so the resumed run trains on the
+    # UNSEEN shards instead of re-covering the seeded order from the start.
+    _ws_path = mcfg.get("warmstart_path")
+    _resume_step = (step_from_checkpoint_path(_ws_path)
+                    if _ws_path and os.path.isfile(_ws_path) else 0)
+    _resume_cap = dcfg.get("records_per_shard_visit")
+    _skip_shards = (_resume_step // _resume_cap) if (_resume_step > 0 and _resume_cap) else 0
+    if _skip_shards > 0:
+        print(f"  Resume: skipping {_skip_shards} already-covered shards "
+              f"(continue onto unseen shards)")
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -932,6 +944,7 @@ def train(config: dict) -> None:
         csd_cache_dir=dcfg.get("csd_cache_dir"),
         seed=dcfg.get("seed"),
         records_per_shard_visit=dcfg.get("records_per_shard_visit"),
+        skip_shards=_skip_shards,
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before
