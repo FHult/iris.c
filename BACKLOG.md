@@ -2245,3 +2245,21 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (drop content-laden patches, keep style-salient ones / use a style-pooled descriptor). Gate code
     + cond-attrib + seeded loader all retained as infrastructure. (d) longer-training NOT run — base
     converged by 3k and the ceiling is signal-bound, not training-bound.
+
+  - **LEAK PENALTY VERDICT (2026-06-25) — FIRST lever to break the ~0.65 ceiling; weight 0.5 too hot.**
+    clean_leak (leak_loss_weight=0.5, hybrid, seed=42, all 22 shards — crashed thermally @2k, resumed
+    to 3k via the skip_shards fix so coverage matches baseline). vs clean_base (identical data, no leak):
+    | scale | base ratio | leak ratio | leak Δstyle | leak prompt_adh |
+    |------:|----:|----:|----:|----:|
+    | 0.3 | −0.40 | 0.543 | +0.016 | +0.153 |
+    | 0.5 | 0.576 | **0.719** | +0.150 | +0.097 |
+    | 0.7 | 0.634 | **0.911** | +0.243 | −0.013 |
+    The 0.911@0.7 is a FALSE win (images WASH — content-free texture games the CSD style metric;
+    prompt_adh −0.013 flags it). The REAL result is the MATCHED-CONTENT comparison: at the same
+    prompt_adh (~+0.097, scale 0.5), leak gives ratio 0.719 / Δstyle +0.150 vs base 0.576 / +0.083 —
+    ~DOUBLE the style at the same content level. Genuine disentanglement (the content-preservation-vs-null
+    penalty trains a style-purer injection), the first lever to clear 0.65 at usable content. **BUT
+    weight 0.5 is too hot:** the style-pure injection washes content at usable scales (0.5 landscape
+    washed, violinist heavily smeared; 0.7 fully washed). **NEXT: weight sweep DOWN (0.1, 0.25) to land
+    clear content + ratio>0.65 simultaneously.** Also: leak penalty raised peak mem to 27GB → thermal
+    crash in the heatwave; trim peak mem (free cond graph before null forward) before long runs.
