@@ -1205,9 +1205,6 @@ def train(config: dict) -> None:
         No Flux block ops appear in the backward pass.
         """
         siglip_feats = mx.where(use_null_image, mx.zeros_like(siglip_feats), siglip_feats)
-        ip_embeds = adapter.get_image_embeds(siglip_feats)
-
-        k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
 
         qs      = flux_state["qs"]       # list[25] [B, H, seq_img, Hd], stop_gradient
         h_final = flux_state["h_final"]  # [B, seq_img, d_inner], stop_gradient
@@ -1220,44 +1217,53 @@ def train(config: dict) -> None:
         pW      = flux_state["pW"]
         seq_img = flux_state["seq_img"]
         d_inner = h_final.shape[2]
-
-        # Accumulate IP contributions from all injection points.
-        # Approximation: each contribution is added to the final hidden state
-        # rather than at its original position in the sequence. This matches
-        # the standard IP-Adapter training approach (no grad through base model).
-        ip_total = mx.zeros((B, seq_img, d_inner), dtype=h_final.dtype)
-        for i, q_i in enumerate(qs):
-            H_i  = q_i.shape[1]
-            Hd_i = q_i.shape[3]
-            k_i  = k_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
-            v_i  = v_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
-            ip_out = mx.fast.scaled_dot_product_attention(
-                q_i, k_i, v_i, scale=Hd_i ** -0.5,
-            )  # [B, H, seq_img, Hd]
-            ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, H_i * Hd_i)
-            ip_total = ip_total + adapter.scale[i] * ip_out
-
-        h_with_ip = h_final + ip_total
-
-        # norm_out + proj_out: frozen Flux layers needed for correct gradient signal.
-        # Jacobian-vector products flow through these 2 ops (negligible trace cost).
         tr = flux.transformer
-        h_with_ip = tr.norm_out(h_with_ip, temb)
-        pred_seq  = tr.proj_out(h_with_ip)  # [B, seq_img, 128]
 
-        # Unpatchify → [B, 32, H/8, W/8]
-        pred = pred_seq.transpose(0, 2, 1).reshape(B, C * 4, pH, pW)
-        pred = pred.reshape(B, C, 2, 2, pH, pW)
-        pred = pred.transpose(0, 1, 4, 2, 5, 3)
-        pred = pred.reshape(B, C, Lh, Lw)
+        # IP injection → predicted velocity, given a set of conditioning tokens. Reuses the
+        # precomputed (stop_gradient) qs/h_final/temb so the cond AND null predictions share the
+        # expensive frozen-Flux work — the leak penalty's null forward is then nearly free here.
+        # Approximation (standard IP-Adapter training): each block's IP contribution is added to
+        # the final hidden state rather than at its original sequence position.
+        def _pred_from_embeds(ip_embeds):
+            k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
+            ip_total = mx.zeros((B, seq_img, d_inner), dtype=h_final.dtype)
+            for i, q_i in enumerate(qs):
+                H_i  = q_i.shape[1]
+                Hd_i = q_i.shape[3]
+                k_i  = k_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
+                v_i  = v_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
+                ip_out = mx.fast.scaled_dot_product_attention(
+                    q_i, k_i, v_i, scale=Hd_i ** -0.5,
+                )  # [B, H, seq_img, Hd]
+                ip_out = ip_out.transpose(0, 2, 1, 3).reshape(B, seq_img, H_i * Hd_i)
+                ip_total = ip_total + adapter.scale[i] * ip_out
+            h_with_ip = tr.norm_out(h_final + ip_total, temb)   # frozen Flux norm_out + proj_out
+            pred_seq  = tr.proj_out(h_with_ip)                  # [B, seq_img, 128]
+            p = pred_seq.transpose(0, 2, 1).reshape(B, C * 4, pH, pW)  # unpatchify → [B,32,H/8,W/8]
+            p = p.reshape(B, C, 2, 2, pH, pW).transpose(0, 1, 4, 2, 5, 3).reshape(B, C, Lh, Lw)
+            return p
 
+        pred = _pred_from_embeds(adapter.get_image_embeds(siglip_feats))
         flow_loss = mx.mean((pred - target) ** 2)
-        if _style_weight > 0.0 and x0_ref is not None:
-            x0_pred = reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
+        total = flow_loss
+        # x0_pred (clean-latent estimate) shared by the style and leak terms.
+        x0_pred = (reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
+                   if (_style_weight > 0.0 or _leak_weight > 0.0) and noisy_in is not None
+                   else None)
+        if _style_weight > 0.0 and x0_ref is not None and x0_pred is not None:
             style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
             _style_loss_accum[0] = style_term
-            return flow_loss + _style_weight * style_term
-        return flow_loss
+            total = total + _style_weight * style_term
+        if _leak_weight > 0.0 and x0_pred is not None:
+            # Null/prompt-only prediction = SAME qs/h_final with conditioning ZEROED → the content
+            # anchor (cheap: no second Flux forward, just the adapter + per-block SDPA). ~0 on null
+            # steps (siglip_feats already zeroed → identical to pred).
+            pred_null = _pred_from_embeds(adapter.get_image_embeds(mx.zeros_like(siglip_feats)))
+            x0_null = reconstruct_x0(noisy_in, pred_null, alpha_in, sigma_in)
+            leak_term = content_leak_loss(x0_pred, x0_null)
+            _leak_loss_accum[0] = leak_term
+            total = total + _leak_weight * leak_term
+        return total
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
 
@@ -1978,7 +1984,7 @@ def train(config: dict) -> None:
                     loss_val, grad_norm_val = compiled_step_with_ip(
                         siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
                     )
-            elif _do_style:
+            elif _do_style or _do_leak:
                 loss_val, grad_norm_val = compiled_step(
                     siglip_feats, use_null_image, flux_state, target,
                     latents, noisy, alpha_t, sigma_t,
