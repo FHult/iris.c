@@ -164,6 +164,53 @@ train/.venv/bin/python train/scripts/pipeline_ctl.py start-flywheel \
   train/configs/flywheel_warmup_run5.yaml
 ```
 
+### DP-7 (2026-06-26): post-plateau decision tree — if the data axis fails too
+
+The eval is now CONTENT-GATED (a scale counts only if prompt_adherence ≥ 75% of the
+no-adapter null 0.1516). Honest plateau ≈ 0.54; raw ratios >0.65 were content-WASH
+artifacts. Architecture levers are exhausted (V-gate caps ~0.63–0.65; leak penalty
+edges to ~0.543 but washes at usable scale; SigLIP pooling/clean_pool9 trending
+negative — loss_cond > loss_null, worsening across windows). The live test is the DATA
+axis: `clean_concentrate` (rung-1, top-25% by style strength). This DP is the branch
+for **if clean_concentrate is also flat**.
+
+**Diagnostic meaning of "data axis flat":** the bottleneck is NOT signal quality — it's
+the REPRESENTATION (SigLIP-dominant features are content-rich by construction) and the
+INJECTION MECHANISM (KV cross-attention leaks content at any scale). Cleaner pairs can't
+fix a representation that entangles style+content at the source. Watch the signature:
+`ip_scale double=0.0000` across every run — double-blocks never engage; injection lives
+only in single-blocks (possible 4B-capacity fingerprint → DP-7 Tier 3).
+
+Next moves, cheapest-and-most-diagnostic first (each gates the next):
+
+- **Tier 0 — ship regardless (~free, parallel).** Surface the hybrid as a tunable
+  `--sref-strength` knob; ~0.54 is the RECOMMENDED operating point, not a ceiling.
+  MJ `--sref`/`--sw` IS this content↔style tradeoff. Already built (web/server.py
+  `--ip` + `--ip-scale`); document/surface it. This is the floor we always have.
+- **Tier 1.1 — injection schedule over timesteps (untried; do FIRST).** `ip_scale` is
+  currently a constant scalar across all denoising steps. Content/layout forms in EARLY
+  steps, texture/style in LATE steps → inject style only after step ~k (or ramp) so
+  content forms first, unconditioned. Style-without-content for free, no retrain.
+  Prototype in the Python MLX forward as a diagnostic; if it lands, wire per-step scale
+  into the C injection path (iris_sample.c / adapter inject).
+- **Tier 1.2 — CSD-dominant conditioning.** CSD is the style-SPECIALIZED encoder,
+  currently one padded row in hybrid. Rebalance toward CSD or run `cond_mode=csd` —
+  attacks entanglement at the source. One config-only training run.
+- **Tier 2.1 — AdaIN / feature-statistics injection** (channel mean/std transfer):
+  content-agnostic by construction; categorically different from every KV-injection
+  variant tried. One training run.
+- **Tier 2.2 — disentanglement objective** beyond the soft leak MSE: swap-consistency /
+  contrastive style loss, or an adversarial content-classifier the conditioning must
+  fool. One training run.
+- **Tier 3.1 — 9B base.** The 4B distilled base may lack capacity to honor prompt AND
+  style at once (the `double=0.0000` signature hints at base-bound). Most expensive →
+  gates on all the cheap levers failing first.
+
+**Recommended branch if rung-1 is flat:** Tier 0 + Tier 1.1 immediately. Only if the
+schedule sweep is also flat → 1.2 → 2.1 → 3.1. Honest caveat: content-preserving style
+transfer is a genuine Pareto tradeoff; ~0.54 may be near the frontier for this base +
+feature family. The schedule sweep is the strongest remaining reason to think otherwise.
+
 ## Standing constraints
 - Never start a production run without PROD-1/PROD-2 active (they are now).
 - Style precompute/backfill and proxy training are GPU-window tasks — schedule against

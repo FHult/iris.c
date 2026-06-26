@@ -2373,3 +2373,47 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     OPERATIONAL: pool9 training (GPU, ~step 1225/3000, slow in 35°C heatwave — thermal crashes happen,
     runs are crash-RESUMABLE via warmstart_path=step_ckpt + auto skip_shards). clean_concentrate queued
     behind it. Heatwave → don't stack GPU jobs; CPU analysis (ranking/regrade/select) is safe in parallel.
+
+  - **==== SREF POST-PLATEAU DECISION TREE (2026-06-26) — if the data axis also fails ====**
+    DIAGNOSTIC MEANING of "clean_concentrate (rung-1 data lever) flat": the bottleneck is NOT
+    "the model could disentangle style from content given cleaner signal." Architecture levers
+    exhausted (V-gate, leak penalty, pooling) + data lever flat ⇒ the plateau is a property of
+    the REPRESENTATION + INJECTION MECHANISM, not the training data. We inject SigLIP-DOMINANT
+    features (content-rich by construction) via KV cross-attention (leaks content at any scale).
+    No amount of cleaner pairs fixes a representation that entangles style+content at the source.
+    SIGNATURE to watch: ip_scale double=0.0000 across EVERY run — the double-blocks never engage;
+    injection lives only in single-blocks. Possible capacity/representation fingerprint (→ Tier 3).
+
+    NEXT STEPS, cheapest-and-most-diagnostic first (run in this order; each gates the next):
+      TIER 0 — ship the deliverable regardless, ~free, do in parallel:
+        Expose the hybrid as a tunable `--sref-strength` knob; call ~0.54 the RECOMMENDED operating
+        point, not a ceiling. MJ `--sref`/`--sw` is exactly this content↔style tradeoff knob. A
+        plateau reframed as a user-tunable Pareto point is a PRODUCT, not a failure. Already built
+        (web/server.py --ip path + --ip-scale); just document/surface it. This is the floor.
+      TIER 1 — cheap, attacks the root cause, little/no retrain:
+        1.1 INJECTION SCHEDULE OVER TIMESTEPS (untried; highest ROI). Today ip_scale is a CONSTANT
+            scalar across all denoising steps. Content/layout is decided in EARLY steps; texture/
+            style in LATE steps. Inject style only after step ~k (or ramp) so content forms first,
+            unconditioned → style-without-content for free, NO training. Prototype in the Python MLX
+            forward as a diagnostic; if it works, wire per-step scale into the C injection path
+            (iris_sample.c / adapter inject). DO THIS FIRST.
+        1.2 CSD-DOMINANT CONDITIONING. We inject SigLIP-dominant; CSD is the STYLE-SPECIALIZED
+            encoder, currently 1 padded row in hybrid. Rebalance the hybrid toward CSD, or run
+            cond_mode=csd. Attacks entanglement at the SOURCE not at injection. One config-only run.
+      TIER 2 — one training run each, different mechanism/objective:
+        2.1 AdaIN / FEATURE-STATISTICS injection (channel mean/std transfer) instead of/alongside KV
+            injection — content-agnostic by construction; a categorically different mechanism than
+            every KV-injection variant tried so far.
+        2.2 DISENTANGLEMENT OBJECTIVE beyond the soft leak MSE: swap-consistency / contrastive style
+            loss (same-style-diff-content refs must yield the SAME conditioning effect) or an
+            adversarial content-classifier the conditioning must fool. Harder structural constraint.
+      TIER 3 — expensive, strategic, last:
+        3.1 9B BASE. The 4B distilled base may lack capacity to honor prompt AND style at once (the
+            double=0.0000 signature hints at this). Same adapter recipe on 9B tests base-bound vs
+            mechanism-bound. Most expensive → gates on all the cheap ones failing first.
+    RECOMMENDATION if rung-1 is flat: Tier 0 (ship knob) + Tier 1.1 (schedule sweep) IMMEDIATELY —
+    the schedule is the one mechanism axis genuinely untouched and is eval-time cheap. Only if
+    schedule is ALSO flat → 1.2 CSD-dominant, then 2.1 AdaIN, then 3.1 9B.
+    HONEST CAVEAT: content-preserving style transfer is a real Pareto tradeoff; ~0.54 may be near
+    where the frontier sits for THIS base + feature family. The schedule sweep (1.1) is the
+    strongest remaining reason to think the plateau is beatable rather than fundamental.
