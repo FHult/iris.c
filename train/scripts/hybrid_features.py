@@ -38,6 +38,9 @@ def main() -> int:
     ap.add_argument("image", help="input image (jpg/png)")
     ap.add_argument("--out", required=True, help="output raw f32 .bin path")
     ap.add_argument("--csd-weights", default="/Volumes/2TBSSD/models/csd_vit_l_style.safetensors")
+    ap.add_argument("--siglip-pool-grid", type=int, default=None,
+                    help="option-2: avg-pool the 729 SigLIP tokens to grid*grid (e.g. 9 → 81). "
+                         "MUST match data.siglip_pool_grid the adapter was trained with.")
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -64,9 +67,13 @@ def main() -> int:
         return 1
 
     sig = sig.reshape(TOKENS, DIM)
+    if args.siglip_pool_grid:                     # option-2: identical pooling to training
+        sys.path.insert(0, str(here.parent))
+        from ip_adapter.dataset import pool_siglip_rows
+        sig = pool_siglip_rows(sig, args.siglip_pool_grid)
     row = np.zeros((1, DIM), dtype=np.float32)
     row[0, :CSD_DIM] = csd                        # CSD in the first csd_dim slots, rest zero
-    packed = np.concatenate([sig, row], axis=0)   # [730, 1152] f32
+    packed = np.concatenate([sig, row], axis=0)   # [grid²+1, 1152] f32
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

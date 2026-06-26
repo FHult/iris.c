@@ -750,12 +750,14 @@ def train(config: dict) -> None:
     # packing a single [730,1152] feature (rows 0..728 = SigLIP, row 729 = CSD zero-padded).
     _cond_mode = dcfg.get("cond_mode", acfg.get("cond_mode", "siglip"))
     _csd_dim = int(acfg.get("csd_dim", 768))
+    _siglip_pool_grid = dcfg.get("siglip_pool_grid")        # option-2: reduce SigLIP token count
+    _n_sig_tokens = (_siglip_pool_grid ** 2) if _siglip_pool_grid else 729
     if _cond_mode == "csd":
         _cond_dummy_shape = (1, _csd_dim)
     elif _cond_mode == "hybrid":
-        _cond_dummy_shape = (1, 730, acfg["siglip_dim"])   # 729 SigLIP + 1 CSD-carrier row
+        _cond_dummy_shape = (1, _n_sig_tokens + 1, acfg["siglip_dim"])  # SigLIP rows + 1 CSD carrier
     else:
-        _cond_dummy_shape = (1, 729, acfg["siglip_dim"])
+        _cond_dummy_shape = (1, _n_sig_tokens, acfg["siglip_dim"])
 
     # CSD mode NEVER uses the live SigLIP encoder. hybrid DOES need SigLIP (cached or live).
     # Force live-SigLIP off for pure csd so a csd config without siglip_cache_dir can't load
@@ -945,6 +947,7 @@ def train(config: dict) -> None:
         seed=dcfg.get("seed"),
         records_per_shard_visit=dcfg.get("records_per_shard_visit"),
         skip_shards=_skip_shards,
+        siglip_pool_grid=_siglip_pool_grid,
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before

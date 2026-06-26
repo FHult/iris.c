@@ -278,6 +278,23 @@ def _load_siglip_embed(rec_id: str, siglip_dir: Optional[str]) -> Optional[np.nd
         return None
 
 
+def pool_siglip_rows(sig: np.ndarray, grid: Optional[int]) -> np.ndarray:
+    """SREF option-2 (curate/reduce SigLIP tokens): spatially avg-pool the 729 SigLIP patch tokens
+    (27x27 grid) down to grid*grid coarser tokens, stripping fine per-patch content detail while
+    keeping coarse spatial style. sig: [729, D] → [grid*grid, D]. No-op if grid is falsy/invalid.
+    The perceiver + C inference are token-count agnostic, so this needs no model/export/parity change
+    — but training cache AND the inference producer (hybrid_features.py) must pool IDENTICALLY."""
+    if not grid or grid <= 0:
+        return sig
+    n, D = sig.shape
+    s = int(round(n ** 0.5))
+    if s * s != n or s % grid != 0 or grid >= s:
+        return sig                      # not a perfect square / not divisible → leave unchanged
+    blk = s // grid
+    pooled = sig.reshape(grid, blk, grid, blk, D).mean(axis=(1, 3))   # [grid, grid, D]
+    return pooled.reshape(grid * grid, D).astype(sig.dtype)
+
+
 def _load_csd_bundles(csd_dir: Optional[str]) -> dict:
     """SREF-LEAK-2: load all per-shard CSD style-embedding bundles into {rec_id: [csd_dim] f16}.
     style_precompute.py writes <dir>/<shard>.npz with keys=rec_ids (NOT per-record files — the
@@ -352,6 +369,8 @@ def make_prefetch_loader(
     skip_shards: int = 0,               # on RESUME: skip the first N shards of the (seeded) order
                                         # so the resumed run CONTINUES onto the unseen shards instead
                                         # of re-covering the start (set to start_step//cap by caller)
+    siglip_pool_grid: Optional[int] = None,  # option-2: avg-pool 729 SigLIP tokens to grid*grid
+                                        # (e.g. 9 → 81) to reduce content granularity; hybrid only
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -508,9 +527,11 @@ def make_prefetch_loader(
             csd = _csd_map.get(rec_id)                            # [csd_dim] f16
             if sig is None or csd is None:
                 return None
+            if siglip_pool_grid:
+                sig = pool_siglip_rows(sig, siglip_pool_grid)    # [grid*grid, 1152] (option-2)
             row = np.zeros((1, sig.shape[1]), dtype=np.float16)   # [1,1152]
             row[0, : csd.shape[0]] = csd.astype(np.float16)       # CSD in the first csd_dim slots
-            return np.concatenate([sig.astype(np.float16), row], axis=0)  # [730,1152]
+            return np.concatenate([sig.astype(np.float16), row], axis=0)  # [grid²+1, 1152]
         return _load_siglip_embed(rec_id, siglip_cache_dir)
 
     _STYLE_NBR_MIN_COS = 0.6
