@@ -2326,3 +2326,50 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (cheaper, quantified ≤~1.5%-rate loss in skipped shards). The CHEAP concentration test is UNAFFECTED
     — it uses full per-record CSD of the 22-shard pool (pool_top25.json, 27,313 recs, record-level, no
     scout). Built: dataset.record_allowlist + style_strength_select.py; arm clean_concentrate queued.
+
+  - **==== SREF CAMPAIGN — MASTER RESUME STATE (2026-06-26) ====**
+    GOAL: break the injection-ratio plateau for style transfer with CONTENT PRESERVED. Metric =
+    null-relative Δstyle/Δleak read THROUGH the CONTENT GATE (sref_sweep_eval.py / sref_regrade.py:
+    a scale only counts if prompt_adherence ≥ 75% of the no-adapter null 0.1516 — washed gens that
+    game the CSD style metric are excluded). HONEST PLATEAU ≈ 0.54; raw ratios >0.65 were all
+    content-WASH artifacts.
+    LEVERS TRIED (all clean, seed=42, all-22-shards, content-gated):
+      • V-gate (per-block per-group SigLIP/CSD injection weight): EXHAUSTED — caps ~0.63–0.65, can't
+        disentangle (scales the entangled signal). siglipdn/hier/learned all ~baseline.
+      • Leak penalty (content_leak_loss = instance-norm content drift cond-vs-null, train style-without-
+        content): the ONLY lever that edges the honest metric (best content-preserving ~0.543 @ w=0.5,
+        low scale). w=0.5 over-stylizes/washes at usable scales; w=0.25 too weak (non-monotonic).
+        Cheap (~13% via shared qs/h_final). Memory hot (27GB → thermal crashes in the heatwave).
+      • Option-2 SigLIP pooling (data.siglip_pool_grid=9 → 729→81 tokens): clean_pool9 TRAINING NOW
+        (verdict pending). Token-count agnostic → no model/C/export change.
+    DATA-QUALITY LEVER (the live thread):
+      • Pool is style-signal DILUTED: per-record CSD-neighbor-density (style_strength_select.py) spans
+        0.32–0.95; ultra-signal concentration varies ~50x across the 22 shards (art-ish 39-40% vs
+        photo-ish <4%); loader trains all equally → ~half teaches weak style.
+      • Universe CSD ALREADY precomputed: /Volumes/16TBCold/precomputed/style/v1_csd = per-image CSD
+        (768-d L2, keyed rec_id), 200-recs/SHARD SCOUT × 1280 journeydb shards = 256K recs. Staged to
+        /Volumes/2TBSSD/universe_csd; universe_neighbors.sqlite + universe_ultra_signal.json (top-10%,
+        25,598 recs) built (CPU). Universe style dist == pool dist (max 0.95) → NO higher quality tier
+        outside, but ~25x more VOLUME, concentrated in shards the pool MISSED (richest 000200/000098/
+        000481 ≈29%, NOT in pool). Hot pool tests PURITY; universe adds VOLUME.
+      • SAMPLING CAVEAT: 0/200 scout shard ≠ empty (rule-of-3 ≤1.5% rate). Shard-level scout select is
+        PRIORITIZATION only; FINAL extreme-signal set = PER-IMAGE over FULL coverage.
+    COST-LADDERED PLAN (each rung de-risks the next; only pay big precompute once proven twice):
+      1. HOT POOL, FREE (22 shards already fully precomputed): clean_concentrate arm BUILT + queued —
+         data.record_allowlist=/Volumes/2TBSSD/sref_eval/pool_top25.json (top-25% by style strength,
+         27,313 recs, RECORD-LEVEL over full-CSD 22 shards — NOT the scout, no sampling bias). Tests:
+         does concentrating signal beat 0.576? If promising, sweep top-10/50%, optionally repack
+         extreme-signal shards as a pipeline rehearsal — all free.
+      2. TARGETED EXPANSION, ~days (if rung1 wins): precompute VAE/Qwen3/SigLIP for the scout-identified
+         RICH shards (~50-100, not all 1280) → more VOLUME at fraction of cost; validates data lever at
+         scale. Known loss: ≤1.5%-rate gems in skipped shards (deliberate).
+      3. FULL UNIVERSE SWEEP, ~weeks (only if rung2 still winning): full per-image CSD over ALL records
+         → universe-wide top-IMAGE selection (per-image, not per-shard) → precompute keepers → repack
+         extreme-signal shards → ultimate run.
+    NEW CODE (committed): dataset.record_allowlist + siglip_pool_grid + skip_shards + seed/cap;
+    sref_sweep_eval content gate + sref_regrade.py; style_strength_select.py; content_leak_loss +
+    leak_loss_weight; hybrid_features --siglip-pool-grid. All Python; no C/export/parity change since
+    the hybrid (v4.1.0). make mps NOT needed for these (training/eval only).
+    OPERATIONAL: pool9 training (GPU, ~step 1225/3000, slow in 35°C heatwave — thermal crashes happen,
+    runs are crash-RESUMABLE via warmstart_path=step_ckpt + auto skip_shards). clean_concentrate queued
+    behind it. Heatwave → don't stack GPU jobs; CPU analysis (ranking/regrade/select) is safe in parallel.
