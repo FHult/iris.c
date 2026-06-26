@@ -2281,3 +2281,18 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     leak penalty is not a clean dial; 0.1 unlikely to help. (3) untried lever = option 2 (curate/reduce
     SigLIP tokens) targets clean-content style directly. (4) the hybrid PLATFORM (content+style at
     moderate scale) remains the usable deliverable regardless of the ratio number.
+
+  - **CONTENT GATE + HONEST RE-JUDGE (2026-06-26) — wash artifacts removed; honest plateau ~0.54.**
+    Added a content gate to the eval (sref_sweep_eval.py + sref_regrade.py): inj_ratio counts as a
+    real win ONLY where prompt_adherence ≥ 75% of the no-adapter null's (0.1516) — i.e. content
+    retained, not washed. Re-judged all saved arms (no re-gen). EVERY ratio >0.65 was a WASH artifact
+    (retain ≤ 0.64). Honest best CONTENT-PRESERVING inj_ratio, clean arms:
+      clean_leak(0.5) 0.543 @0.3 (retain 1.01) · clean_leak025 0.427 @0.5 (0.84) · clean_base −0.40 @0.3.
+    Findings: (1) the metric IS gameable by washing — confirmed; the gate fixes it. (2) at
+    content-safe scales the absolute style is TINY (Δstyle +0.016–0.056) → honest ratio ~0.43–0.54;
+    strong style requires content-washing. (3) the leak penalty still edges the field on the gated
+    metric (0.543), but the gain is modest. (4) NO lever (gate/CSD/hybrid/leak) delivers strong style
+    + preserved content — the ~0.54 honest plateau holds. Threshold note: 0.75 is strict (marks the
+    eyeballed-good hybrid@0.5 retain-0.74 as borderline); the qualitative conclusion holds for any
+    reasonable floor 0.70–0.80. The eval default is now --content-retain 0.75; sref_regrade.py re-grades
+    saved runs offline.

@@ -157,6 +157,10 @@ def main() -> int:
                     help="no-adapter null-baseline scores.json. Raw sref_score is FLOOR-"
                          "confounded (content_leak ~0.32 even for unrelated images); deltas vs "
                          "this null are the real metric (BACKLOG NULL-FLOOR REFRAME).")
+    ap.add_argument("--content-retain", type=float, default=0.75,
+                    help="content gate: a scale counts as a real win only if its prompt-adherence "
+                         "is >= this fraction of the no-adapter null's (content preserved, not washed). "
+                         "Default 0.75. inj_ratio at washed scales is a metric-gaming artifact.")
     args = ap.parse_args()
 
     spec = json.loads(Path(args.eval_set).read_text())
@@ -198,7 +202,8 @@ def main() -> int:
         try:
             _na = json.loads(Path(args.null).read_text()).get("aggregate", {})
             null = {"style_sim": _na["style_sim"]["mean"],
-                    "content_leak": _na["content_leak"]["mean"]}
+                    "content_leak": _na["content_leak"]["mean"],
+                    "prompt_adherence": _na.get("prompt_adherence", {}).get("mean")}
         except Exception as _e:
             print(f"  (null baseline unreadable: {_e})", file=sys.stderr)
     if null is not None:
@@ -211,6 +216,16 @@ def main() -> int:
             a["d_leak"] = d_leak
             a["d_sref"] = round(d_style - d_leak, 4)            # the real objective
             a["inj_ratio"] = round(d_style / d_leak, 3) if d_leak else None  # want > 1.0
+            # CONTENT GATE (2026-06-26): the inj_ratio is GAMEABLE by content-washing — a gen that
+            # collapses into a ref-matching texture scores high style_sim + low content (→ high ratio)
+            # while depicting nothing. prompt_adherence (CLIP gen↔prompt) is the guard: it sits at the
+            # no-adapter null (~0.15) for content-preserving gens and collapses toward 0 when washed.
+            # content_retain = prompt_adherence / null_prompt; a scale is "usable" only if it retains
+            # enough content. inj_ratio at non-usable scales is a WASH ARTIFACT, not a real win.
+            _np = null.get("prompt_adherence")
+            if _np and a.get("prompt_adherence") is not None:
+                a["content_retain"] = round(a["prompt_adherence"] / _np, 3)
+                a["content_ok"] = a["content_retain"] >= args.content_retain
 
     # Keep frontier.json a FLAT scale->agg dict (delta fields added in-place per scale) for
     # backward compatibility with readers that iterate scales; null baseline goes to a sibling.
@@ -221,17 +236,30 @@ def main() -> int:
     print(f"\n=== sref frontier: {args.name} ===")
     if null is not None:
         print(f"null baseline: style_sim={null['style_sim']:+.4f}  content_leak={null['content_leak']:+.4f}")
-        print(f"{'scale':>6} {'n':>3} {'Δstyle':>8} {'Δleak':>8} {'Δsref':>8} {'ratio':>6} "
-              f"{'(style':>8} {'leak':>7} {'sref)':>8} {'prompt':>8}")
+        print(f"{'scale':>6} {'n':>3} {'Δstyle':>8} {'Δleak':>8} {'ratio':>6} {'retain':>7} "
+              f"{'ok':>3} {'prompt':>8}")
         for sc, a in fr.items():
             def f(x):
                 return f"{x:+.4f}" if isinstance(x, (int, float)) else "   —  "
             def g(x):
                 return f"{x:.3f}" if isinstance(x, (int, float)) else "  —  "
+            _ok = a.get("content_ok")
             print(f"{sc:>6} {a['n']:>3} {f(a.get('d_style')):>8} {f(a.get('d_leak')):>8} "
-                  f"{f(a.get('d_sref')):>8} {g(a.get('inj_ratio')):>6} {f(a.get('style_sim')):>8} "
-                  f"{f(a.get('content_leak')):>7} {f(a.get('sref_score')):>8} {f(a.get('prompt_adherence')):>8}")
-        print("  (Δsref = Δstyle − Δleak is the real objective; inj_ratio = Δstyle/Δleak, want > 1.0)")
+                  f"{g(a.get('inj_ratio')):>6} {g(a.get('content_retain')):>7} "
+                  f"{('✓' if _ok else '✗ WASH' if _ok is False else '—'):>3} "
+                  f"{f(a.get('prompt_adherence')):>8}")
+        # Honest headline: best inj_ratio among CONTENT-PRESERVING scales only (washed scales excluded).
+        _usable = [(a.get("inj_ratio"), sc) for sc, a in fr.items()
+                   if a.get("content_ok") and a.get("inj_ratio") is not None]
+        if _usable:
+            _best_r, _best_sc = max(_usable)
+            print(f"  → BEST CONTENT-PRESERVING ratio: {_best_r:.3f} @ scale {_best_sc} "
+                  f"(retain ≥ {args.content_retain:.0%} of null prompt-adherence)")
+        else:
+            print(f"  → NO content-preserving scale (all wash at retain ≥ {args.content_retain:.0%}) "
+                  f"— ratio gains here are wash artifacts")
+        print("  (inj_ratio = Δstyle/Δleak; 'ok'=content retained vs no-adapter null; ✗ WASH = "
+              "ratio is a content-washing artifact, not a real win)")
     else:
         print(f"{'scale':>6} {'n':>3} {'style_sim':>10} {'leak':>8} {'sref':>8} {'prompt':>8}")
         for sc, a in fr.items():
