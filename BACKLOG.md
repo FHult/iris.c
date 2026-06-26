@@ -2296,3 +2296,18 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     eyeballed-good hybrid@0.5 retain-0.74 as borderline); the qualitative conclusion holds for any
     reasonable floor 0.70–0.80. The eval default is now --content-retain 0.75; sref_regrade.py re-grades
     saved runs offline.
+
+  - **DATA-QUALITY / ULTRA-SIGNAL SHARDS (2026-06-26) — the pool is style-signal-DILUTED.**
+    New CPU tool `style_strength_select.py` ranks records by style_strength = mean top-5 CSD-neighbor
+    cosine (dense high-cos neighborhood = strong repeatable style + clean cross-ref pairs) from the
+    existing neighbors.sqlite — no GPU. Analysis of the current 22-shard pool (109,253 records):
+    strength min 0.316 / med 0.718 / p90 0.817 / max 0.950 — WIDE. Per-shard ultra-signal (top-25%,
+    strength≥0.774) concentration varies ~50x: shards 000000/000004/000008/000012 ≈ 39–40% ultra-signal
+    vs 000812/000779/000883/001179 ≈ 0.7–4%. The interleaved loader trains on all 22 equally → ~half the
+    data teaches WEAK/generic style. Plausible cause of the weak clean-content style transfer (the
+    data-bound H2 hypothesis). **Cheap first test (no new precompute — the shards are already cached):**
+    train an ULTRA-SIGNAL arm on the top-25%-by-strength subset (or signal-rich shards only) → content-
+    gated eval vs the diluted pool. If it beats ~0.54 → data-bound (then scale via whole-universe
+    cheap-CSD-score → select → precompute-only-the-subset, using campaign_manager/shard_scores). If not →
+    architecture-bound, ship hybrid. csd_mlx.encode_both() also exposes a content head for future
+    style/content-ratio scoring. Pending: pool9 (option-2) verdict first, then the ultra-signal arm.
