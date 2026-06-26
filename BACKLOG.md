@@ -2263,3 +2263,21 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     washed, violinist heavily smeared; 0.7 fully washed). **NEXT: weight sweep DOWN (0.1, 0.25) to land
     clear content + ratio>0.65 simultaneously.** Also: leak penalty raised peak mem to 27GB → thermal
     crash in the heatwave; trim peak mem (free cond graph before null forward) before long runs.
+
+  - **LEAK WEIGHT SWEEP + SOBER RE-READ (2026-06-26) — earlier "ceiling break" was at SMEARED content.**
+    Three doses, identical seeded data (ratio @0.5 / Δstyle@0.5 / prompt_adh@0.5):
+      base(0): 0.576 / +0.083 / +0.096 · leak0.25: 0.427 / +0.056 / +0.128 · leak0.5: 0.719 / +0.150 / +0.097.
+    Dose response is NON-MONOTONIC: 0.25 preserves content BEST (sharp violinist, prompt +0.128) but
+    suppresses style → WORST ratio (0.427 < baseline). 0.5 = strong style but smears/washes. Eyeballing
+    every arm: **the high ratios (0.69–0.91 @0.7, 0.719 @ leak0.5/0.5) all coincide with content
+    WASHING/smearing** — the CSD style_sim metric rewards a ref-matching texture (high style, no content
+    → low leak → high ratio), so washing GAMES the ratio; prompt_adh→0 is the tell. Sorted by CONTENT
+    QUALITY: sharp content (prompt≥+0.13) tops out ~0.43–0.54 ratio; only smeared/washed content reaches
+    >0.65. **So clean-content style transfer still plateaus ~0.5–0.58; the leak penalty shifts the
+    sharp-content⟷strong-style frontier but doesn't break it with content intact.** The earlier
+    "0.719 broke 0.65" was at SMEARED content (prompt +0.097 = smeared-but-present violinist), not clean.
+    **Implications:** (1) the injection-ratio metric is GAMEABLE by washing — needs a content-quality
+    gate (only credit ratio where prompt_adh stays high) before more ratio-chasing. (2) dose-tuning the
+    leak penalty is not a clean dial; 0.1 unlikely to help. (3) untried lever = option 2 (curate/reduce
+    SigLIP tokens) targets clean-content style directly. (4) the hybrid PLATFORM (content+style at
+    moderate scale) remains the usable deliverable regardless of the ratio number.
