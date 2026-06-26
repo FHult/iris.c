@@ -371,6 +371,8 @@ def make_prefetch_loader(
                                         # of re-covering the start (set to start_step//cap by caller)
     siglip_pool_grid: Optional[int] = None,  # option-2: avg-pool 729 SigLIP tokens to grid*grid
                                         # (e.g. 9 → 81) to reduce content granularity; hybrid only
+    record_allowlist: Optional[set] = None,  # data-quality: train ONLY on these rec_ids (e.g. the
+                                        # top style-strength subset) — concentrate signal, drop dilution
 ) -> Iterator:
     """
     Two-level prefetch pipeline (§3.4).
@@ -594,6 +596,11 @@ def make_prefetch_loader(
                 return
             records = _iter_shard_contents(contents)
             rng.shuffle(records)
+            # Data-quality concentration: keep only allow-listed records (e.g. the top
+            # style-strength subset). Applied BEFORE the cap so the cap counts allowed records;
+            # signal-poor shards naturally contribute fewer (or zero) records.
+            if record_allowlist is not None:
+                records = [r for r in records if r["id"] in record_allowlist]
             # Cap records taken from this shard before rotating to the next (interleaving):
             # take a seeded-random subset so a short run spans many shards. Applied AFTER the
             # shuffle so the subset is representative, not the tar's on-disk order.

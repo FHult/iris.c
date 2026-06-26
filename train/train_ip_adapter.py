@@ -928,6 +928,16 @@ def train(config: dict) -> None:
     if _skip_shards > 0:
         print(f"  Resume: skipping {_skip_shards} already-covered shards "
               f"(continue onto unseen shards)")
+
+    # Data-quality concentration: train only on an allow-listed record subset (e.g. top
+    # style-strength). data.record_allowlist is a path to a JSON manifest with "rec_ids".
+    _allowlist = None
+    _al_path = dcfg.get("record_allowlist")
+    if _al_path and os.path.isfile(_al_path):
+        _allowlist = set(json.loads(Path(_al_path).read_text())["rec_ids"])
+        print(f"  Record allowlist: {len(_allowlist):,} rec_ids from {os.path.basename(_al_path)} "
+              f"(concentration arm — diluting records dropped)")
+
     loader = make_prefetch_loader(
         shard_paths=shard_paths,
         batch_size=dcfg["batch_size"],
@@ -948,6 +958,7 @@ def train(config: dict) -> None:
         records_per_shard_visit=dcfg.get("records_per_shard_visit"),
         skip_shards=_skip_shards,
         siglip_pool_grid=_siglip_pool_grid,
+        record_allowlist=_allowlist,
     )
 
     # Force-materialize mmap'd Flux transformer weights into GPU memory before

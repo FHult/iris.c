@@ -2311,3 +2311,18 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     cheap-CSD-score → select → precompute-only-the-subset, using campaign_manager/shard_scores). If not →
     architecture-bound, ship hybrid. csd_mlx.encode_both() also exposes a content head for future
     style/content-ratio scoring. Pending: pool9 (option-2) verdict first, then the ultra-signal arm.
+
+  - **DATA-QUALITY HARVEST — SAMPLING-BIAS CAVEAT (2026-06-26, capture before scaling).** The universe
+    CSD (`/Volumes/16TBCold/precomputed/style/v1_csd`, per-image CSD, 768-d L2, keyed by rec_id) is a
+    200-records/SHARD SCOUT (256K recs, 1280 journeydb shards). Universe style-strength matches the
+    22-shard pool (med 0.717/p90 0.815/max 0.949) → NO higher quality tier outside, but ~25x more
+    ultra-signal VOLUME, concentrated by shard (top shards 000200/000098/000481 ≈28-29% ultra-signal;
+    many at 0%; the richest are mostly OUTSIDE the current pool). **CAVEAT (do NOT shard-select on the
+    scout for the final set):** a 0/200 shard is not empty — rule-of-3 → true ultra-signal rate ≤~1.5%
+    → up to ~75 great images per "dud" shard × hundreds of shards = real loss. Shard-level scout
+    selection is PRIORITIZATION only; the FINAL extreme-signal set must be PER-IMAGE over FULL coverage
+    (full CSD sweep of ALL records, then pick top images regardless of shard). Cost decision at harvest:
+    full sweep all records (no gems lost, expensive 6.4M CSD) vs scout-prioritized partial sweep
+    (cheaper, quantified ≤~1.5%-rate loss in skipped shards). The CHEAP concentration test is UNAFFECTED
+    — it uses full per-record CSD of the 22-shard pool (pool_top25.json, 27,313 recs, record-level, no
+    scout). Built: dataset.record_allowlist + style_strength_select.py; arm clean_concentrate queued.
