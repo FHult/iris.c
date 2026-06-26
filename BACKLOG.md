@@ -2417,3 +2417,20 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     HONEST CAVEAT: content-preserving style transfer is a real Pareto tradeoff; ~0.54 may be near
     where the frontier sits for THIS base + feature family. The schedule sweep (1.1) is the
     strongest remaining reason to think the plateau is beatable rather than fundamental.
+
+  - **SREF pool9 (option-2 SigLIP pooling 729→81) VERDICT (2026-06-26): NULL — does not break the
+    plateau.** Trained clean (seed42, all-22-shards, cap135, NO leak penalty, siglip_pool_grid=9),
+    thermal-crashed @2500/3000 (Metal "Impacting Interactivity", 2nd of the heatwave); step_2500 EMA
+    bundle graded — 2500 vs 3000 won't flip a content-gated verdict. Content-gated frontier (pooled
+    [82,1152] refs, null prompt-adherence 0.1516): @0.3 Δstyle +0.0055 retain 0.996 ✓ (≈zero style);
+    @0.5 ratio 0.787 retain 0.188 ✗WASH; @0.7 ratio 0.971 retain −0.108 ✗WASH. Best content-preserving
+    ratio 0.160 @0.3 — but Δstyle≈0 there, so the ratio is meaningless. SAME shape as clean_base
+    (clean_base @0.3 Δstyle −0.0099 retain ~1.0; @0.5 prompt-adher 0.0957 = retain 0.63 ✗WASH — its
+    0.576/0.634 are WASH-scale ratios, NOT content-preserving). So pooling neither helps nor hurts at
+    the content-preserving operating point; it's another plateau null. The noisy training-loss gap
+    swings (+12.6% … −51.9% window-to-window) were NOISE, not signal — don't read cond/null gap as a
+    lever verdict; only the content-gated eval decides. CONFIRMS architecture levers exhausted. Pooled
+    refs at /Volumes/2TBSSD/sref_eval/refs_feat_hybrid_pool9 (eval_set_pool9.json). Minor: hybrid_
+    features.py JSON stdout mis-reports "rows":730 when pooling (file is correctly [82,1152] by byte
+    size 377856=82*1152*4) — cosmetic log bug, fix later. NEXT: data lever (clean_concentrate), then
+    DP-7 if flat.
