@@ -2493,3 +2493,29 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     Tier-0 `--sref-strength` default. CAVEAT: at 0.01 granularity per-pair noise (n=10,1 seed) may
     exceed the inter-scale signal — bump to multiple seeds / more pairs at the micro stage so a 0.01
     difference is statistically real, not jitter.
+
+  - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
+    content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
+    MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
+    clean_leak; 0.55/0.60 to clean_leak025), reusing coarse gens. Full content-gated frontiers
+    (null prompt 0.1516, gate retain≥0.75):
+      clean_concentrate_leak: 0.30 r0.443/ret1.00 · 0.35 Δs0.080 r0.516/ret0.926 OK · 0.40 r0.659/ret0.688 WASH
+      clean_leak:             0.30 Δs0.016 r0.543/ret1.01 · 0.45 Δs0.080 r0.512/ret0.888 OK · 0.50 ret0.637 WASH
+      clean_leak025:          0.50 Δs0.056 r0.427/ret0.841 OK · 0.55 ret0.679 WASH
+    KEY 1 — the famous 0.543 (clean_leak @0.3) is a DEGENERATE point: Δstyle only 0.016 (≈no style
+    transfer); ratio looks high only because Δleak≈0 too (the "safe-but-useless corner"). NEVER a
+    usable operating point. The honest metric must be read at a MATCHED USEFUL Δstyle budget.
+    KEY 2 — at matched Δstyle≈0.08: clean_concentrate_leak @0.35 r0.516/ret0.926 vs clean_leak @0.45
+    r0.512/ret0.888 — near-tied ratio, stacked has more retain headroom. Interpolating each arm to its
+    gate-crossing (retain→0.75): BOTH peak at ~ratio 0.62 @ Δstyle~0.115 (stacked at scale~0.39, leak
+    at scale~0.48). So the TRUE content-preserving frontier is ~0.62, not 0.54 — the coarse grid
+    under-measured it by missing the crossing scales. This is a MEASUREMENT CORRECTION, not a new
+    capability (no lever NEWLY broke anything; the model was always ~0.62-capable at the right scale).
+    KEY 3 — data lever (concentration) and objective lever (leak) CONVERGE to the same ~0.62 ceiling;
+    two independent levers hitting the same wall ⇒ likely MECHANISM-bound (representation/KV-injection),
+    which ELEVATES DP-7 (injection schedule / CSD-dominant / AdaIN) as the next real lever over more
+    data. clean_leak025 weaker (peak ~0.5, less headroom) — drop.
+    NEXT: micro-sweep CHAMPION clean_concentrate_leak (ties on ratio, more headroom, data benefit
+    compounds at rung-2) at 0.01 increments around the crossing (~0.36–0.40) with MULTIPLE SEEDS to
+    MEASURE the peak (vs interpolated 0.62) + pin shippable --sref-strength. Then DP-7 mechanism work
+    is the likely next major direction (per KEY 3). All frontier.json now carry the full fine grids.
