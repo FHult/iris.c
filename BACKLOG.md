@@ -2456,3 +2456,32 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     they compose, the 0.5-retain 0.742 should clear 0.75 with Δstyle~0.11. Then optionally top-10%
     concentration sweep (free). Only escalate to rung-2 targeted precompute if the stacked arm clears
     the gate. ip_scale double=0.0000 persists (every arm).
+
+  - **SREF clean_concentrate_leak (data+leak STACKED) VERDICT + COARSE-GRID CONFOUND (2026-06-27):
+    stacking did NOT cleanly break the plateau, BUT exposed that the ~0.543 plateau is likely a
+    SCALE-SAMPLING ARTIFACT.** Full 3000-step run (no crash), content-gated frontier (null prompt
+    0.1516, gate retain≥0.75). Cross-arm table at the fixed 0.3/0.5/0.7 grid (gate-OK rows):
+      arm                     sc   Δstyle   Δleak   ratio  retain  gate
+      clean_leak              0.3  0.0159  0.0293  0.543   1.010  OK   ← incumbent "plateau"
+      clean_concentrate_leak  0.3  0.0468  0.1057  0.443   1.001  OK   ← stacked: 3x Δstyle, lower ratio
+      clean_leak025           0.5  0.0557  0.1303  0.427   0.841  OK   ← MOST gate-passing Δstyle
+      clean_concentrate       0.3  0.0068  0.0277  0.245   1.009  OK
+      clean_pool9             0.3  0.0055  0.0343  0.160   0.996  OK
+      clean_base              0.3 -0.0099  0.0245 -0.404   1.008  OK
+    STACKING: best content-preserving ratio 0.443 @0.3 (< leak-alone 0.543) — levers TRADED OFF
+    (more Δstyle 0.047 AND more Δleak 0.106 → net lower ratio), did NOT compose additively. At 0.5 it
+    washes catastrophically (retain 0.742→0.040): the leak penalty makes injection more potent per
+    unit scale, moving the wash CLIFF down below 0.5.
+    THE CONFOUND (matters more than any single arm): every potent arm sits at retain≈1.0 @0.3 (huge
+    headroom) then washes by 0.5 → its TRUE content-preserving optimum is at an UNSAMPLED scale
+    ~0.33–0.45, and the coarse fixed grid catches each arm at a DIFFERENT frontier position. So
+    (a) the ~0.543 "plateau" is probably a sampling artifact — interpolating clean_concentrate_leak
+    between 0.3(retain1.0,ratio0.443) and 0.5(retain0.04) puts its gate-crossing ~0.36–0.40 with
+    higher Δstyle+ratio than 0.443, plausibly >0.543; (b) clean_leak025 was WRONGLY dismissed as "too
+    weak" — at 0.5 it PASSES the gate (retain0.841) with the highest gate-Δstyle (0.0557), its cliff
+    is higher. The eval docstring's own rule: compare at MATCHED content budget, NEVER a single fixed
+    scale (SREF-EVAL-PARAMS). We've been violating it.
+    NEXT (cheap, EVAL-ONLY, no retrain, GPU cool): fine scale sweep 0.35/0.40/0.45 on the top arms
+    (clean_concentrate_leak, clean_leak; add clean_leak025 @0.55/0.60) to locate each true peak
+    content-preserving ratio, then compare at matched budget. This likely RAISES the honest plateau
+    number and gives the real stacking verdict. Only after that decide rung-2 vs DP-7.
