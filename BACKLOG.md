@@ -2485,3 +2485,11 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (clean_concentrate_leak, clean_leak; add clean_leak025 @0.55/0.60) to locate each true peak
     content-preserving ratio, then compare at matched budget. This likely RAISES the honest plateau
     number and gives the real stacking verdict. Only after that decide rung-2 vs DP-7.
+    STAGED-SWEEP METHODOLOGY (hierarchical bisection, not brute force): coarse 0.3/0.5/0.7 (locate
+    arm) → medium 0.35/0.40/0.45 (localize each arm's gate-crossing cliff, pick champion) → MICRO
+    0.01 increments across a ~0.06 window around the CHAMPION's crossing only (~70 gens, cheap). The
+    content gate is a hard threshold, so the true champion = the exact scale just below retain<0.75
+    where Δstyle/ratio peaks; the 0.01 sweep pins it. That champion scale IS the shippable DP-7
+    Tier-0 `--sref-strength` default. CAVEAT: at 0.01 granularity per-pair noise (n=10,1 seed) may
+    exceed the inter-scale signal — bump to multiple seeds / more pairs at the micro stage so a 0.01
+    difference is statistically real, not jitter.
