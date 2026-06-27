@@ -2434,3 +2434,25 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     features.py JSON stdout mis-reports "rows":730 when pooling (file is correctly [82,1152] by byte
     size 377856=82*1152*4) — cosmetic log bug, fix later. NEXT: data lever (clean_concentrate), then
     DP-7 if flat.
+
+  - **SREF clean_concentrate (rung-1 DATA lever, top-25% style-signal) VERDICT (2026-06-27):
+    DIRECTIONAL WIN — the data lever measurably shifts the content/style frontier, but does not yet
+    clear a strictly content-preserving operating point.** First crash-free 3000-step run (heatwave
+    passed). Trained on record_allowlist=pool_top25.json (27,313 recs, top-25% by CSD-neighbor style
+    strength over full-CSD 22 shards), else IDENTICAL to clean_base (hybrid, seed42, cap135, 729
+    SigLIP, NO leak penalty). Content-gated frontier (null prompt-adher 0.1516), vs the two matched
+    baselines:
+      arm                @0.3 Δstyle/ratio/retain      @0.5 Δstyle/retain        @0.7 retain
+      clean_base         -0.0099 / -0.40 / 1.0 ✓        +0.079 / 0.63 ✗WASH        ✗WASH
+      pool9 (pooled)     +0.0055 / 0.16 / 1.0 ✓         +0.168 / 0.19 ✗WASH        ✗WASH
+      clean_concentrate  +0.0068 / 0.245 / 1.0 ✓        +0.112 / 0.742 ✗(edge)     -0.08 ✗WASH
+    The ROBUST signal is content RETENTION at scale 0.5 (where real style transfers, Δstyle≈0.11):
+    clean_base 0.63 → concentrate 0.742, i.e. concentration pushed the content-preserving boundary
+    OUTWARD, nearly clearing the 0.75 gate. At the strict content-preserving point (0.3) concentrate
+    is the ONLY arm with a positive ratio (0.245 vs clean_base -0.40). So data quality IS a real lever.
+    CAVEAT: 0.245 (strict-gated) is still BELOW the leak arm's ~0.543; one data arm alone does NOT
+    break the plateau — frontier shifted, gate not yet cleared. NEXT (cheap, GPU now cool): STACK the
+    two positive levers — concentrate data + leak_loss_weight=0.5 (clean_concentrate_leak arm) — if
+    they compose, the 0.5-retain 0.742 should clear 0.75 with Δstyle~0.11. Then optionally top-10%
+    concentration sweep (free). Only escalate to rung-2 targeted precompute if the stacked arm clears
+    the gate. ip_scale double=0.0000 persists (every arm).
