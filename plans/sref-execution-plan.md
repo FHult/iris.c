@@ -211,6 +211,43 @@ schedule sweep is also flat → 1.2 → 2.1 → 3.1. Honest caveat: content-pres
 transfer is a genuine Pareto tradeoff; ~0.54 may be near the frontier for this base +
 feature family. The schedule sweep is the strongest remaining reason to think otherwise.
 
+### DP-8 (2026-06-27): champion → mega run — the gated endgame
+
+Once the staged scale sweep (coarse → medium → micro 0.01) yields a **champion**
+(best recipe + ship scale), the endgame is a large high-signal training run — but
+reached through GATES, not a direct jump. The micro champion fixes two things: the
+best **recipe** (winning lever combination) and the provisional **ship scale**
+(`--sref-strength` default). It does NOT prove the recipe scales with data — it is a
+512px / 3000-step / hot-pool result. The champion is the SEED for the mega run, not
+its config.
+
+**Reframe — max-SIGNAL data, not max-VOLUME.** The concentration result says quality
+beats quantity (cutting the style-diluted half HELPED). The mega run trains on the
+EXTREME-SIGNAL harvested subset (per-image top-style selection over full universe
+coverage → repacked high-signal shards), NOT the whole pool. Re-adding the diluted
+pool would regress — it re-adds exactly what concentration removed.
+
+**Gated sequence:**
+1. Micro champion → best recipe; ship Tier-0 `--sref-strength` now.
+2. **GATE — data-bound or mechanism-bound?** If the champion only MARGINALLY edges the
+   plateau (still ~0.5 ratio, tiny Δstyle), the binding constraint is the
+   representation/injection MECHANISM, and more data cannot break a mechanism ceiling →
+   do DP-7 mechanism work (injection schedule, CSD-dominant, AdaIN) FIRST. Only if the
+   champion CLEARLY breaks the plateau is data the right thing to scale.
+3. **Cheap scaling checks before paying weeks:** (a) more steps (6k vs 3k, same data) —
+   does the recipe keep improving? (b) rung-2 targeted rich-shard precompute (~days):
+   does 2–3× high-signal VOLUME keep pushing the frontier? If it flattens at rung-2,
+   rung-3 won't rescue it.
+4. **Mega run (rung-3) only if rung-2 still climbs:** full universe per-image harvest →
+   extreme-signal shards → long MULTI-STAGE training (512 → 768 → 1024, TRAIN-7 gate
+   passed), more steps. This is the real "max data + mega run."
+
+Discipline: each rung must show the recipe STILL improving with more data before paying
+for the next (this is what the BACKLOG cost-ladder is for). The ship scale is
+PROVISIONAL — a better-trained mega model shifts the cliff, so `--sref-strength` is
+RE-SWEPT (micro again) after the mega run. The current champion scale is what we ship
+today, not the final.
+
 ## Standing constraints
 - Never start a production run without PROD-1/PROD-2 active (they are now).
 - Style precompute/backfill and proxy training are GPU-window tasks — schedule against
