@@ -1049,8 +1049,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --vary-strong     Strong variation from --vary-from (strength 0.6)\n");
     fprintf(stderr, "      --vary-strength N Custom variation strength 0.0-1.0\n\n");
     fprintf(stderr, "Style reference (approximate, training-free — v2.6):\n");
-    fprintf(stderr, "      --sref PATH       Style reference image (up to 4 --sref flags)\n");
-    fprintf(stderr, "      --sref-scale N    Style influence 0.0-1.0 (default: 0.7)\n\n");
+    fprintf(stderr, "      (style reference: use --ip / --ip-features with a trained adapter bundle,\n");
+    fprintf(stderr, "       or the web UI's Style mode; see README)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -1112,8 +1112,6 @@ int main(int argc, char *argv[]) {
         {"ip-schedule",      required_argument, 0, 272},
         {"img2img-strength", required_argument, 0, 262},
         {"negative",         required_argument, 0, 'N'},
-        {"sref",             required_argument, 0, 263},
-        {"sref-scale",       required_argument, 0, 264},
         {"vary-from",        required_argument, 0, 265},
         {"vary-subtle",      no_argument,       0, 266},
         {"vary-strong",      no_argument,       0, 267},
@@ -1136,8 +1134,7 @@ int main(int argc, char *argv[]) {
         .num_steps = 0,   /* 0 = auto from model type */
         .seed = -1,
         .guidance = 0.0f, /* 0 = auto from model type */
-        .power_alpha = 2.0f,
-        .sref_scale = 0.7f
+        .power_alpha = 2.0f
     };
 
     char *vary_from = NULL;
@@ -1207,14 +1204,6 @@ int main(int argc, char *argv[]) {
             case 272: ip_schedule = optarg; break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
             case 'N': params.negative_prompt = optarg; break;
-            case 263:
-                if (params.sref_count < 4) {
-                    params.sref_paths[params.sref_count++] = optarg;
-                } else {
-                    fprintf(stderr, "Warning: maximum 4 style reference images supported\n");
-                }
-                break;
-            case 264: params.sref_scale = (float)atof(optarg); break;
             case 265: vary_from = optarg; break;
             case 266: params.img2img_strength = 0.2f; break;
             case 267: params.img2img_strength = 0.6f; break;
@@ -1284,12 +1273,6 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         }
-    }
-
-    /* --sref: not yet implemented (v2.6 target) */
-    if (params.sref_count > 0) {
-        fprintf(stderr, "Error: --sref is not yet implemented (planned for v2.6)\n");
-        return 1;
     }
 
     /* Validate parameters */

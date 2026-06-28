@@ -195,7 +195,53 @@ static void run_hybrid_bundle(const float *img_q) {
     iris_ip_adapter_free(a);
 }
 
+static void check(const char *name, int ok) {
+    printf("%-24s %s\n", name, ok ? "PASS" : "FAIL");
+    if (ok) passes++; else failures++;
+}
+
+/* DP-7 injection schedule: set_schedule parsing + set_step per-step multiplier.
+ * Pure logic (no weights), so a zeroed struct suffices. */
+static void test_schedule(void) {
+    printf("--- injection schedule (DP-7) ---\n");
+    iris_ip_adapter_t a;
+    memset(&a, 0, sizeof(a));
+
+    /* none → constant: mult 1.0 at every step */
+    check("set none ok", iris_ip_adapter_set_schedule(&a, "none") == 0);
+    iris_ip_adapter_set_step(&a, 0, 4); check("none @0 =1", a.ip_sched_mult == 1.0f);
+    iris_ip_adapter_set_step(&a, 3, 4); check("none @3 =1", a.ip_sched_mult == 1.0f);
+
+    /* late:0.5 over 4 steps: frac=step/3 → 0,.33,.67,1; inject when frac>=0.5 */
+    check("set late ok", iris_ip_adapter_set_schedule(&a, "late:0.5") == 0);
+    iris_ip_adapter_set_step(&a, 0, 4); check("late @0 off", a.ip_sched_mult == 0.0f);
+    iris_ip_adapter_set_step(&a, 1, 4); check("late @1 off", a.ip_sched_mult == 0.0f);
+    iris_ip_adapter_set_step(&a, 2, 4); check("late @2 on",  a.ip_sched_mult == 1.0f);
+    iris_ip_adapter_set_step(&a, 3, 4); check("late @3 on",  a.ip_sched_mult == 1.0f);
+
+    /* early:0.5 is the complement (inject when frac<0.5) */
+    check("set early ok", iris_ip_adapter_set_schedule(&a, "early:0.5") == 0);
+    iris_ip_adapter_set_step(&a, 0, 4); check("early @0 on",  a.ip_sched_mult == 1.0f);
+    iris_ip_adapter_set_step(&a, 2, 4); check("early @2 off", a.ip_sched_mult == 0.0f);
+
+    /* late:0.0 = always on (inertness edge — matches schedule-off behaviour) */
+    iris_ip_adapter_set_schedule(&a, "late:0.0");
+    iris_ip_adapter_set_step(&a, 0, 4); check("late:0.0 @0 =1", a.ip_sched_mult == 1.0f);
+
+    /* bad specs rejected and leave the inert state (kind 0, mult 1.0) */
+    check("reject bogus", iris_ip_adapter_set_schedule(&a, "bogus:1") == -1);
+    check("reject late:2", iris_ip_adapter_set_schedule(&a, "late:2") == -1);
+    check("reject late:nan", iris_ip_adapter_set_schedule(&a, "late:nan") == -1);
+    iris_ip_adapter_set_step(&a, 0, 4); check("bad→inert =1", a.ip_sched_mult == 1.0f);
+
+    /* num_steps==1 must not divide by zero */
+    iris_ip_adapter_set_schedule(&a, "late:0.5");
+    iris_ip_adapter_set_step(&a, 0, 1); check("1-step safe", a.ip_sched_mult == 1.0f);
+}
+
 int main(void) {
+    test_schedule();
+
     float *siglip = load_bin(FIX "/in_siglip.bin", (long)SIG_SEQ * SIG_DIM);
     float *img_q  = load_bin(FIX "/in_img_q.bin",  (long)IMG_SEQ * HID);
     if (!siglip || !img_q) return 1;
