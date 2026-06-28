@@ -2553,6 +2553,19 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     CFG-independent, but confirm vs training). (3) re-derive the base model's own no-adapter null +
     champion scale (the 0.39 champion scale is distilled-specific; base will have a different sweet
     spot). Gates DP-8: only if base-model timing/levers beat ~0.70 does the data mega-run reopen.
+    TRANSFER-CHECK VERDICT (2026-06-28): the distilled-trained champion does NOT transfer to the base
+    model → the CHEAP path of SREF-BASE-1 is DEAD. Visual check (base, --base, 24-step, 256x256,
+    artnouveau ref, prompt "a cat sitting on a chair"): base NO-adapter = clean coherent ginger cat
+    (base model is fine); base + champion @0.38/0.5/0.8 = ALL muddy brown/speckled OOD texture — content
+    destroyed AND the reference palette NOT reproduced, at every scale. Cause: the per-block to_k_ip/
+    to_v_ip were trained against the DISTILLED transformer's attention distribution; the undistilled
+    base transformer's attention is different → injecting distilled K/V is out-of-distribution (CFG×IP
+    dual-pass injection likely compounds). CONSEQUENCE: testing timing/levers on a 50-step model now
+    requires TRAINING A BASE-MODEL ADAPTER first → SREF-BASE-1 moves from "last cheap shot" to the
+    SPECULATIVE-RETRAIN tier alongside CSD-dominant / AdaIN / 9B. The cheap levers are now FULLY
+    exhausted; the ~0.70 distilled champion (shipped) is the deliverable, and every remaining >0.70 path
+    is an expensive speculative retrain. The 5-min transfer check (run BEFORE any base sweep) saved
+    hours of garbage base schedule sweeps — keep this gate for any "use adapter X on model Y" idea.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
