@@ -4925,6 +4925,16 @@ int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *i
     return 0;
 }
 
+/* DP-7 injection schedule: forward to the bound IP-adapter (no-op if none). */
+int iris_transformer_set_ip_schedule(iris_transformer_t *tf, const char *spec) {
+    if (!tf || !tf->ip) return -1;
+    return iris_ip_adapter_set_schedule(tf->ip, spec);
+}
+
+void iris_transformer_set_ip_step(iris_transformer_t *tf, int step, int num_steps) {
+    if (tf && tf->ip) iris_ip_adapter_set_step(tf->ip, step, num_steps);
+}
+
 /* ========================================================================
  * Safetensors Loading
  * ======================================================================== */

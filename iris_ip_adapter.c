@@ -116,6 +116,7 @@ iris_ip_adapter_t *iris_ip_adapter_load(const char *bundle_dir) {
 
     iris_ip_adapter_t *a = calloc(1, sizeof(iris_ip_adapter_t));
     if (!a) return NULL;
+    a->ip_sched_mult = 1.0f;   /* schedule off by default → constant injection */
 
     /* meta.json -> dims */
     snprintf(path, sizeof(path), "%s/adapter_meta.json", bundle_dir);
@@ -386,8 +387,8 @@ void iris_ip_adapter_inject(const iris_ip_adapter_t *a, int block_idx,
                             const float *img_q, int img_seq,
                             const float *k_ip, const float *v_ip,
                             float *img_hidden) {
-    float s = a->ip_scale[block_idx];
-    if (s == 0.0f) return;                 /* style-only: double-stream no-op */
+    float s = a->ip_scale[block_idx] * a->ip_sched_mult;
+    if (s == 0.0f) return;                 /* style-only no-op, or schedule gated this step off */
     int H = a->hidden_dim, T = a->num_image_tokens, hd = 128, heads = H / hd;
     float *attn = malloc((size_t)img_seq * H * sizeof(float));
     if (!attn) return;
@@ -395,4 +396,39 @@ void iris_ip_adapter_inject(const iris_ip_adapter_t *a, int block_idx,
     for (size_t i = 0; i < (size_t)img_seq * H; i++)
         img_hidden[i] += s * attn[i];
     free(attn);
+}
+
+int iris_ip_adapter_set_schedule(iris_ip_adapter_t *a, const char *spec) {
+    if (!a) return -1;
+    /* Reset to "none" first so a bad spec leaves a defined (inert) state. */
+    a->ip_sched_kind = 0;
+    a->ip_sched_param = 0.0f;
+    a->ip_sched_mult = 1.0f;
+    if (!spec || !*spec || strcmp(spec, "none") == 0) return 0;
+    float f = 0.0f;
+    if (sscanf(spec, "late:%f", &f) == 1)       a->ip_sched_kind = 1;
+    else if (sscanf(spec, "early:%f", &f) == 1) a->ip_sched_kind = 2;
+    else {
+        fprintf(stderr, "ip-schedule: bad spec '%s' (want none|late:F|early:F)\n", spec);
+        return -1;
+    }
+    if (!isfinite(f) || f < 0.0f || f > 1.0f) {
+        fprintf(stderr, "ip-schedule: fraction %.3f out of [0,1]\n", (double)f);
+        a->ip_sched_kind = 0;
+        return -1;
+    }
+    a->ip_sched_param = f;
+    return 0;
+}
+
+void iris_ip_adapter_set_step(iris_ip_adapter_t *a, int step, int num_steps) {
+    if (!a) return;
+    if (a->ip_sched_kind == 0 || num_steps <= 0) { a->ip_sched_mult = 1.0f; return; }
+    /* Step fraction in [0,1]: 0 at the first (noisiest) step, 1 at the last (cleanest). */
+    float frac = (num_steps > 1) ? (float)step / (float)(num_steps - 1) : 1.0f;
+    switch (a->ip_sched_kind) {
+        case 1: a->ip_sched_mult = (frac >= a->ip_sched_param) ? 1.0f : 0.0f; break; /* late  */
+        case 2: a->ip_sched_mult = (frac <  a->ip_sched_param) ? 1.0f : 0.0f; break; /* early */
+        default: a->ip_sched_mult = 1.0f;
+    }
 }

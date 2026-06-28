@@ -133,6 +133,16 @@ typedef struct {
     /* ip_scale  [num_blocks]  float32 — per-block blend weight */
     float *ip_scale;
 
+    /* Inference-time injection SCHEDULE (DP-7). Gates ip_scale by denoising-step
+     * fraction so style can be injected only in e.g. the LATE (low-noise) steps —
+     * letting content/structure form first. Default = off (kind 0, mult 1.0), which
+     * is bit-identical to constant injection. The sampling loop calls
+     * iris_ip_adapter_set_step() once per step to refresh ip_sched_mult; inject()
+     * multiplies ip_scale[block] by it. */
+    int   ip_sched_kind;      /* 0=none(const) 1=late 2=early */
+    float ip_sched_param;     /* threshold step-fraction in [0,1] */
+    float ip_sched_mult;      /* current per-step multiplier (scratch, default 1.0) */
+
     /* -----------------------------------------------------------------
      * INT8 dequant scale tensors (NULL unless quant == "int8")
      *
@@ -257,6 +267,25 @@ void iris_ip_adapter_inject(
     const float *v_ip,
           float *img_hidden       /* [img_seq * hidden_dim]  modified in-place */
 );
+
+/*
+ * iris_ip_adapter_set_schedule — configure the injection schedule from a spec string.
+ *
+ *   "none"      constant injection (default)
+ *   "late:F"    inject only when step-fraction >= F  (late/low-noise steps)
+ *   "early:F"   inject only when step-fraction <  F  (early/high-noise steps)
+ *
+ * step-fraction = step / (num_steps-1), 0 at the first (noisiest) step, 1 at the last.
+ * Returns 0 on success, -1 on parse error (schedule then left at "none").
+ */
+int iris_ip_adapter_set_schedule(iris_ip_adapter_t *a, const char *spec);
+
+/*
+ * iris_ip_adapter_set_step — refresh ip_sched_mult for step `step` of `num_steps`.
+ * Called once per denoising step by the sampling loop. No-op (mult=1.0) when the
+ * schedule is "none". Safe to call with a == NULL.
+ */
+void iris_ip_adapter_set_step(iris_ip_adapter_t *a, int step, int num_steps);
 
 
 /* -------------------------------------------------------------------------

@@ -175,6 +175,14 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
                          const char *features_path, float scale_mult);
 
 /*
+ * Configure the IP-Adapter injection SCHEDULE (DP-7). Call after iris_load_ip_adapter.
+ * spec: "none" (default), "late:F", or "early:F" — F in [0,1] is the step-fraction
+ * threshold (inject only in the late/low-noise or early/high-noise steps respectively).
+ * Returns 0 on success, -1 on error (no IP-adapter loaded, or bad spec).
+ */
+int iris_set_ip_schedule(iris_ctx *ctx, const char *spec);
+
+/*
  * Check if model is Z-Image (S3-DiT architecture).
  * Returns 1 for Z-Image, 0 for Flux.
  */

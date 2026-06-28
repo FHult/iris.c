@@ -60,6 +60,7 @@ extern int iris_transformer_num_single_layers(iris_transformer_t *tf);
 extern void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora);
 extern int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
                                            float *ip_embeds);
+extern int iris_transformer_set_ip_schedule(iris_transformer_t *tf, const char *spec);
 extern float *iris_transformer_forward(iris_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
@@ -577,6 +578,11 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
         fprintf(stderr, "IP-Adapter: attached (%d blocks, %d image tokens, %d SigLIP rows, "
                 "scale x%.2f)\n", ip->num_blocks, ip->num_image_tokens, n_siglip, scale_mult);
     return 0;
+}
+
+int iris_set_ip_schedule(iris_ctx *ctx, const char *spec) {
+    if (!ctx || !ctx->transformer) return -1;
+    return iris_transformer_set_ip_schedule(ctx->transformer, spec);
 }
 
 /* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.

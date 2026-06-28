@@ -245,6 +245,10 @@ extern float *iris_transformer_forward(iris_transformer_t *tf,
                                        const float *txt_emb, int txt_seq,
                                        float timestep);
 
+/* DP-7 IP-Adapter injection schedule: refresh the per-step multiplier before each
+ * forward. No-op when no IP-adapter is bound or the schedule is "none". */
+extern void iris_transformer_set_ip_step(iris_transformer_t *tf, int step, int num_steps);
+
 /* Z-Image transformer */
 typedef struct zi_transformer zi_transformer_t;
 extern float *zi_transformer_forward(zi_transformer_t *tf,
@@ -319,6 +323,9 @@ float *iris_sample_euler(void *transformer, void *text_encoder,
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
+
+        /* DP-7: gate IP-adapter injection by denoising-step fraction (no-op if off). */
+        iris_transformer_set_ip_step(tf, step, num_steps);
 
         /* Predict velocity with conditioning */
         v_cond = iris_transformer_forward(tf, z_curr, h, w,
@@ -547,6 +554,7 @@ float *iris_sample_euler_with_refs(void *transformer, void *text_encoder,
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Predict velocity with reference image conditioning */
         float *v = iris_transformer_forward_with_refs(tf,
                                                       z_curr, h, w,
@@ -629,6 +637,7 @@ float *iris_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Predict velocity with multiple reference images */
         float *v = iris_transformer_forward_with_multi_refs(tf,
                                                             z_curr, h, w,
@@ -716,6 +725,7 @@ float *iris_sample_euler_cfg(void *transformer, void *text_encoder,
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Unconditioned prediction */
         float *v_uncond = iris_transformer_forward(tf, z_curr, h, w,
                                                     text_emb_uncond, text_seq_uncond,
@@ -804,6 +814,7 @@ float *iris_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Unconditioned prediction (with ref) */
         float *v_uncond = iris_transformer_forward_with_refs(tf,
                               z_curr, h, w,
@@ -893,6 +904,7 @@ float *iris_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
             iris_step_callback(step + 1, num_steps);
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Unconditioned prediction (with refs) */
         float *v_uncond = iris_transformer_forward_with_multi_refs(tf,
                               z_curr, h, w,
@@ -975,6 +987,7 @@ float *iris_sample_euler_ancestral(void *transformer,
 
         if (iris_cancel_requested) { free(z_curr); free(noise); return NULL; }
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* Predict velocity */
         float *v = iris_transformer_forward(tf, z_curr, h, w,
                                             text_emb, text_seq, t_curr);
@@ -1044,6 +1057,7 @@ float *iris_sample_heun(void *transformer,
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
 
+        iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
         /* First velocity estimate */
         float *v1 = iris_transformer_forward(tf, z_curr, h, w,
                                              text_emb, text_seq, t_curr);

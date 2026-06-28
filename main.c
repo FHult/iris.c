@@ -1041,6 +1041,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --ip DIR          Load IP-Adapter bundle (export_adapter.py output)\n");
     fprintf(stderr, "      --ip-features F   Precomputed SigLIP features (raw f32 [n,siglip_dim]); required with --ip\n");
     fprintf(stderr, "      --ip-scale N      IP-Adapter strength multiplier (default: 1.0)\n");
+    fprintf(stderr, "      --ip-schedule S   IP-Adapter injection schedule: none|late:F|early:F (default: none)\n");
     fprintf(stderr, "      --img2img-strength N  Noise injection strength for img2img (0.0-1.0, default: 1.0=in-context)\n");
     fprintf(stderr, "  -N, --negative TEXT   Negative prompt (base models: CFG; distilled: soft guidance at 1.5)\n");
     fprintf(stderr, "      --vary-from PATH  Base image to vary (noise-injection img2img)\n");
@@ -1108,6 +1109,7 @@ int main(int argc, char *argv[]) {
         {"ip",               required_argument, 0, 269},
         {"ip-features",      required_argument, 0, 270},
         {"ip-scale",         required_argument, 0, 271},
+        {"ip-schedule",      required_argument, 0, 272},
         {"img2img-strength", required_argument, 0, 262},
         {"negative",         required_argument, 0, 'N'},
         {"sref",             required_argument, 0, 263},
@@ -1154,6 +1156,7 @@ int main(int argc, char *argv[]) {
     char *ip_bundle = NULL;       /* --ip: IP-Adapter bundle dir (G-1) */
     char *ip_features = NULL;     /* --ip-features: raw f32 SigLIP features file */
     float ip_scale = 1.0f;        /* --ip-scale: multiplier on trained ip_scale */
+    char *ip_schedule = NULL;     /* --ip-schedule: none|late:F|early:F (DP-7) */
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -1201,6 +1204,7 @@ int main(int argc, char *argv[]) {
             case 269: ip_bundle = optarg; break;
             case 270: ip_features = optarg; break;
             case 271: ip_scale = (float)atof(optarg); break;
+            case 272: ip_schedule = optarg; break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
             case 'N': params.negative_prompt = optarg; break;
             case 263:
@@ -1376,6 +1380,11 @@ int main(int argc, char *argv[]) {
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
         if (iris_load_ip_adapter(ctx, ip_bundle, ip_features, ip_scale) != 0) {
             fprintf(stderr, "\nError: failed to load IP-Adapter from %s\n", ip_bundle);
+            iris_free(ctx);
+            return 1;
+        }
+        if (ip_schedule && iris_set_ip_schedule(ctx, ip_schedule) != 0) {
+            fprintf(stderr, "\nError: invalid --ip-schedule '%s'\n", ip_schedule);
             iris_free(ctx);
             return 1;
         }
