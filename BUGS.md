@@ -341,6 +341,21 @@
   vs one-shot@576): at 576px same bundle/features — ONE-SHOT = coherent, DAEMON-attach = PURE BLACK
   (all-zero) output; attach log says "IP-Adapter: attached" but the forward is corrupted. So the daemon
   attach genuinely breaks generation. (At 256px both produce noise — see SREF-LOWRES below.)
+  PRECISE LOCALIZATION (2026-06-28, env-gated diagnostics, since removed): the corruption is in the
+  PER-BLOCK transformer path that an attached adapter forces — NOT in perceive (ip_embeds byte-identical
+  to one-shot, no NaN) and NOT in the inject math. With the adapter attached but ip_inject_block made a
+  no-op, the daemon gen is CLEAN — so the trigger is the inject running. Per-block trace of the image-Q
+  (tf->ip_q_scratch) at step 1, daemon@576 vs one-shot@576: IDENTICAL for blocks 0–12, then at BLOCK 13
+  the daemon's image-Q rows are ALL ZERO (|q|=0.00, while k_ip is still fine) and stay zero for blocks
+  13–24. A zero block-Q also breaks that block's own self-attention → propagates → black. So a block's
+  fused-QKV GPU projection returns ZERO for the image rows at ~block 13 in the WARM daemon only. RULED
+  OUT: LRU cache eviction (bumping MAX_LINEAR_GRAPH_CACHE 64→256 + WEIGHT/BF16 caches 512/1024→2048 did
+  NOT change it). Suspected: a warm-daemon GPU-state / GEMM-row (M-dim) / graph-reuse interaction
+  specific to running iris_metal_sgemm (IP get_kv) interleaved with the bf16-native per-block projections
+  after the fused-path warmup. NEXT: instrument the single-block fused-QKV GEMM output rows per block
+  (which block's projection first returns zero image rows), and/or run under a heap/UB checker that works
+  with the large model (libgmalloc rejects the multi-GB allocs). The one-shot path (fresh process) does
+  the identical compute correctly, so it is layout/warm-state dependent (heisenbug).
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
