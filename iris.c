@@ -585,6 +585,11 @@ int iris_set_ip_schedule(iris_ctx *ctx, const char *spec) {
     return iris_transformer_set_ip_schedule(ctx->transformer, spec);
 }
 
+void iris_unload_ip_adapter(iris_ctx *ctx) {
+    if (!ctx || !ctx->transformer) return;
+    iris_transformer_set_ip_adapter(ctx->transformer, NULL, NULL);  /* frees adapter, clears tf->ip */
+}
+
 /* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.
  * The encoder and transformer can't coexist in memory on most machines,
  * so this is called after text encoding and before denoising. On Metal,

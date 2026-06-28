@@ -497,6 +497,12 @@ typedef struct {
     float   power_alpha;
     char   *lora_path;
     float   lora_scale;
+    /* sref: IP-Adapter attached per-request so the resident model isn't reloaded
+     * (BACKLOG SREF-3 A). NULL ip_features = no adapter for this job. */
+    char   *ip_bundle;
+    char   *ip_features;
+    float   ip_scale;
+    char   *ip_schedule;
 } server_job_t;
 
 /* ---- Queue state (protected by queue_mutex) ---- */
@@ -527,6 +533,9 @@ static void server_free_job(server_job_t *job) {
     free(job->input_path);
     free(job->negative_prompt);
     free(job->lora_path);
+    free(job->ip_bundle);
+    free(job->ip_features);
+    free(job->ip_schedule);
     for (int i = 0; i < job->num_refs; i++) free(job->ref_paths[i]);
     free(job);
 }
@@ -783,7 +792,27 @@ static void *server_worker(void *arg) {
         iris_cancel_requested = 0;
         pthread_mutex_unlock(&queue_mutex);
 
-        server_run_job(ctx, job);
+        /* sref: attach the IP-Adapter to the resident model for this job only, so the
+         * model isn't reloaded (SREF-3 A). Per-request attach/detach keeps the GPU
+         * fast-path for normal jobs (tf->ip set disables it). */
+        int want_ip = (job->ip_features && job->ip_bundle);
+        int ip_ok = 0;
+        if (want_ip) {
+            if (iris_load_ip_adapter(ctx, job->ip_bundle, job->ip_features, job->ip_scale) == 0) {
+                ip_ok = 1;
+                if (job->ip_schedule) iris_set_ip_schedule(ctx, job->ip_schedule);
+            } else {
+                pthread_mutex_lock(&stdout_mutex);
+                printf("{\"event\":\"error\",\"job_id\":\"%s\","
+                       "\"message\":\"Failed to load IP-Adapter\"}\n", job->job_id);
+                fflush(stdout);
+                pthread_mutex_unlock(&stdout_mutex);
+            }
+        }
+        if (!want_ip || ip_ok)
+            server_run_job(ctx, job);
+        if (ip_ok)
+            iris_unload_ip_adapter(ctx);
         server_free_job(job);
 
         pthread_mutex_lock(&queue_mutex);
@@ -882,6 +911,10 @@ static int run_server_mode(iris_ctx *ctx) {
         char *schedule       = json_get_string(line, "schedule");
         char *req_lora       = json_get_string(line, "lora");
         float req_lora_scale = json_get_float(line, "lora_scale", 1.0f);
+        char *ip_bundle      = json_get_string(line, "ip_bundle");
+        char *ip_features    = json_get_string(line, "ip_features");
+        float ip_scale       = json_get_float(line, "ip_scale", 1.0f);
+        char *ip_schedule    = json_get_string(line, "ip_schedule");
 
 /* Helper: emit an error JSON line (no job_id yet) and free parsed strings */
 #define EARLY_ERROR(msg) do { \
@@ -891,6 +924,7 @@ static int run_server_mode(iris_ctx *ctx) {
     pthread_mutex_unlock(&stdout_mutex); \
     free(prompt); free(output_path); free(input_path); \
     free(neg_prompt); free(schedule); free(req_lora); \
+    free(ip_bundle); free(ip_features); free(ip_schedule); \
     for (int _i = 0; _i < num_refs; _i++) free(ref_paths[_i]); \
     continue; \
 } while(0)
@@ -908,13 +942,16 @@ static int run_server_mode(iris_ctx *ctx) {
             pthread_mutex_unlock(&stdout_mutex);
             free(prompt); free(output_path); free(input_path);
             free(neg_prompt); free(schedule); free(req_lora);
+            free(ip_bundle); free(ip_features); free(ip_schedule);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
         {
             int unsafe = !path_is_safe(output_path) ||
-                         (input_path && !path_is_safe(input_path)) ||
-                         (req_lora    && !path_is_safe(req_lora));
+                         (input_path  && !path_is_safe(input_path)) ||
+                         (req_lora    && !path_is_safe(req_lora)) ||
+                         (ip_bundle   && !path_is_safe(ip_bundle)) ||
+                         (ip_features && !path_is_safe(ip_features));
             for (int i = 0; i < num_refs && !unsafe; i++)
                 if (!path_is_safe(ref_paths[i])) unsafe = 1;
             if (unsafe) EARLY_ERROR("Unsafe file path");
@@ -932,6 +969,7 @@ static int run_server_mode(iris_ctx *ctx) {
             pthread_mutex_unlock(&stdout_mutex);
             free(prompt); free(output_path); free(input_path);
             free(neg_prompt); free(schedule); free(req_lora);
+            free(ip_bundle); free(ip_features); free(ip_schedule);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -946,6 +984,7 @@ static int run_server_mode(iris_ctx *ctx) {
             pthread_mutex_unlock(&stdout_mutex);
             free(prompt); free(output_path); free(input_path);
             free(neg_prompt); free(schedule); free(req_lora);
+            free(ip_bundle); free(ip_features); free(ip_schedule);
             for (int i = 0; i < num_refs; i++) free(ref_paths[i]);
             continue;
         }
@@ -966,6 +1005,10 @@ static int run_server_mode(iris_ctx *ctx) {
         job->negative_prompt = neg_prompt;
         job->lora_path       = req_lora;
         job->lora_scale      = req_lora_scale;
+        job->ip_bundle       = ip_bundle;
+        job->ip_features     = ip_features;
+        job->ip_scale        = ip_scale;
+        job->ip_schedule     = ip_schedule;
         job->power_alpha     = 2.0f; /* default; overridden below if power schedule */
 
         if (schedule) {

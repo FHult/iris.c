@@ -181,6 +181,13 @@ int iris_load_ip_adapter(iris_ctx *ctx, const char *bundle_dir,
 int iris_set_ip_schedule(iris_ctx *ctx, const char *spec);
 
 /*
+ * Detach and free the IP-Adapter attached by iris_load_ip_adapter, restoring the
+ * normal (GPU fast-path) generation path. Safe to call when none is attached.
+ * Used by server mode to attach an adapter per-request without reloading the model.
+ */
+void iris_unload_ip_adapter(iris_ctx *ctx);
+
+/*
  * Check if model is Z-Image (S3-DiT architecture).
  * Returns 1 for Z-Image, 0 for Flux.
  */
