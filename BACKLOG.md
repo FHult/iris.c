@@ -2519,6 +2519,40 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     all speculative RETRAINING: CSD-dominant conditioning, AdaIN/stats injection, or 9B base.
     SHIP: Tier-0 --sref-strength at champion 0.38–0.39, NO schedule (schedule adds a knob with no
     ratio benefit; could expose late:0.5 as an optional "max-content-safety" mode — secondary).
+    SHIPPED 2026-06-28 (commit 97e8c66): web/server.py dispatches hybrid feature production
+    (hybrid_features.py, CSD row) when the bundle is cond_mode=hybrid; --sref-strength default 0.38
+    (server fallback + frontend style-mode slider; override IRIS_SREF_STRENGTH). Deploy:
+    IRIS_IP_BUNDLE=/Volumes/2TBSSD/sref_eval/clean_concentrate_leak/bundle. 125 web tests green.
+
+  - **SREF-BASE-1 (BACKLOG, 2026-06-28): re-run the injection-SCHEDULE + lever sweeps on the 50-step
+    BASE model (flux-klein-4b-base --base) — the ONE untested angle that could beat the ~0.70 ceiling.**
+    WHY: the DP-7 timing verdict (ceiling mechanism-bound) was measured on the DISTILLED 4-step model,
+    which gives a schedule only ≤4 grid points and NO clean content(early)/texture(late) temporal
+    separation. A 50-step base model gives the schedule 50 grid points (late:0.5 = inject last 25
+    steps) and a real early-structure/late-texture split — the regime where "let content form first,
+    inject style late" can actually work. This is the last cheap-ish shot at >0.70 before the expensive
+    speculative retrains (CSD-dominant / AdaIN / 9B).
+    MEMORY (measured 2026-06-28, M1 Max, 256x256, /usr/bin/time phys_footprint): base ≡ distilled —
+    noIP 12.55G vs 12.73G; +IP(champion) 19.38G vs 19.37G. IDENTICAL footprint (same 4B arch, both 15G
+    on disk). Step count & CFG do NOT change peak memory (per-step buffer reuse; CFG forwards are
+    sequential). IP-adapter adds ~6.7G (weights + CPU-block f32 buffers — GPU fast paths are disabled
+    when tf->ip set). So MEMORY IS NOT A BLOCKER for the base experiment at ≤512px; the cost is TIME
+    (~25x forwards: 50 steps x2 CFG vs 4 steps) AND the IP path forces CPU blocks (~4x slower) → base+IP
+    generation is ~slow; budget eval time accordingly. Caveat: at >512px the +IP footprint (~19.4G@256)
+    grows toward the ~21.5G system ceiling — check headroom before high-res.
+    RUNNABLE NOW (no new code — --ip-schedule is wired into all CFG euler variants, commit bdfd7ff):
+      iris -d flux-klein-4b-base --base --ip <champion> --ip-features <hybrid> --ip-scale S \
+           --ip-schedule late:F --steps 50 -p PROMPT
+    Then content-gated sweep (sref_sweep_eval --ip-schedule, commit 1c19802) over (S, F) — find if any
+    base-model schedule clears the gate with ratio >0.696.
+    CAVEATS to resolve first: (1) the champion adapter was TRAINED against the DISTILLED transformer's
+    attention; using it on the BASE transformer is an unproven weight-transfer — it attaches (same
+    25-block/3072-dim structure) but quality transfer is unknown. May need a base-trained adapter, or
+    first measure how the distilled adapter behaves on base. (2) CFG×IP interaction: inject currently
+    applies to BOTH uncond and cond passes — verify that's intended (image conditioning is arguably
+    CFG-independent, but confirm vs training). (3) re-derive the base model's own no-adapter null +
+    champion scale (the 0.39 champion scale is distilled-specific; base will have a different sweet
+    spot). Gates DP-8: only if base-model timing/levers beat ~0.70 does the data mega-run reopen.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
