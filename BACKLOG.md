@@ -2494,6 +2494,32 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     exceed the inter-scale signal — bump to multiple seeds / more pairs at the micro stage so a 0.01
     difference is statistically real, not jitter.
 
+  - **SREF DP-7 INJECTION-SCHEDULE VERDICT (2026-06-28): timing does NOT beat the ~0.70 ceiling →
+    ceiling is MECHANISM-BOUND (3 independent levers now converge there).** Implemented --ip-schedule
+    (none|late:F|early:F) in C (commit bdfd7ff, golden parity 20/20, inert verified) + harness
+    passthrough (1c19802). The schedule gates ip_scale by denoising-step fraction so style injects only
+    in late (low-noise) steps, letting content form first. Content-gated sweep of the champion
+    (clean_concentrate_leak, distilled 4-step) across late:0.5 full grid:
+      late:0.5: 0.36 r0.452/ret0.962 · 0.39 r0.540/ret0.931 · 0.42 r0.615/ret0.883 · 0.44 r0.653/
+                ret0.831 · 0.46 r0.678/ret0.796 · 0.50 ret0.702 WASH · 0.7/0.9 WASH
+      BEST content-preserving: ratio 0.678 @0.46 (Δstyle 0.131, retain 0.796).
+    CONTROL @0.39 (schedule on vs off): late:0.5 Δstyle0.094/r0.540/ret0.931 vs no-sched
+    Δstyle0.127/r0.696/ret0.768 — at fixed scale the schedule TRADES style for content (less style,
+    more retain, lower ratio). The schedule DOES work mechanically (at scale 0.5 it lifts retain
+    0.040→0.702 vs no-schedule — content protection is real), but its content-preserving PEAK (0.678)
+    is TIED-marginally-below the no-schedule champion (0.696). So timing shifts the operating point and
+    adds content headroom, but does NOT raise the achievable frontier. late:0.25 protects less (more
+    inject steps); more-aggressive gating just trades along the same ~0.70 frontier.
+    THREE INDEPENDENT LEVERS now converge on ~0.70: data concentration, leak objective, injection
+    timing → the ceiling is MECHANISM-bound (entangled SigLIP-dominant repr + KV cross-attn injection),
+    NOT data/objective/timing-addressable. DP-8 GATE FAILS → the mega data run is NOT justified (more
+    data can't break a mechanism ceiling). CAVEAT: verdict is on the 4-step DISTILLED model (≤4 schedule
+    grid points, no clean content/texture temporal split); a 50-step BASE model has more room and is the
+    one untested angle for timing — separate, more expensive (CFG) experiment. Remaining >0.70 shots are
+    all speculative RETRAINING: CSD-dominant conditioning, AdaIN/stats injection, or 9B base.
+    SHIP: Tier-0 --sref-strength at champion 0.38–0.39, NO schedule (schedule adds a knob with no
+    ratio benefit; could expose late:0.5 as an optional "max-content-safety" mode — secondary).
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
