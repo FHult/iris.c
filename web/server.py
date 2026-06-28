@@ -1101,8 +1101,16 @@ def compute_sref_features(image_bytes: bytes) -> Path:
     # Champion is hybrid → features must carry the CSD row (hybrid_features.py); siglip-only
     # bundles use siglip_features.py. Dispatch on the configured bundle's cond_mode.
     script = HYBRID_FEATURES_SCRIPT if SREF_COND_MODE == "hybrid" else SIGLIP_FEATURES_SCRIPT
-    tmp_img = SREF_DIR / f"{sha}_src.png"
-    tmp_img.write_bytes(image_bytes)
+    # The feature producers decode via TurboJPEG (matching the JPEG shard data the encoder
+    # trained on), so they require JPEG input. Web uploads arrive as PNG/WebP/etc — re-encode
+    # to RGB JPEG here. (Also keeps inference consistent with the JPEG-trained encoder.)
+    tmp_img = SREF_DIR / f"{sha}_src.jpg"
+    try:
+        from PIL import Image
+        import io as _io
+        Image.open(_io.BytesIO(image_bytes)).convert("RGB").save(tmp_img, "JPEG", quality=95)
+    except Exception as e:
+        raise RuntimeError(f"could not decode style reference image: {e}")
     try:
         proc = subprocess.run(
             [str(TRAIN_VENV_PY), str(script), str(tmp_img), "--out", str(out)],

@@ -1746,10 +1746,41 @@ class TestSrefCompletion:
             return R()
         monkeypatch.setattr(srv.subprocess, "run", fake_run)
 
+        from PIL import Image
+        import io as _io
+        def _png(color):  # distinct valid images → distinct sha (avoid the content cache)
+            b = _io.BytesIO(); Image.new("RGB", (8, 8), color).save(b, "PNG")
+            return b.getvalue()
+
         monkeypatch.setattr(srv, "SREF_COND_MODE", "hybrid")
-        srv.compute_sref_features(b"img-bytes-hybrid")
+        srv.compute_sref_features(_png((10, 20, 30)))
         assert seen["script"] == str(srv.HYBRID_FEATURES_SCRIPT)
 
         monkeypatch.setattr(srv, "SREF_COND_MODE", "siglip")
-        srv.compute_sref_features(b"img-bytes-siglip")
+        srv.compute_sref_features(_png((40, 50, 60)))
         assert seen["script"] == str(srv.SIGLIP_FEATURES_SCRIPT)
+
+    def test_non_jpeg_upload_reencoded_to_jpeg(self, tmp_path, monkeypatch):
+        """Web uploads (PNG/WebP) must reach the JPEG-only feature encoders as JPEG
+        (regression: TurboJPEG rejected PNG with 'Not a JPEG file: 0x89 0x50')."""
+        import server as srv, base64 as _b64
+        sref = tmp_path / "sref"; sref.mkdir()
+        monkeypatch.setattr(srv, "SREF_DIR", sref)
+        monkeypatch.setattr(srv, "SREF_COND_MODE", "siglip")
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            img = cmd[2]
+            seen["img"] = img
+            seen["magic"] = open(img, "rb").read(2)
+            Path(cmd[cmd.index("--out") + 1]).write_bytes(b"\0" * 16)
+            class R:  # noqa: E306
+                returncode = 0
+                stderr = ""
+            return R()
+        monkeypatch.setattr(srv.subprocess, "run", fake_run)
+
+        png_bytes = _b64.b64decode(self._PNG.split(",")[1])   # a real PNG (0x89 0x50)
+        srv.compute_sref_features(png_bytes)
+        assert seen["img"].endswith(".jpg")
+        assert seen["magic"] == b"\xff\xd8"                    # JPEG SOI, not PNG
