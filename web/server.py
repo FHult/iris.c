@@ -1187,15 +1187,24 @@ def resolve_style_code(code: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+# iris CLI stderr markers: "  Step N/M " (cli_step_callback) and "<Phase>..." (cli_phase_callback).
+_SREF_STEP_RE = re.compile(r"Step\s+(\d+)\s*/\s*(\d+)")
+_SREF_TIMEOUT_S = 1800
+
+
 def run_generation_sref(job, prompt, width, height, steps, seed,
                         features_path, ip_scale, guidance=None, ip_schedule=None):
-    """One-shot `iris --ip` run for a style-reference generation (SREF-3 v1).
+    """One-shot `iris --ip` run for a style-reference generation.
 
-    The persistent server loads --ip at startup only, so style generations use
-    a dedicated process. Slower (model load per image) and memory-additive to
-    the resident server — acceptable v1; the latency track (bf16 inject, G-1
-    Phase 3, per-request features in server mode) is in BACKLOG SREF-3."""
+    The persistent server loads --ip at startup only, so style generations use a
+    dedicated process — slower (model load per image, and the adapter forces the
+    CPU block path; GPU-native inject is BACKLOG SREF-3). To keep the UI from
+    looking stalled during those minutes, iris's per-step / phase stderr is parsed
+    and streamed as the same progress/status events the resident path emits."""
     job.status = "running"
+    job.total_steps = steps
+    job.phase = "Loading model"
+    job.put_event(("status", job.to_dict()))   # show activity before step 1 (model load)
     out_path = OUTPUT_DIR / f"{job.id}.png"
     cmd = [str(iris_server.iris_binary), "-d", str(iris_server.model_dir),
            "-p", prompt, "-o", str(out_path),
@@ -1210,11 +1219,45 @@ def run_generation_sref(job, prompt, width, height, steps, seed,
         cmd += ["--guidance", str(guidance)]
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              cwd=str(PROJECT_DIR), timeout=1800)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                bufsize=1, cwd=str(PROJECT_DIR))
+        # Stream stderr char-by-char (iris flushes per substep; lines are \r/\n
+        # terminated, but a phase start "X..." has no newline until it finishes —
+        # detect the "..." in the pending buffer for a live phase update).
+        tail, pending, last_phase = [], "", None
+        while True:
+            ch = proc.stderr.read(1)
+            if ch == "":
+                break
+            if ch in "\r\n":
+                line = pending.strip()
+                pending = ""
+                if line:
+                    tail.append(line)
+                    if len(tail) > 30:
+                        tail.pop(0)
+                    m = _SREF_STEP_RE.search(line)
+                    if m:
+                        job.progress, job.total_steps = int(m.group(1)), int(m.group(2))
+                        job.phase = "Denoising"
+                        d = job.to_dict()
+                        d["elapsed"] = time.time() - t0
+                        job.put_event(("progress", d))
+                if time.time() - t0 > _SREF_TIMEOUT_S:
+                    proc.kill()
+                    raise RuntimeError(f"iris timed out ({_SREF_TIMEOUT_S}s)")
+                continue
+            pending += ch
+            if pending.endswith("...") and "Step" not in pending:
+                ph = pending.strip()[:-3].strip()
+                if ph and ph != last_phase:
+                    last_phase = ph
+                    job.phase = ph
+                    job.put_event(("status", job.to_dict()))
+        proc.wait()
         if proc.returncode != 0 or not out_path.exists():
-            raise RuntimeError(
-                (proc.stderr or "").strip()[-400:] or f"iris exited {proc.returncode}")
+            raise RuntimeError("\n".join(tail[-6:]) or f"iris exited {proc.returncode}")
         job.status = "complete"
         job.output_path = out_path
         job.progress = job.total_steps

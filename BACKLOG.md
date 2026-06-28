@@ -2590,8 +2590,26 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     • SREF-CLI-IMG (= G-1 Phase 3): `--sref <image>` in the C binary needs a C-native SigLIP+CSD encoder
       (today features are produced by Python: siglip_features.py / hybrid_features.py). Until then, CLI
       style-ref requires precomputed `--ip-features`; the web does image→features via the Python sidecar.
-    • SREF-3 latency: per-request feature compute inside the resident server + bf16/MPS-native inject
-      (the adapter currently forces CPU blocks, ~4x slower; one-shot subprocess per style gen).
+    • SREF-3 latency (TWO independent costs — confirmed 2026-06-28 by source read):
+      (A) DAEMON BYPASS / model reload per gen (~30-60s, the TRACTABLE one): sref gens do NOT use the
+          resident daemon (iris --server, which keeps the base model loaded). server mode parses no
+          ip_* fields (run_server_mode main.c:797; fields main.c:868-869), and the daemon is launched
+          without --ip — so the IP-adapter only exists on the one-shot CLI path (iris_load_ip_adapter
+          main.c:1356). run_generation_sref therefore spawns a fresh `iris --ip` per style gen that
+          reloads Qwen3+transformer+VAE every time. FIX: add ip_features/ip_scale/ip_schedule to the
+          server-mode JSON request + attach the bundle to the resident model PER-REQUEST (load bundle
+          weights once/lazily; attach tf->ip for sref requests, detach after) and route sref through
+          IrisServer.generate. CAUTION: attaching tf->ip disables GPU fast-paths (the !tf->ip guards),
+          so it MUST be per-request attach/detach, not load-at-startup (else normal gens go CPU too).
+      (B) CPU BLOCK PATH (~4x denoising): any attached adapter forces CPU blocks (bf16/MPS-native
+          inject not implemented). Bigger engine work (GPU-native to_k_ip/to_v_ip + SDPA inject).
+      Doing (A) alone removes the per-gen model reload (the dominant fixed cost) even though (B) keeps
+      denoising on CPU. Also: per-request feature compute inside the resident server (today a Python
+      subprocess per new image; cached by sha after).
+    DONE (2026-06-28): UI no longer LOOKS stalled during sref gens — run_generation_sref streams iris's
+      per-step (`Step N/M`) + phase stderr as progress/status job events (was buffered subprocess.run
+      with no progress); initial "Loading model" phase covers the pre-step reload. (Cosmetic; (A)/(B)
+      are the actual speedups.)
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
