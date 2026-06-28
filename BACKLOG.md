@@ -2519,3 +2519,26 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     compounds at rung-2) at 0.01 increments around the crossing (~0.36–0.40) with MULTIPLE SEEDS to
     MEASURE the peak (vs interpolated 0.62) + pin shippable --sref-strength. Then DP-7 mechanism work
     is the likely next major direction (per KEY 3). All frontier.json now carry the full fine grids.
+
+  - **SREF CHAMPION PINNED (2026-06-28): clean_concentrate_leak, true content-preserving frontier
+    MEASURES ~0.70 @ scale 0.39 — even better than the interpolated 0.62, and the 0.543 "plateau" is
+    now definitively dead.** Micro-sweep (0.01 steps 0.36–0.40, 3 seeds 42/123/7, n=30/scale — clean
+    MONOTONIC curve, so it's signal not noise):
+      scale  Δstyle  ratio  retain  gate
+      0.36   0.096   0.604  0.904   OK
+      0.37   0.106   0.633  0.873   OK
+      0.38   0.116   0.666  0.827   OK
+      0.39   0.127   0.696  0.768   OK (gate edge; crossing ~0.393)
+      0.40   0.137   0.721  0.690   WASH
+    CHAMPION operating point: ratio 0.696 @ 0.39 (Δstyle 0.127, retain 0.768) = best content-preserving
+    point of the entire campaign. SHIP default --sref-strength ≈ 0.38 (ratio 0.666, retain 0.827 —
+    margin for per-image variance); 0.39 = aggressive edge; users can push past with the knob.
+    The measured peak (0.70) > interpolated (0.62) → interpolation under-estimated; clean_leak's true
+    measured peak is likely also >0.62 (not micro-swept — would only matter to claim stacked>leak, but
+    we ship the stacked arm regardless since the data benefit compounds at rung-2). This is still a
+    MEASUREMENT CORRECTION (right scale), NOT a new mechanism — ~0.70 is the recipe's ceiling.
+    frontier.json for clean_concentrate_leak now holds the micro grid (0.36–0.40); the fine grid
+    (0.3–0.7) is preserved in the FINE-SWEEP entry above. Gens at clean_concentrate_leak/gens (3 seeds).
+    NEXT: (a) ship Tier-0 knob at 0.38; (b) DP-7 mechanism test — injection-SCHEDULE sweep (inject
+    style only in late denoising steps) to see if ~0.70 can be pushed further; if it can't, ~0.70 is
+    the mechanism ceiling and the hybrid platform at 0.38 is the deliverable.
