@@ -2567,6 +2567,32 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     is an expensive speculative retrain. The 5-min transfer check (run BEFORE any base sweep) saved
     hours of garbage base schedule sweeps — keep this gate for any "use adapter X on model Y" idea.
 
+  - **SREF FEATURE COMPLETION (2026-06-28): productionized the shipped single-reference adapter
+    across engine/web/UI + added the missing test coverage.** DONE:
+    • Web: `--ip-schedule` now forwarded end-to-end — `run_generation_sref(..., ip_schedule)` adds the
+      flag; `/generate` reads `ip_schedule`, validates via `normalize_ip_schedule()` (mirrors the C
+      parser; 400 on malformed), returns it; UI "Style timing" selector (Constant/Late/Early) under
+      Advanced options. (Schedule doesn't raise the ceiling — DP-7 — but is a real content-headroom knob.)
+    • Web: single-reference is explicit, not silent — `/generate` with >1 style slot uses the first and
+      returns a `warning`; the UI surfaces it. (The trained adapter is single-ref; fusion is deferred.)
+    • Engine: removed the DEAD `--sref`/`--sref-scale` flags + the "v2.6 not implemented" runtime block +
+      the `iris_params.sref_*` fields + `IRIS_PARAMS_DEFAULT` trailing values (positional-macro hazard —
+      caught the excess-initializer warnings). CLI style-ref path is `--ip`/`--ip-features`; help points
+      there. The literal `--sref` flag was an abandoned design distinct from the shipped IP-adapter.
+    • Tests: web `TestSrefCompletion` (8) — schedule validator accept/reject, schedule passthrough,
+      bad-schedule 400, none-default, 0.38 default strength, multi-style warning, hybrid-vs-siglip
+      feature dispatch by cond_mode. C `test_schedule()` in debug/test_ip_adapter.c (17 checks) — set_
+      schedule parse + set_step per-step multiplier (late/early/none, edges, bad-spec inert, 1-step
+      div-guard). make test green (28 unit + 125 web + 7 smokes); test_ip_adapter 37/0.
+    DEFERRED (out of "use the existing adapter" scope → new feature / big engine work):
+    • SREF-MULTIREF: true multi-reference style FUSION (perceiver/feature concat for N refs). Today N>1
+      uses the first + warns. Needs perceiver redesign + a retrained multi-ref adapter.
+    • SREF-CLI-IMG (= G-1 Phase 3): `--sref <image>` in the C binary needs a C-native SigLIP+CSD encoder
+      (today features are produced by Python: siglip_features.py / hybrid_features.py). Until then, CLI
+      style-ref requires precomputed `--ip-features`; the web does image→features via the Python sidecar.
+    • SREF-3 latency: per-request feature compute inside the resident server + bf16/MPS-native inject
+      (the adapter currently forces CPU blocks, ~4x slower; one-shot subprocess per style gen).
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
