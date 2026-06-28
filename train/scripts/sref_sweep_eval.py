@@ -49,7 +49,7 @@ def _iris_bin() -> str:
 
 
 def generate(spec: dict, bundle: str, scales: list[float], seeds: list[int],
-             out_dir: Path, log_dir: Path) -> list[dict]:
+             out_dir: Path, log_dir: Path, ip_schedule: str | None = None) -> list[dict]:
     """Generate every (pair × scale × seed) gen, skipping existing files.
     Returns the flat pair list for sref_eval (each carries ref/gen/prompt/scale)."""
     refs_dir = Path(spec["refs_dir"])
@@ -103,6 +103,8 @@ def generate(spec: dict, bundle: str, scales: list[float], seeds: list[int],
                         "-W", str(W), "-H", str(H),
                         "-o", str(gen),
                     ]
+                    if ip_schedule:
+                        cmd += ["--ip-schedule", ip_schedule]
                     lf = log_dir / f"{stem}.log"
                     with open(lf, "w") as fh:
                         r = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT)
@@ -161,6 +163,9 @@ def main() -> int:
                     help="content gate: a scale counts as a real win only if its prompt-adherence "
                          "is >= this fraction of the no-adapter null's (content preserved, not washed). "
                          "Default 0.75. inj_ratio at washed scales is a metric-gaming artifact.")
+    ap.add_argument("--ip-schedule", default=None,
+                    help="DP-7 injection schedule passed to iris (none|late:F|early:F). "
+                         "Use a distinct --name per schedule so gens don't collide.")
     args = ap.parse_args()
 
     spec = json.loads(Path(args.eval_set).read_text())
@@ -170,7 +175,7 @@ def main() -> int:
     run_dir = Path(args.out_root) / args.name
     gens = run_dir / "gens"
     logs = run_dir / "logs"
-    pairs = generate(spec, args.bundle, scales, seeds, gens, logs)
+    pairs = generate(spec, args.bundle, scales, seeds, gens, logs, args.ip_schedule)
     if not pairs:
         print("no pairs generated", file=sys.stderr)
         return 1
