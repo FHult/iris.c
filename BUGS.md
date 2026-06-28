@@ -313,3 +313,28 @@
 - **ANOMALY-1: Shard-boundary stalls** — Two blocking stalls observed at step ~19,900 (55 min) and ~24,900 (2.6h). Root cause: epoch boundary + simultaneous JDB chunk 2 conversion competing for 2TBSSD I/O. Data% jumps to 100% in timing log. Both resolved automatically. Structural until pixel data is pre-cached to disk. See BACKLOG PIPELINE-3.
 
 - **ANOMALY-2: Optimizer step spikes** — Isolated step-time spikes at steps 19,300 (2.4s vs normal 0.1s) and 25,900 (3.5s). Likely: gradient norm exceeded clip threshold (1.0) triggering full-parameter norm computation, or MLX lazy evaluator GC. No functional impact.
+
+## Inference / Server Anomalies
+
+- **SREF-DAEMON-1 (2026-06-28): per-request IP-Adapter attach in `iris --server` produces CORRUPT
+  (pure-noise) output on a warm daemon.** The SREF-3-A path (server-mode `ip_bundle`/`ip_features`/
+  `ip_scale` → `iris_load_ip_adapter` in `server_worker` → generate → `iris_unload_ip_adapter`) loads
+  the model once and avoids the per-gen reload (verified timings: sref#1 98s cold, sref#2 42s warm). BUT
+  the image is NOISE — the denoise never converges, i.e. the transformer forward is corrupted while the
+  adapter is attached in the daemon. ISOLATION (same bundle/features/model throughout):
+  • daemon, NO adapter (normal gen): CORRECT (clean fox).
+  • daemon + per-request attach (sref): NOISE — even on the FIRST request (so NOT pointer-reuse cache
+    aliasing).
+  • one-shot `iris --ip` (adapter attached at startup, before warmup/any gen): CORRECT (clean styled).
+  ⇒ Bug is specific to attaching the adapter AFTER the model is loaded + bf16-warmed (and/or attaching
+  on the worker thread). Hypotheses to check: (a) `flux_metal_warmup_bf16` primes fused-bf16 GPU
+  graphs/caches that the per-block path (taken when tf->ip set) then misuses — the one-shot may skip
+  warmup since tf->ip is set first; (b) `iris_ip_adapter_perceive`/`get_kv` GPU matmuls hit a warm
+  static-weight GPU cache and get a wrong/stale buffer (cf. the historical MPS B-cache bug + the
+  VAE-K/V-temporaries audit note in MEMORY); (c) worker-thread GPU context/autorelease state at attach.
+  IMPACT: SREF-3-A (daemon model-reuse for sref) is BLOCKED. WORKAROUND IN PLACE: web/server.py routes
+  sref through the working one-shot `run_generation_sref` (correct, but reloads the model per gen). The
+  C server-mode IP support (commit 3872f90) stays as the foundation. `make test` is green — the
+  server-mode smoke does NOT check sref image correctness, so it missed this; ADD a golden-pixel sref
+  check to the server smoke to catch this class. Repro: drive `iris -d flux-klein-model --server` with a
+  request carrying `ip_bundle`+`ip_features`, view output → noise; same bundle one-shot → correct.

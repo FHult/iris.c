@@ -934,6 +934,15 @@ class IrisServer:
             if negative_prompt:
                 request_data["negative_prompt"] = negative_prompt
 
+            # sref: per-request IP-Adapter, attached to the resident model just for this
+            # job (no model reload — SREF-3 A). Params ride on the job from /generate.
+            if getattr(job, "ip_features", None) and getattr(job, "ip_bundle", None):
+                request_data["ip_bundle"] = str(job.ip_bundle)
+                request_data["ip_features"] = str(job.ip_features)
+                request_data["ip_scale"] = float(getattr(job, "ip_scale", 1.0))
+                if getattr(job, "ip_schedule", None):
+                    request_data["ip_schedule"] = job.ip_schedule
+
             # Send request
             request_line = json.dumps(request_data) + "\n"
             try:
@@ -1394,6 +1403,10 @@ def generate():
         job.style = style if (style and style in STYLE_PRESETS) else None
         with jobs_lock:
             jobs[job_id] = job
+        # NOTE: routing sref through the resident daemon (per-request adapter attach,
+        # SREF-3 A) is implemented in the C server but currently produces CORRUPT output
+        # on a warm daemon (BUGS.md SREF-DAEMON-1) — so we use the working one-shot path
+        # (reloads the model per gen, but correct). Switch back once the daemon bug is fixed.
         threading.Thread(
             target=run_generation_sref,
             args=(job, generation_prompt, width, height, steps, seed,

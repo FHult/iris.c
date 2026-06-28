@@ -2601,15 +2601,31 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
           weights once/lazily; attach tf->ip for sref requests, detach after) and route sref through
           IrisServer.generate. CAUTION: attaching tf->ip disables GPU fast-paths (the !tf->ip guards),
           so it MUST be per-request attach/detach, not load-at-startup (else normal gens go CPU too).
-      (B) CPU BLOCK PATH (~4x denoising): any attached adapter forces CPU blocks (bf16/MPS-native
-          inject not implemented). Bigger engine work (GPU-native to_k_ip/to_v_ip + SDPA inject).
+      (B) GPU SKIP / CPU denoising (~1.7x at 256px, more at higher res): attaching ANY adapter sets
+          tf->ip, which disables the fully-fused bf16 GPU pipeline (the `!tf->ip` guards at
+          iris_transformer_flux.c:3728/4230/4475) → falls to the per-block path (still GPU matmuls +
+          attention) WITH the IP injection on CPU (iris_ip_adapter_inject → mha_sdpa). Two ways to fix,
+          BOTH saved here per owner request (2026-06-28):
+            • B2 (#1, the real fix, big): implement IP injection INSIDE the fused bf16 pipeline —
+              per-block GPU K/V projection (ip_embeds @ to_k_ip/to_v_ip) + SDPA(img_q,k_ip,v_ip) +
+              scaled add, inside double_block_bf16/single_block_bf16, with the adapter weights uploaded
+              as GPU bf16 tensors at attach (mind the dynamic-weight GPU-cache hazard — cf. MPS B-cache
+              bug). Gate so the NON-adapter path stays byte-identical (normal gens untouched). Verify vs
+              golden parity (debug/test_ip_adapter.c, corr>0.999) + a real-image CPU-vs-GPU A/B.
+              ~half-day, core-path risk (contained to sref path). Biggest win (~1.7x denoising +).
+            • B1 (#2, safer interim, partial): GPU-accelerate just the inject in the EXISTING per-block
+              fallback (route iris_ip_adapter_inject's K/V matmul + SDPA through GPU primitives instead
+              of CPU mha_sdpa). Keeps the per-block (non-fused) path, so it removes the literal CPU SDPA
+              but NOT the fusion-overhead gap. Low risk, quick, smaller win.
       Doing (A) alone removes the per-gen model reload (the dominant fixed cost) even though (B) keeps
-      denoising on CPU. Also: per-request feature compute inside the resident server (today a Python
-      subprocess per new image; cached by sha after).
+      denoising on the slower path. Also: per-request feature compute inside the resident server (today
+      a Python subprocess per new image; cached by sha after).
     DONE (2026-06-28): UI no longer LOOKS stalled during sref gens — run_generation_sref streams iris's
       per-step (`Step N/M`) + phase stderr as progress/status job events (was buffered subprocess.run
-      with no progress); initial "Loading model" phase covers the pre-step reload. (Cosmetic; (A)/(B)
-      are the actual speedups.)
+      with no progress); initial "Loading model" phase covers the pre-step reload. (Cosmetic.)
+    (A) STATUS (2026-06-28): C server-mode IP support BUILT (commit 3872f90) + timings verified (no
+      model reload), but the per-request attach produces CORRUPT (noise) output on a warm daemon —
+      BUGS.md SREF-DAEMON-1. Web reverted to the working one-shot path; (A) is BLOCKED on that bug.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
