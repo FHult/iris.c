@@ -1633,3 +1633,123 @@ class TestStyleCodes:
         r = client.post("/sref/codes", json={"image": self._PNG})
         assert r.status_code == 400
         assert client.get("/sref/codes").get_json()["sref_enabled"] is False
+
+
+class TestSrefCompletion:
+    """Feature-completion coverage: injection-schedule passthrough, hybrid feature
+    dispatch, the 0.38 default strength, and single-reference multi-style handling."""
+
+    _PNG = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
+            "FcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+    def _wire(self, srv, tmp_path, monkeypatch):
+        bundle = tmp_path / "bundle"; bundle.mkdir(exist_ok=True)
+        feats = tmp_path / "feats.bin"; feats.write_bytes(b"\0" * 16)
+        monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
+        captured = {}
+        monkeypatch.setattr(srv, "run_generation_sref",
+                            lambda *a, **k: captured.setdefault("args", a))
+        return captured
+
+    # ── injection-schedule validator (mirrors the C parser) ──────────────────
+    def test_normalize_ip_schedule_accepts(self):
+        import server as srv
+        assert srv.normalize_ip_schedule(None) is None
+        assert srv.normalize_ip_schedule("") is None
+        assert srv.normalize_ip_schedule("none") is None
+        assert srv.normalize_ip_schedule("late:0.5") == "late:0.5"
+        assert srv.normalize_ip_schedule("early:0.25") == "early:0.25"
+
+    def test_normalize_ip_schedule_rejects(self):
+        import server as srv
+        import pytest as _pt
+        for bad in ("late", "late:2", "early:-0.1", "bogus:0.5", "late:nan"):
+            with _pt.raises(ValueError):
+                srv.normalize_ip_schedule(bad)
+
+    # ── /generate forwards a validated schedule to the sref runner ───────────
+    def test_ip_schedule_forwarded(self, client, tmp_path, monkeypatch):
+        import server as srv
+        cap = self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG, "strength": 0.4, "mode": "style"}],
+            "ip_schedule": "late:0.5",
+        })
+        assert r.status_code == 200 and r.get_json()["sref"] is True
+        # run_generation_sref(job, prompt, w, h, steps, seed, feats, ip_scale, guidance, ip_schedule)
+        assert cap["args"][9] == "late:0.5"
+
+    def test_bad_ip_schedule_rejected(self, client, tmp_path, monkeypatch):
+        import server as srv
+        self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG, "strength": 0.4, "mode": "style"}],
+            "ip_schedule": "bogus:9",
+        })
+        assert r.status_code == 400
+
+    def test_no_schedule_defaults_none(self, client, tmp_path, monkeypatch):
+        import server as srv
+        cap = self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG, "strength": 0.4, "mode": "style"}],
+        })
+        assert r.status_code == 200
+        assert cap["args"][9] is None          # omitted → constant injection
+        assert r.get_json()["ip_schedule"] == "none"
+
+    # ── 0.38 default strength when the slot omits one ───────────────────────
+    def test_default_strength_when_unset(self, client, tmp_path, monkeypatch):
+        import server as srv
+        cap = self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG, "mode": "style"}],  # no strength
+        })
+        assert r.status_code == 200
+        assert cap["args"][7] == pytest.approx(srv.SREF_DEFAULT_STRENGTH)
+
+    # ── single-reference: extra style slots warned, not silently dropped ────
+    def test_multi_style_warns(self, client, tmp_path, monkeypatch):
+        import server as srv
+        cap = self._wire(srv, tmp_path, monkeypatch)
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [
+                {"data": self._PNG, "strength": 0.4, "mode": "style"},
+                {"data": self._PNG, "strength": 0.4, "mode": "style"},
+            ],
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["sref"] is True
+        assert body.get("warning")             # surfaced, not silent
+
+    # ── feature production dispatches by bundle cond_mode ───────────────────
+    def test_feature_dispatch_by_cond_mode(self, tmp_path, monkeypatch):
+        import server as srv
+        sref = tmp_path / "sref"; sref.mkdir()
+        monkeypatch.setattr(srv, "SREF_DIR", sref)
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["script"] = cmd[1]
+            out = cmd[cmd.index("--out") + 1]
+            Path(out).write_bytes(b"\0" * 16)
+            class R:  # noqa: E306
+                returncode = 0
+                stderr = ""
+            return R()
+        monkeypatch.setattr(srv.subprocess, "run", fake_run)
+
+        monkeypatch.setattr(srv, "SREF_COND_MODE", "hybrid")
+        srv.compute_sref_features(b"img-bytes-hybrid")
+        assert seen["script"] == str(srv.HYBRID_FEATURES_SCRIPT)
+
+        monkeypatch.setattr(srv, "SREF_COND_MODE", "siglip")
+        srv.compute_sref_features(b"img-bytes-siglip")
+        assert seen["script"] == str(srv.SIGLIP_FEATURES_SCRIPT)

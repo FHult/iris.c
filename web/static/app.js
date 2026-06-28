@@ -1282,6 +1282,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     lora_scale: lora_scale || 1.0,
                     img2img_strength: img2img_strength || 1.0,
                     negative_prompt: negative_prompt || null,
+                    ip_schedule: document.getElementById('sref-schedule')?.value || 'none',
                 }),
             });
             const data = await response.json();
@@ -1289,6 +1290,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 showError(data.error || 'Failed to queue job');
                 return;
             }
+            // Non-fatal server notices (e.g. extra style references ignored).
+            if (data.warning) showError(data.warning);
             if (!isGenerating) {
                 // Server started the job immediately — connect to its progress stream
                 currentJobId = data.job_id;

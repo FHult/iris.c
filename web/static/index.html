@@ -252,6 +252,14 @@
                             <label for="lora-scale">Scale: <span id="lora-scale-value">1.0</span></label>
                             <input type="range" id="lora-scale" min="0" max="2" step="0.05" value="1.0">
                         </div>
+                        <div class="form-group" id="sref-schedule-group">
+                            <label for="sref-schedule" title="When a style reference is active: inject style across all steps (constant), only late steps (preserves content more), or only early steps (crisper content).">Style timing</label>
+                            <select id="sref-schedule" name="sref-schedule">
+                                <option value="none">Constant (default)</option>
+                                <option value="late:0.5">Late — preserve content</option>
+                                <option value="early:0.5">Early — crisp content</option>
+                            </select>
+                        </div>
                     </div>
                     <button type="button" id="toggle-advanced" class="btn-link">Advanced options</button>
 

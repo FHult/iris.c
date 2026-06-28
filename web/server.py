@@ -70,6 +70,30 @@ SREF_COND_MODE = _bundle_cond_mode()
 # margin for per-image variance (0.39 is the aggressive edge). Override via IRIS_SREF_STRENGTH.
 SREF_DEFAULT_STRENGTH = float(os.environ.get("IRIS_SREF_STRENGTH", "0.38"))
 
+
+def normalize_ip_schedule(spec):
+    """Validate an --ip-schedule spec from the client, mirroring the C parser
+    (iris_ip_adapter_set_schedule). Returns the normalized spec string to pass to
+    iris, or None for 'none'/empty (constant injection → omit the flag).
+    Raises ValueError on a malformed spec so the caller can 400 cleanly.
+
+    The schedule gates IP-Adapter injection by denoising-step fraction: 'late:F'
+    injects only in the last (1-F) of steps (content forms first), 'early:F' only
+    in the first F. It shifts the style/content trade-off; it does not raise the
+    quality ceiling (see BACKLOG DP-7), so it is an optional advanced control."""
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    if spec == "" or spec == "none":
+        return None
+    m = re.fullmatch(r"(late|early):([0-9]*\.?[0-9]+)", spec)
+    if not m:
+        raise ValueError(f"bad ip-schedule '{spec}' (want none|late:F|early:F)")
+    f = float(m.group(2))
+    if not (0.0 <= f <= 1.0):
+        raise ValueError(f"ip-schedule fraction {f} out of [0,1]")
+    return spec
+
 # Known model slots. The startup model dir is prepended dynamically in main().
 # sh_arg: argument to pass to download_model.sh; None means not downloadable via UI.
 MODEL_SLOTS = [
@@ -1156,7 +1180,7 @@ def resolve_style_code(code: str) -> Optional[Path]:
 
 
 def run_generation_sref(job, prompt, width, height, steps, seed,
-                        features_path, ip_scale, guidance=None):
+                        features_path, ip_scale, guidance=None, ip_schedule=None):
     """One-shot `iris --ip` run for a style-reference generation (SREF-3 v1).
 
     The persistent server loads --ip at startup only, so style generations use
@@ -1170,6 +1194,8 @@ def run_generation_sref(job, prompt, width, height, steps, seed,
            "-W", str(width), "-H", str(height), "--steps", str(steps),
            "--ip", str(IP_BUNDLE), "--ip-features", str(features_path),
            "--ip-scale", str(ip_scale)]
+    if ip_schedule:
+        cmd += ["--ip-schedule", ip_schedule]
     if seed is not None:
         cmd += ["--seed", str(seed)]
     if guidance:
@@ -1282,6 +1308,18 @@ def generate():
     style_code = (data.get("style_code") or "").strip()
     if (style_slots or style_code) and IP_BUNDLE and Path(IP_BUNDLE).exists():
         ip_scale = SREF_DEFAULT_STRENGTH
+        # Optional injection-timing schedule (advanced; shifts style/content trade-off,
+        # does not raise the quality ceiling — BACKLOG DP-7). Validated server-side.
+        try:
+            ip_schedule = normalize_ip_schedule(data.get("ip_schedule"))
+        except ValueError as e:
+            return jsonify({"error": f"Invalid ip_schedule: {e}"}), 400
+        # The trained adapter is SINGLE-reference; extra style slots are not fused.
+        # Use the first and tell the client the rest were ignored (no silent drop).
+        style_warning = None
+        if len(style_slots) > 1:
+            style_warning = (f"{len(style_slots)} style references provided; the adapter is "
+                             "single-reference, so only the first is used.")
         if style_code:
             features_path = resolve_style_code(style_code)
             if features_path is None:
@@ -1308,10 +1346,12 @@ def generate():
         threading.Thread(
             target=run_generation_sref,
             args=(job, generation_prompt, width, height, steps, seed,
-                  features_path, ip_scale, guidance),
+                  features_path, ip_scale, guidance, ip_schedule),
             daemon=True).start()
         return jsonify({"job_id": job_id, "status": "started", "sref": True,
-                        "style_code": style_code or None})
+                        "style_code": style_code or None,
+                        "ip_schedule": ip_schedule or "none",
+                        "warning": style_warning})
 
     # Derive effective img2img_strength: take the minimum slot strength so the
     # most-constrained slot drives the global noise level (C backend uses one value).
