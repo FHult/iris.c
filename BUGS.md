@@ -336,5 +336,15 @@
   sref through the working one-shot `run_generation_sref` (correct, but reloads the model per gen). The
   C server-mode IP support (commit 3872f90) stays as the foundation. `make test` is green — the
   server-mode smoke does NOT check sref image correctness, so it missed this; ADD a golden-pixel sref
-  check to the server smoke to catch this class. Repro: drive `iris -d flux-klein-model --server` with a
-  request carrying `ip_bundle`+`ip_features`, view output → noise; same bundle one-shot → correct.
+  check to the server smoke to catch this class.
+  CONFIRMED at MATCHED resolution (2026-06-28, after an initial mis-isolation that compared daemon@256
+  vs one-shot@576): at 576px same bundle/features — ONE-SHOT = coherent, DAEMON-attach = PURE BLACK
+  (all-zero) output; attach log says "IP-Adapter: attached" but the forward is corrupted. So the daemon
+  attach genuinely breaks generation. (At 256px both produce noise — see SREF-LOWRES below.)
+
+- **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
+  from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
+  no-adapter path at 256px is fine (clean image), so it's the IP injection at low res. Likely the
+  img_seq at 256px (16x16=256 image tokens) interacting with the 256 perceiver image-tokens, or the
+  low-res latent + strong injection. NOT normally hit (sref is used at 512+); flagged so a future
+  low-res sref path is validated. Workaround: use >=512px for style reference.
