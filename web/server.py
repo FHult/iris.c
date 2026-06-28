@@ -49,6 +49,26 @@ SREF_DIR = OUTPUT_DIR / "sref"
 IP_BUNDLE = os.environ.get("IRIS_IP_BUNDLE")  # exported adapter bundle dir
 TRAIN_VENV_PY = PROJECT_DIR / "train" / ".venv" / "bin" / "python"
 SIGLIP_FEATURES_SCRIPT = PROJECT_DIR / "train" / "scripts" / "siglip_features.py"
+HYBRID_FEATURES_SCRIPT = PROJECT_DIR / "train" / "scripts" / "hybrid_features.py"
+
+
+def _bundle_cond_mode() -> str:
+    """cond_mode of the configured IP bundle ('siglip'|'csd'|'hybrid'); 'siglip' if unknown.
+    The champion (clean_concentrate_leak) is 'hybrid' → reference features must carry the
+    CSD row, so feature production dispatches to hybrid_features.py (not siglip-only)."""
+    if not IP_BUNDLE:
+        return "siglip"
+    try:
+        return json.loads((Path(IP_BUNDLE) / "adapter_meta.json").read_text()).get("cond_mode", "siglip")
+    except Exception:
+        return "siglip"
+
+
+SREF_COND_MODE = _bundle_cond_mode()
+# Recommended --sref-strength: the champion's content-preserving operating point (see BACKLOG
+# "SREF CHAMPION PINNED"). ~0.70 is the mechanism ceiling; 0.38 = ratio 0.666 / retain 0.827 with
+# margin for per-image variance (0.39 is the aggressive edge). Override via IRIS_SREF_STRENGTH.
+SREF_DEFAULT_STRENGTH = float(os.environ.get("IRIS_SREF_STRENGTH", "0.38"))
 
 # Known model slots. The startup model dir is prepended dynamically in main().
 # sh_arg: argument to pass to download_model.sh; None means not downloadable via UI.
@@ -1048,19 +1068,24 @@ def compute_sref_features(image_bytes: bytes) -> Path:
     the caller surfaces the error to the UI."""
     sha = hashlib.sha256(image_bytes).hexdigest()[:24]
     SREF_DIR.mkdir(parents=True, exist_ok=True)
+    # NOTE: cache is keyed by image content only, NOT cond_mode — a deployment serves ONE
+    # bundle. If you switch IP_BUNDLE to a different cond_mode, clear SREF_DIR/*.bin first
+    # (stale siglip features would be wrong-shaped for a hybrid adapter, and vice-versa).
     out = SREF_DIR / f"{sha}.bin"
     if out.exists():
         return out
+    # Champion is hybrid → features must carry the CSD row (hybrid_features.py); siglip-only
+    # bundles use siglip_features.py. Dispatch on the configured bundle's cond_mode.
+    script = HYBRID_FEATURES_SCRIPT if SREF_COND_MODE == "hybrid" else SIGLIP_FEATURES_SCRIPT
     tmp_img = SREF_DIR / f"{sha}_src.png"
     tmp_img.write_bytes(image_bytes)
     try:
         proc = subprocess.run(
-            [str(TRAIN_VENV_PY), str(SIGLIP_FEATURES_SCRIPT),
-             str(tmp_img), "--out", str(out)],
+            [str(TRAIN_VENV_PY), str(script), str(tmp_img), "--out", str(out)],
             capture_output=True, text=True, timeout=300, cwd=str(PROJECT_DIR))
         if proc.returncode != 0 or not out.exists():
             raise RuntimeError(
-                (proc.stderr or "").strip()[-400:] or "siglip_features failed")
+                (proc.stderr or "").strip()[-400:] or f"{SREF_COND_MODE} feature production failed")
         return out
     finally:
         tmp_img.unlink(missing_ok=True)
@@ -1256,13 +1281,13 @@ def generate():
     style_slots = [s for s in reference_slots if s.get("mode") == "style"]
     style_code = (data.get("style_code") or "").strip()
     if (style_slots or style_code) and IP_BUNDLE and Path(IP_BUNDLE).exists():
-        ip_scale = 1.0
+        ip_scale = SREF_DEFAULT_STRENGTH
         if style_code:
             features_path = resolve_style_code(style_code)
             if features_path is None:
                 return jsonify({"error": f"Unknown style code: {style_code}"}), 400
             if style_slots:
-                ip_scale = float(style_slots[0].get("strength", 1.0))
+                ip_scale = float(style_slots[0].get("strength", SREF_DEFAULT_STRENGTH))
             elif "img2img_strength" in data:
                 ip_scale = float(data["img2img_strength"])
         else:
@@ -1273,7 +1298,7 @@ def generate():
                 features_path = compute_sref_features(sref_bytes)
             except Exception as e:
                 return jsonify({"error": f"Style reference encoding failed: {e}"}), 400
-            ip_scale = float(slot.get("strength", 1.0))
+            ip_scale = float(slot.get("strength", SREF_DEFAULT_STRENGTH))
         job_id = uuid.uuid4().hex[:12]
         job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
         job.batch_id = batch_id

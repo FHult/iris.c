@@ -1693,6 +1693,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 e.stopPropagation();
                 if (referenceImageData[slot]) {
                     referenceImageData[slot].mode = e.target.value;
+                    // Recommended default strength differs by mode: a style reference goes through
+                    // the IP-Adapter, which washes content above ~0.4, so default to the champion
+                    // operating point (0.38); composition (img2img) keeps 0.85.
+                    const def = e.target.value === 'style' ? 0.38 : 0.85;
+                    referenceImageData[slot].strength = def;
+                    if (strengthEl) strengthEl.value = def;
+                    if (labelEl) labelEl.textContent = def.toFixed(2);
                 }
             });
         }
