@@ -356,6 +356,24 @@
   (which block's projection first returns zero image rows), and/or run under a heap/UB checker that works
   with the large model (libgmalloc rejects the multi-GB allocs). The one-shot path (fresh process) does
   the identical compute correctly, so it is layout/warm-state dependent (heisenbug).
+  DEEPER LOCALIZATION (2026-06-28, round 2): traced the actual NaN onset by logging every
+  iris_linear_nobias_bf16 call (M/K/N + first/last output-row L1 + input max). The FIRST NaN is the
+  SINGLE BLOCK's OUTPUT projection (proj_mlp, K=12288 N=3072) of single-block idx 7 (~global block 12),
+  and its INPUT is clean and small (in_max=16.37, no NaN) while q/attn_out/mlp for that block are all
+  NaN-free — i.e. iris_metal_sgemm_bf16 produces NaN from a finite, small input. The earlier "block-13
+  image-Q = 0" was the DOWNSTREAM symptom (block 12's NaN proj output → block 13 input → the max-based
+  |q| diag reported NaN as 0). So the defect is in the bf16 GPU GEMM (iris_metal_sgemm_bf16) path under
+  warm-daemon state, NOT the inputs. RULED OUT FURTHER: (1) beta=0 reading stale pooled bufferC and
+  0*NaN=NaN — zeroing bufferC when beta==0 did NOT fix it; (2) batch_get_input_buffer stale contents —
+  g_batch_input_count is cleared every iris_metal_end_batch and the per-block batches are small, so no
+  cross-block stale reuse. CAVEAT for the next debugger: in BATCH mode (g_in_batch) the matmul is
+  DEFERRED (encoded to g_batch_cmd, copied back at end_batch), so reading the CPU output right after an
+  iris_metal_sgemm_bf16 call is UNRELIABLE — instrument by forcing a synchronous commit, or check buffer
+  contents on-GPU. Prime remaining suspects: an uninitialized/garbage GPU buffer (bufferA from the pool,
+  or the cached f16 weight from get_cached_bf16_as_f16_buffer) read by MPSMatrixMultiplication on a warm
+  command queue; or an MPS matmul descriptor/buffer-size mismatch that surfaces only after N prior batched
+  ops. Recommended next probe: add a synchronous NaN check on bufferA and bufferC contents (GPU) inside
+  iris_metal_sgemm_bf16 right after the matmul (force commit), for the failing call, in the daemon.
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
