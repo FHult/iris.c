@@ -374,6 +374,36 @@
   command queue; or an MPS matmul descriptor/buffer-size mismatch that surfaces only after N prior batched
   ops. Recommended next probe: add a synchronous NaN check on bufferA and bufferC contents (GPU) inside
   iris_metal_sgemm_bf16 right after the matmul (force commit), for the failing call, in the daemon.
+  ROUND 3 — PRECISE A/B + EXHAUSTIVE ELIMINATION (2026-06-29). Instrumented iris_metal_sgemm_bf16's
+  non-batch path (forced synchronous via a temporary global batch-disable) to log per-call, image-rows-only,
+  the two single-block GEMMs: fusedQKV (K=3072 N=27648) and proj_mlp (K=12288 N=3072) — input max,
+  weight-nonzero count, and text-row vs image-row output max. Ran the SAME request (576px, 1 step, seed 7,
+  same bundle/features, ip_scale 0.45) through the WARM DAEMON and a FRESH ONE-SHOT and diffed:
+    * The two traces are BYTE-IDENTICAL through single-block 7 (global block 12). Clean CLIFF at
+      single-block 8 (global block 13): that block's proj_mlp outputs ALL ZERO (text AND image rows,
+      txtC 19.7→0, imgC 6.4→0) in the daemon, while the one-shot outputs the correct 4.188. The fusedQKV
+      of the SAME block is fine in both. The zero then propagates (block 14+ inputs are zero).
+    * At the failing call: INPUT bufferA is nonzero (imgA_max 6.443, identical to one-shot), WEIGHT bufferB
+      is fully populated (Bnz 37.6M/37.7M nonzero — read on CPU), yet OUTPUT is exactly zero. cmdBuffer
+      .status == Completed and .error == nil. So the matmul "succeeds" but writes nothing — a SILENT
+      zero-write of a completed MPSMatrixMultiplication, from valid CPU-visible inputs, warm-process-only,
+      at a fixed cumulative call count. The earlier "NaN" framing (round 2) was a BATCH-DEFERRAL artifact;
+      forced synchronously the true symptom is ZERO output, not NaN.
+    * RULED OUT (each tested by build+run, zero-count unchanged ~24/25): F16_WEIGHT_CACHE_SIZE 512→4096
+      (weight stays populated regardless); iris_metal batch mode (option-2: global batch-disable while
+      adapter attached → all GEMMs synchronous → STILL zero, and ~4x slower); MTLResidencySet on the
+      non-batch command buffer (added useResidencySet to the non-batch path → no change; and blocks 5–12
+      use the same non-set pool buffers fine); beta=0 stale bufferC (memset → no change); ACTIVATION_POOL_SIZE
+      64→256 (no change); the load-time warmup (IRIS_NO_WARMUP → zero-count got WORSE 25→33, so warmup helps).
+    * CONCLUSION: a deep MPS/Metal warm-process-state defect — one specific MPSMatrixMultiplication silently
+      produces a zero result despite resident, valid inputs, only after enough prior GPU work in the process
+      (the daemon's startup warmup/Qwen3 pushes the gen past the threshold; the fresh one-shot stays under it).
+      Not reachable via the buffer/cache/batch/residency/pool knobs above. NEXT: Metal frame capture / Xcode
+      GPU debugger on the block-13 proj_mlp command in the warm daemon (inspect the actual GPU-side matrix
+      inputs/outputs and the MPS kernel selection), or A/B the f32 GPU path (iris_metal_sgemm — get_kv uses it
+      and works warm) vs bf16 for the per-block linears. The WORKING one-shot remains shipped; daemon
+      model-reuse (BACKLOG SREF-3 part A) stays blocked on this. All round-3 instrumentation reverted; C tree
+      unchanged from the committed working state.
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
