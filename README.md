@@ -15,6 +15,27 @@ Three integrated components:
 
 ---
 
+## Easiest install (no prior knowledge needed)
+
+Three commands. Works out of the box on an Apple Silicon Mac.
+
+```bash
+./install.sh            # builds the engine + sets up the web UI (safe to re-run)
+./download_model.sh 4b  # downloads the 4B model (~16 GB — install.sh can do this for you)
+./run.sh                # launches the app and opens http://localhost:8080
+```
+
+Then type a prompt in your browser and click generate. The **first** image loads the model
+(~30–60s); every image after that is fast. To transfer the *look* of a reference picture,
+add it as a **Style** reference slot in the UI.
+
+> Style references need a trained adapter bundle — put it in `./sref-bundle` or set
+> `IRIS_IP_BUNDLE=/path/to/bundle` before `./run.sh`. Without one, normal generation still works.
+
+The rest of this README is the detailed/developer guide.
+
+---
+
 ## Quick Start — Inference
 
 ```bash

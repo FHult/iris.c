@@ -39,3 +39,6 @@ iris_shaders_source.h
 web/output/
 web/venv/
 web/.venv/
+
+# Optional user-provided style-reference adapter bundle (run.sh / IRIS_IP_BUNDLE)
+sref-bundle/
