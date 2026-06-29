@@ -448,13 +448,15 @@ class TestRefSlotNormalise:
         for s in slots:
             w = float(s.get("strength", 1.0))
             if s.get("mode") == "style":
-                w *= 0.5
+                w = 1.0
             strengths.append(w)
         effective = min(strengths)
         assert effective == pytest.approx(0.6)
 
-    def test_style_mode_halves_strength(self):
-        """Style mode should halve the effective weight before taking the minimum."""
+    def test_style_mode_uses_full_strength_incontext(self):
+        """Style mode now uses FULL-STRENGTH in-context conditioning (img2img_strength 1.0),
+        not the old ×0.5 half-weight that produced a near-literal copy of the reference
+        (BACKLOG SREF-CHAMPION-COLLAPSE correction)."""
         slots = [
             {"data": "x", "strength": 0.8, "mode": "style"},
             {"data": "x", "strength": 0.9, "mode": "composition"},
@@ -463,10 +465,10 @@ class TestRefSlotNormalise:
         for s in slots:
             w = float(s.get("strength", 1.0))
             if s.get("mode") == "style":
-                w *= 0.5
+                w = 1.0
             strengths.append(w)
         effective = min(strengths)
-        assert effective == pytest.approx(0.4)  # 0.8 * 0.5 = 0.4 < 0.9
+        assert effective == pytest.approx(0.9)  # style→1.0, composition 0.9 → min 0.9
 
     def test_explicit_img2img_strength_overrides_slots(self):
         """When img2img_strength is set in the request, slot strengths do not override it."""
@@ -1509,8 +1511,10 @@ class TestHiresFixIntermediate:
 
 
 class TestSrefRouting:
-    """SREF-3: style-mode slots route through the IP-Adapter ONLY when a bundle
-    is configured; otherwise the legacy path must handle them (fail-open)."""
+    """Style-mode slots route through IN-CONTEXT img2img conditioning by default; they
+    route through the trained IP-Adapter ONLY when it is explicitly enabled
+    (SREF_USE_ADAPTER) AND a bundle is configured. The adapter is opt-in pending a
+    retrain (BACKLOG SREF-CHAMPION-COLLAPSE)."""
 
     _PNG_1x1 = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
                 "FcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
@@ -1526,11 +1530,34 @@ class TestSrefRouting:
         assert r.status_code == 200
         assert r.get_json().get("sref") is None   # legacy path, not the sref branch
 
+    def test_style_slot_with_bundle_but_adapter_disabled_is_incontext(self, client, monkeypatch, tmp_path):
+        """Regression guard for the good→bad flip: even with a bundle configured, a style
+        slot must default to full-strength IN-CONTEXT conditioning (img2img_strength 1.0),
+        NOT the collapsed adapter, when SREF_USE_ADAPTER is off (the default)."""
+        import server as srv
+        bundle = tmp_path / "bundle"; bundle.mkdir()
+        monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        monkeypatch.setattr(srv, "SREF_USE_ADAPTER", False)
+        called = {}
+        monkeypatch.setattr(srv, "queue_generation",
+                            lambda *a, **k: called.setdefault("args", a))
+        r = client.post("/generate", json={
+            "prompt": "a castle",
+            "reference_images": [{"data": self._PNG_1x1, "strength": 0.38,
+                                  "mode": "style"}],
+        })
+        assert r.status_code == 200
+        assert r.get_json().get("sref") is None              # in-context, not the adapter
+        job = called["args"][0]
+        assert getattr(job, "ip_bundle", None) is None       # adapter not attached
+        assert job.img2img_strength == pytest.approx(1.0)    # full-strength in-context
+
     def test_style_slot_with_bundle_routes_to_sref(self, client, monkeypatch, tmp_path):
         import server as srv
         bundle = tmp_path / "bundle"; bundle.mkdir()
         feats = tmp_path / "feats.bin"; feats.write_bytes(b"\0" * 16)
         monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        monkeypatch.setattr(srv, "SREF_USE_ADAPTER", True)   # opt-in adapter
         monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
         called = {}
         monkeypatch.setattr(srv, "queue_generation",
@@ -1574,6 +1601,9 @@ class TestStyleCodes:
         monkeypatch.setattr(srv, "SREF_CODES_FILE", sref / "codes.json")
         bundle = tmp_path / "bundle"; bundle.mkdir(exist_ok=True)
         monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        # Style codes REQUIRE the trained adapter (no image to do in-context with);
+        # enable it (opt-in since SREF-CHAMPION-COLLAPSE).
+        monkeypatch.setattr(srv, "SREF_USE_ADAPTER", True)
 
         # Stub feature computation: mirror real sha keying, no torch/SigLIP.
         def _fake_feats(image_bytes):
@@ -1647,6 +1677,9 @@ class TestSrefCompletion:
         bundle = tmp_path / "bundle"; bundle.mkdir(exist_ok=True)
         feats = tmp_path / "feats.bin"; feats.write_bytes(b"\0" * 16)
         monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
+        # Trained adapter is opt-in (BACKLOG SREF-CHAMPION-COLLAPSE); enable it for the
+        # adapter-path tests in this class.
+        monkeypatch.setattr(srv, "SREF_USE_ADAPTER", True)
         monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
         captured = {}
         # sref now rides the resident daemon: IP params are set on the job and

@@ -2752,6 +2752,170 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     reference-discrimination corr (cross-ref output corr at fixed seed/prompt). A high sref_score with
     cross-ref corr ≥ ~0.9 is a mode-collapse FALSE POSITIVE, not a win. Repro scripts:
     `scratchpad/painting_discrim.sh` + the corr snippets in this session; promote to `debug/` if reused.
+    ⚠️ THE "MISATTRIBUTION / NO REGRESSION" CLAIM IN THE NEXT ADDENDUM IS WRONG — SUPERSEDED BY THE
+    "REAL REGRESSION" CORRECTION further below (2026-06-29, later same day). Kept for the trail.
+    ADDENDUM (2026-06-29) — COLLAPSE IS RESOLUTION/ASPECT-INDEPENDENT, AND THE USER'S "REGRESSION" IS A
+    MISATTRIBUTION (not a code bug). User reported the web sref "used to work" (a crisp ginger-cat result)
+    but now produces warm mush, and hypothesized the 512px collapse was a LOW-RES artifact (adapter
+    over-powering at low res). Tested at the user's exact successful settings (prompt "a fluffy cat with a
+    hat", seed 7, 1200×1024, scale 0.38, default sigmoid schedule):
+      • Discrimination still collapses at 1200×1024 AND at 1024²: swap ONLY the reference, hold seed →
+        output corr 0.994 (user's own two refs) / 0.97–0.99 (6 synthetic refs). Resolution and aspect do
+        NOT rescue discrimination — the threshold is SCALE, not resolution. Low-res-artifact hypothesis REFUTED.
+      • Good-vs-bad reconciliation (pixel corr, 600×512): the user's loved "good" result (a6db) correlates
+        +0.627 with a NO-ADAPTER seed-7 base gen but only +0.372 with the adapter @0.38 — i.e. the good
+        result lived in the BASE-MODEL family (effectively un-adapted / barely-adapted), NOT the adapter
+        family. The "bad" result (6838) correlates +0.735/+0.746 with the adapter @0.38 family — it IS the
+        adapter's true 0.38 behavior. So the adapter at the shipped 0.38 ALWAYS produced the warm mush; the
+        crisp result the user loved was base output. No regression: commit dates confirm both gens ran
+        identical post-B2 code, and pre-B2 vs post-B2 inject corr 0.9998.
+      • No hidden scale override: web/server.py:1303 sets ip_scale = UI slider "strength" (default 0.38);
+        there is NO resolution/aspect/step conditional that changes it.
+      • Scale just cross-fades base↔collapse, never restores transfer: at scale 0.08 the output is 0.958 to
+        the no-adapter base gen (adapter ~inert); raising scale walks toward the single collapsed warm-mush
+        transform. There is no scale at which the adapter both stays crisp AND discriminates references —
+        because the injection is a near-constant, lowering scale removes the adapter rather than sharpening it.
+    PRODUCT IMPLICATION: the shipped default is a "make-it-painterly" filter, not --sref. Honest options
+    until the retrain: (1) lower the default strength toward ~0.10–0.15 so it nudges rather than overrides
+    (still ref-agnostic, but less destructive), or (2) gate the feature behind a "stylize" label. The real
+    fix remains the retrain (discrimination gate now in debug/sref_ref_discrimination.py).
+    CORRECTION (2026-06-29, later same day) — THE REGRESSION IS REAL AND IS A ROUTING/ENV FLIP, NOT A
+    MISATTRIBUTION. The collapse finding above STANDS (the trained adapter IS mode-collapsed, corr 0.983
+    across 6 distinct refs). What was wrong: the prior addendum concluded "no regression — the loved good
+    result was base output." It analyzed the WRONG exemplar (a6db, a 1200×1024 crisp-cat that is in the
+    base-model family — likely plain txt2img, no/ineffective reference) and over-generalized. The user then
+    posted TWO unambiguous clean STYLE-TRANSFER pairs at "0.38": Churchill line-art ref → clean line-art
+    cat (= web gen aab2c30b, favorited), and CyberFika graphic ref → bold flat-color cartoon cat. Base
+    output CANNOT produce reference-specific style transfer, so these refute "good = base."
+    PROVEN MECHANISM (CLI repro, seed 7532383631326939674, 1024×768, prompt "a fluffy cat with a hat"):
+      • IN-CONTEXT img2img conditioning (`-i REF --img2img-strength 1.0`; reference enters as extra tokens,
+        prompt drives content) reproduces BOTH user images EXACTLY: churchill → clean line-art fluffy cat
+        w/ hat+bowtie in churchill's hat position; cyberfika → bold cartoon cat in the vibrant flat-sticker
+        style on the same yellow-green-cyan gradient. THIS is the path that produced the loved results.
+      • Strength semantics are INVERTED from intuition: `--img2img-strength 1.0` = in-context (style+prompt
+        freedom → a CAT); LOWER strength = more literal copy of the ref (0.19 → reproduces churchill / the
+        cyberfika logo itself, not a cat). So clean transfer needs HIGH strength, i.e. in-context.
+      • The trained-adapter sref path (style_slots AND IRIS_IP_BUNDLE set, server.py:1273) → the collapsed
+        soft cream cat. The in-context path is the LEGACY fail-open branch (server.py:1330+) used when no
+        bundle is configured OR the ref is composition-mode (full strength, no ×0.5 half-weight).
+    ROOT CAUSE OF GOOD→BAD: a web-server restart (the user's "installer") in the 13:41→15:13 window
+    (history.json created_at 1782736860 → 1782742372) brought the server up with
+    IRIS_IP_BUNDLE=/Volumes/2TBSSD/sref_eval/clean_concentrate_leak/bundle SET (the currently-running
+    server, pid 41014 @21:48, has it set). With a bundle set, style-mode refs route to the collapsed
+    trained adapter instead of in-context conditioning → the warm mush. NOT the venv (train/.venv encoders
+    unchanged since Jun 19; web/venv only pip self-upgraded), NOT a binary/C-code change (v4.4.0..HEAD
+    touch only backlog/install.sh; inject corr 0.9998 pre/post-B2), NOT the features (fresh vs cached ref
+    bins corr 0.9995). Pure routing/env flip.
+    FIX TO RESTORE THE LOVED BEHAVIOR (until adapter retrain): route web style references through
+    in-context conditioning, not the trained adapter — i.e. either (a) launch the web server WITHOUT
+    IRIS_IP_BUNDLE and ensure style-mode refs reach in-context at strength ~1.0 (the current legacy style
+    branch applies ×0.5 → 0.19 → literal copy, so that half-weight must be removed/raised for style mode),
+    or (b) in the UI add the reference as a composition/regular reference (routes to in-context @1.0 today).
+    The trained-adapter sref champion stays gated behind the retrain + discrimination gate.
+    Repro images: scratchpad/img2img_repro/{churchill,cyberfika}_incontext.png (clean) vs
+    scratchpad/isolate/*.png (6 collapsed adapter outputs).
+
+  - **🟢 SREF WEB GOOD→BAD REGRESSION — FULL ROOT-CAUSE INVESTIGATION + ROUTING FIX SHIPPED
+    (2026-06-29).** The web "style reference" feature produced clean, reference-specific style
+    transfer for the user on 2026-06-29 ~13:00–13:42, then produced "warm mush" (a constant
+    soft-cream cat) from ~15:12 onward. This entry documents the end-to-end diagnosis, the proven
+    mechanism, the exact root cause, the shipped fix, and the remaining work. Supersedes the earlier
+    "no regression / misattribution" addendum under SREF-CHAMPION-COLLAPSE (which analyzed the wrong
+    exemplar). The mode-collapse finding itself (the adapter is reference-inert) STANDS.
+
+    SYMPTOM / USER GROUND TRUTH. User posted two unambiguous reference→output pairs at the UI default
+    "0.38", prompt "a fluffy cat with a hat": (1) a CyberFika vibrant graphic → bold flat-color cartoon
+    cat on the same yellow-green-cyan gradient; (2) a Churchill line-art coloring page → clean line-art
+    fluffy cat with hat+bowtie in the ref's hat position. These are reference-SPECIFIC transfers — two
+    different references gave two different, on-style outputs. The current behavior instead gives a
+    near-constant warm cream cat regardless of reference. User asked: "explain these — proper clean
+    transfer both at 0.38" and "did the installer change/replace the venv?"
+
+    INVESTIGATION (what was tested, in order, with the ruling):
+      1. Feature extraction integrity — RULED OUT. Fresh web-path SigLIP+CSD bin vs the cached/older
+         ref bins: corr 0.9995 (SigLIP rows 0.9995, CSD row 0.9999). Extraction is stable & correct.
+      2. The venv (user's hypothesis) — RULED OUT. train/.venv (encoders) unchanged since Jun 19;
+         web/venv only had pip self-upgrade (Jun 29 13:47); Pillow/Flask/numpy unchanged since Mar 4.
+      3. Binary / C-code regression — RULED OUT. Commits v4.4.0..HEAD touch only BACKLOG + install.sh;
+         NONE touch IP-adapter / inject C. Per-block (IRIS_NO_FUSED_IP=1) vs B2 fused inject corr
+         0.9998. The installer rebuilds via `make mps` from identical inject source.
+      4. Inject path (fused vs per-block) — RULED OUT. Both produce IDENTICAL mush.
+      5. Is the collapse real on the current binary? — CONFIRMED. Ran the current iris at the user's
+         exact good-gen config (seed 7532383631326939674, 1024×768, scale 0.38, clean_concentrate_leak
+         bundle) across 6 DISTINCT feature bins (fresh churchill + 5 cached web uploads). All 6 →
+         the SAME soft-cream-cat-with-red-tophat. Mean pairwise output pixel corr 0.983 (min 0.962).
+         The trained adapter is reference-inert at the shipped operating point.
+      6. What produced the CLEAN transfers, then? — PROVEN: IN-CONTEXT img2img conditioning, NOT the
+         adapter. CLI repro `./iris -d flux-klein-model -p "a fluffy cat with a hat" -i REF
+         --img2img-strength 1.0 -S 7532383631326939674 -W 1024 -H 768` reproduced BOTH user images
+         EXACTLY (churchill → clean line-art cat; cyberfika → bold cartoon cat). Strength semantics
+         are INVERTED from intuition: --img2img-strength 1.0 = in-context (ref as tokens, prompt drives
+         content → a CAT); LOWER strength = a more literal copy of the reference (0.19 reproduced
+         Churchill / the CyberFika logo itself, not a cat). So clean transfer requires HIGH strength.
+
+    CONCLUSION — TWO PATHS, ONE FLIP. There are two reference paths in web/server.py /generate:
+      • IN-CONTEXT conditioning (legacy fail-open, server.py ~1341+): single reference → input_image →
+        img2img at strength 1.0; reference is extra tokens, prompt drives content. → CLEAN, reference-
+        specific style transfer. THIS is what the user loved.
+      • TRAINED IP-ADAPTER (SREF-3, server.py ~1281): fires when a style slot is present AND a bundle
+        is configured. → the collapsed constant cat.
+    ROOT CAUSE of good→bad: a web-server RESTART (the user's "installer") between the last good gen
+    (history.json created_at 1782736860 ≈ 13:41) and the first mush (1782742372 ≈ 15:13) brought the
+    server up with IRIS_IP_BUNDLE=/Volumes/2TBSSD/sref_eval/clean_concentrate_leak/bundle SET (the
+    server running at investigation time, pid 41014 @21:48, had it set). With a bundle set, style-mode
+    references stopped falling through to in-context conditioning and started routing to the collapsed
+    trained adapter. Pure routing/ENV flip — not venv, not binary, not features. (Note: history.json
+    records img2img_strength 1.0 for BOTH good and bad gens — for the bad gen that's just the untouched
+    Job default; the sref path never sets it. So metadata alone can't distinguish the paths; the visual
+    + CLI repro does.)
+    WHY THE EARLIER ADDENDUM SAID "NO REGRESSION": it analyzed a6db3f1e (a 1200×1024 crisp cat that
+    correlates +0.627 with a no-adapter base gen — i.e. base-family, likely plain txt2img / ineffective
+    ref) and generalized "the loved result was base output." The real style-transfer exemplar is
+    aab2c30b (favorited, line-art cat) which is unmistakably in-context conditioning. Wrong exemplar →
+    wrong conclusion.
+
+    FIX SHIPPED (web/server.py, 2026-06-29): default the web "style" path to IN-CONTEXT conditioning;
+    make the trained adapter OPT-IN behind a retrain.
+      • New env flag SREF_USE_ADAPTER (IRIS_SREF_ADAPTER, default OFF). The adapter route now requires
+        `SREF_USE_ADAPTER and IP_BUNDLE and bundle.exists()`. With the flag off (default), style refs
+        route to in-context EVEN IF IRIS_IP_BUNDLE is still set — so the fix needs only a server
+        restart, no env surgery.
+      • Style-mode slots in the legacy path now use FULL-STRENGTH in-context (img2img_strength forced
+        to 1.0), replacing the old ×0.5 half-weight that yielded 0.19 → a near-literal ref copy.
+      • Saved style_codes (no image upload) can only be realized by the adapter; with the adapter
+        disabled they now return a clear HTTP 400 ("upload the reference image … or set
+        IRIS_SREF_ADAPTER=1") instead of silently misbehaving.
+      • Verified by an in-process Flask test-client routing test (queue_generation patched):
+        A (adapter off, bundle set): style image → in-context, img2img_strength 1.0, sref=None; style_code → 400.
+        B (adapter on, bundle set): style image → trained adapter (sref=True). C (adapter on, no bundle): fail-open to in-context.
+        Python-only change; no C/binary touched, so make mps/make test not implicated. Repro script:
+        scratchpad/test_routing.py.
+      • ACTION FOR USER: restart the web server to load the new code (`web/venv/bin/python web/server.py`).
+        After restart the style upload path gives clean in-context transfer by default.
+
+    NEXT STEPS (priority order):
+      1. RETRAIN the IP-adapter to fix the mode collapse — the only path to TRUE --sref (match THIS
+         reference's specific style, not a generic painterly/in-context-composition look). Before any
+         training spend, run the cheap diagnostic in debug/sref_ref_discrimination.py on existing
+         checkpoints (vary ref at fixed seed/prompt; cross-ref output corr must drop well below ~0.9).
+         If even early/other checkpoints collapse, suspect the conditioning path (perceiver bottleneck /
+         FiLM / ip-KV projections), not the data recipe. Collapse candidates on record: only 3000 steps;
+         128-query perceiver bottleneck; style-pairing signal too weak / largely ignored.
+      2. MANDATORY GATE going forward: every champion A/B must report BOTH eval sets AND a reference-
+         discrimination corr. A high sref_score with cross-ref corr ≥ ~0.9 is a mode-collapse FALSE
+         POSITIVE. (Codified under SREF-CHAMPION-COLLAPSE.)
+      3. PRODUCT/UX: in-context conditioning is a real, shippable "style transfer" (it IS what the user
+         loved) but it leans on the reference's COMPOSITION more than Midjourney --sref does. Decide UI
+         copy: label the current default honestly (e.g. "style transfer (in-context)") and keep the
+         trained-adapter --sref behind the retrain. The "strength" slider is inert for style mode while
+         in-context (forced to 1.0) — either hide it for style mode or repurpose it.
+      4. CLEANUP / CONSISTENCY: revisit whether IRIS_IP_BUNDLE should still be set in run.sh / the
+         launch env at all while the adapter is disabled (currently harmless given the flag gate, but
+         confusing). Once the retrain lands and the adapter is re-enabled, flip IRIS_SREF_ADAPTER=1.
+      5. KEEP: the B2 fused-inject + SREF-3 resident-daemon speed work (4.5–9×) is unaffected and stays
+         — it just won't be exercised until the adapter is re-enabled.
+    Artifacts: scratchpad/img2img_repro/{churchill,cyberfika}_incontext.png (clean, = user's images),
+    scratchpad/isolate/*.png (6 collapsed adapter outputs, corr 0.983), scratchpad/test_routing.py.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans

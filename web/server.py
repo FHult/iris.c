@@ -41,10 +41,12 @@ DEFAULT_IRIS_BINARY = PROJECT_DIR / "iris"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 
 # ── SREF-3: style-reference (IP-Adapter) sidecar ─────────────────────────────
-# A reference slot with mode "style" routes through the trained IP-Adapter when
-# a bundle is configured; otherwise the legacy half-weight img2img heuristic
-# applies (fail-open). Features are computed out-of-process by the training
-# venv (mlx_vlm SigLIP) until G-1 Phase 3 brings SigLIP into the C engine.
+# A reference slot with mode "style" routes through IN-CONTEXT img2img conditioning by default
+# (reference as extra tokens, prompt drives content — the clean reference-specific style transfer).
+# The trained IP-Adapter is OPT-IN (IRIS_SREF_ADAPTER=1) and gated behind a retrain because the
+# shipped champion is mode-collapsed (BACKLOG SREF-CHAMPION-COLLAPSE). When the adapter is enabled
+# AND a bundle is configured, style slots route through it instead. Adapter features are computed
+# out-of-process by the training venv (mlx_vlm SigLIP) until G-1 Phase 3 brings SigLIP into C.
 SREF_DIR = OUTPUT_DIR / "sref"
 IP_BUNDLE = os.environ.get("IRIS_IP_BUNDLE")  # exported adapter bundle dir
 TRAIN_VENV_PY = PROJECT_DIR / "train" / ".venv" / "bin" / "python"
@@ -69,6 +71,12 @@ SREF_COND_MODE = _bundle_cond_mode()
 # "SREF CHAMPION PINNED"). ~0.70 is the mechanism ceiling; 0.38 = ratio 0.666 / retain 0.827 with
 # margin for per-image variance (0.39 is the aggressive edge). Override via IRIS_SREF_STRENGTH.
 SREF_DEFAULT_STRENGTH = float(os.environ.get("IRIS_SREF_STRENGTH", "0.38"))
+# SREF-CHAMPION-COLLAPSE (BACKLOG, 2026-06-29): the shipped IP-Adapter champion is mode-collapsed
+# (maps every reference to ~the same warm-painterly cat; cross-ref output corr 0.983). The clean
+# reference-specific style transfer users loved came from IN-CONTEXT img2img conditioning, not the
+# adapter. So default the web "style" path to in-context conditioning; the trained adapter is
+# OPT-IN until the retrain + discrimination gate lands. Set IRIS_SREF_ADAPTER=1 to re-enable it.
+SREF_USE_ADAPTER = os.environ.get("IRIS_SREF_ADAPTER", "0").strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def normalize_ip_schedule(spec):
@@ -1261,16 +1269,22 @@ def generate():
 
     reference_slots = [_normalise_ref(r) for r in raw_refs if r]
 
-    # SREF-3: a "style"-mode slot routes through the trained IP-Adapter when a
-    # bundle is configured (IRIS_IP_BUNDLE env). v1: single style reference,
-    # txt2img only (other slots ignored on this path). Without a bundle, the
-    # legacy half-weight img2img heuristic below still applies (fail-open).
-    # SREF-3: a "style"-mode reference slot OR a saved style_code routes through
-    # the trained IP-Adapter when a bundle is configured. style_code reuses a
-    # saved look with no image upload (Midjourney --sref <code> model).
+    # A "style"-mode reference routes through IN-CONTEXT img2img conditioning by default
+    # (full-strength reference-as-tokens, prompt drives content — the clean style transfer
+    # users loved). The trained IP-Adapter is OPT-IN (IRIS_SREF_ADAPTER=1) and gated behind a
+    # retrain because the shipped champion is mode-collapsed (BACKLOG SREF-CHAMPION-COLLAPSE).
+    # When the adapter is enabled AND a bundle exists, style slots / saved style_codes route
+    # through it instead. style_code reuses a saved look with no image upload (Midjourney
+    # --sref <code> model) and therefore REQUIRES the adapter (in-context needs an image).
     style_slots = [s for s in reference_slots if s.get("mode") == "style"]
     style_code = (data.get("style_code") or "").strip()
-    if (style_slots or style_code) and IP_BUNDLE and Path(IP_BUNDLE).exists():
+    adapter_available = SREF_USE_ADAPTER and IP_BUNDLE and Path(IP_BUNDLE).exists()
+    if style_code and not adapter_available:
+        return jsonify({"error": "Saved style codes require the trained IP-Adapter, which is "
+                                 "disabled pending retrain (mode collapse — BACKLOG "
+                                 "SREF-CHAMPION-COLLAPSE). Upload the reference image to use "
+                                 "in-context style transfer, or set IRIS_SREF_ADAPTER=1."}), 400
+    if (style_slots or style_code) and adapter_available:
         ip_scale = SREF_DEFAULT_STRENGTH
         # Optional injection-timing schedule (advanced; shifts style/content trade-off,
         # does not raise the quality ceiling — BACKLOG DP-7). Validated server-side.
@@ -1326,13 +1340,17 @@ def generate():
 
     # Derive effective img2img_strength: take the minimum slot strength so the
     # most-constrained slot drives the global noise level (C backend uses one value).
-    # Style-mode slots get half-weight to reduce composition influence.
+    # Style-mode slots use FULL-STRENGTH in-context conditioning (img2img_strength 1.0):
+    # the reference enters as extra tokens and the prompt drives content, which is the
+    # clean reference-specific style transfer. (The old ×0.5 half-weight produced a
+    # near-literal copy of the reference at 0.19, not a style transfer — BACKLOG
+    # SREF-CHAMPION-COLLAPSE correction.)
     if reference_slots:
         effective_strengths = []
         for s in reference_slots:
             w = float(s.get("strength", 1.0))
             if s.get("mode") == "style":
-                w *= 0.5
+                w = 1.0
             effective_strengths.append(w)
         # Use minimum — preserves the strongest constraint; override only when
         # caller explicitly set img2img_strength at the request level.
