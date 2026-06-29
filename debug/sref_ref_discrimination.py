@@ -89,7 +89,7 @@ def main():
         names = list(styled)
         cross = [float(np.corrcoef(styled[x], styled[y])[0, 1]) for x, y in itertools.combinations(names, 2)]
         vs_base = [float(np.corrcoef(styled[n], b)[0, 1]) for n in names]
-        cmean_cross, max_cross = float(np.mean(cross)), float(np.max(cross))
+        mean_cross, max_cross = float(np.mean(cross)), float(np.max(cross))
         mean_base = float(np.mean(vs_base))
         print(f"\ncross-reference output corr: mean {mean_cross:.3f}  max {max_cross:.3f}  (n_refs={len(names)})")
         print(f"styled-vs-no-adapter corr:   mean {mean_base:.3f}")
