@@ -1196,102 +1196,6 @@ def resolve_style_code(code: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-# iris CLI stderr markers: "  Step N/M " (cli_step_callback) and "<Phase>..." (cli_phase_callback).
-_SREF_STEP_RE = re.compile(r"Step\s+(\d+)\s*/\s*(\d+)")
-_SREF_TIMEOUT_S = 1800
-
-
-def run_generation_sref(job, prompt, width, height, steps, seed,
-                        features_path, ip_scale, guidance=None, ip_schedule=None):
-    """One-shot `iris --ip` run for a style-reference generation.
-
-    The persistent server loads --ip at startup only, so style generations use a
-    dedicated process — slower (model load per image, and the adapter forces the
-    CPU block path; GPU-native inject is BACKLOG SREF-3). To keep the UI from
-    looking stalled during those minutes, iris's per-step / phase stderr is parsed
-    and streamed as the same progress/status events the resident path emits."""
-    job.status = "running"
-    job.total_steps = steps
-    job.phase = "Loading model"
-    job.put_event(("status", job.to_dict()))   # show activity before step 1 (model load)
-    out_path = OUTPUT_DIR / f"{job.id}.png"
-    cmd = [str(iris_server.iris_binary), "-d", str(iris_server.model_dir),
-           "-p", prompt, "-o", str(out_path),
-           "-W", str(width), "-H", str(height), "--steps", str(steps),
-           "--ip", str(IP_BUNDLE), "--ip-features", str(features_path),
-           "--ip-scale", str(ip_scale)]
-    if ip_schedule:
-        cmd += ["--ip-schedule", ip_schedule]
-    if seed is not None:
-        cmd += ["--seed", str(seed)]
-    if guidance:
-        cmd += ["--guidance", str(guidance)]
-    t0 = time.time()
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True,
-                                bufsize=1, cwd=str(PROJECT_DIR))
-        # Stream stderr char-by-char (iris flushes per substep; lines are \r/\n
-        # terminated, but a phase start "X..." has no newline until it finishes —
-        # detect the "..." in the pending buffer for a live phase update).
-        tail, pending, last_phase = [], "", None
-        while True:
-            ch = proc.stderr.read(1)
-            if ch == "":
-                break
-            if ch in "\r\n":
-                line = pending.strip()
-                pending = ""
-                if line:
-                    tail.append(line)
-                    if len(tail) > 30:
-                        tail.pop(0)
-                    m = _SREF_STEP_RE.search(line)
-                    if m:
-                        job.progress, job.total_steps = int(m.group(1)), int(m.group(2))
-                        job.phase = "Denoising"
-                        d = job.to_dict()
-                        d["elapsed"] = time.time() - t0
-                        job.put_event(("progress", d))
-                if time.time() - t0 > _SREF_TIMEOUT_S:
-                    proc.kill()
-                    raise RuntimeError(f"iris timed out ({_SREF_TIMEOUT_S}s)")
-                continue
-            pending += ch
-            if pending.endswith("...") and "Step" not in pending:
-                ph = pending.strip()[:-3].strip()
-                if ph and ph != last_phase:
-                    last_phase = ph
-                    job.phase = ph
-                    job.put_event(("status", job.to_dict()))
-        proc.wait()
-        if proc.returncode != 0 or not out_path.exists():
-            raise RuntimeError("\n".join(tail[-6:]) or f"iris exited {proc.returncode}")
-        job.status = "complete"
-        job.output_path = out_path
-        job.progress = job.total_steps
-        job.generation_time = time.time() - t0
-        job.cleanup_temp_files()
-        threading.Thread(target=generate_thumbnail,
-                         args=(job.id, out_path), daemon=True).start()
-        with history_lock:
-            history.insert(0, job)
-            history_by_id[job.id] = job
-            if len(history) > MAX_HISTORY:
-                old_job = history.pop()
-                history_by_id.pop(old_job.id, None)
-            mark_history_dirty()
-        job.put_event(("complete", {"image_url": f"/image/{job.id}",
-                                    "total_time": job.generation_time}))
-        job.put_event(("done", None))
-    except Exception as e:
-        job.status = "error"
-        job.error = str(e)
-        job.cleanup_temp_files()
-        job.put_event(("error", {"message": job.error}))
-        job.put_event(("done", None))
-
-
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -1401,17 +1305,20 @@ def generate():
         job = Job(job_id, prompt=prompt, width=width, height=height, steps=steps)
         job.batch_id = batch_id
         job.style = style if (style and style in STYLE_PRESETS) else None
+        # Route sref through the RESIDENT daemon: the per-request adapter attach (SREF-3 A)
+        # uses the B2 fused on-GPU inject (BACKLOG SREF-3 B2 / BUGS.md SREF-DAEMON-1 RESOLVED),
+        # which is correct on a warm daemon and ~4.5x faster than the one-shot — and avoids
+        # the per-gen base-model reload. The IP params ride on the job; IrisServer.generate
+        # forwards ip_bundle/ip_features/ip_scale/ip_schedule to the server request.
+        job.ip_bundle = IP_BUNDLE
+        job.ip_features = str(features_path)
+        job.ip_scale = ip_scale
+        job.ip_schedule = ip_schedule
         with jobs_lock:
             jobs[job_id] = job
-        # NOTE: routing sref through the resident daemon (per-request adapter attach,
-        # SREF-3 A) is implemented in the C server but currently produces CORRUPT output
-        # on a warm daemon (BUGS.md SREF-DAEMON-1) — so we use the working one-shot path
-        # (reloads the model per gen, but correct). Switch back once the daemon bug is fixed.
-        threading.Thread(
-            target=run_generation_sref,
-            args=(job, generation_prompt, width, height, steps, seed,
-                  features_path, ip_scale, guidance, ip_schedule),
-            daemon=True).start()
+        queue_generation(job, generation_prompt, width, height, steps, seed,
+                         None, None, show_steps, guidance, None, None, 1.0, 1.0,
+                         negative_prompt)
         return jsonify({"job_id": job_id, "status": "started", "sref": True,
                         "style_code": style_code or None,
                         "ip_schedule": ip_schedule or "none",

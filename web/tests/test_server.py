@@ -1533,7 +1533,7 @@ class TestSrefRouting:
         monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
         monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
         called = {}
-        monkeypatch.setattr(srv, "run_generation_sref",
+        monkeypatch.setattr(srv, "queue_generation",
                             lambda *a, **k: called.setdefault("args", a))
         r = client.post("/generate", json={
             "prompt": "a castle",
@@ -1543,6 +1543,7 @@ class TestSrefRouting:
         assert r.status_code == 200
         body = r.get_json()
         assert body.get("sref") is True
+        assert called["args"][0].ip_bundle == str(bundle)   # IP params set on the job
         with srv.jobs_lock:
             assert body["job_id"] in srv.jobs
 
@@ -1611,7 +1612,7 @@ class TestStyleCodes:
         self._wire(srv, tmp_path, monkeypatch)
         code = client.post("/sref/codes", json={"image": self._PNG}).get_json()["code"]
         called = {}
-        monkeypatch.setattr(srv, "run_generation_sref",
+        monkeypatch.setattr(srv, "queue_generation",
                             lambda *a, **k: called.setdefault("ok", True))
         r = client.post("/generate", json={"prompt": "a castle", "style_code": code})
         assert r.status_code == 200
@@ -1648,7 +1649,9 @@ class TestSrefCompletion:
         monkeypatch.setattr(srv, "IP_BUNDLE", str(bundle))
         monkeypatch.setattr(srv, "compute_sref_features", lambda b: feats)
         captured = {}
-        monkeypatch.setattr(srv, "run_generation_sref",
+        # sref now rides the resident daemon: IP params are set on the job and
+        # queue_generation(job, ...) is called. Capture the call args (args[0] = job).
+        monkeypatch.setattr(srv, "queue_generation",
                             lambda *a, **k: captured.setdefault("args", a))
         return captured
 
@@ -1678,8 +1681,8 @@ class TestSrefCompletion:
             "ip_schedule": "late:0.5",
         })
         assert r.status_code == 200 and r.get_json()["sref"] is True
-        # run_generation_sref(job, prompt, w, h, steps, seed, feats, ip_scale, guidance, ip_schedule)
-        assert cap["args"][9] == "late:0.5"
+        # queue_generation(job, ...); the schedule rides on the job for the daemon request.
+        assert cap["args"][0].ip_schedule == "late:0.5"
 
     def test_bad_ip_schedule_rejected(self, client, tmp_path, monkeypatch):
         import server as srv
@@ -1699,7 +1702,7 @@ class TestSrefCompletion:
             "reference_images": [{"data": self._PNG, "strength": 0.4, "mode": "style"}],
         })
         assert r.status_code == 200
-        assert cap["args"][9] is None          # omitted → constant injection
+        assert cap["args"][0].ip_schedule is None   # omitted → constant injection
         assert r.get_json()["ip_schedule"] == "none"
 
     # ── 0.38 default strength when the slot omits one ───────────────────────
@@ -1711,7 +1714,7 @@ class TestSrefCompletion:
             "reference_images": [{"data": self._PNG, "mode": "style"}],  # no strength
         })
         assert r.status_code == 200
-        assert cap["args"][7] == pytest.approx(srv.SREF_DEFAULT_STRENGTH)
+        assert cap["args"][0].ip_scale == pytest.approx(srv.SREF_DEFAULT_STRENGTH)
 
     # ── single-reference: extra style slots warned, not silently dropped ────
     def test_multi_style_warns(self, client, tmp_path, monkeypatch):
