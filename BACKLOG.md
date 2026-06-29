@@ -2917,6 +2917,101 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     Artifacts: scratchpad/img2img_repro/{churchill,cyberfika}_incontext.png (clean, = user's images),
     scratchpad/isolate/*.png (6 collapsed adapter outputs, corr 0.983), scratchpad/test_routing.py.
 
+  - **SREF IN-CONTEXT vs TRAINED ADAPTER — NO DOUBLE-WHAMMY (mutual exclusivity, verified 2026-06-29).**
+    Owner hypothesis: when the adapter is active, is the reference ALSO fed through in-context img2img
+    conditioning — stacking two style injections into an over-cooked "too hot" state that explains the
+    collapse — and could we fix it by dialing the in-context part down while the adapter runs? ANSWER: NO,
+    there is no stacking.
+      • The two paths are MUTUALLY EXCLUSIVE in web/server.py /generate. The adapter branch calls
+        `queue_generation(..., input_image_path=None, reference_image_paths=None, ...)` (server.py:1333-1335)
+        then returns immediately — the reference image is NEVER passed as an img2img/in-context input. It is
+        encoded to SigLIP+CSD features (`job.ip_features`, server.py:1328) and injected ONLY via
+        cross-attention K/V. The legacy in-context path passes the image AS input_image and attaches NO
+        adapter. One request → exactly one path.
+      • PREMISE CORRECTION: "img2img is how we supply the reference for the adapter" is false. The adapter is
+        fed by FEATURE ENCODING (the SigLIP+CSD .bin), not img2img. img2img/in-context is a separate
+        mechanism that only looks similar from the UI ("upload a reference").
+      • COLLAPSE IS INTRINSIC, already proven IN ISOLATION: the isolation test ran the adapter with
+        features-only and NO -i image (pure adapter, zero in-context) and 6 distinct refs STILL gave one
+        constant cat (output corr 0.983). Removing in-context cannot help — there is none in that path. So
+        "too hot from stacking" is ruled out; the adapter maps every reference to ~the same injection on its
+        own. There is nothing to dial down.
+      • DELIBERATE DESIGN (keep): input_image=None in the adapter path is correct — --sref is txt2img + style
+        injection (the Midjourney model), not img2img. Feeding the image in-context TOO would create the real
+        double whammy; the architecture already avoids it.
+      • FUTURE OPTION (only AFTER the adapter works): a deliberate HYBRID — in-context for composition-aware
+        base + adapter style push, each at partial strength (balance the two knobs). With a COLLAPSED adapter
+        this is strictly worse (smears the constant cat onto an otherwise-good in-context result); revisit
+        post-retrain.
+
+  - **SREF ADAPTER RETRAIN — DIAGNOSTIC-FIRST PLAN (the one path to true --sref; opened 2026-06-29).** True
+    --sref (match THIS reference's specific style, content-INDEPENDENT — not the in-context composition look)
+    requires a non-collapsed adapter. Do NOT spend training time before the cheap diagnostic localizes the
+    fault — it branches the entire retrain strategy.
+
+    STEP 0 — DISCRIMINATION SWEEP ON EXISTING CHECKPOINTS (no training; GPU-bound on gens only). Tool:
+    `debug/sref_ref_discrimination.py --bundle B --feat r1.bin r2.bin ... [--scale 0.38 --seed S --size 512]`.
+    PASS = max cross-ref output corr < ~0.90 AND clearly above the no-adapter floor. Material confirmed on
+    disk (2026-06-29):
+      (a) 15 EXPORTED ARMS in /Volumes/2TBSSD/sref_eval/*/bundle: clean_base, clean_concentrate,
+          clean_concentrate_leak (champion), clean_leak, clean_leak025, clean_pool9, clean_hier,
+          clean_siglipdn, style_arm, hybrid_arm, hybrid_hier, hybrid_siglipdown, leak1_pshuf, leak2_xref,
+          csd_arm. 8 simple-set ref bins in /Volumes/2TBSSD/sref_eval/refs_feat_hybrid_simple/.
+      (b) PRE/POST INPUT-NORM bundles: /Volumes/2TBSSD/sref_sweep/{bundle_inputnorm, bundle_confirm_fix} —
+          the decisive test of whether the IP-ADAPTER-INFER-1 grid fix ever bought reference-specificity.
+      (c) Champion intermediate ckpts: clean_concentrate_leak/ckpt/step_{0002500,0003000}.safetensors + best
+          — but BOTH are LATE; NO genuinely-early snapshot exists (gap — a within-run early/late curve needs a
+          fresh run, STEP 2). Testing step_2500 needs an export first (export_adapter.py).
+
+    THE BRANCH (what STEP 0 decides):
+      • If ALL arms + bundle_inputnorm collapse (cross-ref corr ≥ ~0.9 everywhere) → the CONDITIONING PATH is
+        the suspect, NOT data/recipe. LIKELY OUTCOME: the historical IP-ADAPTER-INFER-1 collapse (a few
+        massive-activation SigLIP dims dominate the perceiver Q·K → every learned query attends ONE token →
+        pooled/constant injection) was fixed for its GRID symptom by input-norm but, per memory, may have
+        survived as a CONSTANT-STYLE output. If bundle_inputnorm ALSO collapses on discrimination, that
+        CONFIRMS input-norm only removed the grid, never bought reference-specificity → fix is ARCHITECTURAL
+        (STEP 1A).
+      • If SOME arms discriminate (corr < ~0.9) → recipe/data/duration matters → STEP 1B. NOTE: the
+        all-painterly eval confounded every prior sref_score, so DO NOT trust the old arm ranking — re-rank
+        arms by DISCRIMINATION, not score.
+
+    STEP 1A — IF CONDITIONING-PATH BOUND (architectural retrain). Candidate levers, cheapest first, each
+    GATED by the discrimination test before a full run:
+      1. Per-query DIVERSITY regularization in PerceiverResampler — attention-entropy / query-orthogonality
+         penalty so queries can't all collapse onto one key. Directly targets the collapse mechanism.
+      2. K/V injection RANK audit (cheap OFFLINE probe, no training): measure variance of to_k_ip/to_v_ip
+         outputs across references. If the perceiver output IS diverse but the projections collapse it to a
+         near-constant injection, the fault is the projection, not the perceiver.
+      3. CSD/FiLM path check: FiLM-zero init starts inert — confirm the CSD style vector actually contributes
+         (ablate SigLIP rows → does style survive on CSD alone? ablate CSD → does discrimination change?). If
+         style rides entirely on the collapsed SigLIP perceiver, rebalance toward CSD (CSD-dominant
+         conditioning is a logged speculative lever).
+      4. Stronger/different input normalization than per-dim z-score+affine (the learned affine can relearn
+         the outlier imbalance) — clip massive-activation dims or use fixed standardization.
+      5. Wider/deeper perceiver ONLY if 1–4 implicate capacity (less likely than attention collapse).
+      PLUS a DISCRIMINATION-AWARE TRAINING SIGNAL (not just eval): a contrastive/repulsion term that punishes
+      reference-agnostic output, so the optimizer can't minimize loss by injecting a generic style. This is
+      the single most likely MISSING ingredient — the current loss lets a constant injection win.
+
+    STEP 1B — IF RECIPE-BOUND. Train the discriminating recipe longer than 3000 steps (undertraining is a
+    logged candidate) with that arm's data-concentration + leak objective; re-gate on discrimination at each
+    checkpoint.
+
+    STEP 2 — INSTRUMENT THE RETRAIN (either branch). Checkpoint frequently (e.g. every 250–500 steps) and run
+    the discrimination test PER checkpoint → an early/late discrimination CURVE answering "did it ever
+    discriminate then collapse, or never discriminate?" (the within-run question the step-2500/3000-only ckpts
+    can't). Promote a checkpoint ONLY if it PASSES discrimination — the new mandatory gate, NOT sref_score.
+
+    STEP 3 — RE-ENABLE + VALIDATE. When a checkpoint passes discrimination: export it, set IRIS_SREF_ADAPTER=1,
+    and A/B the trained adapter vs in-context on the DIVERGENCE test (style/content-mismatched pair, e.g. a
+    painterly landscape ref + "a portrait of a woman") to confirm it delivers what in-context structurally
+    cannot (style WITHOUT the reference's composition). Until then the web default stays on in-context.
+
+    PREREQS / PITFALLS (carried): probes run CACHED only (live-encode segfaults MLX — BUGS MLX-1); NEVER train
+    from cold storage (AGENT #6 — copy shards to hot SSD first); `make mps` after any C inference/inject
+    change; the B2 fused inject + SREF-3 resident daemon are unaffected and ready the moment the adapter is
+    re-enabled.
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
