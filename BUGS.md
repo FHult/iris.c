@@ -444,7 +444,17 @@
   daemon = wire the IP-Adapter inject INTO the fused bf16 pipeline (BACKLOG SREF-3 part B2). That pipeline
   already (i) uses batched MPSGraph linears that dodge this bug and (ii) keeps activations on-GPU; injecting
   to_k_ip/to_v_ip there via SDPA gives bf16-speed correct sref with the model resident. Larger but well-scoped
-  work. Until then: SHIP THE ONE-SHOT (bf16, ~98 s, correct). All round-5 code reverted; C tree clean.
+  work. Until then: SHIP THE ONE-SHOT (bf16, correct). All round-5 code reverted; C tree clean.
+  CORRECTION (2026-06-29, clean re-measure): the "MPSGraph ~5× slower" framing above is WRONG — it compared
+  MPSGraph to the FUSED path's ~42 s, but an attached adapter forces the slow PER-BLOCK path for BOTH bf16 and
+  MPSGraph. Measured one-shot sref @576/4steps: bf16 per-block = 224 s (coherent), MPSGraph per-block = 218 s
+  (coherent) — EQUAL. So MPSGraph does NOT regress sref speed; the per-block path itself is the ~220 s
+  bottleneck (synchronous CPU↔GPU round-trip per linear, ~50 s/step). The bf16 DAEMON's earlier "42 s" was the
+  no-adapter FUSED path / a broken short-circuited run, not a valid correct sref baseline. Net: (1) the
+  MPSGraph per-block daemon is a VALID correct path (zero extra memory, ~same speed as the one-shot, saves only
+  the small reload); (2) the REAL win is B2 — wire the IP-Adapter inject into the FUSED bf16 pipeline (~5×
+  faster, ~42 s, on-GPU/batched, already uses MPSGraph linears that dodge this defect). B2 speeds up BOTH the
+  one-shot and the daemon sref and is the high-value next step.
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
