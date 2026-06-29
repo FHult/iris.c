@@ -404,6 +404,28 @@
       and works warm) vs bf16 for the per-block linears. The WORKING one-shot remains shipped; daemon
       model-reuse (BACKLOG SREF-3 part A) stays blocked on this. All round-3 instrumentation reverted; C tree
       unchanged from the committed working state.
+  ROUND 4 — f32-PATH A/B CONFIRMS THE CULPRIT (2026-06-29). Added a global iris_force_f32_linear that, while
+  an IP-Adapter is attached, routes iris_linear_nobias_bf16 through the f32 GEMM (iris_metal_sgemm) instead
+  of iris_metal_sgemm_bf16. RESULT: the warm-daemon sref render is CORRECT (coherent, no black, byte-for-byte
+  the same subject as the one-shot) — so the defect is SPECIFICALLY the bf16 (f32×f16 mixed-precision) GPU
+  GEMM; the f32×f32 path is immune. Two sub-findings:
+    (a) The f32 fallback in iris_linear_nobias_bf16 was itself BUGGY: it converted bf16→f32 into a per-call
+        malloc'd temporary and called iris_linear_nobias → iris_metal_sgemm_CACHED, which keys the weight
+        buffer by POINTER. A freed+reused W_f32 address served a stale GPU buffer → NOISE (same class as the
+        Z-Image B-cache pitfall). Fix: route the temporary through the NON-cached iris_matmul_t. With that, the
+        f32 path renders correctly in BOTH the fresh one-shot and the warm daemon.
+    (b) The f16 residency-eviction theory was tested and DISPROVEN: adding the f16 weight buffers to
+        g_residency_set (addAllocation+commit) + bumping F16 cache so all weights cache → daemon STILL black.
+        So the bf16 GEMM zero-write is NOT f16-weight non-residency.
+  PERF VERDICT — f32 workaround is correct but NOT a net win as-is: warm-daemon f32 sref = ~287 s vs the
+  one-shot's ~98 s (reload ~56 s + bf16 gen ~42 s; bf16 no-IP one-shot @576/4steps measured 36.9 s). The ~245 s
+  overhead is per-call bf16→f32 weight conversion + re-upload (the fused-QKV weight alone is 340 MB, re-done
+  every call). A FAST correct daemon needs the f32 weights CACHED in a GPU buffer keyed by the STABLE bf16
+  source pointer (mirror get_cached_bf16_as_f16_buffer but f32 + an f32×f32 sgemm that uses it) — est. ~+8 GB
+  unified memory (f32 vs f16 weight cache) and est. ~70 s/gen daemon (~28 s/image win over the one-shot).
+  DECISION PENDING (memory cost vs modest win). All round-4 instrumentation reverted EXCEPT none committed yet;
+  C tree clean, one-shot fast (bf16) and unaffected. The genuine fallback bug fix (a) is worth landing
+  regardless if the cached-f32 path is pursued.
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
