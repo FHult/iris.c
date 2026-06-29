@@ -2626,6 +2626,19 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (A) STATUS (2026-06-28): C server-mode IP support BUILT (commit 3872f90) + timings verified (no
       model reload), but the per-request attach produces CORRUPT (noise) output on a warm daemon —
       BUGS.md SREF-DAEMON-1. Web reverted to the working one-shot path; (A) is BLOCKED on that bug.
+    ✅ B2 DONE (2026-06-29, commit beae1b9): IP inject implemented INSIDE the fused bf16 single-block
+      pipeline, fully on-GPU (ip_fused_prepare precomputes per-block k_ip + ip_scale*v_ip as bf16 GPU
+      tensors once per gen — they're step-independent; Phase-11 in single_block_forward_bf16 slices the
+      post-QK-norm image-Q, runs iris_gpu_attention_fused_bf16, zero-pads + adds). Gated to style-only
+      adapters (double-block |ip_scale|≤1e-6). Result @576/4steps: one-shot 224s→50s, warm daemon 38s
+      (4.5–6×), parity vs per-block corr 0.9998 (max|Δ| 9/255), no extra memory, MPS/BLAS/generic build
+      clean. **This ALSO resolves SREF-DAEMON-1** (the fused path uses MPSGraph linears, not the buggy
+      MPSMatrixMultiplication), so the daemon attach now renders correctly — i.e. (A) is unblocked.
+      The web one-shot (`iris --ip`) gets the speedup automatically (txt2img gate). Remaining for the
+      FULL (A) daemon model-reuse: re-enable IrisServer.generate's per-request IP forwarding (the
+      web/main.c wiring that was reverted) — saves the extra ~12s reload (50s→38s) + keeps the model
+      resident. B1 is now moot (B2 supersedes it). img2img sref still uses the per-block path (gates
+      4230/4475 left as !tf->ip — txt2img is the web path).
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
