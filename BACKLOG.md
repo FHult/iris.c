@@ -2696,6 +2696,62 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     leak cases (the flamenco) are reproducible. Harness already supports a second --pairs file; this is
     asset curation + one json, no code. Tie-in: this set also becomes the regression guard for any
     future base-model adapter (SREF-BASE-1) or multi-ref work.
+    DONE (2026-06-29): simple set BUILT — `/Volumes/2TBSSD/sref_eval/eval_set_simple.json`, 8 refs in
+    `refs_simple/` (6 generated anchors: lineart_ink, flat_sticker, mono_inkwash, bold_vector_poster,
+    halftone_comic, woodcut + owner cyberfika sticker + Churchill coloring-page line-art), hybrid+CSD
+    features in `refs_feat_hybrid_simple/` + `refs_feat_csd_simple/`. Building it immediately exposed
+    SREF-CHAMPION-COLLAPSE below.
+
+  - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
+    near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
+    sref_score was an artifact of an all-painterly eval set. Recontextualizes the ENTIRE SREF campaign.**
+    Discovered via the new simple-style eval set (every simple ref came out as the same muddy-brown cat).
+    CONTROLLED TEST (hold prompt="a cat sitting on a chair", seed, scale 0.38, 512px; vary ONLY the
+    reference; pixel-correlate the outputs):
+      • 7 wildly different refs — 5 in-distribution WikiArt paintings (impressionism/cubism/baroque/
+        expressionism/artnouveau) + Churchill line-art + kawaii sticker — produce NEAR-IDENTICAL outputs:
+        pairwise corr ≥ 0.984, painting-vs-painting mean 0.991 (min 0.986), painting-vs-sticker 0.989;
+        differ by < 3/255 per channel.
+      • vs no-adapter baseline: corr 0.375 — so the adapter transforms the image STRONGLY; the injection
+        is strong but CONSTANT, not weak. (Rules out "0.38 is just too low to see differences".)
+      • Replicated at seed 123: cross-ref corr mean 0.988 (line-art vs graphic vs painting). Not a
+        seed/prompt pathology — the controlled design isolates the reference effect and it is ~0.
+      • Distinct features → identical outputs: different reference FEATURES correlate only ~0.30–0.42 in
+        feature space (e.g. churchill-vs-artnouveau feat corr 0.33), yet OUTPUTS corr 0.99. The perceiver
+        + ip_k/ip_v projections collapse diverse style inputs to a near-constant K/V injection.
+      • New simple-style eval @0.38 (16 pairs): ALL 8 styles NEGATIVE Δstyle (style_sim −0.077..+0.037 vs
+        null +0.004), per-style sref_score −0.23..−0.40, aggregate Δstyle −0.026 WASH. Contrast the
+        painting set's Δstyle +0.116 — the SAME constant output scores + on warm/painterly paintings and
+        − on high-key graphic styles.
+    WHY THE PAINTING EVAL NEVER CAUGHT IT: all 5 eval paintings are warm/dark/painterly, so a constant
+    painterly output correlates with each one → inflated style_sim → "0.70 sref_score". The eval measured
+    "applies a generic painterly look," NOT "transfers THIS reference's style." It is a SEVERELY
+    confounded metric on a homogeneous eval set.
+    NOT A BUG IN TODAY'S WORK: the per-block inject path (IRIS_NO_FUSED_IP=1, used for ALL historical
+    champion selection, golden-parity-guarded corr>0.999) collapses identically to the B2 fused path;
+    iris loads distinct per-ref features and the output ≠ no-adapter, so the adapter IS using the
+    features — it just maps them all to ~the same injection. This is TRAINING-side adapter mode collapse
+    (candidates: only 3000 steps; 128-query perceiver bottleneck; style-pairing signal too weak / largely
+    ignored; conditioning underused), NOT an inference knob.
+    IMPLICATIONS / REREADS:
+      (a) The "~0.70 ceiling is MECHANISM-bound" conclusion (DP-7 / fine-sweep / clean_concentrate_leak
+          verdicts) is EXPLAINED by this: the mechanism injects a near-constant, so data concentration,
+          leak objective, and injection timing ALL converge to ~0.70 because none of them touch
+          per-reference fidelity. The convergence wasn't three levers hitting a representational wall —
+          it was three levers all measuring the same painterly-prior artifact.
+      (b) EVERY SREF VERDICT scored on eval_set.json (the 5 paintings) is confounded and should be re-read
+          as "painterly-prior strength," not "style transfer." Champion selection among arms may be noise.
+      (c) The champion is SHIPPED in the web (commit 97e8c66). It still works as a "make-it-painterly"
+          filter (pleasing, ref-agnostic) — a product call for the owner, but it is NOT Midjourney --sref
+          (match the uploaded image's specific style). Flag honestly in any user-facing copy.
+      (d) FIX IS A RETRAIN, and the FIRST diagnostic is cheap: before any new training, measure
+          reference-discrimination on the existing checkpoints (vary ref at fixed seed/prompt; cross-ref
+          output corr must drop well below ~0.9 to claim real transfer). If even early/other checkpoints
+          collapse, the conditioning path itself (perceiver/FiLM/ip-KV) is suspect, not the data recipe.
+    NEW GATE (mandatory going forward): every champion A/B must report (1) BOTH eval sets, and (2) a
+    reference-discrimination corr (cross-ref output corr at fixed seed/prompt). A high sref_score with
+    cross-ref corr ≥ ~0.9 is a mode-collapse FALSE POSITIVE, not a win. Repro scripts:
+    `scratchpad/painting_discrim.sh` + the corr snippets in this session; promote to `debug/` if reused.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
