@@ -2644,7 +2644,58 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
       FULL (A) daemon model-reuse: re-enable IrisServer.generate's per-request IP forwarding (the
       web/main.c wiring that was reverted) — saves the extra ~12s reload (50s→38s) + keeps the model
       resident. B1 is now moot (B2 supersedes it). img2img sref still uses the per-block path (gates
-      4230/4475 left as !tf->ip — txt2img is the web path).
+      4230/4475 left as !tf->ip — txt2img is the web path). [UPDATE 2026-06-29: img2img fused-inject
+      DONE too, gates 4384/4629 wired via ip_fused_prepare, parity corr 0.9997 — commit 6c4000e.]
+
+  - **SREF QUALITATIVE LEVER TEST — CONTENT-LEAK BY REFERENCE TYPE (2026-06-29, owner-driven UI
+    testing of the shipped champion).** First real-world tests of the shipped feature on owner-supplied
+    references (the curated eval set is 5 fine-art paintings only — see SREF-EVAL-COVERAGE-GAP below).
+    FINDINGS:
+    • REFERENCE TYPE is the dominant factor in content leak, separate from ip-scale. SIMPLE styles —
+      line-art (Churchill drawing), flat sticker (cyberfika) — transfer CLEANLY at the 0.38 champion
+      strength: style adopted, zero subject bleed. COMPLEX PHOTO references with a strong foreground
+      subject (flamenco dancer) LEAK that subject's content (fan/arm/tie appeared on the cat). The
+      ~0.70 sref_score ceiling is a STYLE-vs-LEAK average; for low-content refs the usable strength is
+      effectively higher because there's little content to leak. Practical guidance for the UI: simple/
+      graphic refs → champion 0.38 constant is fine; busy photo refs → use the late schedule (below)
+      and/or crop to the texture.
+    • LEVER RANKING (4-way grid, baroque_portrait ruff-collar ref — a gently-leaking proxy for the
+      flamenco; seed 7, 576px/4steps; /tmp/bq_{A,B,C,D}). Strength {0.38,0.25} × schedule {constant,late:0.5}:
+        A 0.38 const → strong painterly style, SUBTLE collar leak
+        B 0.25 const → weak style, no leak (style mostly gone — photographic cat)
+        C 0.38 late  → strong painterly style, CLEAN (no leak)   ← winner
+        D 0.25 late  → ~no style (photographic)
+      CONCLUSION: the LATE injection schedule is a strictly better content-leak lever than lowering
+      strength. Dropping ip-scale (A→B, C→D) sheds leak but also kills the style (style and leak fall
+      together — they're the same KV-injection signal, consistent with the ~0.70 mechanism-bound
+      ceiling). The late schedule (A→C) keeps FULL style intensity while letting image structure lock
+      in during early steps before style injects, so leaked content recedes WITHOUT losing style. This
+      is a QUALITATIVE/content-headroom win, NOT a ceiling break — matches DP-7 (schedule doesn't raise
+      sref_score, but is a real content-headroom knob). The UI "Style timing → Late" selector exposes it.
+    • CAVEAT: tested on baroque_portrait, not the exact flamenco — the flamenco source/features were
+      not identifiable on disk (web only persists unlabeled feature .bin hashes in web/output/sref/, no
+      source image). baroque leaks more gently than the flamenco fan, so the cleanest demo of these
+      levers on the owner's exact image is to load it in the UI at 0.38 + late.
+
+  - **SREF-EVAL-COVERAGE-GAP (BACKLOG, opened 2026-06-29): the eval reference set is 100% complex
+    fine-art paintings — no simple-style refs, and no source-saved real-world refs.** The curated
+    A/B set (`/Volumes/2TBSSD/sref_eval/refs` + eval_set.json, the basis of every sweep/champion verdict)
+    is exactly 5 images: impressionism_landscape, cubism_stilllife, baroque_portrait, artnouveau,
+    expressionism_portrait — ALL busy painterly fine-art. The reference types that transfer BEST in
+    practice (line-art, flat vector, sticker, monochrome ink, logo/graphic) are ENTIRELY ABSENT. So
+    every sref_score/content_leak number to date is measured on the HARD (leak-prone) end of the
+    distribution and the eval never scores the easy wins or quantifies leak-severity-by-reference-type
+    (the 2026-06-29 finding above is qualitative only). Consequence for future tuning/retrained models:
+    an A/B that "wins" on the painting set could regress on simple styles undetected, and vice-versa.
+    ACTION (cheap, do before the next champion comparison): curate a SECOND eval set of ~6–10 simple/
+    graphic references (line-art, flat-color sticker, monochrome ink, bold vector, halftone/comic,
+    woodcut) spanning the easy end; precompute hybrid + CSD features (hybrid_features.py / csd_mlx);
+    add an `eval_set_simple.json` with matched neutral prompts (cat/landscape/portrait); report BOTH
+    sets side-by-side in sref_sweep_eval so champion selection sees the full style-complexity spectrum.
+    Also: persist the SOURCE image (not just the feature .bin) for web-uploaded refs so real-world
+    leak cases (the flamenco) are reproducible. Harness already supports a second --pairs file; this is
+    asset curation + one json, no code. Tie-in: this set also becomes the regression guard for any
+    future base-model adapter (SREF-BASE-1) or multi-ref work.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
