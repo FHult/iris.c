@@ -426,6 +426,25 @@
   DECISION PENDING (memory cost vs modest win). All round-4 instrumentation reverted EXCEPT none committed yet;
   C tree clean, one-shot fast (bf16) and unaffected. The genuine fallback bug fix (a) is worth landing
   regardless if the cached-f32 path is pursued.
+  ROUND 5 — MPSGraph PATH: CORRECT + NO MEMORY, BUT SLOW (2026-06-29). Built iris_metal_sgemm_bf16_mpsgraph:
+  a per-block bf16 linear via MPSGraph (f32 x placeholder, the STABLE cached bf16 weight from
+  get_cached_bf16_buffer, transpose+cast-to-f32, matmul → f32 out) — a DIFFERENT GPU code path than
+  iris_metal_sgemm_bf16's MPSMatrixMultiplication, with NO extra memory (weight stays bf16, cast happens on
+  GPU each call). Routed iris_linear_nobias_bf16 through it while an adapter is attached. RESULT: warm-daemon
+  sref render is CORRECT (coherent cat, matches one-shot) AND fresh one-shot correct — so MPSGraph dodges the
+  MPSMatrixMultiplication warm-state defect, confirming the defect is specific to MPS's MPSMatrixMultiplication
+  (mixed f32×f16) object. PERF: warm-daemon MPSGraph gen = 211 s, one-shot MPSGraph = 218 s — ~5× the bf16
+  gen (~42 s). Root cause of the slowness: the SINGLE-BLOCK path (single_block_forward) is CPU-SYNCHRONOUS
+  (each linear's output feeds CPU ops — RMSNorm, attention, SwiGLU — so it can't batch), and is NOT wrapped in
+  begin_batch (only double_block_forward batches). bf16 MPSMatrixMultiplication is cheap per-call (~0.12 s)
+  but MPSGraph's per-call encode/MPSCommandBuffer/MPSGraphTensorData setup is ~5× heavier and can't be
+  amortized in a per-call-synchronous loop. The FAST MPSGraph linears live only in the FUSED pipeline
+  (single_block_forward_bf16: on-GPU iris_gpu_tensor_t, g_tensor_batch_mode deferred, no per-call commit+wait),
+  which is gated OFF when tf->ip is set. CONCLUSION + REAL FIX: the genuinely fast + correct + zero-memory
+  daemon = wire the IP-Adapter inject INTO the fused bf16 pipeline (BACKLOG SREF-3 part B2). That pipeline
+  already (i) uses batched MPSGraph linears that dodge this bug and (ii) keeps activations on-GPU; injecting
+  to_k_ip/to_v_ip there via SDPA gives bf16-speed correct sref with the model resident. Larger but well-scoped
+  work. Until then: SHIP THE ONE-SHOT (bf16, ~98 s, correct). All round-5 code reverted; C tree clean.
 
 - **SREF-LOWRES (2026-06-28): sref at 256px produces NOISE even on the working one-shot path.** Distinct
   from SREF-DAEMON-1: one-shot `iris --ip` at 256x256 = noise, at 576x576 = coherent (same bundle). The
