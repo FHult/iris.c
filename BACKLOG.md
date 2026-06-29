@@ -2626,6 +2626,12 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (A) STATUS (2026-06-28): C server-mode IP support BUILT (commit 3872f90) + timings verified (no
       model reload), but the per-request attach produces CORRUPT (noise) output on a warm daemon —
       BUGS.md SREF-DAEMON-1. Web reverted to the working one-shot path; (A) is BLOCKED on that bug.
+    ✅ (A) DONE (2026-06-29, commit 5796d92): unblocked by B2 (which fixed the warm-daemon corruption).
+      The web sref /generate branch now sets ip_bundle/ip_features/ip_scale/ip_schedule on the job and
+      routes through queue_generation → IrisServer.generate (resident daemon, per-request attach/detach,
+      NO base-model reload). Removed the dead one-shot run_generation_sref. Live web e2e @576/4steps:
+      first gen 43s (incl. one-time model load), warm daemon **25s** (vs the old one-shot ~224s EVERY
+      time — ~9×). SREF-3 is now fully shipped: fast engine (B2) + model-reuse daemon (A).
     ✅ B2 DONE (2026-06-29, commit beae1b9): IP inject implemented INSIDE the fused bf16 single-block
       pipeline, fully on-GPU (ip_fused_prepare precomputes per-block k_ip + ip_scale*v_ip as bf16 GPU
       tensors once per gen — they're step-independent; Phase-11 in single_block_forward_bf16 slices the
