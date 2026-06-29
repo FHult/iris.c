@@ -3064,6 +3064,8 @@ static void ip_fused_free(iris_transformer_t *tf) {
  * per-block k_ip/v_ip GPU tensors + inject scratch are ready). 0 => use the per-block path. */
 static int ip_fused_prepare(iris_transformer_t *tf, int seq, int img_offset) {
     if (!tf->ip || !tf->ip_embeds) { BF16_DEBUG("[IPFUSED] no ip/embeds\n"); return 0; }
+    /* Parity/debug escape hatch: force the per-block inject path (debug/sref_fused_parity.py). */
+    if (getenv("IRIS_NO_FUSED_IP")) { BF16_DEBUG("[IPFUSED] disabled by env\n"); return 0; }
     iris_ip_adapter_t *a = tf->ip;
     /* The fused double-block path has no inject, so it is only correct when every
      * double-block scale is exactly 0 (the style-only case). Check the actual scales —
@@ -4379,7 +4381,8 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     /* Try BF16 GPU-accelerated path for img2img.
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) &&
+        (!tf->ip || ip_fused_prepare(tf, txt_seq + combined_img_seq, txt_seq))) {  /* B2: img2img sref too */
         float *bf16_output = iris_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4624,7 +4627,8 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
 #ifdef USE_METAL
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) &&
+        (!tf->ip || ip_fused_prepare(tf, txt_seq + combined_img_seq, txt_seq))) {  /* B2: img2img sref too */
         float *bf16_output = iris_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
