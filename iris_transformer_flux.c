@@ -341,6 +341,21 @@ typedef struct iris_transformer {
     float *ip_q_scratch;    /* post-QK-norm pre-RoPE image-Q copy, grown on demand */
     int    ip_q_scratch_rows;
     float *ip_kv_scratch;   /* [2 * num_image_tokens, hidden] per-block k_ip/v_ip */
+
+    /* Fused bf16 path IP inject (B2): precomputed per-block k_ip and ip_scale*v_ip as bf16
+     * GPU tensors (step-independent — built once per gen from ip_embeds), plus reusable
+     * GPU scratch for the on-GPU inject. NULL entries = blocks with ip_scale==0. Metal-only. */
+#ifdef USE_METAL
+    iris_gpu_tensor_t *ip_k_gpu;     /* [num_blocks] */
+    iris_gpu_tensor_t *ip_v_gpu;     /* [num_blocks] (already scaled by ip_scale[g]) */
+    int    ip_fused_ready;           /* 1 once precompute + scratch are built */
+    int    ip_fused_seq;             /* seq dims the inject scratch was sized for */
+    int    ip_fused_img_off;
+    iris_gpu_tensor_t ip_q_saved_gpu;   /* [img_seq, hidden] post-QK-norm pre-RoPE image-Q */
+    iris_gpu_tensor_t ip_delta_gpu;     /* [img_seq, hidden] SDPA(q,k_ip,v_ip) */
+    iris_gpu_tensor_t ip_full_delta_gpu;/* [seq, hidden] zero-padded delta for the residual add */
+    iris_gpu_tensor_t ip_zeros_txt_gpu; /* [txt_seq, hidden] zeros */
+#endif
 } iris_transformer_t;
 
 /* ========================================================================
@@ -3015,6 +3030,109 @@ static int single_block_bf16_scratch_init(single_block_bf16_scratch_t *s,
     return 1;
 }
 
+/* ========================================================================
+ * Fused bf16 IP-Adapter inject (B2)
+ *
+ * The fused bf16 path is ~5x faster than the per-block path but was gated off
+ * whenever an adapter was attached. These helpers let the fused single-block path
+ * run the inject ON-GPU (no per-block CPU sync), so sref runs at fused-path speed.
+ *
+ * k_ip/v_ip are STEP-INDEPENDENT (they depend only on ip_embeds + per-block weights),
+ * so we precompute them ONCE per gen and fold ip_scale[g] into v (SDPA is linear in V:
+ * s*SDPA(q,k,v) == SDPA(q,k,s*v)). Only single blocks carry nonzero scale here; the
+ * fused path is used only for style-only adapters (double-block ip_scale all zero).
+ * ======================================================================== */
+static void ip_fused_free(iris_transformer_t *tf) {
+    if (tf->ip_k_gpu) {
+        for (int g = 0; tf->ip && g < tf->ip->num_blocks; g++)
+            if (tf->ip_k_gpu[g]) iris_gpu_tensor_free(tf->ip_k_gpu[g]);
+        free(tf->ip_k_gpu); tf->ip_k_gpu = NULL;
+    }
+    if (tf->ip_v_gpu) {
+        for (int g = 0; tf->ip && g < tf->ip->num_blocks; g++)
+            if (tf->ip_v_gpu[g]) iris_gpu_tensor_free(tf->ip_v_gpu[g]);
+        free(tf->ip_v_gpu); tf->ip_v_gpu = NULL;
+    }
+    if (tf->ip_q_saved_gpu)   { iris_gpu_tensor_free(tf->ip_q_saved_gpu);   tf->ip_q_saved_gpu = NULL; }
+    if (tf->ip_delta_gpu)     { iris_gpu_tensor_free(tf->ip_delta_gpu);     tf->ip_delta_gpu = NULL; }
+    if (tf->ip_full_delta_gpu){ iris_gpu_tensor_free(tf->ip_full_delta_gpu);tf->ip_full_delta_gpu = NULL; }
+    if (tf->ip_zeros_txt_gpu) { iris_gpu_tensor_free(tf->ip_zeros_txt_gpu); tf->ip_zeros_txt_gpu = NULL; }
+    tf->ip_fused_ready = 0;
+}
+
+/* Returns 1 if the fused bf16 path can serve this adapter at this resolution (and the
+ * per-block k_ip/v_ip GPU tensors + inject scratch are ready). 0 => use the per-block path. */
+static int ip_fused_prepare(iris_transformer_t *tf, int seq, int img_offset) {
+    if (!tf->ip || !tf->ip_embeds) { BF16_DEBUG("[IPFUSED] no ip/embeds\n"); return 0; }
+    iris_ip_adapter_t *a = tf->ip;
+    /* The fused double-block path has no inject, so it is only correct when every
+     * double-block scale is exactly 0 (the style-only case). Check the actual scales —
+     * the meta's style_only flag is an unreliable hint (often False even when zeroed). */
+    if (!a->ip_scale) { BF16_DEBUG("[IPFUSED] no ip_scale\n"); return 0; }
+    /* Treat negligibly-small scales as zero: loading/quant leaves zeroed double-block
+     * scales at ~1e-17, and the per-block path's s*SDPA is then ~0 anyway. */
+    const float IP_SCALE_EPS = 1e-6f;
+    for (int g = 0; g < a->num_double_blocks; g++)
+        if (fabsf(a->ip_scale[g]) > IP_SCALE_EPS) { BF16_DEBUG("[IPFUSED] double scale[%d]=%g\n", g, a->ip_scale[g]); return 0; }
+
+    if (tf->ip_fused_ready && tf->ip_fused_seq == seq && tf->ip_fused_img_off == img_offset)
+        return 1;
+    BF16_DEBUG("[IPFUSED] building seq=%d img_off=%d H=%d hidden=%d nblk=%d\n",
+               seq, img_offset, a->hidden_dim, tf->hidden_size, a->num_blocks);
+
+    /* seq changed (or first time): rebuild inject scratch. k/v are seq-independent. */
+    if (tf->ip_q_saved_gpu)   { iris_gpu_tensor_free(tf->ip_q_saved_gpu);   tf->ip_q_saved_gpu = NULL; }
+    if (tf->ip_delta_gpu)     { iris_gpu_tensor_free(tf->ip_delta_gpu);     tf->ip_delta_gpu = NULL; }
+    if (tf->ip_full_delta_gpu){ iris_gpu_tensor_free(tf->ip_full_delta_gpu);tf->ip_full_delta_gpu = NULL; }
+    if (tf->ip_zeros_txt_gpu) { iris_gpu_tensor_free(tf->ip_zeros_txt_gpu); tf->ip_zeros_txt_gpu = NULL; }
+    tf->ip_fused_ready = 0;
+
+    int H = a->hidden_dim, T = a->num_image_tokens;
+    int txt_seq = img_offset, img_seq = seq - img_offset;
+    if (H != tf->hidden_size || img_seq <= 0 || txt_seq < 0) return 0;
+
+    /* Build per-block k_ip and ip_scale*v_ip f16 GPU tensors once. */
+    if (!tf->ip_k_gpu) {
+        tf->ip_k_gpu = calloc((size_t)a->num_blocks, sizeof(iris_gpu_tensor_t));
+        tf->ip_v_gpu = calloc((size_t)a->num_blocks, sizeof(iris_gpu_tensor_t));
+        if (!tf->ip_k_gpu || !tf->ip_v_gpu) { ip_fused_free(tf); return 0; }
+        float *k_cpu = malloc((size_t)T * H * sizeof(float));
+        float *v_cpu = malloc((size_t)T * H * sizeof(float));
+        if (!k_cpu || !v_cpu) { free(k_cpu); free(v_cpu); ip_fused_free(tf); return 0; }
+        for (int g = 0; g < a->num_blocks; g++) {
+            if (fabsf(a->ip_scale[g]) <= IP_SCALE_EPS) continue;  /* double blocks (and any disabled) */
+            iris_ip_adapter_get_kv(a, g, tf->ip_embeds, k_cpu, v_cpu);
+            float s = a->ip_scale[g];
+            for (size_t i = 0; i < (size_t)T * H; i++) v_cpu[i] *= s;  /* fold scale into V */
+            tf->ip_k_gpu[g] = iris_gpu_tensor_create_bf16(k_cpu, (size_t)T * H);
+            tf->ip_v_gpu[g] = iris_gpu_tensor_create_bf16(v_cpu, (size_t)T * H);
+            if (!tf->ip_k_gpu[g] || !tf->ip_v_gpu[g]) {
+                free(k_cpu); free(v_cpu); ip_fused_free(tf); return 0;
+            }
+        }
+        free(k_cpu); free(v_cpu);
+    }
+
+    /* Inject scratch sized for this resolution. */
+    tf->ip_q_saved_gpu    = iris_gpu_tensor_alloc_f16((size_t)img_seq * H);
+    tf->ip_delta_gpu      = iris_gpu_tensor_alloc_f16((size_t)img_seq * H);
+    tf->ip_full_delta_gpu = iris_gpu_tensor_alloc_f16((size_t)seq * H);
+    float *zeros = calloc((size_t)txt_seq * H, sizeof(float));
+    tf->ip_zeros_txt_gpu  = (txt_seq > 0 && zeros)
+                            ? iris_gpu_tensor_create_bf16(zeros, (size_t)txt_seq * H) : NULL;
+    free(zeros);
+    if (!tf->ip_q_saved_gpu || !tf->ip_delta_gpu || !tf->ip_full_delta_gpu ||
+        (txt_seq > 0 && !tf->ip_zeros_txt_gpu)) {
+        ip_fused_free(tf); return 0;
+    }
+
+    tf->ip_fused_seq = seq;
+    tf->ip_fused_img_off = img_offset;
+    tf->ip_fused_ready = 1;
+    BF16_DEBUG("[IPFUSED] READY (fused inject path active)\n");
+    return 1;
+}
+
 static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
                                       const single_block_t *block,
                                       iris_gpu_tensor_t shift_bf16,
@@ -3025,7 +3143,8 @@ static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
                                       const float *img_rope_cos, const float *img_rope_sin,
                                       const float *txt_rope_cos, const float *txt_rope_sin,
                                       int seq, int img_offset, iris_transformer_t *tf,
-                                      single_block_bf16_scratch_t *scratch) {
+                                      single_block_bf16_scratch_t *scratch,
+                                      int single_block_idx) {
     /* Check if bf16 pipeline is available */
     if (!iris_bf16_pipeline_available()) return 0;
     if (!hidden_gpu || !iris_gpu_tensor_is_f16(hidden_gpu)) return 0;
@@ -3114,6 +3233,14 @@ static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
     iris_gpu_qk_rms_norm_bf16(q_gpu, k_gpu, norm_q_weight_bf16, norm_k_weight_bf16,
                               seq, heads, head_dim, eps);
 
+    /* IP-Adapter (B2): is the on-GPU inject active for this single block? */
+    int ip_g = tf->num_double_layers + single_block_idx;
+    int ip_on = (tf->ip_fused_ready && tf->ip_k_gpu && tf->ip_k_gpu[ip_g] &&
+                 tf->ip && tf->ip->ip_sched_mult != 0.0f);
+    /* Save the post-QK-norm, PRE-RoPE image-token Q rows (layout [txt, img]). */
+    if (ip_on)
+        iris_gpu_slice_seq_bf16(tf->ip_q_saved_gpu, q_gpu, seq - img_offset, h_size, img_offset);
+
     /* === Phase 5: Apply unified RoPE (bf16 tensors, f32 frequencies) === */
     iris_gpu_rope_unified_bf16(q_gpu, k_gpu,
                                txt_rope_cos, txt_rope_sin,
@@ -3149,6 +3276,28 @@ static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
 
     /* === Phase 10: Gated add residual (bf16) === */
     iris_gpu_gated_add_bf16(hidden_gpu, gate_bf16, proj_out_gpu, seq, h_size);
+
+    /* === Phase 11: IP-Adapter inject (B2, on-GPU) ===
+     * hidden[img rows] += SDPA(q_saved, k_ip, ip_scale*v_ip). ip_scale is folded into v_ip,
+     * so the SDPA output IS the scaled contribution. Mirrors iris_ip_adapter_inject. */
+    if (ip_on) {
+        int img_seq = seq - img_offset;
+        int T = tf->ip->num_image_tokens;
+        float inj_scale = 1.0f / sqrtf((float)head_dim);
+        if (iris_gpu_attention_fused_bf16(tf->ip_delta_gpu, tf->ip_q_saved_gpu,
+                                          tf->ip_k_gpu[ip_g], tf->ip_v_gpu[ip_g],
+                                          img_seq, T, heads, head_dim, inj_scale)) {
+            iris_gpu_tensor_t delta_full;
+            if (img_offset > 0) {
+                iris_gpu_concat_seq_bf16(tf->ip_full_delta_gpu, tf->ip_zeros_txt_gpu,
+                                         tf->ip_delta_gpu, img_offset, img_seq, h_size);
+                delta_full = tf->ip_full_delta_gpu;
+            } else {
+                delta_full = tf->ip_delta_gpu;  /* no text rows */
+            }
+            iris_gpu_add_bf16(hidden_gpu, hidden_gpu, delta_full, seq * h_size);
+        }
+    }
 
     if (!own_tensors) return 1;
 
@@ -3377,7 +3526,7 @@ static float *iris_transformer_forward_bf16(iris_transformer_t *tf,
                                        norm_q, norm_k,
                                        img_rope_cos, img_rope_sin,
                                        txt_rope_cos, txt_rope_sin,
-                                       total_seq, txt_seq, tf, &single_scratch)) {
+                                       total_seq, txt_seq, tf, &single_scratch, i)) {
             if (norm_q) iris_gpu_tensor_free(norm_q);
             if (norm_k) iris_gpu_tensor_free(norm_k);
             BF16_DEBUG("[BF16] single block %d failed\n", i);
@@ -3724,8 +3873,11 @@ float *iris_transformer_forward(iris_transformer_t *tf,
 
 #ifdef USE_METAL
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
-     * Cache entries are stable (pointers point into mmap region) so no collision. */
-    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) && !tf->ip) {
+     * Cache entries are stable (pointers point into mmap region) so no collision.
+     * B2: a style-only IP-Adapter can also use the fused path — the inject runs on-GPU
+     * inside single_block_forward_bf16 (ip_fused_prepare builds the per-block k/v). */
+    if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16 && !(tf->lora && tf->lora->scale != 0.0f) &&
+        (!tf->ip || ip_fused_prepare(tf, txt_seq + img_seq, txt_seq))) {
         float *bf16_output = iris_transformer_forward_bf16(tf, img_transposed, img_seq,
                                                            img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
@@ -3910,7 +4062,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
                                                        norm_q_bf16, norm_k_bf16,
                                                        img_rope_cos, img_rope_sin,
                                                        txt_rope_cos, txt_rope_sin,
-                                                       total_seq, txt_seq, tf, NULL)) {
+                                                       total_seq, txt_seq, tf, NULL, i)) {
                             bf16_path_ok = 0;
                             iris_gpu_batch_end();
                             /* Convert back to f32 for fallback */
@@ -4751,6 +4903,9 @@ void iris_transformer_free(iris_transformer_t *tf) {
     if (!tf) return;
 
     /* IP-Adapter state (owned by the transformer once attached) */
+#ifdef USE_METAL
+    ip_fused_free(tf);
+#endif
     if (tf->ip) iris_ip_adapter_free(tf->ip);
     free(tf->ip_embeds);
     free(tf->ip_q_scratch);
@@ -4908,6 +5063,9 @@ void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora) {
  * ownership of both). ip=NULL detaches. Returns 0 on success. */
 int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
                                     float *ip_embeds) {
+#ifdef USE_METAL
+    ip_fused_free(tf);   /* free precomputed fused k/v while tf->ip is still valid */
+#endif
     if (tf->ip) iris_ip_adapter_free(tf->ip);
     free(tf->ip_embeds);
     free(tf->ip_kv_scratch);

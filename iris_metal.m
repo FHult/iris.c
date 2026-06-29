@@ -2480,6 +2480,37 @@ iris_gpu_tensor_t iris_gpu_tensor_alloc_f16(size_t num_elements) {
     }
 }
 
+/* Create a persistent bf16 GPU tensor from f32 CPU data (round-to-nearest-even).
+ * The fused "f16" pipeline tensors actually hold bf16 data (is_f16 means 16-bit), so the
+ * IP-Adapter's precomputed k_ip/v_ip must be bf16 to match the block's q/k/v in the SDPA. */
+iris_gpu_tensor_t iris_gpu_tensor_create_bf16(const float *data, size_t num_elements) {
+    if (!g_initialized || num_elements == 0 || !data) return NULL;
+
+    @autoreleasepool {
+        size_t size = num_elements * sizeof(uint16_t);
+        id<MTLBuffer> buf = [g_device newBufferWithLength:size
+                                                  options:MTLResourceStorageModeShared];
+        if (!buf) return NULL;
+
+        uint16_t *dst = (uint16_t *)[buf contents];
+        for (size_t i = 0; i < num_elements; i++) {
+            uint32_t bits;
+            memcpy(&bits, &data[i], sizeof(bits));
+            uint32_t rounded = bits + 0x7FFF + ((bits >> 16) & 1);  /* round to nearest even */
+            dst[i] = (uint16_t)(rounded >> 16);
+        }
+
+        iris_gpu_tensor_t tensor = (iris_gpu_tensor_t)malloc(sizeof(struct iris_gpu_tensor));
+        if (!tensor) return NULL;  /* buf autoreleased */
+        tensor->buffer = buf;
+        tensor->num_elements = num_elements;
+        tensor->has_pending_work = 0;
+        tensor->persistent = 1;
+        tensor->is_f16 = 1;
+        return tensor;
+    }
+}
+
 iris_gpu_tensor_t iris_gpu_tensor_alloc_persistent(size_t num_elements) {
     if (!g_initialized || num_elements == 0) return NULL;
 

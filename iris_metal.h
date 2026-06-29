@@ -289,6 +289,13 @@ iris_gpu_tensor_t iris_gpu_linear_bf16_bf16out(iris_gpu_tensor_t x,
 iris_gpu_tensor_t iris_gpu_tensor_alloc_f16(size_t num_elements);
 
 /*
+ * Create a persistent bf16 GPU tensor from f32 CPU data (round-to-nearest-even).
+ * Matches the bf16 data stored in the fused pipeline's 16-bit tensors. Caller frees
+ * with iris_gpu_tensor_free().
+ */
+iris_gpu_tensor_t iris_gpu_tensor_create_bf16(const float *data, size_t num_elements);
+
+/*
  * BFloat16 MPS attention for bf16 GPU tensors.
  * Uses native MPSDataTypeBFloat16.
  * Q, K, V, out must all be bf16 tensors (is_f16 = 1).

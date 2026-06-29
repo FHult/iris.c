@@ -316,8 +316,19 @@
 
 ## Inference / Server Anomalies
 
-- **SREF-DAEMON-1 (2026-06-28): per-request IP-Adapter attach in `iris --server` produces CORRUPT
-  (pure-noise) output on a warm daemon.** The SREF-3-A path (server-mode `ip_bundle`/`ip_features`/
+- **SREF-DAEMON-1 — RESOLVED 2026-06-29 via B2 (fused-path inject).** Root cause confirmed: the
+  per-block path (forced by an attached adapter) used iris_metal_sgemm_bf16 (MPSMatrixMultiplication),
+  which silently zero-writes in a warm process. B2 wires the IP-Adapter inject INTO the fused bf16
+  pipeline (iris_gpu_linear_bf16_native = MPSGraph linears, which dodge the defect) and runs the inject
+  ON-GPU (slice post-QK-norm image-Q → SDPA(q, k_ip, ip_scale*v_ip) → add). The fused path no longer
+  touches the buggy GEMM, so the warm daemon renders correctly. Bonus: it is also ~4.5–6× FASTER than
+  the per-block path (one-shot 224 s → 50 s; warm daemon 38 s) with no extra memory (k_ip/v_ip stored
+  bf16). Parity vs the per-block reference: corr 0.9998, mean|Δ| 0.33/255, max|Δ| 9/255 (f16/bf16 vs f32
+  inject noise). Gated to style-only adapters (all double-block ip_scale ≈ 0, |scale|≤1e-6); non-style
+  adapters and img2img still use the per-block path. See iris_transformer_flux.c `ip_fused_prepare` +
+  the Phase-11 inject in `single_block_forward_bf16`. ORIGINAL REPORT (for history) follows.
+
+  The SREF-3-A path (server-mode `ip_bundle`/`ip_features`/
   `ip_scale` → `iris_load_ip_adapter` in `server_worker` → generate → `iris_unload_ip_adapter`) loads
   the model once and avoids the per-gen reload (verified timings: sref#1 98s cold, sref#2 42s warm). BUT
   the image is NOISE — the denoise never converges, i.e. the transformer forward is corrupted while the
