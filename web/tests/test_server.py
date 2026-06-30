@@ -1530,6 +1530,24 @@ class TestSrefRouting:
         assert r.status_code == 200
         assert r.get_json().get("sref") is None   # legacy path, not the sref branch
 
+    def test_style_ref_is_content_destroyed_composition_is_not(self, client, monkeypatch):
+        """Style-only --sref: a STYLE-mode reference is patch-shuffled (composition destroyed,
+        style kept) before in-context; a COMPOSITION-mode reference is left literal."""
+        import server as srv
+        monkeypatch.setattr(srv, "IP_BUNDLE", None)
+        monkeypatch.setattr(srv, "SREF_STYLE_SHUFFLE_GRID", 6)
+        calls = {"n": 0}
+        orig = srv.content_destroy_png
+        monkeypatch.setattr(srv, "content_destroy_png",
+                            lambda b, g=6: calls.__setitem__("n", calls["n"] + 1) or orig(b, g))
+        monkeypatch.setattr(srv, "queue_generation", lambda *a, **k: None)
+        client.post("/generate", json={"prompt": "a cat",
+                    "reference_images": [{"data": self._PNG_1x1, "mode": "style"}]})
+        assert calls["n"] == 1                          # style → content-destroyed
+        client.post("/generate", json={"prompt": "a cat",
+                    "reference_images": [{"data": self._PNG_1x1, "mode": "composition"}]})
+        assert calls["n"] == 1                          # composition → NOT (still 1)
+
     def test_style_slot_with_bundle_but_adapter_disabled_is_incontext(self, client, monkeypatch, tmp_path):
         """Regression guard for the good→bad flip: even with a bundle configured, a style
         slot must default to full-strength IN-CONTEXT conditioning (img2img_strength 1.0),

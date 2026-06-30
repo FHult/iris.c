@@ -77,6 +77,13 @@ SREF_DEFAULT_STRENGTH = float(os.environ.get("IRIS_SREF_STRENGTH", "0.38"))
 # adapter. So default the web "style" path to in-context conditioning; the trained adapter is
 # OPT-IN until the retrain + discrimination gate lands. Set IRIS_SREF_ADAPTER=1 to re-enable it.
 SREF_USE_ADAPTER = os.environ.get("IRIS_SREF_ADAPTER", "0").strip().lower() not in ("", "0", "false", "no", "off")
+# Style-only --sref via content destruction (BACKLOG SREF ARCHITECTURAL RETRAIN, validated 2026-06-30):
+# patch-shuffle a STYLE-mode reference (grid×grid) before the in-context path so its COMPOSITION is
+# destroyed but its texture/palette/rendering style survives → the prompt's subject is kept and only the
+# style transfers (no composition leak), while different references still discriminate (cross-ref output
+# corr ~0.16 vs the collapsed adapter's ~0.95). Default grid 6 (cleanest for rendering styles); set 0/1 to
+# disable (plain in-context = style+composition). Override via IRIS_SREF_SHUFFLE_GRID.
+SREF_STYLE_SHUFFLE_GRID = int(os.environ.get("IRIS_SREF_SHUFFLE_GRID", "6"))
 
 
 def normalize_ip_schedule(spec):
@@ -243,6 +250,31 @@ def convert_image_to_png(image_data: bytes) -> bytes:
         raise ValueError("PIL/Pillow required for non-PNG image formats. Install with: pip install Pillow")
     except Exception as e:
         raise ValueError(f"Failed to convert image: {e}")
+
+
+def content_destroy_png(png_bytes: bytes, grid: int = 6) -> bytes:
+    """Patch-shuffle a reference image to DESTROY composition while preserving local texture /
+    palette / rendering style. The basis of style-only --sref (BACKLOG SREF ARCHITECTURAL RETRAIN):
+    the frozen base attends to the shuffled reference in-context, so the prompt's subject is kept
+    and only the STYLE transfers (no composition leak). Deterministic (fixed permutation per grid),
+    so the same upload caches the same way. grid<=1 → no-op. PIL-only (no numpy)."""
+    if grid is None or grid <= 1:
+        return png_bytes
+    from PIL import Image
+    import io, random as _rnd
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB").resize((512, 512))
+    ph = pw = 512 // grid
+    boxes = [(j * pw, i * ph, (j + 1) * pw, (i + 1) * ph)
+             for i in range(grid) for j in range(grid)]
+    patches = [img.crop(b) for b in boxes]
+    order = list(range(len(patches)))
+    _rnd.Random(1234).shuffle(order)            # fixed seed → deterministic shuffle
+    canvas = Image.new("RGB", (512, 512))
+    for dst, src in zip(boxes, order):
+        canvas.paste(patches[src], (dst[0], dst[1]))
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
 
 
 # Store active jobs and their progress
@@ -1362,6 +1394,10 @@ def generate():
         try:
             image_data = base64.b64decode(reference_slots[0]["data"].split(",")[-1])
             image_data = convert_image_to_png(image_data)
+            # Style-only --sref: a STYLE-mode reference is content-destroyed (composition removed,
+            # style kept) so in-context transfers only the style; composition mode keeps it literal.
+            if reference_slots[0].get("mode") == "style" and SREF_STYLE_SHUFFLE_GRID > 1:
+                image_data = content_destroy_png(image_data, SREF_STYLE_SHUFFLE_GRID)
             input_image_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}.png"
             with open(input_image_path, "wb") as f:
                 f.write(image_data)
@@ -1373,6 +1409,8 @@ def generate():
             try:
                 image_data = base64.b64decode(slot["data"].split(",")[-1])
                 image_data = convert_image_to_png(image_data)
+                if slot.get("mode") == "style" and SREF_STYLE_SHUFFLE_GRID > 1:
+                    image_data = content_destroy_png(image_data, SREF_STYLE_SHUFFLE_GRID)
                 ref_path = OUTPUT_DIR / f"temp_{uuid.uuid4().hex}_ref{i}.png"
                 with open(ref_path, "wb") as f:
                     f.write(image_data)
