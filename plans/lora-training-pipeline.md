@@ -91,10 +91,23 @@ Smoke: warmstart nothing, a few hundred steps on hot cached data (VAE+Qwen3), lo
 - ✅ ROUND-TRIP CLOSED: trained a tiny LoRA in MLX → exported 40 adapters → `iris` LOADS it
   ("Diffusers format, 40 adapters, max_rank=8") and APPLIES it (on-vs-off pixel corr 0.328 — the LoRA
   decisively changes generation). The owner can train custom LoRAs in-house and serve via the engine.
-- REMAINING for production: (piece 3) wire the REAL data loader (train on real images, not random) with
-  the VAE-Q1 BN latent prep → MEANINGFUL LoRAs; (piece 4b) the formal C golden PARITY fixture in make test
-  (the AGENT-protocol guard — math already verified by numpy + the round-trip); (piece 6) a train_lora.py
-  CLI entry point + config; single-block coverage (Kohya/BFL fused export) as a follow-up.
+- ✅ Piece 3 WIRING done (commit prior): train_lora.py + lora_smoke.yaml reuse make_prefetch_loader +
+  _bn_pack_latents (validated path); real-data step 1 ran (loss 0.727 on real 512px images).
+- ⚠️ PIECE 3 PERFORMANCE BLOCKER (2026-06-30): the LoRA step does a FULL forward+BACKWARD through all 25
+  transformer blocks at 512² — fundamentally heavier than the IP-adapter's cheap path (which precomputes
+  the frozen Flux forward OUTSIDE the gradient and only backprops the tiny adapter). LoRA CAN'T use that
+  trick — its trainable params live INSIDE the transformer, so the backward must retain/traverse the whole
+  25-block graph. Result: stalled ~18 min on an early step (MLX huge-graph stall — BUGS MLX-2 class; memory
+  was fine at 35% free, so it's graph-size/compute, not OOM). Unworkable as-is.
+  FIX (next): GRADIENT CHECKPOINTING — `mx.checkpoint` per transformer block (recompute activations in the
+  backward instead of storing) — the standard way to train LoRA/full-backprop on a large frozen transformer.
+  Cuts backward memory + graph size dramatically. Requires reimplementing the block-loop forward with
+  per-block checkpoint (mflux's internal Flux2Transformer.__call__ loop can't be checkpointed externally) —
+  a `_flux_forward_no_ip`-style full-forward reimpl, but checkpointed and run THROUGH norm_out/proj_out with
+  the LoRA active. (The IP-adapter config already exposes `block_gradient_checkpointing` — same idea.)
+- REMAINING after the checkpointing fix: a real-data smoke that completes (loss falls + coherent gen);
+  (piece 4b) the formal C golden PARITY fixture in make test; targeted-style LoRA on a curated dataset;
+  single-block coverage (Kohya/BFL fused export).
 
 ## Log
 - 2026-06-30: design opened; Explore mapped the MLX Flux structure + export format; interface RESOLVED
