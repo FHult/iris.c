@@ -1199,6 +1199,10 @@ def train(config: dict) -> None:
     _repel_weight   = float(tcfg.get("repel_loss_weight", 0.0))
     _repel_margin   = float(tcfg.get("repel_margin", 1.0))
     _repel_buf_max  = int(tcfg.get("repel_buffer", 16))
+    # Option B: give the repulsion's 2nd reference its OWN IP-influenced Q context (an extra
+    # collect-Q forward/step) so x0_other is its REAL output — removes the shared-Q train/infer
+    # mismatch that sank the shared-Q repulsion. Cheap-path + correct_forward_q only.
+    _repel_own_q    = bool(tcfg.get("repel_own_q", False))
     _repel_loss_accum: list = [mx.array(0.0)]
 
     # SREF cause fix, OPTION A (BACKLOG STEP 1A): decorrelate the V injection across references
@@ -1251,7 +1255,7 @@ def train(config: dict) -> None:
     def loss_fn(siglip_feats, use_null_image: mx.array,
                 flux_state: dict, target: mx.array,
                 x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None,
-                repel_feats=None):
+                repel_feats=None, qs_other=None):
         """
         Differentiable adapter-only loss. Flux forward has already been run
         outside this function (no grad); only the tiny adapter graph is traced.
@@ -1285,10 +1289,14 @@ def train(config: dict) -> None:
         # expensive frozen-Flux work — the leak penalty's null forward is then nearly free here.
         # Approximation (standard IP-Adapter training): each block's IP contribution is added to
         # the final hidden state rather than at its original sequence position.
-        def _pred_from_embeds(ip_embeds):
+        def _pred_from_embeds(ip_embeds, qs_use=None):
+            # qs_use overrides the shared (ref-A) Q context — used by the STEP-1A option-B
+            # repulsion to give the 2nd reference its OWN IP-influenced Q (kills the train/infer
+            # mismatch). Defaults to the precomputed shared qs.
+            qs_eff = qs if qs_use is None else qs_use
             k_ip_all, v_ip_all = adapter.get_kv_all(ip_embeds)
             ip_total = mx.zeros((B, seq_img, d_inner), dtype=h_final.dtype)
-            for i, q_i in enumerate(qs):
+            for i, q_i in enumerate(qs_eff):
                 H_i  = q_i.shape[1]
                 Hd_i = q_i.shape[3]
                 k_i  = k_ip_all[:, i].reshape(B, -1, H_i, Hd_i).transpose(0, 2, 1, 3)
@@ -1326,9 +1334,11 @@ def train(config: dict) -> None:
             _leak_loss_accum[0] = leak_term
             total = total + _leak_weight * leak_term
         if _repel_weight > 0.0 and repel_feats is not None and x0_pred is not None:
-            # Cause fix: a DIFFERENT reference, same precomputed Flux state — its prediction must
-            # differ in STYLE from this one. Reuses _pred_from_embeds (cheap, no 2nd Flux forward).
-            pred_other = _pred_from_embeds(adapter.get_image_embeds(repel_feats))
+            # Cause fix (output-space): a DIFFERENT reference must produce a different-STYLE output.
+            # Option B passes qs_other = the 2nd ref's OWN IP-influenced Q so x0_other is its REAL
+            # output (no shared-Q train/infer mismatch); else falls back to the shared-Q context.
+            # The content anchor (content_leak_loss above) keeps this from disrupting WHAT is drawn.
+            pred_other = _pred_from_embeds(adapter.get_image_embeds(repel_feats), qs_use=qs_other)
             x0_other = reconstruct_x0(noisy_in, pred_other, alpha_in, sigma_in)
             repel_term = style_repulsion_loss(x0_pred, x0_other, _repel_margin)
             _repel_loss_accum[0] = repel_term
@@ -1360,10 +1370,10 @@ def train(config: dict) -> None:
 
     def compiled_step(siglip_feats, use_null_image, flux_state, target,
                       x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None,
-                      repel_feats=None):
+                      repel_feats=None, qs_other=None):
         loss_val, grads = loss_and_grad(
             siglip_feats, use_null_image, flux_state, target,
-            x0_ref, noisy_in, alpha_in, sigma_in, repel_feats,
+            x0_ref, noisy_in, alpha_in, sigma_in, repel_feats, qs_other,
         )
         # QUALITY-2: zero double-stream scale gradients so the optimizer never
         # updates indices 0.._nd-1, keeping them pinned at zero.
@@ -2083,6 +2093,16 @@ def train(config: dict) -> None:
                           and not _use_block_injection and len(_repel_buf) > 0)
             if _do_repel or _do_decorr:
                 repel_feats = _repel_buf[random.randrange(len(_repel_buf))]
+            # Option B: collect the 2nd reference's OWN IP-influenced Q (stop_gradient, like ref-A's
+            # qs) so the repulsion targets its REAL output. One extra collect-Q forward this step.
+            qs_other = None
+            if _do_repel and _repel_own_q and repel_feats is not None and _use_correct_forward_q:
+                _k_b, _v_b = adapter.get_kv_all(adapter.get_image_embeds(repel_feats))
+                mx.eval(_k_b, _v_b)
+                qs_other = _flux_forward_with_ip_collect_q(
+                    flux, noisy, text_embeds, t_int, _k_b, _v_b, adapter.scale,
+                )
+                mx.eval(qs_other)
             if _want_2ref and not null_image:
                 _repel_buf.append(siglip_feats)
                 if len(_repel_buf) > _repel_buf_max:
@@ -2100,7 +2120,7 @@ def train(config: dict) -> None:
             elif _do_style or _do_leak or _do_repel or _do_decorr:
                 loss_val, grad_norm_val = compiled_step(
                     siglip_feats, use_null_image, flux_state, target,
-                    latents, noisy, alpha_t, sigma_t, repel_feats,
+                    latents, noisy, alpha_t, sigma_t, repel_feats, qs_other,
                 )
             else:
                 loss_val, grad_norm_val = compiled_step(
