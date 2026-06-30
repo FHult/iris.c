@@ -15,6 +15,7 @@ from mlx.utils import tree_flatten
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lora.lora import LoRALinear, inject_lora_double_blocks, DOUBLE_ATTN_TARGETS, lora_param_count
+from lora.train_step import patchify_pack, unpatchify, make_position_ids
 
 
 # ---- toy model mirroring flux.transformer.transformer_blocks[i].attn.<target> ----
@@ -99,3 +100,24 @@ class TestInjectAndFreeze:
         inject_lora_double_blocks(flux, rank=4, alpha=4)
         # per target: A[4,8] + B[8,4] = 64; × 8 targets
         assert lora_param_count(flux) == 8 * (4 * 8 + 8 * 4)
+
+
+class TestPatchifyRoundTrip:
+    def test_patchify_unpatchify_identity(self):
+        # the train<->infer-critical reshape must round-trip exactly
+        B, C, Lh, Lw = 2, 32, 8, 6
+        x = mx.random.normal((B, C, Lh, Lw))
+        packed = patchify_pack(x)
+        assert packed.shape == (B, (Lh // 2) * (Lw // 2), 128)
+        back = unpatchify(packed, B, C, Lh, Lw)
+        mx.eval(back)
+        assert np.allclose(np.array(x), np.array(back), atol=1e-5)
+
+    def test_position_id_shapes(self):
+        pH, pW, seq_txt = 4, 3, 7
+        img_ids, txt_ids = make_position_ids(pH, pW, seq_txt)
+        mx.eval(img_ids, txt_ids)
+        assert img_ids.shape == (pH * pW, 4) and txt_ids.shape == (seq_txt, 4)
+        # img: T=0, L=0; txt: first 3 axes 0, L = arange
+        assert int(img_ids[:, 0].sum()) == 0 and int(img_ids[:, 3].sum()) == 0
+        assert int(txt_ids[:, 3].max()) == seq_txt - 1
