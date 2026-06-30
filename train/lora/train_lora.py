@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""train/lora/train_lora.py — train a LoRA on the frozen Flux Klein transformer (framework Phase 1).
+
+Reuses the IP-adapter's VALIDATED data path: make_prefetch_loader (VAE+Qwen3 cache) + the VAE-Q1
+_bn_pack_latents transform, so LoRA trains in the exact same latent space the frozen base operates in.
+Trains only the LoRA (piece-1 freeze), exports to the Diffusers safetensors iris_lora.c loads.
+
+  train/.venv/bin/python train/lora/train_lora.py --config <cfg.yaml> --out <lora.safetensors> [--max-steps N]
+"""
+import argparse, glob, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import yaml
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
+from ip_adapter.dataset import make_prefetch_loader
+from train_ip_adapter import _load_vae_bn_stats, _bn_pack_latents   # reuse the VAE-Q1 prep (single source)
+
+from lora.lora import inject_lora_double_blocks, lora_param_count
+from lora.train_step import lora_loss
+from lora.export import export_lora_diffusers
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--out", required=True, help="export path for the trained LoRA (.safetensors)")
+    ap.add_argument("--max-steps", type=int, default=None)
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load(open(args.config))
+    d, t, m, a = cfg["data"], cfg.get("training", {}), cfg["model"], cfg.get("adapter", {})
+    model_dir = os.path.abspath(m["flux_model_dir"])
+    steps = args.max_steps or int(t.get("num_steps", 500))
+    rank = int(a.get("rank", 16)); alpha = float(a.get("alpha", rank))
+
+    print("loading Flux2Klein ...", flush=True)
+    flux = Flux2Klein(model_path=model_dir, quantize=None)
+    inj = inject_lora_double_blocks(flux, rank=rank, alpha=alpha)
+    print(f"injected {len(inj)} LoRA modules (rank {rank}, alpha {alpha}); "
+          f"{lora_param_count(flux):,} trainable params", flush=True)
+    mx.eval(flux.transformer.parameters())
+
+    bn_mean, bn_std = _load_vae_bn_stats(model_dir)
+    shard_paths = sorted(glob.glob(os.path.join(d["shard_path"], "*.tar")))
+    if not shard_paths:
+        raise RuntimeError(f"no .tar shards in {d['shard_path']} (must be hot SSD — AGENT #6)")
+    print(f"{len(shard_paths)} shards; bucket {d.get('bucket', [512,512])}", flush=True)
+    loader = make_prefetch_loader(
+        shard_paths=shard_paths, batch_size=int(d.get("batch_size", 1)),
+        qwen3_cache_dir=d["qwen3_cache_dir"], vae_cache_dir=d["vae_cache_dir"],
+        bucket=tuple(d.get("bucket", [512, 512])), seed=d.get("seed"),
+        records_per_shard_visit=d.get("records_per_shard_visit"),
+    )
+
+    opt = optim.AdamW(learning_rate=float(t.get("learning_rate", 1e-4)),
+                      weight_decay=float(t.get("weight_decay", 0.01)))
+    clip = float(t.get("grad_clip", 1.0))
+
+    def loss_fn(mod, latents, txt, t_int, noise):
+        return lora_loss(mod, latents, txt, t_int, noise)
+    lg = nn.value_and_grad(flux, loss_fn)
+
+    print(f"training {steps} steps ...", flush=True)
+    step, t0, skipped = 0, time.time(), 0
+    for images_np, captions, text_np, vae_np, *_ in loader:
+        if vae_np is None or text_np is None:
+            skipped += 1
+            continue
+        latents = _bn_pack_latents(mx.array(vae_np, dtype=mx.bfloat16), bn_mean, bn_std)
+        txt = mx.array(text_np, dtype=mx.bfloat16)
+        B = latents.shape[0]
+        t_int = mx.clip((mx.sigmoid(mx.random.normal((B,))) * 1000).astype(mx.int32), 0, 999)
+        noise = mx.random.normal(latents.shape)
+        loss, grads = lg(flux, latents, txt, t_int, noise)
+        grads, gn = optim.clip_grad_norm(grads, max_norm=clip)
+        opt.update(flux, grads)
+        mx.eval(flux.trainable_parameters(), opt.state, loss)
+        step += 1
+        if step == 1 or step % 25 == 0:
+            print(f"  step {step}/{steps}  loss {float(loss):.4f}  gnorm {float(gn):.3f}  "
+                  f"{step / (time.time() - t0):.2f} it/s", flush=True)
+        if step >= steps:
+            break
+
+    n = export_lora_diffusers(flux, args.out)
+    print(f"EXPORTED {n} adapters -> {args.out}  (skipped {skipped} incomplete batches)", flush=True)
+    print("TRAINDONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()
