@@ -48,7 +48,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import (fused_flow_noise, get_schedule_values, gram_style_loss,
-                             reconstruct_x0, content_leak_loss, vproj_rank_penalty)
+                             reconstruct_x0, content_leak_loss, vproj_rank_penalty,
+                             style_repulsion_loss)
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 from ip_adapter.constants import SIGLIP_IMAGE_SIZE
@@ -1190,6 +1191,16 @@ def train(config: dict) -> None:
         _rank_u[0] = _ru * mx.rsqrt(mx.sum(_ru * _ru, axis=1, keepdims=True) + 1e-8)
         mx.eval(_rank_u[0])
 
+    # SREF mode-collapse CAUSE fix (BACKLOG STEP 1A): reference-discrimination repulsion. Two
+    # DIFFERENT references predicted at the SAME prompt/noise must produce different AdaIN style
+    # stats; without it the easy minimum is a generic reference-agnostic injection. Cheap path
+    # only (correct_forward_q): the 2nd reference's prediction reuses the precomputed Flux state
+    # via _pred_from_embeds (≈ the leak null pass). Off by default; enable via repel_loss_weight.
+    _repel_weight   = float(tcfg.get("repel_loss_weight", 0.0))
+    _repel_margin   = float(tcfg.get("repel_margin", 1.0))
+    _repel_buf_max  = int(tcfg.get("repel_buffer", 16))
+    _repel_loss_accum: list = [mx.array(0.0)]
+
     # TRAIN-5 Stage 0: per-fence peak memory profiling.
     # Gate behind memory_profile: true in training config. Resets peak counter
     # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
@@ -1231,7 +1242,8 @@ def train(config: dict) -> None:
 
     def loss_fn(siglip_feats, use_null_image: mx.array,
                 flux_state: dict, target: mx.array,
-                x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
+                x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None,
+                repel_feats=None):
         """
         Differentiable adapter-only loss. Flux forward has already been run
         outside this function (no grad); only the tiny adapter graph is traced.
@@ -1287,10 +1299,10 @@ def train(config: dict) -> None:
         pred = _pred_from_embeds(adapter.get_image_embeds(siglip_feats))
         flow_loss = mx.mean((pred - target) ** 2)
         total = flow_loss
-        # x0_pred (clean-latent estimate) shared by the style and leak terms.
+        # x0_pred (clean-latent estimate) shared by the style, leak, and repulsion terms.
         x0_pred = (reconstruct_x0(noisy_in, pred, alpha_in, sigma_in)
-                   if (_style_weight > 0.0 or _leak_weight > 0.0) and noisy_in is not None
-                   else None)
+                   if (_style_weight > 0.0 or _leak_weight > 0.0 or _repel_weight > 0.0)
+                   and noisy_in is not None else None)
         if _style_weight > 0.0 and x0_ref is not None and x0_pred is not None:
             style_term = gram_style_loss(x0_pred, x0_ref.astype(mx.float32))
             _style_loss_accum[0] = style_term
@@ -1304,6 +1316,14 @@ def train(config: dict) -> None:
             leak_term = content_leak_loss(x0_pred, x0_null)
             _leak_loss_accum[0] = leak_term
             total = total + _leak_weight * leak_term
+        if _repel_weight > 0.0 and repel_feats is not None and x0_pred is not None:
+            # Cause fix: a DIFFERENT reference, same precomputed Flux state — its prediction must
+            # differ in STYLE from this one. Reuses _pred_from_embeds (cheap, no 2nd Flux forward).
+            pred_other = _pred_from_embeds(adapter.get_image_embeds(repel_feats))
+            x0_other = reconstruct_x0(noisy_in, pred_other, alpha_in, sigma_in)
+            repel_term = style_repulsion_loss(x0_pred, x0_other, _repel_margin)
+            _repel_loss_accum[0] = repel_term
+            total = total + _repel_weight * repel_term
         if _rank_weight > 0.0:
             # Symptom fix: keep to_v_ip from collapsing to low rank. Gradient flows to the
             # weight; _rank_u is stop_gradient'd state (warm-starts next step's power iter).
@@ -1322,10 +1342,11 @@ def train(config: dict) -> None:
     # is negligible; all real work is in mx.eval dominated by Flux forward at 5-6s).
 
     def compiled_step(siglip_feats, use_null_image, flux_state, target,
-                      x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None):
+                      x0_ref=None, noisy_in=None, alpha_in=None, sigma_in=None,
+                      repel_feats=None):
         loss_val, grads = loss_and_grad(
             siglip_feats, use_null_image, flux_state, target,
-            x0_ref, noisy_in, alpha_in, sigma_in,
+            x0_ref, noisy_in, alpha_in, sigma_in, repel_feats,
         )
         # QUALITY-2: zero double-stream scale gradients so the optimizer never
         # updates indices 0.._nd-1, keeping them pinned at zero.
@@ -1722,6 +1743,8 @@ def train(config: dict) -> None:
     _style_loss_count = 0
     _leak_loss_sum = 0.0
     _leak_loss_count = 0
+    _repel_loss_sum = 0.0
+    _repel_loss_count = 0
 
     # QUALITY-6: cross-ref vs self-ref loss split (populated by QUALITY-1 permutation)
     _self_ref_loss_sum   = 0.0
@@ -1736,6 +1759,10 @@ def train(config: dict) -> None:
     # QUALITY-1: single-step feature buffer — stores siglip_feats from the previous
     # conditioned step so cross-ref works at batch_size=1 (no within-batch permutation).
     _cross_ref_buffer: Optional[mx.array] = None
+
+    # STEP-1A repulsion: ring buffer of recent conditioned references (different images), the
+    # source of the "different-style 2nd reference" for style_repulsion_loss at batch_size=1.
+    _repel_buf: list = []
 
     # ── training_warmup: compile Metal PSO graphs for all bucket shapes then exit ──
     # Triggered by the orchestrator's training_warmup pipeline step, or by running
@@ -2027,6 +2054,17 @@ def train(config: dict) -> None:
             # Leak penalty (block-injection path only) needs the same aux args (x0/noisy/alpha/
             # sigma). Run on every conditioned step; when on, style runs every cond step too.
             _do_leak  = _leak_weight > 0.0 and not null_image
+            # STEP-1A repulsion (cheap path only): pick a DIFFERENT recent reference from the ring
+            # buffer for style_repulsion_loss, then enroll the current reference for future steps.
+            repel_feats = None
+            _do_repel = (_repel_weight > 0.0 and not null_image
+                         and not _use_block_injection and len(_repel_buf) > 0)
+            if _do_repel:
+                repel_feats = _repel_buf[random.randrange(len(_repel_buf))]
+            if _repel_weight > 0.0 and not null_image and not _use_block_injection:
+                _repel_buf.append(siglip_feats)
+                if len(_repel_buf) > _repel_buf_max:
+                    _repel_buf.pop(0)
             if _use_block_injection:
                 if _do_style or _do_leak:
                     loss_val, grad_norm_val = compiled_step_with_ip(
@@ -2037,10 +2075,10 @@ def train(config: dict) -> None:
                     loss_val, grad_norm_val = compiled_step_with_ip(
                         siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
                     )
-            elif _do_style or _do_leak:
+            elif _do_style or _do_leak or _do_repel:
                 loss_val, grad_norm_val = compiled_step(
                     siglip_feats, use_null_image, flux_state, target,
-                    latents, noisy, alpha_t, sigma_t,
+                    latents, noisy, alpha_t, sigma_t, repel_feats,
                 )
             else:
                 loss_val, grad_norm_val = compiled_step(
@@ -2101,6 +2139,9 @@ def train(config: dict) -> None:
             if _do_leak:
                 _leak_loss_sum += float(_leak_loss_accum[0].item())
                 _leak_loss_count += 1
+            if _do_repel:
+                _repel_loss_sum += float(_repel_loss_accum[0].item())
+                _repel_loss_count += 1
 
             # T-01: grad norm EMA + spike alert
             _gn = float(grad_norm_val.item())
@@ -2364,6 +2405,18 @@ def train(config: dict) -> None:
                         flush=True,
                     )
                 _leak_loss_sum = _leak_loss_count = 0
+
+                # STEP-1A repulsion (reference discrimination) — lower = different refs already
+                # diverge (hinge slack shrinks); ~margin = still collapsed.
+                if _repel_weight > 0.0 and _repel_loss_count > 0:
+                    _repel_loss_avg = round(_repel_loss_sum / _repel_loss_count, 6)
+                    print(
+                        f"  repel_loss={_repel_loss_avg:.6f}"
+                        f"  (weight={_repel_weight}, margin={_repel_margin}, "
+                        f"{_repel_loss_count}/{log_interval} steps)",
+                        flush=True,
+                    )
+                _repel_loss_sum = _repel_loss_count = 0
 
                 # QUALITY-6: cross-ref vs self-ref loss split
                 _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None
