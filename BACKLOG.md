@@ -3012,6 +3012,49 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     change; the B2 fused inject + SREF-3 resident daemon are unaffected and ready the moment the adapter is
     re-enabled.
 
+    STEP 0 RESULT (2026-06-30) — DECISIVE: 17/17 CHECKPOINTS COLLAPSE → CONDITIONING-PATH / TRAINING-SIGNAL
+    BOUND, NOT RECIPE-BOUND. Ran debug/sref_ref_discrimination.py (4 maximally-distinct refs: churchill
+    line-art, cyberfika graphic, woodcut, flat sticker; scale 0.38, seed 42, 512px, prompt "a cat sitting on
+    a chair") across every existing checkpoint. EVERY ONE collapses (max cross-ref output corr ≥ 0.90):
+      • 11 HYBRID arms: clean_base 0.997, clean_concentrate 0.994, clean_concentrate_leak (champion) 0.993,
+        clean_hier 0.987, clean_leak 0.998, clean_leak025 0.990, clean_pool9 0.915 (lowest, still collapse),
+        clean_siglipdn 0.995, hybrid_arm 0.995, hybrid_hier 0.994, hybrid_siglipdown 0.996.
+      • 1 CSD arm: csd_arm 0.980 — a STRUCTURALLY DIFFERENT conditioning path (FiLM-modulated queries, no
+        SigLIP perceiver) and it STILL collapses → the failure is NOT perceiver-specific.
+      • 5 SIGLIP arms: bundle_inputnorm 0.999, bundle_confirm_fix 0.997, style_arm 0.991, leak1_pshuf 0.983,
+        leak2_xref 0.992.
+      styled-vs-no-adapter corr 0.22–0.68 everywhere → the adapters transform STRONGLY but reference-
+      INDEPENDENTLY (not inert; rules out "scale too low").
+    THE SMOKING GUN — bundle_inputnorm (the 2026-06-18 IP-ADAPTER-INFER-1 grid fix) collapses at 0.999.
+    This CONFIRMS the long-standing suspicion (memory [[project-sref-state]]): input-norm fixed cross-TOKEN
+    collapse (the grid — all queries attend one token WITHIN a reference, raising ip_embeds cross-token ratio
+    0.0033→0.43) but NEVER touched cross-REFERENCE collapse (DIFFERENT references → ~the same injection).
+    Those are TWO ORTHOGONAL axes; only the first was ever measured/fixed. The "echo of IP-ADAPTER-INFER-1"
+    note was right: same collapse class, surviving as a constant-style output instead of a grid.
+    CONSEQUENCES:
+      (a) MORE/BETTER DATA IS DEFINITIVELY RULED OUT. Every data/objective lever the whole campaign explored
+          (concentration, leak penalty ×weights, pooling, hierarchical inject, SigLIP downscale, CSD-only)
+          collapses identically. Prior sref_score arm rankings are noise (confirmed; re-rank by discrimination).
+      (b) The fault is in the SHARED downstream (cond-encoder output → to_k_ip/to_v_ip → cross-attn injection)
+          AND/OR the TRAINING SIGNAL — both are cond_mode-agnostic, which is the only thing that explains
+          siglip+csd+hybrid all collapsing identically. The loss never rewards reference DISCRIMINATION, so
+          the optimizer's easy minimum is a generic "make-it-stylish" injection.
+    STEP 1A — REVISED PRIORITY (architectural retrain; each gated by re-running discrimination):
+      1. K/V INJECTION RANK AUDIT (offline, no training, CHEAPEST + most diagnostic): for ≥3 distinct refs,
+         measure cross-ref variance of (i) cond-encoder output ip_embeds and (ii) to_k_ip/to_v_ip outputs.
+         Memory says input FEATURES already differ (ref-vs-ref feat corr 0.30–0.42) yet OUTPUTS corr 0.99 →
+         locate WHERE that diversity dies (perceiver/FiLM pooling vs the K/V projection vs the attention).
+         The universal (all-cond_mode) collapse points at the projection/injection, not the encoder.
+      2. DISCRIMINATION-AWARE TRAINING SIGNAL (most likely ROOT, cond_mode-agnostic): add a contrastive /
+         repulsion term that punishes reference-agnostic output (e.g. different-ref injections must differ;
+         or maximize cross-ref output distance at fixed prompt/seed). Without it a constant injection wins.
+      3. Per-query diversity regularization in the perceiver (hybrid/siglip path) — secondary now that CSD
+         (no perceiver) also collapses.
+      4. CSD/FiLM contribution check + rebalance.
+    Artifacts: scratchpad/{sref_discrim_sweep.py, sref_discrim_siglip.py}, discrim_step0[_siglip]/results.json,
+    plans/sref-retrain-diagnostic.md. Tool bug fixed en route (commit ca8577c: NameError in the summary print).
+    New siglip simple-set features at /Volumes/2TBSSD/sref_eval/refs_feat_siglip_simple/.
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
