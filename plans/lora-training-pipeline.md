@@ -83,7 +83,21 @@ distilled passes None). Reference call/setup: mflux `.../variants/txt2img/flux2_
 4. `nn.value_and_grad(flux, step)` → LoRA-only grads (piece 1 froze the base); AdamW; EMA; checkpoint.
 Smoke: warmstart nothing, a few hundred steps on hot cached data (VAE+Qwen3), loss finite/decreasing.
 
-## Status (2026-06-30) — CORE PIPELINE WORKS END-TO-END
+## Status (2026-06-30) — PHASE 1 CORE COMPLETE: real-data LoRA training works end-to-end
+- ✅ Piece 3 DONE (real-data training validated): with the regular-pipeline lessons (MLX memory limit,
+  gradient checkpointing via `nn.utils.checkpoint` — module-aware, NOT bare mx.checkpoint which zeroes the
+  in-block LoRA grad; two-fence eval + clear_cache; logit-normal; grad clip; periodic export), a 100-step
+  run on real 512px data fell **loss 0.90→0.29** (gnorm non-zero, gradients flow), peak 11.5 GB, ~5s/step.
+  Exported → `iris` loads + applies → a COHERENT image with a clear stylistic nudge (on-vs-off corr 0.796).
+  The model is now a framework for training custom LoRAs on real data.
+- KEY GOTCHA (recorded): bare `mx.checkpoint(block)` differentiates only the function INPUTS → ZERO grad to
+  LoRA params captured inside the block (the IP-adapter only checkpointed FROZEN blocks). Use
+  `mlx.nn.utils.checkpoint(block)` (module-aware). Forward parity-verified bit-identical to flux.transformer.
+- REFINEMENTS (next, on a working foundation): EMA (ip_adapter.ema.update_ema); the formal C golden PARITY
+  fixture in make test; a TARGETED-style LoRA on a curated dataset (the pool-wide smoke nudges generically);
+  single-block coverage (Kohya/BFL fused export); base-model port (the guidance hook is already wired).
+
+## (earlier) Status — CORE PIPELINE WORKS END-TO-END
 - ✅ Piece 1 (commit bbdf2aa): LoRALinear + double-block inject/freeze; tests pass.
 - ✅ Piece 2 (commit 1d02615): flow-matching training step; overfit smoke on the REAL model loss
   0.694→0.178 (forward+grad+optimizer+frozen-base correct); patchify round-trip tested.
