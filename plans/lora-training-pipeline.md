@@ -93,9 +93,15 @@ Smoke: warmstart nothing, a few hundred steps on hot cached data (VAE+Qwen3), lo
 - KEY GOTCHA (recorded): bare `mx.checkpoint(block)` differentiates only the function INPUTS → ZERO grad to
   LoRA params captured inside the block (the IP-adapter only checkpointed FROZEN blocks). Use
   `mlx.nn.utils.checkpoint(block)` (module-aware). Forward parity-verified bit-identical to flux.transformer.
-- REFINEMENTS (next, on a working foundation): EMA (ip_adapter.ema.update_ema); the formal C golden PARITY
-  fixture in make test; a TARGETED-style LoRA on a curated dataset (the pool-wide smoke nudges generically);
-  single-block coverage (Kohya/BFL fused export); base-model port (the guidance hook is already wired).
+- ✅ HARDENING DONE: (a) C golden PARITY fixture (commit a276795) — debug/gen_lora_fixture.py + the
+  test_parity_fixture in debug/test_lora.c guard the full train↔infer boundary (MLX LoRALinear → export →
+  lora_load → lora_apply, corr 1.000000 / max_abs 0; make test-unit green). (b) EMA (commit prior) over the
+  LoRA params only, decay-warmup, exports the averaged weights (--no-ema to disable); verified hermetically
+  + end-to-end on the real model (loss 0.61→0.25, EMA promoted + exported).
+- REMAINING (all on a working, hardened foundation): a TARGETED-style LoRA on a curated single-style dataset
+  (the pool-wide smoke nudges generically — a focused set gives a sharp intentional style); single-block
+  coverage (Kohya/BFL fused export, the shared-A handling); base-model port (CFG dual-pass; the guidance
+  hook is wired); generalize the trainer into the pluggable-module interface (framework Phase 2).
 
 ## (earlier) Status — CORE PIPELINE WORKS END-TO-END
 - ✅ Piece 1 (commit bbdf2aa): LoRALinear + double-block inject/freeze; tests pass.
