@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import (fused_flow_noise, get_schedule_values, gram_style_loss,
                              reconstruct_x0, content_leak_loss, vproj_rank_penalty,
-                             style_repulsion_loss)
+                             style_repulsion_loss, vproj_decorr_loss)
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 from ip_adapter.constants import SIGLIP_IMAGE_SIZE
@@ -1201,6 +1201,14 @@ def train(config: dict) -> None:
     _repel_buf_max  = int(tcfg.get("repel_buffer", 16))
     _repel_loss_accum: list = [mx.array(0.0)]
 
+    # SREF cause fix, OPTION A (BACKLOG STEP 1A): decorrelate the V injection across references
+    # directly — penalize the cross-ref V cosine (the exact quantity Step-1A.1 measured at
+    # 0.95–0.998). No x0 round-trip / no shared-Q confound (unlike repel_loss), and cheaper (no 2nd
+    # prediction — just the buffered ref's get_kv_all). Shares the _repel_buf 2nd-reference source.
+    _decorr_weight  = float(tcfg.get("vproj_decorr_weight", 0.0))
+    _decorr_margin  = float(tcfg.get("vproj_decorr_margin", 0.5))
+    _decorr_loss_accum: list = [mx.array(0.0)]
+
     # TRAIN-5 Stage 0: per-fence peak memory profiling.
     # Gate behind memory_profile: true in training config. Resets peak counter
     # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
@@ -1296,7 +1304,8 @@ def train(config: dict) -> None:
             p = p.reshape(B, C, 2, 2, pH, pW).transpose(0, 1, 4, 2, 5, 3).reshape(B, C, Lh, Lw)
             return p
 
-        pred = _pred_from_embeds(adapter.get_image_embeds(siglip_feats))
+        ip_cur = adapter.get_image_embeds(siglip_feats)
+        pred = _pred_from_embeds(ip_cur)
         flow_loss = mx.mean((pred - target) ** 2)
         total = flow_loss
         # x0_pred (clean-latent estimate) shared by the style, leak, and repulsion terms.
@@ -1324,6 +1333,14 @@ def train(config: dict) -> None:
             repel_term = style_repulsion_loss(x0_pred, x0_other, _repel_margin)
             _repel_loss_accum[0] = repel_term
             total = total + _repel_weight * repel_term
+        if _decorr_weight > 0.0 and repel_feats is not None:
+            # Cause fix A: a DIFFERENT reference's V must not be ~collinear with this one.
+            # Operates on the raw V injection (no x0/Q round-trip); reuses ip_cur for this ref.
+            _, v_cur = adapter.get_kv_all(ip_cur)
+            _, v_oth = adapter.get_kv_all(adapter.get_image_embeds(repel_feats))
+            decorr_term = vproj_decorr_loss(v_cur, v_oth, _decorr_margin)
+            _decorr_loss_accum[0] = decorr_term
+            total = total + _decorr_weight * decorr_term
         if _rank_weight > 0.0:
             # Symptom fix: keep to_v_ip from collapsing to low rank. Gradient flows to the
             # weight; _rank_u is stop_gradient'd state (warm-starts next step's power iter).
@@ -1745,6 +1762,8 @@ def train(config: dict) -> None:
     _leak_loss_count = 0
     _repel_loss_sum = 0.0
     _repel_loss_count = 0
+    _decorr_loss_sum = 0.0
+    _decorr_loss_count = 0
 
     # QUALITY-6: cross-ref vs self-ref loss split (populated by QUALITY-1 permutation)
     _self_ref_loss_sum   = 0.0
@@ -2057,11 +2076,14 @@ def train(config: dict) -> None:
             # STEP-1A repulsion (cheap path only): pick a DIFFERENT recent reference from the ring
             # buffer for style_repulsion_loss, then enroll the current reference for future steps.
             repel_feats = None
-            _do_repel = (_repel_weight > 0.0 and not null_image
-                         and not _use_block_injection and len(_repel_buf) > 0)
-            if _do_repel:
+            _want_2ref = (_repel_weight > 0.0 or _decorr_weight > 0.0) and not _use_block_injection
+            _do_repel  = (_repel_weight  > 0.0 and not null_image
+                          and not _use_block_injection and len(_repel_buf) > 0)
+            _do_decorr = (_decorr_weight > 0.0 and not null_image
+                          and not _use_block_injection and len(_repel_buf) > 0)
+            if _do_repel or _do_decorr:
                 repel_feats = _repel_buf[random.randrange(len(_repel_buf))]
-            if _repel_weight > 0.0 and not null_image and not _use_block_injection:
+            if _want_2ref and not null_image:
                 _repel_buf.append(siglip_feats)
                 if len(_repel_buf) > _repel_buf_max:
                     _repel_buf.pop(0)
@@ -2075,7 +2097,7 @@ def train(config: dict) -> None:
                     loss_val, grad_norm_val = compiled_step_with_ip(
                         siglip_feats, use_null_image, noisy, text_embeds, t_int, target,
                     )
-            elif _do_style or _do_leak or _do_repel:
+            elif _do_style or _do_leak or _do_repel or _do_decorr:
                 loss_val, grad_norm_val = compiled_step(
                     siglip_feats, use_null_image, flux_state, target,
                     latents, noisy, alpha_t, sigma_t, repel_feats,
@@ -2142,6 +2164,9 @@ def train(config: dict) -> None:
             if _do_repel:
                 _repel_loss_sum += float(_repel_loss_accum[0].item())
                 _repel_loss_count += 1
+            if _do_decorr:
+                _decorr_loss_sum += float(_decorr_loss_accum[0].item())
+                _decorr_loss_count += 1
 
             # T-01: grad norm EMA + spike alert
             _gn = float(grad_norm_val.item())
@@ -2417,6 +2442,18 @@ def train(config: dict) -> None:
                         flush=True,
                     )
                 _repel_loss_sum = _repel_loss_count = 0
+
+                # STEP-1A option-A V-decorrelation — hinge(cross-ref V cosine - margin); lower =
+                # references already inject distinct V (the direct discrimination signal).
+                if _decorr_weight > 0.0 and _decorr_loss_count > 0:
+                    _decorr_loss_avg = round(_decorr_loss_sum / _decorr_loss_count, 6)
+                    print(
+                        f"  decorr_loss={_decorr_loss_avg:.6f}"
+                        f"  (weight={_decorr_weight}, margin={_decorr_margin}, "
+                        f"{_decorr_loss_count}/{log_interval} steps)",
+                        flush=True,
+                    )
+                _decorr_loss_sum = _decorr_loss_count = 0
 
                 # QUALITY-6: cross-ref vs self-ref loss split
                 _loss_self_ref_avg  = round(_self_ref_loss_sum  / _self_ref_loss_count,  4) if _self_ref_loss_count  > 0 else None

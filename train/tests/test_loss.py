@@ -28,6 +28,7 @@ from ip_adapter.loss import (
     style_stats,
     style_repulsion_loss,
     vproj_rank_penalty,
+    vproj_decorr_loss,
     _HAS_METAL_KERNEL,
 )
 
@@ -657,3 +658,43 @@ class TestVprojRankPenalty:
         after, _ = vproj_rank_penalty(W2, u)
         mx.eval(before, after)
         assert float(after.item()) < float(before.item())
+
+
+class TestVprojDecorrLoss:
+    def _v(self, vecs):
+        # vecs: list of [N, D] per-block V for one ref -> [1, N, 1, D]
+        import numpy as _np
+        return mx.array(_np.stack(vecs)[None, :, None, :].astype(_np.float32))
+
+    def test_identical_v_gives_max_penalty(self):
+        rng = np.random.default_rng(1)
+        v = self._v([rng.standard_normal((6,)) for _ in range(4)])
+        loss = vproj_decorr_loss(v, v, margin=0.5)
+        mx.eval(loss)
+        assert abs(float(loss.item()) - 0.5) < 1e-5     # cos=1 per block -> (1-0.5)
+
+    def test_orthogonal_v_zero_penalty(self):
+        # block V vectors orthogonal between the two refs -> cos 0 < margin -> 0
+        a = self._v([np.array([1.0, 0, 0, 0]) for _ in range(3)])
+        b = self._v([np.array([0, 1.0, 0, 0]) for _ in range(3)])
+        loss = vproj_decorr_loss(a, b, margin=0.5)
+        mx.eval(loss)
+        assert float(loss.item()) == 0.0
+
+    def test_below_margin_no_penalty(self):
+        # cos 0.4 < margin 0.5 -> hinge 0
+        a = self._v([np.array([1.0, 0.0]) for _ in range(2)])
+        import math
+        b = self._v([np.array([0.4, math.sqrt(1 - 0.16)]) for _ in range(2)])
+        loss = vproj_decorr_loss(a, b, margin=0.5)
+        mx.eval(loss)
+        assert float(loss.item()) < 1e-6
+
+    def test_gradient_lowers_v_cosine(self):
+        rng = np.random.default_rng(2)
+        base = rng.standard_normal((3, 8)).astype(np.float32)
+        a = self._v([base[i] for i in range(3)])
+        b0 = self._v([base[i] + 0.05 * rng.standard_normal(8).astype(np.float32) for i in range(3)])
+        g = mx.grad(lambda bb: vproj_decorr_loss(a, bb, margin=0.5))(b0)
+        mx.eval(g)
+        assert np.all(np.isfinite(np.array(g))) and float(mx.sum(mx.abs(g)).item()) > 0.0

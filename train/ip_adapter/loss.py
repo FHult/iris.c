@@ -136,6 +136,25 @@ def vproj_rank_penalty(W: mx.array, u: mx.array, eps: float = 1e-8):
     return penalty, mx.stop_gradient(u_next)
 
 
+def vproj_decorr_loss(v_a: mx.array, v_b: mx.array, margin: float = 0.5,
+                      eps: float = 1e-8) -> mx.array:
+    """Reference-discrimination DIRECTLY on the V injection — the cause fix that attacks the exact
+    quantity Step-1A.1 measured (cross-reference V cosine 0.95–0.998 at collapse). v_a, v_b:
+    [B, num_blocks, ntok, hidden] = get_kv_all()[1] for two DIFFERENT references. Penalizes the
+    per-block cosine of the flattened V above `margin` (hinge): different references must inject a
+    DIFFERENT V. Unlike style_repulsion_loss this needs NO x0 round-trip and NO shared-Q context
+    (the V tensors are exactly what inference injects), so there is no train/infer mismatch.
+    Returns a scalar; ~(1-margin) at full collapse, 0 once V cosine drops below `margin`."""
+    B, N = v_a.shape[0], v_a.shape[1]
+    a = v_a.reshape(B, N, -1)                                     # [B, N, ntok*hidden]
+    b = v_b.reshape(B, N, -1)
+    dot = mx.sum(a * b, axis=2)
+    na  = mx.sqrt(mx.sum(a * a, axis=2) + eps)
+    nb  = mx.sqrt(mx.sum(b * b, axis=2) + eps)
+    cos = dot / (na * nb)                                         # [B, N] per-block V cosine
+    return mx.mean(mx.maximum(0.0, cos - margin))
+
+
 def reconstruct_x0(
     noisy:   mx.array,
     v_pred:  mx.array,
