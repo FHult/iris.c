@@ -14,6 +14,7 @@ import yaml
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx.utils import tree_map
 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
 from ip_adapter.dataset import make_prefetch_loader
 from train_ip_adapter import _load_vae_bn_stats, _bn_pack_latents   # reuse the VAE-Q1 prep (single source)
@@ -41,6 +42,7 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True, help="export path for the trained LoRA (.safetensors)")
     ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--no-ema", action="store_true", help="disable EMA; export the online weights")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -78,6 +80,14 @@ def main():
                       weight_decay=float(t.get("weight_decay", 0.01)))
     clip = float(t.get("grad_clip", 1.0))
 
+    # EMA over the LoRA params only (NOT update_ema, which averages model.parameters() = the whole
+    # frozen 4B). Decay-warmup so short runs don't stay stuck near init (regular-pipeline lesson).
+    use_ema = not args.no_ema
+    ema_decay = float(t.get("ema_decay", 0.9999))
+    ema_every = int(t.get("ema_update_every", 10))
+    ema = tree_map(lambda p: mx.array(p), flux.trainable_parameters()) if use_ema else None
+    ema_n = 0
+
     def loss_fn(mod, latents, txt, t_int, noise):
         return lora_loss(mod, latents, txt, t_int, noise, ckpt_double, ckpt_single)
     lg = nn.value_and_grad(flux, loss_fn)
@@ -100,6 +110,11 @@ def main():
         mx.eval(flux.trainable_parameters(), opt.state, loss)   # fence
         mx.clear_cache()                                        # lesson: bound peak; avoid reclaim churn
         step += 1
+        if use_ema and step % ema_every == 0:
+            ema_n += 1
+            de = min(ema_decay ** ema_every, (1.0 + ema_n) / (10.0 + ema_n))   # decay warmup
+            ema = tree_map(lambda e, m: de * e + (1.0 - de) * m, ema, flux.trainable_parameters())
+            mx.eval(ema)
         if step == 1 or step % 25 == 0:
             print(f"  step {step}/{steps}  loss {float(loss):.4f}  gnorm {float(gn):.3f}  "
                   f"{step / (time.time() - t0):.2f} it/s  peak {mx.get_peak_memory()/1e9:.1f} GB", flush=True)
@@ -109,6 +124,10 @@ def main():
         if step >= steps:
             break
 
+    if use_ema:
+        flux.update(ema)                                        # promote EMA = the exported weights
+        mx.eval(flux.trainable_parameters())
+        print("  exporting EMA weights", flush=True)
     n = export_lora_diffusers(flux, args.out)
     print(f"EXPORTED {n} adapters -> {args.out}  (skipped {skipped} incomplete batches)", flush=True)
     print("TRAINDONE", flush=True)
