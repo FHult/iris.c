@@ -2834,6 +2834,20 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     curation. Fixed: train_lora.py now loads `data.record_allowlist` (json {"rec_ids":[...]}) → set →
     passes to the loader (log confirms "record_allowlist: 250 rec_ids"). v2 is the first genuinely
     cluster-targeted run.
+    VERIFICATION (v2, EMA, 300 steps, loss→0.28): live round-trip in the SHIPPED binary loads "80
+    diffusers adapters across 5 double + 20 single blocks" (max_rank 16, no errors) — single-block
+    coverage confirmed on real weights end-to-end. On-vs-off pixel corr scales monotonically with
+    --lora-scale: 0.847 @1.0, 0.790 @1.5, 0.677 @2.5 → genuinely controllable. Style = a coherent
+    warm soft-focus photographic portrait (creamy bokeh, warm grading), subject preserved, no quality
+    breakdown even at 2.5. HONEST CAVEAT: at default scale 1.0 the effect is MODEST (corr 0.847) —
+    the genuinely-curated tight cluster (intra-cos 0.77) is a photographic style close to the base
+    model's default, so the delta is small; a clear look needs scale ~1.5–2.5. The DRAMATIC v1 look
+    (corr 0.575, warm-earth/weathered) was the inert-allowlist FULL-POOL aggregate (a generic
+    painterly average), NOT curation — so "tighter curation = stronger style" does NOT hold; tighter
+    curation = more COHERENT but potentially SUBTLER (closer to the prior). For a bold targeted style,
+    curate a cluster FAR from the base prior (or raise scale). All artifacts archived to cold
+    (/Volumes/16TBCold/weights/lora: v1, v2, realdata, subset, full-history git bundle, README;
+    SHA-256 verified).
 
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
