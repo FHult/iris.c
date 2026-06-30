@@ -121,3 +121,26 @@ class TestPatchifyRoundTrip:
         # img: T=0, L=0; txt: first 3 axes 0, L = arange
         assert int(img_ids[:, 0].sum()) == 0 and int(img_ids[:, 3].sum()) == 0
         assert int(txt_ids[:, 3].max()) == seq_txt - 1
+
+
+class TestExport:
+    def test_export_keys_shapes_and_baked_scale(self, tmp_path):
+        from lora.export import export_lora_diffusers
+        flux = _Flux(8, 2)
+        inject_lora_double_blocks(flux, rank=4, alpha=8)         # scale = 2.0
+        # set a known B on block0 to_q so we can verify the baked scale
+        mod = flux.transformer.transformer_blocks[0].attn.to_q
+        mod.lora_B = mx.ones(mod.lora_B.shape)
+        p = str(tmp_path / "lora.safetensors")
+        n = export_lora_diffusers(flux, p)
+        assert n == 2 * len(DOUBLE_ATTN_TARGETS)                 # adapters = blocks*targets
+        w = mx.load(p)
+        # Diffusers keys present, with to_out -> to_out.0
+        assert "transformer.transformer_blocks.0.attn.to_q.lora_A.weight" in w
+        assert "transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight" in w
+        assert "transformer.transformer_blocks.1.attn.add_v_proj.lora_A.weight" in w
+        A = w["transformer.transformer_blocks.0.attn.to_q.lora_A.weight"]
+        B = w["transformer.transformer_blocks.0.attn.to_q.lora_B.weight"]
+        assert A.shape == (4, 8) and B.shape == (8, 4)           # [rank,in], [out,rank]
+        assert A.dtype == mx.float32 and B.dtype == mx.float32
+        assert float(B[0, 0]) == 2.0                            # 1.0 * scale(2.0) baked in
