@@ -68,6 +68,27 @@ train from cold storage; `make test`; promote on an eval, not vibes.
 - **Forward for LoRA = the model's STANDARD forward** (NOT `_flux_forward_no_ip`, which is the IP-adapter's
   Q-collection trick). Run all blocks normally with LoRA active; flow-matching MSE on the velocity.
 
+## Piece-2 forward interface (resolved 2026-06-30)
+`flux.transformer.__call__(hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids,
+guidance=None)` → velocity prediction (mflux Flux2Transformer; signature at
+.../flux2_transformer/transformer.py:67-74). `guidance` is the CFG hook (base model;
+distilled passes None). Reference call/setup: mflux `.../variants/txt2img/flux2_klein.py` `predict()`
+(patchify → img_ids/txt_ids → transformer(...)). The LoRA training step:
+1. patchify the cached VAE latent → hidden_states; build img_ids/txt_ids (REUSE the IP-adapter trainer's
+   input prep in `_flux_forward_no_ip` — it already patchifies/embeds/positions; just call the STANDARD
+   transformer forward instead of the Q-collection variant — this is the train↔infer correctness boundary,
+   verify the prep matches inference).
+2. sample timestep (logit-normal), `fused_flow_noise` → (noisy, v_target); set hidden_states = noisy.
+3. `pred = flux.transformer(noisy_patched, text_embeds, t, img_ids, txt_ids, guidance)`; loss = MSE(pred, v_target).
+4. `nn.value_and_grad(flux, step)` → LoRA-only grads (piece 1 froze the base); AdamW; EMA; checkpoint.
+Smoke: warmstart nothing, a few hundred steps on hot cached data (VAE+Qwen3), loss finite/decreasing.
+
+## Status (2026-06-30)
+- ✅ Piece 1 DONE + tested (commit bbdf2aa): LoRALinear + double-block inject/freeze; 7 tests pass.
+- NEXT: piece 2 (training step + flow-matching loss + smoke) — careful pass on the input-prep boundary;
+  then piece 4 export (Diffusers) + the parity fixture (MLX LoRALinear vs C lora_apply), then end-to-end.
+
 ## Log
 - 2026-06-30: design opened; Explore mapped the MLX Flux structure + export format; interface RESOLVED
-  (Diffusers double-block export, bake-scale-into-B, freeze/unfreeze keys). Implementing piece 1.
+  (Diffusers double-block export, bake-scale-into-B, freeze/unfreeze keys); piece 1 built + tested;
+  piece-2 forward interface mapped.
