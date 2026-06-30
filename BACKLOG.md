@@ -2755,6 +2755,31 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     Reusable from the diagnostic campaign: sref_kv_rank_audit.py(--ckpt), sref_ref_discrimination.py, the
     loss primitives (gated off), the simple-style eval set + features.
 
+  - **🟣 PLUGGABLE CONDITIONING FRAMEWORK — train + serve LoRAs, in-sequence encoders, etc. as plugs
+    (opened 2026-06-30). Full roadmap: `plans/pluggable-conditioning-framework.md`.** Turn iris.c into a
+    FRAMEWORK for building/training/validating/serving pluggable conditioning against the frozen Flux base,
+    composably. Born from the SREF journey: condition WITH the base's native mechanisms; validate every plug
+    with a discrimination/eval gate. THE RAILS: (1) content-destruction style path — SHIPPED; (2) learned
+    IN-SEQUENCE encoders (reference → compact style/subject tokens in the sequence; trained once, any
+    reference; style→subject→face) — the SREF Phase-2 milestone; (3) LoRAs — WEIGHT-space deltas, today
+    iris_lora.c only LOADS external ones (BFL/Kohya/Diffusers/XLabs), **training is NEW**; (4) frontier:
+    reference→LoRA hypernetwork (instant custom LoRA). Rails compose (weight-space ⟂ activation-space; stack
+    a character LoRA + an instant style reference). NOT "a better LoRA" — the in-sequence rail is the
+    standard COMPLEMENT (instant, no per-concept training).
+    PIECES — TRAINING ("build a plug"): generalize train_ip_adapter.py (already a frozen-Flux loop w/
+    precompute caches + flow-matching loss + EMA + ckpt) into a PLUGGABLE trainable-module interface; a LoRA
+    TRAINING pipeline (Phase 1, foundational — train low-rank deltas w/ the diffusion objective, export to
+    the BFL/Kohya format the engine ALREADY loads → train→serve closes immediately); in-sequence encoder
+    training (Phase 2); the discrimination gate as the shared validation. SERVING ("use a plug"): a unified
+    conditioning-plug interface in the C engine (LoRA = iris_lora.c half exists; in-sequence = produce tokens
+    → concat into the sequence); compose multiple plugs w/ per-plug strength; web/CLI surface.
+    SEQUENCING: Phase 1 LoRA TRAINING pipeline (lowest risk, reuses infra, lets the owner build custom
+    LoRAs in-house instead of only consuming external) → Phase 2 generalized trainer + learned in-sequence
+    STYLE encoder (de-risked; beats the shuffle on graphic styles + saveable codes) → Phase 3 subject/face
+    encoders + serving composability → Phase 4 hypernetwork. GUARDRAILS (carried): train↔infer parity +
+    prod-flag compile + make mps for any C reimpl; cached-mode only; never train from cold; promote only on
+    the gate. This subsumes the SREF "learned encoder" next-step into a broader framework.
+
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
     sref_score was an artifact of an all-painterly eval set. Recontextualizes the ENTIRE SREF campaign.**

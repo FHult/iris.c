@@ -118,7 +118,9 @@ live web POST of churchill as a style ref → clean line-art cat, no composition
 web_sref_churchill.png). The web "style" upload is now true style-only --sref, no model change.
 REMAINING (optional polish): reduce faint background fragments (e.g. mild blur after shuffle, or mask);
 formal discrimination-gate run through the web path; the learned style-token encoder as a future quality
-lever for graphic styles.
+lever for graphic styles — now folded into the broader **Pluggable Conditioning Framework**
+(`plans/pluggable-conditioning-framework.md`, BACKLOG "PLUGGABLE CONDITIONING FRAMEWORK") as Rail 2 /
+Phase 2 alongside a LoRA training pipeline.
 
 ## Log
 - 2026-06-30: review opened; charter banked; Explore confirmed injection mechanism (side-channel vs
