@@ -83,10 +83,18 @@ distilled passes None). Reference call/setup: mflux `.../variants/txt2img/flux2_
 4. `nn.value_and_grad(flux, step)` → LoRA-only grads (piece 1 froze the base); AdamW; EMA; checkpoint.
 Smoke: warmstart nothing, a few hundred steps on hot cached data (VAE+Qwen3), loss finite/decreasing.
 
-## Status (2026-06-30)
-- ✅ Piece 1 DONE + tested (commit bbdf2aa): LoRALinear + double-block inject/freeze; 7 tests pass.
-- NEXT: piece 2 (training step + flow-matching loss + smoke) — careful pass on the input-prep boundary;
-  then piece 4 export (Diffusers) + the parity fixture (MLX LoRALinear vs C lora_apply), then end-to-end.
+## Status (2026-06-30) — CORE PIPELINE WORKS END-TO-END
+- ✅ Piece 1 (commit bbdf2aa): LoRALinear + double-block inject/freeze; tests pass.
+- ✅ Piece 2 (commit 1d02615): flow-matching training step; overfit smoke on the REAL model loss
+  0.694→0.178 (forward+grad+optimizer+frozen-base correct); patchify round-trip tested.
+- ✅ Piece 4a (commit prior): Diffusers export (keys/shapes/baked-scale tested).
+- ✅ ROUND-TRIP CLOSED: trained a tiny LoRA in MLX → exported 40 adapters → `iris` LOADS it
+  ("Diffusers format, 40 adapters, max_rank=8") and APPLIES it (on-vs-off pixel corr 0.328 — the LoRA
+  decisively changes generation). The owner can train custom LoRAs in-house and serve via the engine.
+- REMAINING for production: (piece 3) wire the REAL data loader (train on real images, not random) with
+  the VAE-Q1 BN latent prep → MEANINGFUL LoRAs; (piece 4b) the formal C golden PARITY fixture in make test
+  (the AGENT-protocol guard — math already verified by numpy + the round-trip); (piece 6) a train_lora.py
+  CLI entry point + config; single-block coverage (Kohya/BFL fused export) as a follow-up.
 
 ## Log
 - 2026-06-30: design opened; Explore mapped the MLX Flux structure + export format; interface RESOLVED
