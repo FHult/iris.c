@@ -108,7 +108,20 @@ The multi-week "architectural retrain" is now potentially a preprocessing + wiri
    if crude preprocessing plateaus (esp. for graphic styles). Now de-risked — we know in-sequence
    style-only works; training just sharpens it. Base-model adapter (Candidate 3) only if even that stalls.
 
+## SHIPPED (2026-06-30, commit 4b898b5) — style-only --sref via content-destruction
+Steps 1–3 done. Tuned: grids 6/8/12 all discriminate (mean 0.158–0.175); grid 6 cleanest for rendering
+styles (finer adds background fragments); cyberfika-type decorative patterns inherently partial. WIRED:
+`content_destroy_png` (PIL patch-shuffle, deterministic) applied to STYLE-mode references before in-context
+(web/server.py); composition-mode stays literal; default grid 6, `IRIS_SREF_SHUFFLE_GRID` override.
+TESTED: unit test (style→destroyed, composition→not) + full web suite 136 pass. END-TO-END VALIDATED:
+live web POST of churchill as a style ref → clean line-art cat, no composition leak (scratchpad/
+web_sref_churchill.png). The web "style" upload is now true style-only --sref, no model change.
+REMAINING (optional polish): reduce faint background fragments (e.g. mild blur after shuffle, or mask);
+formal discrimination-gate run through the web path; the learned style-token encoder as a future quality
+lever for graphic styles.
+
 ## Log
 - 2026-06-30: review opened; charter banked; Explore confirmed injection mechanism (side-channel vs
   in-sequence) + no base support; FIRST EXPERIMENT (content-destroyed in-context) VALIDATED the direction
-  (corr 0.158, 3/4 styles excellent, no composition leak) → no-retrain shortcut; plan reframed.
+  (corr 0.158, 3/4 styles excellent, no composition leak) → no-retrain shortcut; plan reframed; SHIPPED the
+  content-destruction in the web style path + end-to-end validated (commit 4b898b5).
