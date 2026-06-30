@@ -3055,6 +3055,44 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     plans/sref-retrain-diagnostic.md. Tool bug fixed en route (commit ca8577c: NameError in the summary print).
     New siglip simple-set features at /Volumes/2TBSSD/sref_eval/refs_feat_siglip_simple/.
 
+    STEP 1A.1 RESULT (2026-06-30) — ROOT CAUSE PINNED: `to_v_ip` IS CATASTROPHICALLY LOW-RANK → V is
+    near-constant across references → output collapse. UNIVERSAL across cond_modes. Tool:
+    debug/sref_kv_rank_audit.py (offline; runs cond-encoder → ip_embeds → to_k_ip/to_v_ip on N distinct
+    refs; reports cross-ref cosine per stage + the SVD stable_rank of the K/V weight matrices).
+    STAGE CROSS-REF COSINE (cos→1 = references stop mattering):
+      • Champion (hybrid, 6 refs): raw SigLIP 0.348 → ip_embeds SigLIP-half 0.407 (STILL DISCRIMINATES —
+        the perceiver is NOT the collapse site; input-norm worked) | ip_embeds CSD-half 0.978 (FiLM rank-1
+        collapse, matches the 2026-06-22 CSD verdict) | K 0.864 | **V 0.953** (var_ratio 0.205).
+      • bundle_inputnorm (siglip-only, 4 refs): raw 0.332 → ip_embeds 0.916 (this perceiver IS collapsed —
+        undertrained 600-step proof) | K 0.917 | **V 0.998** (var_ratio 0.035 — only 3.5% of V is
+        reference-specific). The output collapses regardless of where ip_embeds lands.
+    WEIGHT-MATRIX STABLE_RANK (Σσ²/σ1²; 3072 = full rank, low = collapses inputs to a few directions):
+      • Champion to_k_ip blocks 5/12/24 = 104/255/311 (near-full) vs **to_v_ip = 5.9/6.7/18.5** (RANK ~6).
+      • bundle_inputnorm to_k_ip ≈ 770 all blocks vs **to_v_ip = ~25** all single-blocks.
+      • Block 0 (a double-block) ≈ 770 for BOTH K and V in both bundles — consistent with double-blocks
+        never engaging (ip_scale_double ≈ 0; the persistent campaign fingerprint).
+    MECHANISM: cross-attn injection = softmax(Q·Kᵀ)·V. `to_v_ip` projects every reference's ip_embeds onto
+    a ~6–25-dim subspace → V is dominated by a few SHARED directions → the injected value is
+    reference-INDEPENDENT → output collapses, no matter how diverse the perceiver/K are. K stays full-rank
+    (the adapter LOOKS at refs differently) but V collapsed (it INJECTS the same thing). This is the easy
+    minimum of a loss that rewards a generic "make-it-stylish" push and never rewards reference-specific V.
+    Reconciles everything: the perceiver/grid fix (input side) never touched this OUTPUT-side collapse;
+    every cond_mode shares to_k_ip/to_v_ip so every cond_mode collapses; data levers can't move a low-rank
+    projection. RECONCILES the prior "perceiver + ip_k/ip_v collapse" memory note — it's specifically ip_V,
+    not the perceiver and not ip_K.
+    STEP 1A — REVISED FIX (sharpened by the rank finding; each gated by re-running discrimination):
+      1. DISCRIMINATION-AWARE TRAINING SIGNAL (the cause): contrastive/repulsion term forcing different refs
+         → different V/output. Removes the incentive that drives to_v_ip low-rank. PRIMARY fix.
+      2. RANK/VARIANCE REGULARIZER on to_v_ip (direct symptom fix): penalize low stable_rank / preserve input
+         variance through to_v_ip (nuclear-norm ratio, or a V-output decorrelation term). Re-audit rank after.
+      3. CSD FiLM redesign (secondary; hybrid only): rank-1 global (scale,shift) can't carry style — but
+         siglip-only collapses too, so this is NOT the bottleneck; deprioritize vs (1)/(2).
+      4. K is healthy — no work.
+      Probe the retrain with debug/sref_kv_rank_audit.py per checkpoint (cheap, offline) alongside the
+      discrimination gen-gate — to_v_ip stable_rank rising AND cross-ref V cosine dropping is the leading
+      indicator that the fix is working, before spending gens.
+    Artifacts: debug/sref_kv_rank_audit.py (new, committed). Numbers reproduced 2026-06-30.
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +

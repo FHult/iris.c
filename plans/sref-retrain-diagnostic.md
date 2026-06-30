@@ -82,12 +82,31 @@ Key reads:
 - vs-baseline 0.22–0.68 → the adapters DO transform strongly, just reference-independently
   (not inert; rules out "scale too low").
 
-## Next → Step 1A (architectural; see BACKLOG)
-Cheapest-first, each gated by re-running this discrimination test before a full run:
-1. K/V injection RANK audit (offline, no training): variance of to_k_ip/to_v_ip across refs —
-   is diversity lost at the perceiver or the projection? csd collapse says check the projection.
-2. Discrimination-aware TRAINING signal (contrastive/repulsion term punishing ref-agnostic output)
-   — most likely missing ingredient; affects ALL cond_modes, consistent with universal collapse.
-3. Per-query diversity regularization in the perceiver (hybrid path).
-4. CSD/FiLM contribution check + rebalance.
-Instrument the retrain with frequent checkpoints + per-checkpoint discrimination (Step 2).
+## Step 1A.1 RESULT (2026-06-30) — ROOT CAUSE: `to_v_ip` is low-rank → V near-constant → collapse
+Tool: `debug/sref_kv_rank_audit.py` (offline; cond-encoder → ip_embeds → K/V on N refs; cross-ref
+cosine per stage + SVD stable_rank of the weight matrices).
+
+Stage cross-ref cosine (cos→1 = refs stop mattering):
+- Champion (hybrid): raw SigLIP 0.348 → **ip_embeds SigLIP-half 0.407 (discriminates! perceiver is
+  NOT the site)** | ip_embeds CSD-half 0.978 (FiLM rank-1) | K 0.864 | **V 0.953**.
+- bundle_inputnorm (siglip): raw 0.332 → ip_embeds 0.916 | K 0.917 | **V 0.998** (var_ratio 0.035).
+
+Weight stable_rank (3072=full, low=collapsing):
+- Champion to_k_ip 104/255/311 (blocks 5/12/24) vs **to_v_ip 5.9/6.7/18.5**.
+- bundle_inputnorm to_k_ip ~770 vs **to_v_ip ~25**. (Block 0 ~770 for both — double-block, never engages.)
+
+Mechanism: inject = softmax(Q·Kᵀ)·V; a rank-~6 `to_v_ip` projects every ref onto the same few
+directions → V reference-independent → output collapse regardless of perceiver/K. K stays full-rank
+(adapter looks at refs differently) but V collapsed (injects the same thing). Universal across cond_modes
+→ explains all 17 collapses. The easy minimum of a loss that never rewards reference-specific V.
+
+## Next → Step 1A retrain (sharpened by the rank finding)
+1. **Discrimination-aware training signal** (the CAUSE): contrastive/repulsion term forcing different
+   refs → different V/output. Removes the incentive to collapse to_v_ip. PRIMARY.
+2. **Rank/variance regularizer on to_v_ip** (direct symptom fix): penalize low stable_rank / preserve
+   V-output variance. Re-audit rank after.
+3. CSD FiLM redesign — secondary (siglip-only collapses too, so CSD isn't the bottleneck).
+4. K is healthy — no work.
+Instrument retrain: per-checkpoint run BOTH `sref_kv_rank_audit.py` (cheap, offline — leading indicator:
+to_v_ip stable_rank ↑ AND cross-ref V cosine ↓) and `sref_ref_discrimination.py` (gen-gate, promote only
+on PASS). Web stays on in-context (IRIS_SREF_ADAPTER off) until a checkpoint PASSES discrimination.
