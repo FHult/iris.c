@@ -50,11 +50,24 @@ confirm it changes generation as expected.
 parity fixture + prod-flag compile + `make mps`; cached-mode only (live-encode segfaults MLX); never
 train from cold storage; `make test`; promote on an eval, not vibes.
 
-## Open questions (Explore agent answering 2026-06-30)
-- [ ] Exact MLX Flux Linear attribute paths + dims (the modules to wrap).
-- [ ] How the existing forward runs + how the base is frozen (value_and_grad scope vs explicit freeze).
-- [ ] MLX freeze/trainable mechanics for a param subset.
-- [ ] Exact BFL/Kohya export keys + shapes + alpha convention from iris_lora.c.
+## RESOLVED interface (2026-06-30)
+- **MLX targets (double blocks, the MVP):** `flux.transformer.transformer_blocks[i].attn.{to_q,to_k,to_v,
+  to_out, add_q_proj, add_k_proj, add_v_proj, to_add_out}` — all nn.Linear [3072,3072], 5 blocks × 8 = 40.
+  Single blocks (`single_transformer_blocks[i].attn.{to_qkv_mlp_proj,to_out}`, fused) DEFERRED (Diffusers
+  export doesn't carry single q/k/v; needs Kohya/BFL + the fused/shared-A handling).
+- **Export = DIFFUSERS format (clean 1:1 with the MLX names, separate q/k/v — no fused/shared-A problem):**
+  `transformer.transformer_blocks.{i}.attn.{to_q,to_k,to_v}.lora_{A,B}.weight`, `...to_out.0.lora_{A,B}` (note
+  the `.0`), `...{add_q_proj,add_k_proj,add_v_proj,to_add_out}.lora_{A,B}`. A=[rank,3072], B=[3072,rank], f32.
+  iris_lora.c load_diffusers (iris_lora.c:359-398) reads exactly these for double blocks.
+- **No alpha tensor in the loader** (iris_lora.c reads only lora_A/lora_B; scale is the inference --lora-scale).
+  → at export, BAKE `alpha/rank` into lora_B so trained strength = `--lora-scale 1.0`; the user scales from there.
+- **C apply math (to match in the parity fixture):** `out += scale * (x @ A^T) @ B^T`, A[rank,in], B[out,rank].
+- **Freezing:** wrap each target Linear in LoRALinear (frozen base `.linear` + trainable `lora_A/lora_B`);
+  `flux.freeze()` then `flux.unfreeze(recurse=True, keys=["lora_A","lora_B"])`; `nn.value_and_grad(flux, ...)`
+  then grads ONLY the LoRA. (MLX freeze/unfreeze accept `keys`.)
+- **Forward for LoRA = the model's STANDARD forward** (NOT `_flux_forward_no_ip`, which is the IP-adapter's
+  Q-collection trick). Run all blocks normally with LoRA active; flow-matching MSE on the velocity.
 
 ## Log
-- 2026-06-30: design opened; Explore mapping the MLX Flux structure + export format.
+- 2026-06-30: design opened; Explore mapped the MLX Flux structure + export format; interface RESOLVED
+  (Diffusers double-block export, bake-scale-into-B, freeze/unfreeze keys). Implementing piece 1.
