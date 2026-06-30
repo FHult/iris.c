@@ -2734,16 +2734,21 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
          showed the distilled adapter does NOT transfer → this is a fresh train + new CFG/inject code. Untested
          whether base also collapses; gate cheaply.
       4. **Different injection (AdaIN/stats or higher scale w/ content preservation).** Speculative; only if 1–3 stall.
-    NEXT STEPS (sequenced):
-      (a) ARCHITECTURE REVIEW (in progress 2026-06-30) — `plans/sref-architecture-retrain.md`: confirm the
-          in-context-vs-adapter mechanism difference in code (training inject + C inference + base support),
-          then design candidate 1 concretely (token format, where they concat, how the frozen base attends,
-          the content/style loss split) and define the FIRST experiment + its discrimination gate.
-      (b) Build candidate 1 (learned in-context) behind a cond_mode/flag; train↔infer parity guard per the
-          AGENT protocol; smoke-train warmstart-from-nothing; gate on `sref_ref_discrimination.py` (<0.90)
-          AND a quality eyeball (not just the corr number — B showed corr can move while quality degrades).
-      (c) If 1 passes the gate → scale to a full run → new champion path → flip IRIS_SREF_ADAPTER on. If it
-          stalls → candidate 2/3.
+    NEXT STEPS (sequenced) — UPDATED 2026-06-30 after the first experiment VALIDATED the direction AND
+    surfaced a NO-RETRAIN shortcut:
+      ✅ (a) ARCHITECTURE REVIEW done — mechanism confirmed (adapter=side-channel additive SDPA; in-context=
+          in-sequence concat; no base support). FIRST EXPERIMENT (patch-shuffled refs through the EXISTING
+          in-context path) → cross-ref corr 0.158 (vs adapter 0.93–0.99) with STYLE TRANSFER and NO
+          COMPOSITION LEAK (churchill→line-art, woodcut→engraving, flat→sticker all excellent; cyberfika
+          partial). ⇒ "in-sequence style-only" works TODAY with ZERO training by content-destroying the
+          reference. plans/sref-architecture-retrain.md.
+      (b) NO-RETRAIN SHORTCUT (do first): tune content-destruction (grid/blur/frequency/multi-shuffle) to fix
+          graphic styles + maximize style fidelity; wire into the web "style" path (preprocess → in-context),
+          upgrading the shipped default from style+composition to true style-only --sref with NO model change.
+      (c) Validate on both eval sets + the discrimination gate (<0.90) + quality eyeball; if it beats plain
+          in-context, SHIP it as --sref.
+      (d) LATER quality lever — a LEARNED content-destroyer/style-token encoder (the original "learned
+          in-context"), only if crude preprocessing plateaus; now de-risked. Base-model adapter only if that stalls.
     GUARDRAILS (carried): every train↔infer reimpl needs the parity fixture + prod-flag compile + `make mps`
     (AGENT protocol); cached-mode only (live-encode segfaults MLX, BUGS MLX-1); never train from cold storage
     (AGENT #6); promote ONLY on the discrimination gate, never sref_score; web stays on in-context meanwhile.

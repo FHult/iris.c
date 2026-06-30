@@ -81,5 +81,34 @@ chooses the multi-week direction. Repro: `scratchpad/sref_arch_probe.*`.
 - Promote ONLY on `sref_ref_discrimination.py` max cross-ref corr <0.90 AND a quality eyeball (corr can
   move while quality degrades — Option B showed this). Web stays on in-context until a ckpt PASSES.
 
+## FIRST EXPERIMENT RESULT (2026-06-30) — VALIDATED, and a NO-RETRAIN shortcut emerged
+Patch-shuffled (6×6) references through the EXISTING in-context path (`-i shuf --img2img-strength 1.0`,
+prompt "a cat sitting on a chair", seed 42, 512px):
+- **Discrimination: cross-ref output corr mean 0.158 / max 0.379** (vs the adapter's 0.93–0.99 collapse).
+  STRONGLY discriminates — passes the gate by a mile.
+- **Style transfer WITHOUT composition leak:** churchill→clean line-art cat, woodcut→engraving/hatched cat,
+  flat_sticker→flat-color sticker cat — all EXCELLENT, no trace of the reference's composition. cyberfika
+  (busy paisley) only PARTIAL (style went to the background, cat stayed photoreal) — graphic/decorative
+  patterns are harder to read as a global "style."
+- CONCLUSION: "in-sequence style-only" is VALIDATED — and achievable TODAY with NO TRAINING by
+  content-destroying the reference before the existing in-context path. 3/4 styles excellent.
+Artifacts: scratchpad/arch_probe/{*_shuf.png, out_*.png}.
+
+## REFRAMED PLAN — exploit the no-retrain shortcut first, learned encoder as a later quality lever
+The multi-week "architectural retrain" is now potentially a preprocessing + wiring task:
+1. **Tune content-destruction** (cheap, no train): grid size, multi-scale/averaged shuffles, blur, or
+   frequency filtering — to (a) fix graphic styles like cyberfika and (b) maximize style fidelity. Measure
+   on the simple-style eval set: discrimination (<0.90), style match, content-leak.
+2. **Wire into the web "style" path**: preprocess the reference (content-destroy) → existing in-context.
+   This UPGRADES the shipped in-context default from "style+composition" to true "style-only --sref" with
+   no model change. Keep a strength/þabout knob.
+3. **Validate + ship**: run the full eval (both eval sets) + the discrimination gate + a quality eyeball;
+   compare to plain in-context (which leaks composition). If it wins, it's the new --sref.
+4. **LATER quality lever (the original Candidate 1):** a LEARNED content-destroyer / style-token encoder,
+   if crude preprocessing plateaus (esp. for graphic styles). Now de-risked — we know in-sequence
+   style-only works; training just sharpens it. Base-model adapter (Candidate 3) only if even that stalls.
+
 ## Log
-- 2026-06-30: review opened; charter banked; Explore agent mapping injection paths + base support.
+- 2026-06-30: review opened; charter banked; Explore confirmed injection mechanism (side-channel vs
+  in-sequence) + no base support; FIRST EXPERIMENT (content-destroyed in-context) VALIDATED the direction
+  (corr 0.158, 3/4 styles excellent, no composition leak) → no-retrain shortcut; plan reframed.
