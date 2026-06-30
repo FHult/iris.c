@@ -3135,6 +3135,14 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (c) longer RANK-ONLY (best so far at 0.886; may cross 0.90 with more steps — cheap, stable). Full detail
     + hypotheses in plans/sref-retrain-diagnostic.md. NET STATUS: root cause solid (to_v_ip rank), rank
     penalty is a real partial win (0.977→0.886), cause-fix repulsion is unproven and under active iteration.
+    UPDATE (2026-06-30, C + A done): (C) longer rank-only @600 = V cosine still 0.965 → rank raises V
+    *rank* but leaves V *vectors* collinear → explains the plateau; stopped. (A) vproj_decorr_loss
+    (commit 95c2c53) penalized V cosine directly: V cosine DROPPED 0.965→0.578 but gen discrimination got
+    WORSE (0.983/0.995) — the optimizer GAMED the V-space proxy (ref-specific V variation that doesn't
+    propagate to the image at scale 0.38). KEY LESSON: intermediate-tensor proxies (x0-style-stats, V-cosine)
+    get gamed/destabilize; only the OUTPUT is non-gameable. to_v_ip rank is necessary-not-sufficient. Remaining
+    principled lever = OUTPUT-space repulsion done right (Option B: x0 repulsion with the 2nd ref's OWN Q
+    context + a content anchor). 5 training experiments done; cause fix UNSOLVED; best still rank-only 0.886.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans

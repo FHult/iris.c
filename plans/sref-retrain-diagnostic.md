@@ -90,9 +90,21 @@ Discrimination results (max cross-ref output corr; PASS <0.90):
 - **C (longer rank-only) gate @600: V-injection cross-ref cosine still 0.965** (≈champion 0.953) →
   rank-only does NOT decorrelate V; it raises V *rank* (capacity) but the V *vectors* stay collinear.
   This EXPLAINS the rank-only plateau and motivates A. C stopped.
-- **A (`vproj_decorr_loss`, commit 95c2c53): RUNNING** — rank 2.0 + decorr 1.0 (margin 0.5) directly
-  penalizes that 0.965 V cosine. Watch: decorr_loss ↓ + offline V cosine ↓ + discrimination <0.90,
-  loss STABLE (unlike the repulsion's divergence). `/Volumes/2TBSSD/sref_eval/run_A_decorr/`.
+- **A (`vproj_decorr_loss`, commit 95c2c53): NEGATIVE — GAMED THE PROXY.** rank 2.0 + decorr 1.0/margin
+  0.5, 300 steps, loss STABLE (~0.75). Offline V cosine DROPPED HARD 0.965→**0.578** (var_ratio 0.166→
+  0.551) — V tensors genuinely decorrelated — BUT gen discrimination got WORSE: cross-ref output
+  **0.983/0.995** (vs rank-only 0.886, champion 0.977); styled-vs-base 0.290. The optimizer satisfied
+  "low V cosine" by adding ref-specific V variation that is large in norm but DOESN'T propagate to the
+  image (attenuated at scale 0.38 / ignored by the frozen base). A V-space PROXY is gameable.
+  KEY LESSON (both cause-fix attempts now): intermediate-tensor proxies (x0-style-stats AND V-cosine) get
+  GAMED or destabilize; the ONLY non-gameable target is the generated OUTPUT itself. Rank penalty helps
+  modestly (0.886) precisely because it's an indirect capacity nudge, not a gameable separation target.
+  REASSESSMENT: to_v_ip low-rank is REAL but necessary-not-sufficient; fixing V-space alone can't force
+  output discrimination. The remaining principled lever is OUTPUT-space repulsion done right = Option B
+  (style_repulsion on x0 but with the 2nd ref's OWN Q context to kill the train/infer mismatch) PLUS a
+  content anchor to stop the destabilization the first repulsion showed. If B also fails, the collapse may
+  be inherent to injecting at scale 0.38 into the frozen distilled base → bigger architecture/scale change.
+  STATE: best is still rank-only 0.886 (FAILS <0.90). 5 training experiments done; cause fix UNSOLVED.
 
 ## Step 1A.1 RESULT (2026-06-30) — ROOT CAUSE: `to_v_ip` is low-rank → V near-constant → collapse
 Tool: `debug/sref_kv_rank_audit.py` (offline; cond-encoder → ip_embeds → K/V on N refs; cross-ref
