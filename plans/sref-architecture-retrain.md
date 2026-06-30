@@ -34,17 +34,46 @@ base was never trained for, and it collapses. → Make the adapter produce IN-SE
    SREF-BASE-1) + new CFG/inject code. Gate cheaply whether base also collapses.
 4. **Different injection (AdaIN/stats or higher scale + content preservation).** Speculative; only if 1–3 stall.
 
-## Architecture review — open questions (being answered now)
-- [ ] EXACT adapter injection mechanism in training (`_flux_forward_with_ip*`, `get_kv_all`): additive
-  per-block SDPA over IP tokens × scale? (Explore agent mapping.)
-- [ ] EXACT in-context mechanism (C inference: where do reference tokens enter the sequence; concat order
-  [TEXT,IMAGE]). Confirms the "in-sequence vs side-channel" distinction.
-- [ ] Base-model adapter training support — exists or needs new code (CFG dual-pass, guidance).
-- [ ] Why the injection must be low-scale (does high scale destroy content?).
+## Architecture review — ANSWERS (Explore agent, 2026-06-30, with code refs)
+- **Adapter injection (training):** separate per-block SDPA `ip_out = SDPA(image_Q, K_ip, V_ip)` then
+  `hidden = hidden + scale[i]*ip_out` (train_ip_adapter.py:3447-3452, single-stream :3499-3507). IP tokens
+  are NOT in the sequence; image Q is the frozen base's. A learned residual side-channel.
+- **In-context (C inference):** reference VAE latents CONCATENATED into the sequence
+  `[TEXT | TARGET_IMAGE | REFERENCE_IMAGE]` (iris_transformer_flux.c:4445), distinguished only by RoPE
+  T-offset; native self-attention attends to them every block → different refs = different tokens =
+  different output → DISCRIMINATES. No bottleneck projection, no scale knob.
+- **Base-model adapter:** NO support — guidance hardcoded None, no CFG dual-pass, distilled 4-step only;
+  needs substantial new code. (SREF-BASE-1; distilled adapter is OOD on base.)
+- **Scale ~0.38:** learned per-block scalar (init 1.0), settles low as a SYMPTOM of the low-rank collapse
+  (balances content destruction vs the constant style push), not an architectural requirement.
+- ⚠️ The agent's *recommendation* ("full-rank K/V init + vproj_rank_penalty + vproj_decorr_loss") is
+  EXACTLY the loss approach the 6 experiments already REFUTED (rank gamed/plateaus, decorr gamed,
+  repulsion overpowered). DO NOT re-try loss-design fixes — that path is closed.
 
-## Candidate 1 design (DRAFT — fill after the review answers land)
-_Token format, concat point, how the frozen base attends, content/style loss split, train↔infer parity
-plan, first-experiment config + discrimination gate._
+## Candidate 1 design — learned in-context, style-only tokens
+THE INSIGHT, sharpened: in-context DISCRIMINATES (in-sequence) but LEAKS composition (the ref's VAE latents
+carry content). The adapter DECOUPLES (style-only) but COLLAPSES (side-channel). Candidate 1 wants BOTH:
+place STYLE-ONLY tokens IN the sequence so native attention discriminates them, while carrying no
+composition. Encoder: reference → (content-invariant) style tokens in the base's img-embedding space →
+concat into the single-stream sequence (like the reference image tokens, but learned + style-only).
+**KEY RISK:** learned tokens in raw hidden space are OOD for the frozen base (in-context works because ref
+tokens are real VAE latents through the SAME img embed). The tokens must live in an in-distribution
+representation, or the base won't use them coherently. → De-risk BEFORE building a training pipeline.
+
+## FIRST EXPERIMENT (cheap, NO training — de-risks the whole direction)
+Probe the core hypothesis with the EXISTING in-context path + image preprocessing only:
+**Feed CONTENT-DESTROYED references (patch-shuffled / heavily blurred) through in-context img2img and
+measure whether STYLE transfers WITHOUT composition, and whether it DISCRIMINATES.**
+- Patch-shuffle destroys composition but preserves local texture/colour/style; VAE-encode → in-sequence.
+- Run `iris -d flux-klein-model -i <shuffled_ref> -p "a cat sitting on a chair" --img2img-strength 1.0`
+  across several distinct refs (churchill, cyberfika, woodcut, flat_sticker), fixed seed.
+- Measure: (a) style match (palette/texture vs ref), (b) composition leak (should be ~0 — scrambled),
+  (c) DISCRIMINATION (cross-ref output corr — want < 0.90, like real in-context, unlike the adapter).
+DECISION: if content-destroyed in-context still discriminates AND drops the composition leak → "in-sequence
+style-only" is VIABLE → build a learned encoder that produces such tokens (Candidate 1 proper). If it
+collapses or stays leaky → in-sequence can't be cleanly decoupled from content → pivot to base-model
+adapter (Candidate 3) or higher-capacity CSD (Candidate 2). Either way this ~30-min, no-train probe
+chooses the multi-week direction. Repro: `scratchpad/sref_arch_probe.*`.
 
 ## Execution gates (every architecture attempt)
 - train↔infer PARITY fixture + prod-flag compile + `make mps` (AGENT protocol) before trusting any result.
