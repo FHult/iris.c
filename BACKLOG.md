@@ -2702,6 +2702,54 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     features in `refs_feat_hybrid_simple/` + `refs_feat_csd_simple/`. Building it immediately exposed
     SREF-CHAMPION-COLLAPSE below.
 
+  - **🟣 SREF ARCHITECTURAL RETRAIN — CHARTER & NEXT STEPS (opened 2026-06-30, the active forward item).**
+    After the diagnostic campaign PROVED the collapse is not loss-fixable (root cause + 6 failed loss
+    experiments — see "SREF ADAPTER RETRAIN — DIAGNOSTIC-FIRST PLAN" and STEP-1A FINAL below; full design in
+    `plans/sref-architecture-retrain.md`), the path to true --sref is ARCHITECTURAL. This is the charter.
+    WHAT WE KNOW (the constraints any new architecture must respect):
+      • The conditioning ENCODERS are not the bottleneck on their own: the SigLIP perceiver's output
+        ip_embeds still DISCRIMINATE refs (cross-ref cos 0.407). The CSD FiLM path is rank-1 global
+        (`out = q*(1+scale)+shift`, same scale/shift for all 128 tokens — model.py CSDImageProj) and DOES
+        collapse (0.978), but siglip-only arms collapse too, so CSD is not the sole cause.
+      • The INJECTION is the collapse site + the structural suspect: per-block ADDITIVE cross-attention
+        K/V (to_k_ip/to_v_ip) at a learned low scale (~0.38) into the FROZEN DISTILLED base. to_v_ip
+        learns rank ~6 → V near-constant; forcing it otherwise is gamed/overpowered (6 experiments).
+      • THE CENTRAL CLUE: plain IN-CONTEXT conditioning (reference tokens placed IN the transformer
+        sequence — the img2img path) DISCRIMINATES references fine (it's the shipped web path). The
+        frozen base already knows how to use in-sequence tokens; the adapter's separate additive K/V
+        side-channel is a mechanism the frozen base was NOT trained for, and its loss-minimum is a
+        generic style push (collapse). → The most promising redesign makes the adapter produce
+        IN-SEQUENCE conditioning, not a side-channel injection.
+    CANDIDATE ARCHITECTURES (to be detailed + sequenced in the review; ranked by impact×tractability):
+      1. **Learned in-context conditioning (LEADING).** Encode the reference (SigLIP/CSD) → a small set of
+         learned TOKENS that are CONCATENATED into the sequence (like img2img in-context, which provably
+         discriminates), trained to carry STYLE while a content term keeps the prompt's subject. Inherits
+         the proven in-context discrimination; the training learns compression + style-isolation. Cheapest
+         to validate against the proven mechanism.
+      2. **Higher-capacity CSD conditioning.** Replace the rank-1 global FiLM with a real cross-attention /
+         higher-rank modulation so the content-invariant CSD signal can carry style structure. Pairs with (1)
+         or the existing perceiver.
+      3. **Base-model adapter (highest impact, highest cost).** Train against the UNDISTILLED base (CFG,
+         50 steps, more capacity) — the distilled base may be too rigid to steer without collapse. SREF-BASE-1
+         showed the distilled adapter does NOT transfer → this is a fresh train + new CFG/inject code. Untested
+         whether base also collapses; gate cheaply.
+      4. **Different injection (AdaIN/stats or higher scale w/ content preservation).** Speculative; only if 1–3 stall.
+    NEXT STEPS (sequenced):
+      (a) ARCHITECTURE REVIEW (in progress 2026-06-30) — `plans/sref-architecture-retrain.md`: confirm the
+          in-context-vs-adapter mechanism difference in code (training inject + C inference + base support),
+          then design candidate 1 concretely (token format, where they concat, how the frozen base attends,
+          the content/style loss split) and define the FIRST experiment + its discrimination gate.
+      (b) Build candidate 1 (learned in-context) behind a cond_mode/flag; train↔infer parity guard per the
+          AGENT protocol; smoke-train warmstart-from-nothing; gate on `sref_ref_discrimination.py` (<0.90)
+          AND a quality eyeball (not just the corr number — B showed corr can move while quality degrades).
+      (c) If 1 passes the gate → scale to a full run → new champion path → flip IRIS_SREF_ADAPTER on. If it
+          stalls → candidate 2/3.
+    GUARDRAILS (carried): every train↔infer reimpl needs the parity fixture + prod-flag compile + `make mps`
+    (AGENT protocol); cached-mode only (live-encode segfaults MLX, BUGS MLX-1); never train from cold storage
+    (AGENT #6); promote ONLY on the discrimination gate, never sref_score; web stays on in-context meanwhile.
+    Reusable from the diagnostic campaign: sref_kv_rank_audit.py(--ckpt), sref_ref_discrimination.py, the
+    loss primitives (gated off), the simple-style eval set + features.
+
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
     sref_score was an artifact of an all-painterly eval set. Recontextualizes the ENTIRE SREF campaign.**
