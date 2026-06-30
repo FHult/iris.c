@@ -3143,6 +3143,30 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     get gamed/destabilize; only the OUTPUT is non-gameable. to_v_ip rank is necessary-not-sufficient. Remaining
     principled lever = OUTPUT-space repulsion done right (Option B: x0 repulsion with the 2nd ref's OWN Q
     context + a content anchor). 5 training experiments done; cause fix UNSOLVED; best still rank-only 0.886.
+    FINAL (2026-06-30, Option B done) — CAUSE FIX IS UNREACHABLE BY LOSS DESIGN; COLLAPSE IS STRUCTURAL.
+    (B) x0 repulsion with the 2nd ref's OWN IP-influenced Q (commit, fixes the train/infer mismatch) +
+    content anchor (leak 0.5): repel_loss dipped early (0.48→0.29, styles separating) then RE-COLLAPSED
+    (back to 0.49 by step 300) as the content anchor (0.5) overpowered the repulsion (0.2) — restored
+    content but lost the separation. Discrimination 0.950/0.961 (FAIL, worse than rank-only). FULL SCOREBOARD
+    (max cross-ref output corr, PASS <0.90): champion 0.993 · rank-only 0.926 (BEST) · aggressive x0-repel
+    0.939 · gentle x0-repel 0.945 · A V-decorr 0.995 · B own-Q repel 0.961. SIX experiments, ALL FAIL.
+    The model has an overwhelming preference for the collapsed solution at scale-0.38 injection into the
+    FROZEN DISTILLED base; every loss lever either (a) is GAMED in an intermediate space (V-decorr), (b)
+    DESTABILIZES (aggressive x0), or (c) is OVERPOWERED by the flow/content terms (gentle, B re-collapse).
+    The rank penalty (symptom) is the only partial mover (0.977→0.886) and even it plateaus. CONCLUSION:
+    the SREF mode collapse is STRUCTURAL / mechanism-bound — NOT a training-loss-design problem. This
+    INDEPENDENTLY CONFIRMS the earlier "~0.70 mechanism-bound ceiling" (SREF CHAMPION PINNED / FINE-SWEEP)
+    from a fresh angle (6 loss-design experiments). REAL fixes are architectural, all speculative-retrain
+    tier: (1) CSD-dominant conditioning (the SigLIP perceiver path is the collapsing one); (2) a BASE-model
+    adapter (undistilled → CFG, more capacity, higher effective scale — but SREF-BASE-1 showed the distilled
+    adapter doesn't transfer, so this is a fresh train); (3) a different injection mechanism / higher scale
+    with content preservation. RECOMMENDATION: BANK the diagnosis (root cause + the proof that loss-design
+    can't fix it is durable, valuable); KEEP the web on the working IN-CONTEXT path (real per-reference
+    style transfer for users TODAY, IRIS_SREF_ADAPTER off); treat true --sref as a larger future project,
+    NOT a loss tweak. Reusable assets committed: loss primitives (style_repulsion_loss, vproj_rank_penalty,
+    vproj_decorr_loss) + trainer wiring (all gated off by default) + sref_kv_rank_audit.py(--ckpt) +
+    sref_ref_discrimination.py. Run dirs: /Volumes/2TBSSD/sref_eval/{smoke_rank,smoke_rank_repel,smoke_gentle,
+    run_C_rankonly,run_A_decorr,run_B_ownq}/.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans

@@ -172,6 +172,15 @@ FALLBACKS if gentle also fails to pass <0.90:
 - Longer RANK-ONLY run (rank-only is the best so far at 0.886; it may cross 0.90 with more steps —
   cheap, stable, no repulsion risk).
 
+### Option B RESULT (2026-06-30) — also FAILS; collapse is STRUCTURAL
+B (x0 repulsion, 2nd ref's OWN Q context + content anchor): repel_loss dipped early (0.48→0.29) then
+RE-COLLAPSED (0.49 @300) — content anchor (0.5) overpowered repel (0.2). Discrimination 0.950/0.961 (FAIL).
+SCOREBOARD (max cross-ref corr, PASS<0.90): champion 0.993 · rank-only 0.926 (BEST) · aggr-repel 0.939 ·
+gentle-repel 0.945 · A V-decorr 0.995 · B own-Q 0.961. SIX experiments, ALL FAIL. → mode collapse is
+STRUCTURAL/mechanism-bound, not a loss-design problem (confirms the earlier ~0.70 ceiling). Real fixes are
+architectural (CSD-dominant / base-model adapter / different injection). RECOMMENDATION: bank the diagnosis,
+keep web on in-context, true --sref = larger future project. Full detail in BACKLOG.
+
 ### (superseded design note) wiring the CAUSE fix: `style_repulsion_loss`
 batch_size=1 + the cheap `correct_forward_q` path (frozen-Flux state precomputed once, reused by
 `_pred_from_embeds`). So a SECOND reference's prediction at the same noisy latent is nearly free. Plan:
