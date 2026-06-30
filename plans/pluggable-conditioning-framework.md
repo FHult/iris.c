@@ -60,5 +60,28 @@ promote ONLY on the discrimination/eval gate; `make test` after changes.
 - **Phase 3 — subject/face in-sequence encoders + serving composability** (stack LoRA + in-sequence).
 - **Phase 4 (frontier) — reference→LoRA hypernetwork.** Instant custom LoRA; speculative.
 
+## Cross-model portability (4B distilled → 4B base 50-step → future 9B base)
+Iterate on **4B distilled first** (fastest: 4 steps, no CFG, cheapest to train + eval), then port.
+What ports vs what is per-model:
+- **Rail 1 (content-destruction): FREE on every variant.** Weight-less (preprocessing + in-context) →
+  works on any model with in-context img2img, no retrain. Verify CFG (base) applies the in-context
+  reference in BOTH the cond and uncond passes.
+- **Rail 2 (in-sequence encoders): the RECIPE ports, the WEIGHTS don't.** Trained against a specific
+  transformer's attention. 4B-distilled→4B-base: same hidden dim (3072), base attention differs →
+  likely a fine-tune (should transfer BETTER than the side-channel adapter did — native channel;
+  empirical). 4B→9B: different hidden dim (3072→4096) + depth → new encoder + retrain.
+- **Rail 3 (LoRAs): the PIPELINE ports, the WEIGHTS are per-model.** A LoRA is bound to its model's
+  weights; iris_lora.c already loads 4B and 9B by format. Retrain against whichever model you target.
+- **UPSIDE (not just compatibility):** base (CFG, 50 steps, more capacity) may make the trained rails
+  work BETTER — the distilled base's RIGIDITY was part of why the side-channel adapter collapsed
+  (SREF Act 5). The base port is a potential ceiling-RAISER, not just a checkbox.
+
+**DESIGN PRINCIPLE — build the framework MODEL-AWARE from day one so the port is cheap:**
+(1) dims from config, never hardcoded (already the project rule) → 3072 vs 4096 is automatic;
+(2) a CFG-CAPABLE training path — base needs a null+cond dual-pass + guidance; the current trainer
+hardcodes `guidance=None` with no dual-pass (base-model training is NET-NEW code — SREF-BASE-1).
+Phase 1's LoRA trainer should support BOTH distilled (no CFG) and base (CFG) from the start.
+
 ## Status
 - 2026-06-30: roadmap opened. Rail 1 (content-destruction style) SHIPPED. Rails 2–4 = this framework.
+  Owner sequencing: build/validate on 4B distilled → check 4B base (50-step) compatibility → future 9B base.

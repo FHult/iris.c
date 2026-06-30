@@ -2779,6 +2779,15 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     encoders + serving composability → Phase 4 hypernetwork. GUARDRAILS (carried): train↔infer parity +
     prod-flag compile + make mps for any C reimpl; cached-mode only; never train from cold; promote only on
     the gate. This subsumes the SREF "learned encoder" next-step into a broader framework.
+    CROSS-MODEL PORTABILITY (owner plan: 4B distilled → 4B base 50-step → future 9B base): Rail 1
+    (content-destruction) is WEIGHT-LESS → free on every variant. Rail 2 (in-sequence encoders): recipe
+    ports, WEIGHTS don't (4B-distilled→base = same dim 3072 but diff attention → fine-tune; 4B→9B = dim
+    3072→4096 → new encoder). Rail 3 (LoRAs): pipeline ports, weights per-model (iris_lora.c already loads
+    4B+9B). UPSIDE: base (CFG, more capacity) may make trained rails work BETTER — distilled rigidity was
+    part of the collapse. DESIGN PRINCIPLE (bake in now): build MODEL-AWARE — dims-from-config (no
+    hardcoding) + a CFG-CAPABLE training path (base needs null+cond dual-pass; trainer currently hardcodes
+    guidance=None, base training = net-new code). Phase 1 LoRA trainer supports distilled (no CFG) AND base
+    (CFG) from day one so the port is cheap.
 
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
