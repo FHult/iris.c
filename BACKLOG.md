@@ -2789,6 +2789,27 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     guidance=None, base training = net-new code). Phase 1 LoRA trainer supports distilled (no CFG) AND base
     (CFG) from day one so the port is cheap.
 
+  - **✅ LORA-TRAIN-1 (2026-06-30) — Phase 1 LoRA TRAINING pipeline WORKING end-to-end (train→export→serve
+    closed). First targeted-style LoRA learned a sharp, intentional style from a curated pool subset.**
+    Built `train/lora/` (lora.py LoRALinear + double-block injection; train_step.py checkpointed
+    flux_forward_lora w/ parity corr 1.0 vs flux.transformer; export.py → Diffusers safetensors iris_lora.c
+    already loads; train_lora.py reusing the IP-adapter's VALIDATED data path — make_prefetch_loader +
+    VAE-Q1 _bn_pack_latents — so LoRA trains in C's exact latent space). REGULAR-PIPELINE LESSONS applied:
+    module-aware gradient checkpointing (`mlx.nn.utils.checkpoint`, NOT bare `mx.checkpoint` which zeroes
+    captured-param grads — verified grad 0.0→113.0); MLX memory limit (BUGS MLX-2 wedge); cached-mode only;
+    hot-SSD shards only; bucket [512,512] pinned to square precompute; EMA over trainable_parameters() only
+    (NOT update_ema = whole frozen 4B) w/ decay-warmup. GUARD: `debug/test_lora.c` train↔infer parity
+    fixture (gen_lora_fixture.py golden = MLX LoRALinear delta; C lora_apply reproduces corr 1.000000
+    max_abs 0.00000) in `make test-unit` — green.
+    STYLE DEMO: curated densest CSD cluster (N=250, curate_style_subset.py) → 300-step rank-16 train,
+    loss 0.58→0.09; on-vs-off corr 0.575 (strong, content-preserving). Eyeballed: "a cat sitting on a
+    chair" goes from bright clean stock-photo → coherent desaturated warm-earth, heavy-grain, weathered/
+    aged aesthetic; SUBJECT preserved (still a tabby on a chair). A real, deliberate style — NOT the
+    reference-inert collapse the IP-adapter suffered. Validates the framework thesis: weight-space LoRA
+    deltas trained with the diffusion objective give a clean, controllable conditioning rail. Distilled 4B
+    only so far; base (CFG dual-pass) + single-block coverage + pluggable-module generalization are the
+    open Phase-1/2 follow-ups (see PLUGGABLE CONDITIONING FRAMEWORK above).
+
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
     sref_score was an artifact of an all-painterly eval set. Recontextualizes the ENTIRE SREF campaign.**
