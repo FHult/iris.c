@@ -25,6 +25,9 @@ from ip_adapter.loss import (
     gram_matrix,
     gram_style_loss,
     reconstruct_x0,
+    style_stats,
+    style_repulsion_loss,
+    vproj_rank_penalty,
     _HAS_METAL_KERNEL,
 )
 
@@ -542,3 +545,115 @@ class TestLossNumericalStability:
         loss = gram_style_loss(x, y)
         mx.eval(loss)
         assert np.isfinite(float(loss.item()))
+
+
+# ---------------------------------------------------------------------------
+# Reference-discrimination signal (SREF mode-collapse fix — BACKLOG STEP 1A)
+# ---------------------------------------------------------------------------
+
+class TestStyleStats:
+    def test_shape_is_2c(self):
+        x = mx.zeros((2, 32, 4, 4))
+        s = style_stats(x)
+        mx.eval(s)
+        assert s.shape == (2, 64)        # [B, 2C] = means then stds
+
+    def test_known_mean_and_std(self):
+        # channel filled with a constant c -> mean c, std 0; with values {-1,1} -> mean 0, std 1
+        x = np.zeros((1, 2, 2, 2), dtype=np.float32)
+        x[0, 0] = 3.0                                  # ch0 constant 3 -> mean 3, std 0
+        x[0, 1] = np.array([[-1, 1], [-1, 1]])         # ch1 -> mean 0, std 1
+        s = np.array(style_stats(mx.array(x)))
+        assert abs(s[0, 0] - 3.0) < 1e-4 and abs(s[0, 1] - 0.0) < 1e-4   # means
+        assert s[0, 2] < 1e-2 and abs(s[0, 3] - 1.0) < 1e-3              # stds
+
+
+class TestStyleRepulsionLoss:
+    def test_identical_inputs_give_max_penalty(self):
+        # same prediction for two refs == full collapse -> d2=0 -> loss == margin
+        rng = np.random.default_rng(7)
+        x = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
+        loss = style_repulsion_loss(x, x, margin=1.0)
+        mx.eval(loss)
+        assert abs(float(loss.item()) - 1.0) < 1e-5
+
+    def test_very_different_styles_zero_penalty(self):
+        # styles far apart (d2 >> margin) -> hinge clamps to 0
+        a = mx.full((1, 32, 4, 4), 5.0)
+        b = mx.full((1, 32, 4, 4), -5.0)               # means differ by 10 -> d2 huge
+        loss = style_repulsion_loss(a, b, margin=1.0)
+        mx.eval(loss)
+        assert float(loss.item()) == 0.0
+
+    def test_monotonic_in_similarity(self):
+        rng = np.random.default_rng(8)
+        base = rng.standard_normal((1, 16, 4, 4)).astype(np.float32)
+        a = mx.array(base)
+        near = mx.array(base + 0.01 * rng.standard_normal(base.shape).astype(np.float32))
+        far = mx.array(base + 2.0 * rng.standard_normal(base.shape).astype(np.float32))
+        l_near = float(style_repulsion_loss(a, near, margin=1.0).item())
+        l_far = float(style_repulsion_loss(a, far, margin=1.0).item())
+        assert l_near > l_far                          # more similar -> larger penalty
+
+    def test_gradient_pushes_styles_apart(self):
+        rng = np.random.default_rng(9)
+        a = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        b0 = a + 0.05 * mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
+        g = mx.grad(lambda b: style_repulsion_loss(a, b, margin=1.0))(b0)
+        mx.eval(g)
+        assert np.all(np.isfinite(np.array(g))) and float(mx.sum(mx.abs(g)).item()) > 0.0
+
+
+class TestVprojRankPenalty:
+    def _converge(self, W, iters=40, seed=0):
+        rng = np.random.default_rng(seed)
+        u = mx.array(rng.standard_normal((W.shape[0], W.shape[2])).astype(np.float32))
+        u = u * mx.rsqrt(mx.sum(u * u, axis=1, keepdims=True))
+        pen = None
+        for _ in range(iters):
+            pen, u = vproj_rank_penalty(W, u)
+        mx.eval(pen, u)
+        return float(pen.item()), u
+
+    def test_sigma1_matches_svd(self):
+        # power iteration's sigma1^2/frob^2 must match the true SVD top-energy fraction
+        rng = np.random.default_rng(3)
+        M = rng.standard_normal((6, 6)).astype(np.float32)
+        W = mx.array(M[None])                          # [1,6,6]
+        pen, _ = self._converge(W, iters=60)
+        sv = np.linalg.svd(M, compute_uv=False)
+        true_frac = float(sv[0] ** 2 / (sv ** 2).sum())
+        assert abs(pen - true_frac) < 1e-3
+
+    def test_rank1_penalty_near_one(self):
+        # rank-1 matrix: all energy in sigma1 -> penalty ~ 1.0
+        rng = np.random.default_rng(4)
+        a = rng.standard_normal((8, 1)).astype(np.float32)
+        b = rng.standard_normal((1, 8)).astype(np.float32)
+        W = mx.array((a @ b)[None])
+        pen, _ = self._converge(W, iters=60)
+        assert pen > 0.99
+
+    def test_orthogonal_penalty_near_inverse_n(self):
+        # orthogonal matrix: flat spectrum -> penalty ~ 1/n
+        q, _ = np.linalg.qr(np.random.default_rng(5).standard_normal((8, 8)))
+        W = mx.array(q.astype(np.float32)[None])
+        pen, _ = self._converge(W, iters=60)
+        assert abs(pen - 1.0 / 8) < 0.02
+
+    def test_gradient_lowers_top_energy(self):
+        # one gradient step on the penalty must reduce sigma1^2/frob^2 (flatten spectrum)
+        rng = np.random.default_rng(6)
+        M = (np.diag([5.0, 1.0, 0.5, 0.2]).astype(np.float32)
+             + 0.05 * rng.standard_normal((4, 4)).astype(np.float32))
+        W = mx.array(M[None])
+        u = mx.array(rng.standard_normal((1, 4)).astype(np.float32))
+        u = u * mx.rsqrt(mx.sum(u * u, axis=1, keepdims=True))
+        for _ in range(30):
+            _, u = vproj_rank_penalty(W, u)            # converge u first
+        before, _ = vproj_rank_penalty(W, u)
+        g = mx.grad(lambda Ww: vproj_rank_penalty(Ww, u)[0])(W)
+        W2 = W - 0.01 * g
+        after, _ = vproj_rank_penalty(W2, u)
+        mx.eval(before, after)
+        assert float(after.item()) < float(before.item())

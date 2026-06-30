@@ -80,6 +80,62 @@ def content_leak_loss(x0_cond: mx.array, x0_null: mx.array) -> mx.array:
     return mx.mean((instance_norm(x0_cond) - instance_norm(x0_null)) ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Reference-discrimination signal (SREF mode-collapse fix — BACKLOG STEP 1A)
+#
+# Step-0 diagnostic: every trained adapter is REFERENCE-INERT (different refs -> ~identical
+# output, cross-ref corr ~0.99). Step-1A.1 pinned the mechanism: to_v_ip is rank ~6, so the
+# injected V is near-constant across references. The loss never rewards reference-specific
+# output, so a low-rank generic "make-it-stylish" injection is the easy minimum. These two
+# terms add that missing pressure — one on the OUTPUT (cause), one on the WEIGHT (symptom).
+# ---------------------------------------------------------------------------
+
+def style_stats(x: mx.array, eps: float = 1e-5) -> mx.array:
+    """Per-channel STYLE descriptor = (spatial mean, spatial std) — the AdaIN style component
+    (complement of instance_norm's content). x: float32 [B, C, H, W] -> [B, 2C] (means then
+    stds). These are exactly the per-channel stats Gram captures as covariance and the ones
+    content_leak_loss leaves free; here they are the quantity references must DIFFER on."""
+    mu  = x.mean(axis=(2, 3))                                      # [B, C]
+    var = ((x - mu[:, :, None, None]) ** 2).mean(axis=(2, 3))      # [B, C]
+    sd  = mx.sqrt(var + eps)                                       # [B, C]
+    return mx.concatenate([mu, sd], axis=1)                        # [B, 2C]
+
+
+def style_repulsion_loss(x0_a: mx.array, x0_b: mx.array, margin: float = 1.0) -> mx.array:
+    """Discrimination-aware signal: two DIFFERENT style references, predicted at the SAME
+    prompt / noise / timestep, MUST produce different STYLE stats — else the adapter is
+    reference-blind (the to_v_ip collapse). Hinge on the per-channel style descriptor:
+    penalize ONLY when the two references' styles are too similar (d2 < margin); no reward for
+    pushing them apart beyond the margin (keeps it from fighting the reconstruction term).
+    Both float32 [B, C, H, W]; the caller supplies x0_b from a DIFFERENT-style reference at the
+    same noisy latent. Returns a scalar; ~margin on collapse, 0 once styles differ enough."""
+    d2 = mx.mean((style_stats(x0_a) - style_stats(x0_b)) ** 2)
+    return mx.maximum(0.0, margin - d2)
+
+
+def vproj_rank_penalty(W: mx.array, u: mx.array, eps: float = 1e-8):
+    """Rank-promoting spectral penalty on the stacked V-injection weights to_v_ip — the direct
+    symptom fix for the Step-1A.1 finding (to_v_ip stable_rank ~6 -> V near-constant across
+    refs). Penalizes the top-1 singular-energy fraction sigma1^2 / ||W||_F^2 per block (scale-
+    invariant; minimizing it flattens the spectrum, RAISING stable rank = sum(sigma^2)/sigma1^2).
+
+    sigma1 is estimated by ONE power-iteration step warm-started from u (cheap: two batched
+    mat-vecs, negligible vs a Flux forward). u is PERSISTENT power-iteration state the caller
+    threads across steps; the returned u_next is stop_gradient'd. Across steps the warm start
+    converges u to the top singular vector, so the single-step estimate tracks sigma1 closely.
+
+    W: [N, d, e] (to_v_ip_stacked, applied as out_e = in_d @ W[d,e]); u: [N, e] (unit).
+    Returns (penalty_scalar, u_next [N, e])."""
+    v = mx.einsum("nde,ne->nd", W, u)                             # W u  -> [N, d]
+    v = v * mx.rsqrt(mx.sum(v * v, axis=1, keepdims=True) + eps)  # normalize (left vec est)
+    un = mx.einsum("nde,nd->ne", W, v)                            # W^T v -> [N, e]
+    s2 = mx.sum(un * un, axis=1)                                  # [N] ~ sigma1^2
+    frob2 = mx.sum(W * W, axis=(1, 2)) + eps                      # [N] ||W_block||_F^2
+    penalty = mx.mean(s2 / frob2)
+    u_next = un * mx.rsqrt(s2[:, None] + eps)                     # warm start for next step
+    return penalty, mx.stop_gradient(u_next)
+
+
 def reconstruct_x0(
     noisy:   mx.array,
     v_pred:  mx.array,
