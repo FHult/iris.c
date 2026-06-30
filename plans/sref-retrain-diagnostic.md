@@ -114,7 +114,17 @@ directions → V reference-independent → output collapse regardless of perceiv
 - `style_stats` helper. 10 tests in `test_loss.py` (power-iter≡SVD; rank-1→1, orthogonal→1/n; gradients);
   full loss suite 49 passed.
 
-### NEXT — wiring into the training step (the design fork; NOT yet done — needs confirmation)
+### Done (commit bac44e5) — rank penalty WIRED + smoke-validated
+`vproj_rank_penalty` wired into both trainer loss paths behind `training.vproj_rank_weight` (threads
+persistent power-iter state `_rank_u`; no signature change). `sref_kv_rank_audit.py --ckpt` added.
+SMOKE (warmstart from collapsed champion, rank_weight 2.0, 300 steps, hot cached data,
+`/Volumes/2TBSSD/sref_eval/smoke_rank/`):
+- Wiring VALID: trains clean, no MLX wedge, loss stable (avg 1.24→0.75), mlx_mem peak 24.8 GB.
+- to_v_ip stable_rank ROSE: baseline 5.9/6.8/18.7 → step300 **15.1/24.1/43.7** (2.3–3.5×, still climbing).
+- Discrimination (export→gen-gate): cross-ref corr mean 0.977→**0.886**, max 0.993→**0.926**. Moved the
+  right way (~0.09) but STILL FAILS <0.90. → capacity↑ helps but doesn't FORCE use. Repulsion is next.
+
+### NEXT — wire the CAUSE fix: `style_repulsion_loss` (the design fork)
 batch_size=1 + the cheap `correct_forward_q` path (frozen-Flux state precomputed once, reused by
 `_pred_from_embeds`). So a SECOND reference's prediction at the same noisy latent is nearly free. Plan:
 1. **Second-reference source for repulsion (recommended: memory bank).** Keep a small ring buffer of the

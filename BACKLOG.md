@@ -3093,6 +3093,36 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
       indicator that the fix is working, before spending gens.
     Artifacts: debug/sref_kv_rank_audit.py (new, committed). Numbers reproduced 2026-06-30.
 
+    STEP 1A IMPLEMENTATION + SMOKE (2026-06-30) — rank penalty WIRED + VALIDATED; symptom fix helps but
+    is INSUFFICIENT alone → repulsion (cause fix) is next. Implemented two pure, unit-tested loss
+    primitives (commit 30293b1): `style_repulsion_loss` (cause: different refs at same prompt/noise must
+    produce different AdaIN style stats; hinge) + `vproj_rank_penalty` (symptom: spectral penalty
+    σ1²/‖W‖_F² on to_v_ip, σ1 via warm-started power iteration). Wired the RANK penalty into both trainer
+    loss paths behind `training.vproj_rank_weight` (commit bac44e5; threads persistent power-iter state
+    _rank_u; no signature change). Added `sref_kv_rank_audit.py --ckpt` (per-checkpoint weight-rank, the
+    leading indicator).
+    SMOKE: warmstart from the collapsed champion (step_0003000), vproj_rank_weight=2.0, 300 steps, 512px,
+    cached hot data (config /Volumes/2TBSSD/sref_eval/smoke_rank/). Results:
+      • WIRING VALIDATED: trains clean, NO MLX wedge, loss finite/stable (avg 1.24→0.75), mlx_mem peak
+        24.8 GB. (Direct trainer, not flywheel.)
+      • to_v_ip stable_rank ROSE monotonically (blocks 5/12/24): baseline 5.9/6.8/18.7 → step150
+        13.4/18.4/32.9 → step300 15.1/24.1/43.7 (2.3–3.5×, still climbing). top1 energy fell
+        (block5 0.170→0.066). Symptom fix works as designed.
+      • DISCRIMINATION (export step300 → bundle → sref_ref_discrimination.py, 4 refs @0.38/512): cross-ref
+        output corr mean 0.977→**0.886**, max 0.993→**0.926**; styled-vs-noadapter 0.373→0.262. So
+        capacity↑ DID move discrimination the right way (~0.09 mean) — references start to matter — but it
+        STILL FAILS the 0.90 gate. EXACTLY as predicted: rank-penalty grants V the CAPACITY to carry
+        ref-specific info but does not FORCE its USE; a low-rank generic injection is still the loss's easy
+        minimum. (Caveat: 300 warmstart steps, rank not plateaued — a longer run would push further, but
+        the gap to <0.90 is the repulsion's job.)
+    NEXT — wire the CAUSE fix (`style_repulsion_loss`), the more invasive change (batch=1 → needs a
+    different-style 2nd reference): ring-buffer of recent cond_features; each cond step compute
+    x0_other = _pred_from_embeds(get_image_embeds(buffered)) on the SAME precomputed Flux state (cheap),
+    add repel_w·style_repulsion_loss(x0_pred, x0_other). Signature change through loss_fn/compiled_step.
+    Then re-run the smoke (rank + repulsion together) and re-gate on discrimination — target max cross-ref
+    corr < 0.90 (and ideally ≪). Artifacts: /Volumes/2TBSSD/sref_eval/smoke_rank/{config.yaml,ckpt,bundle},
+    scratchpad task logs.
+
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
     MECHANISM-bound.** Ran combined fine grids (0.35/0.40/0.45 added to clean_concentrate_leak +
