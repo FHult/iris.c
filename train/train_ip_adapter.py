@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 from ip_adapter.model import IPAdapterKlein
 from ip_adapter.loss import (fused_flow_noise, get_schedule_values, gram_style_loss,
-                             reconstruct_x0, content_leak_loss)
+                             reconstruct_x0, content_leak_loss, vproj_rank_penalty)
 from ip_adapter.ema import update_ema, _flatten
 from ip_adapter.dataset import make_prefetch_loader, augment_mlx, BUCKETS
 from ip_adapter.constants import SIGLIP_IMAGE_SIZE
@@ -1176,6 +1176,20 @@ def train(config: dict) -> None:
     _leak_weight = float(tcfg.get("leak_loss_weight", 0.0))
     _leak_loss_accum: list = [mx.array(0.0)]
 
+    # SREF mode-collapse fix (BACKLOG STEP 1A): rank-promoting spectral penalty on to_v_ip.
+    # Step-1A.1 found to_v_ip stable_rank ~6 → V near-constant across references → output
+    # collapse. Penalize σ1²/‖W‖_F² per block (minimizing flattens the spectrum, RAISING stable
+    # rank). σ1 via one warm-started power-iteration step (cheap); _rank_u is the persistent
+    # power-iteration state, threaded across steps. Off by default; enable via vproj_rank_weight.
+    _rank_weight = float(tcfg.get("vproj_rank_weight", 0.0))
+    _rank_loss_accum: list = [mx.array(0.0)]
+    _rank_u: list = [None]
+    if _rank_weight > 0.0:
+        _Wv = adapter.to_v_ip_stacked
+        _ru = mx.random.normal((_Wv.shape[0], _Wv.shape[2]))            # [num_blocks, hidden]
+        _rank_u[0] = _ru * mx.rsqrt(mx.sum(_ru * _ru, axis=1, keepdims=True) + 1e-8)
+        mx.eval(_rank_u[0])
+
     # TRAIN-5 Stage 0: per-fence peak memory profiling.
     # Gate behind memory_profile: true in training config. Resets peak counter
     # after each eval fence to isolate: Flux fwd / adapter bwd+opt / param update / EMA.
@@ -1290,6 +1304,13 @@ def train(config: dict) -> None:
             leak_term = content_leak_loss(x0_pred, x0_null)
             _leak_loss_accum[0] = leak_term
             total = total + _leak_weight * leak_term
+        if _rank_weight > 0.0:
+            # Symptom fix: keep to_v_ip from collapsing to low rank. Gradient flows to the
+            # weight; _rank_u is stop_gradient'd state (warm-starts next step's power iter).
+            rank_pen, _u_next = vproj_rank_penalty(adapter.to_v_ip_stacked, _rank_u[0])
+            _rank_u[0] = _u_next
+            _rank_loss_accum[0] = rank_pen
+            total = total + _rank_weight * rank_pen
         return total
 
     loss_and_grad = nn.value_and_grad(adapter, loss_fn)
@@ -1368,6 +1389,11 @@ def train(config: dict) -> None:
             leak_term = content_leak_loss(x0_pred, x0_null)
             _leak_loss_accum[0] = leak_term
             total = total + _leak_weight * leak_term
+        if _rank_weight > 0.0:
+            rank_pen, _u_next = vproj_rank_penalty(adapter.to_v_ip_stacked, _rank_u[0])
+            _rank_u[0] = _u_next
+            _rank_loss_accum[0] = rank_pen
+            total = total + _rank_weight * rank_pen
         return total
 
     loss_and_grad_with_ip = nn.value_and_grad(adapter, loss_fn_with_ip)

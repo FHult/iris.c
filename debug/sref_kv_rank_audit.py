@@ -86,16 +86,44 @@ def cross_ref_stats(mat):
     return float(np.mean(cos)), float(np.min(cos)), float(np.max(cos)), var_ratio
 
 
+def _stable_rank_report(Wk, Wv, blocks=(0, 5, 12, 24)):
+    """Print stable_rank / top-1 energy of stacked K and V weight matrices [N,d,e]."""
+    print("\nweight-matrix rank of to_k_ip / to_v_ip (stable_rank: 3072=full, low=collapsing; "
+          "top1=σ1²/Σσ² energy in the #1 direction):")
+    for label, W in (("to_k_ip", np.array(Wk.astype(mx.float32))),
+                     ("to_v_ip", np.array(Wv.astype(mx.float32)))):
+        for n in blocks:
+            sv = np.linalg.svd(W[n].astype(np.float64), compute_uv=False)
+            sr = float((sv ** 2).sum() / (sv[0] ** 2 + 1e-30))
+            t1 = float(sv[0] ** 2 / ((sv ** 2).sum() + 1e-30))
+            print(f"  {label} block {n:2d}: stable_rank {sr:8.1f}  top1 {t1:6.3f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bundle", required=True)
-    ap.add_argument("--feat", nargs="+", required=True)
+    ap.add_argument("--bundle", help="exported adapter bundle dir (full stage audit)")
+    ap.add_argument("--ckpt", help="training checkpoint .safetensors (weight-rank only — for "
+                                   "per-checkpoint instrumentation; no refs/model needed)")
+    ap.add_argument("--feat", nargs="+", help="reference feature .bin files (>=3; bundle mode)")
     ap.add_argument("--cond-mode", default="hybrid", choices=["hybrid", "siglip", "csd"])
     ap.add_argument("--siglip-dim", type=int, default=1152)
     ap.add_argument("--csd-dim", type=int, default=768)
     ap.add_argument("--num-image-tokens", type=int, default=256)
     ap.add_argument("--perceiver-heads", type=int, default=16)
     args = ap.parse_args()
+
+    # --ckpt: weight-rank only, straight from a training checkpoint (the leading indicator the
+    # SREF retrain watches per checkpoint — to_v_ip stable_rank should RISE as collapse is fixed).
+    if args.ckpt:
+        w = mx.load(args.ckpt)
+        for pref in ("", "ema."):
+            if f"{pref}to_v_ip_stacked" in w:
+                print(f"=== {args.ckpt}  [{pref or 'online'}] ===")
+                _stable_rank_report(w[f"{pref}to_k_ip_stacked"], w[f"{pref}to_v_ip_stacked"])
+        return 0
+
+    if not (args.bundle and args.feat):
+        ap.error("bundle mode needs --bundle and --feat (or use --ckpt for weight-rank only)")
 
     model = IPAdapterKlein(num_blocks=25, hidden_dim=3072,
                            num_image_tokens=args.num_image_tokens, siglip_dim=args.siglip_dim,
@@ -151,17 +179,7 @@ def main():
     # Weight-matrix rank: does to_k_ip/to_v_ip intrinsically collapse inputs toward a few
     # dominant directions? stable_rank = ||W||_F^2 / ||W||_2^2 (= Σσ²/σ1²); 3072 = full,
     # low = dominated by its top singular direction (collapses diverse inputs to ~one output).
-    print("\nweight-matrix rank of to_k_ip / to_v_ip (stable_rank: 3072=full, low=collapsing; "
-          "top1=σ1²/Σσ² energy in the #1 direction):")
-    Wk = np.array(model.to_k_ip_stacked.astype(mx.float32))   # [25, 3072, 3072] (d->e)
-    Wv = np.array(model.to_v_ip_stacked.astype(mx.float32))
-    for label, W in (("to_k_ip", Wk), ("to_v_ip", Wv)):
-        for n in (0, 5, 12, 24):
-            sv = np.linalg.svd(W[n].astype(np.float64), compute_uv=False)
-            sr = float((sv ** 2).sum() / (sv[0] ** 2 + 1e-30))
-            t1 = float(sv[0] ** 2 / ((sv ** 2).sum() + 1e-30))
-            t8 = float((sv[:8] ** 2).sum() / ((sv ** 2).sum() + 1e-30))
-            print(f"  {label} block {n:2d}: stable_rank {sr:8.1f}  top1 {t1:6.3f}  top8 {t8:6.3f}")
+    _stable_rank_report(model.to_k_ip_stacked, model.to_v_ip_stacked)
     return 0
 
 
