@@ -82,6 +82,18 @@ Key reads:
 - vs-baseline 0.22–0.68 → the adapters DO transform strongly, just reference-independently
   (not inert; rules out "scale too low").
 
+## Step 1A FIX CAMPAIGN (2026-06-30) — running C/A; repulsion was a dead end
+Discrimination results (max cross-ref output corr; PASS <0.90):
+- champion (collapsed) 0.993 · **rank-only @300 0.926 (best so far)** · aggressive repel 0.939 · gentle repel 0.945.
+- BOTH x0-repulsion tunings made it WORSE → `style_repulsion_loss` mechanism is counterproductive
+  (train/infer mismatch: ref-B's V in ref-A's shared Q context). ABANDONED.
+- **C (longer rank-only) gate @600: V-injection cross-ref cosine still 0.965** (≈champion 0.953) →
+  rank-only does NOT decorrelate V; it raises V *rank* (capacity) but the V *vectors* stay collinear.
+  This EXPLAINS the rank-only plateau and motivates A. C stopped.
+- **A (`vproj_decorr_loss`, commit 95c2c53): RUNNING** — rank 2.0 + decorr 1.0 (margin 0.5) directly
+  penalizes that 0.965 V cosine. Watch: decorr_loss ↓ + offline V cosine ↓ + discrimination <0.90,
+  loss STABLE (unlike the repulsion's divergence). `/Volumes/2TBSSD/sref_eval/run_A_decorr/`.
+
 ## Step 1A.1 RESULT (2026-06-30) — ROOT CAUSE: `to_v_ip` is low-rank → V near-constant → collapse
 Tool: `debug/sref_kv_rank_audit.py` (offline; cond-encoder → ip_embeds → K/V on N refs; cross-ref
 cosine per stage + SVD stable_rank of the weight matrices).
