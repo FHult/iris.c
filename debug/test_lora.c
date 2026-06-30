@@ -131,12 +131,56 @@ static void test_free_null(void) {
     printf("PASS free_null (no crash)\n");
 }
 
+static float *load_bin(const char *path, long n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "FAIL: cannot open %s\n", path); failures++; return NULL; }
+    float *p = malloc(n * sizeof(float));
+    long got = fread(p, sizeof(float), n, f);
+    fclose(f);
+    if (got != n) { fprintf(stderr, "FAIL: short read %s (%ld/%ld)\n", path, got, n); failures++; }
+    return p;
+}
+
+static void compare_tol(const char *name, const float *got, const float *gold, long n, double tol) {
+    double dot = 0, na = 0, nb = 0, maxabs = 0;
+    for (long i = 0; i < n; i++) {
+        dot += (double)got[i] * gold[i]; na += (double)got[i] * got[i]; nb += (double)gold[i] * gold[i];
+        double d = fabs((double)got[i] - gold[i]); if (d > maxabs) maxabs = d;
+    }
+    double corr = (na > 0 && nb > 0) ? dot / (sqrt(na) * sqrt(nb)) : 0.0;
+    int ok = (corr > 0.999 && maxabs < tol);
+    printf("%-20s corr=%.6f max_abs=%.5f  %s\n", name, corr, maxabs, ok ? "PASS" : "FAIL");
+    if (!ok) failures++;
+}
+
+/* Test 5: train↔infer PARITY (AGENT protocol) — C lora_apply must reproduce the MLX LoRALinear
+ * golden from debug/fixtures/lora (gen_lora_fixture.py): export → lora_load → lora_apply == MLX. */
+static void test_parity_fixture(void) {
+    const int rank = 4, dim = 8, seq = 5;
+    lora_state_t *lora = lora_load("debug/fixtures/lora/lora.safetensors", 1, 0, dim, 1.0f);
+    if (!lora) { fprintf(stderr, "FAIL parity: lora_load returned NULL\n"); failures++; return; }
+    lora_adapter_t *a = &lora->double_img_q[0];
+    if (!a->lora_A || !a->lora_B) {
+        fprintf(stderr, "FAIL parity: to_q adapter not loaded\n"); failures++; lora_free(lora); return;
+    }
+    float *x = load_bin("debug/fixtures/lora/x.bin", (long)seq * dim);
+    float *gold = load_bin("debug/fixtures/lora/golden.bin", (long)seq * dim);
+    if (x && gold) {
+        float out[5 * 8] = {0};                 /* seq*dim; out starts at 0 → becomes the delta */
+        float scratch[5 * 4];                   /* seq*rank */
+        lora_apply(a, 1.0f, x, out, seq, scratch);
+        compare_tol("parity (vs MLX)", out, gold, (long)seq * dim, 1e-3);
+    }
+    free(x); free(gold); lora_free(lora);
+}
+
 int main(void) {
     printf("=== LoRA unit tests ===\n");
     test_scale_zero();
     test_rank1_correctness();
     test_multi_token();
     test_free_null();
+    test_parity_fixture();
 
     if (failures > 0) {
         fprintf(stderr, "\n%d FAILED\n", failures);
