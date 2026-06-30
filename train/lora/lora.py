@@ -23,6 +23,13 @@ DOUBLE_ATTN_TARGETS = [
     "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",  # text stream
 ]
 
+# Single-stream (Flux2ParallelSelfAttention) fused Linears. mflux fuses QKV+MLP into one input
+# projection and attn+MLP into one output projection — these map 1:1 to the C single_linear1/2.
+SINGLE_ATTN_TARGETS = [
+    "to_qkv_mlp_proj",   # norm → [Q,K,V,gate,up]  → C single_linear1
+    "to_out",            # [attn_out, mlp_out] → hidden → C single_linear2
+]
+
 
 class LoRALinear(nn.Module):
     """Frozen `linear` + trainable low-rank delta. forward = base + scale*(x A^T) B^T."""
@@ -59,6 +66,28 @@ def inject_lora_double_blocks(flux, rank: int = 16, alpha: float | None = None,
             lin = getattr(attn, name, None)
             if not isinstance(lin, nn.Linear):
                 continue                              # absent or not a plain Linear → skip
+            setattr(attn, name, LoRALinear(lin, rank=rank, alpha=alpha))
+            injected.append((bi, name))
+    flux.freeze(recurse=True)
+    flux.unfreeze(recurse=True, keys=["lora_A", "lora_B"])
+    return injected
+
+
+def inject_lora_single_blocks(flux, rank: int = 16, alpha: float | None = None,
+                              targets: list[str] | None = None) -> list[tuple[int, str]]:
+    """Wrap each single block's fused attention Linears (to_qkv_mlp_proj, to_out) with LoRALinear,
+    then freeze the model and unfreeze ONLY the LoRA params. Recursive unfreeze(keys=[lora_A,lora_B])
+    covers any double-block LoRA injected earlier too, so call order doesn't matter. Returns the list
+    of (block_index, attr_name) injected."""
+    targets = targets or SINGLE_ATTN_TARGETS
+    injected: list[tuple[int, str]] = []
+    blocks = flux.transformer.single_transformer_blocks
+    for bi, block in enumerate(blocks):
+        attn = block.attn
+        for name in targets:
+            lin = getattr(attn, name, None)
+            if not isinstance(lin, nn.Linear):
+                continue
             setattr(attn, name, LoRALinear(lin, rank=rank, alpha=alpha))
             injected.append((bi, name))
     flux.freeze(recurse=True)

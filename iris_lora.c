@@ -397,22 +397,31 @@ static void load_diffusers(lora_state_t *lora, const safetensors_file_t *sf, int
         if (load_adapter(&lora->double_txt_proj[i], sf, dk, uk, &lora->max_rank, hidden, hidden)) loaded++;
     }
 
-    /* Single blocks: proj_out → single_linear2 (dims vary, no fixed size check) */
+    /* Single blocks. mflux Flux2 fuses the single-stream projections into two Linears that map
+     * 1:1 onto our fused adapters: attn.to_qkv_mlp_proj → single_linear1 (norm→[Q,K,V,gate,up]),
+     * attn.to_out → single_linear2 ([attn_out, mlp_out]→hidden). Falls back to the HF-diffusers
+     * `proj_out` name for single_linear2 when no fused `to_out` LoRA is present (dims vary → no
+     * size check). This gives full single-block coverage from a Diffusers-format file. */
+    int single_l1 = 0, single_l2 = 0;
     for (int i = 0; i < lora->num_single_blocks; i++) {
-        /* For diffusers single blocks, Q/K/V are separate but use the same input (norm).
-         * We load them as separate adapters and store in single_linear1_q/k/v.
-         * Since our struct doesn't have separate single Q/K/V, we skip for now and
-         * note in the warning below. The user can use Kohya format for full single block support. */
+        snprintf(dk, sizeof(dk), "transformer.single_transformer_blocks.%d.attn.to_qkv_mlp_proj.lora_A.weight", i);
+        snprintf(uk, sizeof(uk), "transformer.single_transformer_blocks.%d.attn.to_qkv_mlp_proj.lora_B.weight", i);
+        if (load_adapter(&lora->single_linear1[i], sf, dk, uk, &lora->max_rank, -1, -1)) { loaded++; single_l1++; }
 
-        /* proj_out → single_linear2 */
-        snprintf(dk, sizeof(dk), "transformer.single_transformer_blocks.%d.proj_out.lora_A.weight", i);
-        snprintf(uk, sizeof(uk), "transformer.single_transformer_blocks.%d.proj_out.lora_B.weight", i);
-        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1)) loaded++;
+        snprintf(dk, sizeof(dk), "transformer.single_transformer_blocks.%d.attn.to_out.lora_A.weight", i);
+        snprintf(uk, sizeof(uk), "transformer.single_transformer_blocks.%d.attn.to_out.lora_B.weight", i);
+        if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1)) { loaded++; single_l2++; }
+        else {
+            /* HF-diffusers fallback: the fused output projection is named proj_out */
+            snprintf(dk, sizeof(dk), "transformer.single_transformer_blocks.%d.proj_out.lora_A.weight", i);
+            snprintf(uk, sizeof(uk), "transformer.single_transformer_blocks.%d.proj_out.lora_B.weight", i);
+            if (load_adapter(&lora->single_linear2[i], sf, dk, uk, &lora->max_rank, -1, -1)) { loaded++; single_l2++; }
+        }
     }
 
-    if (lora->num_single_blocks > 0) {
-        fprintf(stderr, "LoRA: note: diffusers single-block Q/K/V LoRAs not supported "
-                "(only proj_out loaded); use Kohya format for full single block support\n");
+    if (lora->num_single_blocks > 0 && single_l1 == 0 && single_l2 > 0) {
+        fprintf(stderr, "LoRA: note: only single-block output projection loaded "
+                "(no attn.to_qkv_mlp_proj LoRA in file)\n");
     }
 
     fprintf(stderr, "LoRA: loaded %d diffusers adapters across %d double + %d single blocks\n",

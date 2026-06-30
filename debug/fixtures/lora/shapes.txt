@@ -1,1 +1,1 @@
-rank=4 dim=8 seq=5
+rank=4 dim=8 seq=5 single1_out=12

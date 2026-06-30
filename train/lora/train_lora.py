@@ -19,7 +19,7 @@ from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
 from ip_adapter.dataset import make_prefetch_loader
 from train_ip_adapter import _load_vae_bn_stats, _bn_pack_latents   # reuse the VAE-Q1 prep (single source)
 
-from lora.lora import inject_lora_double_blocks, lora_param_count
+from lora.lora import inject_lora_double_blocks, inject_lora_single_blocks, lora_param_count
 from lora.train_step import lora_loss, make_ckpt_blocks
 from lora.export import export_lora_diffusers
 
@@ -55,6 +55,8 @@ def main():
     print("loading Flux2Klein ...", flush=True)
     flux = Flux2Klein(model_path=model_dir, quantize=None)
     inj = inject_lora_double_blocks(flux, rank=rank, alpha=alpha)
+    if a.get("single_blocks", True):                       # full-coverage default (20 single blocks)
+        inj += inject_lora_single_blocks(flux, rank=rank, alpha=alpha)
     print(f"injected {len(inj)} LoRA modules (rank {rank}, alpha {alpha}); "
           f"{lora_param_count(flux):,} trainable params", flush=True)
     mx.eval(flux.transformer.parameters())
@@ -68,12 +70,21 @@ def main():
     shard_paths = sorted(glob.glob(os.path.join(d["shard_path"], "*.tar")))
     if not shard_paths:
         raise RuntimeError(f"no .tar shards in {d['shard_path']} (must be hot SSD — AGENT #6)")
+    # record_allowlist: train ONLY on the curated rec_ids (curate_style_subset.py → {"rec_ids":[...]}).
+    # Without this the loader yields the WHOLE pool — the targeted-style curation would be inert.
+    allow = None
+    if d.get("record_allowlist"):
+        import json
+        al = json.load(open(d["record_allowlist"]))
+        allow = set(al["rec_ids"] if isinstance(al, dict) else al)
+        print(f"record_allowlist: {len(allow)} rec_ids from {d['record_allowlist']}", flush=True)
     print(f"{len(shard_paths)} shards; bucket {d.get('bucket', [512,512])}", flush=True)
     loader = make_prefetch_loader(
         shard_paths=shard_paths, batch_size=int(d.get("batch_size", 1)),
         qwen3_cache_dir=d["qwen3_cache_dir"], vae_cache_dir=d["vae_cache_dir"],
         bucket=tuple(d.get("bucket", [512, 512])), seed=d.get("seed"),
         records_per_shard_visit=d.get("records_per_shard_visit"),
+        record_allowlist=allow,
     )
 
     opt = optim.AdamW(learning_rate=float(t.get("learning_rate", 1e-4)),

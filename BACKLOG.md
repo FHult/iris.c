@@ -2810,6 +2810,31 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     only so far; base (CFG dual-pass) + single-block coverage + pluggable-module generalization are the
     open Phase-1/2 follow-ups (see PLUGGABLE CONDITIONING FRAMEWORK above).
 
+  - **✅ LORA-TRAIN-2 (2026-06-30) — FULL single-block coverage + two bugs caught. The LoRA now adapts
+    all 25 blocks (was 5 double only), and the targeted-style curation is no longer inert.**
+    (1) SINGLE-BLOCK COVERAGE: mflux Flux2's single block fuses its projections into TWO Linears that
+    map 1:1 onto the C engine's fused single-block adapters — `attn.to_qkv_mlp_proj` (norm→[Q,K,V,gate,
+    up]) → `single_linear1`, `attn.to_out` ([attn_out,mlp_out]→hidden) → `single_linear2`. The C
+    transformer ALREADY applies both (iris_transformer_flux.c:3708/3796); only the Diffusers LOADER was
+    missing them (it loaded `proj_out`→single_linear2 only and warned "use Kohya"). Extended
+    `load_diffusers` to read the fused keys (kept the HF `proj_out` fallback). Python: `SINGLE_ATTN_TARGETS`
+    + `inject_lora_single_blocks` (wraps both fused Linears; recursive unfreeze covers double+single
+    regardless of call order); export iterates `single_transformer_blocks`. train_step.flux_forward_lora
+    already loops the (checkpointed) single blocks → single-block LoRA gets gradients with NO train-step
+    change. Per-adapter count 40→80; trainable params 3.9M→18.7M. GUARD: extended `debug/test_lora.c` —
+    fixture now carries the fused single-block keys with DISTINCT out dims (12 vs 8) so a mis-route can't
+    pass; C loads `to_qkv_mlp_proj`→single_linear1 & `to_out`→single_linear2 at corr 1.000000 (prod-flag
+    compile: single2 max_abs 1e-5 = ffast-math noise). make mps relinked; make test-unit green. Real-weights
+    round-trip confirmed: a live train exports 160 tensors = 80 adapters (double 0-4 + single 0-19, all 20
+    to_qkv_mlp_proj present), keys match the loader verbatim. v2 train (single+double): loss 1.00→0.11 by
+    step 150, peak 23.3 GB stable (32 GB machine, mlx_memory_pct 0.6) — no wedge.
+    (2) BUG — record_allowlist was INERT: `make_prefetch_loader` accepts `record_allowlist` but
+    train_lora.py never passed it, so the LORA-TRAIN-1 "targeted" run actually trained on the FULL 22-shard
+    pool, not the 250-id curated cluster. The corr-0.575 style there came from the whole pool, not the
+    curation. Fixed: train_lora.py now loads `data.record_allowlist` (json {"rec_ids":[...]}) → set →
+    passes to the loader (log confirms "record_allowlist: 250 rec_ids"). v2 is the first genuinely
+    cluster-targeted run.
+
   - **🔴 SREF-CHAMPION-COLLAPSE (2026-06-29) — THE SHIPPED CHAMPION IS REFERENCE-INERT: it applies a
     near-CONSTANT warm-painterly transform almost INDEPENDENT of the reference image. The ~0.70
     sref_score was an artifact of an all-painterly eval set. Recontextualizes the ENTIRE SREF campaign.**

@@ -174,6 +174,32 @@ static void test_parity_fixture(void) {
     free(x); free(gold); lora_free(lora);
 }
 
+/* Test 6: SINGLE-BLOCK key routing — the Diffusers loader must map the mflux fused single-block
+ * keys to the C fused adapters: attn.to_qkv_mlp_proj → single_linear1, attn.to_out → single_linear2.
+ * Distinct out dims (12 vs 8) so a mis-route can't silently pass. */
+static void test_single_block_parity(void) {
+    const int rank = 4, dim = 8, seq = 5, sout1 = 12;
+    lora_state_t *lora = lora_load("debug/fixtures/lora/lora.safetensors", 0, 1, dim, 1.0f);
+    if (!lora) { fprintf(stderr, "FAIL single: lora_load returned NULL\n"); failures++; return; }
+    lora_adapter_t *a1 = &lora->single_linear1[0];   /* to_qkv_mlp_proj */
+    lora_adapter_t *a2 = &lora->single_linear2[0];   /* to_out */
+    if (!a1->lora_A || !a2->lora_A) {
+        fprintf(stderr, "FAIL single: fused adapter(s) not loaded (l1=%p l2=%p)\n",
+                (void*)a1->lora_A, (void*)a2->lora_A); failures++; lora_free(lora); return;
+    }
+    float *x  = load_bin("debug/fixtures/lora/x.bin", (long)seq * dim);
+    float *g1 = load_bin("debug/fixtures/lora/golden_single1.bin", (long)seq * sout1);
+    float *g2 = load_bin("debug/fixtures/lora/golden_single2.bin", (long)seq * dim);
+    if (x && g1 && g2) {
+        float out1[5 * 12] = {0}, out2[5 * 8] = {0}, scratch[5 * 4];
+        lora_apply(a1, 1.0f, x, out1, seq, scratch);
+        compare_tol("single1 (to_qkv_mlp)", out1, g1, (long)seq * sout1, 1e-3);
+        lora_apply(a2, 1.0f, x, out2, seq, scratch);
+        compare_tol("single2 (to_out)", out2, g2, (long)seq * dim, 1e-3);
+    }
+    free(x); free(g1); free(g2); lora_free(lora);
+}
+
 int main(void) {
     printf("=== LoRA unit tests ===\n");
     test_scale_zero();
@@ -181,6 +207,7 @@ int main(void) {
     test_multi_token();
     test_free_null();
     test_parity_fixture();
+    test_single_block_parity();
 
     if (failures > 0) {
         fprintf(stderr, "\n%d FAILED\n", failures);

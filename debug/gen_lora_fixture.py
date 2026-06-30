@@ -22,20 +22,44 @@ A = rng.standard_normal((RANK, DIM)).astype(np.float32)
 B = rng.standard_normal((DIM, RANK)).astype(np.float32)   # non-zero → exercises the matmul (not identity)
 x = rng.standard_normal((SEQ, DIM)).astype(np.float32)
 
-lin = nn.Linear(DIM, DIM)
-lora = LoRALinear(lin, rank=RANK, alpha=ALPHA)
-lora.lora_A = mx.array(A)
-lora.lora_B = mx.array(B)
-# golden delta = LoRALinear(x) - base(x) = (alpha/rank) * (x A^T) B^T  — what C lora_apply must reproduce
-golden = np.array(lora(mx.array(x)) - lin(mx.array(x))).astype(np.float32)
 
-# Diffusers safetensors (mirrors train/lora/export.py: to_q keys, B baked with alpha/rank)
+def golden_delta(a_np, b_np, in_dim, out_dim):
+    """LoRALinear delta = (alpha/rank)*(x A^T) B^T for a fresh Linear, as f32 [SEQ,out_dim]."""
+    lin = nn.Linear(in_dim, out_dim)
+    lora = LoRALinear(lin, rank=RANK, alpha=ALPHA)
+    lora.lora_A = mx.array(a_np); lora.lora_B = mx.array(b_np)
+    return np.array(lora(mx.array(x)) - lin(mx.array(x))).astype(np.float32)
+
+
+# Double-block to_q adapter (in=out=DIM): the original parity case.
+golden = golden_delta(A, B, DIM, DIM)
+
+# Single-block FUSED adapters (the new path). to_qkv_mlp_proj → single_linear1 (out>in, like the real
+# fused QKV+MLP proj); to_out → single_linear2. Distinct dims so a mis-route can't accidentally pass.
+SOUT1 = 12
+A_s1 = rng.standard_normal((RANK, DIM)).astype(np.float32)
+B_s1 = rng.standard_normal((SOUT1, RANK)).astype(np.float32)
+golden_s1 = golden_delta(A_s1, B_s1, DIM, SOUT1)
+A_s2 = rng.standard_normal((RANK, DIM)).astype(np.float32)
+B_s2 = rng.standard_normal((DIM, RANK)).astype(np.float32)
+golden_s2 = golden_delta(A_s2, B_s2, DIM, DIM)
+
+# Diffusers safetensors (mirrors train/lora/export.py: B baked with alpha/rank). One file carries the
+# double to_q AND the fused single-block adapters so the loader's key routing is what's under test.
 mx.save_safetensors(os.path.join(OUT, "lora.safetensors"), {
     "transformer.transformer_blocks.0.attn.to_q.lora_A.weight": mx.array(A),
     "transformer.transformer_blocks.0.attn.to_q.lora_B.weight": mx.array(B * (ALPHA / RANK)),
+    "transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj.lora_A.weight": mx.array(A_s1),
+    "transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj.lora_B.weight": mx.array(B_s1 * (ALPHA / RANK)),
+    "transformer.single_transformer_blocks.0.attn.to_out.lora_A.weight": mx.array(A_s2),
+    "transformer.single_transformer_blocks.0.attn.to_out.lora_B.weight": mx.array(B_s2 * (ALPHA / RANK)),
 })
 x.tofile(os.path.join(OUT, "x.bin"))
 golden.tofile(os.path.join(OUT, "golden.bin"))
+golden_s1.tofile(os.path.join(OUT, "golden_single1.bin"))
+golden_s2.tofile(os.path.join(OUT, "golden_single2.bin"))
 with open(os.path.join(OUT, "shapes.txt"), "w") as f:
-    f.write(f"rank={RANK} dim={DIM} seq={SEQ}\n")
-print(f"fixture written to {OUT}  (rank {RANK}, dim {DIM}, seq {SEQ}; golden |max| {np.abs(golden).max():.3f})")
+    f.write(f"rank={RANK} dim={DIM} seq={SEQ} single1_out={SOUT1}\n")
+print(f"fixture written to {OUT}  (rank {RANK}, dim {DIM}, seq {SEQ}; "
+      f"golden |max| {np.abs(golden).max():.3f}, single1 |max| {np.abs(golden_s1).max():.3f}, "
+      f"single2 |max| {np.abs(golden_s2).max():.3f})")
