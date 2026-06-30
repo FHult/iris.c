@@ -124,7 +124,31 @@ SMOKE (warmstart from collapsed champion, rank_weight 2.0, 300 steps, hot cached
 - Discrimination (export→gen-gate): cross-ref corr mean 0.977→**0.886**, max 0.993→**0.926**. Moved the
   right way (~0.09) but STILL FAILS <0.90. → capacity↑ helps but doesn't FORCE use. Repulsion is next.
 
-### NEXT — wire the CAUSE fix: `style_repulsion_loss` (the design fork)
+### Repulsion wired (commit 717a1f9) — but did NOT separate refs as tuned (2026-06-30)
+Ring buffer of recent refs → cheap 2nd prediction via `_pred_from_embeds` on the shared Flux state →
+`repel_loss_weight·style_repulsion_loss`. Combined smoke (warmstart champion, rank_w 2.0 + repel_w 0.5,
+margin 1.0): repel was ACTIVE (repel_loss 0.98→~0.5–0.9) but **destabilized** — loss CLIMBED 0.6→2.0
+(repulsion fights reconstruction with no content anchor). step150 discrimination cross-ref **0.904/0.939**
+— WORSE than rank-only@300 (0.886/0.926); styled-vs-base 0.218 (transforms harder but all refs still
+→ similar transform). So the repulsion disrupted WITHOUT disentangling. Killed (diverging).
+LEADING HYPOTHESES for why it underperforms:
+1. **Train/infer mismatch in the repel term:** x0_other = ref-B's V injected into ref-A's Q + h_final
+   (shared precomputed Flux state). So we separate "B's V vs A's V WITHIN A's context" — which may not
+   transfer to inference where B runs in its OWN context. (The leak null-pass reuses the state too, but
+   null=zeros is benign; a real 2nd ref is not.)
+2. Over-weight/margin (0.5/1.0) → degenerate disruption, not clean separation. Gentle run testing now.
+3. style_stats(x0 latent) may be a weak repel target vs operating directly on the V injection (the
+   measured collapse site).
+NOW TESTING: gentle config (repel_w 0.1, margin 0.3, rank_w 2.0) — `/Volumes/2TBSSD/sref_eval/smoke_gentle/`.
+Watch: loss STABLE (~0.7, unlike the diverging 2.0) AND cross-ref corr < rank-only's 0.886.
+FALLBACKS if gentle also fails to pass <0.90:
+- Redesign repel to act on V directly: decorrelate to_v_ip outputs across buffered refs (penalize
+  cross-ref V cosine — the exact quantity Step 1A.1 measured at 0.95–0.998), no x0 round-trip.
+- Give the 2nd ref its OWN Q context (extra correct-forward-Q pass) to kill the train/infer mismatch.
+- Longer RANK-ONLY run (rank-only is the best so far at 0.886; it may cross 0.90 with more steps —
+  cheap, stable, no repulsion risk).
+
+### (superseded design note) wiring the CAUSE fix: `style_repulsion_loss`
 batch_size=1 + the cheap `correct_forward_q` path (frozen-Flux state precomputed once, reused by
 `_pred_from_embeds`). So a SECOND reference's prediction at the same noisy latent is nearly free. Plan:
 1. **Second-reference source for repulsion (recommended: memory bank).** Keep a small ring buffer of the

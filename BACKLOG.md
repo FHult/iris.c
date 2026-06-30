@@ -3122,6 +3122,19 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     Then re-run the smoke (rank + repulsion together) and re-gate on discrimination — target max cross-ref
     corr < 0.90 (and ideally ≪). Artifacts: /Volumes/2TBSSD/sref_eval/smoke_rank/{config.yaml,ckpt,bundle},
     scratchpad task logs.
+    REPULSION WIRED (commit 717a1f9) + FIRST RESULT (2026-06-30) — NEGATIVE as tuned, needs rethink.
+    Ring buffer of recent refs → cheap 2nd prediction via _pred_from_embeds → repel_w·style_repulsion_loss.
+    Combined smoke (rank_w 2.0 + repel_w 0.5 / margin 1.0): repel ACTIVE (repel_loss 0.98→~0.5–0.9) but
+    DESTABILIZED — loss CLIMBED 0.6→2.0 (no content anchor; fights reconstruction). step150 discrimination
+    0.904/0.939 — WORSE than rank-only@300 (0.886/0.926); styled-vs-base 0.218. So it disrupts WITHOUT
+    disentangling. Likely a TRAIN/INFER MISMATCH: x0_other = ref-B's V in ref-A's shared Q/h_final context,
+    which may not transfer to per-reference inference. Now testing gentle (repel_w 0.1 / margin 0.3,
+    /Volumes/2TBSSD/sref_eval/smoke_gentle/). FALLBACKS if it still fails <0.90: (a) decorrelate to_v_ip
+    OUTPUTS across buffered refs directly (penalize cross-ref V cosine — the exact 0.95–0.998 quantity from
+    Step 1A.1, no x0 round-trip); (b) give the 2nd ref its OWN Q context (extra correct-forward-Q pass);
+    (c) longer RANK-ONLY (best so far at 0.886; may cross 0.90 with more steps — cheap, stable). Full detail
+    + hypotheses in plans/sref-retrain-diagnostic.md. NET STATUS: root cause solid (to_v_ip rank), rank
+    penalty is a real partial win (0.977→0.886), cause-fix repulsion is unproven and under active iteration.
 
   - **SREF FINE-SWEEP RESULT (2026-06-27): the ~0.543 plateau was a MEASUREMENT ARTIFACT; the true
     content-preserving frontier is ~0.62, and the data & objective levers TIE there → leans
