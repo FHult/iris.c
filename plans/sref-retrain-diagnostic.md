@@ -100,13 +100,38 @@ directions → V reference-independent → output collapse regardless of perceiv
 (adapter looks at refs differently) but V collapsed (injects the same thing). Universal across cond_modes
 → explains all 17 collapses. The easy minimum of a loss that never rewards reference-specific V.
 
-## Next → Step 1A retrain (sharpened by the rank finding)
-1. **Discrimination-aware training signal** (the CAUSE): contrastive/repulsion term forcing different
-   refs → different V/output. Removes the incentive to collapse to_v_ip. PRIMARY.
-2. **Rank/variance regularizer on to_v_ip** (direct symptom fix): penalize low stable_rank / preserve
-   V-output variance. Re-audit rank after.
-3. CSD FiLM redesign — secondary (siglip-only collapses too, so CSD isn't the bottleneck).
-4. K is healthy — no work.
-Instrument retrain: per-checkpoint run BOTH `sref_kv_rank_audit.py` (cheap, offline — leading indicator:
-to_v_ip stable_rank ↑ AND cross-ref V cosine ↓) and `sref_ref_discrimination.py` (gen-gate, promote only
-on PASS). Web stays on in-context (IRIS_SREF_ADAPTER off) until a checkpoint PASSES discrimination.
+## Step 1A IMPLEMENTATION
+
+### Done (committed 30293b1) — loss primitives + hermetic tests (no training, reversible)
+`train/ip_adapter/loss.py`:
+- `style_repulsion_loss(x0_a, x0_b, margin)` — CAUSE fix. Two different-style refs at the SAME
+  prompt/noise must produce different AdaIN per-channel style stats; hinge penalizes only collapse
+  (d²<margin). Complements `content_leak_loss` (content via instance_norm; this = the style stats it
+  leaves free).
+- `vproj_rank_penalty(W, u)` — SYMPTOM fix. Spectral penalty σ1²/‖W‖_F² on `to_v_ip_stacked`; σ1 via one
+  warm-started power-iteration step (u = persistent state). Minimizing flattens the spectrum → raises
+  stable_rank.
+- `style_stats` helper. 10 tests in `test_loss.py` (power-iter≡SVD; rank-1→1, orthogonal→1/n; gradients);
+  full loss suite 49 passed.
+
+### NEXT — wiring into the training step (the design fork; NOT yet done — needs confirmation)
+batch_size=1 + the cheap `correct_forward_q` path (frozen-Flux state precomputed once, reused by
+`_pred_from_embeds`). So a SECOND reference's prediction at the same noisy latent is nearly free. Plan:
+1. **Second-reference source for repulsion (recommended: memory bank).** Keep a small ring buffer of the
+   last K steps' reference features (cond_features). Each cond step, draw one buffered ref, compute its
+   `x0_other = _pred_from_embeds(get_image_embeds(buffered))` on the SAME precomputed Flux state, add
+   `repel_w * style_repulsion_loss(x0_pred, x0_other)`. No dataloader change; reuses the shared Flux work.
+   (Alt: have the loader yield a random different-style 2nd ref per step — cleaner data, but a loader change.)
+   NOTE: the buffered/2nd ref must be a RANDOM other image (≠ the dataset's same-style neighbor — that
+   would punish same-style images for sharing style).
+2. **Rank penalty:** thread persistent `u` [25,3072] through the compiled step; add `rank_w *
+   vproj_rank_penalty(adapter.to_v_ip_stacked, u)`; return `u_next`.
+3. **Hyperparameters (defaults to validate, then tune):** repel margin ~ (set from the latent's style-stat
+   scale), repel_w ~0.1, rank_w ~0.01. Apply repulsion on COND steps only.
+4. **Risk:** touches the compiled hot loop (MLX wedge history). Validate with a SHORT smoke run (~300 steps)
+   watching: to_v_ip stable_rank (sref_kv_rank_audit.py) ↑ and cross-ref V cosine ↓ BEFORE a full run.
+
+### Instrument every retrain
+Per checkpoint: `sref_kv_rank_audit.py` (cheap, offline — leading indicator: to_v_ip stable_rank↑ + V
+cosine↓) AND `sref_ref_discrimination.py` (gen-gate; promote ONLY on PASS, not sref_score). Web stays on
+in-context (IRIS_SREF_ADAPTER off) until a checkpoint PASSES discrimination, then flip IRIS_SREF_ADAPTER=1.
