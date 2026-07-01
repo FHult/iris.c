@@ -2810,6 +2810,30 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     only so far; base (CFG dual-pass) + single-block coverage + pluggable-module generalization are the
     open Phase-1/2 follow-ups (see PLUGGABLE CONDITIONING FRAMEWORK above).
 
+  - **✅ LORA-TRAIN-4 (2026-07-01) — CONTENT-AGNOSTIC curation FIXES the transfer/collapse failure of
+    LORA-TRAIN-3. A "same look, varied subject" cluster trains a style that transfers to ANY subject and
+    scales to bold WITHOUT collapsing off-distribution content.**
+    Root cause of LORA-TRAIN-3: the CSD-far cluster was coherent BY being subject-specific (fantasy
+    portraits) → the LoRA entangled style with content → worked on portraits, collapsed on cats.
+    Fix — `train/lora/curate_lookstyle_subset.py`: decode a sample of pool images → a ~17-d content-
+    AGNOSTIC LOOK vector (RGB/HSV/luminance stats, warmth, colorfulness, grain). Cluster tight in
+    look-space but score = look_coh − μ·csd_coh, penalising cached-CSD coherence so the cluster shares a
+    LOOK while spanning diverse SUBJECTS. Selected cluster: look_coh 0.961, csd_coh −0.010 (vs the far
+    cluster's ~0.75), ALL 22 shards — a high-key/bright/light-palette look across a cathedral, a glass cup,
+    a cyber-portrait, a bride, a pencil sketch, a white tiger (6 unrelated subjects, one look). Trained
+    full-coverage (80 modules, 300 steps, loss→0.08 — cleanest fit of the three).
+    RESULT: on-vs-off @scale1.0 — cat 0.847, portrait 0.900 (BALANCED; far-LoRA was portrait-biased
+    0.819 vs cat-inert 0.899). @scale2.5 — cat 0.653 and portrait 0.727 with BOTH subjects fully intact
+    and coherently restyled (warmer/richer/polished "premium-photo" look), whereas the far-LoRA at 2.5
+    already smeared the cat and fully collapsed it by 4.0. So content-agnostic curation delivers the
+    property CSD-distance did not: a TRANSFERABLE style, controllable to bold without content collapse.
+    CAVEAT: the specific look selected by the densest+diverse objective is high-key/warm-polish — coherent
+    and controllable but tasteful rather than dramatic; the distilled 4-step prior still caps how far a
+    default-scale restyle can go (bold = use scale ~2-2.5, or move to the base/CFG model). The METHOD is
+    the deliverable: to target a different look, bias curate_lookstyle_subset's look descriptor (e.g.
+    require high grain / dark / saturated). Artifacts (lora_look_v1, lora_look_subset, log) archived to
+    cold; tool + config committed.
+
   - **⚠️ LORA-TRAIN-3 (2026-07-01) — "curate a cluster FAR from the base prior → bolder style" FALSIFIED.
     Far-in-CSD-space does NOT yield a bolder-at-default LoRA; it yielded a WEAKER, content-entangled one.**
     Followed up LORA-TRAIN-2's hypothesis (near-prior cluster = subtle → so pick a FAR one). Built
