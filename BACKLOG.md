@@ -2810,6 +2810,41 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     only so far; base (CFG dual-pass) + single-block coverage + pluggable-module generalization are the
     open Phase-1/2 follow-ups (see PLUGGABLE CONDITIONING FRAMEWORK above).
 
+  - **🧭 DATA-SELECTION PRINCIPLE (2026-07-01) — DECORRELATE the conditioned attribute from content;
+    COVER its range, don't cluster it. A genuinely new lever (data axis) for training ANY conditioning
+    module on the frozen base — LoRA, IP-adapter, in-sequence encoder — distinct from every prior
+    loss/architecture-axis fix. Emerged from the LoRA arc (LORA-TRAIN-2/3/4).**
+    THE TRAP: selecting training data by style-cluster tightness (the obvious "coherent style" choice,
+    e.g. CSD kNN) silently CONFOUNDS the target attribute (style) with CONTENT — CSD-tight clusters are
+    also content-tight (LORA-TRAIN-3: the densest far cluster was all fantasy portraits). A module trained
+    on it entangles style with subject → won't transfer / collapses off-distribution.
+    THE RULE: a conditioning module only learns to USE its conditioning if, in the training data, the
+    conditioned attribute VARIES INDEPENDENTLY of content AND the target can't be predicted without it.
+    Cluster-by-similarity violates both. Instead:
+      • single-attribute module (a LoRA = one baked style): DECORRELATE — hold the LOOK coherent (palette/
+        tone/contrast/grain — a cheap content-invariant style coordinate) while forcing content DIVERSITY
+        (penalise csd_coh). curate_lookstyle_subset.py; validated LORA-TRAIN-4 (transfers to any subject,
+        scales to bold w/o collapse).
+      • multi-attribute conditioning module (IP-adapter = reads any reference): DECORRELATE **and** COVER —
+        stratify the reference set across the FULL look-space so no constant output can win, and build
+        reference↔target pairs that share look but differ in content.
+    WOULD THIS HAVE HELPED THE IP-ADAPTER COLLAPSE (SREF-CHAMPION-COLLAPSE — reference-INERT, near-constant
+    injection, to_v_ip rank ~6)? PLAUSIBLY, and it is the UNTRIED axis: all 6 prior collapse-fixes were
+    LOSS-side; data selection was never varied (SREF pairs were CSD-neighbour-based; the eval was the
+    homogeneous all-painterly set that MASKED the collapse). Reference-inertness = the model produced a
+    constant "average" because (a) the references clustered in one narrow region (warm/painterly) so a
+    constant scored well → no gradient to discriminate, and (b) content-confounded pairs let it shortcut.
+    The look descriptor directly attacks both — content-invariant coordinate to STRATIFY references
+    (coverage) + a way to build content-DECORRELATED pairs — and it also builds the right EVAL (vary look,
+    hold content = debug/sref_ref_discrimination.py), which the painterly eval was not.
+    HONEST CAVEAT: the collapse was also characterised as STRUCTURAL (rank ~6). If that rank limit is truly
+    architectural, data won't lift it — BUT rank collapse is usually DOWNSTREAM of a training signal that
+    never demanded discrimination, so look-stratified + content-decorrelated data + a discrimination reward
+    is a real shot at the ROOT, not a retune. PROPOSED TEST (dormant behind the SREF adapter re-enable):
+    rebuild the SREF pair dataset with look-stratified reference coverage + content-decorrelated pairs, add
+    a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
+    [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
+
   - **✅ LORA-TRAIN-4 (2026-07-01) — CONTENT-AGNOSTIC curation FIXES the transfer/collapse failure of
     LORA-TRAIN-3. A "same look, varied subject" cluster trains a style that transfers to ANY subject and
     scales to bold WITHOUT collapsing off-distribution content.**
