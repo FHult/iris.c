@@ -1,0 +1,74 @@
+adapter:
+  block_gradient_checkpointing: false
+  freeze_double_stream_scales: true
+  hidden_dim: 3072
+  injection_gate: none
+  ip_scale_init: 0.5
+  num_blocks: 25
+  num_double_blocks: 5
+  num_image_tokens: 256
+  perceiver_depth: 4
+  perceiver_heads: 16
+  siglip_dim: 1152
+  sref_strength: 1.0
+  style_only: false
+data:
+  anchor_mix_ratio: 0.2
+  anchor_shard_dir: null
+  batch_size: 1
+  bucket:
+  - 512
+  - 512
+  cond_mode: hybrid
+  csd_cache_dir: /Volumes/2TBSSD/sref_eval/style_cache
+  hard_example_dir: null
+  hard_mix_ratio: 0.0
+  num_prefetch_threads: 2
+  prefetch_batches: 12
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443
+  record_allowlist: /Volumes/2TBSSD/sref_eval/pool_top25.json
+  records_per_shard_visit: 135
+  seed: 42
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot
+  siglip_cache_dir: /Volumes/2TBSSD/precomputed/siglip/v_336c6e
+  style_neighbors_db: /Volumes/2TBSSD/sref_eval/neighbors_look.sqlite
+  vae_cache_dir: /Volumes/2TBSSD/precomputed/vae/v_2232c1
+eval:
+  enabled: false
+  every_steps: 10000
+  height: 512
+  num_steps: 4
+  seed: 42
+  width: 512
+logging: null
+model:
+  flux_model_dir: flux-klein-model
+  qwen3_model_dir: flux-klein-model
+  siglip_model: google/siglip-so400m-patch14-384
+output:
+  checkpoint_dir: /Volumes/2TBSSD/sref_eval/sref_look_test/ckpt
+  checkpoint_every: 500
+  keep_last_n: 2
+  log_every: 25
+training:
+  correct_forward_q: true
+  cross_ref_prob: 0.5
+  ema_decay: 0.9999
+  ema_update_every: 10
+  grad_clip: 1.0
+  image_dropout_prob: 0.3
+  leak_loss_weight: 0.5
+  learning_rate: 0.0001
+  log_cond_attrib: true
+  memory_profile: false
+  mlx_memory_pct: 0.6
+  n_grad_steps_per_fwd: 1
+  num_steps: 3000
+  patch_shuffle_prob: 0.5
+  style_loss_every: 1
+  style_loss_weight: 0.05
+  text_dropout_prob: 0.1
+  use_block_injection: false
+  val_every: 3000
+  warmup_steps: 300
+  weight_decay: 0.01

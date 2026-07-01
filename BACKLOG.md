@@ -2889,6 +2889,23 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     TREATMENT run: identical recipe, swap `neighbors.sqlite → neighbors_look.sqlite` (look-similar /
     content-different pairs), 3000 steps from scratch, then gate and compare to 0.984. No warm-start
     needed. ~3.2 h for the single treatment run (3.8 s/step × 3000).
+    STATUS 2026-07-01 — READY TO RUN, blocked on a fresh machine. Look-pairing DB built
+    (`/Volumes/2TBSSD/sref_eval/neighbors_look.sqlite`, 27,313 recs, 100% coverage, look-cos 0.71-0.81
+    from different shards). Treatment config committed: `train/configs/sref_look_treatment.yaml` (champion
+    recipe, only style_neighbors_db + checkpoint_dir changed). Builder tool: `train/lora/build_look_neighbors.py`.
+    OPERATIONAL FINDING (memory): the 3000-step run THRASHED twice on the dev machine — MLX working set
+    ~23 GB peak (leaner than the champion's 27 GB) but a long prior session had left ~18 GB of macOS swap,
+    leaving < 1 GB headroom on 32 GB → forward-pass paging → rate collapsed 0.19→0.02 steps/s around step
+    ~400. Root: session-accumulated swap, not the recipe (champion trained fine on a FRESH machine).
+    Gradient checkpointing is a NO-OP for this path (code: only helps the TRAIN-6 block-injection forward,
+    not correct_forward_q). FIX = reboot to clear swap, then run on the clean machine (23 GB fits ~28 GB
+    fresh headroom). RELAUNCH after reboot:
+      `train/.venv/bin/python train/train_ip_adapter.py --config train/configs/sref_look_treatment.yaml`
+    then export `train/export/export_adapter.py --checkpoint .../sref_look_test/ckpt/best.safetensors
+    --output .../sref_look_test/bundle --use-ema --perceiver-heads 16 --validate`, and gate BOTH the
+    treatment bundle and the champion (`clean_concentrate_leak/bundle`) with
+    `debug/sref_ref_discrimination.py --feat` (5 hybrid paintings + churchill_lineart/flat_sticker/woodcut
+    from refs_feat_hybrid[_simple]) at `--scale 0.38 --seed 42`; compare max cross-ref corr to 0.984.
 
   - **✅ LORA-TRAIN-4 (2026-07-01) — CONTENT-AGNOSTIC curation FIXES the transfer/collapse failure of
     LORA-TRAIN-3. A "same look, varied subject" cluster trains a style that transfers to ANY subject and
