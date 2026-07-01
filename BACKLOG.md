@@ -2878,12 +2878,17 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
          `style_neighbors_db: neighbors_look.sqlite`. Discrimination losses OFF. Gate both on 5 diverse
          reference styles; compare max_cross to 0.984.
       3. If data-only is insufficient, add `repulsion_weight`/`vproj_decorr_weight` (data + loss).
-    FEASIBILITY BLOCKER (resolve before running): the flywheel `base_checkpoint`
-    (`/Volumes/16TBCold/weights/flywheel-20260507/final.safetensors`) is ABSENT — only `weights/lora/`
-    exists on cold; no adapter checkpoint found in the quick-searched dirs (broad find aborted, slow). The
-    web champion is behind a RUNTIME `IRIS_IP_BUNDLE` env path (not a fixed file). So warm-start is
-    UNRESOLVED: either locate the champion/base checkpoint, or train from scratch (longer; a short
-    from-scratch run may read as inert on the gate, muddying the data signal). Decide init before spend.
+    FEASIBILITY — RESOLVED (2026-07-01): champion FOUND at
+    `/Volumes/2TBSSD/sref_eval/clean_concentrate_leak/` — `bundle/adapter_weights.safetensors` (exported,
+    what the gate/web load) + `ckpt/{best,step_0003000}.safetensors` (training ckpts) + `config.yaml`.
+    Champion recipe (config.yaml): cond_mode HYBRID, `style_neighbors_db = neighbors.sqlite` (CSD-based!),
+    `leak_loss_weight 0.5`, `cross_ref_prob 0.5`, `style_loss_weight 0.05`, `ip_scale_init 0.5`,
+    num_image_tokens 256, 3000 steps from scratch, allowlist `pool_top25.json` (27 313 rec_ids),
+    records_per_shard_visit 135. KEY: the champion ALREADY used CSD-neighbour pairing + content-leak loss
+    and STILL collapsed (gate max_cross ≥ 0.984) → it IS the matched CONTROL. So the A/B needs only the
+    TREATMENT run: identical recipe, swap `neighbors.sqlite → neighbors_look.sqlite` (look-similar /
+    content-different pairs), 3000 steps from scratch, then gate and compare to 0.984. No warm-start
+    needed. ~3.2 h for the single treatment run (3.8 s/step × 3000).
 
   - **✅ LORA-TRAIN-4 (2026-07-01) — CONTENT-AGNOSTIC curation FIXES the transfer/collapse failure of
     LORA-TRAIN-3. A "same look, varied subject" cluster trains a style that transfers to ANY subject and
