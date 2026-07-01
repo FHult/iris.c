@@ -2810,6 +2810,31 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     only so far; base (CFG dual-pass) + single-block coverage + pluggable-module generalization are the
     open Phase-1/2 follow-ups (see PLUGGABLE CONDITIONING FRAMEWORK above).
 
+  - **⚠️ LORA-TRAIN-3 (2026-07-01) — "curate a cluster FAR from the base prior → bolder style" FALSIFIED.
+    Far-in-CSD-space does NOT yield a bolder-at-default LoRA; it yielded a WEAKER, content-entangled one.**
+    Followed up LORA-TRAIN-2's hypothesis (near-prior cluster = subtle → so pick a FAR one). Built
+    `train/lora/curate_far_subset.py`: CSD-encode 12 base-model generations → prior centroid (the model's
+    own style signature; CSD is content-invariant), then pick the densest pool cluster maximising
+    distance-from-prior subject to a coherence floor. It cleanly selected a genuinely far, coherent cluster:
+    prior_cos −0.113 vs the photographic v2 cluster's +0.037 (pool range −0.314..+0.556), intra-cos 0.746,
+    18/22 shards — visually a fantasy digital-illustration / pop-surrealism PORTRAIT style (mermaids,
+    sea-elves, jewel-toned painterly faces). Trained full-coverage (80 modules, 300 steps, loss→0.17, EMA).
+    RESULT (honest, counterintuitive): on-vs-off corr @scale1.0 = 0.899 — WEAKER than the near-prior v2's
+    0.847. On "a cat on a chair" @1.0 the output is ~photographic; on a matching "portrait of a woman" @1.0
+    corr 0.819 (still mostly photographic). Diagnostic (push scale): portrait @3.0 DOES become a painterly
+    digital-illustration portrait (style IS learned) but cat @4.0 collapses to warm painterly smears (no cat).
+    LESSONS: (a) CSD-distance of the training IMAGES predicts neither transfer strength nor "boldness" — it
+    measures how different the data's style is, not how easily a LoRA distills a TRANSFERABLE style or
+    overrides the sticky 4-step DISTILLED prior. (b) A far cluster is far partly by being CONTENT-specific
+    (fantasy female portraits), so the LoRA entangles style with subject → transfers to portraits, distorts/
+    collapses on off-distribution content (cats). (c) The near-prior photographic cluster transferred MORE
+    cleanly precisely because its "style" (warm-snapshot rendering) is nearly content-agnostic. TAKEAWAYS
+    for a bold general style: prefer a coherent cluster whose style is content-AGNOSTIC (color/grain/light,
+    not subject); and/or bake higher alpha (bold at scale 1.0 = current scale ~2, but a knob not new
+    capability); and/or move to the BASE (non-distilled, CFG) model whose prior is less rigid. The distilled
+    4-step prior is the real ceiling, not the data's CSD-distance. Artifacts (lora_far_v1, far_subset, prior
+    imgs, log) archived to cold; tool + config committed.
+
   - **✅ LORA-TRAIN-2 (2026-06-30) — FULL single-block coverage + two bugs caught. The LoRA now adapts
     all 25 blocks (was 5 double only), and the targeted-style curation is no longer inert.**
     (1) SINGLE-BLOCK COVERAGE: mflux Flux2's single block fuses its projections into TWO Linears that
