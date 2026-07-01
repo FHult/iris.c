@@ -2845,6 +2845,46 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
     [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
 
+  - **🔬 SREF-DATA-TEST (2026-07-01, planned) — concrete recipe + feasibility to test the DATA-SELECTION
+    PRINCIPLE on the IP-adapter reference-inert collapse. Pipeline mapped; the intervention is a
+    SWAPPABLE pairing DB + reused caches (no trainer changes, no re-precompute).**
+    PIPELINE MAP (code investigation, file:line):
+      • PAIRING is a swappable SQLite DB. `neighbors.sqlite` schema: `neighbors(rec_id PK, neighbor_ids
+        TEXT[json], neighbor_cos TEXT[json])` + `meta(k=10, dedup_cos=0.95)`, 109 253 rows = whole pool.
+        Built by `train/scripts/style_neighbors.py` (CSD kNN, cos≥0.6 gate `_STYLE_NBR_MIN_COS`, excl
+        cos>0.95). Loader `train/ip_adapter/dataset.py:539-670` reads it when `data.style_neighbors_db`
+        is set: per record picks one same-style neighbor and loads ITS cond features as `style_ref`.
+      • BASELINE trains WITHOUT it: `stage1_512px.yaml` sets no style_neighbors_db → arbitrary cross-ref
+        (`cross_ref_prob 0.5`, swap SigLIP across batch) + `patch_shuffle_prob 0.5` + Gram `style_loss
+        0.05`. So the shipped adapter learned from RANDOM references — a plausible root of the constant
+        "average" injection (nothing forces per-reference discrimination).
+      • Loader yields per step: target image/vae/qwen3/siglip + `style_ref` = neighbor's SigLIP[729,1152]
+        / CSD[768] / hybrid[730,1152]; `data.cond_mode` ∈ siglip|csd|hybrid (champion = hybrid).
+      • CACHES 100% REUSED from baseline_pool_hot — vae v_2232c1, qwen3 v_059443, siglip v_336c6e (all
+        verified present) → a short standalone train is ~1 h (stage1 ~3.8 s/step), NOT the ~day flywheel.
+        Entry: `python train/train_ip_adapter.py --config <cfg>` (override cache dirs + shard_path).
+      • DISCRIMINATION-REWARD terms already EXIST but default OFF (`train/ip_adapter/loss.py:104-155`):
+        `style_repulsion_loss` (repulsion_weight; output-space style-stats hinge), `vproj_decorr_loss`
+        (vproj_decorr_weight; per-block V-cosine hinge), `vproj_rank_penalty` (rank_weight; anti low-rank
+        to_v_ip). Leaving them OFF isolates the DATA lever.
+      • GATE ready: `debug/sref_ref_discrimination.py` — vary ref, hold prompt/seed/scale, pixel-corr;
+        PASS = max_cross < 0.90 AND mean_base < 0.95. Needs `--bundle` + ≥3 ref `.bin`
+        (csd_features.py / siglip_features.py). Known collapse: max_cross ≥ 0.984.
+    EXPERIMENT (data-only A/B):
+      1. Build `neighbors_look.sqlite` (same schema) — for each record, neighbours = LOOK-similar
+         (curate_lookstyle 17-d look vec) but CONTENT-different (penalise cached-CSD cosine): look-shared,
+         subject-varied pairs. Optionally stratify the training set across look-space (coverage).
+      2. A/B short trains from the SAME init: control = arbitrary cross-ref (as-is); treatment =
+         `style_neighbors_db: neighbors_look.sqlite`. Discrimination losses OFF. Gate both on 5 diverse
+         reference styles; compare max_cross to 0.984.
+      3. If data-only is insufficient, add `repulsion_weight`/`vproj_decorr_weight` (data + loss).
+    FEASIBILITY BLOCKER (resolve before running): the flywheel `base_checkpoint`
+    (`/Volumes/16TBCold/weights/flywheel-20260507/final.safetensors`) is ABSENT — only `weights/lora/`
+    exists on cold; no adapter checkpoint found in the quick-searched dirs (broad find aborted, slow). The
+    web champion is behind a RUNTIME `IRIS_IP_BUNDLE` env path (not a fixed file). So warm-start is
+    UNRESOLVED: either locate the champion/base checkpoint, or train from scratch (longer; a short
+    from-scratch run may read as inert on the gate, muddying the data signal). Decide init before spend.
+
   - **✅ LORA-TRAIN-4 (2026-07-01) — CONTENT-AGNOSTIC curation FIXES the transfer/collapse failure of
     LORA-TRAIN-3. A "same look, varied subject" cluster trains a style that transfers to ANY subject and
     scales to bold WITHOUT collapsing off-distribution content.**
