@@ -18,7 +18,8 @@ Performance: plans/ip-adapter-training.md Metal Optimisations section
 """
 
 import argparse
-import gc
+import gc as _gcmod   # aliased: train() has a function-local `import gc` (online-encode branch) that
+                      # would otherwise shadow this and make the loop's gc.collect() an UnboundLocalError
 import glob
 import math
 import json
@@ -2179,7 +2180,7 @@ def train(config: dict) -> None:
             # RSS creeps → swap on a memory-tight host. A periodic collect keeps it flat (SREF memory
             # investigation 2026-07: swap crept 13→17 GB over 400 steps at flat MLX active).
             if step % 20 == 0:
-                gc.collect()
+                _gcmod.collect()
 
             # Style loss accumulation — _style_loss_accum[0] was set inside loss_fn
             # and is already materialized by Fence 1 above (it's in loss_val's graph).
