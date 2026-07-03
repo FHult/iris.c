@@ -2889,6 +2889,26 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     TREATMENT run: identical recipe, swap `neighbors.sqlite → neighbors_look.sqlite` (look-similar /
     content-different pairs), 3000 steps from scratch, then gate and compare to 0.984. No warm-start
     needed. ~3.2 h for the single treatment run (3.8 s/step × 3000).
+    MEMORY (2026-07-03, hard-won) — the treatment run repeatedly thrashed on the 32 GB dev machine; the
+    champion trained fine because its machine had more headroom. THREE distinct causes, each fixed
+    non-confoundingly (infra only — no effect on trained weights or the A/B):
+      1. This hybrid/256-token/correct_forward_q config peaks at 24.56 GB — ~4 GB ABOVE the standard
+         training's documented 20.44 GB (TRAIN-7) that `mlx_memory_pct 0.6` (≈19 GB) was tuned for. 0.6
+         sits BELOW this config's working set → MLX reclaim-churn wedge (BUGS MLX-2). FIX: raise to 0.80.
+      2. A one-time +4 GB persistent jump at every step%500 — NOT the checkpoint (which streams safely via
+         `_save_safetensors_streaming`), but the EMA-DRIFT TELEMETRY (`dict(_flatten(adapter.parameters()))`
+         + float32 casts, line ~2242) pushing peak 24.56→28.43. FIX: `training.log_ema_drift: false`
+         (new flag, gates the block; default true keeps champion behaviour).
+      3. Python-side anonymous creep ~15 MB/step (loader numpy arrays in MLX/numpy reference cycles),
+         invisible to MLX active but growing swap 13→20 GB over ~1700 steps → thrash. FIX: `gc.collect()`
+         every 20 steps in the loop (slowed to ~4 MB/step; not fully eliminated — a fresh reboot clears the
+         baseline swap so the residual creep has room).
+    Runs 3/4/5 pushed the thrash point 300→400→1700 as fixes landed; run5 (gc + telemetry-still-on)
+    reached step 1700 before tipping. Deferring checkpointing was a MISTAKE (no salvageable ckpt) — keep
+    checkpointing ON (streaming save is memory-safe). Final config = `train/configs/sref_look_treatment.yaml`
+    (now: checkpoint_every 500, mlx_memory_pct 0.80, prefetch_batches 6, log_ema_drift false). Run on a
+    FRESH reboot (clears accumulated swap). This memory profile is the "what's different from the past
+    MLX-2 fix": 0.6 was calibrated to the LIGHTER standard workload, not this heavier SREF config.
     STATUS 2026-07-01 — READY TO RUN, blocked on a fresh machine. Look-pairing DB built
     (`/Volumes/2TBSSD/sref_eval/neighbors_look.sqlite`, 27,313 recs, 100% coverage, look-cos 0.71-0.81
     from different shards). Treatment config committed: `train/configs/sref_look_treatment.yaml` (champion

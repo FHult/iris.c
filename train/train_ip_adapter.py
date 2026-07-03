@@ -18,6 +18,7 @@ Performance: plans/ip-adapter-training.md Metal Optimisations section
 """
 
 import argparse
+import gc
 import glob
 import math
 import json
@@ -2173,6 +2174,13 @@ def train(config: dict) -> None:
 
             step += 1
 
+            # Bound Python-side anonymous growth: the prefetch loader's numpy arrays can linger in
+            # reference cycles (MLX/numpy interop) that refcounting doesn't free promptly, so anonymous
+            # RSS creeps → swap on a memory-tight host. A periodic collect keeps it flat (SREF memory
+            # investigation 2026-07: swap crept 13→17 GB over 400 steps at flat MLX active).
+            if step % 20 == 0:
+                gc.collect()
+
             # Style loss accumulation — _style_loss_accum[0] was set inside loss_fn
             # and is already materialized by Fence 1 above (it's in loss_val's graph).
             if _do_style:
@@ -2238,7 +2246,10 @@ def train(config: dict) -> None:
             # T-06: EMA drift (RMS diff between online and EMA weights, top-5 by size)
             # Sort by tensor element count descending so we sample weight matrices
             # rather than bias vectors — gives a more representative drift signal.
-            if step % 500 == 0:
+            # dict(_flatten(...)) of all params + float32 casts allocates a persistent
+            # ~+4 GB step-buffer on the hybrid/256-token path (SREF memory investigation
+            # 2026-07); set training.log_ema_drift: false to skip on RAM-tight hosts.
+            if tcfg.get("log_ema_drift", True) and step % 500 == 0:
                 try:
                     _flat_online = dict(_flatten(adapter.parameters()))
                     _flat_ema    = dict(_flatten(ema_params))
