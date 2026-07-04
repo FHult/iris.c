@@ -2909,6 +2909,12 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (now: checkpoint_every 500, mlx_memory_pct 0.80, prefetch_batches 6, log_ema_drift false). Run on a
     FRESH reboot (clears accumulated swap). This memory profile is the "what's different from the past
     MLX-2 fix": 0.6 was calibrated to the LIGHTER standard workload, not this heavier SREF config.
+    CAFFEINATE (2026-07-04, root-cause of the 'thrash'): the standalone trainer run under plain
+    nohup was IDLE-THROTTLED by macOS when the operator stepped away — step rate swung 0.20→0.02
+    with user attendance, NOT purely memory. The slow throttled steps gave swap time to accumulate,
+    which masqueraded as the MLX wedge. FIX: run under `caffeinate -dimsu -w <pid>` (or launch via
+    start_pipeline.sh, which already does this). The memory fixes (telemetry-off peak 24.56, gc,
+    mlx 0.80) are still needed, but caffeinate is what makes the run finish at ~0.2 steps/s.
     STATUS 2026-07-01 — READY TO RUN, blocked on a fresh machine. Look-pairing DB built
     (`/Volumes/2TBSSD/sref_eval/neighbors_look.sqlite`, 27,313 recs, 100% coverage, look-cos 0.71-0.81
     from different shards). Treatment config committed: `train/configs/sref_look_treatment.yaml` (champion
