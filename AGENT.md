@@ -62,6 +62,13 @@ This project implements three targets:
 
 # Development Rules
 
+- **This is macOS (Apple Silicon, BSD userland).** Use BSD-compatible commands, not GNU/Linux-only
+  ones: no `setsid` (use `nohup … & disown`); no `ls --time-style` (use `stat -f '%Sm'`); no `pgrep -c`
+  (use `pgrep -f … | wc -l`); no GNU `date -d`; use `vm_stat`/`sysctl`/`pmset` not `free`/`/proc`.
+- **Always `caffeinate` long-running / unattended processes.** macOS idle-throttles background jobs when
+  the operator steps away (rate collapses ~10× and looks like a memory wedge). Wrap long runs in
+  `caffeinate -dimsu -w <pid>` (or `caffeinate -dimsu <cmd>`), or launch via `train/start_pipeline.sh`
+  which already does this. Attach to a running job: `nohup caffeinate -dimsu -w <pid> & disown`.
 - No additional project dependencies. Acceptable external deps are BLAS/OpenBLAS and Metal/MPS from macOS.
 - Reject tiny speed gains that add complexity; prefer substantial wins.
 - Always test code modifications with `make test`.
