@@ -2909,6 +2909,22 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (now: checkpoint_every 500, mlx_memory_pct 0.80, prefetch_batches 6, log_ema_drift false). Run on a
     FRESH reboot (clears accumulated swap). This memory profile is the "what's different from the past
     MLX-2 fix": 0.6 was calibrated to the LIGHTER standard workload, not this heavier SREF config.
+    RESULT 2026-07-04 — ❌ HYPOTHESIS FALSIFIED. Treatment (look-stratified/content-decorrelated
+    neighbors_look.sqlite, full 3000-step matched recipe, EMA) vs champion control, identical 8-ref gate
+    (5 hybrid WikiArt paintings + churchill_lineart/flat_sticker/woodcut, scale 0.38, seed 42):
+      • TREATMENT: cross-ref corr mean 0.987, MAX 0.997; vs-baseline 0.446 → FAIL: MODE COLLAPSE.
+      • CONTROL (champion): cross-ref corr mean 0.984, MAX 0.996; vs-baseline 0.380 → FAIL: MODE COLLAPSE.
+    Treatment collapsed exactly as hard as the champion (Δmax +0.001 = noise, marginally WORSE). Both apply
+    a strong (vs-baseline ~0.4, NOT inert) but reference-INDEPENDENT transform. Look-based content-
+    decorrelated PAIRING does NOT move the collapse → the DATA-selection axis is RULED OUT for the
+    IP-adapter reference-inertness — the OPPOSITE of its effect on the LoRA (LORA-TRAIN-4, where content-
+    agnostic data FIXED content-entanglement). CONCLUSION: confirms the STRUCTURAL cause (SREF-CHAMPION-
+    COLLAPSE, to_v_ip rank ~6) — the perceiver+ip_k/ip_v mechanism collapses diverse references to a
+    near-constant K/V regardless of how training pairs are chosen; not a data or loss artifact. The
+    DATA-SELECTION PRINCIPLE's honest caveat ("if the rank-6 limit is truly architectural, data won't lift
+    it") is CONFIRMED. Remaining levers if the adapter is revisited are ARCHITECTURAL (raise to_v_ip rank /
+    redesign injection / the in-sequence-encoder rail), NOT data or the already-tried loss terms.
+    Artifacts: treatment bundle `/Volumes/2TBSSD/sref_eval/sref_look_test/bundle`, ckpts step_2500/3000+best.
     CAFFEINATE (2026-07-04, root-cause of the 'thrash'): the standalone trainer run under plain
     nohup was IDLE-THROTTLED by macOS when the operator stepped away — step rate swung 0.20→0.02
     with user attendance, NOT purely memory. The slow throttled steps gave swap time to accumulate,
