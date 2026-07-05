@@ -2869,7 +2869,9 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     (it is per-step test-time optimization through the CSD ViT, NOT learnable modulation — un-C-implementable;
     and "768-d CSD alone is sufficient" was REFUTED); CSGO-scale triplet pipelines (8×H800, 210k triplets).
     Also: "style-consistent, content-diverse" training data (i2L MegaStyle) independently validates our
-    DATA-SELECTION PRINCIPLE. Full citations in the plan doc.
+    DATA-SELECTION PRINCIPLE. Full citations in the plan doc. IMPLEMENTATION PLAN for shortlist #1 (RoPE band-control +
+    strength bias + reference-KV reuse, phased, with code anchors, gate script, sweep protocol and
+    acceptance criteria): `plans/sref-rope-band-control.md`.
 
   - **🔬 SREF-DATA-TEST (2026-07-01, planned) — concrete recipe + feasibility to test the DATA-SELECTION
     PRINCIPLE on the IP-adapter reference-inert collapse. Pipeline mapped; the intervention is a
