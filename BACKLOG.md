@@ -2845,6 +2845,32 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
     [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
 
+  - **📚 SREF-ARCH-RESEARCH (2026-07-05) — deep research on SREF architecture options COMPLETE; ranked
+    shortlist in `plans/sref-architecture-options.md`.** 24 sources, 118 claims, adversarial verification +
+    6 targeted source-verification agents. HEADLINES: (1) the SEQUENCE PATH is the only conditioning
+    mechanism validated on Flux-family DiTs (OminiControl/DreamO/USO/Kontext all concat reference tokens +
+    small LoRA; NO validated K/V-injection adapter on any DiT) — matches our empirical record exactly.
+    (2) Published triangulation of our collapse: encoder features entangle style+semantics and
+    reconstruction training over-relies on the reference (InstantStyle/DEADiff, verified); distilled
+    few-step models COMMIT STRUCTURE IN THE FIRST STEP (2503.10637, verified) → a weak side-channel on a
+    4-step model has nothing to steer, so "ignore the reference" is the easy optimum. (3) Control LoRAs
+    TRANSFER base↔distilled WITHOUT retraining (verified, SDXL) → train conditioning on the 4B base when
+    ported, ship on distilled; hybrid first-step-from-base sampling restores diversity. RANKED SHORTLIST:
+    #1 RoPE frequency-band control on reference keys (Untwisting RoPE, 2602.05013 — copying is POSITIONAL/
+    high-freq-RoPE; attenuate high + amplify low bands, reference keys only, single-stream blocks only;
+    training-free, C-implementable) + OminiControl2 reference-KV reuse across steps + attention-bias
+    strength — a zero-training upgrade of the SHIPPED in-context rail (replaces crude patch-shuffle).
+    #2 USO-style learned in-sequence style tokens (SigLIP→projector→192 tokens with text RoPE ids;
+    Stage-1 trains projector ONLY with DiT frozen → fits 32GB MLX, consumes our cached SigLIP; verified in
+    paper+code). #3 base-training+transfer as enabler. #4 i2L hypernetwork→instant LoRA (verified on
+    FLUX.2-klein-base-4B AND Z-Image — our exact backbones; output = plain LoRA our loader already serves;
+    8×A100×7d at their scale → Phase-4; cheap interim = CSD-retrieval over our own style-LoRA library).
+    AVOID (verified): K/V side-channel adapters; naive shared-attention on DiT (collapses); RB-Modulation
+    (it is per-step test-time optimization through the CSD ViT, NOT learnable modulation — un-C-implementable;
+    and "768-d CSD alone is sufficient" was REFUTED); CSGO-scale triplet pipelines (8×H800, 210k triplets).
+    Also: "style-consistent, content-diverse" training data (i2L MegaStyle) independently validates our
+    DATA-SELECTION PRINCIPLE. Full citations in the plan doc.
+
   - **🔬 SREF-DATA-TEST (2026-07-01, planned) — concrete recipe + feasibility to test the DATA-SELECTION
     PRINCIPLE on the IP-adapter reference-inert collapse. Pipeline mapped; the intervention is a
     SWAPPABLE pairing DB + reused caches (no trainer changes, no re-precompute).**
