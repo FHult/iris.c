@@ -469,9 +469,12 @@ void iris_gpu_gated_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t gate_bf16,
                               iris_gpu_tensor_t proj, int seq, int hidden);
 
 /* BF16 RoPE unified (text + image) */
+/* img_cos_k/img_sin_k: separate K-side image RoPE table (SREF band-control). NULL → use img_cos/img_sin
+ * for K too (default, bit-identical). Q always uses img_cos/img_sin. */
 void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                  const float *txt_cos, const float *txt_sin,
                                  const float *img_cos, const float *img_sin,
+                                 const float *img_cos_k, const float *img_sin_k,
                                  int seq, int img_offset, int heads, int head_dim, int axis_dim);
 
 /* BF16 RoPE 2D (single stream) */

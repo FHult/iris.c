@@ -92,15 +92,18 @@ typedef struct {
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
     float img2img_strength; /* img2img denoising strength 0.0-1.0 (default: 1.0 = in-context conditioning) */
     const char *negative_prompt; /* Negative prompt for CFG uncond pass (base models only; NULL = empty string) */
-    /* Style reference is provided via the trained IP-Adapter: load a bundle with
-     * iris_load_ip_adapter() (CLI --ip / --ip-features), or use the web UI Style mode.
-     * The old training-free --sref design was never shipped and has been removed. */
+    /* SREF Phase-1 RoPE band-control (plans/sref-rope-band-control.md): on the in-context reference path
+     * (-i), scale the K-side reference RoPE H/W bands to suppress positional copying (style-only transfer).
+     * shf<1 attenuates high-freq (copying) bands; slf>1 amplifies low-freq (semantic/style) bands.
+     * 1.0/1.0 = OFF (default). */
+    float sref_rope_shf;    /* high-freq scale, 0<shf<=1 (1.0 = off) */
+    float sref_rope_slf;    /* low-freq scale,  slf>=1  (1.0 = off) */
 } iris_params;
 
 /* Default parameters */
 #define IRIS_DEFAULT_WIDTH  256
 #define IRIS_DEFAULT_HEIGHT 256
-#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL }
+#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL, 1.0f, 1.0f }
 
 /* ========================================================================
  * Core API

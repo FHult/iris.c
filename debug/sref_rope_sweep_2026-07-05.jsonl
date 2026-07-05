@@ -1,0 +1,14 @@
+{"label": "A_patchshuffle6", "shuffle_grid": 6, "extra": "", "n_refs": 8, "max_cross": 0.7908, "mean_cross": 0.293, "style_adh": 0.2189, "copy_corr": 0.0758, "discriminates": true}
+{"label": "B_incontext_raw", "shuffle_grid": 0, "extra": "", "n_refs": 8, "max_cross": 0.3647, "mean_cross": 0.0699, "style_adh": 0.4964, "copy_corr": 0.2568, "discriminates": true}
+{"label": "shf0.0_slf1.0", "shuffle_grid": 0, "extra": "--sref-shf 0.0 --sref-slf 1.0", "n_refs": 8, "max_cross": 0.6457, "mean_cross": 0.2522, "style_adh": 0.2478, "copy_corr": 0.1173, "discriminates": true}
+{"label": "shf0.0_slf1.5", "shuffle_grid": 0, "extra": "--sref-shf 0.0 --sref-slf 1.5", "n_refs": 8, "max_cross": 0.3936, "mean_cross": 0.1133, "style_adh": 0.3542, "copy_corr": 0.1616, "discriminates": true}
+{"label": "shf0.0_slf2.0", "shuffle_grid": 0, "extra": "--sref-shf 0.0 --sref-slf 2.0", "n_refs": 8, "max_cross": 0.3649, "mean_cross": 0.0734, "style_adh": 0.4808, "copy_corr": 0.3123, "discriminates": true}
+{"label": "shf0.2_slf1.0", "shuffle_grid": 0, "extra": "--sref-shf 0.2 --sref-slf 1.0", "n_refs": 8, "max_cross": 0.4171, "mean_cross": 0.1862, "style_adh": 0.2814, "copy_corr": 0.1293, "discriminates": true}
+{"label": "shf0.2_slf1.5", "shuffle_grid": 0, "extra": "--sref-shf 0.2 --sref-slf 1.5", "n_refs": 8, "max_cross": 0.3599, "mean_cross": 0.0832, "style_adh": 0.4024, "copy_corr": 0.2251, "discriminates": true}
+{"label": "shf0.2_slf2.0", "shuffle_grid": 0, "extra": "--sref-shf 0.2 --sref-slf 2.0", "n_refs": 8, "max_cross": 0.2955, "mean_cross": 0.0475, "style_adh": 0.5112, "copy_corr": 0.3615, "discriminates": true}
+{"label": "shf0.4_slf1.0", "shuffle_grid": 0, "extra": "--sref-shf 0.4 --sref-slf 1.0", "n_refs": 8, "max_cross": 0.4639, "mean_cross": 0.1466, "style_adh": 0.2978, "copy_corr": 0.1384, "discriminates": true}
+{"label": "shf0.4_slf1.5", "shuffle_grid": 0, "extra": "--sref-shf 0.4 --sref-slf 1.5", "n_refs": 8, "max_cross": 0.3769, "mean_cross": 0.0696, "style_adh": 0.4302, "copy_corr": 0.31, "discriminates": true}
+{"label": "shf0.4_slf2.0", "shuffle_grid": 0, "extra": "--sref-shf 0.4 --sref-slf 2.0", "n_refs": 8, "max_cross": 0.2675, "mean_cross": 0.0494, "style_adh": 0.539, "copy_corr": 0.4015, "discriminates": true}
+{"label": "shf0.6_slf1.0", "shuffle_grid": 0, "extra": "--sref-shf 0.6 --sref-slf 1.0", "n_refs": 8, "max_cross": 0.3445, "mean_cross": 0.117, "style_adh": 0.3558, "copy_corr": 0.1779, "discriminates": true}
+{"label": "shf0.6_slf1.5", "shuffle_grid": 0, "extra": "--sref-shf 0.6 --sref-slf 1.5", "n_refs": 8, "max_cross": 0.2896, "mean_cross": 0.0573, "style_adh": 0.4757, "copy_corr": 0.3462, "discriminates": true}
+{"label": "shf0.6_slf2.0", "shuffle_grid": 0, "extra": "--sref-shf 0.6 --sref-slf 2.0", "n_refs": 8, "max_cross": 0.2195, "mean_cross": 0.0538, "style_adh": 0.5562, "copy_corr": 0.3781, "discriminates": true}

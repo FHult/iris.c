@@ -2845,6 +2845,35 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
     [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
 
+  - **✅ SREF-ROPE-PHASE1 (2026-07-05) — RoPE band-control shipped for the in-context style rail;
+    PASSES the gate and DOMINATES patch-shuffle. Confirms "Untwisting RoPE" on our 4-step DISTILLED model
+    (first test of that mechanism off 50-step Flux).** Implements shortlist #1 from SREF-ARCH-RESEARCH
+    (plan: plans/sref-rope-band-control.md). Scales the K-side reference-token RoPE H/W bands in
+    SINGLE-STREAM blocks only: s(d) = shf + (slf-shf)*(d/15)^2 baked into a K-only combined table (per-pair
+    scalar commutes with the 2x2 rotation → exact, zero per-step cost). CLI `--sref-shf`/`--sref-slf`
+    (shf∈[0,1] high-freq attenuation, slf>=1 low-freq boost; 1.0/1.0 = OFF, default). Default-off is
+    BIT-IDENTICAL (corr 1.000000, maxabs 0); make test-unit green; BLAS+generic compile-clean; f32+bf16
+    paths both wired. Gate: debug/sref_rope_gate.py (8 refs the adapter collapsed on; discrimination +
+    CSD style adherence + copy_corr). Sweep data: debug/sref_rope_sweep_2026-07-05.jsonl.
+    RESULT (8-ref gate, "a cat on a chair", seed 42, 512px):
+      • baseline B raw in-context:  max_cross 0.365  style_adh 0.496  copy_corr 0.257
+      • baseline A patch-shuffle6 (SHIPPED): max_cross 0.791  style_adh 0.219  copy_corr 0.076
+      • shf0.0 slf1.0 (full atten):  max_cross 0.646  style_adh 0.248  copy_corr 0.117
+      • shf0.0 slf1.5 (RECOMMENDED):  max_cross 0.394  style_adh 0.354  copy_corr 0.162
+      • shf0.6 slf1.5 (strong style): max_cross 0.290  style_adh 0.476  copy_corr 0.346
+    ACCEPTANCE MET: multiple cells satisfy max_cross<0.90 AND copy_corr<B AND style_adh>=A; e.g.
+    shf0.0/slf1.5 (style 0.354=1.6x patch-shuffle, copy 0.162<0.257, discrim 0.394). Band-control STRICTLY
+    beats patch-shuffle: +60-120% style adherence AND ~2x better reference discrimination (max_cross
+    0.29-0.39 vs 0.79). MECHANISM CONFIRMED on distilled: full high-freq attenuation (shf=0.0) suppresses
+    positional COPYING — the woodcut-owl reference correctly yields a CAT at shf=0.0, but low-freq boost
+    WITHOUT high-freq attenuation (shf=1/slf=1.5) COPIES the owl. So shf is the copy-killer, slf the
+    style-strength knob. CAVEAT: copy_corr conflates composition-copy (bad) with palette-adoption (good) —
+    strong style raises it; rely on style_adh + discrimination + visual (no content copy) for tuning.
+    BUG FIXED mid-sweep: setter guard mapped a legitimate shf=0.0 to off; now shf=0.0 (full attenuation)
+    is usable (daemon params + IRIS_PARAMS_DEFAULT default to 1.0). NEXT (not yet done, awaiting go): wire
+    the chosen default into web/server.py (make patch-shuffle opt-in), then Phase 2 (strength bias gamma)
+    + Phase 3 (reference-KV reuse) per the plan.
+
   - **📚 SREF-ARCH-RESEARCH (2026-07-05) — deep research on SREF architecture options COMPLETE; ranked
     shortlist in `plans/sref-architecture-options.md`.** 24 sources, 118 claims, adversarial verification +
     6 targeted source-verification agents. HEADLINES: (1) the SEQUENCE PATH is the only conditioning

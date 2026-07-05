@@ -5412,6 +5412,7 @@ void iris_gpu_gated_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t gate_bf16,
 void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                                  const float *txt_cos, const float *txt_sin,
                                  const float *img_cos, const float *img_sin,
+                                 const float *img_cos_k, const float *img_sin_k,
                                  int seq, int img_offset, int heads, int head_dim, int axis_dim) {
     if (!g_shaders_initialized || !g_rope_unified_bf16_pipeline) return;
     if (!q || !k || !q->is_f16 || !k->is_f16) return;
@@ -5427,8 +5428,13 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         id<MTLBuffer> bufTxtSin = get_rope_buffer(txt_sin, txt_size);
         id<MTLBuffer> bufImgCos = get_rope_buffer(img_cos, img_size);
         id<MTLBuffer> bufImgSin = get_rope_buffer(img_sin, img_size);
+        /* SREF band-control: separate K-side image table (falls back to Q table when NULL). */
+        id<MTLBuffer> bufImgCosK = (img_cos_k && img_cos_k != img_cos)
+                                       ? get_rope_buffer(img_cos_k, img_size) : bufImgCos;
+        id<MTLBuffer> bufImgSinK = (img_sin_k && img_sin_k != img_sin)
+                                       ? get_rope_buffer(img_sin_k, img_size) : bufImgSin;
 
-        if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
+        if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin || !bufImgCosK || !bufImgSinK) return;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
 
@@ -5451,15 +5457,15 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder endEncoding];
         }
 
-        /* Apply RoPE to K */
+        /* Apply RoPE to K (SREF: K-side image table = band-scaled reference table when active) */
         {
             id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
             [encoder setComputePipelineState:g_rope_unified_bf16_pipeline];
             [encoder setBuffer:k->buffer offset:0 atIndex:0];
             [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
             [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
-            [encoder setBuffer:bufImgCos offset:0 atIndex:3];
-            [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+            [encoder setBuffer:bufImgCosK offset:0 atIndex:3];
+            [encoder setBuffer:bufImgSinK offset:0 atIndex:4];
             [encoder setBytes:&seq length:sizeof(int) atIndex:5];
             [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
             [encoder setBytes:&heads length:sizeof(int) atIndex:7];

@@ -657,6 +657,8 @@ static void server_run_job(iris_ctx *ctx, server_job_t *job) {
         .linear_schedule  = job->linear_schedule,
         .power_schedule   = job->power_schedule,
         .power_alpha      = job->power_alpha,
+        .sref_rope_shf    = 1.0f,  /* SREF band-control off (daemon does not expose it) */
+        .sref_rope_slf    = 1.0f,
     };
 
     iris_image *output = NULL;
@@ -1071,7 +1073,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
-    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
+    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n");
+    fprintf(stderr, "      --sref-shf N      SREF style: attenuate reference high-freq RoPE bands (0-1; 1=off)\n");
+    fprintf(stderr, "      --sref-slf N      SREF style: amplify reference low-freq RoPE bands (>=1; 1=off)\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
@@ -1159,6 +1163,8 @@ int main(int argc, char *argv[]) {
         {"vary-subtle",      no_argument,       0, 266},
         {"vary-strong",      no_argument,       0, 267},
         {"vary-strength",    required_argument, 0, 268},
+        {"sref-shf",         required_argument, 0, 273},
+        {"sref-slf",         required_argument, 0, 274},
         {0, 0, 0, 0}
     };
 
@@ -1177,7 +1183,9 @@ int main(int argc, char *argv[]) {
         .num_steps = 0,   /* 0 = auto from model type */
         .seed = -1,
         .guidance = 0.0f, /* 0 = auto from model type */
-        .power_alpha = 2.0f
+        .power_alpha = 2.0f,
+        .sref_rope_shf = 1.0f, /* SREF band-control off by default */
+        .sref_rope_slf = 1.0f
     };
 
     char *vary_from = NULL;
@@ -1246,6 +1254,8 @@ int main(int argc, char *argv[]) {
             case 271: ip_scale = (float)atof(optarg); break;
             case 272: ip_schedule = optarg; break;
             case 262: params.img2img_strength = (float)atof(optarg); break;
+            case 273: params.sref_rope_shf = (float)atof(optarg); break;  /* SREF band-control high-freq scale */
+            case 274: params.sref_rope_slf = (float)atof(optarg); break;  /* SREF band-control low-freq scale */
             case 'N': params.negative_prompt = optarg; break;
             case 265: vary_from = optarg; break;
             case 266: params.img2img_strength = 0.2f; break;

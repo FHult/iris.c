@@ -324,6 +324,19 @@ typedef struct iris_transformer {
     int cached_combined_ref_w;
     int cached_combined_t_offset;
 
+    /* SREF Phase-1: RoPE band-control (plans/sref-rope-band-control.md). Per-generation scales for the
+     * K-side reference RoPE: high-freq attenuation (shf) and low-freq amplification (slf) of the H/W
+     * bands, applied to reference-token KEYS in single-stream blocks to suppress positional copying.
+     * Both == 1.0 → OFF (default, bit-identical). sref_krope_cos/sin point at the active K-side combined
+     * table (target rows unscaled, reference rows band-scaled); NULL → single blocks use the Q table. */
+    float sref_rope_shf;              /* input: high-freq scale (0<shf<=1); 1.0 = off */
+    float sref_rope_slf;              /* input: low-freq scale (slf>=1);    1.0 = off */
+    float *sref_krope_cos;            /* active K-side combined RoPE (NULL when off) */
+    float *sref_krope_sin;
+    float *cached_krope_cos;          /* backing buffer for the K-side table */
+    float *cached_krope_sin;
+    int    cached_krope_seq;          /* allocated combined_img_seq of the backing buffer */
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     #define MAX_TF_SHARDS 4
@@ -1230,6 +1243,63 @@ static void get_cached_combined_rope(iris_transformer_t *tf,
 
     *cos_out = tf->cached_combined_rope_cos;
     *sin_out = tf->cached_combined_rope_sin;
+}
+
+/* SREF Phase-1 RoPE band-control (plans/sref-rope-band-control.md, "Untwisting RoPE" arXiv 2602.05013).
+ * Scale the H(axis 1) and W(axis 2) RoPE bands of the reference rows [ref_start, seq) of a K-side
+ * table by s(d) = shf + (slf-shf)*(d/(half-1))^2  (beta=2): high-freq pairs (d=0) attenuated by shf,
+ * low-freq pairs (d=half-1) amplified by slf. A per-pair scalar commutes with the 2x2 rotation, so
+ * scaling cos+sin of a pair scales that band's contribution to the QK dot product exactly. T(axis 0)
+ * and L(axis 3) are left unscaled. Table layout: 128 floats/token = 4 axes*32; pairs at [d*2],[d*2+1]. */
+static void band_scale_ref_krope(float *cos_k, float *sin_k, int ref_start, int seq,
+                                 int axis_dim, float shf, float slf) {
+    int half = axis_dim / 2;   /* 16 */
+    float sd[16];
+    for (int d = 0; d < half; d++) {
+        float dn = (half > 1) ? (float)d / (float)(half - 1) : 0.0f;
+        sd[d] = shf + (slf - shf) * dn * dn;
+    }
+    for (int pos = ref_start; pos < seq; pos++) {
+        float *c = cos_k + (size_t)pos * axis_dim * 4;
+        float *s = sin_k + (size_t)pos * axis_dim * 4;
+        for (int d = 0; d < half; d++) {
+            float f = sd[d];
+            int h = axis_dim + d * 2;       /* axis 1 (H) pair */
+            int w = axis_dim * 2 + d * 2;   /* axis 2 (W) pair */
+            c[h] *= f; c[h + 1] *= f; s[h] *= f; s[h + 1] *= f;
+            c[w] *= f; c[w + 1] *= f; s[w] *= f; s[w + 1] *= f;
+        }
+    }
+}
+
+/* Build (or reuse) the K-side combined RoPE table: a copy of the Q-side combined table whose
+ * REFERENCE rows [img_seq, combined_seq) have their H/W bands band-scaled. Sets tf->sref_krope_cos/sin.
+ * When band-control is off (shf==slf==1) leaves them NULL so single blocks use the Q table (bit-identical).
+ * combined_cos/sin: the just-built Q-side combined table; img_seq: where reference rows begin. */
+static void set_kside_krope(iris_transformer_t *tf, const float *combined_cos, const float *combined_sin,
+                            int img_seq, int combined_seq, int axis_dim) {
+    tf->sref_krope_cos = NULL;
+    tf->sref_krope_sin = NULL;
+    if (tf->sref_rope_shf == 1.0f && tf->sref_rope_slf == 1.0f) return;  /* OFF */
+    size_t n = (size_t)combined_seq * axis_dim * 4;
+    if (tf->cached_krope_seq != combined_seq || !tf->cached_krope_cos || !tf->cached_krope_sin) {
+        free(tf->cached_krope_cos); free(tf->cached_krope_sin);
+        tf->cached_krope_cos = (float *)malloc(n * sizeof(float));
+        tf->cached_krope_sin = (float *)malloc(n * sizeof(float));
+        if (!tf->cached_krope_cos || !tf->cached_krope_sin) {
+            free(tf->cached_krope_cos); tf->cached_krope_cos = NULL;
+            free(tf->cached_krope_sin); tf->cached_krope_sin = NULL;
+            tf->cached_krope_seq = 0;
+            return;  /* fall back to Q table (band control silently off this step) */
+        }
+        tf->cached_krope_seq = combined_seq;
+    }
+    memcpy(tf->cached_krope_cos, combined_cos, n * sizeof(float));
+    memcpy(tf->cached_krope_sin, combined_sin, n * sizeof(float));
+    band_scale_ref_krope(tf->cached_krope_cos, tf->cached_krope_sin, img_seq, combined_seq,
+                         axis_dim, tf->sref_rope_shf, tf->sref_rope_slf);
+    tf->sref_krope_cos = tf->cached_krope_cos;
+    tf->sref_krope_sin = tf->cached_krope_sin;
 }
 
 /* ========================================================================
@@ -3243,10 +3313,15 @@ static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
     if (ip_on)
         iris_gpu_slice_seq_bf16(tf->ip_q_saved_gpu, q_gpu, seq - img_offset, h_size, img_offset);
 
-    /* === Phase 5: Apply unified RoPE (bf16 tensors, f32 frequencies) === */
+    /* === Phase 5: Apply unified RoPE (bf16 tensors, f32 frequencies) ===
+     * SREF Phase-1: Q uses the normal img table; K uses the band-scaled reference table when active
+     * (single-stream blocks only). NULL/off → same table → bit-identical. */
+    const float *img_kcos = tf->sref_krope_cos ? tf->sref_krope_cos : img_rope_cos;
+    const float *img_ksin = tf->sref_krope_sin ? tf->sref_krope_sin : img_rope_sin;
     iris_gpu_rope_unified_bf16(q_gpu, k_gpu,
                                txt_rope_cos, txt_rope_sin,
                                img_rope_cos, img_rope_sin,
+                               img_kcos, img_ksin,
                                seq, img_offset, heads, head_dim, axis_dim);
 
     /* === Phase 6: Self-attention (native bf16 fused SDPA) === */
@@ -3755,11 +3830,14 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
     apply_rope_2d(k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
 
-    /* Image portion: apply 2D RoPE starting at img_offset */
+    /* Image portion: apply 2D RoPE starting at img_offset.
+     * SREF Phase-1: K uses the band-scaled reference table when active (single blocks only). */
     float *img_q = q + img_offset * h_size;
     float *img_k = k + img_offset * h_size;
+    const float *img_kcos = tf->sref_krope_cos ? tf->sref_krope_cos : img_rope_cos;
+    const float *img_ksin = tf->sref_krope_sin ? tf->sref_krope_sin : img_rope_sin;
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_k, img_kcos, img_ksin, img_seq, heads, head_dim, axis_dim);
 
     double _t4 = prof_get_time();
     prof_single_qknorm_rope += _t4 - _t3;
@@ -3829,6 +3907,8 @@ float *iris_transformer_forward(iris_transformer_t *tf,
                                 float timestep) {
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
+    tf->sref_krope_cos = NULL;  /* no reference tokens → single blocks use the Q table */
+    tf->sref_krope_sin = NULL;
 
     /* Ensure work buffers are sized for actual sequence length */
     int total_seq = img_seq + txt_seq;
@@ -4356,6 +4436,9 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     get_cached_combined_rope(tf, img_h, img_w, ref_h, ref_w, t_offset,
                              &combined_rope_cos, &combined_rope_sin);
 
+    /* SREF Phase-1: build the K-side band-scaled table for the reference rows [img_seq, combined). */
+    set_kside_krope(tf, combined_rope_cos, combined_rope_sin, img_seq, combined_img_seq, tf->axis_dim);
+
     /* Get cached text RoPE */
     float *txt_rope_cos, *txt_rope_sin;
     get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
@@ -4597,6 +4680,9 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
         rope_offset += ref_seq * axis_dim * 4;
     }
 
+    /* SREF Phase-1: build the K-side band-scaled table for the reference rows [img_seq, combined). */
+    set_kside_krope(tf, combined_rope_cos, combined_rope_sin, img_seq, combined_img_seq, axis_dim);
+
     /* Get cached text RoPE */
     float *txt_rope_cos, *txt_rope_sin;
     get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
@@ -4780,6 +4866,7 @@ static float *read_floats(FILE *f, int count) {
 iris_transformer_t *iris_transformer_load(FILE *f) {
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
+    tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
 
     /* Read config */
     uint32_t config[10];
@@ -5037,6 +5124,8 @@ void iris_transformer_free(iris_transformer_t *tf) {
     free(tf->cached_txt_rope_sin);
     free(tf->cached_combined_rope_cos);
     free(tf->cached_combined_rope_sin);
+    free(tf->cached_krope_cos);
+    free(tf->cached_krope_sin);
 
     /* Close safetensors files if in mmap mode */
     if (tf->use_mmap) {
@@ -5061,6 +5150,15 @@ int iris_transformer_num_single_layers(iris_transformer_t *tf) { return tf->num_
 void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora) {
     lora_free(tf->lora);
     tf->lora = lora;
+}
+
+/* SREF Phase-1: set the K-side reference RoPE band-control scales (1.0/1.0 = off).
+ * shf ∈ [0,1] (0 = full high-freq attenuation, a valid setting); slf >= 1 (1 = no low-freq boost).
+ * Out-of-range values fall back to off (1.0). All params paths default these to 1.0. */
+void iris_transformer_set_sref_bands(iris_transformer_t *tf, float shf, float slf) {
+    if (!tf) return;
+    tf->sref_rope_shf = (shf >= 0.0f && shf <= 1.0f) ? shf : 1.0f;
+    tf->sref_rope_slf = (slf >= 1.0f) ? slf : 1.0f;
 }
 
 /* Attach an IP-Adapter + perceived embeddings (replaces any existing; takes
@@ -5197,6 +5295,7 @@ static void warmup_bf16_weights(iris_transformer_t *tf) {
 iris_transformer_t *iris_transformer_load_safetensors(const char *model_dir) {
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
+    tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
 
     char name[256];
 
@@ -5445,6 +5544,7 @@ iris_transformer_t *iris_transformer_load_safetensors(const char *model_dir) {
 iris_transformer_t *iris_transformer_load_safetensors_mmap(const char *model_dir) {
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
+    tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
 
     /* Parse config from transformer/config.json, fall back to 4B defaults */
     if (parse_transformer_config(model_dir, tf) != 0) {

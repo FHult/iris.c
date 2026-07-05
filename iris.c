@@ -58,6 +58,7 @@ extern int iris_transformer_hidden_size(iris_transformer_t *tf);
 extern int iris_transformer_num_double_layers(iris_transformer_t *tf);
 extern int iris_transformer_num_single_layers(iris_transformer_t *tf);
 extern void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora);
+extern void iris_transformer_set_sref_bands(iris_transformer_t *tf, float shf, float slf);
 extern int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
                                            float *ip_embeds);
 extern int iris_transformer_set_ip_schedule(iris_transformer_t *tf, const char *spec);
@@ -1381,6 +1382,10 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         return NULL;
     }
 
+    /* SREF Phase-1: apply RoPE band-control to the in-context reference path (1.0/1.0 = off).
+     * Must run AFTER the transformer is lazily loaded above. */
+    iris_transformer_set_sref_bands(ctx->transformer, p.sref_rope_shf, p.sref_rope_slf);
+
     /* Encode image to latent */
     if (iris_phase_callback) iris_phase_callback("encoding reference image", 0);
     float *img_tensor = iris_image_to_tensor(img_to_use);
@@ -1596,6 +1601,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         free(text_emb_uncond);
         return NULL;
     }
+
+    /* SREF Phase-1: RoPE band-control on the multi-reference in-context path (1.0/1.0 = off). */
+    iris_transformer_set_sref_bands(ctx->transformer, p.sref_rope_shf, p.sref_rope_slf);
 
     /* Build reference pixel dimensions, clamped and rounded to 16. */
     int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
