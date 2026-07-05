@@ -1245,7 +1245,10 @@ static void get_cached_combined_rope(iris_transformer_t *tf,
     *sin_out = tf->cached_combined_rope_sin;
 }
 
-/* SREF Phase-1 RoPE band-control (plans/sref-rope-band-control.md, "Untwisting RoPE" arXiv 2602.05013).
+/* SREF Phase-1 RoPE band-control. Method credit: "Untwisting RoPE: Frequency Control for Shared
+ * Attention in DiTs" (arXiv:2602.05013) — reference copying in DiT attention is caused by high-frequency
+ * RoPE dominance; attenuating high / amplifying low reference-key bands trades copying for style,
+ * training-free. See plans/sref-rope-band-control.md and CHANGELOG.md (References/Credits).
  * Scale the H(axis 1) and W(axis 2) RoPE bands of the reference rows [ref_start, seq) of a K-side
  * table by s(d) = shf + (slf-shf)*(d/(half-1))^2  (beta=2): high-freq pairs (d=0) attenuated by shf,
  * low-freq pairs (d=half-1) amplified by slf. A per-pair scalar commutes with the 2x2 rotation, so

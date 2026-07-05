@@ -1075,7 +1075,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
     fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n");
     fprintf(stderr, "      --sref-shf N      SREF style: attenuate reference high-freq RoPE bands (0-1; 1=off)\n");
-    fprintf(stderr, "      --sref-slf N      SREF style: amplify reference low-freq RoPE bands (>=1; 1=off)\n\n");
+    fprintf(stderr, "      --sref-slf N      SREF style: amplify reference low-freq RoPE bands (>=1; 1=off)\n");
+    fprintf(stderr, "                        Training-free style transfer (RoPE band-control; see CHANGELOG.md).\n");
+    fprintf(stderr, "                        e.g. --sref-shf 0.0 --sref-slf 1.5 = style-only, subject kept\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
