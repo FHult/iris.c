@@ -2870,9 +2870,19 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     style-strength knob. CAVEAT: copy_corr conflates composition-copy (bad) with palette-adoption (good) —
     strong style raises it; rely on style_adh + discrimination + visual (no content copy) for tuning.
     BUG FIXED mid-sweep: setter guard mapped a legitimate shf=0.0 to off; now shf=0.0 (full attenuation)
-    is usable (daemon params + IRIS_PARAMS_DEFAULT default to 1.0). NEXT (not yet done, awaiting go): wire
-    the chosen default into web/server.py (make patch-shuffle opt-in), then Phase 2 (strength bias gamma)
-    + Phase 3 (reference-KV reuse) per the plan.
+    is usable (daemon params + IRIS_PARAMS_DEFAULT default to 1.0).
+    ✅ WEB-WIRING DONE (2026-07-05): band-control is now the DEFAULT web style rail. The web server talks to
+    the resident `iris --server` daemon over JSON (not CLI flags), and the daemon previously hardcoded
+    band-control OFF ("daemon does not expose it"), so this needed BOTH sides: (1) main.c daemon now parses
+    `sref_shf`/`sref_slf` JSON keys (default 1.0 = off) → server_job_t → iris_params (was hardcoded 1.0f);
+    (2) web/server.py adds IRIS_SREF_SHF (default 0.0) / IRIS_SREF_SLF (default 1.5), sets them on a job only
+    when a STYLE-mode reference is present (composition refs untouched), and forwards them in the daemon
+    request; the patch-shuffle (IRIS_SREF_SHUFFLE_GRID) default flipped 6→0 (now OPT-IN, composes with bands).
+    VERIFIED: make mps relinked; make test-unit 28/28; DAEMON END-TO-END — two gens in one warm session, same
+    seed/prompt/ref, one with sref_shf=0.0/slf=1.5 vs one with no keys → outputs DIFFER (band-control engages
+    via the daemon path) while the no-keys path is byte-identical to pre-change (params 1.0/1.0 by
+    construction); web server launches (port bound, GET / → 200), config defaults confirmed via import.
+    NEXT: Phase 2 (strength bias gamma) + Phase 3 (reference-KV reuse) per the plan.
 
   - **📚 SREF-ARCH-RESEARCH (2026-07-05) — deep research on SREF architecture options COMPLETE; ranked
     shortlist in `plans/sref-architecture-options.md`.** 24 sources, 118 claims, adversarial verification +

@@ -491,6 +491,8 @@ typedef struct {
     int     show_steps;
     float   guidance;
     float   img2img_strength;
+    float   sref_rope_shf;   /* SREF band-control: reference high-freq RoPE key scale (1.0=off) */
+    float   sref_rope_slf;   /* SREF band-control: reference low-freq RoPE key scale (1.0=off) */
     char   *negative_prompt;
     int     linear_schedule;
     int     power_schedule;
@@ -657,8 +659,8 @@ static void server_run_job(iris_ctx *ctx, server_job_t *job) {
         .linear_schedule  = job->linear_schedule,
         .power_schedule   = job->power_schedule,
         .power_alpha      = job->power_alpha,
-        .sref_rope_shf    = 1.0f,  /* SREF band-control off (daemon does not expose it) */
-        .sref_rope_slf    = 1.0f,
+        .sref_rope_shf    = job->sref_rope_shf,  /* SREF band-control (style refs; 1.0=off) */
+        .sref_rope_slf    = job->sref_rope_slf,
     };
 
     iris_image *output = NULL;
@@ -909,6 +911,8 @@ static int run_server_mode(iris_ctx *ctx) {
         int   show_steps     = json_get_bool(line, "show_steps", 1);
         float guidance       = json_get_float(line, "guidance", 0.0f);
         float img2img_str    = json_get_float(line, "img2img_strength", 1.0f);
+        float sref_shf       = json_get_float(line, "sref_shf", 1.0f);
+        float sref_slf       = json_get_float(line, "sref_slf", 1.0f);
         char *neg_prompt     = json_get_string(line, "negative_prompt");
         char *schedule       = json_get_string(line, "schedule");
         char *req_lora       = json_get_string(line, "lora");
@@ -1004,6 +1008,8 @@ static int run_server_mode(iris_ctx *ctx) {
         job->show_steps      = show_steps;
         job->guidance        = guidance;
         job->img2img_strength = img2img_str;
+        job->sref_rope_shf   = sref_shf;
+        job->sref_rope_slf   = sref_slf;
         job->negative_prompt = neg_prompt;
         job->lora_path       = req_lora;
         job->lora_scale      = req_lora_scale;

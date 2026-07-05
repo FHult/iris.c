@@ -77,13 +77,22 @@ SREF_DEFAULT_STRENGTH = float(os.environ.get("IRIS_SREF_STRENGTH", "0.38"))
 # adapter. So default the web "style" path to in-context conditioning; the trained adapter is
 # OPT-IN until the retrain + discrimination gate lands. Set IRIS_SREF_ADAPTER=1 to re-enable it.
 SREF_USE_ADAPTER = os.environ.get("IRIS_SREF_ADAPTER", "0").strip().lower() not in ("", "0", "false", "no", "off")
+# SREF band-control (SREF-ROPE-PHASE1, validated 2026-07-05): the surgical replacement for the
+# patch-shuffle. For a STYLE-mode reference we attenuate its high-frequency RoPE bands (kills
+# composition COPYING — the prompt's subject is kept) and amplify its low-frequency bands (boosts
+# style adoption), applied to the reference KEYS in single-stream blocks only — training-free, zero
+# per-step cost (BACKLOG SREF-ROPE-PHASE1; CHANGELOG; plans/sref-rope-band-control.md). It beat the
+# patch-shuffle by +60–120% CSD style adherence and ~2× reference discrimination, so it is now the
+# DEFAULT style rail. shf ∈ [0,1] (0 = full high-freq attenuation, 1 = off); slf ≥ 1 (1 = off).
+# Override via IRIS_SREF_SHF / IRIS_SREF_SLF; set BOTH to 1.0 to disable band-control entirely.
+SREF_ROPE_SHF = float(os.environ.get("IRIS_SREF_SHF", "0.0"))
+SREF_ROPE_SLF = float(os.environ.get("IRIS_SREF_SLF", "1.5"))
 # Style-only --sref via content destruction (BACKLOG SREF ARCHITECTURAL RETRAIN, validated 2026-06-30):
 # patch-shuffle a STYLE-mode reference (grid×grid) before the in-context path so its COMPOSITION is
-# destroyed but its texture/palette/rendering style survives → the prompt's subject is kept and only the
-# style transfers (no composition leak), while different references still discriminate (cross-ref output
-# corr ~0.16 vs the collapsed adapter's ~0.95). Default grid 6 (cleanest for rendering styles); set 0/1 to
-# disable (plain in-context = style+composition). Override via IRIS_SREF_SHUFFLE_GRID.
-SREF_STYLE_SHUFFLE_GRID = int(os.environ.get("IRIS_SREF_SHUFFLE_GRID", "6"))
+# destroyed but its texture/palette/rendering style survives. NOW OPT-IN — superseded as the default
+# style rail by RoPE band-control (SREF-ROPE-PHASE1) above. Default 0 = disabled; set
+# IRIS_SREF_SHUFFLE_GRID=6 to re-enable (it composes with band-control). Override via IRIS_SREF_SHUFFLE_GRID.
+SREF_STYLE_SHUFFLE_GRID = int(os.environ.get("IRIS_SREF_SHUFFLE_GRID", "0"))
 
 
 def normalize_ip_schedule(spec):
@@ -971,6 +980,16 @@ class IrisServer:
             if img2img_strength and float(img2img_strength) < 1.0:
                 request_data["img2img_strength"] = float(img2img_strength)
 
+            # SREF RoPE band-control (SREF-ROPE-PHASE1): style-mode references get high-freq
+            # RoPE-band attenuation on the reference keys (suppresses copying, preserves style).
+            # 1.0/1.0 = off; forwarded only when engaged so the non-style path is byte-identical.
+            sref_shf = float(getattr(job, "sref_shf", 1.0))
+            sref_slf = float(getattr(job, "sref_slf", 1.0))
+            if sref_shf != 1.0:
+                request_data["sref_shf"] = sref_shf
+            if sref_slf != 1.0:
+                request_data["sref_slf"] = sref_slf
+
             if negative_prompt:
                 request_data["negative_prompt"] = negative_prompt
 
@@ -1449,6 +1468,11 @@ def generate():
     job.img2img_strength = img2img_strength
     job.negative_prompt = negative_prompt
     job.hires_fix_intermediate = hires_fix_intermediate
+    # SREF band-control is the default style rail: a STYLE-mode reference gets high-freq RoPE
+    # attenuation (kills copying) + low-freq boost (adds style) on the frozen in-context path.
+    # Composition-mode refs are left untouched (1.0/1.0 = off) so they still copy layout.
+    job.sref_shf = SREF_ROPE_SHF if style_slots else 1.0
+    job.sref_slf = SREF_ROPE_SLF if style_slots else 1.0
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:

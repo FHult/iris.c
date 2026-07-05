@@ -24,6 +24,10 @@ Flux Klein transformer. This is Phase 1 of the pluggable style rail
   ./iris -d flux-klein-4b -p "a cat sitting on a chair" -i style_ref.jpg \
          --sref-shf 0.0 --sref-slf 1.5 -o out.png
   ```
+- **Web UI**: band-control is now the default style rail — a Style-mode reference uses
+  `--sref-shf 0.0 --sref-slf 1.5` (env `IRIS_SREF_SHF` / `IRIS_SREF_SLF`). The previous
+  patch-shuffle is now opt-in (`IRIS_SREF_SHUFFLE_GRID=6`; default `0` = off). The persistent
+  `iris --server` daemon gained matching `sref_shf` / `sref_slf` JSON request keys.
 
 ### Why
 
