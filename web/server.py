@@ -1236,13 +1236,34 @@ def _write_style_thumb(image_bytes: bytes, sha: str) -> None:
         pass
 
 
+def _store_style_ref_image(image_bytes: bytes, sha: str) -> None:
+    """Store the reference image (long side capped at 1024px) so a saved style code can be
+    REPLAYED through the in-context band-control rail without re-uploading — no adapter needed.
+    The in-context path resizes to the generation size anyway, so 1024px is plenty."""
+    from PIL import Image
+    import io as _io
+    im = Image.open(_io.BytesIO(image_bytes)).convert("RGB")
+    im.thumbnail((1024, 1024))
+    im.save(SREF_DIR / f"{sha}_ref.png")
+
+
 def save_style_code(image_bytes: bytes, label: str = "") -> dict:
-    """Compute features for a reference, register a short code, return its record.
-    Idempotent on identical images (same sha → same code)."""
-    features_path = compute_sref_features(image_bytes)            # raises on failure
-    sha = features_path.stem                                      # SREF_DIR/<sha>.bin
+    """Register a reusable style code for a reference image. Stores the reference IMAGE so the
+    code replays through the in-context band-control rail (training-free, no adapter). If the
+    trained IP-Adapter is enabled (IRIS_SREF_ADAPTER=1), also precomputes its features so the
+    same code works on that opt-in path. Idempotent on identical images (same sha → same code)."""
+    sha = hashlib.sha256(image_bytes).hexdigest()[:24]   # same key compute_sref_features uses
+    SREF_DIR.mkdir(parents=True, exist_ok=True)
     code = sha[:8]
+    _store_style_ref_image(image_bytes, sha)             # raises on failure (surfaced to UI)
     _write_style_thumb(image_bytes, sha)
+    # Adapter features are only needed for the opt-in trained-adapter path; compute them there so
+    # saving a code never depends on the training venv / SigLIP infra on the default rail.
+    if SREF_USE_ADAPTER:
+        try:
+            compute_sref_features(image_bytes)
+        except Exception:
+            pass
     with _sref_codes_lock:
         codes = _load_style_codes()
         rec = codes.get(code, {})
@@ -1255,11 +1276,21 @@ def save_style_code(image_bytes: bytes, label: str = "") -> dict:
 
 
 def resolve_style_code(code: str) -> Optional[Path]:
-    """code -> features .bin path, or None if unknown / features missing."""
+    """code -> features .bin path (opt-in adapter path), or None if unknown / features missing."""
     rec = _load_style_codes().get(code)
     if not rec:
         return None
     p = SREF_DIR / f"{rec['sha']}.bin"
+    return p if p.exists() else None
+
+
+def resolve_style_code_image(code: str) -> Optional[Path]:
+    """code -> stored reference-image path for the in-context band-control rail, or None if
+    unknown / the image is missing (e.g. a legacy code saved before images were stored)."""
+    rec = _load_style_codes().get(code)
+    if not rec:
+        return None
+    p = SREF_DIR / f"{rec['sha']}_ref.png"
     return p if p.exists() else None
 
 
@@ -1332,17 +1363,27 @@ def generate():
     # (full-strength reference-as-tokens, prompt drives content — the clean style transfer
     # users loved). The trained IP-Adapter is OPT-IN (IRIS_SREF_ADAPTER=1) and gated behind a
     # retrain because the shipped champion is mode-collapsed (BACKLOG SREF-CHAMPION-COLLAPSE).
-    # When the adapter is enabled AND a bundle exists, style slots / saved style_codes route
-    # through it instead. style_code reuses a saved look with no image upload (Midjourney
-    # --sref <code> model) and therefore REQUIRES the adapter (in-context needs an image).
+    # A saved style_code reuses a look with no image upload (Midjourney --sref <code> model). On
+    # the default rail it replays through IN-CONTEXT band-control: resolve the code to its stored
+    # reference image and inject it as a style-mode slot, so it flows through the same path as an
+    # uploaded style reference (no adapter, no training). When the adapter is enabled AND a bundle
+    # exists, the block below takes precedence and routes the code through the trained adapter.
     style_slots = [s for s in reference_slots if s.get("mode") == "style"]
     style_code = (data.get("style_code") or "").strip()
     adapter_available = SREF_USE_ADAPTER and IP_BUNDLE and Path(IP_BUNDLE).exists()
     if style_code and not adapter_available:
-        return jsonify({"error": "Saved style codes require the trained IP-Adapter, which is "
-                                 "disabled pending retrain (mode collapse — BACKLOG "
-                                 "SREF-CHAMPION-COLLAPSE). Upload the reference image to use "
-                                 "in-context style transfer, or set IRIS_SREF_ADAPTER=1."}), 400
+        ref_img_path = resolve_style_code_image(style_code)
+        if ref_img_path is None:
+            return jsonify({"error": f"Unknown style code (or its saved reference image is "
+                                     f"missing): {style_code}"}), 400
+        try:
+            with open(ref_img_path, "rb") as f:
+                code_img_b64 = base64.b64encode(f.read()).decode()
+        except Exception as e:
+            return jsonify({"error": f"Could not read style code image: {e}"}), 400
+        code_strength = float(data["img2img_strength"]) if "img2img_strength" in data else 1.0
+        reference_slots.append({"data": code_img_b64, "strength": code_strength, "mode": "style"})
+        style_slots = [s for s in reference_slots if s.get("mode") == "style"]
     if (style_slots or style_code) and adapter_available:
         ip_scale = SREF_DEFAULT_STRENGTH
         # Optional injection-timing schedule (advanced; shifts style/content trade-off,
@@ -1866,7 +1907,9 @@ def list_style_codes():
     """List saved style codes (the saved-styles gallery). Newest first."""
     codes = sorted(_load_style_codes().values(),
                    key=lambda r: r.get("created", ""), reverse=True)
-    sref_enabled = bool(IP_BUNDLE and Path(IP_BUNDLE).exists())
+    # Saved style codes now replay through the in-context band-control rail, so the feature is
+    # available whenever the base model is loaded — no IP-Adapter bundle required.
+    sref_enabled = True
     return jsonify({"sref_enabled": sref_enabled, "codes": [
         {"code": r["code"], "label": r.get("label", ""),
          "created": r.get("created", ""),
@@ -1875,9 +1918,8 @@ def list_style_codes():
 
 @app.route("/sref/codes", methods=["POST"])
 def create_style_code():
-    """Save a reference image as a reusable style code. body: {image, label?}."""
-    if not (IP_BUNDLE and Path(IP_BUNDLE).exists()):
-        return jsonify({"error": "Style transfer not configured (IRIS_IP_BUNDLE unset)"}), 400
+    """Save a reference image as a reusable style code. body: {image, label?}.
+    Works on the default (band-control) rail — no IP-Adapter bundle required."""
     data = request.json or {}
     img_b64 = data.get("image")
     if not img_b64:

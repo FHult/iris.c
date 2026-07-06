@@ -4,7 +4,22 @@ All notable, user-facing changes to iris.c. Newest first.
 
 ---
 
-## Unreleased — SREF style transfer: RoPE band-control (`--sref-shf` / `--sref-slf`)
+## Unreleased
+
+### Saved style codes on the band-control rail (web UI)
+
+Saved **style codes** (the Midjourney `--sref <code>` model — reuse a look without re-uploading the
+image) now work on the default **band-control** rail, with **no trained adapter required**. Saving a
+code stores the reference image (`web/output/sref/<sha>_ref.png`); generating with a `style_code`
+resolves that image and replays it through the in-context style path (band-control), so a saved look
+transfers its style while the prompt drives the subject. The opt-in trained IP-Adapter
+(`IRIS_SREF_ADAPTER=1`) still routes codes through its precomputed features when enabled.
+`POST /sref/codes` no longer requires `IRIS_IP_BUNDLE`, and the saved-styles gallery is always
+available (`sref_enabled: true`).
+
+---
+
+## v5.0.0 — SREF style transfer: RoPE band-control (`--sref-shf` / `--sref-slf`)
 
 **Training-free style-only reference conditioning for the in-context (`-i`) path**, on the frozen
 Flux Klein transformer. This is Phase 1 of the pluggable style rail
