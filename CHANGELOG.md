@@ -110,8 +110,10 @@ in-context/sequence path is the right substrate on Flux) was informed by a verif
 - **OminiControl** (arXiv:2411.15098) and **OminiControl2** (arXiv:2503.08280) — in-sequence conditioning
   on Flux with a small LoRA; the additive attention-bias `B(γ)` on generation→condition logits is the
   basis for the shipped Phase 2 `--sref-strength` (implemented as `log(γ)` on reference-key attention
-  columns in the fused Metal kernels), and condition-token K/V reuse across denoising steps is the basis
-  for the planned Phase 3 KV-reuse.
+  columns in the fused Metal kernels). Condition-token K/V reuse across denoising steps (OminiControl2)
+  was the basis for a proposed Phase 3, but a viability probe found the prerequisite asymmetric mask both
+  degrades style quality (−28% CSD adherence) and forces the slow custom kernel (~40× on this stack) on
+  4-step distilled Flux, so Phase 3 was abandoned (see BACKLOG SREF-ROPE-PHASE3).
 - **USO** (arXiv:2508.18966) — a learned in-sequence style-token producer (SigLIP → projector) on Flux;
   the model for the planned learned-encoder rail.
 - **Distilling Diversity and Control in Diffusion Models** (arXiv:2503.10637) — few-step distilled models

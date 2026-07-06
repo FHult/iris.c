@@ -2845,6 +2845,34 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
     [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
 
+  - **❌ SREF-ROPE-PHASE3 (2026-07-06) — reference-KV reuse is a NO-GO on this stack. Viability probe
+    (asymmetric mask, the prerequisite) FAILS both gates: it degrades style quality AND regresses perf.
+    Phase 3 abandoned; probe code reverted (throwaway measurement), negative result logged here.**
+    Plan Phase 3 (plans/sref-rope-band-control.md) proposed masking reference-token queries off the noisy
+    target image (so ref K/V becomes step-invariant and reusable across the 4 steps → ~20-30% wall-clock).
+    The plan mandated validating the MASK ALONE first ("changes output; run the gate + golden diff"); I
+    implemented it behind an opt-in `--sref-kv-reuse` flag (bf16 fused kernel gained a query-dependent mask:
+    ref queries [ref_start,seq) skip target keys [txt_seq,ref_start); per-call query ranges for single vs
+    double blocks; default off = bit-identical) and measured on the 8-ref gate atop shf0.0/slf1.5.
+    RESULT (8-ref gate, "a cat on a chair", seed 42, 512px; data: debug/sref_p3_mask_probe_2026-07-06.jsonl):
+      • mask OFF (= P2 γ=1 baseline): max_cross 0.394  style_adh 0.354  copy_corr 0.162   ~4 s/gen (MPSGraph SDPA)
+      • mask ON  (--sref-kv-reuse):   max_cross 0.615  style_adh 0.255  copy_corr 0.141   ~148 s/gen (custom kernel)
+    TWO INDEPENDENT FAILURES:
+      1. QUALITY: the mask DROPS CSD style adherence 28% (0.354→0.255) and WORSENS reference discrimination
+         (max_cross 0.394→0.615). Decoupling ref queries from the target makes the reference tokens carry a
+         weaker, less target-adapted style signal → less adherence and more similar (less discriminating)
+         outputs. This is exactly the quality risk the plan flagged as "unvalidated on 4-step distilled",
+         now CONFIRMED negative. (Output is finite/coherent — the -INF masking doesn't NaN — it's just worse.)
+      2. PERF: the mask has NO MPSGraph SDPA support, so it forces the custom fused kernel — ~40× SLOWER
+         (148 s vs 4 s/gen). Phase 3's whole point is a SPEEDUP; the prerequisite makes attention dramatically
+         slower. K/V caching cannot recover a 40× attention penalty; the only path to a net win would be to
+         port the mask INTO MPSGraph SDPA (an additive mask tensor) — a large, risky effort — and even then
+         the quality loss (failure 1) stands. Not worth it.
+    VERDICT: abandon reference-KV reuse. The quality win is Phases 1-2 (band-control + strength); the
+    distilled path is already fast (4 steps), so the perf-only Phase 3 was low-value and both gates killed it.
+    (Decided with the user: "viability probe first" — the probe did its job. Committed nothing but this log +
+    the probe data; all probe code reverted so the tree stays at Phase-2.)
+
   - **✅ SREF-ROPE-PHASE2 (2026-07-06) — `--sref-strength` γ strength-bias shipped; PASSES acceptance
     (γ monotonically trades style strength, discrimination intact, default γ=1 a verified no-op).**
     Implements Phase 2 of plans/sref-rope-band-control.md. Additive log(γ) on the reference-token KEY
