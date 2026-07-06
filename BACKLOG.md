@@ -1787,6 +1787,15 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   SREF-CHAMPION-COLLAPSE). ACTIONS: (a) set UI expectations ("works best with bold/graphic references"),
   do not over-promise; (b) for painterly, the architectural project is the only path; (c) consider
   gating/labelling references by "graphic-ness" so users know what will work.
+  USER CASE REPRODUCED (2026-07-06, anime glossy food-illustration ref, 720×1280): confirms a THIRD
+  regime between graphic-works and painterly-fails — SEMI-REALISTIC illustration transfers SUBTLY: the
+  glossy/saturated/vibrant *rendering quality* comes through (band-control robot is visibly glossier +
+  blue-accented vs the matte no-reference txt2img robot, corr 0.71) but NOT the flat cel-shaded/outlined
+  aesthetic; raising slf 1.5→2.5 and shf 0→0.3 barely strengthens it. TWO extra findings: (1) the user's
+  "composition leaks" was the OLD composition-mode default copying the plate — the P0 style-default fix
+  addresses it; (2) ASPECT RATIO MATTERS — rendering at the reference's aspect (portrait) noticeably
+  strengthened the transfer vs a square render (the web already auto-sets dims from the ref, so this is
+  mostly handled). Net: for semi-realistic refs, expectation-setting is the fix, not a stronger default.
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.
 
