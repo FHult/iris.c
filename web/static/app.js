@@ -1538,9 +1538,12 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateClearAllButton() {
         const hasAnyImage = referenceImageData.some(s => s !== null);
         clearAllImagesBtn.style.display = hasAnyImage ? 'block' : 'none';
-        // Show the global Style/Composition toggle only when at least one reference is present.
+        // Show the global Style/Composition toggle (and its hint) only when a reference is present.
         const modeRow = document.getElementById('ref-mode-global-row');
         if (modeRow) modeRow.style.display = hasAnyImage ? 'flex' : 'none';
+        const hint = document.getElementById('ref-mode-hint');
+        if (hint) hint.style.display = hasAnyImage ? 'block' : 'none';
+        _updateRefModeHint();
     }
 
     // The reference mode is a single GLOBAL toggle (Style default) shared by all slots — Style routes
@@ -1548,6 +1551,16 @@ document.addEventListener('DOMContentLoaded', () => {
     function _globalRefMode() {
         const el = document.getElementById('ref-mode-global');
         return el ? el.value : 'style';
+    }
+
+    // A short expectation-setting note under the mode toggle. Style transfer (band-control) is
+    // strong for bold/graphic references, subtle for paintings/photos (BACKLOG SREF-STYLE-CEILING).
+    function _updateRefModeHint() {
+        const hint = document.getElementById('ref-mode-hint');
+        if (!hint) return;
+        hint.textContent = _globalRefMode() === 'style'
+            ? 'Style works best with bold, graphic references (line-art, comics, flat illustration, woodcut). Paintings and photos transfer only subtly.'
+            : "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
     }
 
     // Read strength/mode for a slot (strength from the per-slot slider; mode from the global toggle)
@@ -1696,6 +1709,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (referenceImageData[i]) referenceImageData[i].mode = mode;
             }
             renderAllSlots();  // re-applies _updateSlotControls (shows/hides the strength sliders)
+            _updateRefModeHint();
         });
     }
 

@@ -1935,6 +1935,13 @@ footer a:hover {
     color: white;
 }
 
+.ref-mode-hint {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: rgba(255,255,255,0.55);
+    margin: -0.2rem 0 0.6rem;
+}
+
 .ref-strength-slider {
     flex: 1;
     min-width: 0;
