@@ -1722,14 +1722,37 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
 
 ## C Binary / CLI
 
-- **B-001: --vary-from / --vary-strength CLI wiring** (~1 hour) — `main.c`, `iris.h`
-- **B-002: Z-Image CFG infrastructure** (~1 day) — `iris_sample.c`, `iris.c`, `iris.h` — unblocks Z-Image-Omni-Base; do this before B-003
-- **B-003: Negative prompt for distilled Flux** (~2 hours) — `iris.c`, `main.c` — prerequisite for Web UI Feature 1
+- ~~**B-001: --vary-from / --vary-strength CLI wiring**~~ — ✅ DONE (verified 2026-07-06, stale entry).
+  `main.c` has `--vary-from` (opt 265), `--vary-subtle` (266 → strength 0.2), `--vary-strong`
+  (267 → 0.6), `--vary-strength N` (268); `vary_from` is used as an img2img input at main.c:1510.
+- **B-002: Z-Image CFG infrastructure** (~1 day) — `iris_sample.c`, `iris.c`, `iris.h` — unblocks Z-Image-Omni-Base
+- ~~**B-003: Negative prompt for distilled Flux**~~ — ✅ DONE (verified 2026-07-06, stale entry).
+  `iris.c` (~line 902): distilled models with a non-empty `negative_prompt` and no explicit guidance
+  nudge `guidance = 1.5f` and enable CFG (`use_cfg = !is_distilled || negative_prompt`), encoding the
+  negative as the uncond pass. CLI `-N/--negative`, daemon `negative_prompt` key, and web request key
+  all plumbed. (Web UI Feature 1 = exposing this in the UI — soft-blocked by P0 UI-STYLE-UX.)
 
 ---
 
 ## Web UI Features
 
+- 🔴 **P0 — UI-STYLE-UX: make style transfer the obvious, working default; cut the confusing options
+  (2026-07-06, user report).** User feedback: "too difficult as a user to get style transfer — too
+  many confusing options to choose from and tweak — and I did not get any style transfer from the
+  default options." ROOT CAUSE (confirmed 2026-07-06): each reference slot has a per-slot
+  **"Comp / Style" dropdown** (`web/static/index.html`, `<option value="composition">` listed FIRST →
+  default). Band-control (the shipped training-free style rail; job.sref_shf/slf, engaged only when a
+  slot's mode == "style") therefore NEVER fires on the default path — an uploaded reference is treated
+  as **composition** (literal img2img copy), not style. So the default UX silently gives composition
+  copying, not style transfer, and the fix (per-slot dropdown) is buried + jargon. WHAT TO DO (design
+  is the user's call — DO NOT just add more controls; this P0 is about REMOVING confusion):
+  (a) make the common case one obvious action — e.g. an upload prompts "Match this composition" vs
+  "Transfer this style", or default an uploaded reference to STYLE (band-control) with a single clear
+  toggle; (b) hide the advanced knobs (shf/slf/strength, per-slot Comp/Style, ip-schedule) behind an
+  "advanced" disclosure; (c) verify end-to-end that the default path produces VISIBLE style transfer
+  (the CLI band-control gate passes — the gap is UI wiring/defaults, not the mechanism). NOTE: this
+  supersedes/soft-blocks Feature 1 (adding a negative-prompt field would add clutter) until the UI is
+  simplified. Cross-ref: CHANGELOG v5.0.0/v5.1.0 (band-control + style codes), SREF-ROPE-PHASE1/2.
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.
 
