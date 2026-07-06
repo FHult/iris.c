@@ -493,6 +493,7 @@ typedef struct {
     float   img2img_strength;
     float   sref_rope_shf;   /* SREF band-control: reference high-freq RoPE key scale (1.0=off) */
     float   sref_rope_slf;   /* SREF band-control: reference low-freq RoPE key scale (1.0=off) */
+    float   sref_strength;   /* SREF strength bias: reference attention gamma (1.0=off) */
     char   *negative_prompt;
     int     linear_schedule;
     int     power_schedule;
@@ -661,6 +662,7 @@ static void server_run_job(iris_ctx *ctx, server_job_t *job) {
         .power_alpha      = job->power_alpha,
         .sref_rope_shf    = job->sref_rope_shf,  /* SREF band-control (style refs; 1.0=off) */
         .sref_rope_slf    = job->sref_rope_slf,
+        .sref_strength    = job->sref_strength,  /* SREF strength bias (style refs; 1.0=off) */
     };
 
     iris_image *output = NULL;
@@ -913,6 +915,7 @@ static int run_server_mode(iris_ctx *ctx) {
         float img2img_str    = json_get_float(line, "img2img_strength", 1.0f);
         float sref_shf       = json_get_float(line, "sref_shf", 1.0f);
         float sref_slf       = json_get_float(line, "sref_slf", 1.0f);
+        float sref_strength  = json_get_float(line, "sref_strength", 1.0f);
         char *neg_prompt     = json_get_string(line, "negative_prompt");
         char *schedule       = json_get_string(line, "schedule");
         char *req_lora       = json_get_string(line, "lora");
@@ -1009,6 +1012,7 @@ static int run_server_mode(iris_ctx *ctx) {
         job->guidance        = guidance;
         job->img2img_strength = img2img_str;
         job->sref_rope_shf   = sref_shf;
+        job->sref_strength   = sref_strength;
         job->sref_rope_slf   = sref_slf;
         job->negative_prompt = neg_prompt;
         job->lora_path       = req_lora;
@@ -1082,6 +1086,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n");
     fprintf(stderr, "      --sref-shf N      SREF style: attenuate reference high-freq RoPE bands (0-1; 1=off)\n");
     fprintf(stderr, "      --sref-slf N      SREF style: amplify reference low-freq RoPE bands (>=1; 1=off)\n");
+    fprintf(stderr, "      --sref-strength N SREF style: reference attention strength gamma (<1 weaker, >1 stronger; 1=off, GPU only)\n");
     fprintf(stderr, "                        Training-free style transfer (RoPE band-control; see CHANGELOG.md).\n");
     fprintf(stderr, "                        e.g. --sref-shf 0.0 --sref-slf 1.5 = style-only, subject kept\n\n");
     fprintf(stderr, "Output options:\n");
@@ -1173,6 +1178,7 @@ int main(int argc, char *argv[]) {
         {"vary-strength",    required_argument, 0, 268},
         {"sref-shf",         required_argument, 0, 273},
         {"sref-slf",         required_argument, 0, 274},
+        {"sref-strength",    required_argument, 0, 275},
         {0, 0, 0, 0}
     };
 
@@ -1193,7 +1199,8 @@ int main(int argc, char *argv[]) {
         .guidance = 0.0f, /* 0 = auto from model type */
         .power_alpha = 2.0f,
         .sref_rope_shf = 1.0f, /* SREF band-control off by default */
-        .sref_rope_slf = 1.0f
+        .sref_rope_slf = 1.0f,
+        .sref_strength = 1.0f  /* SREF strength bias off by default */
     };
 
     char *vary_from = NULL;
@@ -1264,6 +1271,7 @@ int main(int argc, char *argv[]) {
             case 262: params.img2img_strength = (float)atof(optarg); break;
             case 273: params.sref_rope_shf = (float)atof(optarg); break;  /* SREF band-control high-freq scale */
             case 274: params.sref_rope_slf = (float)atof(optarg); break;  /* SREF band-control low-freq scale */
+            case 275: params.sref_strength = (float)atof(optarg); break;  /* SREF strength bias gamma */
             case 'N': params.negative_prompt = optarg; break;
             case 265: vary_from = optarg; break;
             case 266: params.img2img_strength = 0.2f; break;

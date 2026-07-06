@@ -2845,6 +2845,42 @@ stdio also moved to $HOME. Armed for the 2026-06-15→18 absence: run5 → flywh
     a reference-discrimination term, re-measure cross-ref corr on the discrimination gate. See
     [[sref_platform_strategy]] / SREF-CHAMPION-COLLAPSE.
 
+  - **✅ SREF-ROPE-PHASE2 (2026-07-06) — `--sref-strength` γ strength-bias shipped; PASSES acceptance
+    (γ monotonically trades style strength, discrimination intact, default γ=1 a verified no-op).**
+    Implements Phase 2 of plans/sref-rope-band-control.md. Additive log(γ) on the reference-token KEY
+    columns of attention (OminiControl B(γ)): γ<1 weakens, γ>1 amplifies the reference's pull. Layered on
+    band-control; dials style strength independently of the RoPE bands. IMPLEMENTATION (GPU/Metal path):
+    a file-scope bias in iris_metal.m (`iris_metal_set_attention_bias`, set per-generation by the flux
+    ref-aware forward via `sref_set_strength_bias`, cleared before VAE decode) is read by the fused
+    custom kernels (attention_fused / attention_fused_bf16 gained buffer 9=ref_start, 10=log(γ)); when the
+    bias is non-zero the fused wrappers BYPASS the MPSGraph SDPA fast path (which has no additive mask) and
+    use the custom kernel. So γ=1 → bias 0 → untouched MPSGraph path (bit-identical); γ≠1 → custom kernel
+    with bias (still GPU). References are the trailing keys, so ref_start = total_seq - ref_seq is one
+    constant for all flux block attentions; VAE/zImage/ip-adapter run while the bias is 0 and are
+    unaffected. Chose a global over threading γ through ~13 attention call sites + joint_attention_bf16
+    (which lacks a tf pointer). Plumbing: CLI `--sref-strength` → daemon `sref_strength` JSON key → web
+    `IRIS_SREF_GAMMA` (default 1.0=off, opt-in) → iris_params.sref_strength → iris_transformer_set_sref_strength
+    (clamps γ to [1e-3, 8]). CPU-only builds (BLAS/generic): γ is a documented no-op (bias applied only in
+    the Metal kernels); default-off keeps them bit-identical (both compile clean).
+    RESULT (8-ref gate, "a cat on a chair", seed 42, 512px, atop band-control shf0.0/slf1.5):
+      • γ=0.5:  max_cross 0.383  style_adh 0.322  copy_corr 0.132
+      • γ=1.0:  max_cross 0.394  style_adh 0.354  copy_corr 0.162  ← EXACT match to Phase-1 shf0.0/slf1.5 (no-op ✓)
+      • γ=2.0:  max_cross 0.522  style_adh 0.380  copy_corr 0.204
+      • γ=4.0:  max_cross 0.395  style_adh 0.433  copy_corr 0.236
+    ACCEPTANCE MET: style_adh rises monotonically with γ (0.322→0.433, +34% from γ=0.5→4) while discrimination
+    holds (max_cross < 0.53 throughout, well under 0.90). copy_corr rises with γ too (the expected strength
+    trade-off — stronger γ pulls everything toward the reference). γ is a COMPLEMENTARY strength knob to slf:
+    γ=4 atop slf1.5 reaches style_adh 0.433 (vs 0.354 at γ=1), approaching the Phase-1 shf0.6/slf1.5 cell
+    (0.476) by a different lever. Sweep data: debug/sref_p2_strength_sweep_2026-07-06.jsonl.
+    VERIFIED: make mps clean (no warnings); make test-unit 28/28; BLAS+generic compile clean; CLI end-to-end
+    (γ=2 vs γ=1 same seed/ref → outputs differ corr 0.945, no corruption → bias engages on the shipped bf16
+    path + VAE-clear works). GOTCHA (logged): the gate's CSD encoder is MLX → must run via train/.venv/bin/python
+    (web/venv lacks mlx); and `make blas`/`make generic` overwrite the `iris` binary (all targets emit `iris`) —
+    do not build other backends while an MPS sweep using ./iris is running. Web default γ=1 (off, opt-in via
+    IRIS_SREF_GAMMA) until a value is chosen. NEXT: Phase 3 (reference-KV reuse; perf) per the plan.
+    KNOWN LIMITATION: at very large seq the custom kernel exceeds threadgroup memory (~7680 keys) → the bias is
+    dropped and the gen falls back (unbiased) at that resolution; fine at ≤~768px.
+
   - **✅ SREF-ROPE-PHASE1 (2026-07-05) — RoPE band-control shipped for the in-context style rail;
     PASSES the gate and DOMINATES patch-shuffle. Confirms "Untwisting RoPE" on our 4-step DISTILLED model
     (first test of that mechanism off 50-step Flux).** Implements shortlist #1 from SREF-ARCH-RESEARCH

@@ -497,6 +497,8 @@ kernel void attention_fused(
     constant int &num_heads [[buffer(6)]],
     constant int &head_dim [[buffer(7)]],
     constant float &scale [[buffer(8)]],
+    constant int &attn_bias_ref_start [[buffer(9)]],   // SREF strength: first ref-key column
+    constant float &attn_bias_value [[buffer(10)]],    // SREF strength: log(gamma); 0 = off
     threadgroup float *shared_scores [[threadgroup(0)]],  // [seq_k] dynamic
     uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
     uint3 tid_pos [[thread_position_in_threadgroup]],
@@ -537,6 +539,8 @@ kernel void attention_fused(
             dot += q_row[d] * k_row[d];
         }
         float score = dot * scale;
+        // SREF strength bias (OminiControl B(gamma)): add log(gamma) to reference-key columns
+        if (attn_bias_value != 0.0f && key_idx >= attn_bias_ref_start) score += attn_bias_value;
         shared_scores[key_idx] = score;
         local_max = max(local_max, score);
     }
@@ -1784,6 +1788,8 @@ kernel void attention_fused_bf16(
     constant int &num_heads [[buffer(6)]],
     constant int &head_dim [[buffer(7)]],
     constant float &scale [[buffer(8)]],
+    constant int &attn_bias_ref_start [[buffer(9)]],   // SREF strength: first ref-key column
+    constant float &attn_bias_value [[buffer(10)]],    // SREF strength: log(gamma); 0 = off
     threadgroup float *shared_scores [[threadgroup(0)]],  // [seq_k] dynamic
     uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
     uint3 tid_pos [[thread_position_in_threadgroup]],
@@ -1829,6 +1835,8 @@ kernel void attention_fused_bf16(
             dot += shared_q[d] * bf16_to_f32(k_row[d]);
         }
         float score = dot * scale;
+        // SREF strength bias (OminiControl B(gamma)): add log(gamma) to reference-key columns
+        if (attn_bias_value != 0.0f && key_idx >= attn_bias_ref_start) score += attn_bias_value;
         shared_scores[key_idx] = score;
         local_max = max(local_max, score);
     }

@@ -337,6 +337,12 @@ typedef struct iris_transformer {
     float *cached_krope_sin;
     int    cached_krope_seq;          /* allocated combined_img_seq of the backing buffer */
 
+    /* SREF Phase-2: strength bias (plans/sref-rope-band-control.md). gamma>0; 1.0 = OFF (default,
+     * bit-identical). In a ref-aware forward, an additive log(gamma) is applied to reference-token
+     * KEY columns of the fused attention (GPU custom kernel) — OminiControl B(gamma): gamma<1 weakens,
+     * gamma>1 amplifies the influence of the reference tokens. GPU (Metal) path only. */
+    float sref_strength;              /* input: gamma; 1.0 = off */
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     #define MAX_TF_SHARDS 4
@@ -1303,6 +1309,23 @@ static void set_kside_krope(iris_transformer_t *tf, const float *combined_cos, c
                          axis_dim, tf->sref_rope_shf, tf->sref_rope_slf);
     tf->sref_krope_cos = tf->cached_krope_cos;
     tf->sref_krope_sin = tf->cached_krope_sin;
+}
+
+/* SREF Phase-2: activate (or clear) the per-generation attention strength bias for a ref-aware
+ * forward. References are the trailing (combined_img_seq - img_seq) tokens of the full
+ * [txt, target-img, ref] attention sequence, so the reference-key columns are
+ * [total_seq - ref_seq, total_seq). gamma=1.0 → bias 0 → no-op (GPU fast path untouched).
+ * GPU/Metal path only (the fused custom kernels apply the bias); a no-op on CPU-only builds. */
+static void sref_set_strength_bias(iris_transformer_t *tf, int img_seq, int combined_img_seq,
+                                   int total_seq) {
+#ifdef USE_METAL
+    int ref_seq = combined_img_seq - img_seq;
+    float bias = (tf->sref_strength > 0.0f && tf->sref_strength != 1.0f && ref_seq > 0)
+                 ? logf(tf->sref_strength) : 0.0f;
+    iris_metal_set_attention_bias(bias != 0.0f ? total_seq - ref_seq : 0, bias);
+#else
+    (void)tf; (void)img_seq; (void)combined_img_seq; (void)total_seq;
+#endif
 }
 
 /* ========================================================================
@@ -4441,6 +4464,7 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
 
     /* SREF Phase-1: build the K-side band-scaled table for the reference rows [img_seq, combined). */
     set_kside_krope(tf, combined_rope_cos, combined_rope_sin, img_seq, combined_img_seq, tf->axis_dim);
+    sref_set_strength_bias(tf, img_seq, combined_img_seq, total_seq);
 
     /* Get cached text RoPE */
     float *txt_rope_cos, *txt_rope_sin;
@@ -4685,6 +4709,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* SREF Phase-1: build the K-side band-scaled table for the reference rows [img_seq, combined). */
     set_kside_krope(tf, combined_rope_cos, combined_rope_sin, img_seq, combined_img_seq, axis_dim);
+    sref_set_strength_bias(tf, img_seq, combined_img_seq, total_seq);
 
     /* Get cached text RoPE */
     float *txt_rope_cos, *txt_rope_sin;
@@ -4870,6 +4895,7 @@ iris_transformer_t *iris_transformer_load(FILE *f) {
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
     tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
+    tf->sref_strength = 1.0f;  /* SREF strength bias OFF by default */
 
     /* Read config */
     uint32_t config[10];
@@ -5164,6 +5190,16 @@ void iris_transformer_set_sref_bands(iris_transformer_t *tf, float shf, float sl
     tf->sref_rope_slf = (slf >= 1.0f) ? slf : 1.0f;
 }
 
+/* SREF Phase-2: set the reference-strength gamma. gamma=1.0 (or <=0) disables (default).
+ * Clamped to [1e-3, 8] — gamma=0 would be a log(0)=-inf mask; 1e-3 is an effective mask. */
+void iris_transformer_set_sref_strength(iris_transformer_t *tf, float gamma) {
+    if (!tf) return;
+    if (!(gamma > 0.0f) || gamma == 1.0f) { tf->sref_strength = 1.0f; return; }
+    if (gamma < 1e-3f) gamma = 1e-3f;
+    if (gamma > 8.0f)  gamma = 8.0f;
+    tf->sref_strength = gamma;
+}
+
 /* Attach an IP-Adapter + perceived embeddings (replaces any existing; takes
  * ownership of both). ip=NULL detaches. Returns 0 on success. */
 int iris_transformer_set_ip_adapter(iris_transformer_t *tf, iris_ip_adapter_t *ip,
@@ -5299,6 +5335,7 @@ iris_transformer_t *iris_transformer_load_safetensors(const char *model_dir) {
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
     tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
+    tf->sref_strength = 1.0f;  /* SREF strength bias OFF by default */
 
     char name[256];
 
@@ -5548,6 +5585,7 @@ iris_transformer_t *iris_transformer_load_safetensors_mmap(const char *model_dir
     iris_transformer_t *tf = calloc(1, sizeof(iris_transformer_t));
     if (!tf) return NULL;
     tf->sref_rope_shf = 1.0f; tf->sref_rope_slf = 1.0f;  /* SREF band-control OFF by default */
+    tf->sref_strength = 1.0f;  /* SREF strength bias OFF by default */
 
     /* Parse config from transformer/config.json, fall back to 4B defaults */
     if (parse_transformer_config(model_dir, tf) != 0) {

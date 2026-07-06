@@ -98,12 +98,15 @@ typedef struct {
      * 1.0/1.0 = OFF (default). */
     float sref_rope_shf;    /* high-freq scale, 0<shf<=1 (1.0 = off) */
     float sref_rope_slf;    /* low-freq scale,  slf>=1  (1.0 = off) */
+    /* SREF Phase-2 strength bias: additive log(gamma) on reference-key attention columns
+     * (OminiControl B(gamma)); gamma<1 weakens, gamma>1 amplifies. 1.0 = OFF. GPU/Metal path. */
+    float sref_strength;    /* reference strength gamma (1.0 = off) */
 } iris_params;
 
 /* Default parameters */
 #define IRIS_DEFAULT_WIDTH  256
 #define IRIS_DEFAULT_HEIGHT 256
-#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL, 1.0f, 1.0f }
+#define IRIS_PARAMS_DEFAULT { IRIS_DEFAULT_WIDTH, IRIS_DEFAULT_HEIGHT, 0, -1, 0.0f, 0, 0, 2.0f, 1.0f, NULL, 1.0f, 1.0f, 1.0f }
 
 /* ========================================================================
  * Core API

@@ -416,6 +416,11 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
                              iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
+/* SREF strength bias (Phase 2): set an additive log(gamma) applied to reference-token KEY
+ * columns [ref_start, seq_k) in the fused-attention custom kernels. Set once per generation by
+ * the flux ref-aware forward; bias = 0 disables (fast MPSGraph SDPA path, bit-identical). */
+void iris_metal_set_attention_bias(int ref_start, float bias);
+
 /* Native BF16 attention on GPU tensors (all tensors must be bf16 format).
  * Uses bf16 compute shaders with f32 accumulation for numerical stability.
  * Returns 1 on success, 0 if tensors are not bf16 or shaders unavailable.

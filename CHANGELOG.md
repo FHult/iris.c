@@ -28,6 +28,15 @@ Flux Klein transformer. This is Phase 1 of the pluggable style rail
   `--sref-shf 0.0 --sref-slf 1.5` (env `IRIS_SREF_SHF` / `IRIS_SREF_SLF`). The previous
   patch-shuffle is now opt-in (`IRIS_SREF_SHUFFLE_GRID=6`; default `0` = off). The persistent
   `iris --server` daemon gained matching `sref_shf` / `sref_slf` JSON request keys.
+- **`--sref-strength N` (Phase 2)** — an optional reference-attention strength knob layered on
+  band-control. `N` is a multiplier γ on how strongly the generation attends to the reference:
+  `N<1` weakens, `N>1` amplifies, `N=1` = off (default, bit-identical). It adds `log(N)` to the
+  reference-token *key* columns of attention (OminiControl-style bias), so it dials style strength
+  independently of the RoPE bands. GPU/Metal path only. Env `IRIS_SREF_GAMMA` for the web UI
+  (default `1.0` = off). Example: `--sref-shf 0.0 --sref-slf 1.5 --sref-strength 2.0`.
+  Measured (8-ref gate, atop shf0.0/slf1.5): CSD style adherence rises monotonically with γ —
+  0.322 (γ=0.5) → 0.354 (γ=1) → 0.380 (γ=2) → 0.433 (γ=4) — while reference discrimination holds
+  (max cross-ref corr < 0.53 throughout). γ=1 reproduces the Phase-1 numbers exactly (no-op).
 
 ### Why
 
@@ -99,8 +108,10 @@ in-context/sequence path is the right substrate on Flux) was informed by a verif
 - **InstantStyle** (arXiv:2404.02733) and **DEADiff** (arXiv:2403.06951) — style/content entanglement in
   image-feature injection is architectural, and block-targeted injection is the structural remedy.
 - **OminiControl** (arXiv:2411.15098) and **OminiControl2** (arXiv:2503.08280) — in-sequence conditioning
-  on Flux with a small LoRA; condition-token K/V reuse across denoising steps and attention-bias strength
-  control (the basis for the planned Phase 2 `--sref-strength` and Phase 3 KV-reuse).
+  on Flux with a small LoRA; the additive attention-bias `B(γ)` on generation→condition logits is the
+  basis for the shipped Phase 2 `--sref-strength` (implemented as `log(γ)` on reference-key attention
+  columns in the fused Metal kernels), and condition-token K/V reuse across denoising steps is the basis
+  for the planned Phase 3 KV-reuse.
 - **USO** (arXiv:2508.18966) — a learned in-sequence style-token producer (SigLIP → projector) on Flux;
   the model for the planned learned-encoder rail.
 - **Distilling Diversity and Control in Diffusion Models** (arXiv:2503.10637) — few-step distilled models

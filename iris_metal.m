@@ -4401,6 +4401,21 @@ static int iris_gpu_attention_mpsgraph_f32(iris_gpu_tensor_t out,
                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /* GPU tensor version of fused attention (no transpose needed) */
+/* SREF strength bias (Phase 2): an additive log(gamma) on reference-token KEY columns of the
+ * fused-attention custom kernels (OminiControl B(gamma)). Set once per generation by the flux
+ * ref-aware forward; 0 = off. A file-scope global avoids threading it through every attention
+ * signature. When non-zero, the fused wrappers bypass the MPSGraph SDPA fast path (which has no
+ * mask) and use the custom kernel, which applies the bias. Reference tokens are the trailing
+ * keys, so ref_start = total_seq - ref_seq is constant across all flux block attentions; other
+ * callers (VAE/zImage/ip-adapter) run while it is 0 and are unaffected. */
+static int   g_attn_bias_ref_start = 0;
+static float g_attn_bias_value     = 0.0f;
+
+void iris_metal_set_attention_bias(int ref_start, float bias) {
+    g_attn_bias_ref_start = ref_start;
+    g_attn_bias_value     = bias;
+}
+
 int iris_gpu_attention_fused(iris_gpu_tensor_t out,
                              iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
@@ -4408,8 +4423,10 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
 
     /* Try MPSGraph native SDPA first (Flash Attention, no seq_k limit).
-     * Falls through to custom kernel only if MPSGraph is unavailable. */
-    if (!prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
+     * Falls through to custom kernel only if MPSGraph is unavailable — OR when a SREF strength
+     * bias is active (MPSGraph SDPA has no additive mask, so the biased path must use the
+     * custom kernel below). */
+    if (g_attn_bias_value == 0.0f && !prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
         if (iris_gpu_attention_mpsgraph_f32(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
@@ -4436,6 +4453,8 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
         [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setBytes:&g_attn_bias_ref_start length:sizeof(int) atIndex:9];
+        [encoder setBytes:&g_attn_bias_value length:sizeof(float) atIndex:10];
         [encoder setThreadgroupMemoryLength:scores_size atIndex:0];
 
         NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
@@ -5068,8 +5087,9 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
     /* Try MPSGraph attention first (faster than custom kernel).
-     * Fall back to custom kernel only if MPSGraph fails or is disabled. */
-    if (!prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
+     * Fall back to custom kernel only if MPSGraph fails or is disabled — OR when a SREF strength
+     * bias is active (MPSGraph SDPA has no additive mask; the biased path needs the custom kernel). */
+    if (g_attn_bias_value == 0.0f && !prefer_custom_attn() && NSClassFromString(@"MPSGraph")) {
         if (iris_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
@@ -5100,6 +5120,8 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
             [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
             [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+            [encoder setBytes:&g_attn_bias_ref_start length:sizeof(int) atIndex:9];
+            [encoder setBytes:&g_attn_bias_value length:sizeof(float) atIndex:10];
             [encoder setThreadgroupMemoryLength:bf16_scores_size atIndex:0];
 
             /* Dispatch: one threadgroup per (query_pos, head) pair */
@@ -5127,7 +5149,10 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
         }
     }
 
-    if (NSClassFromString(@"MPSGraph")) {
+    /* MPSGraph SDPA has no additive mask, so it can only be used when no SREF bias is active.
+     * If a bias IS active but the custom kernel did not fit (very large seq), return 0 so the
+     * caller falls back — the bias is dropped at that resolution (documented limitation). */
+    if (g_attn_bias_value == 0.0f && NSClassFromString(@"MPSGraph")) {
         if (iris_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
@@ -6727,6 +6752,8 @@ int iris_metal_attention_fused(float *out,
         [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setBytes:&g_attn_bias_ref_start length:sizeof(int) atIndex:9];
+        [encoder setBytes:&g_attn_bias_value length:sizeof(float) atIndex:10];
         [encoder setThreadgroupMemoryLength:raw_scores_size atIndex:0];
 
         /* Dispatch: one threadgroup per (query_pos, head) pair

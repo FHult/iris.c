@@ -1,0 +1,5 @@
+{"phase": "SREF-ROPE-PHASE2", "note": "gamma strength-bias sweep atop band-control shf0.0/slf1.5; 8-ref gate, 'a cat sitting on a chair', seed 42, 512px; metrics recomputed from images with train/.venv (CSD is MLX)"}
+{"gamma": "0.5", "max_cross": 0.3827, "mean_cross": 0.1449, "style_adh": 0.3224, "copy_corr": 0.1321, "discriminates": true}
+{"gamma": "1.0", "max_cross": 0.3936, "mean_cross": 0.1133, "style_adh": 0.3542, "copy_corr": 0.1616, "discriminates": true}
+{"gamma": "2.0", "max_cross": 0.5222, "mean_cross": 0.1145, "style_adh": 0.3796, "copy_corr": 0.2038, "discriminates": true}
+{"gamma": "4.0", "max_cross": 0.3946, "mean_cross": 0.0970, "style_adh": 0.4332, "copy_corr": 0.2357, "discriminates": true}

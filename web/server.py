@@ -87,6 +87,11 @@ SREF_USE_ADAPTER = os.environ.get("IRIS_SREF_ADAPTER", "0").strip().lower() not 
 # Override via IRIS_SREF_SHF / IRIS_SREF_SLF; set BOTH to 1.0 to disable band-control entirely.
 SREF_ROPE_SHF = float(os.environ.get("IRIS_SREF_SHF", "0.0"))
 SREF_ROPE_SLF = float(os.environ.get("IRIS_SREF_SLF", "1.5"))
+# SREF strength bias (SREF-ROPE-PHASE2): an optional reference-attention strength gamma applied on
+# top of band-control (OminiControl B(gamma) — additive log(gamma) on reference-key attention
+# columns; gamma<1 weakens, gamma>1 amplifies the reference's influence). 1.0 = OFF (default);
+# opt-in knob until a swept value is chosen. Override via IRIS_SREF_GAMMA. GPU/Metal path only.
+SREF_STRENGTH_GAMMA = float(os.environ.get("IRIS_SREF_GAMMA", "1.0"))
 # Style-only --sref via content destruction (BACKLOG SREF ARCHITECTURAL RETRAIN, validated 2026-06-30):
 # patch-shuffle a STYLE-mode reference (grid×grid) before the in-context path so its COMPOSITION is
 # destroyed but its texture/palette/rendering style survives. NOW OPT-IN — superseded as the default
@@ -985,10 +990,13 @@ class IrisServer:
             # 1.0/1.0 = off; forwarded only when engaged so the non-style path is byte-identical.
             sref_shf = float(getattr(job, "sref_shf", 1.0))
             sref_slf = float(getattr(job, "sref_slf", 1.0))
+            sref_gamma = float(getattr(job, "sref_gamma", 1.0))
             if sref_shf != 1.0:
                 request_data["sref_shf"] = sref_shf
             if sref_slf != 1.0:
                 request_data["sref_slf"] = sref_slf
+            if sref_gamma != 1.0:
+                request_data["sref_strength"] = sref_gamma
 
             if negative_prompt:
                 request_data["negative_prompt"] = negative_prompt
@@ -1473,6 +1481,7 @@ def generate():
     # Composition-mode refs are left untouched (1.0/1.0 = off) so they still copy layout.
     job.sref_shf = SREF_ROPE_SHF if style_slots else 1.0
     job.sref_slf = SREF_ROPE_SLF if style_slots else 1.0
+    job.sref_gamma = SREF_STRENGTH_GAMMA if style_slots else 1.0
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:

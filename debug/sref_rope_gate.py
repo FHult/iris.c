@@ -16,6 +16,9 @@ One config per invocation → one JSON row on stdout (append to a sweep file). S
       --extra "--sref-shf 0.2 --sref-slf 1.5"            # a band-control cell
   debug/sref_rope_gate.py --label patchshuffle --shuffle-grid 6   # baseline A
   debug/sref_rope_gate.py --label incontext_raw                   # baseline B (no shuffle, no bands)
+
+RUN WITH THE TRAIN VENV: the CSD style encoder is MLX-based, so invoke via
+`train/.venv/bin/python debug/sref_rope_gate.py ...` (web/venv lacks mlx → CSD import fails).
 """
 import argparse, io, json, os, random, shlex, subprocess, sys
 from pathlib import Path
