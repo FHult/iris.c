@@ -1763,6 +1763,30 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   REMAINING (optional polish, not blocking): real in-browser user check that the default now "feels"
   like style transfer; consider an even simpler first-run affordance; the shf/slf/strength/ip-schedule
   knobs remain server-env only (not surfaced), so nothing to hide there.
+
+- 🔴 **SREF-STYLE-CEILING (2026-07-06) — band-control style transfer is STYLE-DEPENDENT: it works for
+  GRAPHIC / high-contrast references but FAILS for PAINTERLY / subtle ones, on BOTH distilled AND
+  4B-base. A mechanism ceiling, not a tuning bug. Corrects the over-optimistic v5.0.0/v5.1.0 framing.**
+  User report: "composition leaks in both cases / no style transfer from defaults." Reproduced visually
+  this session (a baroque portrait ref, prompt "a dog running in a grassy field", seed 7, 512px):
+    • WOODCUT (graphic) ref + band-control (shf0.0/slf1.5) → output dog rendered in clean woodcut
+      linework, composition suppressed. STYLE TRANSFERS. ✓
+    • BAROQUE (painterly) ref → NO setting transfers the painterly rendering: shf0.0 kills composition
+      but yields a GENERIC PHOTO (no style); shf0.5/0.7 brings back a specific composition element (the
+      reference's ruff collar leaks onto the dog) but STILL no painterly style; slf up to 2.0,
+      --sref-strength up to 3.0, and the 4B-BASE model (24-step CFG) ALL still produce a plain photo dog.
+      Old patch-shuffle ALSO fails on painterly.
+  ROOT: in-context conditioning transfers high-contrast/graphic texture (survives the distilled
+  first-step structure commit + the RoPE-band scaling) but not soft painterly rendering / subtle
+  palette. Consistent with the MODEST CSD gate numbers (style_adh ~0.35 = weak style); the gate's
+  amenable refs (woodcut/flat) masked the painterly failure. METRIC CAVEAT: pixel copy_corr AND CSD both
+  under-measured this — reinforces SREF-METRIC-1 (need a real style-vs-composition-leak metric).
+  IMPLICATION: v5.x "training-free style transfer" is real ONLY for bold/graphic reference styles.
+  Painterly / photographic-subtlety style transfer remains UNSOLVED on this stack via in-context
+  methods → needs the deferred learned-encoder / base-adapter architectural work (see
+  SREF-CHAMPION-COLLAPSE). ACTIONS: (a) set UI expectations ("works best with bold/graphic references"),
+  do not over-promise; (b) for painterly, the architectural project is the only path; (c) consider
+  gating/labelling references by "graphic-ness" so users know what will work.
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.
 
