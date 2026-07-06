@@ -62,6 +62,10 @@ This project implements three targets:
 
 # Development Rules
 
+- **Git remotes.** `origin` is **`FHult/iris.c`** — our repository; push branches, tags, and cut
+  GitHub releases here (`gh ... --repo FHult/iris.c`). `upstream` is `antirez/iris.c` (the original
+  project, read-only for us) — never push tags/releases there. There is also a `fork`/`contrib`
+  remote for auxiliary work.
 - **This is macOS (Apple Silicon, BSD userland).** Use BSD-compatible commands, not GNU/Linux-only
   ones: no `setsid` (use `nohup … & disown`); no `ls --time-style` (use `stat -f '%Sm'`); no `pgrep -c`
   (use `pgrep -f … | wc -l`); no GNU `date -d`; use `vm_stat`/`sysctl`/`pmset` not `free`/`/proc`.
