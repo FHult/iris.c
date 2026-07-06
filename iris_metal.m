@@ -4416,6 +4416,20 @@ void iris_metal_set_attention_bias(int ref_start, float bias) {
     g_attn_bias_value     = bias;
 }
 
+/* The SREF strength bias is applied only in the fused custom kernels, which are capped by
+ * threadgroup memory (~7680 keys). When a bias is active but seq_k exceeds that, the biased path
+ * cannot run and the generation falls back to an UNBIASED kernel — warn once so it is not silent
+ * (no-silent-caps rule). Happens only at very high resolution / many references with gamma != 1. */
+static void sref_warn_bias_dropped(int seq_k) {
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "[SREF] --sref-strength bias NOT applied: seq_k=%d exceeds the fused-kernel "
+                        "threadgroup limit (~7680 keys); lower resolution or reference count for it to apply.\n",
+                seq_k);
+    }
+}
+
 int iris_gpu_attention_fused(iris_gpu_tensor_t out,
                              iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
@@ -4437,7 +4451,10 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
      * 32KB threadgroup memory allows up to ~7680 seq_k. */
     NSUInteger scores_size = (NSUInteger)seq_k * sizeof(float);
     NSUInteger static_size = 256 * sizeof(float) * 2; /* shared_max + shared_sum */
-    if (scores_size + static_size > 32768) return 0;  /* Hard limit: 32KB threadgroup */
+    if (scores_size + static_size > 32768) {
+        if (g_attn_bias_value != 0.0f) sref_warn_bias_dropped(seq_k);
+        return 0;  /* Hard limit: 32KB threadgroup */
+    }
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
@@ -5099,6 +5116,7 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
     NSUInteger bf16_scores_size = (NSUInteger)seq_k * sizeof(float);
     NSUInteger bf16_static_size = (256 + 256 + 128) * sizeof(float); /* max/sum/q */
     int custom_kernel_fits = (bf16_scores_size + bf16_static_size <= 32768);
+    if (!custom_kernel_fits && g_attn_bias_value != 0.0f) sref_warn_bias_dropped(seq_k);
 
     if (custom_kernel_fits && g_attention_fused_bf16_pipeline) {
         @autoreleasepool {
