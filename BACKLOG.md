@@ -1785,7 +1785,9 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   Painterly / photographic-subtlety style transfer remains UNSOLVED on this stack via in-context
   methods → needs the deferred learned-encoder / base-adapter architectural work (see
   SREF-CHAMPION-COLLAPSE). ACTIONS: (a) set UI expectations ("works best with bold/graphic references"),
-  do not over-promise; (b) for painterly, the architectural project is the only path; (c) consider
+  do not over-promise; (b) for painterly/semi-real, the learned-encoder project is the only path —
+  PLANNED in `plans/sref-learned-encoder-project.md` (USO-style in-sequence style tokens, base-first
+  training + transfer, gated on a real style metric); (c) consider
   gating/labelling references by "graphic-ness" so users know what will work.
   USER CASE REPRODUCED (2026-07-06, anime glossy food-illustration ref, 720×1280): confirms a THIRD
   regime between graphic-works and painterly-fails — SEMI-REALISTIC illustration transfers SUBTLY: the
