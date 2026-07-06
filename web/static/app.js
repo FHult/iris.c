@@ -1538,34 +1538,43 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateClearAllButton() {
         const hasAnyImage = referenceImageData.some(s => s !== null);
         clearAllImagesBtn.style.display = hasAnyImage ? 'block' : 'none';
+        // Show the global Style/Composition toggle only when at least one reference is present.
+        const modeRow = document.getElementById('ref-mode-global-row');
+        if (modeRow) modeRow.style.display = hasAnyImage ? 'flex' : 'none';
     }
 
-    // Read strength/mode from the slot controls DOM (fallback to defaults)
+    // The reference mode is a single GLOBAL toggle (Style default) shared by all slots — Style routes
+    // through training-free in-context band-control; Composition keeps the reference's layout (img2img).
+    function _globalRefMode() {
+        const el = document.getElementById('ref-mode-global');
+        return el ? el.value : 'style';
+    }
+
+    // Read strength/mode for a slot (strength from the per-slot slider; mode from the global toggle)
     function _slotControls(slot) {
         const slotEl = refSlots[slot];
         const strengthEl = slotEl ? slotEl.querySelector('.ref-strength-slider') : null;
-        const modeEl = slotEl ? slotEl.querySelector('.ref-mode-select') : null;
         return {
             strength: strengthEl ? parseFloat(strengthEl.value) : 0.85,
-            mode: modeEl ? modeEl.value : 'composition',
+            mode: _globalRefMode(),
         };
     }
 
-    // Show or hide the per-slot controls overlay
+    // Show or hide the per-slot controls overlay. The per-slot strength slider only matters for
+    // Composition (img2img); Style uses full-strength in-context band-control, so we hide the slider
+    // in Style mode to keep the default UI simple (advanced knobs live behind the mode switch).
     function _updateSlotControls(slot) {
         const slotEl = refSlots[slot];
         if (!slotEl) return;
         const controls = slotEl.querySelector('.ref-slot-controls');
         if (!controls) return;
-        const hasImage = referenceImageData[slot] !== null;
-        controls.style.display = hasImage ? 'flex' : 'none';
-        if (hasImage) {
+        const showControls = referenceImageData[slot] !== null && _globalRefMode() === 'composition';
+        controls.style.display = showControls ? 'flex' : 'none';
+        if (showControls) {
             const s = referenceImageData[slot];
             const strengthEl = controls.querySelector('.ref-strength-slider');
-            const modeEl = controls.querySelector('.ref-mode-select');
             const labelEl = controls.querySelector('.ref-strength-label');
             if (strengthEl) strengthEl.value = s.strength;
-            if (modeEl) modeEl.value = s.mode;
             if (labelEl) labelEl.textContent = s.strength.toFixed(2);
         }
     }
@@ -1576,7 +1585,7 @@ document.addEventListener('DOMContentLoaded', () => {
         referenceImageData[slot] = {
             dataUrl,
             strength: prev ? prev.strength : 0.85,
-            mode: prev ? prev.mode : 'composition',
+            mode: prev ? prev.mode : _globalRefMode(),
         };
         const preview = refPreviews[slot];
         const clearBtn = refClearBtns[slot];
@@ -1677,10 +1686,22 @@ document.addEventListener('DOMContentLoaded', () => {
         updateClearAllButton();
     }
 
+    // Global reference-mode toggle (Style default). Applies to every slot; Style = in-context
+    // band-control (full strength, no per-slot slider), Composition = img2img (per-slot strength).
+    const globalModeEl = document.getElementById('ref-mode-global');
+    if (globalModeEl) {
+        globalModeEl.addEventListener('change', () => {
+            const mode = globalModeEl.value;
+            for (let i = 0; i < 4; i++) {
+                if (referenceImageData[i]) referenceImageData[i].mode = mode;
+            }
+            renderAllSlots();  // re-applies _updateSlotControls (shows/hides the strength sliders)
+        });
+    }
+
     refSlots.forEach((slotEl, slot) => {
-        // Wire per-slot controls
+        // Wire the per-slot strength slider (Composition only; mode is the global toggle above)
         const strengthEl = slotEl.querySelector('.ref-strength-slider');
-        const modeEl = slotEl.querySelector('.ref-mode-select');
         const labelEl = slotEl.querySelector('.ref-strength-label');
         if (strengthEl) {
             strengthEl.addEventListener('input', (e) => {
@@ -1688,21 +1709,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (referenceImageData[slot]) {
                     referenceImageData[slot].strength = parseFloat(e.target.value);
                     if (labelEl) labelEl.textContent = referenceImageData[slot].strength.toFixed(2);
-                }
-            });
-        }
-        if (modeEl) {
-            modeEl.addEventListener('change', (e) => {
-                e.stopPropagation();
-                if (referenceImageData[slot]) {
-                    referenceImageData[slot].mode = e.target.value;
-                    // Recommended default strength differs by mode: a style reference goes through
-                    // the IP-Adapter, which washes content above ~0.4, so default to the champion
-                    // operating point (0.38); composition (img2img) keeps 0.85.
-                    const def = e.target.value === 'style' ? 0.38 : 0.85;
-                    referenceImageData[slot].strength = def;
-                    if (strengthEl) strengthEl.value = def;
-                    if (labelEl) labelEl.textContent = def.toFixed(2);
                 }
             });
         }

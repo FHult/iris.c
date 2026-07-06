@@ -1753,6 +1753,16 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
   (the CLI band-control gate passes — the gap is UI wiring/defaults, not the mechanism). NOTE: this
   supersedes/soft-blocks Feature 1 (adding a negative-prompt field would add clutter) until the UI is
   simplified. Cross-ref: CHANGELOG v5.0.0/v5.1.0 (band-control + style codes), SREF-ROPE-PHASE1/2.
+  ✅ CORE FIX SHIPPED (2026-07-06): uploaded references now default to STYLE (band-control) so the
+  default path actually transfers style; the 4 per-slot "Comp/Style" dropdowns were replaced by ONE
+  global toggle ("Use as: Style — adopt the look / Composition — keep the layout", Style default,
+  shown only when a reference is present); the per-slot strength slider is now hidden in Style mode
+  (full-strength in-context; only shown for Composition). Verified end-to-end against the running
+  server: default (Style) routes through band-control and is distinct from Composition (corr 0.406,
+  output not a literal reference copy); app.js syntax-clean; no leftover dropdowns.
+  REMAINING (optional polish, not blocking): real in-browser user check that the default now "feels"
+  like style transfer; consider an even simpler first-run affordance; the shf/slf/strength/ip-schedule
+  knobs remain server-env only (not surfaced), so nothing to hide there.
 - [ ] **18. Batch prompt generation** — Submit a list of different prompts to generate in sequence.
 - [ ] **20. Per-job timeout** — Prevent hung generations from blocking the queue forever.
 
