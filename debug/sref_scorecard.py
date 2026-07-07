@@ -146,6 +146,10 @@ def main():
     ap.add_argument("--refs", nargs="*", default=None, help="subset of ref ids (default: all)")
     ap.add_argument("--regen", action="store_true")
     ap.add_argument("--jsonl", default=None)
+    ap.add_argument("--score-only", action="store_true",
+                    help="do NOT render (no C iris) — score PNGs pre-rendered by another path "
+                         "(e.g. debug/sref_infer_style.py, the learned-projector gate). Fails loudly "
+                         "if the expected PNGs are missing.")
     args = ap.parse_args()
 
     import shlex
@@ -156,21 +160,28 @@ def main():
         refs = [r for r in refs if r["id"] in args.refs]
     extra = shlex.split(args.extra)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. no-reference baseline (shared across methods; the reference's effect is measured vs this)
-    base_png = out_dir / f"_baseline_s{seed}.png"
-    if not render(base_png, prompt, seed, args.size, args.steps, args.model, ref=None, regen=args.regen):
-        sys.exit("baseline render failed")
-
-    # 2. one render per reference with the method's flags
     md = out_dir / args.label; md.mkdir(exist_ok=True)
-    rendered = []
-    for r in refs:
-        op = md / f"{r['id']}.png"
-        if render(op, prompt, seed, args.size, args.steps, args.model, ref=r["path"], extra=extra, regen=args.regen):
-            rendered.append((r, op))
-    if not rendered:
-        sys.exit("no renders")
+    base_png = out_dir / f"_baseline_s{seed}.png"
+
+    if args.score_only:
+        # score PNGs already rendered by an external path (the learned rail isn't in the C binary yet)
+        if not base_png.exists():
+            sys.exit(f"--score-only: missing baseline {base_png} (run debug/sref_infer_style.py first)")
+        rendered = [(r, md / f"{r['id']}.png") for r in refs if (md / f"{r['id']}.png").exists()]
+        if not rendered:
+            sys.exit(f"--score-only: no per-ref PNGs under {md} (run debug/sref_infer_style.py first)")
+    else:
+        # 1. no-reference baseline (shared across methods; the reference's effect is measured vs this)
+        if not render(base_png, prompt, seed, args.size, args.steps, args.model, ref=None, regen=args.regen):
+            sys.exit("baseline render failed")
+        # 2. one render per reference with the method's flags
+        rendered = []
+        for r in refs:
+            op = md / f"{r['id']}.png"
+            if render(op, prompt, seed, args.size, args.steps, args.model, ref=r["path"], extra=extra, regen=args.regen):
+                rendered.append((r, op))
+        if not rendered:
+            sys.exit("no renders")
 
     # 3. score
     M = Metrics()
