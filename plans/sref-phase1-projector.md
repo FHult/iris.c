@@ -21,10 +21,17 @@ gate it with `debug/sref_scorecard.py`. Written so a fresh session can execute i
   DiT frozen, full backprop with gradient checkpointing; reuses `make_prefetch_loader` + VAE-Q1 BN-pack +
   augment; LR warmup+cosine, null-style CFG dropout, projector safetensors checkpoints. `--smoke`
   synthetic mode verified the full loop + checkpointing end-to-end (loads, trains, saves a 408 MB ckpt).
-- 🔴 **BLOCKED — real training run needs staged HOT-SSD data.** The shards + siglip/vae/qwen3 caches are
-  not currently staged (`/Volumes/2TBSSD/embeddings` empty). Staging is the data-prep/pipeline track (a
-  substantial separate effort). Once staged: fill `sref_projector_v1.yaml` `data.*`, run with `--config`,
-  gate checkpoints with `debug/sref_scorecard.py` (kill on collapse; painterly must beat 0.009).
+- ✅ **REAL-DATA path CONFIRMED (correction: the data was already staged).** ~522k samples precomputed +
+  hot (siglip v_336c6e / vae v_2232c1 / qwen3 v_059443), a hot shard pool (`/Volumes/2TBSSD/
+  baseline_pool_hot`, 22 tars incl. the 18 style-subset shards), a style look-pairing DB
+  (`sref_eval/style_cache/neighbors.sqlite`, 101,771 records w/ neighbors). `sref_projector_v1.yaml`
+  cribs the working `sref_eval/style_arm/config.yaml` recipe. A 120-step run on the 4B base ran clean
+  end-to-end (loader + VAE-Q1 BN-pack + look-paired neighbors + frozen-DiT forward + backprop to the
+  projector), no NaN, checkpoint saved (`/Volumes/2TBSSD/checkpoints/sref_projector/`). ~0.17 it/s → the
+  full 4000-step run ≈ 6.5 h (unattended/caffeinated).
+- ⬜ REMAINING: (1) the full training run; (2) a Python INFERENCE harness (projector → style tokens →
+  `flux_forward_style` at inference → VAE decode) so `debug/sref_scorecard.py` can GATE checkpoints
+  (kill on collapse; painterly styleCSD Δ must beat band-control's 0.009). Then Stage 2 (add DiT LoRA).
 
 ## Architecture decision (settled)
 Train with **full backprop through the frozen DiT** — NOT the IP-adapter trainer's Q-caching trick
