@@ -1,0 +1,27 @@
+# SREF Phase-1 Stage-1 — learned in-sequence style projector (plans/sref-phase1-projector.md).
+# Trains ONLY the StyleProjector; the DiT is frozen. Train on the 4B BASE (steerable).
+# REQUIRES staged HOT-SSD data (shards + siglip/vae/qwen3 caches) — the run is blocked until the
+# data-prep/pipeline track stages it. NEVER point at cold storage (/Volumes/16TBCold) — CLAUDE.md.
+model:
+  flux_model_dir: flux-klein-4b-base        # 4B base (higher style ceiling; not distilled)
+adapter:
+  num_style_tokens: 192                       # USO-scale; sequence cost ~+19% at 1024-token image
+data:
+  batch_size: 1
+  bucket: [512, 512]                          # pinned single bucket (VAE-Q1 precompute contract)
+  shard_paths: []                             # TODO: hot-SSD shard tars (staged) — e.g. /Volumes/2TBSSD/shards/*.tar
+  siglip_cache_dir: /Volumes/2TBSSD/precomputed/siglip   # TODO: staged SigLIP features (.npz)
+  vae_cache_dir:    /Volumes/2TBSSD/precomputed/vae       # TODO: staged VAE latents (.npz)
+  qwen3_cache_dir:  /Volumes/2TBSSD/precomputed/qwen3     # TODO: staged Qwen3 text embeds
+  style_neighbors_db: /Volumes/2TBSSD/neighbors_look.sqlite  # look-paired, content-decorrelated pairs
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 200
+  num_steps: 4000
+  null_style_prob: 0.1                         # CFG dropout: zero SigLIP on ~10% of batches
+  grad_clip: 1.0
+  weight_decay: 0.01
+  checkpoint_every: 500
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_projector
+  guidance: 3.5                                # 4B base CFG guidance during training

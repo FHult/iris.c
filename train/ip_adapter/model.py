@@ -110,6 +110,11 @@ class StyleProjector(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn_in = nn.Linear(hidden_dim, ffn_mult * hidden_dim, bias=True)
         self.ffn_out = nn.Linear(ffn_mult * hidden_dim, hidden_dim, bias=True)
+        # Zero-init the residual FFN output so the module starts as tokens = norm1(cross_attn(...))
+        # (still reference-discriminating), and the capacity FFN grows in during training — a
+        # standard stability trick that tames the first-step gradient spike.
+        self.ffn_out.weight = mx.zeros_like(self.ffn_out.weight)
+        self.ffn_out.bias = mx.zeros_like(self.ffn_out.bias)
         self.norm2 = nn.LayerNorm(hidden_dim)
         # per-dim SigLIP standardization across the token axis (IP-ADAPTER-INFER-1 fix)
         self.in_gamma = mx.ones((siglip_dim,))
