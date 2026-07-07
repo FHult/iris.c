@@ -15,7 +15,16 @@ gate it with `debug/sref_scorecard.py`. Written so a fresh session can execute i
   → gradients reach the projector THROUGH the frozen DiT (the whole premise works), no NaN. The
   in-sequence forward (`flux_forward_style` = `flux_forward_lora` + style concat + extended text RoPE) is
   correct. Note: gnorm spiked at step 0 (~400) then went tiny — tune projector init / LR / warmup for
-  the real run. ⬜ Real data loader + training run on the 4B base + scorecard gate — the work below.
+  the real run.
+- ✅ **Stage-1 trainer code-complete + verified** — `train/train_style_projector.py` (+ shared
+  `train/lora/style_step.py`, config `train/configs/sref_projector_v1.yaml`). Projector-only trainable,
+  DiT frozen, full backprop with gradient checkpointing; reuses `make_prefetch_loader` + VAE-Q1 BN-pack +
+  augment; LR warmup+cosine, null-style CFG dropout, projector safetensors checkpoints. `--smoke`
+  synthetic mode verified the full loop + checkpointing end-to-end (loads, trains, saves a 408 MB ckpt).
+- 🔴 **BLOCKED — real training run needs staged HOT-SSD data.** The shards + siglip/vae/qwen3 caches are
+  not currently staged (`/Volumes/2TBSSD/embeddings` empty). Staging is the data-prep/pipeline track (a
+  substantial separate effort). Once staged: fill `sref_projector_v1.yaml` `data.*`, run with `--config`,
+  gate checkpoints with `debug/sref_scorecard.py` (kill on collapse; painterly must beat 0.009).
 
 ## Architecture decision (settled)
 Train with **full backprop through the frozen DiT** — NOT the IP-adapter trainer's Q-caching trick
