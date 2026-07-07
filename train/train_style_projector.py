@@ -135,9 +135,15 @@ def main():
             while True:
                 yield fixed, text, sig
     else:
-        from ip_adapter.dataset import make_prefetch_loader, augment_mlx
+        import glob as _glob
+        from ip_adapter.dataset import make_prefetch_loader
+        shard_paths = dcfg.get("shard_paths") or sorted(
+            _glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
+        if not shard_paths:
+            sys.exit(f"no .tar shards under {dcfg.get('shard_path')}")
+        print(f"  {len(shard_paths)} shard tars (hot); caches: siglip/vae/qwen3", flush=True)
         loader = make_prefetch_loader(
-            shard_paths=dcfg["shard_paths"], batch_size=B,
+            shard_paths=shard_paths, batch_size=B,
             text_dropout_prob=tcfg.get("text_dropout_prob", 0.0),
             qwen3_cache_dir=dcfg.get("qwen3_cache_dir"), vae_cache_dir=dcfg.get("vae_cache_dir"),
             siglip_cache_dir=dcfg.get("siglip_cache_dir"), bucket=bucket,
