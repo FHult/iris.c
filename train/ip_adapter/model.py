@@ -78,6 +78,59 @@ class PerceiverResampler(nn.Module):
         return self.norm(out)  # [B, 128, 3072]
 
 
+class StyleProjector(nn.Module):
+    """SREF Phase-1 (plans/sref-learned-encoder-project.md) — the LEARNED-ENCODER rail.
+
+    Maps SigLIP patch features → `num_style_tokens` style tokens that are CONCATENATED INTO THE
+    TRANSFORMER SEQUENCE (like extra context/text tokens), NOT injected into attention K/V. The
+    K/V side-channel is exactly what mode-collapsed (SREF-CHAMPION-COLLAPSE); the sequence path is
+    the only mechanism validated on Flux DiTs (USO, arXiv 2508.18966). The trainer gives these
+    tokens text-like (non-spatial) RoPE ids so they contribute APPEARANCE, not layout.
+
+    Learned queries cross-attend to the 729 SigLIP PATCH tokens (per-patch, not pooled) + a small
+    FFN for capacity. Reuses the per-dim SigLIP input standardization that fixed the massive-
+    activation pooling collapse (IP-ADAPTER-INFER-1). Only this module trains; the DiT is frozen.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 3072,
+        num_heads: int = 24,
+        num_style_tokens: int = 192,
+        siglip_dim: int = 1152,
+        ffn_mult: int = 4,
+    ):
+        super().__init__()
+        self.num_style_tokens = num_style_tokens
+        self.hidden_dim = hidden_dim
+        self.query_tokens = mx.random.normal((num_style_tokens, hidden_dim)) * 0.02
+        self.cross_attn = nn.MultiHeadAttention(
+            dims=hidden_dim, num_heads=num_heads, key_input_dims=siglip_dim, bias=False
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ffn_in = nn.Linear(hidden_dim, ffn_mult * hidden_dim, bias=True)
+        self.ffn_out = nn.Linear(ffn_mult * hidden_dim, hidden_dim, bias=True)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        # per-dim SigLIP standardization across the token axis (IP-ADAPTER-INFER-1 fix)
+        self.in_gamma = mx.ones((siglip_dim,))
+        self.in_beta = mx.zeros((siglip_dim,))
+
+    def _norm_input(self, f: mx.array) -> mx.array:
+        mean = f.mean(axis=1, keepdims=True)
+        var = f.var(axis=1, keepdims=True)
+        f = (f - mean) * mx.rsqrt(var + 1e-5)
+        return f * self.in_gamma + self.in_beta
+
+    def __call__(self, siglip_features: mx.array) -> mx.array:
+        # siglip_features: [B, 729, siglip_dim] → [B, num_style_tokens, hidden_dim]
+        B = siglip_features.shape[0]
+        f = self._norm_input(siglip_features)
+        q = mx.broadcast_to(self.query_tokens[None], (B,) + self.query_tokens.shape)
+        x = self.norm1(self.cross_attn(q, f, f))           # [B, T, hidden]
+        h = self.ffn_out(nn.gelu(self.ffn_in(x)))          # capacity FFN, residual
+        return self.norm2(x + h)                           # [B, num_style_tokens, hidden]
+
+
 class CSDImageProj(nn.Module):
     """
     Content-invariant conditioning (SREF-LEAK-1 structural fix): a single CSD style

@@ -1,6 +1,15 @@
 # SREF Learned-Encoder / Base-Adapter — Project Plan (the "strong style transfer" project)
 
-Status: **PROPOSED / not started.** The larger future project to achieve *strong* reference-style
+Status (2026-07-07): **Phase 0 DONE, Phase 1 STARTED.**
+- Phase 0 ✅ — scorecard (`debug/sref_scorecard.py`) + frozen eval set (`debug/sref_eval_set.json`).
+  Full band-control baseline (the target to beat): **styleCSD Δ graphic 0.096 / painterly 0.009 /
+  semi_real 0.121** — the ceiling, now measured.
+- Phase 1 🔨 — `StyleProjector` implemented + smoke-tested (`train/ip_adapter/model.py`; discriminates
+  refs at init, no collapse). Trainer path + exact injection point settled in
+  `plans/sref-phase1-projector.md`. Remaining: trainer script + smoke overfit + training run + gate.
+- Phases 2–4 (DiT LoRA / base-train+transfer / reward) not started; M5-gated.
+
+The larger future project to achieve *strong* reference-style
 transfer — including the painterly and semi-realistic references that the shipped training-free
 band-control rail cannot handle (BACKLOG **SREF-STYLE-CEILING**). Self-contained; written to be
 executed by a fresh session and to survive the hardware gate.
