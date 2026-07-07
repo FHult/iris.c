@@ -10,7 +10,12 @@ gate it with `debug/sref_scorecard.py`. Written so a fresh session can execute i
   tokens (off-diag 0.03) — i.e. no collapse at init. Maps SigLIP `[B,729,1152]` → `[B,192,3072]`.
 - ✅ **Phase-0 gate ready** — scorecard + frozen eval set; band-control baseline to beat:
   **styleCSD Δ graphic 0.096 / painterly 0.009 / semi_real 0.121** (`debug/sref_eval_set.json`).
-- ⬜ Trainer + smoke overfit + training run + gate — **the work below.**
+- ✅ **Mechanics smoke PASSED** — `train/lora/smoke_style.py`: overfit a batch with the projector as
+  the only trainable module, DiT frozen. Loss 0.75→0.30, projector query_tokens updated (max |Δ| 0.126)
+  → gradients reach the projector THROUGH the frozen DiT (the whole premise works), no NaN. The
+  in-sequence forward (`flux_forward_style` = `flux_forward_lora` + style concat + extended text RoPE) is
+  correct. Note: gnorm spiked at step 0 (~400) then went tiny — tune projector init / LR / warmup for
+  the real run. ⬜ Real data loader + training run on the 4B base + scorecard gate — the work below.
 
 ## Architecture decision (settled)
 Train with **full backprop through the frozen DiT** — NOT the IP-adapter trainer's Q-caching trick
