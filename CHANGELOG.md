@@ -4,7 +4,37 @@ All notable, user-facing changes to iris.c. Newest first.
 
 ---
 
-## Unreleased
+## v5.2.0 — Style-transfer UX + SREF research foundations
+
+### What's new (user-facing) — web UI
+
+- **References default to Style mode.** Uploading a reference now conditions on its *style* by default
+  (previously composition), and a single global **Composition / Style** toggle replaces the confusing
+  per-slot dropdowns. Directly fixes the "too many options / no style transfer from the defaults" report.
+- **Expectation-setting hint** under the toggle: training-free band-control style transfer works best
+  with **bold, graphic** references (line-art, flat illustration, high-contrast); painterly and
+  photographic references transfer only weakly (see `SREF-STYLE-CEILING`).
+
+No C/inference changes — the `iris` binary is unchanged from v5.1.0.
+
+### Under the hood — SREF research (no shipped generation change)
+
+Groundwork toward *strong* style transfer for the painterly / semi-real references band-control cannot do:
+
+- **A real style-transfer metric** — `debug/sref_scorecard.py` + a frozen eval set that separates style
+  adherence, composition leak, and prompt adherence **per reference type**. The gate every prior effort
+  lacked (a single mean had hidden the painterly failure).
+- **Learned in-sequence style encoder — investigated and ruled out on this stack.** A USO-style
+  SigLIP→style-token projector (with and without a jointly-trained DiT LoRA) does not bind style through
+  the frozen Flux backbone — three decisive negatives, root cause and probes documented in BACKLOG
+  `SREF-LEARNED-STAGE1`.
+- **Retrieval-hybrid instant-LoRA — the new direction, Phase 0 validated.** A per-style LoRA *does*
+  impart painterly style (the first mechanism on this stack to do so); the remaining work is
+  data/cluster curation. Scoped in `plans/sref-retrieval-hybrid-project.md`.
+
+---
+
+## v5.1.0 — Saved style codes on the band-control rail
 
 ### Saved style codes on the band-control rail (web UI)
 
