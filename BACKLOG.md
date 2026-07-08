@@ -328,8 +328,28 @@ steps, diverse data where the average escape can't win) independently landed nea
 read: the in-sequence style→output path is HIGH-RESISTANCE on Flux.2 Klein; the LoRA improved the base
 denoiser instead of routing SigLIP. A cleaner (unconfounded) cheap test = 2 distinct style clusters + same
 prompt (average becomes high-loss → SigLIP required). Artifacts: `…/learned_encoder_stage1/stage2_probe*`.
-DECISION (open): fall back to retrieval-hybrid instant-LoRA (plan's designated fallback; reuses the WORKING
-per-style LoRA + CSD index) / one clean 2-cluster forced-binding probe (~2–3h) / commit to full Stage-2.
+CLEAN 2-CLUSTER PROBE (2026-07-08, `--two-cluster`, the UNCONFOUNDED test): CSD-clustered a 16-pool into
+2 style groups (cross-cluster CSD dist 0.87) so the average is a muddy high-loss blend → SigLIP is REQUIRED
+to fit both. 8 samples, rank-16 LoRA + projector, 300 steps. Result **DECISIVE KILL**: overfit loss
+0.445→0.127 (below the muddy-average floor) BUT swap routing gap = **within-cluster corr 0.9975 vs
+cross-cluster 0.9976 = −0.0001** (zero style routing) and CSD dominance 1/8 = chance. Outputs are identical
+regardless of which reference's SigLIP is fed, even with the escape closed.
+ROOT CAUSE (the durable learning): in flow-matching the model input IS a noised version of the TARGET, so
+at low-to-mid noise it reconstructs each target from the input alone and NEVER needs the style tokens; the
+conditioning is only forced at high noise, and that weak signal is never learned on this stack (4B, our
+compute, in-sequence tokens). The loss-drop to 0.127 came from denoising the input latent, NOT from routing
+SigLIP — the swap test (starts from PURE noise) exposes it. Explains ALL THREE negatives: Stage-1
+(projector-only 4000 steps, near-inert), Probe A (LoRA fixed-prompt, corr 0.9996), Probe B (LoRA 2-cluster,
+gap 0.000). Also explains WHY the shipped IN-CONTEXT path works (the VAE reference tokens ARE the actual
+image content in the sequence — high-information, impossible to ignore) while a LEARNED abstracted style
+token is never weighted. Both learned-adapter families have now failed on this stack: K/V injection
+(collapsed, SREF-CHAMPION-COLLAPSE) AND in-sequence tokens (never bind, here). USO succeeded on FULL dev
+(50-step, far larger model + reward learning) — out of our compute budget.
+**DECISION: KILL the learned-encoder Stage-1/2 direction as tested; fall back to the RETRIEVAL-HYBRID
+instant-LoRA path** (CSD-nearest trained per-style LoRA + interpolation — reuses the two things that DO work
+here: per-style LoRA weight-space training + the CSD style index). Full Stage-2 (M5, bigger LoRA, reward
+learning) is not worth the ~2-day/M5 spend against three negatives. Artifacts:
+`…/learned_encoder_stage1/stage2_probe_2cluster*`. Probe tool retained: `train/lora/probe_style_lora.py`.
 
 ### SESSION INSIGHTS — 2026-06-20 (direct-trainer dataset experiments; read first)
 - **[PARTLY SUPERSEDED — see "NULL-FLOOR REFRAME" below.]** Earlier read: "no adapter
