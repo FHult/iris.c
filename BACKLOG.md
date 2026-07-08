@@ -281,6 +281,40 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🔴 SREF-LEARNED-STAGE1 (2026-07-08) — projector-only (frozen DiT) does NOT transfer style. Stage-2 DiT LoRA is the gate.
+Ran the full Phase-1 Stage-1 of the learned-encoder project (`plans/sref-learned-encoder-project.md`):
+`StyleProjector` (SigLIP→192 in-sequence style tokens, TEXT|STYLE|IMAGE, text-like RoPE), DiT FROZEN,
+4000 steps on the 4B base (`train/train_style_projector.py` + `sref_projector_v1.yaml`, look-paired data,
+loss 0.71→~0.4, clean). Gated the step-4000 checkpoint with the new Python harness
+(`debug/sref_infer_style.py` → renders eval set → `sref_scorecard.py --score-only`), 24-step base renders,
+seed 7, prompt "a robot standing in a desert":
+  • styleCSD Δ: graphic **0.0069**, painterly **0.0033**, semi_real **−0.0057** (OVERALL 0.0041).
+    styleGram Δ **0.00000** everywhere. Band-control (the bar to beat): graphic 0.096 / painterly 0.009.
+    → Does NOT beat band-control on ANY type; painterly ~1/3 of the (already-weak) band-control number.
+  • Renders are COHERENT (std 43 vs baseline 43 — NOT washed out, so the single-forward guidance-embed
+    base regime is valid; the CFG concern is ruled out). But every ref moves the output only ~2.5%
+    (L1 6.3/255) and by nearly the SAME amount for every reference → style tokens near-inert.
+  • Cross-ref output pixel corr 0.98 (heuristic collapse metric fired ≥0.90 — but pixel corr conflates
+    seed-fixed LAYOUT with style, so the scorecard styleCSD/Gram Δ is the real verdict, and it's ~0).
+INTERPRETATION: NOT the same as SREF-CHAMPION-COLLAPSE (that was a reference-INDEPENDENT constant,
+to_v_ip rank ~6). Here the tokens carry a FAINT reference-dependent signal (styleCSD Δ preserves the
+graphic>painterly>semi_real difficulty ordering; cross-ref corr 0.98 not 1.00) — just far too weak to
+matter. Most consistent with the **frozen DiT having no pathway to convert in-sequence style tokens into
+style**: with the backbone frozen, the flow-matching loss is minimized by near-inert tokens (the trivial
+solution). This is exactly what the plan's **Stage 2 (DiT LoRA r128, trained jointly)** exists to fix,
+and matches USO's finding that the LoRA stage delivers the real style transfer (projector-alone is weak).
+DECISION (open, needs user): Stage 2 is the real style-transfer mechanism but is **M5-gated** (base+LoRA
+training, ~2-day M1 run / 128 GB). Options: (a) cheap Stage-2 PROBE — inject a small LoRA into the style
+forward and overfit ~8 eval refs a few hundred steps to confirm the capacity hypothesis before committing;
+(b) full Stage 2; (c) fall back to the **retrieval-hybrid instant-LoRA** path (CSD-nearest trained per-style
+LoRA + interpolation — reuses the WORKING per-style LoRA + CSD index, no collapse risk). Artifacts: `/Volumes/2TBSSD/sref_eval/learned_encoder_stage1/` (scorecard json + 12 renders),
+checkpoints `/Volumes/2TBSSD/checkpoints/sref_projector/`.
+TRAJECTORY (step-2000 vs 4000, done): OVERALL styleCSD Δ 0.0028 vs 0.0041; painterly 0.0069 vs 0.0033;
+graphic −0.0008 vs 0.0069 — all sub-0.01 NOISE around zero, no strong-then-collapsed arc. → **flat
+plateau, NOT collapse-over-training**. Supports the capacity-limit reading (projector never learned style
+through the frozen backbone; no collapse dynamics) → Stage-2 DiT LoRA is the right thing to test, and a
+cheap overfit probe is well-motivated before a full run.
+
 ### SESSION INSIGHTS — 2026-06-20 (direct-trainer dataset experiments; read first)
 - **[PARTLY SUPERSEDED — see "NULL-FLOOR REFRAME" below.]** Earlier read: "no adapter
   transfers style — all NEGATIVE sref_score (style_sim ~0.02–0.10 < content_leak ~0.35–0.47)."
