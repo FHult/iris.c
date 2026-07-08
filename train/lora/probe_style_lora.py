@@ -81,6 +81,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--n", type=int, default=8, help="# samples to overfit")
+    ap.add_argument("--two-cluster", action="store_true",
+                    help="pick N samples as 2 stylistically-distinct clusters (CSD) so the 'predict the "
+                         "average' escape is high-loss and SigLIP is REQUIRED — the unconfounded probe.")
+    ap.add_argument("--pool", type=int, default=16, help="candidate pool to CSD-cluster (two-cluster mode)")
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -123,6 +127,7 @@ def main():
         siglip_cache_dir=dcfg.get("siglip_cache_dir"), bucket=bucket,
         style_neighbors_db=dcfg.get("style_neighbors_db"), cond_mode="siglip", seed=dcfg.get("seed"))
     print("  loader created; collecting samples ...", flush=True)
+    n_collect = args.pool if args.two_cluster else args.n
     samples = []
     for images_np, captions, text_np, vae_np, siglip_np, style_ref_np, bhw, ids in loader:
         if vae_np is None or siglip_np is None:
@@ -131,9 +136,33 @@ def main():
         sig = mx.array(siglip_np, dtype=mx.bfloat16)
         mx.eval(lat, sig)
         samples.append((lat, sig))
-        if len(samples) >= args.n:
+        if len(samples) >= n_collect:
             break
-    print(f"  cached {len(samples)} samples (empty-text overfit)", flush=True)
+
+    labels = None
+    if args.two_cluster:
+        # CSD-cluster the pool into 2 stylistically-distinct groups of n//2, so their AVERAGE is a muddy
+        # high-loss blend → the model must read SigLIP to tell the clusters apart (closes the average escape).
+        from style_encoder.csd_mlx import CSDStyleEncoder, preprocess
+        from PIL import Image
+        enc = CSDStyleEncoder("/Volumes/2TBSSD/models/csd_vit_l_style.safetensors")
+        vecs = []
+        for lat, _ in samples:
+            img = _decode_latents(flux.vae, _bn_unpack(lat, bn_m, bn_s).astype(mx.bfloat16))
+            vecs.append(np.asarray(enc.encode(np.stack([preprocess(Image.fromarray(img).resize((512, 512)))])))[0])
+            mx.clear_cache()
+        V = np.stack(vecs)                                   # [pool, 768] L2-normalised
+        D = 1.0 - V @ V.T                                    # cosine distance
+        i0, j0 = np.unravel_index(np.argmax(D), D.shape)     # two farthest = cluster seeds
+        half = args.n // 2
+        a = list(np.argsort(D[i0])[:half])                   # nearest to seed A (incl i0)
+        b = [k for k in np.argsort(D[j0]) if k not in a][:half]
+        idx = a + b
+        samples = [samples[k] for k in idx]
+        labels = [0] * len(a) + [1] * len(b)
+        sep = float(np.mean([1.0 - float(V[p] @ V[q]) for p in a for q in b]))   # mean cross-cluster CSD dist
+        print(f"  2 CSD clusters of {half} (cross-cluster CSD dist {sep:.3f}; bigger=more distinct)", flush=True)
+    print(f"  {len(samples)} samples cached (fixed-prompt overfit)", flush=True)
 
     ckpt_d, ckpt_s = make_ckpt_blocks(flux)
     opt = optim.AdamW(learning_rate=args.lr, weight_decay=0.0)
@@ -203,14 +232,34 @@ def main():
     print(f"swap output corr:       mean off-diag {offdiag.mean():.4f}  max {offdiag.max():.4f}  "
           f"(Stage-1 frozen-DiT baseline: ~0.98)")
     print(f"style binding:          {csd_note}")
-    diverged = offdiag.mean() < 0.90
-    bind = (diag_wins is not None and diag_wins > max(1, n // 4))
-    if diverged and bind:
-        verdict = "GREENLIGHT — the LoRA makes in-sequence style tokens CAUSAL and style-binding; run full Stage 2."
-    elif diverged:
-        verdict = "PARTIAL — outputs diverge (tokens are causal) but style-binding is weak; Stage 2 plausible, watch disentanglement."
+
+    if labels is not None:
+        # 2-cluster decisive signal: if SigLIP routes style, swap outputs CLUSTER by style — within-cluster
+        # pairs more similar than cross-cluster pairs. Inert ⇒ within ≈ cross ≈ ~0.99.
+        within = [_corr(outs[i], outs[j]) for i in range(n) for j in range(i + 1, n) if labels[i] == labels[j]]
+        cross = [_corr(outs[i], outs[j]) for i in range(n) for j in range(i + 1, n) if labels[i] != labels[j]]
+        wmean, cmean = float(np.mean(within)), float(np.mean(cross))
+        gap = wmean - cmean
+        print(f"cluster routing:        within-cluster corr {wmean:.4f}  cross-cluster corr {cmean:.4f}  "
+              f"gap {gap:+.4f}  (gap > ~0.02 = SigLIP routes style)")
+        if gap > 0.02 and cmean < 0.97:
+            verdict = ("GREENLIGHT — swap outputs CLUSTER BY STYLE (within>cross); the LoRA makes in-sequence "
+                       "tokens route style. Run full Stage 2.")
+        elif gap > 0.005:
+            verdict = ("PARTIAL — weak but present clustering (gap {:+.4f}); Stage 2 plausible but marginal. "
+                       "Consider more steps/rank before a full commit.".format(gap))
+        else:
+            verdict = ("KILL — no style routing even with the average-escape closed (within≈cross≈inert). "
+                       "In-sequence+LoRA does not bind style on this stack. Fall back to retrieval-hybrid.")
     else:
-        verdict = "KILL — outputs stay inert even with a LoRA (corr ~Stage-1); in-sequence+LoRA does not bind. Fall back to retrieval-hybrid."
+        diverged = offdiag.mean() < 0.90
+        bind = (diag_wins is not None and diag_wins > max(1, n // 4))
+        if diverged and bind:
+            verdict = "GREENLIGHT — the LoRA makes in-sequence style tokens CAUSAL and style-binding; run full Stage 2."
+        elif diverged:
+            verdict = "PARTIAL — outputs diverge (tokens are causal) but style-binding is weak; Stage 2 plausible, watch disentanglement."
+        else:
+            verdict = "KILL — outputs stay inert even with a LoRA (corr ~Stage-1); in-sequence+LoRA does not bind. Fall back to retrieval-hybrid."
     print(f"VERDICT: {verdict}")
     print(f"renders in {args.out_dir}", flush=True)
 
