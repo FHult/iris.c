@@ -1,0 +1,25 @@
+# SREF retrieval-hybrid Phase 0 — cluster-tightness A/B. Identical to lora_painterly_v1.yaml EXCEPT the
+# record_allowlist points at the TIGHTER top-100 impressionism cluster (mean cos 0.53 vs 0.45 at N=250).
+# Isolates cluster tightness as the variable: does a tighter cluster transfer the SPECIFIC style better?
+model:
+  flux_model_dir: flux-klein-model
+adapter:
+  rank: 16
+  alpha: 16
+data:
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot
+  vae_cache_dir: /Volumes/2TBSSD/precomputed/vae/v_2232c1
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443
+  bucket: [512, 512]
+  batch_size: 1
+  seed: 42
+  record_allowlist: /Volumes/2TBSSD/sref_eval/lora_painterly_tight_subset.json
+training:
+  num_steps: 400
+  learning_rate: 1.5e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mlx_memory_pct: 0.6
+  ema_decay: 0.9999
+  ema_update_every: 10
+  checkpoint_every: 200

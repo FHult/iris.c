@@ -13,10 +13,20 @@ styleCSD Δ vs the impressionism ref = +0.011 @ scale1.0 (edges band-control's 0
 is PAINTERLY-SPARSE (per-ref top-50 CSD cos only 0.53–0.59 for ALL painterly styles), so "250 nearest
 impressionism" was a grab-bag of digital art averaging to a generic painterly look — the LoRA faithfully
 learned its cluster; the cluster wasn't impressionism. → **The bottleneck is CLUSTER QUALITY / DATA, not
-the mechanism** (vindicates the "style-compute more/art-rich shards" instinct). NEXT: (a) cheap — tighten
-the cluster (top-50–100, higher cos) and re-gate; (b) CSD-index art-rich shards (WikiArt) for DENSE,
-specific style clusters. Montage artifact of the result exists. The mechanism go/no-go is GREEN; the
-project is now a data-curation problem.
+the mechanism** (vindicates the "style-compute more/art-rich shards" instinct). Montage artifact of the
+result exists. The mechanism go/no-go is GREEN; the project is now a data-curation problem.
+
+**CLUSTER-TIGHTNESS A/B (2026-07-08, done):** retrained the SAME LoRA on a TIGHTER top-100 cluster
+(mean cos 0.53 vs 0.45), everything else identical (`lora_painterly_tight_v1.yaml`,
+`…_tight_subset.json`). Re-gated impressionism at scales 1.0/1.5/2.0. Result: styleCSD Δ **+0.0038 @1.0 /
+−0.051 @1.5 / −0.024 @2.0** — NO improvement over loose (+0.0114 / −0.040); if anything slightly LOWER,
+and the ×2.0 image is *less* painterly (near-photoreal). CONCLUSION: **within-pool tightening is NOT the
+lever.** You cannot select your way to an impressionism cluster that isn't in the pool — the 22
+photo-heavy shards are painterly-sparse, so "nearest impressionism" = bluish landscape photos, and a
+tighter selection just picks more of those. → **The lever is BROADER, ART-RICH DATA.** NEXT (the real
+Phase-1): CSD-index art-rich shards (WikiArt especially; more of the corpus) to find DENSE, genuinely
+specific style clusters, then stage+precompute the selected clusters and train library LoRAs from them
+(the never-train-from-cold cost the user already flagged). Within-pool selection knobs are exhausted.
 
 Original proposal below.
 
