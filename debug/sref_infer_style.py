@@ -32,7 +32,7 @@ NOTE (guidance): training passes `guidance` into tr.time_guidance_embed and runs
 harness does the same for train↔infer consistency. If base renders look washed out, revisit true CFG
 (two forwards) — but then the trainer must match. Logged as an open question in plans/sref-phase1-projector.md.
 """
-import argparse, json, sys, os, time
+import argparse, io, json, sys, os, time
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -85,7 +85,15 @@ class _Siglip:
 
     def feats(self, image_path):
         raw = Path(image_path).read_bytes()
-        img = self._pre(raw)                       # [1,3,384,384] f32
+        try:
+            img = self._pre(raw)                   # JPEG path (TurboJPEG) — exact precompute parity
+        except OSError:
+            # non-JPEG eval refs (e.g. PNG): TurboJPEG rejects them; decode with PIL and apply the
+            # IDENTICAL resize + SigLIP normalize as _preprocess_siglip so features still match.
+            from precompute_all import _resize, SIGLIP_IMAGE_SIZE, _SIGLIP_MEAN, _SIGLIP_STD
+            arr = _resize(np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8),
+                          SIGLIP_IMAGE_SIZE)
+            img = ((arr.astype(np.float32) / 255.0 - _SIGLIP_MEAN) / _SIGLIP_STD).transpose(2, 0, 1)[None]
         t = self._torch
         with t.no_grad():
             out = self._m(pixel_values=t.from_numpy(img).to(self._dev))
