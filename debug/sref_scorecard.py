@@ -150,6 +150,9 @@ def main():
                     help="do NOT render (no C iris) — score PNGs pre-rendered by another path "
                          "(e.g. debug/sref_infer_style.py, the learned-projector gate). Fails loudly "
                          "if the expected PNGs are missing.")
+    ap.add_argument("--no-input-ref", action="store_true",
+                    help="render WITHOUT -i (method style is in the flags, e.g. --lora), scoring the "
+                         "output against each ref. For the retrieval-hybrid per-style LoRA gate.")
     args = ap.parse_args()
 
     import shlex
@@ -174,11 +177,14 @@ def main():
         # 1. no-reference baseline (shared across methods; the reference's effect is measured vs this)
         if not render(base_png, prompt, seed, args.size, args.steps, args.model, ref=None, regen=args.regen):
             sys.exit("baseline render failed")
-        # 2. one render per reference with the method's flags
+        # 2. one render per reference with the method's flags. --no-input-ref: the method's style comes
+        #    from the flags (e.g. --lora), NOT an in-context image, so render WITHOUT -i; the ref is used
+        #    only for scoring. (For a fixed-weight LoRA the per-ref renders are identical — gate a subset.)
         rendered = []
         for r in refs:
             op = md / f"{r['id']}.png"
-            if render(op, prompt, seed, args.size, args.steps, args.model, ref=r["path"], extra=extra, regen=args.regen):
+            rref = None if args.no_input_ref else r["path"]
+            if render(op, prompt, seed, args.size, args.steps, args.model, ref=rref, extra=extra, regen=args.regen):
                 rendered.append((r, op))
         if not rendered:
             sys.exit("no renders")
