@@ -1,0 +1,25 @@
+# Retrieval-hybrid prove-out — per-style LoRA for hot-pool style CLUSTER 23 (cyberpunk neon concept art,
+# intra_cos 0.673 — the TIGHT, coherent cluster the painterly A/B lacked). Distilled model (product target
+# + band-control baseline parity). Cluster from train/lora/cluster_hot_styles.py; all VAE/Qwen3 already hot.
+model:
+  flux_model_dir: flux-klein-model
+adapter:
+  rank: 16
+  alpha: 16
+data:
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot
+  vae_cache_dir: /Volumes/2TBSSD/precomputed/vae/v_2232c1
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443
+  bucket: [512, 512]
+  batch_size: 1
+  seed: 42
+  record_allowlist: /Volumes/2TBSSD/sref_eval/hot_style_clusters/cluster23_subset.json
+training:
+  num_steps: 400
+  learning_rate: 1.5e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mlx_memory_pct: 0.6
+  ema_decay: 0.9999
+  ema_update_every: 10
+  checkpoint_every: 200
