@@ -1,6 +1,26 @@
 # SREF Retrieval-Hybrid Instant-LoRA — Project Scope
 
-Status (2026-07-08): **PROPOSED.** The learned-encoder direction is KILLED (three decisive
+Status (2026-07-08): **PHASE 0 = QUALIFIED PASS (mechanism works; data-gated).** Trained one
+impressionism-seeded per-style LoRA (distilled, rank 16, 400 steps, cluster cos 0.45;
+`train/lora/curate_style_seeded.py` + `lora_painterly_v1.yaml` → `…/lora_lib/painterly_impressionism.safetensors`)
+and gated it (`sref_scorecard.py --no-input-ref`). KEY RESULT: **the LoRA MECHANISM WORKS** — at
+`--lora-scale 2.0` the output is CLEARLY painterly/digital-painting (soft brushed sky, illustrated,
+painted signature), a capability band-control AND the learned encoder both lacked (weight-space edit is
+always active → not subject to the "never learns the signal" failure). corr(out,baseline)=0.88 at scale 1.0
+(NOT inert, unlike the encoder's 0.98–0.999). BUT it's GENERIC painterly, not impressionism SPECIFICALLY:
+styleCSD Δ vs the impressionism ref = +0.011 @ scale1.0 (edges band-control's 0.009) but −0.040 @ scale2.0
+(moves toward digital-painting, AWAY from impressionism's specific CSD). ROOT CAUSE: the 22-shard hot pool
+is PAINTERLY-SPARSE (per-ref top-50 CSD cos only 0.53–0.59 for ALL painterly styles), so "250 nearest
+impressionism" was a grab-bag of digital art averaging to a generic painterly look — the LoRA faithfully
+learned its cluster; the cluster wasn't impressionism. → **The bottleneck is CLUSTER QUALITY / DATA, not
+the mechanism** (vindicates the "style-compute more/art-rich shards" instinct). NEXT: (a) cheap — tighten
+the cluster (top-50–100, higher cos) and re-gate; (b) CSD-index art-rich shards (WikiArt) for DENSE,
+specific style clusters. Montage artifact of the result exists. The mechanism go/no-go is GREEN; the
+project is now a data-curation problem.
+
+Original proposal below.
+
+Status (2026-07-08, proposal): **PROPOSED.** The learned-encoder direction is KILLED (three decisive
 negatives — BACKLOG `SREF-LEARNED-STAGE1`; the in-sequence style-token pathway never binds because
 the flow-matching input is a noised target, so conditioning is never forced). This is the pragmatic
 replacement: build the "instant style" UX out of the **two mechanisms that demonstrably work on this
