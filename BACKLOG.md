@@ -315,6 +315,22 @@ plateau, NOT collapse-over-training**. Supports the capacity-limit reading (proj
 through the frozen backbone; no collapse dynamics) → Stage-2 DiT LoRA is the right thing to test, and a
 cheap overfit probe is well-motivated before a full run.
 
+CHEAP STAGE-2 PROBE (2026-07-08, `train/lora/probe_style_lora.py`): injected a rank-16 LoRA (18.7M, 80
+double+single attn sites) + trained the projector JOINTLY, overfit 8 look-paired samples 300 steps with a
+FIXED prompt (so SigLIP is the only cross-sample distinguisher). Result **KILL-leaning**: overfit loss
+1.13→0.25 (oscillating ~0.3, NOT converging to 0), but the causal swap test (fixed seed+prompt, vary only
+SigLIP) gave cross-ref output corr **0.9996** (Stage-1 was 0.98 — i.e. MORE inert) and CSD diagonal-
+dominance **1/8 = chance**. CAVEAT (my probe's confound): the fixed-prompt overfit lets "predict the blurry
+AVERAGE of 8" reach ~0.25 loss WITHOUT using SigLIP, so the loss-drop isn't evidence of binding and a
+no-binding result is partly expected from the setup. Still weighty because: both paths cut loss, so easy
+SigLIP-binding would have shown SOME swap divergence (it went the other way, to 0.9996); and Stage-1 (4000
+steps, diverse data where the average escape can't win) independently landed near-inert. TWO setups → same
+read: the in-sequence style→output path is HIGH-RESISTANCE on Flux.2 Klein; the LoRA improved the base
+denoiser instead of routing SigLIP. A cleaner (unconfounded) cheap test = 2 distinct style clusters + same
+prompt (average becomes high-loss → SigLIP required). Artifacts: `…/learned_encoder_stage1/stage2_probe*`.
+DECISION (open): fall back to retrieval-hybrid instant-LoRA (plan's designated fallback; reuses the WORKING
+per-style LoRA + CSD index) / one clean 2-cluster forced-binding probe (~2–3h) / commit to full Stage-2.
+
 ### SESSION INSIGHTS — 2026-06-20 (direct-trainer dataset experiments; read first)
 - **[PARTLY SUPERSEDED — see "NULL-FLOOR REFRAME" below.]** Earlier read: "no adapter
   transfers style — all NEGATIVE sref_score (style_sim ~0.02–0.10 < content_leak ~0.35–0.47)."
