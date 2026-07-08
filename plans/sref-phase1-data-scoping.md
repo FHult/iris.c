@@ -1,5 +1,28 @@
 # SREF Retrieval-Hybrid — Phase 1 Data Scoping
 
+> **UPDATE 2026-07-08 (supersedes much of the options analysis below).** Two corrections after checking
+> the docs + shard provenance:
+> 1. **The corpus-wide SUBSET style compute is ALREADY DONE.** `style_precompute.py` ran a **200-records/
+>    shard subsample** over ALL 1280 unified shards → `/Volumes/16TBCold/precomputed/style/v1_csd`
+>    (256k CSD vectors, manifest 2026-06-11). Every shard is covered (one at 187/200). So there is **no
+>    coverage gap to fill** — "style rankings of all shards" is a `style_shard_report.py` run away, not a
+>    multi-day recompute. Earlier "journeydb (200) uncovered" was WRONG: journeydb is IN the 1280
+>    (`build_shards.py --sources converted/{laion,journeydb,coyo,wikiart}`; provenance: 000000–~000750
+>    journeydb, ~000870+ coyo).
+> 2. **WikiArt is already in the corpus — but diluted.** It appears only as a MINORITY mixed into ~a dozen
+>    shards (~000760–000860, tagged "journeydb+wikiart" / "coyo+laion+wikiart"), never a dense block, and
+>    can't be isolated at the record level (per-shard provenance only, combined-source). This is why the
+>    **corpus-wide painterly density tops out at only ~0.62** (impressionism top-50 across all 256k
+>    vectors, vs 0.59 in the 22-shard pool). So **Option B (download clean WikiArt) is still the way to get
+>    genuinely DENSE, movement-labeled painterly clusters** — the in-corpus wikiart is too thin/unlabeled —
+>    but it is NO LONGER the only path, and the "mine the corpus" cost is already sunk (the subsample
+>    exists; use `style_shard_report` to rank shards for free).
+>
+> Net: the infra the user described (subset style compute of all shards) EXISTS and is COMPLETE for the
+> unified corpus. Remaining questions are (a) do we want FULL per-image CSD on the art-rich shards to
+> surface more painterly needles, and (b) clean WikiArt for dense labeled clusters. Both are downstream of
+> reading the `style_shard_report` rankings.
+
 Status (2026-07-08): **SCOPING — needs a data-source decision before any big job.** Phase 0 proved the
 per-style LoRA mechanism transfers painterly style; the cluster-tightness A/B proved within-pool
 selection is exhausted (top-100 no better than top-250). The bottleneck is **dense, movement-specific
