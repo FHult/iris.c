@@ -138,3 +138,22 @@ trade = **base for strong style (slow, 50-step + CFG, ~12–25× a distilled ren
 `guidance_embeds=false` (true CFG), so `train_lora` `guidance=None` is the correct regime for base — no code
 change. Tools: `cluster_hot_styles.py`, `style_retrieve.py` (rank-concat blend). Base-unlock montage artifact
 exists. NEXT: train c9+c8 on base → full retrieval demo (query → CSD-nearest LoRA → apply on base → discriminate).
+
+## END-TO-END DEMO (2026-07-09) — the full retrieval loop works
+
+Trained 3 base LoRAs (cyberpunk/portrait/graphic hot-pool clusters), built `library.json` (centroids +
+LoRA paths + scale 1.0), extracted HELD-OUT query images (ranked outside each training subset), and ran
+the resolver end-to-end (`style_retrieve.py`):
+- **Retrieval discrimination: 3-for-3** on held-out queries (diagonal-dominant CSD matrix: cyberpunk 0.82,
+  portrait 0.79, graphic 0.73 to their own centroids, clear margins over the others).
+- **Apply on base (50-step), fixed prompt "a portrait of a warrior", seed 7**: each retrieved LoRA produces
+  a visibly distinct restyle vs the photoreal baseline — cyberpunk = strong painterly concept-art (best),
+  fantasy = polished ornate character, graphic = monochrome painterly. All 4 outputs distinct (md5).
+- CAVEAT: at a single global scale 1.0 the styles read as VARIATIONS (cyberpunk transfers most; fantasy/
+  graphic subtler; graphic came out monochrome-painterly, not its bold flat-poster character). PROMPT
+  CONGRUENCE matters (first demo used a night-scene prompt that only suited cyberpunk — re-ran neutral).
+CONCLUSION: **the retrieval-hybrid product loop is proven** — arbitrary reference → CSD-nearest LoRA →
+visible style on base, no per-request training. Remaining = per-LoRA scale calibration + broader/cleaner
+library (WikiArt for painterly). Montage artifact exists. Tools: cluster_hot_styles.py, style_retrieve.py,
+library.json. NEXT (product): wire into web (ref upload → CSD → retrieve+blend → base render), or broaden
+the library, or add the blend-of-2 demo.
