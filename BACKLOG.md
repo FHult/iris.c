@@ -281,6 +281,31 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🔴 SREF-STYLE-CFG-PROBE (2026-07-09) — style-CFG CANNOT rescue the learned projector on base. Experiment A CLOSED.
+Re-opened the learned-encoder death sentence in the BASE context: the Stage-1 gate ran a SINGLE forward with a
+guidance EMBEDDING, but both models are `guidance_embeds:false` (true CFG) — so the style tokens were never
+CFG-amplified (`debug/sref_infer_style.py:31-32` flags this open Q). The one base-only lever the distilled model
+structurally lacks (true two-pass CFG `v = v_null + w·(v_cond − v_null)`) was never applied.
+Ran a cheap velocity-space PRE-CHECK before spending render heat (scratchpad `vel_probe.py`): shared 8-step NULL
+trajectory for realistic `x_t` at 4 noise levels, then per-ref `v_cond` vs shared `v_null` on the 4000-step
+projector, 11 eval refs. **Verdict: CLOSE — CFG can't help, for two measured reasons:**
+  • **Push is tiny exactly where style is decided.** ‖Δ‖/‖v_null‖ = **0.0060 @t1000** (high noise, sets global
+    style/comp), rising to only **0.0242 @t250** (low noise, texture-only). The DiT down-weights the OPTIONAL
+    style-token channel precisely at the high-noise steps that matter → amplifying a 0.6% push needs guidance
+    ~20–30, which wrecks quality. This is the noised-target root cause shown as a number.
+  • **The ref-dependent part is per-image noise, not style.** Cross-ref Δ corr ~0.51–0.59 (NOT a pure constant
+    ~1.0), but **within-type ≈ cross-type at every noise level** (t1000: within 0.599 vs cross 0.588; t250:
+    0.523 vs 0.518, gap ~0.01). If Δ encoded style, within-type would be much higher. So CFG amplifies
+    idiosyncratic jitter, not style. Velocity-space confirmation of the Stage-2 probe's within-cluster 0.9975
+    vs cross 0.9976 (gap 0.000).
+`v_cond` cross-ref corr @t1000 = 1.0000 (dominated by shared `v_null` — the DELTA corr is the real signal).
+**Consequence:** the base's CFG lever does NOT reopen the token-channel encoder (A dead). It DOES positively
+point at B/C: the failure is specifically (a) high-noise down-weighting of an optional channel and (b) no
+style-organized signal — both bypassed by FiLM/AdaLN modulation (unignorable, all-noise, CSD is style-organized
+by construction) and by hypernetwork→LoRA (conditioning IS the velocity field; proven +0.176, style-organized).
+The token channel was the one that put style where the DiT is free to ignore it at high noise — now MEASURED,
+not theorized. Probe is throwaway (scratchpad); GPU freed (web stopped) for the run.
+
 ### 🔴 SREF-LEARNED-STAGE1 (2026-07-08) — projector-only (frozen DiT) does NOT transfer style. Stage-2 DiT LoRA is the gate.
 Ran the full Phase-1 Stage-1 of the learned-encoder project (`plans/sref-learned-encoder-project.md`):
 `StyleProjector` (SigLIP→192 in-sequence style tokens, TEXT|STYLE|IMAGE, text-like RoPE), DiT FROZEN,
