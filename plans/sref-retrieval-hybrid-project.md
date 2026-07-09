@@ -157,3 +157,29 @@ visible style on base, no per-request training. Remaining = per-LoRA scale calib
 library (WikiArt for painterly). Montage artifact exists. Tools: cluster_hot_styles.py, style_retrieve.py,
 library.json. NEXT (product): wire into web (ref upload → CSD → retrieve+blend → base render), or broaden
 the library, or add the blend-of-2 demo.
+
+## PRODUCT ITEMS 1/2/3 (2026-07-09)
+
+**Item 1 — web wiring (DONE, committed 79c04cc).** "Style Library" reference mode → server CSD-matches the
+ref to the nearest trained per-style LoRA and applies it (retrieval-hybrid), no per-request training.
+`resolve_style_lora()` (cached) + `/generate` library path (`job.style_lora`, abs path under STYLE_LIB_DIR)
++ `/sref/resolve` (preview) + `/style-library` (list) + UI mode option. Base-trained LoRAs
+(STYLE_LIBRARY_MODEL=flux-klein-4b-base) → run the web on base for strong style; a warning fires otherwise.
+Live-validated: /style-library lists 3 styles; /sref/resolve discriminates (cyberpunk 0.82, portrait 0.79).
+
+**Item 3 — scale calibration + blend (in progress).** Base is LoRA-sensitive (c23: 1.0 good, 1.5 overcooks).
+Sweeping c9/c8 at 0.8/1.0/1.2 → pick best styleCSD Δ vs centroid, write per-LoRA scale into library.json.
+Blend-of-2 demo pending (rank-concat interpolation). (NOTE: bash `declare -A` needs bash4; macOS is 3.2 —
+use parallel-array specs in scripts.)
+
+**Item 2 — broaden library (KEY FINDING; training heat-deferred).** Naive CSD clustering on the MIXED
+corpus surfaces PHOTOGRAPHIC CONTENT-GENRES as tightly as rendering styles: the "new distinct" clusters
+were food photography (0.63), surreal-sculpture photography (0.62), interior/real-estate photography (0.51)
+— from the coyo/laion stock sources, NOT useful transferable styles. The useful RENDERING styles concentrate
+in the journeydb/Midjourney region, and the shipped 3 (cyberpunk/fantasy/graphic) already capture the
+dominant ones (other tight clusters just overlap them). **Fix: journeydb-restricted finer clustering**
+(shards <800, k=50) → real new styles: **line-art/coloring-book (c42, intra 0.666) is a clear add**; some
+candidates are still content-ish (hyperreal 3D renders) → needs a VISUAL curation pass, not blind training.
+So the library IS broadenable with real styles, via style-aware (journeydb-restricted + eyeballed) selection.
+NEXT (cooler weather): curate the journeydb-restricted candidates (line-art + a few more) → train base LoRAs
+→ add to library.json. WikiArt remains the lever for the painterly styles the corpus lacks.
