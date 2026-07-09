@@ -167,10 +167,13 @@ ref to the nearest trained per-style LoRA and applies it (retrieval-hybrid), no 
 (STYLE_LIBRARY_MODEL=flux-klein-4b-base) → run the web on base for strong style; a warning fires otherwise.
 Live-validated: /style-library lists 3 styles; /sref/resolve discriminates (cyberpunk 0.82, portrait 0.79).
 
-**Item 3 — scale calibration + blend (in progress).** Base is LoRA-sensitive (c23: 1.0 good, 1.5 overcooks).
-Sweeping c9/c8 at 0.8/1.0/1.2 → pick best styleCSD Δ vs centroid, write per-LoRA scale into library.json.
-Blend-of-2 demo pending (rank-concat interpolation). (NOTE: bash `declare -A` needs bash4; macOS is 3.2 —
-use parallel-array specs in scripts.)
+**Item 3 — scale calibration + blend (DONE).** Base is LoRA-sensitive and the optimum DIFFERS per LoRA:
+calibrated styleCSD Δ vs centroid → **c23=1.0** (1.5 overcooks, Δ 0.176), **c9=1.2** (monotonic, Δ 0.132),
+**c8=1.2** (Δ 0.062) — written into library.json (a single global scale would have under-driven c9/c8).
+**Blend-of-2 validated**: style_retrieve top-2 → rank-concat merge (merged_A=vstack(A), merged_B=hstack(w·B))
+→ a rank-32 merged .safetensors that `iris --lora` LOADS and renders cleanly (coherent painterly-portrait
+blend of cyberpunk+fantasy, no artifacts). Exact-interpolation blend confirmed end-to-end. (NOTE: bash
+`declare -A` needs bash4; macOS is 3.2 — use parallel-array specs.)
 
 **Item 2 — broaden library (KEY FINDING; training heat-deferred).** Naive CSD clustering on the MIXED
 corpus surfaces PHOTOGRAPHIC CONTENT-GENRES as tightly as rendering styles: the "new distinct" clusters
