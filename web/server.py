@@ -53,6 +53,15 @@ TRAIN_VENV_PY = PROJECT_DIR / "train" / ".venv" / "bin" / "python"
 SIGLIP_FEATURES_SCRIPT = PROJECT_DIR / "train" / "scripts" / "siglip_features.py"
 HYBRID_FEATURES_SCRIPT = PROJECT_DIR / "train" / "scripts" / "hybrid_features.py"
 
+# SREF Style Library (retrieval-hybrid): a reference image is CSD-matched to the nearest trained
+# per-style LoRA (plans/sref-retrieval-hybrid-project.md) and that LoRA is applied — instant style, no
+# per-request training. The LoRAs are trained on the BASE model (steerable → strong visible style; on the
+# distilled model they only tint), so run the web with `--model-dir flux-klein-4b-base` to use this well.
+STYLE_LIB_DIR = Path(os.environ.get("IRIS_STYLE_LIB", "/Volumes/2TBSSD/sref_eval/lora_lib"))
+STYLE_LIBRARY_JSON = STYLE_LIB_DIR / "library.json"
+STYLE_RETRIEVE_SCRIPT = PROJECT_DIR / "train" / "lora" / "style_retrieve.py"
+STYLE_LIBRARY_MODEL = os.environ.get("IRIS_STYLE_LIB_MODEL", "flux-klein-4b-base")
+
 
 def _bundle_cond_mode() -> str:
     """cond_mode of the configured IP bundle ('siglip'|'csd'|'hybrid'); 'siglip' if unknown.
@@ -977,7 +986,14 @@ class IrisServer:
                 # Backwards compatibility: single image mode
                 request_data["input_image"] = str(input_image_path)
 
-            if lora_name and model_dir_path:
+            # SREF style library: a CSD-resolved per-style LoRA (absolute path under STYLE_LIB_DIR),
+            # applied when a "library"-mode reference matched a trained style. Takes precedence over a
+            # named lora. Strong style needs the base model (see STYLE_LIBRARY_MODEL).
+            style_lora = getattr(job, "style_lora", None)
+            if style_lora:
+                request_data["lora"] = str(style_lora)
+                request_data["lora_scale"] = float(getattr(job, "style_lora_scale", 1.0))
+            elif lora_name and model_dir_path:
                 lora_full_path = model_dir_path / "loras" / lora_name
                 request_data["lora"] = str(lora_full_path)
                 request_data["lora_scale"] = float(lora_scale)
@@ -1199,6 +1215,51 @@ def compute_sref_features(image_bytes: bytes) -> Path:
         tmp_img.unlink(missing_ok=True)
 
 
+def resolve_style_lora(image_bytes: bytes):
+    """Reference image bytes -> nearest trained style LoRA from the library (CSD retrieval).
+
+    Returns {"name","lora","scale","cos"} or None if no library is present. Shells out to
+    train/lora/style_retrieve.py (CSD encode + nearest-centroid over library.json), content-hash
+    cached so a repeated reference never re-encodes. The LoRA path is absolute (under STYLE_LIB_DIR)."""
+    if not STYLE_LIBRARY_JSON.exists():
+        return None
+    sha = hashlib.sha256(image_bytes).hexdigest()[:24]
+    SREF_DIR.mkdir(parents=True, exist_ok=True)
+    cache = SREF_DIR / f"{sha}_stylelora.json"
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass
+    tmp_img = SREF_DIR / f"{sha}_qsrc.jpg"
+    try:
+        from PIL import Image
+        import io as _io
+        Image.open(_io.BytesIO(image_bytes)).convert("RGB").save(tmp_img, "JPEG", quality=95)
+    except Exception as e:
+        raise RuntimeError(f"could not decode style reference image: {e}")
+    try:
+        proc = subprocess.run(
+            [str(TRAIN_VENV_PY), str(STYLE_RETRIEVE_SCRIPT), "--query", str(tmp_img),
+             "--library", str(STYLE_LIBRARY_JSON), "--top-k", "1"],
+            capture_output=True, text=True, timeout=300, cwd=str(PROJECT_DIR))
+        line = [l for l in (proc.stdout or "").splitlines() if l.startswith("{")]
+        if proc.returncode != 0 or not line:
+            raise RuntimeError((proc.stderr or "").strip()[-400:] or "style retrieval failed")
+        res = json.loads(line[-1])
+        # validate the resolved LoRA lives under the library dir (no arbitrary path)
+        lora_path = Path(res["lora"]).resolve()
+        if STYLE_LIB_DIR.resolve() not in lora_path.parents or not lora_path.exists():
+            raise RuntimeError(f"resolved LoRA outside the style library: {lora_path}")
+        out = {"name": res["matched"][0], "lora": str(lora_path),
+               "scale": float(res.get("scale", 1.0)),
+               "cos": float((res.get("cos") or [0.0])[0])}
+        cache.write_text(json.dumps(out))
+        return out
+    finally:
+        tmp_img.unlink(missing_ok=True)
+
+
 # ── Style codes: a saved-style library (Midjourney --sref <code> model) ──────
 # A style code is a short stable id for a reference's computed features, so a
 # look can be reused without re-uploading the image. Registry maps code ->
@@ -1358,6 +1419,23 @@ def generate():
         return {"data": r, "strength": 1.0, "mode": "composition"}
 
     reference_slots = [_normalise_ref(r) for r in raw_refs if r]
+
+    # SREF Style Library (retrieval-hybrid): a "library"-mode reference is CSD-matched to the nearest
+    # TRAINED per-style LoRA and that LoRA is applied — the reference is NOT passed as an in-context
+    # image (the LoRA IS the style; content comes from the prompt). Resolve now and drop the slot so it
+    # doesn't also flow through the img2img/band-control/adapter paths.
+    resolved_style_lora = None
+    library_slots = [s for s in reference_slots if s.get("mode") == "library"]
+    if library_slots:
+        try:
+            lib_bytes = convert_image_to_png(base64.b64decode(library_slots[0]["data"].split(",")[-1]))
+            resolved_style_lora = resolve_style_lora(lib_bytes)
+        except Exception as e:
+            return jsonify({"error": f"Style library resolution failed: {e}"}), 400
+        if resolved_style_lora is None:
+            return jsonify({"error": "No style library is configured on this server "
+                                     "(IRIS_STYLE_LIB / library.json missing)."}), 400
+        reference_slots = [s for s in reference_slots if s.get("mode") != "library"]
 
     # A "style"-mode reference routes through IN-CONTEXT img2img conditioning by default
     # (full-strength reference-as-tokens, prompt drives content — the clean style transfer
@@ -1523,6 +1601,10 @@ def generate():
     job.sref_shf = SREF_ROPE_SHF if style_slots else 1.0
     job.sref_slf = SREF_ROPE_SLF if style_slots else 1.0
     job.sref_gamma = SREF_STRENGTH_GAMMA if style_slots else 1.0
+    # SREF Style Library: apply the CSD-resolved per-style LoRA (retrieval-hybrid).
+    if resolved_style_lora:
+        job.style_lora = resolved_style_lora["lora"]
+        job.style_lora_scale = resolved_style_lora["scale"]
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:
@@ -1541,7 +1623,16 @@ def generate():
     )
     thread.start()
 
-    return jsonify({"job_id": job_id, "status": "started"})
+    resp = {"job_id": job_id, "status": "started"}
+    if resolved_style_lora:
+        resp["style_match"] = resolved_style_lora["name"]
+        resp["style_cos"] = resolved_style_lora["cos"]
+        if model_dir_path and model_dir_path.name != STYLE_LIBRARY_MODEL:
+            resp["warning"] = (
+                f"Style-library LoRAs are trained on {STYLE_LIBRARY_MODEL}; the loaded model is "
+                f"{model_dir_path.name}, so the style will only tint. Run the web with "
+                f"--model-dir {STYLE_LIBRARY_MODEL} for strong style.")
+    return jsonify(resp)
 
 
 @app.route("/progress/<job_id>")
@@ -1954,6 +2045,39 @@ def style_code_thumb(code):
         if thumb.exists():
             return send_file(thumb, mimetype="image/png")
     return jsonify({"error": "not found"}), 404
+
+
+@app.route("/sref/resolve", methods=["POST"])
+def sref_resolve():
+    """Preview which trained style a reference matches (CSD retrieval-hybrid). Does not generate —
+    the UI uses this to show the matched style before the user hits generate."""
+    data = request.json or {}
+    img_b64 = (data.get("image") or "").strip()
+    if not img_b64:
+        return jsonify({"error": "image (base64) required"}), 400
+    try:
+        img_bytes = convert_image_to_png(base64.b64decode(img_b64.split(",")[-1]))
+        res = resolve_style_lora(img_bytes)
+    except Exception as e:
+        return jsonify({"error": f"resolve failed: {e}"}), 400
+    if res is None:
+        return jsonify({"error": "no style library configured"}), 404
+    return jsonify({"match": res["name"], "cos": res["cos"], "scale": res["scale"],
+                    "on_base": bool(model_dir_path and model_dir_path.name == STYLE_LIBRARY_MODEL)})
+
+
+@app.route("/style-library", methods=["GET"])
+def style_library():
+    """List the trained styles in the retrieval-hybrid library (for the UI)."""
+    if not STYLE_LIBRARY_JSON.exists():
+        return jsonify({"styles": [], "enabled": False})
+    try:
+        lib = json.loads(STYLE_LIBRARY_JSON.read_text())
+        return jsonify({"enabled": True, "model": STYLE_LIBRARY_MODEL,
+                        "on_base": bool(model_dir_path and model_dir_path.name == STYLE_LIBRARY_MODEL),
+                        "styles": [{"name": e["name"], "scale": e.get("scale", 1.0)} for e in lib]})
+    except Exception as e:
+        return jsonify({"styles": [], "enabled": False, "error": str(e)})
 
 
 @app.route("/server-status")

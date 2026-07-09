@@ -91,7 +91,8 @@ def main():
 
     print(f"\nrun:\n  ./iris -d {args.model} --lora {lora} --lora-scale {scale} -p \"<prompt>\" -o out.png")
     print(json.dumps({"lora": str(lora), "scale": float(scale),
-                      "matched": [lib[int(i)]["name"] for i in order]}))
+                      "matched": [lib[int(i)]["name"] for i in order],
+                      "cos": [round(float(sim[int(i)]), 4) for i in order]}))
 
 
 if __name__ == "__main__":

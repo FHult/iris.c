@@ -1558,9 +1558,14 @@ document.addEventListener('DOMContentLoaded', () => {
     function _updateRefModeHint() {
         const hint = document.getElementById('ref-mode-hint');
         if (!hint) return;
-        hint.textContent = _globalRefMode() === 'style'
-            ? 'Style works best with bold, graphic references (line-art, comics, flat illustration, woodcut). Paintings and photos transfer only subtly.'
-            : "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
+        const mode = _globalRefMode();
+        if (mode === 'library') {
+            hint.textContent = 'Matches your reference to the nearest trained style and applies that style LoRA — the strongest, most consistent transfer, including painterly looks. Your prompt drives the subject. Best on the base model.';
+        } else if (mode === 'composition') {
+            hint.textContent = "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
+        } else {
+            hint.textContent = 'Style works best with bold, graphic references (line-art, comics, flat illustration, woodcut). Paintings and photos transfer only subtly.';
+        }
     }
 
     // Read strength/mode for a slot (strength from the per-slot slider; mode from the global toggle)
