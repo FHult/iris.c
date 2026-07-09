@@ -1,0 +1,29 @@
+# SREF experiment B — CSD→timestep-modulation (FiLM). Follows the CLOSED in-sequence style-token
+# path (SREF-STYLE-CFG-PROBE). Injects the content-invariant CSD vector into the UNIGNORABLE adaLN
+# modulation channel instead of the optional attention token stream. Zero new precompute: reuses the
+# hot CSD subset (universe_csd, 200/shard) + the same hot pool + vae/qwen3 caches + look-pairing DB.
+# Train ONLY the CSDModulation MLP; DiT frozen.
+model:
+  flux_model_dir: flux-klein-4b-base          # base = steerable (distilled commits structure step 1)
+adapter:
+  csd_dim: 768
+  mlp_dim: 1024
+data:
+  batch_size: 1
+  bucket: [512, 512]
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot                    # hot pool (22 tars, incl. style subset)
+  vae_cache_dir:    /Volumes/2TBSSD/precomputed/vae/v_2232c1
+  qwen3_cache_dir:  /Volumes/2TBSSD/precomputed/qwen3/v_059443
+  csd_cache_dir:    /Volumes/2TBSSD/universe_csd                   # hot CSD subset (200/shard × 1280)
+  style_neighbors_db: /Volumes/2TBSSD/sref_eval/style_cache/neighbors.sqlite  # look-paired (DATA-SELECTION PRINCIPLE)
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+  num_steps: 4000
+  null_style_prob: 0.1
+  grad_clip: 1.0
+  weight_decay: 0.01
+  checkpoint_every: 500
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_film
+  guidance: 3.5                                # 4B base CFG guidance

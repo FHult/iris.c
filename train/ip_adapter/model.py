@@ -175,6 +175,41 @@ class CSDImageProj(nn.Module):
         return self.norm(out)  # [B, num_queries, hidden_dim]
 
 
+class CSDModulation(nn.Module):
+    """SREF experiment B: FiLM the content-invariant CSD style vector into the DiT's TIMESTEP/
+    guidance modulation channel (`temb`), NOT the attention token stream.
+
+    Motivation (SREF-STYLE-CFG-PROBE, 2026-07-09): the in-sequence style-token channel is
+    OPTIONAL — the frozen DiT down-weights it precisely at the high-noise steps that set style
+    (‖Δ‖/‖v_null‖ = 0.006 @t1000), and its ref-dependent part is per-image noise, not style
+    (within-type ≈ cross-type). The timestep-modulation channel is the opposite: `temb` feeds
+    EVERY block's adaLN (scale/shift/gate) and the final norm at EVERY noise level — the model
+    cannot ignore it. So map CSD [B, 768] → a delta added onto `temb` before the (frozen)
+    modulation MLPs. CSD is content-invariant by construction (can't leak content into a global
+    signal), and this is trivially C-implementable (a 2-layer MLP + a vector add on temb — no new
+    attention kernel). Zero-init final layer (adaLN-zero convention, mirrors CSDImageProj) → delta
+    = 0 at init (identity start, stable), then it learns; gradients flow through the frozen
+    modulation MLPs back to fc1/fc2 from step 0.
+    """
+
+    def __init__(self, hidden_dim: int = 3072, csd_dim: int = 768, mlp_dim: int = 1024):
+        super().__init__()
+        self.fc1 = nn.Linear(csd_dim, mlp_dim, bias=True)
+        self.fc2 = nn.Linear(mlp_dim, hidden_dim, bias=True)
+        # adaLN-zero: zero the OUTPUT layer so the temb delta is 0 at init (identity start).
+        self.fc2.weight = mx.zeros_like(self.fc2.weight)
+        self.fc2.bias = mx.zeros_like(self.fc2.bias)
+        self.hidden_dim = hidden_dim
+
+    def __call__(self, csd: mx.array) -> mx.array:
+        # csd: [B, csd_dim] (L2-normalised CSD style embedding); tolerate [B,1,csd_dim].
+        if csd.ndim == 3:
+            csd = csd.reshape(csd.shape[0], -1)
+        h = self.fc1(csd)
+        h = h * mx.sigmoid(h)          # SiLU (dependency-free)
+        return self.fc2(h)             # [B, hidden] — temb delta
+
+
 class IPAdapterKlein(nn.Module):
     """
     IP-Adapter companion model for Flux Klein 4B.
