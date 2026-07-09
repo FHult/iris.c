@@ -114,3 +114,27 @@ rank-16 LoRA (`train_lora.py`, full double+single coverage, on hot SSD, caffeina
 --label lora_painterly --model flux-klein-4b-base --extra "--lora <exported> --lora-scale 1.0"`. If
 painterly styleCSD Δ > 0.009, the project is greenlit; if not, reconsider (the stack may simply not do
 painterly at 4B). Everything else (library, retrieval, blend, web) is downstream of that one number.
+
+---
+
+## PROVE-OUT RESULT (2026-07-09) — journeydb tight clusters + BASE model = the answer
+
+Detoured from painterly (corpus can't supply dense painterly) to prove the mechanism on corpus-rich
+styles with zero new data. Mined 3 distinct dense hot-pool clusters (`cluster_hot_styles.py`):
+**c23 cyberpunk (intra_cos 0.673)**, c9 fantasy portrait (0.594), c8 graphic poster (0.559) — all far
+tighter than painterly (0.45–0.53), confirming the corpus HAS dense coherent styles. Trained a per-cluster
+LoRA (rank 16, 400 steps) on c23; gated on prompt "a lone figure standing on a city street at night", seed 7:
+
+- **Distilled (4-step):** styleCSD Δ **+0.041** but VISUALLY only a tint (baseline ≈ LoRA) — the step-1
+  structure-lock (SREF-STYLE-CEILING) caps expression even for a TIGHT cluster.
+- **Base (50-step CFG):** styleCSD Δ **+0.176 (4× distilled)** with a STRONG cohesive visible restyle
+  (deep teal cinematic grade, atmosphere, backlit silhouette). **BASE UNLOCKS the style distilled could
+  only tint.** Base is far more LoRA-sensitive: ×1.0 sweet spot, ×1.5 overcooks (Δ −0.31).
+
+CONCLUSIONS: (1) **tight cluster is the lever** — the Phase-0 painterly failure was cluster LOOSENESS, not
+the mechanism; (2) corpus + per-style LoRA deliver strong visible style transfer **on the base**; (3) product
+trade = **base for strong style (slow, 50-step + CFG, ~12–25× a distilled render), distilled for fast/graphic**;
+(4) per-LoRA scale must be calibrated & stored in the retrieval manifest (base ~1.0). Both models are
+`guidance_embeds=false` (true CFG), so `train_lora` `guidance=None` is the correct regime for base — no code
+change. Tools: `cluster_hot_styles.py`, `style_retrieve.py` (rank-concat blend). Base-unlock montage artifact
+exists. NEXT: train c9+c8 on base → full retrieval demo (query → CSD-nearest LoRA → apply on base → discriminate).
