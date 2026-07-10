@@ -281,6 +281,37 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🔴 SREF-FILM-1 (2026-07-10) — CSD→modulation (experiment B) COLLAPSES too. The collapse is LOSS-bound, not channel-bound.
+Built + trained the FiLM rail A's probe pointed at: `CSDModulation` (768→1024→3072, adaLN-zero) FiLMs the
+content-invariant CSD vector into the DiT's timestep-modulation embedding (`temb += csd_mod(csd)`) — the
+UNIGNORABLE adaLN channel that scales every block's norm at every noise level, not the optional token stream.
+DiT frozen, 4000 steps on the 4B base, `cond_mode=csd` on hot `universe_csd` + look-pairing (~26% cross).
+Loss fell 0.47→0.28 (DEEPER than the token projector's ~0.4 plateau — the channel IS used strongly). Gated the
+step-4000 ckpt (`debug/sref_infer_film.py` → `sref_scorecard.py`, base 24-step, seed 7, "a robot in a desert"):
+  • **HARD-KILL COLLAPSE: cross-ref output corr 0.9998 (max 1.0000, min 0.9990)** — every one of 11 wildly
+    different refs → near-identical output. WORSE than the token projector (0.98).
+  • Scorecard styleCSD Δ painterly **0.0603** (graphic 0.010, semi_real −0.14, overall 0.019) — this BEATS
+    band-control 0.009 but is a **CONFOUND** (textbook SREF-CHAMPION-COLLAPSE): a constant mildly-painterly
+    transform correlates with painterly centroids. NOT reference-conditioned transfer. The mandatory collapse
+    gate (corr ≥0.90 = false positive) fires → the 0.0603 is void.
+  • **Diagnostic (rules out harness bugs):** module DID train (`fc2.weight` off zero-init, std 0.015); CSD
+    inputs ARE distinct (cross-ref cosine 0.08–0.47); YET the `temb` deltas are near-identical across refs
+    (cross-ref cosine **0.9998**, norm ~44). The module learned to map WILDLY different CSD inputs → the SAME
+    large constant temb shift. It uses the channel hard, but constantly.
+**ROOT CAUSE (durable, now proven across TWO channels):** the collapse is NOT the injection site — it's the
+flow-matching objective. A noised-target loss on a FROZEN DiT never rewards reference-DISCRIMINATION, so the
+easy minimum for ANY learned reference→conditioning module is a reference-INDEPENDENT constant — whether
+injected as attention tokens (SREF-STYLE-STAGE1 / -CFG-PROBE) or as adaLN modulation (here). The "unignorable
+channel" hypothesis was wrong: applying the channel forces it to be USED, not to be reference-DEPENDENT; the
+module just puts a constant in it. This reconciles the whole SREF arc: the two things that WORK sidestep this
+loss — in-context VAE-ref tokens ARE the image (the loss cannot reconstruct without them at high noise), and
+per-style LoRA is direct weight surgery (no reference-mapping to collapse). → The learned-conditioning-module
+direction is DEAD on this stack (both channels). Only remaining instant-generic bet = **C (hypernetwork→LoRA)**,
+and ONLY if trained by DISTILLING known-good per-style LoRA weights (supervised regression reference→weights),
+NOT the collapsing flow loss — else it collapses the same way. Retrieval-hybrid stays the shipped answer.
+Artifacts: `/tmp/sref_scorecard/film_4000/`, ckpts `/Volumes/2TBSSD/checkpoints/sref_film/`. Scaffolding
+committed e56d4a6; gate result here.
+
 ### 🔴 SREF-STYLE-CFG-PROBE (2026-07-09) — style-CFG CANNOT rescue the learned projector on base. Experiment A CLOSED.
 Re-opened the learned-encoder death sentence in the BASE context: the Stage-1 gate ran a SINGLE forward with a
 guidance EMBEDDING, but both models are `guidance_embeds:false` (true CFG) — so the style tokens were never
