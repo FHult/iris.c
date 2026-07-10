@@ -1,0 +1,30 @@
+# SREF Stage-0.5 go/no-go — joint LoRA + CSDModulation with in-batch contrastive (256px, batch>1).
+# The cheap local test of the ONE untried lever (batch>1 in-batch contrastive on a TRAINABLE backbone).
+# plans/sref-joint-backbone-project.md §4. Zero new precompute: hot universe_csd + pool + vae/qwen3.
+model:
+  flux_model_dir: flux-klein-4b-base
+adapter:
+  lora_rank: 64                                 # trainable backbone (double+single attn); not the frozen/r16 that failed
+data:
+  batch_size: 4                                 # >1 REQUIRED for the in-batch contrastive term
+  bucket: [256, 256]                            # ¼ the tokens of 512px so batch 4 + LoRA fits 32GB
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot
+  vae_cache_dir:   /Volumes/2TBSSD/precomputed/vae/v_2232c1
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443
+  csd_cache_dir:   /Volumes/2TBSSD/universe_csd
+  style_neighbors_db: /Volumes/2TBSSD/sref_eval/style_cache/neighbors.sqlite
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+  num_steps: 8000
+  contrastive_weight: 1.0                        # λ on the InfoNCE term
+  infonce_tau: 0.1
+  highnoise_bias: 1.0                            # bias timestep sampling toward high noise
+  null_style_prob: 0.1
+  grad_clip: 1.0
+  grad_checkpoint: true                          # memory-safe at batch 4 (no speed cost here); flip off if you have headroom
+  weight_decay: 0.01
+  checkpoint_every: 1000
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_joint_probe
+  guidance: 3.5
