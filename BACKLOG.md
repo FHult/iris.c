@@ -281,6 +281,48 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🟠 SREF-INFONCE-VOID (2026-07-10) — the Stage-0.5 in-batch InfoNCE CANNOT punish reference-blindness. The probe would have returned a FALSE NO-GO.
+Audited `train/lora/probe_joint_contrastive.py:155-159` before spending the (wedged) batched run. The term is
+`logits = l2(style_stats(x0_pred)) @ l2(style_stats(latent)).T / τ`, `labels = arange(B)`. **The reference
+(`csd`) does not appear in the loss at all** — the positive for prediction `i` is sample `i`'s OWN target.
+The design doc's claim ("a constant output cannot classify → collapse punished") conflates **output-constancy**
+with **reference-independence**. The collapse we actually have is reference-independent but strongly
+INPUT-dependent — and such a model classifies perfectly.
+Numeric proof on 8 REAL VAE latents (`v_2232c1`), τ=0.1, B=8, chance CE = ln 8 = 2.0794:
+| v_pred regime | t=900 | t=600 | t=200 |
+|---|---|---|---|
+| (a) `v_pred = v_target` — PERFECT but reference-blind | **1.2413 / acc 100%** | 1.2413 / 100% | 1.2413 / 100% |
+| (b) `v_pred = const` — total degenerate collapse | 2.0777 / acc 12% | 1.6048 / 100% | 1.2563 / 100% |
+| (c) `v_pred = v_target + 0.5·noise` — sloppy, reference-blind | 1.2928 / 100% | 1.2966 / 100% | 1.2451 / 100% |
+  • **(a) is the killer, and it is FLAT in t (1.2413 at every noise level):** the InfoNCE global minimum is
+    attained by a good reference-blind denoiser. The term rewards DENOISING FIDELITY, not reference use →
+    **zero anti-collapse pressure**, at any timestep. The high-noise bias cannot fix this.
+  • (b) only fails at high noise because of a second, separate defect: `x0_pred = (α·noisy − σ·v_pred)/(α²+σ²)`
+    leaks `α²/(α²+σ²)` of the target straight from the model's INPUT (30.8% at t=600, 1.2% at t=900). So at
+    t≤600 even a constant `v_pred` classifies 100%. `highnoise_bias=1.0` (median t≈730) masks THIS leak only.
+  • Third pathology: at the recon optimum the CE gradient is still large (off-diag style-stat cosines ~0.9 on
+    natural latents), so `λ_c=1.0` (vs recon ~0.3) actively pushes `x0_pred` style-stats to be MORE mutually
+    orthogonal than the true targets — a content-driven repulsion that degrades recon and still never consults
+    the reference.
+**CONSEQUENCE:** the 8000-step Stage-0.5 run would have collapsed and been read as "in-batch contrastive
+doesn't break it ⇒ the loss-bound verdict is ironclad, learned adapters are dead" — a false NO-GO on the
+flagship hypothesis, from a test that never applied the pressure it advertised. The M1-vs-cloud blocker was
+therefore being debated for the WRONG objective.
+**THE FIX (mirrors the collapse METRIC, which is correctly specified):** contrast over REFERENCES with CONTENT
+HELD FIXED. Share one noisy latent `x_t` across the row set, forward it with B distinct refs, and set
+`logits[i,j] = sim(style(x0_pred_i), desc(ref_j))/τ`, labels = diag. A reference-blind model then emits
+identical rows → chance accuracy → loss = ln B = maximum penalty. Sharing `x_t` also cancels the α·noisy leak
+(identical for every i, so it cannot discriminate). Two structural corollaries:
+  1. **It does NOT need batch 8–16.** The minimum unit is a content-DUPLICATED pair (same `x_t`, refs a≠b) —
+     `style_repulsion_loss` (`train/ip_adapter/loss.py:104`) is already this shape. Effective batch 2.
+  2. **Extra negatives are FREE (MoCo, brief item 1) because negatives are reference DESCRIPTORS, not
+     forwarded outputs** — only the positive needs a forward. A queue of CSD vectors gives many negatives at
+     batch 2. But the queue is a BONUS; the load-bearing term is the content-shared pair (brief item 6).
+Also: data is ~74% self-paired (ref = the target's own image), which makes the reference redundant with the
+noisy input — the exact shortcut that produces collapse. The corrected run must be **100% cross-paired**
+(ref = a different image of the same style).
+Sim: scratchpad `infonce_shortcut.py` (throwaway; numbers above are the durable artifact). Nothing trained.
+
 ### 🔴 SREF-FILM-1 (2026-07-10) — CSD→modulation (experiment B) COLLAPSES too. The collapse is LOSS-bound, not channel-bound.
 Built + trained the FiLM rail A's probe pointed at: `CSDModulation` (768→1024→3072, adaLN-zero) FiLMs the
 content-invariant CSD vector into the DiT's timestep-modulation embedding (`temb += csd_mod(csd)`) — the
