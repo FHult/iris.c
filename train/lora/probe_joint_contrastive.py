@@ -69,6 +69,18 @@ def _l2(x, axis=-1, eps=1e-6):
     return x / mx.maximum(mx.linalg.norm(x, axis=axis, keepdims=True), eps)
 
 
+def _fix_seq(t, L):
+    """Pad/truncate text embeds to a FIXED length L. Real captions have variable token counts; the
+    loader pads to the per-BATCH max, so seq_txt changes every batch → MLX recompiles the whole
+    (huge) graph each step and never progresses. A fixed shape → compile once, then step."""
+    s = t.shape[1]
+    if s == L:
+        return t
+    if s > L:
+        return t[:, :L]
+    return mx.concatenate([t, mx.zeros((t.shape[0], L - s, t.shape[2]), dtype=t.dtype)], axis=1)
+
+
 def _forward_vpred(flux, csd_mod, noisy, text, csd, t_int, ckpt_d, ckpt_s, guidance):
     B, C, Lh, Lw = noisy.shape
     hidden = patchify_pack(noisy.astype(text.dtype))
@@ -104,6 +116,7 @@ def main():
     ckpt_dir = tcfg.get("checkpoint_dir", "/Volumes/2TBSSD/checkpoints/sref_joint_probe")
     B = int(dcfg.get("batch_size", 4))
     bucket = tuple(dcfg.get("bucket", [256, 256]))
+    text_seq = int(dcfg.get("text_seq", 128))     # FIXED text length → constant graph shape (no per-batch recompile)
     guidance = tcfg.get("guidance")
 
     print(f"loading Flux2Klein ({model_dir}) ...", flush=True)
@@ -209,7 +222,8 @@ def main():
                 csd = mx.array(sref_np if sref_np is not None else csd_np, dtype=mx.bfloat16)
                 if csd.ndim == 3:
                     csd = csd.reshape(csd.shape[0], -1)
-                yield latent, mx.array(text_np, dtype=mx.bfloat16), csd
+                text = _fix_seq(mx.array(text_np, dtype=mx.bfloat16), text_seq)
+                yield latent, text, csd
 
     # ── train loop ──────────────────────────────────────────────────────────────
     print(f"training {total} steps (bucket {bucket}, B={B}, lr {lr}, λ_con {lambda_c}, τ {tau}, "
