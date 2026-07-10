@@ -141,6 +141,18 @@ def style_repulsion_loss(x0_a: mx.array, x0_b: mx.array, margin: float = 1.0) ->
 # dominate the softmax and dilute the a-vs-b margin that carries the pressure.
 # ---------------------------------------------------------------------------
 
+def pair_row_ce(z: mx.array, s_pos: mx.array, s_neg: mx.array, tau: float = 0.1) -> mx.array:
+    """Mean cross-entropy of ONE branch's 2-way softmax: its output must sit closer to the reference
+    it was handed (s_pos) than to the other branch's (s_neg). Both references are frozen.
+
+    Exposed separately because the two rows DECOUPLE: `loss_a = recon + λ/2·pair_row_ce(z_a,s_a,s_b)`
+    and `loss_b = λ/2·pair_row_ce(z_b,s_b,s_a)` can be differentiated in two SEQUENTIAL batch-1
+    passes and their grad trees summed — batch-1 memory, 2× compute, no co-resident batch."""
+    d = (mx.sum(z * s_pos, axis=1) - mx.sum(z * s_neg, axis=1)) / tau
+    # softplus(-d) == cross-entropy of a 2-way softmax whose positive logit leads by d
+    return mx.mean(mx.logaddexp(mx.zeros_like(d), -d))
+
+
 def pair_contrastive_loss(
     z_a: mx.array,
     z_b: mx.array,
@@ -161,11 +173,7 @@ def pair_contrastive_loss(
     every z, with equality iff d = 0. So ln 2 is a HARD FLOOR for any reference-blind model, while a
     reference-aware one drives L → 0. `test_pair_contrastive.py` asserts exactly this.
     """
-    d_a = (mx.sum(z_a * s_a, axis=1) - mx.sum(z_a * s_b, axis=1)) / tau
-    d_b = (mx.sum(z_b * s_b, axis=1) - mx.sum(z_b * s_a, axis=1)) / tau
-    # softplus(-d) == cross-entropy of a 2-way softmax whose positive logit leads by d
-    ce = mx.logaddexp(mx.zeros_like(d_a), -d_a) + mx.logaddexp(mx.zeros_like(d_b), -d_b)
-    return 0.5 * mx.mean(ce)
+    return 0.5 * (pair_row_ce(z_a, s_a, s_b, tau) + pair_row_ce(z_b, s_b, s_a, tau))
 
 
 def pair_row_accuracy(z: mx.array, s_pos: mx.array, s_neg: mx.array) -> mx.array:

@@ -1,23 +1,44 @@
 """train/lora/probe_joint_contrastive.py — SREF Stage-0.5 go/no-go probe.
 
-Tests the ONE lever we have never been able to try (plans/sref-joint-backbone-project.md §2): does a
-TRAINABLE backbone (LoRA) + an IN-BATCH CONTRASTIVE loss (needs batch>1) break the reference-collapse
-that killed every frozen-backbone adapter (SREF-FILM-1: the collapse is loss-bound, not channel-bound)?
+Tests the ONE lever we have never been able to try (plans/sref-joint-backbone-project.md): does a
+TRAINABLE backbone (LoRA) + a loss that CANNOT be satisfied by ignoring the reference break the
+collapse that killed every frozen-backbone adapter?
 
-Cheap + local: 256px (¼ the tokens of 512px) so batch 4 + LoRA fits on the M1 32GB. Joint-trains a LoRA
-(r64, double+single attn) AND the CSDModulation (CSD→temb FiLM) via one `_Joint` value_and_grad. Loss =
-flow-recon + λ·InfoNCE over the batch (each prediction's AdaIN style-stats must match its OWN reference's
-target more than the other batch members' → a constant/collapsed output cannot classify → collapse punished).
+THE OBJECTIVE (BACKLOG SREF-INFONCE-VOID / SREF-PAIR-VS-BANK — read before touching this file).
+Forward the SAME noisy latent x_t TWICE: branch A on the correct reference `a` (a style-neighbour of
+the target, never the target itself), branch B on a FOREIGN reference `b`. Each branch's output style
+`z = proj(x0_pred)` must match the reference IT WAS HANDED.
 
-PRIMARY SIGNAL (logged every --diag-every steps): fixed-content cross-ref x0 correlation — forward the SAME
-latent+noise+t with each of the batch's B distinct CSD refs; if the outputs decorrelate (corr < ~0.9) the
-reference finally matters. GO ⇒ proceed to the render+scorecard gate. NO-GO (stays ≥0.9) ⇒ the loss-bound
-verdict is ironclad; stop. NEVER train from cold storage (hot SSD only — CLAUDE.md).
+    loss = L_recon(branch A)  +  λ·½·[ pair_row_ce(z_a, s_a, s_b) + pair_row_ce(z_b, s_b, s_a) ]
+
+A reference-blind model emits z_a == z_b and pays ≥ ln 2 = 0.6931, ALWAYS (guard:
+train/tests/test_pair_contrastive.py). Two superseded shapes that a reference-blind model beats,
+and which must not creep back in:
+  • contrasting each prediction against its OWN target  → a perfect ref-blind denoiser attains the
+    minimum (acc 100%, flat in t). The reference was not even an argument of that loss.
+  • a bank of negatives on the correct-ref branch alone → ref-blind scores 98.0% top-1 vs 1023
+    negatives, because cos(CSD(target), CSD(its style-neighbour)) = 0.75. The foreign branch is the
+    only term denoising cannot reach (cos(target, foreign) = 0.12).
+
+WHY IT FITS AN M1. The two rows decouple (each touches only its own z plus frozen descriptors), so
+they run as two SEQUENTIAL batch-1 forward/backward passes with summed grad trees: batch-1 memory,
+2× compute. No co-resident batch — which is what wedged MLX's value_and_grad at batch 2/4.
+
+t is sampled in [700, 950]: below t≈400 the input pins α²/(α²+σ²) of x0_pred (84.5% at t=300), so the
+model cannot move style there even if it reads the reference (debug/sref_noise_band.py).
+
+PRIMARY SIGNALS (logged every --diag-every steps):
+  • foreign-row accuracy — EXACTLY 0.5 under collapse (the two rows' accuracies sum to 1). Rising
+    off 0.5 = the reference is being used. Do NOT use a bank's top-1: it reads ~98% while collapsed.
+  • cross-ref x0 correlation at fixed content — < 0.90 = collapse broken.
+GO ⇒ render+scorecard gate. NO-GO ⇒ the loss-bound verdict is ironclad; stop.
+NEVER train from cold storage (hot SSD only — CLAUDE.md).
 
   train/.venv/bin/python train/lora/probe_joint_contrastive.py --smoke --steps 40
   train/.venv/bin/python train/lora/probe_joint_contrastive.py --config train/configs/sref_joint_probe_v1.yaml
 """
-import argparse, os, sys, time, math, random
+import argparse, collections, math, os, random, sys, time
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # train/
 
 import yaml
@@ -25,13 +46,14 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
 
 from ip_adapter.model import CSDModulation
-from ip_adapter.loss import get_schedule_values, fused_flow_noise, reconstruct_x0, style_stats
+from ip_adapter.latent_csd import LatentCSDProjector, load_vae_bn_stats, bn_pack
+from ip_adapter.loss import get_schedule_values, fused_flow_noise, reconstruct_x0, pair_row_ce
 from lora.lora import inject_lora_double_blocks, inject_lora_single_blocks
-from lora.train_step import make_ckpt_blocks, patchify_pack, unpatchify, make_position_ids
+from lora.train_step import patchify_pack, unpatchify, make_position_ids, make_ckpt_blocks
 from lora.film_step import flux_forward_film
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,30 +61,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 class _Joint(nn.Module):
     """Container so nn.value_and_grad differentiates BOTH the LoRA (unfrozen inside flux) and the
-    fully-trainable CSDModulation in one pass. trainable_parameters() = LoRA + csd_mod."""
+    fully-trainable CSDModulation in one pass. The projector is NOT here: it is frozen, and gradient
+    flows THROUGH it into x0_pred without updating it."""
     def __init__(self, flux, csd_mod):
         super().__init__()
         self.flux = flux
         self.csd_mod = csd_mod
-
-
-def _load_vae_bn_stats(model_dir):
-    st = mx.load(os.path.join(model_dir, "vae", "diffusion_pytorch_model.safetensors"))
-    m = st["bn.running_mean"].astype(mx.float32).reshape(32, 2, 2)
-    s = mx.sqrt(st["bn.running_var"].astype(mx.float32).reshape(32, 2, 2) + 1e-4)
-    mx.eval(m, s); return m, s
-
-
-def _bn_pack(lat, m, s):
-    _, _, Lh, Lw = lat.shape
-    return ((lat.astype(mx.float32) - mx.tile(m, (1, Lh // 2, Lw // 2)))
-            / mx.tile(s, (1, Lh // 2, Lw // 2))).astype(lat.dtype)
-
-
-def _sample_t_highbias(bias=1.0):
-    """One shared timestep, biased toward HIGH noise (where global style is set). sigmoid(N(bias,1))."""
-    u = float(mx.sigmoid(mx.random.normal((1,)) + bias).item())
-    return max(1, min(999, int(u * 1000)))
 
 
 def _l2(x, axis=-1, eps=1e-6):
@@ -70,9 +74,8 @@ def _l2(x, axis=-1, eps=1e-6):
 
 
 def _fix_seq(t, L):
-    """Pad/truncate text embeds to a FIXED length L. Real captions have variable token counts; the
-    loader pads to the per-BATCH max, so seq_txt changes every batch → MLX recompiles the whole
-    (huge) graph each step and never progresses. A fixed shape → compile once, then step."""
+    """Pad/truncate text embeds to a FIXED length. Variable seq_txt → MLX rebuilds the (huge) graph
+    every step and never progresses."""
     s = t.shape[1]
     if s == L:
         return t
@@ -81,7 +84,7 @@ def _fix_seq(t, L):
     return mx.concatenate([t, mx.zeros((t.shape[0], L - s, t.shape[2]), dtype=t.dtype)], axis=1)
 
 
-def _forward_vpred(flux, csd_mod, noisy, text, csd, t_int, ckpt_d, ckpt_s, guidance):
+def _forward_vpred(flux, csd_mod, noisy, text, csd, t_int, guidance, ckpt_d=None, ckpt_s=None):
     B, C, Lh, Lw = noisy.shape
     hidden = patchify_pack(noisy.astype(text.dtype))
     img_ids, txt_ids = make_position_ids(Lh // 2, Lw // 2, text.shape[1])
@@ -90,12 +93,40 @@ def _forward_vpred(flux, csd_mod, noisy, text, csd, t_int, ckpt_d, ckpt_s, guida
     return unpatchify(seq, B, C, Lh, Lw)
 
 
+class ForeignRefQueue:
+    """Rolling bank of recently-seen CSD vectors, the SOURCE of branch B's foreign reference.
+
+    This is the one correct use of a frozen-encoder bank: not as extra softmax negatives (those are
+    easy and dilute the a-vs-b margin) but to supply a foreign reference at batch 1, so the pair
+    never needs two co-resident samples. Picks the HARDEST safe negative: among candidates with
+    cos(s_a, s_b) < max_cos (above that the "foreign" style may actually BE the target's style —
+    label noise), take the most similar one."""
+
+    def __init__(self, size=4096, pool=16, max_cos=0.5):
+        self.q = collections.deque(maxlen=size)
+        self.pool, self.max_cos = pool, max_cos
+
+    def add(self, s):
+        self.q.append(np.asarray(s, dtype=np.float32))
+
+    def sample(self, s_a, rng):
+        if len(self.q) < 2:
+            return None
+        idx = rng.choice(len(self.q), min(self.pool, len(self.q)), replace=False)
+        cand = np.stack([self.q[i] for i in idx])
+        cos = cand @ np.asarray(s_a, dtype=np.float32).ravel()
+        ok = np.where(cos < self.max_cos)[0]
+        if len(ok) == 0:
+            return None
+        return cand[ok[np.argmax(cos[ok])]], float(cos[ok].max())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--steps", type=int, default=None)
-    ap.add_argument("--diag-every", type=int, default=40)
+    ap.add_argument("--diag-every", type=int, default=100)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config)) if args.config else {}
@@ -104,20 +135,22 @@ def main():
     if args.smoke and not args.config:
         model_dir = os.path.join(ROOT, "flux-klein-model")
     rank = int(cfg.get("adapter", {}).get("lora_rank", 64))
+    proj_ckpt = cfg.get("adapter", {}).get(
+        "projector_ckpt", "/Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors")
     lr = float(tcfg.get("learning_rate", 1e-4))
     warmup = int(tcfg.get("warmup_steps", 50))
     total = args.steps or int(tcfg.get("num_steps", 8000))
     lambda_c = float(tcfg.get("contrastive_weight", 1.0))
     tau = float(tcfg.get("infonce_tau", 0.1))
     null_prob = float(tcfg.get("null_style_prob", 0.1))
-    t_bias = float(tcfg.get("highnoise_bias", 1.0))
+    t_lo, t_hi = tcfg.get("t_range", [700, 950])
     grad_clip = float(tcfg.get("grad_clip", 1.0))
     ckpt_every = int(tcfg.get("checkpoint_every", 1000))
     ckpt_dir = tcfg.get("checkpoint_dir", "/Volumes/2TBSSD/checkpoints/sref_joint_probe")
-    B = int(dcfg.get("batch_size", 4))
     bucket = tuple(dcfg.get("bucket", [256, 256]))
-    text_seq = int(dcfg.get("text_seq", 128))     # FIXED text length → constant graph shape (no per-batch recompile)
+    text_seq = int(dcfg.get("text_seq", 128))
     guidance = tcfg.get("guidance")
+    LN2 = math.log(2.0)
 
     print(f"loading Flux2Klein ({model_dir}) ...", flush=True)
     t0 = time.time()
@@ -130,14 +163,26 @@ def main():
     print(f"  loaded + injected {len(inj)} LoRA modules (r{rank}); {n/1e6:.2f} M trainable "
           f"(LoRA + CSDModulation); {time.time()-t0:.1f}s", flush=True)
 
-    # 256px activations are small → grad checkpointing (needed at 512px) usually just costs a 2nd
-    # forward per step. Default OFF here; flip training.grad_checkpoint if batch 4 OOMs.
-    if bool(tcfg.get("grad_checkpoint", False)):
+    proj = LatentCSDProjector()
+    if os.path.exists(proj_ckpt):
+        proj.load_weights(proj_ckpt)
+        print(f"  latent->CSD projector loaded ({proj_ckpt})", flush=True)
+    elif not args.smoke:
+        sys.exit(f"missing projector checkpoint {proj_ckpt} — train it first "
+                 f"(train/lora/train_latent_csd_projector.py)")
+    proj.freeze()
+    proj.eval()
+
+    # Grad checkpointing: batch-1 backward peaks at 25.19 GB raw vs 15.72 GB checkpointed
+    # (debug/sref_memory_ladder.py, 4B base @256px) for 21% slower steps — the 21.5 GB ceiling
+    # needs it. The old wedge was checkpointing x a BATCHED graph; at batch 1 it compiles fine.
+    if bool(tcfg.get("grad_checkpoint", True)):
         ckpt_d, ckpt_s = make_ckpt_blocks(flux)
         print("  grad checkpointing ON", flush=True)
     else:
         ckpt_d, ckpt_s = None, None
-    bn_m, bn_s = _load_vae_bn_stats(model_dir)
+
+    bn_m, bn_s = load_vae_bn_stats(model_dir)
 
     def sched(step):
         if step < warmup:
@@ -146,117 +191,157 @@ def main():
         return lr * 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
     opt = optim.AdamW(learning_rate=lr, weight_decay=float(tcfg.get("weight_decay", 0.01)))
 
-    def loss_fn(J, latent, text, csd, t_int, noise):
+    def _z(noisy, v_pred, alpha, sigma):
+        return _l2(proj(reconstruct_x0(noisy, v_pred, alpha, sigma).astype(mx.float32)))
+
+    # ── the two DECOUPLED rows. Each is a batch-1 forward/backward; grads are summed. ──────────
+    def loss_a(J, noisy, text, s_a, s_b, t_int, alpha, sigma, v_target):
+        v = _forward_vpred(J.flux, J.csd_mod, noisy, text, s_a, t_int, guidance, ckpt_d, ckpt_s)
+        l_recon = mx.mean((v.astype(mx.float32) - v_target.astype(mx.float32)) ** 2)
+        return l_recon + lambda_c * 0.5 * pair_row_ce(_z(noisy, v, alpha, sigma), s_a, s_b, tau)
+
+    def loss_b(J, noisy, text, s_a, s_b, t_int, alpha, sigma):
+        v = _forward_vpred(J.flux, J.csd_mod, noisy, text, s_b, t_int, guidance, ckpt_d, ckpt_s)
+        return lambda_c * 0.5 * pair_row_ce(_z(noisy, v, alpha, sigma), s_b, s_a, tau)
+
+    def loss_recon_only(J, noisy, text, csd, t_int, v_target):
+        v = _forward_vpred(J.flux, J.csd_mod, noisy, text, csd, t_int, guidance, ckpt_d, ckpt_s)
+        return mx.mean((v.astype(mx.float32) - v_target.astype(mx.float32)) ** 2)
+
+    lg_a = nn.value_and_grad(joint, loss_a)
+    lg_b = nn.value_and_grad(joint, loss_b)
+    lg_r = nn.value_and_grad(joint, loss_recon_only)
+
+    def train_step(latent, text, s_a, s_b, t_int, noise, drop_style):
         alpha, sigma = get_schedule_values(t_int)
         noisy, v_target = fused_flow_noise(latent, noise, alpha, sigma)
-        v_pred = _forward_vpred(J.flux, J.csd_mod, noisy, text, csd, t_int, ckpt_d, ckpt_s, guidance)
-        l_recon = mx.mean((v_pred.astype(mx.float32) - v_target.astype(mx.float32)) ** 2)
-        x0 = reconstruct_x0(noisy, v_pred, alpha, sigma)
-        s_pred = _l2(style_stats(x0))                       # [B, 2C]
-        s_tgt = _l2(style_stats(latent.astype(mx.float32)))  # [B, 2C]
-        logits = (s_pred @ s_tgt.T) / tau                    # [B, B]
-        labels = mx.arange(latent.shape[0])
-        l_con = mx.mean(nn.losses.cross_entropy(logits, labels))
-        return l_recon + lambda_c * l_con
+        if drop_style:
+            # CFG dropout: no reference at all -> the contrastive is undefined; pure recon.
+            l, g = lg_r(joint, noisy, text, mx.zeros_like(s_a), t_int, v_target)
+            mx.eval(g)
+            la, lb = float(l), 0.0
+        else:
+            l_a, g_a = lg_a(joint, noisy, text, s_a, s_b, t_int, alpha, sigma, v_target)
+            mx.eval(g_a, l_a)                       # execute + free pass A's graph before pass B
+            l_b, g_b = lg_b(joint, noisy, text, s_a, s_b, t_int, alpha, sigma)
+            mx.eval(g_b, l_b)
+            g = tree_map(lambda x, y: x + y, g_a, g_b)   # rows decouple -> gradients add
+            la, lb = float(l_a), float(l_b)
+        g, gn = optim.clip_grad_norm(g, max_norm=grad_clip)
+        opt.update(joint, g)
+        mx.eval(joint.trainable_parameters(), opt.state)
+        return la, lb, float(gn)
 
-    lg = nn.value_and_grad(joint, loss_fn)
-
-    def train_step(latent, text, csd, t_int, noise):
-        loss, grads = lg(joint, latent, text, csd, t_int, noise)
-        grads, gn = optim.clip_grad_norm(grads, max_norm=grad_clip)
-        opt.update(joint, grads)
-        mx.eval(joint.trainable_parameters(), opt.state, loss)
-        return float(loss), float(gn)
-
-    def collapse_metric(latent, text, csd):
-        """Fixed CONTENT (sample 0), vary the reference across the batch's B CSDs → cross-ref x0 corr.
-        Low (<~0.9) = the reference finally changes the output (collapse broken)."""
-        Bn = latent.shape[0]
-        t_int = mx.full((Bn,), 600, dtype=mx.int32)
+    def diagnostics(latent, text, s_a, s_b):
+        """Fixed CONTENT, two references, no gradients. Returns the three honest reads:
+        (1) foreign-row accuracy — EXACTLY 0.5 under collapse (the rows' accuracies sum to 1);
+        (2) cross-ref x0 correlation — < 0.90 = collapse broken;
+        (3) the pair term itself — >= ln2 for ANY reference-blind model, so falling below ln2 is
+            the unambiguous proof the reference is being used (test_pair_contrastive.py)."""
+        t_int = mx.full((1,), 850, dtype=mx.int32)
         alpha, sigma = get_schedule_values(t_int)
-        l0 = mx.broadcast_to(latent[0:1], latent.shape)
         mx.random.seed(1234)
-        noise0 = mx.broadcast_to(mx.random.normal(latent[0:1].shape), latent.shape)
-        t0b = mx.broadcast_to(text[0:1], text.shape)
-        noisy, _ = fused_flow_noise(l0, noise0, alpha, sigma)
-        v = _forward_vpred(flux, csd_mod, noisy, t0b, csd, t_int, ckpt_d, ckpt_s, guidance)
-        x0 = np.array(reconstruct_x0(noisy, v, alpha, sigma).astype(mx.float32))
-        cc = []
-        for i in range(Bn):
-            for j in range(i + 1, Bn):
-                a, b = x0[i].ravel(), x0[j].ravel()
-                a, b = a - a.mean(), b - b.mean()
-                d = np.sqrt((a * a).sum() * (b * b).sum())
-                cc.append(float((a * b).sum() / d) if d > 0 else 0.0)
-        return float(np.mean(cc)), float(np.max(cc))
+        noisy, _ = fused_flow_noise(latent, mx.random.normal(latent.shape), alpha, sigma)
+        v_a = _forward_vpred(flux, csd_mod, noisy, text, s_a, t_int, guidance, ckpt_d, ckpt_s)
+        v_b = _forward_vpred(flux, csd_mod, noisy, text, s_b, t_int, guidance, ckpt_d, ckpt_s)
+        x0_a = reconstruct_x0(noisy, v_a, alpha, sigma).astype(mx.float32)
+        x0_b = reconstruct_x0(noisy, v_b, alpha, sigma).astype(mx.float32)
+        z_a, z_b = _l2(proj(x0_a)), _l2(proj(x0_b))
+        acc_a = float(mx.sum(z_a * s_a) > mx.sum(z_a * s_b))
+        acc_b = float(mx.sum(z_b * s_b) > mx.sum(z_b * s_a))
+        pair = float(0.5 * (pair_row_ce(z_a, s_a, s_b, tau) + pair_row_ce(z_b, s_b, s_a, tau)))
+        a, b = np.array(x0_a).ravel(), np.array(x0_b).ravel()
+        a, b = a - a.mean(), b - b.mean()
+        d = np.sqrt((a * a).sum() * (b * b).sum())
+        corr = float((a * b).sum() / d) if d > 0 else 0.0
+        return 0.5 * (acc_a + acc_b), corr, float(mx.sum(z_a * z_b)), pair
 
-    # ── data ──────────────────────────────────────────────────────────────────
+    # ── data. batch 1 CONTENT; the pair comes from two forwards, not two samples. ─────────────
+    rng = np.random.default_rng(int(dcfg.get("seed") or 0))
+    queue = ForeignRefQueue(size=int(tcfg.get("foreign_queue", 4096)),
+                            max_cos=float(tcfg.get("foreign_max_cos", 0.5)))
     if args.smoke:
-        print("SMOKE: synthetic data — verify the joint loop + contrastive + collapse metric", flush=True)
+        print("SMOKE: synthetic data — verify the split-backward loop + pair loss + diagnostics", flush=True)
         Lh = Lw = bucket[0] // 8
         mx.random.seed(0)
         def batches():
             while True:
-                lat = (mx.random.normal((B, 32, Lh, Lw)) * 0.5).astype(mx.bfloat16)
-                txt = (mx.random.normal((B, 48, 7680)) * 0.1).astype(mx.bfloat16)
-                c = _l2(mx.random.normal((B, 768))).astype(mx.bfloat16)
-                yield lat, txt, c
+                lat = (mx.random.normal((1, 32, Lh, Lw)) * 0.5).astype(mx.bfloat16)
+                txt = (mx.random.normal((1, text_seq, 7680)) * 0.1).astype(mx.bfloat16)
+                yield lat, txt, _l2(mx.random.normal((1, 768))).astype(mx.float32)
     else:
         import glob as _glob
         from ip_adapter.dataset import make_prefetch_loader
         shard_paths = dcfg.get("shard_paths") or sorted(_glob.glob(os.path.join(dcfg["shard_path"], "*.tar")))
         if not shard_paths:
             sys.exit(f"no .tar shards under {dcfg.get('shard_path')}")
-        print(f"  {len(shard_paths)} shard tars (hot); cond_mode=csd, B={B}", flush=True)
+        print(f"  {len(shard_paths)} shard tars (hot); cond_mode=csd, batch 1 content + 2 forwards", flush=True)
         loader = make_prefetch_loader(
-            shard_paths=shard_paths, batch_size=B,
+            shard_paths=shard_paths, batch_size=1,
             qwen3_cache_dir=dcfg.get("qwen3_cache_dir"), vae_cache_dir=dcfg.get("vae_cache_dir"),
             siglip_cache_dir=None, bucket=bucket,
             style_neighbors_db=dcfg.get("style_neighbors_db"),
             cond_mode="csd", csd_cache_dir=dcfg.get("csd_cache_dir"), seed=dcfg.get("seed"))
         def batches():
-            for _img, _cap, text_np, vae_np, csd_np, sref_np, _bhw, _ids in loader:
-                if vae_np is None or text_np is None or csd_np is None:
+            skipped = 0
+            for _img, _cap, text_np, vae_np, _csd_np, sref_np, _bhw, _ids in loader:
+                # 100% CROSS-PAIRED. sref_np is a style-NEIGHBOUR's CSD; the old fallback to the
+                # sample's own CSD made the reference redundant with the target being denoised
+                # (~74% of samples) — precisely the shortcut that produces collapse.
+                if vae_np is None or text_np is None or sref_np is None:
+                    skipped += 1
                     continue
-                latent = _bn_pack(mx.array(vae_np, dtype=mx.bfloat16), bn_m, bn_s)
-                csd = mx.array(sref_np if sref_np is not None else csd_np, dtype=mx.bfloat16)
-                if csd.ndim == 3:
-                    csd = csd.reshape(csd.shape[0], -1)
+                latent = bn_pack(mx.array(vae_np, dtype=mx.bfloat16), bn_m, bn_s)
+                s = mx.array(sref_np, dtype=mx.float32)
+                if s.ndim == 3:
+                    s = s.reshape(s.shape[0], -1)
                 text = _fix_seq(mx.array(text_np, dtype=mx.bfloat16), text_seq)
-                yield latent, text, csd
+                yield latent, text, _l2(s)
+            print(f"  [data] exhausted (skipped {skipped} self-paired/missing)", flush=True)
 
-    # ── train loop ──────────────────────────────────────────────────────────────
-    print(f"training {total} steps (bucket {bucket}, B={B}, lr {lr}, λ_con {lambda_c}, τ {tau}, "
-          f"high-noise bias {t_bias}) ...", flush=True)
-    t0 = time.time(); step = 0
-    for latent, text, csd in batches():
+    print(f"training {total} steps (bucket {bucket}, batch-1 x 2 passes, lr {lr}, λ_c {lambda_c}, "
+          f"τ {tau}, t∈[{t_lo},{t_hi}]) ...", flush=True)
+    print(f"  reference-blind floor on the pair term = λ·ln2 = {lambda_c*LN2:.4f}", flush=True)
+    t0 = time.time(); step = 0; no_foreign = 0
+    for latent, text, s_a in batches():
         if step >= total:
             break
-        if latent.shape[0] < 2:
-            continue  # contrastive needs ≥2
+        s_a_np = np.array(s_a).ravel()
+        got = queue.sample(s_a_np, rng)
+        queue.add(s_a_np)
+        if got is None:                              # queue cold, or no safe foreign ref found
+            no_foreign += 1
+            continue
+        s_b = mx.array(got[0], dtype=mx.float32)[None, :]
+
         opt.learning_rate = sched(step)
-        c = mx.zeros_like(csd) if random.random() < null_prob else csd
-        tv = _sample_t_highbias(t_bias)
-        t_int = mx.full((latent.shape[0],), tv, dtype=mx.int32)
+        tv = int(rng.integers(t_lo, t_hi + 1))
+        t_int = mx.full((1,), tv, dtype=mx.int32)
         noise = mx.random.normal(latent.shape)
-        loss, gn = train_step(latent, text, c, t_int, noise)
+        drop = random.random() < null_prob
+        l_a, l_b, gn = train_step(latent, text, s_a, s_b, t_int, noise, drop)
+
         if step % 20 == 0 or step == total - 1:
             sps = (step + 1) / (time.time() - t0)
-            print(f"  step {step:5d}  loss {loss:.4f}  gnorm {gn:.3f}  lr {opt.learning_rate.item():.2e}"
-                  f"  t {tv}  {sps:.2f} it/s", flush=True)
+            # NOTE: on a CFG-dropout step there is no reference, so the pair term is absent and
+            # loss_b is exactly 0. Tag it — otherwise it reads as a floor violation.
+            tag = "  [null]" if drop else ""
+            print(f"  step {step:5d}  loss_a {l_a:.4f}  loss_b {l_b:.4f}  gnorm {gn:.3f}  "
+                  f"lr {opt.learning_rate.item():.2e}  t {tv}  cos(a,b) {got[1]:.3f}  "
+                  f"{sps:.3f} it/s  peak {mx.get_peak_memory()/2**30:.1f} GB{tag}", flush=True)
         if step > 0 and step % args.diag_every == 0:
-            cm_mean, cm_max = collapse_metric(latent, text, csd)
-            flag = "  <<< COLLAPSE BROKEN" if cm_max < 0.90 else ""
-            print(f"    [collapse] cross-ref x0 corr  mean {cm_mean:.4f}  max {cm_max:.4f}"
-                  f"  (want < 0.90){flag}", flush=True)
+            acc, corr, zcos, pair = diagnostics(latent, text, s_a, s_b)
+            flag = "  <<< COLLAPSE BROKEN" if (corr < 0.90 and pair < LN2) else ""
+            print(f"    [diag] foreign-row acc {acc:.3f} (0.5 = collapse)  cross-ref x0 corr {corr:.4f} "
+                  f"(want < 0.90)  cos(z_a,z_b) {zcos:.4f}  pair {pair:.4f} "
+                  f"(ref-blind floor {LN2:.4f}){flag}", flush=True)
         if step > 0 and step % ckpt_every == 0:
             os.makedirs(ckpt_dir, exist_ok=True)
-            flat = dict(tree_flatten(joint.trainable_parameters()))
             mx.save_safetensors(os.path.join(ckpt_dir, f"joint_probe_{step:07d}.safetensors"),
-                                {k: v for k, v in flat.items()})
+                                dict(tree_flatten(joint.trainable_parameters())))
             print(f"  saved ckpt @ {step}", flush=True)
         step += 1
-    print("DONE", flush=True)
+    print(f"DONE ({no_foreign} steps skipped for want of a foreign ref)", flush=True)
 
 
 if __name__ == "__main__":
