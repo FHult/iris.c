@@ -281,6 +281,54 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🟢 SREF-PAIR-VS-BANK (2026-07-10) — the anti-collapse pressure lives in the FOREIGN-ref row. A negative bank alone does NOT supply it; a content-shared PAIR does. Batch-1 memory still suffices (split backward).
+Second opinion (Fable) independently reached the corrected positive (`z_i` vs `CSD(ref_j)`, not vs the sample's
+own target — see SREF-INFONCE-VOID) and concluded: since the reference-side encoder (CSD) is FROZEN, negatives
+need no gradients, so a precomputed **negative bank** gives full InfoNCE at **batch 1** → "the M1 wall is an
+artifact of the objective, not the hardware." Fable's anti-collapse argument: "a constant output has fixed
+similarities to every `s`; it cannot align with `s_i` better than the negatives." **That argument kills the
+CONSTANT solution but not OUR failure mode**, which is reference-blind yet strongly INPUT-dependent: a good
+denoiser recovers `x̂0 ≈ x0_i`, and `r_i` is a same-STYLE neighbour of `x0_i`, so `CSD(x̂0) ≈ CSD(r_i) = s_i`.
+It wins the bank without ever reading the reference.
+Measured on the REAL CSD index (`sref_eval/style_cache`, 24 shards) + the REAL look-pairing
+(`neighbors.sqlite`), 512 queries, 1023 bank negatives, τ=0.1 (chance CE = ln 1024 = 6.9315):
+| model | Fable's batch-1 bank (correct ref only) | content-shared PAIR, foreign-ref row |
+|---|---|---|
+| REF-AWARE (adopts the handed style) | 0.4665 / acc 99.6% | 0.4342 / acc 99.4% |
+| **REF-BLIND (denoises, ignores ref)** | **1.7766 / acc 98.0%** | **8.0978 / acc 0.0%** |
+| CONSTANT (degenerate) | 8.6923 / acc 0.0% | — |
+| RANDOM | 6.9755 / acc 0.0% | — |
+  • **`cos(CSD(target), CSD(its style-neighbour)) = 0.7526`** — the reference is REDUNDANT with the target the
+    model is already denoising. That single number is why the correct-ref row is nearly free (98% top-1 while
+    fully collapsed — a NEW false-positive trap: bank top-1 accuracy looks great on a collapsed model).
+  • **`cos(CSD(target), CSD(foreign ref)) = 0.1205`** — the FOREIGN-ref row cannot be reached by denoising. It
+    is the only term a reference-blind model cannot satisfy. Pair-only (2-way softmax, chance 0.6931):
+    ref-aware **0.0006** vs ref-blind **3.1660**; the foreign row alone is 0.0006 vs **6.3266**, acc 0%.
+  • Fable's item 6 ("swap loss = a strict special case of the bank; skip as a training objective") is therefore
+    **inverted**: the swap/pair IS the load-bearing term; the bank is the cheap bonus. Fable's item 1 ("the bank
+    dissolves the wall — start here") is necessary-but-not-sufficient.
+  • Bank negatives DILUTE the pair: they are easy (random style), so the softmax is dominated by them and the
+    a-vs-b margin contributes little. Keep the pair as a 2-way (hard-negative) term; add a modest bank
+    separately if at all.
+**THE WALL STILL FALLS, for a different reason.** The two rows DECOUPLE — row A's softmax touches only `z_A`
+plus frozen descriptors, row B's only `z_B`. So the pair is two SEQUENTIAL batch-1 forwards/backwards with
+summed grad trees (Fable's own hygiene item 5b, "split the backward"), i.e. **batch-1 memory, 2× compute** —
+no co-resident batch, no GradCache, no 32 GB graph. The joint-backbone falsification IS M1-feasible.
+Corollaries adopted from Fable (sound, independent of the above): frozen-encoder negatives need no momentum
+encoder (no MoCo staleness); `mx.eval` the grad tree every micro-step or the lazy graph regrows the stall;
+don't `mx.compile` the 25-block training step; keep norms/adaLN/modulation in bf16 if quantizing (4-bit base
+only when 512px or micro-batch >1 is wanted); train the mechanism at 256px, gate at 512px, never below 256.
+**PREREQUISITE (new, unbuilt):** `z = proj(x̂0)` must live in CSD space, but our `style_stats` is AdaIN stats on
+VAE latents — a DIFFERENT space; the two are not comparable. Either decode+CSD inside the graph (~2–3 GB) or
+distil a **latent→CSD projector** offline from the cached `(vae latent, CSD)` pairs we already have
+(`precomputed/vae/v_2232c1` × `universe_csd`, ~200/shard × 1281 shards). The projector is the cheap option and
+is independently useful as an in-loop style metric. **Open tension to resolve with it:** the contrastive needs
+a mid-noise band — at low `t`, `x̂0` is dominated by the input leak (`α²/(α²+σ²)` = 30.8% at t=600) so the model
+cannot move style even if it reads the ref; at high `t`, `x̂0` is mush. Fable says t<0.7; our root cause says
+style is set at HIGH noise. Sweep and measure whether a ref-AWARE oracle can even win row B at each `t`.
+Sims: scratchpad `bank_infonce_test.py`, `pair_vs_bank.py` (throwaway; numbers above are the artifact).
+Nothing trained; no GPU touched.
+
 ### 🟠 SREF-INFONCE-VOID (2026-07-10) — the Stage-0.5 in-batch InfoNCE CANNOT punish reference-blindness. The probe would have returned a FALSE NO-GO.
 Audited `train/lora/probe_joint_contrastive.py:155-159` before spending the (wedged) batched run. The term is
 `logits = l2(style_stats(x0_pred)) @ l2(style_stats(latent)).T / τ`, `labels = arange(B)`. **The reference

@@ -76,13 +76,25 @@ decoupled cross-attention token path can be added later once the mechanism is pr
 
 - `noisy = α·x0 + σ·noise`, `v_target = α·noise − σ·x0` (existing `fused_flow_noise`).
 - `x0_pred = (α·noisy − σ·v_pred)/(α²+σ²)` (existing `predict_x0`, unbiased).
-- **Style descriptor** `s(x) = concat(mean_HW(x), std_HW(x))` per channel → [B, 2C] (AdaIN stats,
-  content-invariant to first order; existing `style_stats`). L2-normalise.
-- **L_recon** = mean_i ‖v_pred_i − v_target_i‖².
-- **L_contrastive (InfoNCE)**: `S[i,j] = s(x0_pred_i)·s(x0_target_j)/τ`; `L = CE(S, diag)`. Each
-  prediction's style must match its OWN target's style more than the other batch members' → a constant
-  output cannot classify → collapse punished.
-- **Total** `L = L_recon + λ_c·L_contrastive` (+ optional `λ_s·gram_style_loss`).
+- **Style descriptor** of an OUTPUT: `z = proj(x0_pred)`, a latent→CSD projector (distilled offline from the
+  cached `(vae latent, CSD)` pairs) so the output's style lives in the SAME space as the reference's `CSD(r)`.
+  L2-normalise. (`style_stats` — AdaIN mean/std on latents — is a DIFFERENT space and is NOT comparable to CSD.)
+- **L_recon** = ‖v_pred_A − v_target‖², on the correct-ref branch only.
+- **L_contrastive — CONTENT-SHARED PAIR (superseded design; see BACKLOG SREF-INFONCE-VOID / SREF-PAIR-VS-BANK).**
+  Forward the SAME noisy latent `x_t` twice: branch A with the correct ref `a` (the target's style-neighbour),
+  branch B with a FOREIGN ref `b`. Two 2-way softmaxes over the frozen descriptors `{CSD(a), CSD(b)}`:
+  `L_c = ½[CE(⟨z_A,·⟩/τ, a) + CE(⟨z_B,·⟩/τ, b)]`.
+  A reference-blind model emits `z_A = z_B` and pays ~full penalty on branch B, which **cannot be reached by
+  denoising** (`cos(CSD(target), CSD(foreign ref)) = 0.12`, vs 0.75 for the correct ref).
+  ⚠ **What does NOT work:** contrasting each prediction against its OWN target
+  (`S[i,j] = s(x0_pred_i)·s(x0_target_j)/τ`) — its minimum is attained by a perfect *reference-blind* denoiser
+  (measured: loss 1.2413 / acc 100% at every `t`). Nor does a correct-ref-only negative bank: a reference-blind
+  model scores 98.0% top-1 against 1023 negatives. The foreign-ref branch is the load-bearing term.
+- **Total** `L = L_recon + λ_c·L_contrastive` (+ optional modest bank of extra negatives; it dilutes the pair,
+  so keep the 2-way hard-negative term primary).
+- **Memory:** the two rows DECOUPLE (each softmax touches only its own `z` + frozen descriptors), so run them
+  as two sequential **batch-1** forward/backward passes and sum the grad trees. Batch-1 memory, 2× compute.
+  No co-resident batch is required — which removes the M1 blocker this plan was written around.
 
 ### The primary anti-collapse diagnostic (in-loop, cheap)
 
@@ -107,8 +119,9 @@ The render+scorecard gate then confirms the change is STYLE (not content-copying
 - **Stage 0 — data.** Precompute CSD for the full corpus (only a 200/shard subset exists as
   `universe_csd`). Build the look-pair index at scale (method already in `neighbors.sqlite`).
 - **Stage 0.5 — CHEAP LOCAL GO/NO-GO (this doc's immediate deliverable).** Test the ONE thing we've never
-  tried: does **in-batch contrastive + trainable backbone** break the collapse? Run at **256 px** (¼ the
-  tokens of 512 px) where **batch 4–8 + LoRA fits on the M1**. ~5–10k steps.
+  tried: does a **content-shared-pair contrastive + trainable backbone** break the collapse? Run at **256 px**
+  as two sequential **batch-1** passes (grads summed) — NOT the batch 4–8 co-resident graph that wedged MLX.
+  Prereq: the latent→CSD projector. ~5–10k steps.
   **GO = in-loop cross-ref `x0` corr < 0.9 AND (render gate) styleCSD Δ beats band-control 0.009 with
   cross-ref output corr < 0.9.** NO-GO = collapses even with in-batch contrastive → the loss-bound verdict
   is ironclad, stop, and we spent ~a day not a cloud budget.

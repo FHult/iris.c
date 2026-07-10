@@ -1,5 +1,16 @@
 # Can we train an "instant style-reference adapter" for Flux.2 on an M1 Max 32 GB? — External-review brief
 
+> **RESOLVED 2026-07-10 — see BACKLOG `SREF-INFONCE-VOID` + `SREF-PAIR-VS-BANK`.** Answer: **yes, locally.**
+> The batch>1 wall was an artifact of the objective. Two corrections to §2/§4 below: (a) the Stage-0.5 InfoNCE
+> as implemented contrasts each prediction against its OWN target, whose minimum is attained by a *reference-
+> blind* denoiser — it had **zero** anti-collapse pressure and would have produced a false NO-GO; (b) a
+> correct-ref-only negative bank (review answer to Q1) also fails — a reference-blind model scores 98.0% top-1
+> against 1023 negatives, because `cos(CSD(target), CSD(its style-neighbour)) = 0.75`. The load-bearing term is
+> the **content-shared pair** (Q6, which the review recommended skipping): same `x_t`, correct ref vs FOREIGN
+> ref; the foreign row is unsatisfiable by denoising (`cos = 0.12`). Its two rows decouple, so it runs as two
+> sequential **batch-1** passes with summed grads — batch-1 memory, 2× compute. Cloud is needed for SCALE
+> (throughput), not for the falsification. The §3 numbers below stand; the §4 questions are answered there.
+
 Self-contained brief for a second opinion (Fable). **The question: is there genuinely NO way to run the
 "expensive" joint-backbone training on consumer hardware (Apple M1 Max, 32 GB unified memory, MLX), or are
 we missing a technique that would make it fit?** Everything needed to reason about it is below; no repo
