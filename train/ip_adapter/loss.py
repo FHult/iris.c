@@ -113,6 +113,70 @@ def style_repulsion_loss(x0_a: mx.array, x0_b: mx.array, margin: float = 1.0) ->
     return mx.maximum(0.0, margin - d2)
 
 
+# ---------------------------------------------------------------------------
+# Content-shared PAIR contrastive (SREF — BACKLOG SREF-INFONCE-VOID / SREF-PAIR-VS-BANK)
+#
+# The ONE loss shape that a reference-blind model cannot satisfy. Forward the SAME noisy latent
+# x_t TWICE: branch A conditioned on the correct reference a (the target's style-neighbour),
+# branch B on a FOREIGN reference b. Each branch's output style must match the reference IT WAS
+# HANDED, in preference to the other branch's.
+#
+# What does NOT work, and why (both measured, 2026-07-10):
+#   • Contrasting each prediction against its OWN target (the old Stage-0.5 InfoNCE). The reference
+#     is not even an argument of that loss; its minimum is attained by a perfect *reference-blind*
+#     denoiser (loss 1.2413, acc 100%, flat in t). Zero anti-collapse pressure.
+#   • A bank of frozen negatives on the correct-ref branch alone. A reference-blind model scores
+#     98.0% top-1 against 1023 negatives, because cos(CSD(target), CSD(its style-neighbour)) = 0.75
+#     — the reference is REDUNDANT with the target the model is already denoising. (Bank top-1
+#     accuracy is therefore a false-positive trap: it reads 98% on a fully collapsed model.)
+# The foreign branch is what closes both holes: cos(CSD(target), CSD(foreign ref)) = 0.12, so it
+# cannot be reached by denoising. Sharing x_t across the two branches also cancels the x0_pred input
+# leak (identical for both, so it cannot discriminate).
+#
+# The two rows DECOUPLE — each softmax touches only its own z plus frozen descriptors — so the
+# caller may run them as two sequential batch-1 forward/backward passes and sum the grad trees.
+# No co-resident batch is required.
+#
+# A bank of extra negatives is deliberately NOT included: they are easy (random style), so they
+# dominate the softmax and dilute the a-vs-b margin that carries the pressure.
+# ---------------------------------------------------------------------------
+
+def pair_contrastive_loss(
+    z_a: mx.array,
+    z_b: mx.array,
+    s_a: mx.array,
+    s_b: mx.array,
+    tau: float = 0.1,
+) -> mx.array:
+    """Two 2-way softmaxes over the frozen reference descriptors {s_a, s_b}.
+
+    z_a, z_b: [B, D] L2-normalised proj(x0_pred) for the correct-ref / foreign-ref branch.
+    s_a, s_b: [B, D] L2-normalised CSD(ref_a) / CSD(ref_b). Frozen — no gradient.
+
+    L = ½·mean[ softplus(−d_A) + softplus(−d_B) ],
+        d_A = (⟨z_a,s_a⟩ − ⟨z_a,s_b⟩)/τ,   d_B = (⟨z_b,s_b⟩ − ⟨z_b,s_a⟩)/τ
+
+    EXACT ANTI-COLLAPSE PROPERTY (what makes this testable): a reference-blind model emits
+    z_a = z_b = z, hence d_B = −d_A, hence L = ½[softplus(−d) + softplus(d)] ≥ ln 2 = 0.6931 for
+    every z, with equality iff d = 0. So ln 2 is a HARD FLOOR for any reference-blind model, while a
+    reference-aware one drives L → 0. `test_pair_contrastive.py` asserts exactly this.
+    """
+    d_a = (mx.sum(z_a * s_a, axis=1) - mx.sum(z_a * s_b, axis=1)) / tau
+    d_b = (mx.sum(z_b * s_b, axis=1) - mx.sum(z_b * s_a, axis=1)) / tau
+    # softplus(-d) == cross-entropy of a 2-way softmax whose positive logit leads by d
+    ce = mx.logaddexp(mx.zeros_like(d_a), -d_a) + mx.logaddexp(mx.zeros_like(d_b), -d_b)
+    return 0.5 * mx.mean(ce)
+
+
+def pair_row_accuracy(z: mx.array, s_pos: mx.array, s_neg: mx.array) -> mx.array:
+    """Fraction of a branch's outputs closer to the reference it was handed than to the other's.
+
+    The honest in-loop collapse diagnostic. For a reference-blind model z_a = z_b, so the two rows'
+    accuracies sum to exactly 1 (one row is right iff the other is wrong) → their mean is 0.5,
+    chance. Read this, NOT a bank's top-1 accuracy, which reads ~98% on a collapsed model."""
+    return mx.mean((mx.sum(z * s_pos, axis=1) > mx.sum(z * s_neg, axis=1)).astype(mx.float32))
+
+
 def vproj_rank_penalty(W: mx.array, u: mx.array, eps: float = 1e-8):
     """Rank-promoting spectral penalty on the stacked V-injection weights to_v_ip — the direct
     symptom fix for the Step-1A.1 finding (to_v_ip stable_rank ~6 -> V near-constant across
