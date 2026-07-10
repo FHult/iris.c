@@ -281,6 +281,37 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🟢 SREF-LATENT-CSD-PROJ (2026-07-10) — latent→CSD projector TRAINED and PASSES its gate. The contrastive's `t` band is [700, 950], NOT Fable's `t<0.7`.
+Built the prerequisite for the content-shared-pair contrastive (SREF-PAIR-VS-BANK): `z = proj(x0_pred)` must
+live in CSD space so it can be compared to the frozen `CSD(ref)`. `LatentCSDProjector`
+(`train/ip_adapter/latent_csd.py`, 4.46 M params, conv + multi-scale mean/std pool → 768-d, L2-normed)
+distilled from the ~104k cached `(vae latent, CSD)` pairs (`precomputed/vae/v_2232c1` × `universe_csd`,
+520 populated shards). 20 000 steps, batch 64, ~9 it/s, ~35 min, no 4B DiT in the loop.
+Trainer `train/lora/train_latent_csd_projector.py`; ckpt `/Volumes/2TBSSD/checkpoints/latent_csd/`.
+  • Held-out `cos(proj, CSD)` = **0.8353** full-res (64×64 latent), **0.7936** at a 32×32 crop (the 256px
+    training resolution) — resolution-agnostic as designed.
+  • **GEOMETRY GATE PASSED (the real one):** `cos(proj(target), CSD(style-neighbour))` **0.7151** vs
+    `cos(proj(target), CSD(foreign))` **0.1423** → separation **0.5728**, i.e. **90% of the true-CSD
+    separation (0.6332)** retained. The pair loss has the gap it needs to push on.
+  • **Val cosine is NOT a sufficient gate — it has the same collapse shape one level down.** At 20 smoke
+    steps the projector scored a respectable val cosine **0.44** while retaining **0%** of the separation:
+    it was emitting the mean CSD direction. Always read the geometry check.
+**NOISE BAND RESOLVED (`debug/sref_noise_band.py`).** Fable's review said restrict the contrastive to
+`t < 0.7` because "x0_pred is mush at high noise". Both halves of that are wrong here:
+  • *Analytic.* `x0_pred = (α·noisy − σ·v_pred)/(α²+σ²)`, so the INPUT pins `leak = α²/(α²+σ²)` of it and
+    the model's authority is `∂x0_pred/∂v_pred = σ/(α²+σ²)`. leak/gain: t=300 → 84.5%/0.517;
+    t=400 → 69.2%/0.769; t=600 → 30.8%/1.154; **t=700 → 15.5%/1.207 (peak authority)**; t=900 → 1.2%/1.098.
+    **Below t≈400 the model CANNOT move style even if it reads the reference** — the contrastive has no lever
+    exactly where Fable would put it.
+  • *Empirical.* Readability of `proj(x0_pred)` is **flat in t**: separation at a realistic `v_pred` error
+    (e=0.5) is 0.6608 @t300 vs **0.6499 @t900** (−1.6%). `x0_pred` is LINEAR in `v_pred`, so a competent model
+    can emit any `x0_pred`; "mush at high noise" is a warmup concern about an untrained `v_pred`, not a
+    structural bound. The only real trade-off shows at e=0.75, where the minimum is **at t=700** (0.5897) —
+    peak authority also amplifies `v_pred` error most — recovering to 0.6089 @t900.
+  • **→ Sample `t ∈ [700, 950]`, centred ~850** (leak ≤5.9%, authority 1.05–1.21, best in-band readability).
+    Consistent with the SREF-STYLE-CFG-PROBE root cause (style is set at high noise), against Fable's item 4/§
+    "restrict to low/mid noise".
+
 ### 🟢 SREF-PAIR-VS-BANK (2026-07-10) — the anti-collapse pressure lives in the FOREIGN-ref row. A negative bank alone does NOT supply it; a content-shared PAIR does. Batch-1 memory still suffices (split backward).
 Second opinion (Fable) independently reached the corrected positive (`z_i` vs `CSD(ref_j)`, not vs the sample's
 own target — see SREF-INFONCE-VOID) and concluded: since the reference-side encoder (CSD) is FROZEN, negatives

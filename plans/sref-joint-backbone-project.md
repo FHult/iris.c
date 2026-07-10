@@ -47,9 +47,12 @@ Four levers, applied together. The first is the one we have literally never been
 2. **Trainable backbone (LoRA r64–128, or full FT on cloud).** Gives the model the lever to actually
    change its style behaviour so the contrastive/style terms have something to push. (Not the frozen
    backbone; not the tiny r16 that failed.)
-3. **High-noise-biased timestep sampling.** Global style is set at high noise, where the noised latent
-   carries little info and conditioning MUST be used. Bias `t` sampling toward high noise so the
-   style-use gradient lands where the model can't cheat.
+3. **High-noise-biased timestep sampling — sample `t ∈ [700, 950]`, centred ~850.** Measured
+   (`debug/sref_noise_band.py`, BACKLOG SREF-LATENT-CSD-PROJ): the input pins `α²/(α²+σ²)` of `x0_pred`
+   (84.5% at t=300, 15.5% at t=700, 1.2% at t=900) and the model's authority `σ/(α²+σ²)` peaks at t≈700.
+   Below t≈400 the model CANNOT move style even if it reads the reference — the contrastive has no lever
+   there. Readability of `proj(x0_pred)` is flat in `t` (−1.6% from t=300 to t=900), so there is no
+   high-noise penalty to trade against.
 4. **Style-space loss + CFG dropout.** A CSD/Gram/AdaIN-stats term alongside reconstruction (rewarded now
    because the backbone can move); style-condition dropout so inference-time CFG can amplify the (now
    organised) style signal — the amplifier experiment A found was missing.
