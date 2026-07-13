@@ -168,6 +168,17 @@ int iris_load_lora(iris_ctx *ctx, const char *path, float scale);
 void iris_unload_lora(iris_ctx *ctx);
 
 /*
+ * SREF joint-backbone style adapter: FiLM a reference image's CSD style vector into the DiT
+ * timestep modulation. Pair with iris_load_lora(<joint_lora>) for the full adapter.
+ *   csdmod_path : csd_mod.safetensors (the CSDModulation MLP weights, from export_joint_to_c.py)
+ *   csd         : the reference's L2-normalised CSD embedding [csd_dim] (computed upstream)
+ *   scale       : style strength (0.85 default; 0 = off). See BACKLOG STYLE-SCALE RESULT.
+ * Returns 0 on success, -1 on error.
+ */
+int iris_set_sref_csd(iris_ctx *ctx, const char *csdmod_path,
+                      const float *csd, int csd_dim, float scale);
+
+/*
  * Load an IP-Adapter bundle (export_adapter.py output) with precomputed SigLIP
  * features (raw f32 [n, siglip_dim] file) and attach it to the Flux transformer.
  * Image-conditioned generation runs on the CPU block path while attached

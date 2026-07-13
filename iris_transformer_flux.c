@@ -343,6 +343,15 @@ typedef struct iris_transformer {
      * gamma>1 amplifies the influence of the reference tokens. GPU (Metal) path only. */
     float sref_strength;              /* input: gamma; 1.0 = off */
 
+    /* SREF joint-backbone: CSDModulation temb delta. When non-NULL, csd_delta[hidden] (already
+     * multiplied by the style strength) is added to the timestep embedding every step — the FiLM
+     * style injection (iris_csdmod.c). NULL = off (default; bit-identical). Owned by tf. */
+    float *csd_delta;
+    /* Style-CFG: when 1, the csd_delta injection is SKIPPED for this forward. The CFG sampler raises
+     * it for the unconditional pass so the style lives only in v_cond → CFG AMPLIFIES the style
+     * (v = v_u + g*(v_c - v_u)) instead of cancelling it. Default 0 (single-forward paths apply it). */
+    int csd_skip;
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     #define MAX_TF_SHARDS 4
@@ -3957,6 +3966,10 @@ float *iris_transformer_forward(iris_transformer_t *tf,
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    /* SREF joint-backbone: FiLM the CSD style delta into temb (temb += style_scale*csd_mod(csd)).
+     * Precomputed once per generation, const across steps; flows through t_emb_silu into every
+     * block's adaLN + final norm. NULL = off (default; bit-identical). */
+    if (tf->csd_delta && !tf->csd_skip) { for (int i = 0; i < hidden; i++) t_emb[i] += tf->csd_delta[i]; }
 
     /* Get cached 2D RoPE frequencies for image tokens */
     float *img_rope_cos, *img_rope_sin;
@@ -4456,6 +4469,10 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    /* SREF joint-backbone: FiLM the CSD style delta into temb (temb += style_scale*csd_mod(csd)).
+     * Precomputed once per generation, const across steps; flows through t_emb_silu into every
+     * block's adaLN + final norm. NULL = off (default; bit-identical). */
+    if (tf->csd_delta && !tf->csd_skip) { for (int i = 0; i < hidden; i++) t_emb[i] += tf->csd_delta[i]; }
 
     /* Get cached combined RoPE for img2img (target + reference) */
     float *combined_rope_cos, *combined_rope_sin;
@@ -4688,6 +4705,10 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    /* SREF joint-backbone: FiLM the CSD style delta into temb (temb += style_scale*csd_mod(csd)).
+     * Precomputed once per generation, const across steps; flows through t_emb_silu into every
+     * block's adaLN + final norm. NULL = off (default; bit-identical). */
+    if (tf->csd_delta && !tf->csd_skip) { for (int i = 0; i < hidden; i++) t_emb[i] += tf->csd_delta[i]; }
 
     /* Allocate combined RoPE arrays */
     float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
@@ -5030,6 +5051,7 @@ void iris_transformer_free(iris_transformer_t *tf) {
     free(tf->ip_embeds);
     free(tf->ip_q_scratch);
     free(tf->ip_kv_scratch);
+    free(tf->csd_delta);   /* SREF joint-backbone CSDModulation temb delta */
 
     /* In mmap mode, bf16 pointers point into the mmap'd file region and must
      * NOT be freed. Clean up any cached block weights first, then only NULL
@@ -5179,6 +5201,20 @@ int iris_transformer_num_single_layers(iris_transformer_t *tf) { return tf->num_
 void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora) {
     lora_free(tf->lora);
     tf->lora = lora;
+}
+
+/* SREF joint-backbone: set the CSDModulation temb delta (already style-scaled). Takes ownership
+ * of `delta` (freed on next set / on transformer free). NULL = off. */
+void iris_transformer_set_csd_delta(iris_transformer_t *tf, float *delta) {
+    if (!tf) return;
+    free(tf->csd_delta);
+    tf->csd_delta = delta;
+}
+
+/* Style-CFG: the CFG sampler raises this for the unconditional forward so the CSD style delta is
+ * applied ONLY in v_cond → CFG amplifies rather than cancels the style. */
+void iris_transformer_set_csd_skip(iris_transformer_t *tf, int skip) {
+    if (tf) tf->csd_skip = skip;
 }
 
 /* SREF Phase-1: set the K-side reference RoPE band-control scales (1.0/1.0 = off).

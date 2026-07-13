@@ -13,6 +13,7 @@
 #include "iris_qwen3.h"
 #include "iris_lora.h"
 #include "iris_ip_adapter.h"
+#include "iris_csdmod.h"
 #include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,7 @@ extern int iris_transformer_hidden_size(iris_transformer_t *tf);
 extern int iris_transformer_num_double_layers(iris_transformer_t *tf);
 extern int iris_transformer_num_single_layers(iris_transformer_t *tf);
 extern void iris_transformer_set_lora(iris_transformer_t *tf, lora_state_t *lora);
+extern void iris_transformer_set_csd_delta(iris_transformer_t *tf, float *delta);
 extern void iris_transformer_set_sref_bands(iris_transformer_t *tf, float shf, float slf);
 extern void iris_transformer_set_sref_strength(iris_transformer_t *tf, float gamma);
 #ifdef USE_METAL
@@ -484,6 +486,39 @@ int iris_load_lora(iris_ctx *ctx, const char *path, float scale) {
 void iris_unload_lora(iris_ctx *ctx) {
     if (!ctx || !ctx->transformer) return;
     iris_transformer_set_lora(ctx->transformer, NULL);
+}
+
+/* SREF joint-backbone: attach the CSDModulation style injection. Loads the csd_mod MLP
+ * (csdmod_path), runs it on the reference's L2-normalised CSD vector `csd` [csd_dim], scales the
+ * resulting temb delta by `scale`, and hands it to the transformer (temb += delta each step).
+ * csdmod_path==NULL or scale==0 clears it (off). Returns 0 on success, -1 on failure. */
+int iris_set_sref_csd(iris_ctx *ctx, const char *csdmod_path,
+                      const float *csd, int csd_dim, float scale) {
+    if (!ctx) return -1;
+    if (!iris_load_transformer_if_needed(ctx)) return -1;
+    /* off / clear */
+    if (!csdmod_path || !*csdmod_path || !csd || scale == 0.0f) {
+        iris_transformer_set_csd_delta(ctx->transformer, NULL);
+        return 0;
+    }
+    csd_mod_t m;
+    if (csd_mod_load(&m, csdmod_path)) return -1;
+    if (m.csd_dim != csd_dim ||
+        m.hidden_dim != iris_transformer_hidden_size(ctx->transformer)) {
+        fprintf(stderr, "iris_set_sref_csd: dim mismatch (csd %d/%d, hidden %d/%d)\n",
+                m.csd_dim, csd_dim, m.hidden_dim, iris_transformer_hidden_size(ctx->transformer));
+        csd_mod_free(&m);
+        return -1;
+    }
+    float *delta = malloc((size_t)m.hidden_dim * sizeof(float));
+    float *work  = malloc((size_t)m.mlp_dim * sizeof(float));
+    if (!delta || !work) { free(delta); free(work); csd_mod_free(&m); return -1; }
+    csd_mod_forward(&m, csd, delta, work);
+    for (int i = 0; i < m.hidden_dim; i++) delta[i] *= scale;
+    free(work);
+    csd_mod_free(&m);
+    iris_transformer_set_csd_delta(ctx->transformer, delta);  /* takes ownership */
+    return 0;
 }
 
 /* Load an IP-Adapter bundle (export_adapter.py output) + precomputed SigLIP

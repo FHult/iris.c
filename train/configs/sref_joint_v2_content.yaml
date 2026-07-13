@@ -1,0 +1,37 @@
+# SREF joint-backbone v2 — CONTENT-ADHERENCE tuning on the EXPANDED data.
+# Baseline v1 (sref_joint_probe_v1.yaml) PASSED the Stage-0.5 gate (BACKLOG SREF-JOINT-STAGE0.5) but
+# over-weights style: promptAdh 0.19, the subject is only faintly legible. v2 rebalances toward content
+# and prepares style-CFG, on the full 22-shard CSD coverage (~100k pairs vs 16,656).
+model:
+  flux_model_dir: flux-klein-4b-base
+adapter:
+  lora_rank: 64                                 # unchanged from the passing baseline for clean attribution
+  projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors
+data:
+  bucket: [256, 256]
+  text_seq: 128
+  shard_path: /Volumes/2TBSSD/baseline_pool_hot
+  vae_cache_dir:   /Volumes/2TBSSD/precomputed/vae_sref256px    # EXPANDED to full 5000/shard
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443   # already full 5000/shard
+  csd_cache_dir:   /Volumes/2TBSSD/universe_csd_full            # EXPANDED to full 5000/shard -> ~100k usable pairs
+  style_neighbors_db: /Volumes/2TBSSD/sref_eval/style_cache/neighbors.sqlite
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+  num_steps: 10000
+  contrastive_weight: 1.0                        # keep the load-bearing pair term at full strength
+  infonce_tau: 0.1
+  t_range: [200, 950]                            # WIDER (was [700,950]): low/mid-noise steps practice CONTENT
+                                                 #   (below ~400 the input pins x0_pred, so those steps train recon,
+                                                 #    which is exactly the content signal the v1 render lacked)
+  foreign_queue: 4096
+  foreign_max_cos: 0.5
+  null_style_prob: 0.25                          # UP (was 0.1): train the unconditional path so the null baseline
+                                                 #   isn't degenerate AND style-CFG becomes usable at inference
+  grad_checkpoint: true
+  grad_clip: 1.0
+  weight_decay: 0.01
+  checkpoint_every: 1000
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_joint_v2_content
+  guidance: 3.5

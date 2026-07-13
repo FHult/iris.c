@@ -66,6 +66,53 @@
   - **Impact:** warmup-run2 (and any prior IP-adapter training) was in the wrong space and was
     restarted after this fix.
 
+- **VAE-RES-1: cached-mode training silently no-ops when `data.bucket` resolution ≠ VAE-cache
+  resolution — presents as "dies at step 0," not an error. FIXED 2026-07-10.** (A live violation
+  of CLAUDE.md Training-Pipeline-Invariant #1, the precompute↔train resolution contract.)
+  - **Symptom:** the SREF Stage-0.5 probe (`train/lora/probe_joint_contrastive.py`, config
+    `sref_joint_probe_v1.yaml`) loaded model/LoRA/projector/dataset, printed the
+    `training 8000 steps` banner, then logged **zero step lines** and ran indefinitely. No error,
+    no `sample_q timeout`, no crash. Three launches wedged identically (one the operator believed
+    they had "interrupted" — they hadn't; it never trained). Signature: GPU util oscillating
+    then idle, dataset **worker threads pegged in pure-Python** `_PyEval_EvalFrameDefault`
+    (from a `sample` stack dump — no py-spy needed, py-spy needs root on macOS), RSS churning,
+    ~24 min with no step.
+  - **Root cause:** config pinned `data.bucket: [256, 256]` → the loader requests a VAE latent
+    with `expected_hw=(H/8,W/8)=(32,32)`, but the only VAE cache (`precomputed/vae/v_2232c1`)
+    held **512px** latents, shape **(32, 64, 64)**. `dataset._load_vae_latent(expected_hw=...)`
+    rejects any latent whose spatial shape ≠ expected (returns `None`), so the probe's loop hits
+    `if vae_np is None: skipped += 1; continue` for **100% of samples**. `step` never advances;
+    the worker spins forever decoding JPEGs and rejecting them. In cached mode there is no live-VAE
+    fallback, so the mismatch is an unrecoverable silent per-sample skip — and because the step
+    line prints only *after* the first `train_step` returns (which never happens), and the long
+    first-MLX-compile window overlaps, it masquerades as "died at step 0 / interrupted training."
+  - **Diagnosis path (fast next time):** step banner printed but no step 0 + loader worker threads
+    hot in Python + GPU idle ⇒ ~100% sample-skip. Check `_load_vae_latent`'s `expected_hw` against
+    the ACTUAL npz shape (`np.load(...)['latent'].shape`) BEFORE suspecting a compile hang.
+  - **Fix:** precomputed 256px VAE latents for the probe's 22 hot shards — first **200/shard**
+    (the deterministic tar-order subset that exactly matches the `universe_csd` CSD subset;
+    verified ID-for-ID), **4,400 latents**, VAE-only (`precompute_all.py --image-size 256
+    --subsample-per-shard 200`, qwen3 model load auto-skipped because its cache was already
+    complete; ~3 min at ~0.04 s/img). Written to an **isolated sibling dir**
+    `precomputed/vae_sref256px/` — deliberately OUTSIDE the managed `precomputed/vae/` tree so
+    `cache_manager --clear-stale vae` (which `shutil.rmtree`s every non-`current` version dir, and
+    `current → v_21e5b5` is empty) can never sweep it and it can't be confused with the 512px
+    `v_2232c1`; a `README.md` in the dir records resolution/source/teacher/consumer. Reverted the
+    config to `bucket: [256,256]` + `vae_cache_dir → precomputed/vae_sref256px`.
+  - **Why not just run at 512px (to match the cache):** it runs (samples flow, step 0 executes) but
+    peaks **23.6 GB** on this **32 GB** machine → **11.5 GB swap, ~70 s/step, ~6 days** for 8000
+    steps. Every major memory lever is already spent (per-block grad checkpointing = finest;
+    `mx.fast.scaled_dot_product_attention` = no seq² scores; two passes freed between each other
+    via `mx.eval`; guidance is a single-forward embedding not CFG; f16 weights) — only ~1 GB of
+    small levers (bf16 optimizer, r64→r32) against a ~4 GB gap. Metal buffers are wired, so the
+    23.6 GB allocation forces the OS to page everything else out. The plan (`plans/
+    sref-joint-backbone-project.md` §4) specified 256px precisely for this reason.
+  - **Validation:** 256px verify run steps cleanly — peak **16.0–16.6 GB**, ~**5.5 s/step**, step
+    lines and diagnostics flowing; full 8000-step probe launched (ETA ~12 h).
+  - **Prevention idea (BACKLOG candidate):** the loader should emit a one-time WARNING when the
+    running skip-rate is ~100% over the first K samples — a silent no-op reads as a hang and cost
+    hours here (and previously under Invariant #1). Cheap counter on `_load_vae_latent`-None.
+
 ## Pipeline Bugs (Fixed)
 
 - **PIPE-1: Multi-chunk precomputed file collision** — When chunks 2–4 ran `build_shards.py`

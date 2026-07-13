@@ -1179,6 +1179,9 @@ int main(int argc, char *argv[]) {
         {"sref-shf",         required_argument, 0, 273},
         {"sref-slf",         required_argument, 0, 274},
         {"sref-strength",    required_argument, 0, 275},
+        {"sref-csdmod",      required_argument, 0, 276},
+        {"sref-csd",         required_argument, 0, 277},
+        {"sref-scale",       required_argument, 0, 278},
         {0, 0, 0, 0}
     };
 
@@ -1220,6 +1223,9 @@ int main(int argc, char *argv[]) {
     char *ip_features = NULL;     /* --ip-features: raw f32 SigLIP features file */
     float ip_scale = 1.0f;        /* --ip-scale: multiplier on trained ip_scale */
     char *ip_schedule = NULL;     /* --ip-schedule: none|late:F|early:F (DP-7) */
+    char *sref_csdmod_path = NULL; /* --sref-csdmod: CSDModulation MLP weights (joint adapter) */
+    char *sref_csd_path = NULL;    /* --sref-csd: reference CSD vector [csd_dim] f32 */
+    float sref_scale = 0.85f;      /* --sref-scale: style strength (BACKLOG STYLE-SCALE RESULT) */
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -1272,6 +1278,9 @@ int main(int argc, char *argv[]) {
             case 273: params.sref_rope_shf = (float)atof(optarg); break;  /* SREF band-control high-freq scale */
             case 274: params.sref_rope_slf = (float)atof(optarg); break;  /* SREF band-control low-freq scale */
             case 275: params.sref_strength = (float)atof(optarg); break;  /* SREF strength bias gamma */
+            case 276: sref_csdmod_path = optarg; break;   /* SREF joint-backbone: CSDModulation weights */
+            case 277: sref_csd_path = optarg; break;      /* SREF joint-backbone: reference CSD vector */
+            case 278: sref_scale = (float)atof(optarg); break; /* SREF joint-backbone: style strength */
             case 'N': params.negative_prompt = optarg; break;
             case 265: vary_from = optarg; break;
             case 266: params.img2img_strength = 0.2f; break;
@@ -1416,6 +1425,30 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "\nWarning: Failed to load LoRA from %s\n", lora_path);
         } else {
             LOG_NORMAL(" done\n");
+        }
+    }
+
+    /* SREF joint-backbone: attach the CSDModulation style injection (pair with --lora <joint_lora>).
+     * Reads the reference's CSD vector [csd_dim] f32 from --sref-csd and FiLMs it into temb. */
+    if (sref_csd_path) {
+        FILE *cf = fopen(sref_csd_path, "rb");
+        if (!cf) {
+            fprintf(stderr, "Error: cannot open --sref-csd %s\n", sref_csd_path);
+        } else {
+            fseek(cf, 0, SEEK_END); long sz = ftell(cf); fseek(cf, 0, SEEK_SET);
+            int n = (sz > 0) ? (int)(sz / (long)sizeof(float)) : 0;
+            float *csd = (n > 0) ? malloc((size_t)n * sizeof(float)) : NULL;
+            if (csd && fread(csd, sizeof(float), (size_t)n, cf) == (size_t)n) {
+                if (iris_set_sref_csd(ctx, sref_csdmod_path, csd, n, sref_scale) != 0)
+                    fprintf(stderr, "Warning: failed to attach SREF CSD modulation\n");
+                else
+                    LOG_NORMAL("SREF: CSD style modulation attached (scale=%.2f, csd_dim=%d)\n",
+                               sref_scale, n);
+            } else {
+                fprintf(stderr, "Error: bad --sref-csd file %s (%d floats)\n", sref_csd_path, n);
+            }
+            free(csd);
+            fclose(cf);
         }
     }
 

@@ -281,6 +281,107 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🟢 SREF-JOINT-C-PORT (2026-07-13) — adapter reimplemented in C AND WORKING via STYLE-CFG. Generic style adapter now runs in the shipped iris/Metal engine + discriminates references at the pixel level.
+**RESOLVED via style-CFG (option 3).** csd_delta is injected ONLY in the conditional forward
+(`iris_sample.c` raises `tf->csd_skip` on the uncond pass via `iris_transformer_set_csd_skip`), so
+`v = v_u + g(v_c − v_u)` AMPLIFIES the style instead of cancelling it. Result @512px, prompt "a robot
+standing in a desert", seed 7: strong content (crisp robot from prompt-CFG) + reference-specific style,
+α-controlled. **Discrimination proven:** woodcut ref → dark monochrome ink on paper; impressionism ref →
+light silvery painterly shimmer — SAME seed/prompt, visibly different styles. **α range shifts DOWN** (CFG
+~g× amplifies): usable 0.2–0.4, over-amplifies to blank by 0.85; sweet spot **α≈0.35–0.4** (≈ Python's
+0.85 / 3.5). NEXT: scorecard the C style-CFG outputs to fix the production default α, then wire into
+web/server.py (Python computes CSD(ref)→768-vec; iris `--lora joint_lora + --sref-csdmod + --sref-csd +
+--sref-scale`). Original port details:
+The joint adapter (LoRA r64 + CSDModulation) now runs in the shipped C/Metal `iris`:
+- **Export** `train/lora/export_joint_to_c.py`: joint ckpt → Diffusers-named `joint_lora.safetensors`
+  (strip `flux.`, add `.weight`, double `to_out`→`to_out.0`) + `csd_mod.safetensors`. LoRA loads via the
+  EXISTING `--lora` (iris_lora.c already does Diffusers double+single) — "loaded 80 adapters", zero new code.
+- **New C**: `iris_csdmod.c/.h` (fc1→silu→fc2 temb delta) + temb injection in all 3 flux forwards
+  (`iris_transformer_flux.c`, `tf->csd_delta`, NULL-guarded = bit-identical off) + `iris_set_sref_csd()`
+  (iris.c) + CLI `--sref-csdmod/--sref-csd/--sref-scale` (main.c). **Parity guard** `debug/test_csdmod.c` +
+  `gen_csdmod_fixture.py`: corr 1.000000, max_abs **3e-08** under production flags. `make mps` clean.
+  Artifacts in `/Volumes/2TBSSD/sref_eval/joint_v1_c_export/`. CSD encode stays in Python (pass the 768-vec).
+- **THE ISSUE (guidance mechanism):** C base model = **CFG** (2 forwards, `v=v_u+g(v_c−v_u)`). csd_delta is in
+  temb of BOTH forwards → the style is common-mode and **cancels in the CFG difference**. Measured @512px
+  impressionism ref: g=3.5 → crisp robot, NO style; g=1.0 (pure cond) → strong impressionist style, NO
+  content. Training/Python used the **guidance EMBEDDING** (single forward, guidance in temb, no CFG) → got
+  BOTH. The C has no guidance-embedding path (base=CFG, distilled=guidance pre-baked).
+- **FORK (open):** (1) ship `-g 1.0` (works now, weak content, zero code); (2) add guidance-embedding
+  single-forward for base weights (matches training exactly; re-architects base inference, needs base
+  guidance_embed weights); (3) inject csd_delta ONLY in the conditional forward under CFG → CFG AMPLIFIES
+  the style (the "style-CFG amplifier" the plan wanted; needs a forward-side cond/uncond flag; α re-tunes
+  for the ~g× amplification). (3) is likely the best result/effort; (2) is the faithful match.
+
+### 🔴 SREF-JOINT-V2-CONTENT (2026-07-12) — wider t-band is the WRONG content lever. NEGATIVE: it weakened style and did NOT improve content. v1 recipe stays champion.
+Hypothesis (v2, `sref_joint_v2_content.yaml`): the v1 render over-weighted style (promptAdh 0.19), so widen
+`t_range` [700,950]→[200,950] (low/mid-noise steps train content-recon) + raise `null_style_prob` 0.1→0.25.
+Trained 10k steps on the EXPANDED data (see below): in-loop discrimination STILL stabilized (final diags:
+acc pinned 1.000, pair to 0.006, cos(z_a,z_b) to −0.23) — so the recipe change did NOT break discrimination.
+BUT the render gate (ckpt 7000, same harness) REGRESSED on what matters:
+- styleCSD Δ overall **0.114 → 0.053** (painterly **0.216 → 0.076**, −65%); visually the styles are MUTED
+  (impressionism = washed-out haze vs v1's committed pastel brushwork; woodcut = gray relief vs stark ink).
+- promptAdh **0.190 → 0.178** — NO content gain (slightly worse). cross-ref output corr 0.57 → 0.28 (more
+  varied but weaker style). Method caveat: the gate reused the v1 baseline PNG (existed, no --regen), so v2's
+  null-baseline coherence wasn't assessed; the styleCSD Δ *comparison* is valid (same baseline).
+- **Lesson:** widening the band just dilutes the high-noise style-learning steps without buying prompt
+  adherence — the content weakness is the model prioritizing style OVER the prompt subject, which the band
+  doesn't touch. Content-vs-style is NOT a t-band slider. **Next lever = INFERENCE-side style-scale**
+  (`temb += α·csd_mod(csd)`, sweep α on the WORKING v1 ckpt-7000) — trades style↔content with no retrain and
+  yields a per-generation user knob. Champion remains v1 `joint_probe_0007000.safetensors`.
+- **✅ STYLE-SCALE RESULT (2026-07-13): the inference knob WORKS — solves weak-content with no retrain.**
+  Added `--style-scale α` to `debug/sref_gate_joint.py` (`temb += α·csd_mod(csd)`); swept α on v1 ckpt-7000
+  (coarse 0.3/0.5/0.7 → fine 0.75–0.95 → two-decimal 0.80–0.90). Clean monotonic style↔content slider
+  (styleCSD Δ / promptAdh): α=1.0 0.114/0.190 · 0.90 0.104/0.204 · **0.85 0.092/0.208** · 0.80 0.082/0.211 ·
+  0.70 0.052/0.208 · 0.50 −0.041/0.227 · 0.30 −0.138/0.239. Content saturates by ~0.85; style declines
+  gently; **graphic** styleCSD crosses 0 at α≈0.77 (graphic is the fragile type — painterly stays strong
+  throughout, 0.15–0.22). **DEFAULT α≈0.85** (81% of full style, graphic safely +, subject legible, visually
+  confirmed on anime/impressionism/vector); expose [0.70–1.0] as the user slider. This is the on-device fix:
+  ship v1 ckpt-7000 + a style-strength slider, no cloud, no retrain. (Method note: renders land in
+  `/tmp/sref_scorecard/` — /tmp got day-rollover-cleaned mid-sweep, losing the baseline PNG for the last
+  point; move gate output to a persistent dir when this is productionized.) NEXT = wire into web/server.py as
+  a generic "upload a reference" mode (MLX inference path: base + LoRA r64 + csd_mod + α), like the Style
+  Library but reference-generic.
+- **DATA (kept, positive):** expanded CSD+VAE coverage 200→5000/shard across the 22 hot shards →
+  usable training pairs **16,656 → 101,771 (6.1×)**, 0 neighbor slots dropped (was 455,406). Isolated caches
+  `/Volumes/2TBSSD/universe_csd_full` + expanded `/Volumes/2TBSSD/precomputed/vae_sref256px` (READMEs). qwen3
+  already covered 5000/shard. This unlock is reusable for any future on-device run.
+
+### 🟢🟢 SREF-JOINT-STAGE0.5 (2026-07-11) — STAGE-0.5 GATE PASSED. First learned generic style-reference adapter to break collapse on this stack (4th attempt). GREENLIGHT cloud Stage-1.
+The joint-backbone recipe (`plans/sref-joint-backbone-project.md`: TRAINABLE LoRA r64 backbone +
+content-shared-PAIR contrastive with a FOREIGN-ref branch + high-noise `t∈[700,950]`) is the first that
+does NOT collapse to a reference-inert constant. 8000-step probe, 256px, batch-1 ×2 split-backward,
+~4 s/step, peak 16.6 GB. Checkpoint `/Volumes/2TBSSD/checkpoints/sref_joint_probe/joint_probe_0007000.safetensors`
+(160 LoRA + 4 csd_mod tensors). All three gates:
+- **Gate 1 (in-loop discrimination) — PASS, and STABILIZED.** Early (steps 100–1500) the foreign-row acc
+  oscillated 0.5↔1.0 and `pair` bounced across the 0.6931 ref-blind floor; by steps 7000–7900 acc is
+  **pinned at 1.000** and `pair` is **consistently 0.04–0.39 (all below floor)**, cross-ref x0 corr < 0.9 in
+  7/10. cos(z_a,z_b) drops to 0.03–0.18 at the strong steps. Prior 3 adapters were permanently pinned at
+  corr≈1.0 / acc 0.5.
+- **Gate 2a (render cross-ref output corr < 0.90) — PASS.** 11 refs / 55 pairs, seed+prompt fixed:
+  **mean 0.5715, max 0.8856, min 0.2332**. (Champion collapse was ≥0.984.) The renders are DISTINCT,
+  COHERENT stylized images — monochrome-ink (woodcut) / soft-pastel (impressionism) / anime / cubist /
+  bright-vector — not different noise.
+- **Gate 2b (styleCSD Δ > 0.009) — PASS.** overall **0.1143**; painterly **0.216** (strong), graphic
+  **0.051**; semi_real −0.077 but that's **n=1** (anime, which visually looked BEST — kept content, so its
+  CSD moved less vs the degenerate null baseline; a metric artifact, not a style failure).
+- **Tooling:** render gate = `debug/sref_gate_joint.py` (injects LoRA r64 + csd_mod from the joint ckpt into
+  the SAME `flux_forward_film` forward the probe trained; reuses FILM harness generate/BN-unpack/CSD encoder —
+  no train↔infer divergence). Scorecard `debug/sref_scorecard.py --score-only`. Renders in
+  `/tmp/sref_scorecard/joint_7000/`.
+- **Caveats / Stage-1 tuning axes (honest):** (1) CONTENT/prompt adherence is WEAK — promptAdh 0.190, the
+  "robot in a desert" is only faintly legible except in anime; the model over-weights style. Levers: lower
+  csd_mod/LoRA scale at inference, widen the `t` band to include low-noise (so it practices content), more
+  recon weight, add the decoupled cross-attn token path (plan Stage 2). (2) The NULL-CSD baseline DEGENERATES
+  to a texture (blue stripes) — the model trained almost always WITH a ref (null_style_prob 0.1), so the
+  unconditional path is undertrained → styleCSD Δ (measured vs baseline) is noisy; raise null_style_prob if
+  CFG is wanted, and/or gate on absolute CSD(out,ref). (3) composition leak moderate (0.055; graphic 0.095).
+  (4) eval set small (11 refs, semi_real n=1) — broaden it (SREF-EVAL-COVERAGE-GAP). (5) 512px inference of a
+  256px-trained LoRA renders coherently (good resolution generalization). Checkpoint used is 7000 (loop
+  breaks before an 8000 save); the late diags show 7000 is the converged state.
+- **Verdict:** the "learned style adapters are dead" conclusion is OVERTURNED. Proceed to cloud Stage-1
+  (full recipe @512px, batch 32, ~50–100k steps) per plan §4 — the real product go/no-go — with content
+  adherence as the #1 thing to tune. Retrieval-hybrid remains the shipped baseline until Stage-1 ships.
+
 ### 🟢 SREF-LATENT-CSD-PROJ (2026-07-10) — latent→CSD projector TRAINED and PASSES its gate. The contrastive's `t` band is [700, 950], NOT Fable's `t<0.7`.
 Built the prerequisite for the content-shared-pair contrastive (SREF-PAIR-VS-BANK): `z = proj(x0_pred)` must
 live in CSD space so it can be compared to the frozen `CSD(ref)`. `LatentCSDProjector`

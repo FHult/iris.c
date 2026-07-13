@@ -248,6 +248,7 @@ extern float *iris_transformer_forward(iris_transformer_t *tf,
 /* DP-7 IP-Adapter injection schedule: refresh the per-step multiplier before each
  * forward. No-op when no IP-adapter is bound or the schedule is "none". */
 extern void iris_transformer_set_ip_step(iris_transformer_t *tf, int step, int num_steps);
+extern void iris_transformer_set_csd_skip(iris_transformer_t *tf, int skip);
 
 /* Z-Image transformer */
 typedef struct zi_transformer zi_transformer_t;
@@ -726,13 +727,16 @@ float *iris_sample_euler_cfg(void *transformer, void *text_encoder,
         if (iris_cancel_requested) { free(z_curr); return NULL; }
 
         iris_transformer_set_ip_step(tf, step, num_steps);  /* DP-7 */
-        /* Unconditioned prediction */
+        /* Unconditioned prediction. Style-CFG: suppress the CSD style delta on the uncond pass so
+         * the style lives only in v_cond → the CFG combine AMPLIFIES it instead of cancelling it. */
+        iris_transformer_set_csd_skip(tf, 1);
         float *v_uncond = iris_transformer_forward(tf, z_curr, h, w,
                                                     text_emb_uncond, text_seq_uncond,
                                                     t_curr);
+        iris_transformer_set_csd_skip(tf, 0);
         if (!v_uncond) { free(z_curr); return NULL; }
 
-        /* Conditioned prediction */
+        /* Conditioned prediction (prompt + CSD style) */
         float *v_cond = iris_transformer_forward(tf, z_curr, h, w,
                                                   text_emb_cond, text_seq_cond,
                                                   t_curr);

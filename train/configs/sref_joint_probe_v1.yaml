@@ -7,10 +7,10 @@ adapter:
   lora_rank: 64                                 # trainable backbone (double+single attn); not the frozen/r16 that failed
   projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors
 data:
-  bucket: [256, 256]                            # ¼ the tokens of 512px; batch-1 x 2 passes fits comfortably
+  bucket: [256, 256]                            # ¼ the tokens of 512px; batch-1 x 2 passes fits 16 GB. Requires the 256px VAE cache below.
   text_seq: 128                                 # FIXED text length → constant graph shape (avoids the recompile wedge)
   shard_path: /Volumes/2TBSSD/baseline_pool_hot
-  vae_cache_dir:   /Volumes/2TBSSD/precomputed/vae/v_2232c1
+  vae_cache_dir:   /Volumes/2TBSSD/precomputed/vae_sref256px   # 256px latents (32,32,32); isolated sibling of precomputed/vae/. NOT v_2232c1 (512px). See dir README.
   qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3/v_059443
   csd_cache_dir:   /Volumes/2TBSSD/universe_csd
   style_neighbors_db: /Volumes/2TBSSD/sref_eval/style_cache/neighbors.sqlite
