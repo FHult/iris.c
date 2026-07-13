@@ -281,6 +281,56 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🔵 SREF-STYLE-ROUTER (PROPOSED, 2026-07-13) — classify the style reference (CSD) → route to the best method/expert per reference-type; confidence-gated with the generic adapter as the floor.
+IDEA (operator): style-transfer methods have LARGE, MEASURED per-reference-type effectiveness gaps, so
+classify the reference's style at inference (CSD — already computed) and route to the best method /
+specialist LoRA for that type, instead of applying one method to everything. A mixture-of-experts over
+style-transfer methods, gated by a cheap CSD classifier.
+
+WHY IT'S REAL — this session's scorecards, styleCSD Δ per type, SAME eval set:
+| method                                  | graphic | painterly |
+|-----------------------------------------|---------|-----------|
+| band-control (training-free)            | strong  | FAILS (SREF-STYLE-CEILING) |
+| joint adapter, GUIDANCE-EMBED (Python)  | 0.05    | 0.22      |
+| joint adapter, STYLE-CFG (the C ship)   | 0.30    | 0.12      |
+| retrieval Style Library                 | strong where a trained LoRA exists | — |
+Load-bearing datum: the SAME adapter, two inference MODES, has OPPOSITE per-type strengths → the routing
+axis is METHOD/MODE, not only "which model." Band-control's painterly failure vs the adapter's painterly
+strength is the other half.
+
+SKELETON ALREADY EXISTS: the retrieval Style Library IS a CSD→per-style-LoRA router (`resolve_style_lora`,
+plans/sref-retrieval-hybrid-project.md). This generalizes it to route across METHODS/experts. Routing is
+CHEAP: CSD(ref) is already computed at inference (library + adapter); style-type classification on CSD is
+a tiny model (we already cluster by CSD — `train/lora/cluster_hot_styles.py`). No new encoder, no
+per-image cost.
+
+KEY DESIGN — CONFIDENCE-GATED, generic adapter as the FLOOR: route to a specialist only when the
+classifier is confident; else fall back to the v5.3.0 generic adapter (SREF-JOINT-C-PORT — handles
+anything). Then the router is NEVER worse than what shipped → bounded misroute risk + universal coverage.
+
+CAVEATS: (1) do NOT build N specialists up front — each is a training run + tight look-coherent data
+(DATA-SELECTION PRINCIPLE); the obvious first specialist, painterly, needs the WikiArt build (the deferred
+painterly lever, thin today). (2) eval set is only 11 refs (5 graphic / 5 painterly / 1 semi-real) — too
+thin for rigorous per-type routing; broaden first (SREF-EVAL-COVERAGE-GAP). (3) router quality caps the
+whole thing, but CSD retrieval already discriminated held-out refs 3/3 → low risk.
+
+STAGED PLAN (cheapest wins first):
+1. MEASURE THE MAP — scorecard per style-type × per-method on a BROADENED eval set → the actual
+   "CSD-region → best-method" table (router ground truth AND shows where a specialist even helps).
+2. ROUTE EXISTING METHODS (near-zero cost, no new models) — CSD-confidence router over band-control (free)
+   vs the style-CFG adapter, + a PER-TYPE α (graphic wants higher strength, painterly lower — measured).
+   Add a guidance-embed MODE iff step 1 says painterly needs it (needs the deferred C guidance-embed
+   single-forward path, not yet built — SREF-JOINT-C-PORT fork option 2).
+3. BUILD THE HIGHEST-VALUE SPECIALIST (likely painterly) only where step 1 shows the biggest gap; A/B vs
+   the generic adapter before adding it to the router.
+v1 = a router over the methods we ALREADY have, NOT a fleet of new models. Specialists follow the map.
+Possible upgrade: fit a small CSD→best-method meta-model directly on the step-1 scorecard results rather
+than hand-coding style-type buckets.
+
+Refs: SREF-JOINT-C-PORT (the generic floor / v5.3.0), retrieval-hybrid (the CSD→LoRA skeleton),
+SREF-STYLE-CEILING (band-control's painterly ceiling), SREF-EVAL-COVERAGE-GAP (eval breadth),
+[[data_selection_principle]] + WikiArt painterly lever (specialist data).
+
 ### 🟢 SREF-JOINT-C-PORT (2026-07-13) — adapter reimplemented in C AND WORKING via STYLE-CFG. Generic style adapter now runs in the shipped iris/Metal engine + discriminates references at the pixel level.
 **RESOLVED via style-CFG (option 3).** csd_delta is injected ONLY in the conditional forward
 (`iris_sample.c` raises `tf->csd_skip` on the uncond pass via `iris_transformer_set_csd_skip`), so
