@@ -289,9 +289,13 @@ standing in a desert", seed 7: strong content (crisp robot from prompt-CFG) + re
 α-controlled. **Discrimination proven:** woodcut ref → dark monochrome ink on paper; impressionism ref →
 light silvery painterly shimmer — SAME seed/prompt, visibly different styles. **α range shifts DOWN** (CFG
 ~g× amplifies): usable 0.2–0.4, over-amplifies to blank by 0.85; sweet spot **α≈0.35–0.4** (≈ Python's
-0.85 / 3.5). NEXT: scorecard the C style-CFG outputs to fix the production default α, then wire into
-web/server.py (Python computes CSD(ref)→768-vec; iris `--lora joint_lora + --sref-csdmod + --sref-csd +
---sref-scale`). Original port details:
+0.85 / 3.5). Default locked at **α=0.4** (C scorecard: styleCSD Δ graphic 0.30 / painterly 0.12 /
+overall 0.19 — style-CFG RESCUES graphic, the fragile Python type). **SHIPPED to web** (2026-07-13):
+`train/lora/dump_csd.py` (image→768-f32 CSD, matches the training encoder cos 1.0) + `web/server.py`
+`resolve_sref_adapter()` + a new **"adapter"** reference mode (routing → job → generate() sets
+`lora=joint_lora + sref_csdmod + sref_csd + sref_scale`, forces CFG) + the "Learned Style" UI option
+(index.html/app.js). Env `IRIS_SREF_ADAPTER_DIR` / `IRIS_SREF_ADAPTER_SCALE` (0.4); needs the resident
+daemon on flux-klein-4b-base. Web tests green (no regression). Original port details:
 The joint adapter (LoRA r64 + CSDModulation) now runs in the shipped C/Metal `iris`:
 - **Export** `train/lora/export_joint_to_c.py`: joint ckpt → Diffusers-named `joint_lora.safetensors`
   (strip `flux.`, add `.weight`, double `to_out`→`to_out.0`) + `csd_mod.safetensors`. LoRA loads via the

@@ -62,6 +62,17 @@ STYLE_LIBRARY_JSON = STYLE_LIB_DIR / "library.json"
 STYLE_RETRIEVE_SCRIPT = PROJECT_DIR / "train" / "lora" / "style_retrieve.py"
 STYLE_LIBRARY_MODEL = os.environ.get("IRIS_STYLE_LIB_MODEL", "flux-klein-4b-base")
 
+# SREF learned GENERIC style adapter (joint LoRA r64 + CSDModulation, applied via style-CFG in C —
+# BACKLOG SREF-JOINT-C-PORT). Unlike the retrieval Style Library it works for ANY reference, not just
+# trained styles: the reference is CSD-encoded and the joint LoRA + csd_mod FiLM its style into temb.
+# Requires the resident iris daemon to run a compatible base model (flux-klein-4b-base).
+SREF_ADAPTER_DIR = Path(os.environ.get("IRIS_SREF_ADAPTER_DIR",
+                                       "/Volumes/2TBSSD/sref_eval/joint_v1_c_export"))
+SREF_ADAPTER_LORA = SREF_ADAPTER_DIR / "joint_lora.safetensors"
+SREF_ADAPTER_CSDMOD = SREF_ADAPTER_DIR / "csd_mod.safetensors"
+SREF_ADAPTER_DEFAULT_SCALE = float(os.environ.get("IRIS_SREF_ADAPTER_SCALE", "0.4"))  # style-CFG op point
+DUMP_CSD_SCRIPT = PROJECT_DIR / "train" / "lora" / "dump_csd.py"
+
 
 def _bundle_cond_mode() -> str:
     """cond_mode of the configured IP bundle ('siglip'|'csd'|'hybrid'); 'siglip' if unknown.
@@ -998,6 +1009,18 @@ class IrisServer:
                 request_data["lora"] = str(lora_full_path)
                 request_data["lora_scale"] = float(lora_scale)
 
+            # SREF learned generic adapter (joint LoRA + CSDModulation, style-CFG). Takes precedence
+            # over library/named lora; needs CFG (guidance>0) for the style-CFG amplification.
+            sref_adapter = getattr(job, "sref_adapter", None)
+            if sref_adapter:
+                request_data["lora"] = sref_adapter["lora"]
+                request_data["lora_scale"] = 1.0
+                request_data["sref_csdmod"] = sref_adapter["csdmod"]
+                request_data["sref_csd"] = sref_adapter["csd"]
+                request_data["sref_scale"] = float(sref_adapter.get("scale", 0.4))
+                if not request_data.get("guidance"):
+                    request_data["guidance"] = 3.5   # style-CFG needs CFG on the base model
+
             if img2img_strength and float(img2img_strength) < 1.0:
                 request_data["img2img_strength"] = float(img2img_strength)
 
@@ -1260,6 +1283,35 @@ def resolve_style_lora(image_bytes: bytes):
         tmp_img.unlink(missing_ok=True)
 
 
+def resolve_sref_adapter(image_bytes: bytes):
+    """Reference image bytes -> the C sref joint-adapter args (learned GENERIC style adapter).
+
+    Computes CSD(ref) -> 768-f32 vector via train/lora/dump_csd.py (content-hash cached so a
+    repeated reference never re-encodes), and returns the paths iris needs:
+    {"lora","csdmod","csd","scale"}, or None if the adapter export is not installed. Unlike
+    resolve_style_lora (retrieval over trained styles), this works for ANY reference."""
+    if not (SREF_ADAPTER_LORA.exists() and SREF_ADAPTER_CSDMOD.exists()):
+        return None
+    sha = hashlib.sha256(image_bytes).hexdigest()[:24]
+    SREF_DIR.mkdir(parents=True, exist_ok=True)
+    csd_path = SREF_DIR / f"{sha}_adapter.csd.f32"
+    if not csd_path.exists():
+        tmp_img = SREF_DIR / f"{sha}_adaptersrc.jpg"
+        try:
+            from PIL import Image
+            import io as _io
+            Image.open(_io.BytesIO(image_bytes)).convert("RGB").save(tmp_img, "JPEG", quality=95)
+            proc = subprocess.run(
+                [str(TRAIN_VENV_PY), str(DUMP_CSD_SCRIPT), "--image", str(tmp_img), "--out", str(csd_path)],
+                capture_output=True, text=True, timeout=300, cwd=str(PROJECT_DIR))
+            if proc.returncode != 0 or not csd_path.exists():
+                raise RuntimeError((proc.stderr or "").strip()[-400:] or "CSD dump failed")
+        finally:
+            tmp_img.unlink(missing_ok=True)
+    return {"lora": str(SREF_ADAPTER_LORA), "csdmod": str(SREF_ADAPTER_CSDMOD),
+            "csd": str(csd_path), "scale": SREF_ADAPTER_DEFAULT_SCALE}
+
+
 # ── Style codes: a saved-style library (Midjourney --sref <code> model) ──────
 # A style code is a short stable id for a reference's computed features, so a
 # look can be reused without re-uploading the image. Registry maps code ->
@@ -1437,6 +1489,27 @@ def generate():
                                      "(IRIS_STYLE_LIB / library.json missing)."}), 400
         reference_slots = [s for s in reference_slots if s.get("mode") != "library"]
 
+    # SREF learned GENERIC adapter: an "adapter"-mode reference applies the joint LoRA + CSDModulation
+    # (style-CFG) for ANY reference. Resolve now and drop the slot so it doesn't also flow through the
+    # img2img/band-control paths. Needs CFG (base model) for the style-CFG amplification to work.
+    resolved_adapter = None
+    adapter_slots = [s for s in reference_slots if s.get("mode") == "adapter"]
+    if adapter_slots:
+        try:
+            ad_bytes = convert_image_to_png(base64.b64decode(adapter_slots[0]["data"].split(",")[-1]))
+            resolved_adapter = resolve_sref_adapter(ad_bytes)
+        except Exception as e:
+            return jsonify({"error": f"Style adapter resolution failed: {e}"}), 400
+        if resolved_adapter is None:
+            return jsonify({"error": "The learned style adapter is not installed on this server "
+                                     "(IRIS_SREF_ADAPTER_DIR / joint_lora.safetensors missing)."}), 400
+        try:
+            if data.get("sref_scale") not in (None, ""):
+                resolved_adapter["scale"] = float(data["sref_scale"])   # UI slider override
+        except (TypeError, ValueError):
+            pass
+        reference_slots = [s for s in reference_slots if s.get("mode") != "adapter"]
+
     # A "style"-mode reference routes through IN-CONTEXT img2img conditioning by default
     # (full-strength reference-as-tokens, prompt drives content — the clean style transfer
     # users loved). The trained IP-Adapter is OPT-IN (IRIS_SREF_ADAPTER=1) and gated behind a
@@ -1605,6 +1678,9 @@ def generate():
     if resolved_style_lora:
         job.style_lora = resolved_style_lora["lora"]
         job.style_lora_scale = resolved_style_lora["scale"]
+    # SREF learned generic adapter (joint LoRA + CSDModulation via style-CFG).
+    if resolved_adapter:
+        job.sref_adapter = resolved_adapter
 
     # Store temp file paths in job for cleanup after generation completes
     if input_image_path:

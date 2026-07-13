@@ -1561,6 +1561,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const mode = _globalRefMode();
         if (mode === 'library') {
             hint.textContent = 'Matches your reference to the nearest trained style and applies that style LoRA — the strongest, most consistent transfer, including painterly looks. Your prompt drives the subject. Best on the base model.';
+        } else if (mode === 'adapter') {
+            hint.textContent = 'A learned adapter that transfers ANY reference’s style (not just trained ones) onto your prompt’s subject — graphic and painterly alike. Style is strong but content stays legible. Base model.';
         } else if (mode === 'composition') {
             hint.textContent = "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
         } else {
