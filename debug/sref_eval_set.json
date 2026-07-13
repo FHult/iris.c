@@ -1,20 +1,144 @@
 {
-  "version": 1,
-  "created": "2026-07-07",
-  "note": "Frozen SREF scorecard eval set (Phase 0 of plans/sref-learned-encoder-project.md). Reference types chosen to span the band-control ceiling found in BACKLOG SREF-STYLE-CEILING: graphic (transfers well), painterly (fails), semi_real (subtle). GAPS to expand later: semi_real is thin (1 ref = the user's anime case) and there is NO photographic ref yet.",
-  "eval_prompt": "a robot standing in a desert",
-  "eval_seed": 7,
-  "refs": [
-    {"id": "woodcut",              "type": "graphic",   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/woodcut.jpg"},
-    {"id": "churchill_lineart",    "type": "graphic",   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/churchill_lineart.jpg"},
-    {"id": "flat_sticker",         "type": "graphic",   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/flat_sticker.jpg"},
-    {"id": "halftone_comic",       "type": "graphic",   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/halftone_comic.jpg"},
-    {"id": "bold_vector",          "type": "graphic",   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/bold_vector_poster.jpg"},
-    {"id": "baroque_portrait",     "type": "painterly", "path": "/Volumes/2TBSSD/sref_eval/refs/baroque_portrait.jpg"},
-    {"id": "impressionism",        "type": "painterly", "path": "/Volumes/2TBSSD/sref_eval/refs/impressionism_landscape.jpg"},
-    {"id": "artnouveau",           "type": "painterly", "path": "/Volumes/2TBSSD/sref_eval/refs/artnouveau.jpg"},
-    {"id": "expressionism",        "type": "painterly", "path": "/Volumes/2TBSSD/sref_eval/refs/expressionism_portrait.jpg"},
-    {"id": "cubism",               "type": "painterly", "path": "/Volumes/2TBSSD/sref_eval/refs/cubism_stilllife.jpg"},
-    {"id": "anime_tonkatsu",       "type": "semi_real", "path": "/Volumes/2TBSSD/sref_eval/refs_semireal/anime_tonkatsu.png"}
-  ]
+ "eval_prompt": "a robot standing in a desert",
+ "eval_seed": 7,
+ "refs": [
+  {
+   "id": "woodcut",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/woodcut.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "churchill_lineart",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/churchill_lineart.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "flat_sticker",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/flat_sticker.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "halftone_comic",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/halftone_comic.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "bold_vector",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_simple/bold_vector_poster.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "baroque_portrait",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs/baroque_portrait.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "impressionism",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs/impressionism_landscape.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "artnouveau",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs/artnouveau.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "expressionism",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs/expressionism_portrait.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "cubism",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs/cubism_stilllife.jpg",
+   "source": "held_out"
+  },
+  {
+   "id": "anime_tonkatsu",
+   "type": "semi_real",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_semireal/anime_tonkatsu.png",
+   "source": "held_out"
+  },
+  {
+   "id": "folk_illustration",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/folk_illustration.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "ink_splatter",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/ink_splatter.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "botanical_lineart",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/botanical_lineart.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "ornate_emblem",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/ornate_emblem.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "flat_illustration",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/flat_illustration.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "dark_fantasy",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/dark_fantasy.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "textural_portrait",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/textural_portrait.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "watercolor_owl",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/watercolor_owl.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "cinematic_noir",
+   "type": "semi_real",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/cinematic_noir.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "glam_punk",
+   "type": "semi_real",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/glam_punk.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "retro_concept",
+   "type": "semi_real",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/retro_concept.jpg",
+   "source": "hot_cluster"
+  },
+  {
+   "id": "cyberpunk",
+   "type": "semi_real",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/cyberpunk.jpg",
+   "source": "hot_cluster"
+  }
+ ]
 }
