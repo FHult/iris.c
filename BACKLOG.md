@@ -281,6 +281,25 @@ The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
 
+### 🟢 SREF-EVAL-BROADENED (2026-07-13) — eval 11→23 refs; refreshed baseline OVERTURNS the "semi_real fails" conclusion (it was n=1 noise) and CONFIRMS generalization.
+Broadened the style eval from 11 (5 graphic / 5 painterly / 1 semi_real) to 23 (10 / 8 / 5): CSD
+farthest-cluster (`cluster_hot_styles.py --k 60`) + hand-curation from a contact sheet (dropped generic
+photos + a desert content-confound), labeled by `type` + `source` (held_out fine-art vs hot_cluster
+in-distribution). Backup `debug/sref_eval_set_v1.json`. Fixes SREF-EVAL-COVERAGE-GAP.
+REFRESHED BASELINE — shipped C style-CFG adapter @ α=0.4, styleCSD Δ:
+  graphic   n=10  +0.257  (held-out 0.299 / in-dist 0.216)
+  painterly n=8   +0.105  (0.120 / 0.081)
+  semi_real n=5   +0.102  (the OLD n=1 anime = −0.029; in-dist n=4 = +0.135)
+  overall   n=23  +0.171
+TWO CORRECTIONS: (1) "semi_real FAILS (−0.03)" (SREF-JOINT-STAGE0.5 / -V2 / -C-PORT caveats) was a
+SINGLE-SAMPLE ARTIFACT — at n=5 it's +0.102; the adapter transfers semi_real fine. The thin eval had
+produced a false negative. (2) GENERALIZATION CONFIRMED: held-out ≥ in-distribution on graphic AND
+painterly → the adapter is not merely recalling trained styles (if it were, in-dist would win). Ranking:
+graphic strongest, painterly/semi_real ~equal. Caveats: promptAdh prints 0 in the C-render scorecard runs
+(scoring-path artifact; content is legible visually); leak Δ ~0.10 moderate. Now the per-type GROUND TRUTH
+for SREF-STYLE-ROUTER step 1 + the train-more gate. Painterly breadth still data-limited (in-dist painterly
+is DIGITAL-painterly; true fine-art painterly needs the WikiArt build).
+
 ### 🔵 SREF-STYLE-ROUTER (PROPOSED, 2026-07-13) — classify the style reference (CSD) → route to the best method/expert per reference-type; confidence-gated with the generic adapter as the floor.
 IDEA (operator): style-transfer methods have LARGE, MEASURED per-reference-type effectiveness gaps, so
 classify the reference's style at inference (CSD — already computed) and route to the best method /
