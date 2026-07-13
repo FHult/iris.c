@@ -4,6 +4,31 @@ All notable, user-facing changes to iris.c. Newest first.
 
 ---
 
+## v5.3.0 — Learned generic style adapter (any reference → its style)
+
+### What's new (user-facing) — web UI
+
+- **New "Learned Style" reference mode.** Upload *any* reference image and its style transfers onto your
+  prompt's subject — not just the handful of trained Style Library looks, and including painterly and
+  graphic styles that training-free band-control can't do. It sits alongside the Style Library in the
+  "Use as:" selector. The reference is CSD-encoded and a trained adapter applies its look; your prompt
+  still drives the content. Works best on the base model (`--model-dir flux-klein-4b-base`).
+
+### Under the hood — the adapter, reimplemented in C
+
+- The learned joint-backbone style adapter — the first to break the reference-collapse that killed three
+  prior attempts (it discriminates references at the pixel level: woodcut → ink, impressionism → shimmer)
+  — now runs in the shipped iris/Metal engine:
+  - `iris_csdmod.c` — the CSDModulation MLP FiLM'd into the timestep embedding, parity-guarded bit-exact
+    vs the Python trainer (`debug/test_csdmod.c`: corr 1.0, max_abs 3e-8 under production flags).
+  - **Style-CFG** — the style is injected only in the *conditional* CFG forward, so classifier-free
+    guidance amplifies it instead of cancelling it. Default strength 0.4.
+  - LoRA loads via the existing `--lora`; new `--sref-csdmod` / `--sref-csd` / `--sref-scale` flags plus
+    the resident-daemon path. `train/lora/export_joint_to_c.py` and `dump_csd.py` produce the artifacts.
+- Non-sref generation is unchanged — the adapter is fully gated off by default (`make test` green).
+
+---
+
 ## v5.2.0 — Style-transfer UX + SREF research foundations
 
 ### What's new (user-facing) — web UI
