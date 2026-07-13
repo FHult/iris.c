@@ -506,6 +506,10 @@ typedef struct {
     char   *ip_features;
     float   ip_scale;
     char   *ip_schedule;
+    /* sref joint-backbone: CSDModulation style injection (per job, like ip). */
+    char   *sref_csdmod_path;
+    char   *sref_csd_path;
+    float   sref_scale;
 } server_job_t;
 
 /* ---- Queue state (protected by queue_mutex) ---- */
@@ -539,6 +543,8 @@ static void server_free_job(server_job_t *job) {
     free(job->ip_bundle);
     free(job->ip_features);
     free(job->ip_schedule);
+    free(job->sref_csdmod_path);
+    free(job->sref_csd_path);
     for (int i = 0; i < job->num_refs; i++) free(job->ref_paths[i]);
     free(job);
 }
@@ -619,6 +625,27 @@ static void server_run_job(iris_ctx *ctx, server_job_t *job) {
             fprintf(stderr, "Warning: Failed to load LoRA from %s\n", job->lora_path);
     } else {
         iris_unload_lora(ctx);
+    }
+
+    /* Apply/clear the SREF joint-backbone CSD style injection (per job; resident model persists,
+     * so always set — NULL/scale 0 clears any leftover from a previous job). */
+    if (job->sref_csd_path) {
+        FILE *cf = fopen(job->sref_csd_path, "rb");
+        if (cf) {
+            fseek(cf, 0, SEEK_END); long sz = ftell(cf); fseek(cf, 0, SEEK_SET);
+            int n = (sz > 0) ? (int)(sz / (long)sizeof(float)) : 0;
+            float *csd = (n > 0) ? malloc((size_t)n * sizeof(float)) : NULL;
+            if (csd && fread(csd, sizeof(float), (size_t)n, cf) == (size_t)n)
+                iris_set_sref_csd(ctx, job->sref_csdmod_path, csd, n, job->sref_scale);
+            else
+                iris_set_sref_csd(ctx, NULL, NULL, 0, 0.0f);
+            free(csd);
+            fclose(cf);
+        } else {
+            iris_set_sref_csd(ctx, NULL, NULL, 0, 0.0f);
+        }
+    } else {
+        iris_set_sref_csd(ctx, NULL, NULL, 0, 0.0f);
     }
 
     /* Set seed */
@@ -924,6 +951,9 @@ static int run_server_mode(iris_ctx *ctx) {
         char *ip_features    = json_get_string(line, "ip_features");
         float ip_scale       = json_get_float(line, "ip_scale", 1.0f);
         char *ip_schedule    = json_get_string(line, "ip_schedule");
+        char *sref_csdmod    = json_get_string(line, "sref_csdmod");
+        char *sref_csd       = json_get_string(line, "sref_csd");
+        float sref_scale_j   = json_get_float(line, "sref_scale", 0.0f);
 
 /* Helper: emit an error JSON line (no job_id yet) and free parsed strings */
 #define EARLY_ERROR(msg) do { \
@@ -1021,6 +1051,9 @@ static int run_server_mode(iris_ctx *ctx) {
         job->ip_features     = ip_features;
         job->ip_scale        = ip_scale;
         job->ip_schedule     = ip_schedule;
+        job->sref_csdmod_path = sref_csdmod;
+        job->sref_csd_path   = sref_csd;
+        job->sref_scale      = sref_scale_j;
         job->power_alpha     = 2.0f; /* default; overridden below if power schedule */
 
         if (schedule) {
@@ -1225,7 +1258,8 @@ int main(int argc, char *argv[]) {
     char *ip_schedule = NULL;     /* --ip-schedule: none|late:F|early:F (DP-7) */
     char *sref_csdmod_path = NULL; /* --sref-csdmod: CSDModulation MLP weights (joint adapter) */
     char *sref_csd_path = NULL;    /* --sref-csd: reference CSD vector [csd_dim] f32 */
-    float sref_scale = 0.85f;      /* --sref-scale: style strength (BACKLOG STYLE-SCALE RESULT) */
+    float sref_scale = 0.4f;       /* --sref-scale: style strength. Style-CFG amplifies ~g x, so ~0.4
+                                    * (not the Python 0.85); range ~0.2-0.5. BACKLOG SREF-JOINT-C-PORT. */
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
