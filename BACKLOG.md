@@ -333,6 +333,18 @@ painterly lever, thin today). (2) eval set is only 11 refs (5 graphic / 5 painte
 thin for rigorous per-type routing; broaden first (SREF-EVAL-COVERAGE-GAP). (3) router quality caps the
 whole thing, but CSD retrieval already discriminated held-out refs 3/3 → low risk.
 
+MAP STEP-1 RESULT (2026-07-13, 23-ref set) — REFRAMES the router: no current method beats the adapter.
+styleCSD Δ, DEPLOYABLE methods with comparable neutral baselines: graphic — band-control 0.108 vs
+style-CFG adapter **0.257**; painterly — 0.036 vs **0.105** (band-control fails painterly, SREF-STYLE-CEILING);
+semi_real — 0.104 vs 0.102 (TIE). So the shipped adapter is already the BEST deployable method on every
+type; band-control only ties semi_real (its edge = free). ⇒ a router OVER EXISTING methods gains ~nothing;
+the router's value is ENTIRELY in FUTURE SPECIALISTS that beat the generic floor (→ build the painterly
+specialist FIRST; a router earns its keep only once a specialist wins its type). METHOD CAVEATS: (a) drop
+guidance-embed's numbers — its "baseline" was a styled painterly image (not neutral) → inflated Δ, AND it
+destroys content (Python-only, not deployable). (b) styleCSD Δ ALONE is misleading (rewards over-styling);
+a valid map needs a COMMON baseline + a working CONTENT metric (promptAdh printed 0 — scoring-path artifact
+to fix). Tools: `debug/cluster_csd_candidates.py` (generalized clustering for eval broadening).
+
 STAGED PLAN (cheapest wins first):
 1. MEASURE THE MAP — scorecard per style-type × per-method on a BROADENED eval set → the actual
    "CSD-region → best-method" table (router ground truth AND shows where a specialist even helps).
