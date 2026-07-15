@@ -345,6 +345,23 @@ destroys content (Python-only, not deployable). (b) styleCSD Δ ALONE is mislead
 a valid map needs a COMMON baseline + a working CONTENT metric (promptAdh printed 0 — scoring-path artifact
 to fix). Tools: `debug/cluster_csd_candidates.py` (generalized clustering for eval broadening).
 
+SPECIALIST ATTEMPT 1 (2026-07-15) — FAILED (corrupted generation), but CONFOUNDED by a reused projector →
+INCONCLUSIVE, + a real lesson. Built a painterly specialist on-device: 12 WikiArt shards → VAE256/qwen3/CSD
++ within-movement pairs (22,945; NN/random 0.58); trained the winning recipe 8000 steps. In-loop
+discrimination was the CLEANEST yet (foreign-row acc pinned 1.000, pair→0.04). BUT the render gate on the 12
+fine-art painterly refs: specialist styleCSD Δ **0.028** vs generic **0.058** — generic WINS on its own turf,
+AND the specialist outputs are GLITCHY GARBAGE (blocky speckle), broken at every α (0.15/0.25/0.4) AND with
+NO csd (base+specialist-LoRA baseline is already corrupt) → the LoRA itself broke generation, not the
+csd_mod/amplification. ROOT CAUSE: the specialist reused the GENERIC's journeydb-fit latent→CSD projector on
+WikiArt latents (flagged in the config). At high-t (recon weak) the contrastive dominates, so a mis-specified
+projector target pushed the LoRA to produce latents that score in the WRONG space but decode to noise.
+**LESSON (banked): the latent→CSD projector is DATA-SPECIFIC — retrain it per corpus; do NOT reuse across
+data.** So the router's specialist premise is UNTESTED, not disproven. But combined with the MAP result (no
+current method beats the generic) the working hypothesis is that the GENERIC adapter is the robust answer and
+specialists are high-effort/uncertain. A clean re-test = retrain latent_csd projector on WikiArt latents →
+retrain specialist → re-gate (~1.5 days). Artifacts: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist,
+/Volumes/2TBSSD/precomputed/vae_wikiart256 + qwen3_wikiart, wikiart_csd, wikiart_neighbors.sqlite.
+
 STAGED PLAN (cheapest wins first):
 1. MEASURE THE MAP — scorecard per style-type × per-method on a BROADENED eval set → the actual
    "CSD-region → best-method" table (router ground truth AND shows where a specialist even helps).
