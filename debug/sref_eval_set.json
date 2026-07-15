@@ -139,6 +139,60 @@
    "type": "semi_real",
    "path": "/Volumes/2TBSSD/sref_eval/refs_cluster/cyberpunk.jpg",
    "source": "hot_cluster"
+  },
+  {
+   "id": "engraving",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/engraving.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "ukiyoe",
+   "type": "graphic",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/ukiyoe.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "renaissance",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/renaissance.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "impressionism_wa",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/impressionism_wa.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "tonalist_landscape",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/tonalist_landscape.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "expressionism_wa",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/expressionism_wa.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "symbolist",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/symbolist.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "realist_portrait",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/realist_portrait.jpg",
+   "source": "wikiart"
+  },
+  {
+   "id": "post_impressionist",
+   "type": "painterly",
+   "path": "/Volumes/2TBSSD/sref_eval/refs_wikiart/post_impressionist.jpg",
+   "source": "wikiart"
   }
  ]
 }
