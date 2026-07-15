@@ -1,0 +1,35 @@
+# SREF painterly SPECIALIST — the joint-backbone recipe (LoRA r64 + CSDModulation, style-CFG at
+# inference) trained ONLY on fine-art WikiArt pairs. Tests SREF-STYLE-ROUTER: does a painterly
+# specialist beat the generic adapter's painterly styleCSD Δ (0.105 on the broadened eval)?
+# Data build (2026-07-15): 12 WikiArt shards staged hot → VAE256/qwen3/CSD precompute + within-movement
+# neighbor pairs (23,444; NN/random 0.58). Recipe = the WINNING v1 (t∈[700,950]); NOT the v2 wider band.
+model:
+  flux_model_dir: flux-klein-4b-base
+adapter:
+  lora_rank: 64
+  projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors  # reused (generic); retrain on WikiArt is a follow-on if the specialist underperforms
+data:
+  bucket: [256, 256]
+  text_seq: 128
+  shard_path: /Volumes/2TBSSD/wikiart_pool_hot
+  vae_cache_dir:   /Volumes/2TBSSD/precomputed/vae_wikiart256    # 256px (32,32,32)
+  qwen3_cache_dir: /Volumes/2TBSSD/precomputed/qwen3_wikiart
+  csd_cache_dir:   /Volumes/2TBSSD/wikiart_csd
+  style_neighbors_db: /Volumes/2TBSSD/wikiart_neighbors.sqlite
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+  num_steps: 8000
+  contrastive_weight: 1.0
+  infonce_tau: 0.1
+  t_range: [700, 950]                            # the WINNING recipe (v2's [200,950] REGRESSED)
+  foreign_queue: 4096
+  foreign_max_cos: 0.5
+  null_style_prob: 0.1
+  grad_checkpoint: true
+  grad_clip: 1.0
+  weight_decay: 0.01
+  checkpoint_every: 1000
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist
+  guidance: 3.5
