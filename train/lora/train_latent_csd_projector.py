@@ -146,6 +146,7 @@ def geometry_check(proj, bn_m, bn_s, pool, n=384, seed=0):
 
 
 def main():
+    global VAE_DIR, CSD_DIR, EVAL_CSD_DIR, VAL_SHARD_MOD
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--batch-size", type=int, default=64)
@@ -156,7 +157,15 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="40 shards (>=1 val shard), tiny run, no checkpoint")
     ap.add_argument("--model-dir", default=os.path.join(ROOT, "flux-klein-4b-base"))
     ap.add_argument("--ckpt-dir", default=CKPT_DIR)
+    ap.add_argument("--vae-dir", default=VAE_DIR, help="raw-latent dir (per-corpus; e.g. WikiArt)")
+    ap.add_argument("--csd-dir", default=CSD_DIR, help="CSD bundle dir (must match --vae-dir corpus)")
+    ap.add_argument("--eval-csd-dir", default=EVAL_CSD_DIR,
+                    help="held-out geometry eval: CSD bundles + neighbors.sqlite in this dir")
+    ap.add_argument("--val-shard-mod", type=int, default=VAL_SHARD_MOD,
+                    help="hold out every Nth populated shard (lower for small corpora)")
     args = ap.parse_args()
+    VAE_DIR, CSD_DIR = args.vae_dir, args.csd_dir
+    EVAL_CSD_DIR, VAL_SHARD_MOD = args.eval_csd_dir, args.val_shard_mod
 
     rng = np.random.default_rng(0)
     random.seed(0); mx.random.seed(0)

@@ -7,7 +7,7 @@ model:
   flux_model_dir: flux-klein-4b-base
 adapter:
   lora_rank: 64
-  projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors  # reused (generic); retrain on WikiArt is a follow-on if the specialist underperforms
+  projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd_wikiart/latent_csd_projector.safetensors  # WikiArt-specific projector (v1 reused the generic's -> corrupted; SREF-STYLE-ROUTER specialist attempt 1). val cos 0.83, geometry 98% retained.
 data:
   bucket: [256, 256]
   text_seq: 128
@@ -31,5 +31,5 @@ training:
   grad_clip: 1.0
   weight_decay: 0.01
   checkpoint_every: 1000
-  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist_v2
   guidance: 3.5
