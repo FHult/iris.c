@@ -362,6 +362,23 @@ specialists are high-effort/uncertain. A clean re-test = retrain latent_csd proj
 retrain specialist → re-gate (~1.5 days). Artifacts: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist,
 /Volumes/2TBSSD/precomputed/vae_wikiart256 + qwen3_wikiart, wikiart_csd, wikiart_neighbors.sqlite.
 
+SPECIALIST ATTEMPT 2 (2026-07-16) — clean re-test with a WikiArt-specific projector. The projector fix
+WORKED (un-corrupted), but exposed a DEEPER failure → nuanced NEGATIVE. Trained a WikiArt latent→CSD
+projector (val cos 0.83, geometry 98% retained) and retrained the specialist (v2) against it. Results:
+(1) COHERENCE RESTORED — the projector diagnosis was right: v2 renders are coherent (not v1's garbage);
+the base+v2-LoRA baseline is a coherent painterly scene. (2) STRONG STYLE — v2 fine-art painterly styleCSD
+Δ **0.157** vs generic 0.058 vs corrupted-v1 0.028 (reference-specific, above its own always-painting
+baseline). BUT (3) SUBJECT DESTROYED — promptAdh **0.084** (vs generic 0.327); the "robot in a desert" is
+absent at α=0.4 AND at α=0.15/0.25 AND even at α=0 (no csd). The subject loss is in the LoRA WEIGHTS, not
+the csd_mod scale → un-fixable by α. ROOT CAUSE: training ONLY on WikiArt paintings OVERFIT the LoRA to
+"produce a painting," destroying prompt-following. **LESSON 2: narrow-data specialization overfits and
+loses prompt-following; the generic's DIVERSE data (incl. photorealistic) is what preserves the subject.**
+VERDICT: the router/specialist direction, tested rigorously TWICE, does NOT yield a usable specialist via
+"train only on the type." The GENERIC adapter is the robust answer. A "done-right" specialist would need
+MIXED data (WikiArt + diverse content, or a diverse-recon anchor / lower rank / regularization) — an
+uncertain further experiment. Artifacts kept: checkpoints/sref_painterly_specialist_v2,
+checkpoints/latent_csd_wikiart, the WikiArt caches.
+
 STAGED PLAN (cheapest wins first):
 1. MEASURE THE MAP — scorecard per style-type × per-method on a BROADENED eval set → the actual
    "CSD-region → best-method" table (router ground truth AND shows where a specialist even helps).
