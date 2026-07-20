@@ -42,21 +42,54 @@ _Q  = 4      # num_image_tokens (real: 16)
 _N  = 25     # num_blocks  (real: 25)
 
 
-def _make_synthetic_weights() -> dict[str, np.ndarray]:
-    """Return a float32 weight dict matching training checkpoint key layout."""
+_CSD = 24    # csd_dim  (real: 768) — small for the test
+
+
+def _make_synthetic_weights(mode: str = "siglip") -> dict[str, np.ndarray]:
+    """Return a float32 weight dict matching a training checkpoint's key layout
+    for the given conditioning mode ('siglip' | 'csd' | 'hybrid').
+
+    A real checkpoint carries exactly ONE mode's keys (SREF-LEAK-2 / SREF-COMBINE-1),
+    so load_checkpoint() skips the other modes' keys — the fixture must mirror that."""
     rng = np.random.default_rng(0)
-    return {
-        "image_proj.query_tokens":                  rng.standard_normal((_Q, _D)).astype(np.float32),
-        "image_proj.cross_attn.query_proj.weight":  rng.standard_normal((_D, _D)).astype(np.float32),
-        "image_proj.cross_attn.key_proj.weight":    rng.standard_normal((_D, _S)).astype(np.float32),
-        "image_proj.cross_attn.value_proj.weight":  rng.standard_normal((_D, _S)).astype(np.float32),
-        "image_proj.cross_attn.out_proj.weight":    rng.standard_normal((_D, _D)).astype(np.float32),
-        "image_proj.norm.weight":                   rng.standard_normal((_D,)).astype(np.float32),
-        "image_proj.norm.bias":                     np.zeros(_D, dtype=np.float32),
-        "to_k_ip_stacked":                          rng.standard_normal((_N, _D, _D)).astype(np.float32),
-        "to_v_ip_stacked":                          rng.standard_normal((_N, _D, _D)).astype(np.float32),
-        "scale":                                    np.ones(_N, dtype=np.float32),
+    w = {
+        "to_k_ip_stacked": rng.standard_normal((_N, _D, _D)).astype(np.float32),
+        "to_v_ip_stacked": rng.standard_normal((_N, _D, _D)).astype(np.float32),
+        "scale":           np.ones(_N, dtype=np.float32),
     }
+    if mode in ("siglip", "hybrid"):
+        # SigLIP PerceiverResampler (cross-attn + input-norm in_gamma/in_beta).
+        w.update({
+            "image_proj.query_tokens":                  rng.standard_normal((_Q, _D)).astype(np.float32),
+            "image_proj.cross_attn.query_proj.weight":  rng.standard_normal((_D, _D)).astype(np.float32),
+            "image_proj.cross_attn.key_proj.weight":    rng.standard_normal((_D, _S)).astype(np.float32),
+            "image_proj.cross_attn.value_proj.weight":  rng.standard_normal((_D, _S)).astype(np.float32),
+            "image_proj.cross_attn.out_proj.weight":    rng.standard_normal((_D, _D)).astype(np.float32),
+            "image_proj.norm.weight":                   rng.standard_normal((_D,)).astype(np.float32),
+            "image_proj.norm.bias":                     np.zeros(_D, dtype=np.float32),
+            "image_proj.in_gamma":                      np.ones(_S, dtype=np.float32),
+            "image_proj.in_beta":                       np.zeros(_S, dtype=np.float32),
+        })
+    if mode == "csd":
+        # CSD FiLM conditioning (no cross-attn): film.weight is nn.Linear(csd_dim, 2*hidden).
+        w.update({
+            "image_proj.query_tokens": rng.standard_normal((_Q, _D)).astype(np.float32),
+            "image_proj.norm.weight":  rng.standard_normal((_D,)).astype(np.float32),
+            "image_proj.norm.bias":    np.zeros(_D, dtype=np.float32),
+            "image_proj.film.weight":  rng.standard_normal((2 * _D, _CSD)).astype(np.float32),
+            "image_proj.film.bias":    np.zeros(2 * _D, dtype=np.float32),
+        })
+    if mode == "hybrid":
+        # Hybrid = SigLIP perceiver (above) + a SEPARATE CSD module + per-block leak gate.
+        w.update({
+            "csd_proj.query_tokens": rng.standard_normal((_Q, _D)).astype(np.float32),
+            "csd_proj.film.weight":  rng.standard_normal((2 * _D, _CSD)).astype(np.float32),
+            "csd_proj.film.bias":    np.zeros(2 * _D, dtype=np.float32),
+            "csd_proj.norm.weight":  rng.standard_normal((_D,)).astype(np.float32),
+            "csd_proj.norm.bias":    np.zeros(_D, dtype=np.float32),
+            "group_gate":            np.zeros((_N, 2), dtype=np.float32),
+        })
+    return w
 
 
 def _write_synthetic_checkpoint(path: str, weights: dict[str, np.ndarray]) -> None:
@@ -135,8 +168,10 @@ class TestQuantUtils:
 
     def test_infer_dims(self):
         weights = _make_synthetic_weights()
-        # Map to export keys
-        export_w = {v: weights[k] for k, v in _KEY_MAP.items()}
+        # Map the fixture's own (checkpoint-side) keys to export keys. A checkpoint
+        # only carries one mode's keys, so map from the weights we have — not the
+        # full multi-mode _KEY_MAP (which would KeyError on absent csd/hybrid keys).
+        export_w = {_KEY_MAP[k]: v for k, v in weights.items()}
         dims = _infer_dims(export_w)
         assert dims["num_blocks"]       == _N
         assert dims["hidden_dim"]       == _D
@@ -166,8 +201,21 @@ class TestExportPipeline:
 
     def test_load_checkpoint_live_keys(self, checkpoint):
         w = load_checkpoint(checkpoint, use_ema=False)
-        assert set(w.keys()) == set(_KEY_MAP.values())
+        # A siglip-mode checkpoint round-trips exactly its own keys through _KEY_MAP;
+        # the csd/hybrid-only export keys are skipped (SREF-LEAK-2 / SREF-COMBINE-1).
+        expected = {_KEY_MAP[k] for k in _make_synthetic_weights("siglip")}
+        assert set(w.keys()) == expected
         assert all(v.dtype == np.float32 for v in w.values())
+
+    @pytest.mark.parametrize("mode", ["siglip", "csd", "hybrid"])
+    def test_load_checkpoint_all_modes(self, mode, tmp_path_factory):
+        """load_checkpoint returns exactly the keys for the checkpoint's mode —
+        guards the SREF-era csd/hybrid _KEY_MAP additions that drifted undetected."""
+        ckpt = str(tmp_path_factory.mktemp(f"ckpt_{mode}") / "step_000500.safetensors")
+        _write_synthetic_checkpoint(ckpt, _make_synthetic_weights(mode))
+        w = load_checkpoint(ckpt, use_ema=False)
+        expected = {_KEY_MAP[k] for k in _make_synthetic_weights(mode)}
+        assert set(w.keys()) == expected
 
     def test_load_checkpoint_ema_missing_raises(self, checkpoint):
         with pytest.raises(ValueError, match="ema"):

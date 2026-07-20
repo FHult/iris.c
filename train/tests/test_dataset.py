@@ -383,13 +383,15 @@ def _make_synthetic_shard(path: str, n_records: int = 5):
 
 
 class TestMakePrefetchLoader:
-    def test_yields_6_tuple(self, tmp_path):
+    def test_yields_8_tuple(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
         batch = next(iter(loader))
-        assert len(batch) == 7   # +style_ref (SREF-1)
+        # (images, caps, temb, vae, siglip, style_ref, bucket_hw, ids)
+        # 6 -> 7 (+style_ref, SREF-1) -> 8 (+ids, per-shard loss attribution)
+        assert len(batch) == 8
 
     def test_image_batch_shape(self, tmp_path):
         shard = str(tmp_path / "shard_000.tar")
@@ -397,7 +399,7 @@ class TestMakePrefetchLoader:
 
         bH, bW = 512, 512
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(bH, bW))
-        images, captions, text_embs, vae_lats, siglip, style_ref, bucket_hw = next(iter(loader))
+        images, captions, text_embs, vae_lats, siglip, style_ref, bucket_hw, ids = next(iter(loader))
 
         assert images.shape == (2, 3, bH + 32, bW + 32)
         assert images.dtype == np.float32
@@ -418,7 +420,7 @@ class TestMakePrefetchLoader:
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(640, 640))
-        *_, bucket_hw = next(iter(loader))
+        *_, bucket_hw, _ids = next(iter(loader))
         assert bucket_hw == (640, 640)
 
     def test_no_precomputed_caches_returns_none(self, tmp_path):
@@ -426,7 +428,7 @@ class TestMakePrefetchLoader:
         _make_synthetic_shard(shard, n_records=10)
 
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512))
-        _, _, text_embs, vae_lats, siglip, _, _ = next(iter(loader))
+        _, _, text_embs, vae_lats, siglip, _, _, _ = next(iter(loader))
         assert text_embs is None
         assert vae_lats is None
         assert siglip is None
@@ -477,7 +479,7 @@ class TestStyleNeighborRef:
         ndb = self._neighbors_db(tmp_path, {s: [stems[(i + 1) % 4]] for i, s in enumerate(stems)})
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
                                       siglip_cache_dir=sig, style_neighbors_db=ndb)
-        _, _, _, _, siglip, style_ref, _ = next(iter(loader))
+        _, _, _, _, siglip, style_ref, _, _ = next(iter(loader))
         assert siglip is not None
         assert style_ref is not None, "neighbor features must be supplied"
         assert style_ref.shape == siglip.shape
@@ -497,7 +499,7 @@ class TestStyleNeighborRef:
                                  cos=0.3)
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
                                       siglip_cache_dir=sig, style_neighbors_db=ndb)
-        *_, style_ref, _bk = next(iter(loader))
+        *_, style_ref, _bucket, _ids = next(iter(loader))
         assert style_ref is None, "cos<0.6 neighbors must not be used as style refs"
 
     def test_no_db_yields_none(self, tmp_path):
@@ -507,7 +509,7 @@ class TestStyleNeighborRef:
         sig = self._siglip_cache(tmp_path, stems)
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
                                       siglip_cache_dir=sig)
-        *_, style_ref, _bk = next(iter(loader))
+        *_, style_ref, _bucket, _ids = next(iter(loader))
         assert style_ref is None
 
     def test_missing_db_path_fails_open(self, tmp_path):
@@ -515,5 +517,5 @@ class TestStyleNeighborRef:
         _make_synthetic_shard(shard, n_records=4)
         loader = make_prefetch_loader([shard], batch_size=2, bucket=(512, 512),
                                       style_neighbors_db=str(tmp_path / "absent.sqlite"))
-        *_, style_ref, _bk = next(iter(loader))
+        *_, style_ref, _bucket, _ids = next(iter(loader))
         assert style_ref is None   # no crash, legacy behavior
