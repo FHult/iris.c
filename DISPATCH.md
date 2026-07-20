@@ -1,3 +1,9 @@
+> ⚠️ **This is the V1 reference — it is outdated.**
+> The active pipeline is V2. **Read `train/DISPATCH.md` instead.**
+> V1 scripts have been archived to `train/scripts/v1/` and should not be used.
+
+---
+
 # DISPATCH — AI Agent Operational Guide
 
 This document is written for AI agents operating on this repository. It covers
