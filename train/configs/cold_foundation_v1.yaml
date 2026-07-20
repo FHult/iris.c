@@ -1,0 +1,103 @@
+# cold_foundation_v1.yaml
+# Purpose: First foundation campaign using your real three-tier hardware.
+#   - cold (16 TB HDD)   = source of truth + archive target for all shards + full precompute history
+#   - hot  (2 TB external SSD) = primary compute tier for medium runs and at-scale precompute of active subsets
+#   - ultrahot (internal NVMe) = small/quick experiments (movement policy between hot↔ultrahot still WIP)
+#
+# Strategy: Full cold-only shard build on the HDD first (using --cold-only), then let the stager
+# pull only the shards needed for each progressive medium run onto the external 2 TB SSD.
+# Parallel ablation harness runs on hot (or ultrahot) to discover good QUALITY settings on your data.
+# Everything important (shard_scores.db, ablation_history.db, hard_examples, versioned precompute)
+# ends up archived on cold.
+#
+# Usage (with both cold HDD + hot external SSD attached):
+#   ./train/start_pipeline.sh --data-root /Volumes/2TBSSD --config train/configs/cold_foundation_v1.yaml
+#
+# For the initial full cold-only shard build (only HDD attached):
+#   Use the direct `build_shards.py --cold-only` command (see cold_foundation_bootstrap.sh output).
+
+recipe: ip_adapter_flux4b
+chunks: 4
+scale: medium                 # start with proven medium budgets; expand in later campaigns
+poll_interval: 60
+
+# Three-tier storage (your actual hardware)
+#   cold   = 16 TB HDD (source of truth, slow archive)
+#   hot    = 2 TB external SSD (primary compute for medium runs)
+#   ultrahot = internal NVMe (small/quick experiments — movement logic still WIP)
+storage:
+  cold_root:      "/Volumes/16TBCold"          # 16 TB HDD — never delete, all shards + full precompute + archives live here
+  hot_root:       "/Volumes/2TBSSD"            # 2 TB external SSD — main working area for real training + at-scale precompute
+  ultrahot_root:  "/Users/fredrikhult/ultrahot" # internal NVMe — small runs, fast experiments (hot↔ultrahot policy still WIP)
+  data_prep_tier: hot                          # where prep (dedupe, build, precompute) writes its working data
+  staging_margin_gb: 150                       # leave headroom on the 2 TB external SSD
+  cleanup_safety_gb: 80
+  archive_after_chunk: true                    # after each medium chunk, copy new precomp + checkpoints back to cold HDD
+  background_staging: true                     # while training chunk N on hot, stage chunk N+1 from cold HDD in background
+  max_parallel_transfers: 3
+
+model:
+  flux_model: flux-klein-model
+  checkpoint_dir: /Volumes/16TBCold/checkpoints/stage1
+
+training_config: train/configs/stage1_512px.yaml
+
+# Use the full JourneyDB range for foundation (you have everything).
+# The "medium" step counts + precompute.max_shards give a practical first pass.
+jdb:
+  validation_tgzs: [0, 0]
+  tgz_ranges:
+    medium:
+      1: [1, 13]
+      2: [50, 62]
+      3: [100, 112]
+      4: [150, 162]
+
+data_sources:
+  laion_hf_repo: "laion/laion-art"
+  coyo_hf_repo: ""
+  laion_coyo_mode: "skip"   # you already have the converted pools on cold
+
+data_volume:
+  medium: 0.25
+
+training:
+  mine_use_ema: true
+  mine: true
+  hard_mix_ratio: 0.05
+  hard_mix_ratio_by_chunk:
+    2: 0.10
+    3: 0.12
+    4: 0.15
+  siglip: true
+
+  mine_eval_records:
+    medium: 25000
+  mine_top_k:
+    medium: 4000
+
+  steps:
+    medium:
+      1: 105000
+      2: 40000
+      3: 40000
+      4: 40000
+
+  lr:
+    1: 1.0e-4
+    2: 3.0e-5
+    3: 1.0e-5
+    4: 1.0e-5
+
+precompute:
+  max_shards:
+    medium: 150          # generous foundation coverage; raise or remove for later full passes
+  vae_batch: 4
+
+anomaly:
+  loss_threshold: 2.0
+  loss_high_steps: 100
+  grad_norm_pause: 50.0
+  grad_norm_warn: 10.0
+  grad_spike_polls: 10
+  siglip_min_coverage: 90
