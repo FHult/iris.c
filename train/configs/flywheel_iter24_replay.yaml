@@ -1,0 +1,79 @@
+# One-shot REPLAY of warmup-run5 iteration 24 (Option B).
+#
+# GOAL: re-run iter24's exact 40-shard mix as a single from-scratch 1000-step
+# iteration and reproduce its held-out cond_gap (DB record: cond_gap=0.0727,
+# train_loss=0.4994, hyperparams cross_ref_prob=0.5 / style_loss_weight=0.07).
+#
+# HOW THE 40 SHARDS ARE PINNED (important — read before editing):
+#   The orchestrator has NO "use exactly these shards" config field. shard_manifest
+#   is ONLY a source-tag override fed to scan_shard_pool() ({shard_id:{source}} dict);
+#   it does NOT restrict selection (the run5 comment that implied otherwise was
+#   aspirational — never implemented). select_shards() always picks from the WHOLE
+#   score DB via its bandit policy.
+#   BUT: select_shards() has a short-circuit (shard_selector.py:946) — when the pool
+#   size <= n_shards it returns ALL shards deterministically, bypassing the policy.
+#   So we pin the set by making the pool exactly those 40:
+#     1. shards_dir points at a 40-symlink farm (the iter24 set only).
+#     2. ephemeral_scores routes the score DB to shard_scores_scratch.db (NOT the
+#        1280-shard production shard_scores.db), so scan_shard_pool registers exactly
+#        these 40. With n_shards: 40 the short-circuit returns all 40, every run.
+#   LAUNCH PREREQ: shard_scores_scratch.db must be absent/empty so the pool is exactly
+#   40 (currently absent — verified 2026-06-16). If it exists with other shards,
+#   delete it first: rm -f /Volumes/2TBSSD/shard_scores_scratch.db
+#
+#   Symlink farm built at: /Volumes/2TBSSD/flywheel_replay/iter24_shards/  (40 tars)
+#   Reference path list:   /Volumes/2TBSSD/flywheel_replay/iter24_manifest.json
+#     (a record of the set for humans — NOT wired into shard_manifest, which expects
+#      a dict and would crash on a JSON array.)
+#
+# NOTE ON SEED: run5/iter24 itself was unseeded. seed:42 is set here for a
+# controlled, repeatable replay, so this will not bit-reproduce iter24's RNG draws.
+#
+# Launch (only when source-probe is NOT running — GPU conflict):
+#   ./train/start_pipeline.sh --config train/configs/flywheel_iter24_replay.yaml
+
+flywheel:
+  name: "iter24-replay"
+  max_iterations: 1              # one-shot
+  steps_per_iteration: 1000
+  n_shards: 40                   # == pool size → select_shards returns all 40
+  poll_interval: 60
+  min_free_gb: 40
+
+  # Pin the exact iter24 set (see header).
+  shards_dir: "/Volumes/2TBSSD/flywheel_replay/iter24_shards"
+  ephemeral_scores: true         # scratch score DB; production shard_scores.db untouched
+
+  # From-scratch data-selection, identical to run5.
+  from_scratch_each_iter: true
+  base_checkpoint: null
+
+  # Style-paired cross-ref + subsampled precompute — same as run5/iter24.
+  style_pairing: true
+  style_cold_dir: "/Volumes/16TBCold/precomputed/style/v1_csd"
+  precompute_subsample_per_shard: 200
+
+  training_config: "train/configs/stage1_512px.yaml"
+
+  hyperparams:
+    cross_ref_prob: 0.5          # iter24 DB record
+    style_loss_weight: 0.07      # iter24 DB record
+    seed: 42                     # merged into training cfg → train_ip_adapter reads tcfg["seed"]
+
+  # Selection policy is INERT here (pool size == n_shards triggers the
+  # return-all short-circuit before any policy runs). Kept minimal for clarity.
+  shard_selection:
+    performance_weight: 0.30
+    min_diversity_pct:  0.30
+    exploration_rate:   0.40
+    recency_penalty:    0.20
+    recency_window_iters: 2
+
+  # shard_manifest is source-tagging only and irrelevant to this replay (all 40
+  # selected regardless of source). Left null.
+  shard_manifest: null
+
+  # One-shot: plateau detection and ablation are irrelevant.
+  plateau_patience:   0
+  plateau_threshold:  0.02
+  ablation_every_n:   0

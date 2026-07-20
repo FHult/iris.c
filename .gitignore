@@ -42,3 +42,7 @@ web/.venv/
 
 # Optional user-provided style-reference adapter bundle (run.sh / IRIS_IP_BUNDLE)
 sref-bundle/
+
+# External code-audit reports (Grok, May-Jun 2026) + metal-audit package — archived
+# reference material, findings extracted to BACKLOG.md. Kept locally, out of git.
+reviews/

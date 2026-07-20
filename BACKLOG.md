@@ -2283,6 +2283,25 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
 - **BL-004: simdgroup_matrix for Custom GEMM Tiles** — M3+ only
 - **BL-005: Native bfloat MSL Type** — M3+ only
 
+### Metal Kernel Audit (Grok, 2026-05) — Triaged / mostly SUPERSEDED (2026-07-20)
+
+External metal-kernel audit package (3 docs + 2 HTML) archived to `reviews/`
+(`metal_kernel_audit_{summary,comprehensive}.md`, `metal_optimization_backlog.md`).
+Re-checked against the perf work landed *after* the May audit — most of it is stale:
+
+- **B-METAL-01 (CPU softmax fallback) / B-METAL-02 (make `attention_fused` dominant)
+  — SUPERSEDED.** The f32 attention path now routes through MPSGraph native SDPA (Flash
+  Attention) as the PRIMARY path (BL-001, done), with the custom kernel only a fallback;
+  BF16 already used Apple `scaledDotProductAttentionWithQueryTensor`. The audit's premise
+  (hand kernel is the hot path, CPU softmax leaks) no longer holds.
+- **B-METAL-03 (float4 vectorize the custom-kernel inner loops) — LOW VALUE now.** The
+  custom kernel is a fallback; BL-002 already replaced its barriers with simd_sum/simd_max.
+- **B-METAL-04 (simdgroup_matrix QK^T / scores@V) — == BL-004, already tracked, M3+ only.**
+- **B-METAL-05 (block super-kernel fusion) — speculative; not scheduled.**
+- The audit's "IP-Adapter C path missing" framing is STALE (fused inject shipped 2026-06-29
+  B2; joint adapter ported to C 2026-07-13). The one concrete keeper — a metal
+  parity/perf regression harness — is committed as `debug/metal_regression_suite.sh`.
+
 ---
 
 ## Test Gaps
@@ -2328,7 +2347,11 @@ All 9 bugs fixed: INFER-C-001 in commit `76564f8`; INFER-H-001 and INFER-M-001 i
 
 ## C-Engine Static Review (Grok 4.3, 2026-06) — Triaged
 
-External static review of the C inference engine (`grok_bug_report.md`, untracked).
+> NOTE (2026-07-20): the raw Grok audit reports referenced in this and the following
+> three "— Triaged" sections are archived under `reviews/` (git-ignored). Findings were
+> already extracted here; the reports are kept locally as reference only.
+
+External static review of the C inference engine (`grok_bug_report.md`, archived in `reviews/`).
 Verified accurate on spot-check (C-01, H-01, H-04, L-01, M-08 confirmed against
 source). Triaged below — severities re-calibrated from the original report. Scope
 is the C binary only; none of this affects the Python training/flywheel pipeline.
