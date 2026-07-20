@@ -1,0 +1,59 @@
+# SREF painterly SPECIALIST v3 — MIXED DATA (SREF-STYLE-ROUTER step 3, attempt 3).
+# v2 (pure WikiArt) overfit: strong style (styleCSD 0.157) but destroyed prompt-following
+# (promptAdh 0.084). Hypothesis: mixing WikiArt (style lever) with diverse content (40:60)
+# keeps the style while restoring the subject. Plan: plans/sref-mixed-painterly-specialist.md.
+#
+# Data (built 2026-07-20): 12 WikiArt shards (23,444) + 7 diverse shards (35,000) = 40.1% WikiArt.
+# Unified caches under mixed_painterly_v3/ (symlinks, no copies); merged within-style neighbor DB
+# (132,697 rows). Projector = the GENERIC one (geometry gate: 84% diverse / 76% WikiArt retain —
+# best single projector across both corpora; WikiArt projector fails diverse at 45%).
+model:
+  flux_model_dir: flux-klein-4b-base
+adapter:
+  lora_rank: 64
+  projector_ckpt: /Volumes/2TBSSD/checkpoints/latent_csd/latent_csd_projector.safetensors  # generic; holds the geometry gate on BOTH corpora (76%/84%)
+data:
+  bucket: [256, 256]
+  text_seq: 128
+  shard_paths:                                    # explicit mix -> controls the 40:60 ratio
+    - /Volumes/2TBSSD/wikiart_pool_hot/000.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/004.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/008.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/012.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/013.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/018.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/022.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/026.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/027.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/031.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/036.tar
+    - /Volumes/2TBSSD/wikiart_pool_hot/040.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000000.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000004.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000008.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000012.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000026.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000061.tar
+    - /Volumes/2TBSSD/baseline_pool_hot/000112.tar
+  shard_path: /Volumes/2TBSSD/wikiart_pool_hot    # fallback (unused when shard_paths is set)
+  vae_cache_dir:   /Volumes/2TBSSD/mixed_painterly_v3/vae256
+  qwen3_cache_dir: /Volumes/2TBSSD/mixed_painterly_v3/qwen3
+  csd_cache_dir:   /Volumes/2TBSSD/mixed_painterly_v3/csd
+  style_neighbors_db: /Volumes/2TBSSD/mixed_painterly_v3/neighbors.sqlite
+  seed: 0
+training:
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+  num_steps: 8000
+  contrastive_weight: 1.0
+  infonce_tau: 0.1
+  t_range: [700, 950]                             # the winning v1 band (v2's [200,950] regressed)
+  foreign_queue: 4096
+  foreign_max_cos: 0.5
+  null_style_prob: 0.1
+  grad_checkpoint: true
+  grad_clip: 1.0
+  weight_decay: 0.01
+  checkpoint_every: 1000
+  checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_painterly_specialist_v3_mixed
+  guidance: 3.5

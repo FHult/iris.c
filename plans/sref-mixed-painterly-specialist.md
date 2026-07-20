@@ -1,7 +1,25 @@
 # SREF Mixed-Data Painterly Specialist (SREF-STYLE-ROUTER step 3, attempt 3)
 
-**Status:** SCOPED (2026-07-20) — awaiting go on mix-ratio + launch.
-**Owner decision pending:** mix ratio; whether to launch the ~1.5-day run now.
+**Status:** RUN 1 LAUNCHED (2026-07-20). 40:60 mix, generic projector. ~11 h; gate at 7000.
+
+## Run 1 — LAUNCHED 2026-07-20
+
+- Config `train/configs/sref_painterly_specialist_v3_mixed.yaml`; caches built by
+  `debug/build_mixed_painterly_caches.py` → `/Volumes/2TBSSD/mixed_painterly_v3/` (vae256/qwen3 58,444
+  @ 40.1% WikiArt, 19 CSD bundles, merged neighbors 132,697). Projector = generic (see resolution below).
+- **Smoke (100 steps, real config) PASSED:** reaches steps (no cache-miss death); peak **16.6 GB** (no
+  swap); **0.18–0.21 it/s → ~11 h** for 8000 steps; pair term `loss_b` 0.75→0.27 dropping BELOW the
+  0.6931 ref-blind floor (learning reference-discrimination, not collapsing); gnorm 6.3→0.6.
+- Log `/Volumes/2TBSSD/logs/sref_painterly_v3_mixed.log`; checkpoints every 1000 →
+  `checkpoints/sref_painterly_specialist_v3_mixed/`.
+- **GATE at 7000/8000:** `debug/sref_gate_joint.py` (LoRA r64 + csd_mod render) →
+  `debug/sref_scorecard.py --score-only`. PASS = painterly styleCSD Δ ≥ ~0.157 AND promptAdh recovers
+  (≥ ~0.15) AND cross-ref output corr < 0.90. Fast-follow if WikiArt style is weak: train a multi-corpus
+  projector (the generic holds only 76% of the WikiArt gap vs 84% diverse).
+
+---
+
+**Original scope (2026-07-20), for the trail:**
 
 ## Hypothesis
 
@@ -53,11 +71,17 @@ Diverse (content preservation) — the generic's data:
 2. **Merge neighbor DBs** — `wikiart_neighbors.sqlite` (23,444) ∪ the diverse look-neighbor DB into
    one `mixed_neighbors.sqlite` (both are within-style pairs — the correct signal for each source).
 3. **`data.shard_paths`** = 12 WikiArt tars + K diverse tars, K chosen to hit the target ratio.
-4. **Projector**: the trainer applies one latent→CSD projector to all latents. WikiArt needs the
-   WikiArt projector; diverse needs the generic's. **Open risk** — a single projector may not fit
-   both latent distributions. Options: (a) fit a NEW projector on mixed latents; (b) accept the
-   WikiArt projector if the diverse latents' CSD recovery stays above the geometry gate. Resolve
-   with a cheap projector-fit + geometry-gate check before the full run.
+4. **Projector — RESOLVED 2026-07-20: use the GENERIC projector (`checkpoints/latent_csd/`).**
+   Cross-corpus geometry-gate test (`scratchpad/proj_geo_eval.py`, gap = cos(proj,neighbour) −
+   cos(proj,foreign), true gap ~0.60–0.63):
+   - generic proj: **diverse 84% retain (gap 0.53), WikiArt 76% retain (gap 0.46)** — usable on BOTH.
+   - WikiArt proj: WikiArt 98% but **diverse only 45%** (gap 0.28) — fails the majority corpus.
+   The generic projector is the best SINGLE projector for the mix (it is at home on the 60% diverse
+   majority and still holds a strong WikiArt gap). The v1 "generic-proj-corrupts-WikiArt" failure was
+   a *pure-WikiArt* run compounding the 24% gap loss; a diverse-majority mix is far more forgiving. No
+   projector training needed for run 1. **Fast-follow only if** the WikiArt contrastive underperforms
+   at the 7000-step gate → then train a multi-corpus projector (trainer needs a small multi-source
+   `build_index` change; both corpora are 32×32 latents so batches stack cleanly).
 
 ## Mix ratio — THE decision
 
