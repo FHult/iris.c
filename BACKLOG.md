@@ -300,6 +300,16 @@ graphic strongest, painterly/semi_real ~equal. Caveats: promptAdh prints 0 in th
 for SREF-STYLE-ROUTER step 1 + the train-more gate. Painterly breadth still data-limited (in-dist painterly
 is DIGITAL-painterly; true fine-art painterly needs the WikiArt build).
 
+### 🔴 SREF-STYLE-ROUTER — CLOSED 2026-07-21 (three independent negatives; the GENERIC v5.3.0 stands).
+No current method beats the generic per-type (step 1). A pure-WikiArt painterly specialist v2 got strong
+style (styleCSD 0.157) but overfit → destroyed prompt-following (promptAdh 0.084). The mixed-data
+hypothesis (WikiArt + diverse to keep style while restoring content) was the last untried lever and
+FAILED: v3 40:60 gated at painterly styleCSD Δ **0.0495** (< generic-painterly ~0.058 — the mix
+over-diluted the style) with cross-ref corr max 0.98 (reference-inertness; in-loop `loss_b` discrimination
+did not transfer to inference). promptAdh recovered (0.115) but style collapsed. ⇒ the specialist is NOT
+the lever at any mix that preserves content; the router direction is closed. Full trail:
+`plans/sref-mixed-painterly-specialist.md`. Original proposal (kept for the trail):
+
 ### 🔵 SREF-STYLE-ROUTER (PROPOSED, 2026-07-13) — classify the style reference (CSD) → route to the best method/expert per reference-type; confidence-gated with the generic adapter as the floor.
 IDEA (operator): style-transfer methods have LARGE, MEASURED per-reference-type effectiveness gaps, so
 classify the reference's style at inference (CSD — already computed) and route to the best method /

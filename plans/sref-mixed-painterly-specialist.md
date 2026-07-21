@@ -1,6 +1,7 @@
 # SREF Mixed-Data Painterly Specialist (SREF-STYLE-ROUTER step 3, attempt 3)
 
-**Status:** RUN 1 GATED — NEGATIVE (2026-07-21). 40:60 mix over-diluted the WikiArt style.
+**Status:** CLOSED — NEGATIVE (2026-07-21). 40:60 mix over-diluted the WikiArt style; the
+router/specialist direction is closed (3rd negative). GENERIC v5.3.0 stands. See BACKLOG SREF-STYLE-ROUTER.
 
 ## Run 1 GATE RESULT — NEGATIVE (2026-07-21)
 
