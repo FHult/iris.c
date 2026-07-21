@@ -61,8 +61,8 @@ No Python, no CUDA, no virtual environment required.
 
 | Model | Flag | Steps | Speed | License |
 |-------|------|-------|-------|---------|
-| Flux.2 Klein 4B distilled | `flux-klein-4b` | 4 | ~7.6s @ 512² on M3 Max | MIT |
-| Flux.2 Klein 4B base | `flux-klein-4b-base` | 50 | ~25× slower | MIT |
+| Flux.2 Klein 4B distilled | `flux-klein-4b` | 4 | ~7.6s @ 512² on M3 Max | Apache 2.0 |
+| Flux.2 Klein 4B base | `flux-klein-4b-base` | 50 | ~25× slower | Apache 2.0 |
 | Flux.2 Klein 9B distilled | `flux-klein-9b` | 4 | higher quality | Non-commercial |
 | Flux.2 Klein 9B base | `flux-klein-9b-base` | 50 | highest quality | Non-commercial |
 | Z-Image-Turbo 6B | `zimage-turbo` | 9 | 8 NFE | Apache 2.0 |
