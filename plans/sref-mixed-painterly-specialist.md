@@ -1,6 +1,30 @@
 # SREF Mixed-Data Painterly Specialist (SREF-STYLE-ROUTER step 3, attempt 3)
 
-**Status:** RUN 1 LAUNCHED (2026-07-20). 40:60 mix, generic projector. ~11 h; gate at 7000.
+**Status:** RUN 1 GATED — NEGATIVE (2026-07-21). 40:60 mix over-diluted the WikiArt style.
+
+## Run 1 GATE RESULT — NEGATIVE (2026-07-21)
+
+Scorecard on `joint_probe_0007000` (style-scale 1.0), 32-ref eval:
+
+| type | styleCSD Δ | promptAdh | | cross-ref corr |
+|---|---|---|---|---|
+| graphic | 0.1026 | 0.1206 | painterly (the lever) | mean 0.86 / **max 0.98** |
+| **painterly** | **0.0495** | 0.1147 | v2 pure-WikiArt | 0.157 / promptAdh 0.084 |
+| semi_real | 0.0624 | 0.1313 | gate target | ≥0.157 / ≥~0.15 / max<0.90 |
+| OVERALL | 0.0714 | 0.1195 | | |
+
+**FAILS all three gates.** painterly styleCSD Δ **0.0495 << 0.157** (v2) — the mix diluted the WikiArt
+style to below even the generic's painterly (~0.058). promptAdh rose to 0.115 (from v2's 0.084 — subject
+partially recovered) but style collapsed, so it doesn't matter. cross-ref corr max 0.98 = partial
+reference-inertness (in-loop `loss_b` discrimination did NOT transfer to inference — the recurring
+train→infer gap). **Conclusion (per this plan's decision rule): mixing over-diluted → the specialist is
+NOT the lever; the GENERIC v5.3.0 stands. This is the THIRD independent negative for router/specialist**
+(SREF-STYLE-ROUTER twice + this). Artifacts kept: `checkpoints/sref_painterly_specialist_v3_mixed/`,
+`mixed_painterly_v3/` caches, renders `/tmp/sref_scorecard/joint_v3_7000/`.
+
+---
+
+**Run 1 launch record (2026-07-20), for the trail:**
 
 ## Run 1 — LAUNCHED 2026-07-20
 
