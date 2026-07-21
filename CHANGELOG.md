@@ -15,7 +15,9 @@ and the CSD-ViT-L reference encoder (CC-BY-4.0):
 
 See each release's `MODEL_CARD.md` and [docs/sref.md](docs/sref.md). Also this cycle: the SREF web reference UX collapsed into one
 auto-routing flow (`/sref/capabilities`), a canonical `docs/sref.md` guide, and test guards for the
-csd_mod C parity + the web SREF routing (now in the nightly).
+csd_mod C parity + the web SREF routing (now in the nightly). **License correction:** the README model
+table now lists the Flux.2 Klein **4B** models (distilled and base) as **Apache 2.0** — they were
+mislabeled MIT; verified against the Black Forest Labs model cards during the release license check.
 
 ---
 
