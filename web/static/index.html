@@ -299,10 +299,15 @@
                             <label for="ref-mode-global" class="ref-mode-global-label">Use as:</label>
                             <select id="ref-mode-global" class="ref-mode-global-select">
                                 <option value="style">Style — adopt the look, keep my prompt's subject</option>
-                                <option value="library">Style Library — match a trained style (strongest)</option>
-                                <option value="adapter">Learned Style — generic adapter, works on any reference</option>
                                 <option value="composition">Composition — keep the reference's layout</option>
                             </select>
+                        </div>
+                        <div class="ref-engine-row" id="ref-engine-row" style="display:none">
+                            <button type="button" class="ref-engine-toggle" id="ref-engine-toggle" aria-expanded="false">Advanced ▾</button>
+                            <span class="ref-engine-adv" id="ref-engine-adv" style="display:none">
+                                <label for="ref-engine">Engine:</label>
+                                <select id="ref-engine" class="ref-engine-select"></select>
+                            </span>
                         </div>
                         <div class="ref-mode-hint" id="ref-mode-hint" style="display:none"></div>
                         <div class="reference-images-grid">

@@ -1702,6 +1702,36 @@ class TestSrefV53Routing:
         r = client.post("/sref/resolve", json={"image": self._PNG_DATAURL})
         assert r.status_code == 404
 
+    # ── /sref/capabilities (drives the auto-engine UI) ──────────────────────
+    def test_capabilities_none_installed_auto_is_band_control(self, client, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "SREF_ADAPTER_LORA", tmp_path / "no_lora")
+        monkeypatch.setattr(srv, "SREF_ADAPTER_CSDMOD", tmp_path / "no_csdmod")
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", tmp_path / "no_lib.json")
+        body = client.get("/sref/capabilities").get_json()
+        assert body["adapter"] is False and body["library"] is False
+        assert body["band_control"] is True and body["auto"] == "style"
+
+    def test_capabilities_library_only_auto_is_library(self, client, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "SREF_ADAPTER_LORA", tmp_path / "no_lora")
+        monkeypatch.setattr(srv, "SREF_ADAPTER_CSDMOD", tmp_path / "no_csdmod")
+        lib = tmp_path / "library.json"; lib.write_text("[]")
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", lib)
+        body = client.get("/sref/capabilities").get_json()
+        assert body["library"] is True and body["auto"] == "library"
+
+    def test_capabilities_adapter_wins_auto(self, client, monkeypatch, tmp_path):
+        import server as srv
+        lora = tmp_path / "joint_lora.safetensors"; lora.write_bytes(b"x")
+        csdmod = tmp_path / "csd_mod.safetensors"; csdmod.write_bytes(b"x")
+        lib = tmp_path / "library.json"; lib.write_text("[]")
+        monkeypatch.setattr(srv, "SREF_ADAPTER_LORA", lora)
+        monkeypatch.setattr(srv, "SREF_ADAPTER_CSDMOD", csdmod)
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", lib)
+        body = client.get("/sref/capabilities").get_json()
+        assert body["adapter"] is True and body["auto"] == "adapter"  # adapter beats library
+
 
 class TestStyleCodes:
     """SREF-3 style codes: save a reference as a reusable code, list/delete,

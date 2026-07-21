@@ -1543,31 +1543,82 @@ document.addEventListener('DOMContentLoaded', () => {
         if (modeRow) modeRow.style.display = hasAnyImage ? 'flex' : 'none';
         const hint = document.getElementById('ref-mode-hint');
         if (hint) hint.style.display = hasAnyImage ? 'block' : 'none';
+        if (hasAnyImage) _syncEnginePicker();
+        else { const er = document.getElementById('ref-engine-row'); if (er) er.style.display = 'none'; }
         _updateRefModeHint();
     }
 
-    // The reference mode is a single GLOBAL toggle (Style default) shared by all slots — Style routes
-    // through training-free in-context band-control; Composition keeps the reference's layout (img2img).
+    // Style-reference engine availability (GET /sref/capabilities), fetched at load. Drives the
+    // auto-pick: Style routes to the strongest INSTALLED engine (adapter > library > band-control).
+    let _srefCaps = { adapter: false, library: false, band_control: true, auto: 'style', on_base: true };
+
+    // The primary toggle is Style vs Composition. Style resolves to a concrete SERVER mode via the
+    // engine picker: 'auto' -> the best installed engine; otherwise the explicit choice. The resolved
+    // value ('adapter' | 'library' | 'style' | 'composition') is exactly what /generate expects.
+    function _resolveEngine() {
+        const engEl = document.getElementById('ref-engine');
+        let eng = engEl ? engEl.value : 'auto';
+        if (eng === 'auto') eng = _srefCaps.auto || 'style';
+        return eng;   // 'adapter' | 'library' | 'style'
+    }
     function _globalRefMode() {
         const el = document.getElementById('ref-mode-global');
-        return el ? el.value : 'style';
+        const primary = el ? el.value : 'style';
+        return primary === 'composition' ? 'composition' : _resolveEngine();
     }
 
-    // A short expectation-setting note under the mode toggle. Style transfer (band-control) is
-    // strong for bold/graphic references, subtle for paintings/photos (BACKLOG SREF-STYLE-CEILING).
+    // A short expectation-setting note under the mode toggle, keyed on the RESOLVED engine, plus a
+    // base-model warning (style transfer only works on the style base; distilled just tints).
     function _updateRefModeHint() {
         const hint = document.getElementById('ref-mode-hint');
         if (!hint) return;
         const mode = _globalRefMode();
+        let msg;
         if (mode === 'library') {
-            hint.textContent = 'Matches your reference to the nearest trained style and applies that style LoRA — the strongest, most consistent transfer, including painterly looks. Your prompt drives the subject. Best on the base model.';
+            msg = 'Style Library: matches your reference to the nearest trained style and applies that LoRA — the strongest, most consistent transfer (incl. painterly). Your prompt drives the subject.';
         } else if (mode === 'adapter') {
-            hint.textContent = 'A learned adapter that transfers ANY reference’s style (not just trained ones) onto your prompt’s subject — graphic and painterly alike. Style is strong but content stays legible. Base model.';
+            msg = 'Learned Style: a learned adapter that transfers ANY reference’s style (graphic and painterly alike) onto your prompt’s subject — content stays legible.';
         } else if (mode === 'composition') {
-            hint.textContent = "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
+            msg = "Keeps the reference's composition/layout; your prompt restyles it (img2img).";
         } else {
-            hint.textContent = 'Style works best with bold, graphic references (line-art, comics, flat illustration, woodcut). Paintings and photos transfer only subtly.';
+            msg = 'Band-control (training-free): strong for bold, graphic references (line-art, comics, woodcut); paintings and photos transfer only subtly.';
         }
+        if (mode !== 'composition' && !_srefCaps.on_base) {
+            msg += ` — ⚠ load ${_srefCaps.style_model || 'the base model'} for real style transfer (the distilled model only tints).`;
+        }
+        hint.textContent = msg;
+    }
+
+    // Populate the advanced engine picker from the CURRENT capabilities (Auto + installed engines),
+    // and show the advanced row only when a Style-mode reference is present. Rebuilds each call
+    // (so it reflects capabilities that load asynchronously) while preserving the user's selection.
+    function _syncEnginePicker() {
+        const engEl = document.getElementById('ref-engine');
+        const engRow = document.getElementById('ref-engine-row');
+        const primary = document.getElementById('ref-mode-global');
+        const hasImg = referenceImageData.some(s => s !== null);
+        const isStyle = !primary || primary.value !== 'composition';
+        if (engRow) engRow.style.display = (hasImg && isStyle) ? 'flex' : 'none';
+        if (!engEl) return;
+        const prev = engEl.value || 'auto';
+        const autoLabel = { adapter: 'Learned Style', library: 'Style Library', style: 'Band-control' }[_srefCaps.auto] || 'Band-control';
+        const opts = [`<option value="auto">Auto — ${autoLabel}</option>`];
+        if (_srefCaps.adapter) opts.push('<option value="adapter">Learned Style — any reference</option>');
+        if (_srefCaps.library) opts.push('<option value="library">Style Library — trained styles</option>');
+        opts.push('<option value="style">Band-control — fast, graphic</option>');
+        engEl.innerHTML = opts.join('');
+        if ([...engEl.options].some(o => o.value === prev)) engEl.value = prev;  // keep selection
+    }
+
+    async function _loadSrefCapabilities() {
+        try {
+            const r = await fetch('/sref/capabilities');
+            if (r.ok) _srefCaps = Object.assign(_srefCaps, await r.json());
+        } catch (e) { /* keep the band-control default */ }
+        _syncEnginePicker();
+        // If a reference was added before caps resolved, re-resolve its stored mode.
+        if (referenceImageData.some(s => s !== null)) _applyResolvedModeToSlots();
+        else _updateRefModeHint();
     }
 
     // Read strength/mode for a slot (strength from the per-slot slider; mode from the global toggle)
@@ -1708,17 +1759,36 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Global reference-mode toggle (Style default). Applies to every slot; Style = in-context
     // band-control (full strength, no per-slot slider), Composition = img2img (per-slot strength).
+    // Apply the RESOLVED server mode (primary toggle + engine) to every slot's stored .mode.
+    function _applyResolvedModeToSlots() {
+        const mode = _globalRefMode();
+        for (let i = 0; i < 4; i++) {
+            if (referenceImageData[i]) referenceImageData[i].mode = mode;
+        }
+        renderAllSlots();  // re-applies _updateSlotControls (shows/hides the strength sliders)
+        _updateRefModeHint();
+    }
     const globalModeEl = document.getElementById('ref-mode-global');
     if (globalModeEl) {
         globalModeEl.addEventListener('change', () => {
-            const mode = globalModeEl.value;
-            for (let i = 0; i < 4; i++) {
-                if (referenceImageData[i]) referenceImageData[i].mode = mode;
-            }
-            renderAllSlots();  // re-applies _updateSlotControls (shows/hides the strength sliders)
-            _updateRefModeHint();
+            _syncEnginePicker();           // show/hide the engine row (Style only)
+            _applyResolvedModeToSlots();
         });
     }
+    const engineEl = document.getElementById('ref-engine');
+    if (engineEl) engineEl.addEventListener('change', _applyResolvedModeToSlots);
+    const engineToggle = document.getElementById('ref-engine-toggle');
+    if (engineToggle) {
+        engineToggle.addEventListener('click', () => {
+            const adv = document.getElementById('ref-engine-adv');
+            if (!adv) return;
+            const open = adv.style.display !== 'none';
+            adv.style.display = open ? 'none' : 'inline-flex';
+            engineToggle.setAttribute('aria-expanded', String(!open));
+            engineToggle.textContent = open ? 'Advanced ▾' : 'Advanced ▴';
+        });
+    }
+    _loadSrefCapabilities();
 
     refSlots.forEach((slotEl, slot) => {
         // Wire the per-slot strength slider (Composition only; mode is the global toggle above)

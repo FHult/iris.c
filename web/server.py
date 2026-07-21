@@ -2156,6 +2156,26 @@ def style_library():
         return jsonify({"styles": [], "enabled": False, "error": str(e)})
 
 
+@app.route("/sref/capabilities", methods=["GET"])
+def sref_capabilities():
+    """Which style-reference engines are installed, so the UI can auto-pick the strongest one.
+
+    'auto' resolves to the best available engine (Learned Style adapter > Style Library > band-control).
+    Band-control ('style') is always available (training-free); 'composition' is always available too.
+    on_base flags whether the loaded model is the style base — style transfer only works there."""
+    adapter = SREF_ADAPTER_LORA.exists() and SREF_ADAPTER_CSDMOD.exists()
+    library = STYLE_LIBRARY_JSON.exists()
+    auto = "adapter" if adapter else ("library" if library else "style")
+    return jsonify({
+        "adapter": bool(adapter),
+        "library": bool(library),
+        "band_control": True,
+        "auto": auto,
+        "on_base": bool(model_dir_path and model_dir_path.name == STYLE_LIBRARY_MODEL),
+        "style_model": STYLE_LIBRARY_MODEL,
+    })
+
+
 @app.route("/server-status")
 def server_status():
     """Get server status including ready state and current job."""

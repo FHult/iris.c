@@ -1942,6 +1942,51 @@ footer a:hover {
     margin: -0.2rem 0 0.6rem;
 }
 
+.ref-engine-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: -0.2rem 0 0.5rem;
+    flex-wrap: wrap;
+}
+
+.ref-engine-toggle {
+    font-size: 0.72rem;
+    color: rgba(255,255,255,0.6);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+}
+
+.ref-engine-toggle:hover { color: rgba(255,255,255,0.85); }
+
+.ref-engine-adv {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.ref-engine-adv label {
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.7);
+}
+
+.ref-engine-select {
+    font-size: 0.78rem;
+    padding: 0.3rem 0.45rem;
+    background: rgba(255,255,255,0.08);
+    color: white;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.ref-engine-select option {
+    background: #1e1e2e;
+    color: white;
+}
+
 .ref-strength-slider {
     flex: 1;
     min-width: 0;
