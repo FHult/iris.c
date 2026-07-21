@@ -1605,6 +1605,104 @@ class TestSrefRouting:
         assert r.get_json().get("sref") is None
 
 
+class TestSrefV53Routing:
+    """Routing coverage for the v5.3.0 modes that shipped with NO tests:
+    resolve_style_lora (Style Library retrieval) + resolve_sref_adapter (Learned Style adapter)
+    + the /style-library and /sref/resolve endpoints. Guards the 'returns None when the artifact
+    is absent', the content-hash cache, and the LoRA-path security check."""
+
+    _B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+    _PNG_BYTES = base64.b64decode(_B64)
+    _PNG_DATAURL = "data:image/png;base64," + _B64
+
+    @staticmethod
+    def _sha(b):
+        import hashlib
+        return hashlib.sha256(b).hexdigest()[:24]
+
+    # ── resolve_style_lora (Style Library) ──────────────────────────────────
+    def test_style_lora_none_without_library(self, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", tmp_path / "absent.json")
+        assert srv.resolve_style_lora(self._PNG_BYTES) is None
+
+    def test_style_lora_cache_hit_skips_retrieval(self, monkeypatch, tmp_path):
+        import server as srv
+        lib = tmp_path / "library.json"; lib.write_text("[]")
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", lib)
+        monkeypatch.setattr(srv, "SREF_DIR", tmp_path)
+        cached = {"name": "cyberpunk", "lora": "/l.safetensors", "scale": 1.2, "cos": 0.91}
+        (tmp_path / f"{self._sha(self._PNG_BYTES)}_stylelora.json").write_text(json.dumps(cached))
+        monkeypatch.setattr(srv.subprocess, "run",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("shelled out on cache hit")))
+        assert srv.resolve_style_lora(self._PNG_BYTES) == cached
+
+    def test_style_lora_rejects_lora_outside_library(self, monkeypatch, tmp_path):
+        """Security: a resolved LoRA path outside STYLE_LIB_DIR must be rejected, not loaded."""
+        import types
+        import server as srv
+        lib_dir = tmp_path / "lib"; lib_dir.mkdir()
+        (lib_dir / "library.json").write_text("[]")
+        monkeypatch.setattr(srv, "STYLE_LIB_DIR", lib_dir)
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", lib_dir / "library.json")
+        monkeypatch.setattr(srv, "SREF_DIR", tmp_path / "sref")
+        evil = tmp_path / "evil.safetensors"; evil.write_bytes(b"x")   # outside lib_dir
+        fake = types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+            {"matched": ["x"], "lora": str(evil), "scale": 1.0, "cos": [0.9]}) + "\n")
+        monkeypatch.setattr(srv.subprocess, "run", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="outside"):
+            srv.resolve_style_lora(self._PNG_BYTES)
+
+    # ── resolve_sref_adapter (Learned Style) ────────────────────────────────
+    def test_sref_adapter_none_when_not_installed(self, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "SREF_ADAPTER_LORA", tmp_path / "absent_lora.st")
+        monkeypatch.setattr(srv, "SREF_ADAPTER_CSDMOD", tmp_path / "absent_csdmod.st")
+        assert srv.resolve_sref_adapter(self._PNG_BYTES) is None
+
+    def test_sref_adapter_cache_hit_returns_args(self, monkeypatch, tmp_path):
+        import server as srv
+        lora = tmp_path / "joint_lora.safetensors"; lora.write_bytes(b"x")
+        csdmod = tmp_path / "csd_mod.safetensors"; csdmod.write_bytes(b"x")
+        sdir = tmp_path / "sref"; sdir.mkdir()
+        monkeypatch.setattr(srv, "SREF_ADAPTER_LORA", lora)
+        monkeypatch.setattr(srv, "SREF_ADAPTER_CSDMOD", csdmod)
+        monkeypatch.setattr(srv, "SREF_ADAPTER_DEFAULT_SCALE", 0.4)
+        monkeypatch.setattr(srv, "SREF_DIR", sdir)
+        (sdir / f"{self._sha(self._PNG_BYTES)}_adapter.csd.f32").write_bytes(b"\0" * (768 * 4))
+        monkeypatch.setattr(srv.subprocess, "run",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("shelled out on cache hit")))
+        res = srv.resolve_sref_adapter(self._PNG_BYTES)
+        assert res["lora"] == str(lora) and res["csdmod"] == str(csdmod) and res["scale"] == 0.4
+
+    # ── endpoints ───────────────────────────────────────────────────────────
+    def test_style_library_empty(self, client, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", tmp_path / "absent.json")
+        r = client.get("/style-library")
+        assert r.status_code == 200
+        assert r.get_json() == {"styles": [], "enabled": False}
+
+    def test_style_library_populated(self, client, monkeypatch, tmp_path):
+        import server as srv
+        lib = tmp_path / "library.json"
+        lib.write_text(json.dumps([{"name": "cyberpunk", "scale": 1.2}]))
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", lib)
+        body = client.get("/style-library").get_json()
+        assert body["enabled"] is True
+        assert body["styles"] == [{"name": "cyberpunk", "scale": 1.2}]
+
+    def test_sref_resolve_requires_image(self, client):
+        assert client.post("/sref/resolve", json={}).status_code == 400
+
+    def test_sref_resolve_404_without_library(self, client, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setattr(srv, "STYLE_LIBRARY_JSON", tmp_path / "absent.json")
+        r = client.post("/sref/resolve", json={"image": self._PNG_DATAURL})
+        assert r.status_code == 404
+
+
 class TestStyleCodes:
     """SREF-3 style codes: save a reference as a reusable code, list/delete,
     and drive generation from a code with no image upload."""
