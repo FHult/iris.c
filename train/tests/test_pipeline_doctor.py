@@ -1228,3 +1228,12 @@ class TestNightlyHealth:
         pd._check_nightly_health({})
         issues = _by_category("nightly_health")
         assert len(issues) == 1 and issues[0].severity == "WARNING"
+
+    def test_web_failure_warns(self, doctor, tmp_path):
+        # web/tests (Flask API incl. SREF routing) is a nightly step; a failure must surface,
+        # not fall through to silent (the gap that let a stale web test lurk).
+        self._write(tmp_path, status="web_failed", age_h=2, web_passed=140, web_failed=5)
+        pd._check_nightly_health({})
+        issues = _by_category("nightly_health")
+        assert len(issues) == 1 and issues[0].severity == "WARNING"
+        assert "web failed" in issues[0].title and "5 failures" in issues[0].title

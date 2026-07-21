@@ -2994,6 +2994,8 @@ def _check_nightly_health(cfg: dict) -> None:
     ctx = {"status": status, "age_hours": round(age_h, 1),
            "pytest_passed": res.get("pytest_passed"),
            "pytest_failed": res.get("pytest_failed"),
+           "web_passed": res.get("web_passed"),
+           "web_failed": res.get("web_failed"),
            "git_sha": res.get("git_sha"), "log": res.get("log")}
 
     if age_h > 48:
@@ -3011,10 +3013,10 @@ def _check_nightly_health(cfg: dict) -> None:
                     f"build hides every other regression (QWEN-1 lesson). "
                     f"Inspect: tail -60 {res.get('log')}",
              ctx=ctx)
-    elif status in ("pytest_failed", "unit_failed"):
+    elif status in ("pytest_failed", "unit_failed", "web_failed"):
+        _nfail = res.get("web_failed", "?") if status == "web_failed" else res.get("pytest_failed", "?")
         _add("WARNING", "nightly_health",
-             f"Nightly health: {status.replace('_', ' ')} "
-             f"({res.get('pytest_failed', '?')} pytest failures)",
+             f"Nightly health: {status.replace('_', ' ')} ({_nfail} failures)",
              detail=f"Run of {res.get('ts')} at {res.get('git_sha')}. "
                     f"Inspect: tail -60 {res.get('log')}",
              ctx=ctx)

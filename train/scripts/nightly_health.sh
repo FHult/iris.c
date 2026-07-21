@@ -5,9 +5,10 @@
 # shipped because the mps build was broken for three weeks unnoticed. This run
 # executes everything that needs NO GPU and NO model weights, every night,
 # and writes a machine-readable verdict that pipeline_doctor surfaces:
-#   1. pytest train/tests  (709 tests, CPU-only)
+#   1. pytest train/tests  (CPU-only)
 #   2. make mps            (full compile of the production target — build check)
-#   3. make test-unit      (C unit suites: LoRA/kernels/VAE/safetensors/IP/JPEG/PNG)
+#   3. make test-unit      (C unit suites: LoRA/kernels/VAE/safetensors/IP/CSDModulation/JPEG/PNG)
+#   4. pytest web/tests    (Flask API suite, incl. SREF routing — CPU-only, no GPU/model)
 #
 # Output: $DATA_ROOT/health/nightly_health.json  (doctor: _check_nightly_health)
 # Log:    $DATA_ROOT/logs/nightly_health.log
@@ -49,10 +50,20 @@ BUILD_EXIT=$?
 make test-unit >> "$LOG" 2>&1
 UNIT_EXIT=$?
 
+# 4. Web API suite (Flask test client; CPU-only, no GPU/model) — catches web-surface rot
+#    that steps 1-3 miss (e.g. SREF routing / style-code contracts).
+WEB_OUT=$(web/venv/bin/python3 -m pytest web/tests/ -q --tb=line 2>&1)
+WEB_EXIT=$?
+echo "$WEB_OUT" | tail -15 >> "$LOG"
+WEB_PASSED=$(echo "$WEB_OUT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+WEB_FAILED=$(echo "$WEB_OUT" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | head -1)
+WEB_PASSED=${WEB_PASSED:-0}; WEB_FAILED=${WEB_FAILED:-0}
+
 DUR=$(( $(date +%s) - T0 ))
 STATUS=ok
 [ "$PY_FAILED" -gt 0 ] || [ "$PYTEST_EXIT" -ne 0 ] && STATUS=pytest_failed
 [ "$UNIT_EXIT" -ne 0 ] && STATUS=unit_failed
+[ "$WEB_FAILED" -gt 0 ] || [ "$WEB_EXIT" -ne 0 ] && STATUS=web_failed
 [ "$BUILD_EXIT" -ne 0 ] && STATUS=build_failed
 
 TMP="$OUT_DIR/nightly_health.json.tmp"
@@ -66,10 +77,13 @@ cat > "$TMP" <<EOF
   "pytest_exit": $PYTEST_EXIT,
   "build_exit": $BUILD_EXIT,
   "unit_exit": $UNIT_EXIT,
+  "web_passed": $WEB_PASSED,
+  "web_failed": $WEB_FAILED,
+  "web_exit": $WEB_EXIT,
   "duration_s": $DUR,
   "log": "$LOG"
 }
 EOF
 mv "$TMP" "$OUT_DIR/nightly_health.json"
-echo "status=$STATUS pytest=$PY_PASSED/$((PY_PASSED+PY_FAILED)) build=$BUILD_EXIT unit=$UNIT_EXIT (${DUR}s)" >> "$LOG"
+echo "status=$STATUS pytest=$PY_PASSED/$((PY_PASSED+PY_FAILED)) build=$BUILD_EXIT unit=$UNIT_EXIT web=$WEB_PASSED/$((WEB_PASSED+WEB_FAILED)) (${DUR}s)" >> "$LOG"
 [ "$STATUS" = ok ]
