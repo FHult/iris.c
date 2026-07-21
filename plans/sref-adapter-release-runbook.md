@@ -3,8 +3,13 @@
 **Status: RELEASED on GitHub (2026-07-21).** https://github.com/FHult/iris.c/releases/tag/sref-adapter-v1
 Scope shipped = the generic Learned Style adapter alone (`joint_lora` + `csd_mod` + model card +
 manifest); `--latest=false` so it doesn't supersede the engine version release. HF upload intentionally
-skipped (owner preference). Style Library bundle NOT released (optional follow-up). The BACKLOG
-platform-vision endgame — open-weight release of the generic adapter (v5.3.0) — is DONE.
+skipped (owner preference). The BACKLOG platform-vision endgame — open-weight release of the generic
+adapter (v5.3.0) — is DONE.
+
+**Style Library ALSO released (2026-07-21):** https://github.com/FHult/iris.c/releases/tag/style-library-v1
+— 3 base LoRAs (cyberpunk/fantasy/graphic) + a PORTABLE `library.json` (relative filenames; needed a
+`style_retrieve.py` fix to resolve LoRA paths against the manifest dir) + model card. Artifacts under
+`release/style-library-v1/`.
 
 ## Prerequisites — DONE
 
