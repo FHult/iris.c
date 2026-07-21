@@ -207,6 +207,10 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_ip_adapter debug/test_ip_adapter.c iris_ip_adapter.c iris_kernels.c iris_safetensors.c -lm
 	@/tmp/flux_test_ip_adapter
 	@rm -f /tmp/flux_test_ip_adapter
+	@echo "=== CSDModulation parity tests (Learned Style adapter, C vs Python golden) ==="
+	@$(CC) -O2 -I. -o /tmp/flux_test_csdmod debug/test_csdmod.c iris_csdmod.c iris_safetensors.c iris_kernels.c -lm
+	@/tmp/flux_test_csdmod debug/fixtures/csdmod
+	@rm -f /tmp/flux_test_csdmod
 	@echo "=== JPEG unit tests ==="
 	@$(MAKE) -C jpg_test test --no-print-directory
 	@echo "=== PNG tests ==="

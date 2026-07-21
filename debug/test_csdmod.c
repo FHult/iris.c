@@ -2,11 +2,14 @@
  * test_csdmod.c - parity guard for the C CSDModulation vs the Python training module.
  * Loads the exported csd_mod weights + a golden fixture (debug/gen_csdmod_fixture.py) and
  * checks C csd_mod_forward reproduces the Python CSDModulation output to a tight tolerance
- * (corr > 0.999, max_abs <= 1e-3). Weights/fixtures live on 2TBSSD -> run on demand
- * (like debug/vae_parity.c), not in the hermetic make test.
+ * (corr > 0.999, max_abs <= 1e-3). Two modes:
+ *   - HERMETIC (in make test-unit): the committed synthetic fixture debug/fixtures/csdmod/ (small
+ *     random weights, fc2 de-zeroed so the matmul is exercised) — gen with --synthetic.
+ *   - REAL-WEIGHTS (on demand, like debug/vae_parity.c): the shipped joint_v1_c_export on 2TBSSD.
  *
- *   gen: train/.venv/bin/python debug/gen_csdmod_fixture.py --weights <dir>/csd_mod.safetensors --out <dir>
- *   run: ./test_csdmod <dir>
+ *   gen (hermetic): train/.venv/bin/python debug/gen_csdmod_fixture.py --synthetic --out debug/fixtures/csdmod
+ *   gen (real):     train/.venv/bin/python debug/gen_csdmod_fixture.py --weights <dir>/csd_mod.safetensors --out <dir>
+ *   run:            ./test_csdmod <dir>   (defaults to the real-weights export dir)
  */
 #include "iris_csdmod.h"
 

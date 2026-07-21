@@ -20,16 +20,39 @@ from ip_adapter.model import CSDModulation
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", required=True)
+    ap.add_argument("--weights", help="exported csd_mod.safetensors (omit with --synthetic)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--synthetic", action="store_true",
+                    help="build a SMALL random CSDModulation (hermetic make-test fixture) instead of "
+                         "loading real weights; randomises the zero-init fc2 so the matmul is exercised, "
+                         "and writes csd_mod.safetensors alongside the input/golden.")
     args = ap.parse_args()
 
-    w = mx.load(args.weights)
-    mlp_dim, csd_dim = w["fc1.weight"].shape       # [1024, 768]
-    hidden_dim = w["fc2.weight"].shape[0]          # 3072
-    mod = CSDModulation(hidden_dim=hidden_dim, csd_dim=csd_dim, mlp_dim=mlp_dim)
-    mod.update(tree_unflatten(list(w.items())))
+    if args.synthetic:
+        # Small, non-degenerate dims (all distinct, none a multiple of another) — enough to exercise
+        # fc1/SiLU/fc2 + biases without a large committed fixture. CRUCIAL: randomise fc2 (adaLN-zero
+        # at init) so the golden is non-trivial and the C fc2 matmul is actually tested.
+        csd_dim, mlp_dim, hidden_dim = 24, 40, 48
+        mod = CSDModulation(hidden_dim=hidden_dim, csd_dim=csd_dim, mlp_dim=mlp_dim)
+        rng0 = np.random.default_rng(args.seed + 1)
+        params = {
+            "fc1.weight": mx.array((rng0.standard_normal((mlp_dim, csd_dim)) * 0.2).astype(np.float32)),
+            "fc1.bias":   mx.array((rng0.standard_normal(mlp_dim) * 0.1).astype(np.float32)),
+            "fc2.weight": mx.array((rng0.standard_normal((hidden_dim, mlp_dim)) * 0.2).astype(np.float32)),
+            "fc2.bias":   mx.array((rng0.standard_normal(hidden_dim) * 0.1).astype(np.float32)),
+        }
+        mod.update(tree_unflatten(list(params.items())))
+        os.makedirs(args.out, exist_ok=True)
+        mx.save_safetensors(os.path.join(args.out, "csd_mod.safetensors"), params)
+    else:
+        if not args.weights:
+            ap.error("--weights is required unless --synthetic is given")
+        w = mx.load(args.weights)
+        mlp_dim, csd_dim = w["fc1.weight"].shape       # [1024, 768]
+        hidden_dim = w["fc2.weight"].shape[0]          # 3072
+        mod = CSDModulation(hidden_dim=hidden_dim, csd_dim=csd_dim, mlp_dim=mlp_dim)
+        mod.update(tree_unflatten(list(w.items())))
     mod.eval()
     mx.eval(mod.parameters())
 
