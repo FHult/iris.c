@@ -1,0 +1,20 @@
+# iris SREF Style Library v1 — release bundle manifest
+#
+# LoRA source (not in git — lives on 2TBSSD): /Volumes/2TBSSD/sref_eval/lora_lib/
+# library.json here is the PORTABLE copy (relative filenames), tracked in git under release/style-library-v1/.
+# Verify after download:  shasum -a 256 -c MANIFEST.txt  (from the dir holding all four files)
+
+0336f67db9a5e40e63c83866adc2ac25c810da7b609400122b5bcd55881421a8  cyberpunk_c23_base.safetensors
+cd75ce4aca7705db69a754b0c2b156fbc914833b33b5a338ad247ab26dbe7e86  fantasy_portrait_c9_base.safetensors
+c9c898620b603b79fa0ed2f59f2fc6597cd5a0fea9d9c5ffb1de4ea77ca854de  graphic_c8_base.safetensors
+56eb604d6a06e0da6478773ff813349bf6c520209a879de1d4a8e12cb2650e1a  library.json
+
+# cyberpunk_c23_base.safetensors        74,732,956 bytes  (scale 1.0)
+# fantasy_portrait_c9_base.safetensors  74,732,956 bytes  (scale 1.2)
+# graphic_c8_base.safetensors           74,732,956 bytes  (scale 1.2)
+# library.json                              51,164 bytes  (CSD centroids + relative filenames + scales)
+# MODEL_CARD.md                          ships alongside (becomes the release README)
+#
+# NOT bundled (obtain from source, see MODEL_CARD.md):
+#   - Flux.2 Klein 4B base   (Apache 2.0)  black-forest-labs/FLUX.2-klein-base-4B
+#   - CSD-ViT-L              (CC-BY-4.0)   tomg-group-umd/CSD-ViT-L

@@ -64,6 +64,13 @@ def main():
     args = ap.parse_args()
 
     lib = json.loads(Path(args.library).read_text())
+    # Resolve each LoRA path relative to the manifest's own directory when it is not absolute, so a
+    # DOWNLOADED library (relative filenames in library.json) works wherever the user unpacks it.
+    # Absolute paths are left as-is (backward compatible with the locally-built library).
+    _libdir = Path(args.library).resolve().parent
+    for e in lib:
+        if not os.path.isabs(e["lora"]):
+            e["lora"] = str(_libdir / e["lora"])
     C = np.stack([np.asarray(e["centroid"], dtype=np.float32) for e in lib])
     C /= (np.linalg.norm(C, axis=1, keepdims=True) + 1e-8)
 
