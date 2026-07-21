@@ -29,8 +29,10 @@ Then type a prompt in your browser and click generate. The **first** image loads
 (~30–60s); every image after that is fast. To transfer the *look* of a reference picture,
 add it as a **Style** reference slot in the UI.
 
-> Style references need a trained adapter bundle — put it in `./sref-bundle` or set
-> `IRIS_IP_BUNDLE=/path/to/bundle` before `./run.sh`. Without one, normal generation still works.
+> **Style transfer needs the base model** (`flux-klein-4b-base`) — the distilled model only tints.
+> The default rail is training-free (band-control), so it works out of the box; the stronger
+> **Learned Style** and **Style Library** modes need their adapter/library installed. See the
+> canonical guide **[docs/sref.md](docs/sref.md)** for which mode to use when.
 
 The rest of this README is the detailed/developer guide.
 

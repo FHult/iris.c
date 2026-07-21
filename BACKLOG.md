@@ -277,6 +277,10 @@ The HW-M5 items below are grounded in these — re-verify on the actual device.
 
 ## SREF Objective — Style-Reference Model (Midjourney --sref for the app)
 
+> **Canonical usage guide: [docs/sref.md](docs/sref.md)** — which of the four shipped modes
+> (Learned Style adapter / band-control / Style Library / in-context) to use when, the conventions
+> (base-not-distilled, the collapse gate), and a status index of this section's `plans/sref-*` trail.
+
 The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
