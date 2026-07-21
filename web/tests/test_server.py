@@ -1773,13 +1773,16 @@ class TestStyleCodes:
         assert r.status_code == 400
         assert "Unknown style code" in r.get_json()["error"]
 
-    def test_save_blocked_without_bundle(self, client, tmp_path, monkeypatch):
+    def test_save_works_without_bundle_on_band_control_rail(self, client, tmp_path, monkeypatch):
+        # v5.1.0: saved style codes replay through the in-context band-control rail, so saving works
+        # with NO IP-Adapter bundle and the feature is always enabled (previously bundle-gated).
         import server as srv
         self._wire(srv, tmp_path, monkeypatch)
         monkeypatch.setattr(srv, "IP_BUNDLE", None)
         r = client.post("/sref/codes", json={"image": self._PNG})
-        assert r.status_code == 400
-        assert client.get("/sref/codes").get_json()["sref_enabled"] is False
+        assert r.status_code == 200
+        assert r.get_json().get("code")
+        assert client.get("/sref/codes").get_json()["sref_enabled"] is True
 
 
 class TestSrefCompletion:
