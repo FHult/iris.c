@@ -4,6 +4,18 @@ All notable, user-facing changes to iris.c. Newest first.
 
 ---
 
+## sref-adapter-v1 — open-weight release of the generic Learned Style adapter (2026-07-21)
+
+The v5.3.0 Learned Style adapter weights are now published:
+[github.com/FHult/iris.c/releases/tag/sref-adapter-v1](https://github.com/FHult/iris.c/releases/tag/sref-adapter-v1)
+(`joint_lora.safetensors` + `csd_mod.safetensors`, MIT). Requires the Flux.2 Klein 4B **base**
+(Apache 2.0) and the CSD-ViT-L reference encoder (CC-BY-4.0). See the release `MODEL_CARD.md` and
+[docs/sref.md](docs/sref.md). Also this cycle: the SREF web reference UX collapsed into one
+auto-routing flow (`/sref/capabilities`), a canonical `docs/sref.md` guide, and test guards for the
+csd_mod C parity + the web SREF routing (now in the nightly).
+
+---
+
 ## v5.3.0 — Learned generic style adapter (any reference → its style)
 
 ### What's new (user-facing) — web UI

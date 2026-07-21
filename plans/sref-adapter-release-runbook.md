@@ -1,7 +1,10 @@
 # SREF Learned Style Adapter v1 — open-weight release runbook
 
-**Status: PREREQUISITES LINED UP (2026-07-21). Release HELD pending owner go.**
-The BACKLOG platform-vision endgame: open-weight release of the generic Learned Style adapter (v5.3.0).
+**Status: RELEASED on GitHub (2026-07-21).** https://github.com/FHult/iris.c/releases/tag/sref-adapter-v1
+Scope shipped = the generic Learned Style adapter alone (`joint_lora` + `csd_mod` + model card +
+manifest); `--latest=false` so it doesn't supersede the engine version release. HF upload intentionally
+skipped (owner preference). Style Library bundle NOT released (optional follow-up). The BACKLOG
+platform-vision endgame — open-weight release of the generic adapter (v5.3.0) — is DONE.
 
 ## Prerequisites — DONE
 
