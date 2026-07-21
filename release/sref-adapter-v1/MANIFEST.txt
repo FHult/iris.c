@@ -1,0 +1,16 @@
+# iris SREF Learned Style Adapter v1 — release bundle manifest
+#
+# Source (not in git — lives on 2TBSSD): /Volumes/2TBSSD/sref_eval/joint_v1_c_export/
+# Provenance: checkpoint sref_joint_probe/joint_probe_0007000, exported by train/lora/export_joint_to_c.py
+# Verify after download:  shasum -a 256 -c MANIFEST.txt  (from the dir holding the two files)
+
+53a2f83ef46cc465ab299b7ea689db271e2f066ea5816c106e534896352ea0ef  joint_lora.safetensors
+64243c4bd5dac0602834039439362e3d3829d877be9b3381723224223ef9b299  csd_mod.safetensors
+
+# joint_lora.safetensors   298,866,301 bytes  (LoRA rank 64, DiT double+single attention)
+# csd_mod.safetensors       15,745,357 bytes  (CSDModulation FiLM, CSD 768 -> 1024 -> 3072)
+# MODEL_CARD.md             ships alongside (becomes the release README)
+#
+# NOT bundled (obtain from source, see MODEL_CARD.md):
+#   - Flux.2 Klein 4B base   (Apache 2.0)  black-forest-labs/FLUX.2-klein-base-4B
+#   - CSD-ViT-L              (CC-BY-4.0)   tomg-group-umd/CSD-ViT-L
