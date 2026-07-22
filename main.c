@@ -1121,7 +1121,12 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --sref-slf N      SREF style: amplify reference low-freq RoPE bands (>=1; 1=off)\n");
     fprintf(stderr, "      --sref-strength N SREF style: reference attention strength gamma (<1 weaker, >1 stronger; 1=off, GPU only)\n");
     fprintf(stderr, "                        Training-free style transfer (RoPE band-control; see CHANGELOG.md).\n");
-    fprintf(stderr, "                        e.g. --sref-shf 0.0 --sref-slf 1.5 = style-only, subject kept\n\n");
+    fprintf(stderr, "                        e.g. --sref-shf 0.0 --sref-slf 1.5 = style-only, subject kept\n");
+    fprintf(stderr, "      --sref-csdmod F   SREF Learned Style adapter: csd_mod.safetensors (with --lora joint_lora)\n");
+    fprintf(stderr, "      --sref-csd F      CSD style vector of the reference (f32; from dump_csd.py)\n");
+    fprintf(stderr, "      --sref-scale N    Learned Style strength / style-CFG alpha (default 0.4)\n");
+    fprintf(stderr, "                        Learned generic style adapter, works on any reference (base model).\n");
+    fprintf(stderr, "                        See the sref-adapter-v1 release + docs/sref.md.\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
