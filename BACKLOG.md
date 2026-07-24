@@ -294,9 +294,24 @@ shipped (release stays at 3 styles):
 **Lesson (durable):** a tight CSD cluster does NOT imply a transferable style LoRA. Styles defined by
 COMPOSITION/BACKGROUND (die-cut) or fine LINEWORK don't imprint as usable LoRAs on the frozen base; the
 shipped 3 (cyberpunk/fantasy/graphic) work because they're bold COLOR/TEXTURE transforms that apply to
-any subject. Future library adds should target color/texture-defined styles, and gate on a real render
-(retrieval cosine + tight cluster are necessary, NOT sufficient). Trained LoRAs kept as artifacts on
+any subject. Trained LoRAs kept as artifacts on
 `/Volumes/2TBSSD/sref_eval/lora_lib/{sticker_c26,ink_c3}_base.safetensors` (unreleased).
+
+**WATERCOLOUR (2026-07-24) — also NEGATIVE, and it corrected the evaluation method.** Trained a
+watercolour LoRA on a caption-curated, subject-diverse "watercolour" subset (the right kind of
+color/texture style). Two evaluation lessons:
+(1) **My visual render gate was MISCALIBRATED.** The SHIPPED, working cyberpunk LoRA at scale 1.2 on an
+off-domain prompt ("a fox in a forest") ALSO renders fully photorealistic — the retrieval library LoRAs
+are subtle and prompt-congruence-dependent, so "photorealistic at 1.2" is NOT evidence of failure. Pushing
+scale to force visibility just produces ARTIFACTS (chaotic streaks), not clean style — a false-negative trap.
+(2) **The PROPER gate is styleCSD Δ**, exactly as the library was originally validated. Measured:
+watercolour LoRA styleCSD Δ = **−0.11** (output is LESS watercolour than base), vs the shipped cyberpunk's
+**+0.176**. So it genuinely does not transfer. **Recipe is IDENTICAL to the shipped ones** (rank 16, 400
+steps, ema 0.9999; configs `lora_cluster{8,23}_base_v1.yaml`), so this is NOT a recipe bug — my chosen
+clusters (sticker/ink/watercolour) simply don't imprint a usable style DIRECTION while c8/c23 do. WHY some
+clusters imprint and others don't (with identical recipe + comparable weight magnitude) is the open
+question — the real blocker for library breadth. **Any future attempt MUST gate on styleCSD Δ (target ≳
++0.10 vs base), not on eyeballing a render.** Watercolour LoRA kept unreleased. Library stays at 3.
 
 The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
