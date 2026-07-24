@@ -308,10 +308,31 @@ scale to force visibility just produces ARTIFACTS (chaotic streaks), not clean s
 watercolour LoRA styleCSD Δ = **−0.11** (output is LESS watercolour than base), vs the shipped cyberpunk's
 **+0.176**. So it genuinely does not transfer. **Recipe is IDENTICAL to the shipped ones** (rank 16, 400
 steps, ema 0.9999; configs `lora_cluster{8,23}_base_v1.yaml`), so this is NOT a recipe bug — my chosen
-clusters (sticker/ink/watercolour) simply don't imprint a usable style DIRECTION while c8/c23 do. WHY some
-clusters imprint and others don't (with identical recipe + comparable weight magnitude) is the open
-question — the real blocker for library breadth. **Any future attempt MUST gate on styleCSD Δ (target ≳
-+0.10 vs base), not on eyeballing a render.** Watercolour LoRA kept unreleased. Library stays at 3.
+clusters (sticker/ink/watercolour) simply don't imprint a usable style DIRECTION while c8/c23 do. **Any
+future attempt MUST gate on styleCSD Δ (target ≳ +0.10 vs base), not on eyeballing a render.** Watercolour
+LoRA kept unreleased. Library stays at 3.
+
+**CLUSTER COMPARISON — WHY c8/c23 work and mine don't (2026-07-24).** Compared the shipped training subsets
+(`hot_style_clusters/cluster{08,23,09}_subset.json`) vs the failed ones on size / tightness / far-from-prior,
+and re-ran styleCSD Δ on all three failures. Findings:
+- **NOT the recipe** (identical), **NOT subset size** (all 250), **NOT far-from-prior** — REFUTED: the failed
+  sticker (cos-to-prior 0.53) / ink (0.50) are FARTHER from the global CSD prior than the working
+  cyberpunk 0.68 / graphic 0.62 / fantasy 0.75.
+- **Two necessary conditions distinguish them:**
+  1. **Cluster tightness (intra-cos of the trained 250) ≥ ~0.74.** Working: cyberpunk 0.861, fantasy 0.791,
+     graphic 0.741. Failed: watercolour **0.524** (caption-matching gathered stylistically-diverse
+     "watercolour" → too loose). This alone kills watercolour.
+  2. **Style must be a content-agnostic COLOR/TEXTURE transform** (recolors/retextures ANY subject).
+     sticker (0.730) and ink (0.723) are tight ENOUGH but the WRONG TYPE — sticker is a COMPOSITION style
+     (die-cut character on white), ink is a TONE style (desaturation); neither imprints a direction that
+     applies to arbitrary content. styleCSD Δ confirms: sticker **−0.038**, ink **+0.029**, watercolour
+     **−0.114** (vs shipped cyberpunk +0.176; all < the +0.10 bar).
+- **The real obstacle for right-type styles: CSD conflates MEDIUM with CONTENT.** A CSD-tight "watercolour"
+  cluster (seed-curated) pulls FANTASY PORTRAITS (content match), not the watercolour medium; the
+  caption-clean watercolour set has the right medium but is too loose (0.52). Landing a subset that is BOTH
+  tight AND genuinely the medium is the crux. **Untried path:** intersect the two — take the caption-matched
+  watercolour records (right medium), then keep only the CSD-tightest ~250 (raises tightness toward 0.74
+  while staying watercolour). That is the one experiment that could still land a 4th style; gate on styleCSD Δ.
 
 The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
