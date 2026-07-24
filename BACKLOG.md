@@ -281,6 +281,23 @@ The HW-M5 items below are grounded in these — re-verify on the actual device.
 > (Learned Style adapter / band-control / Style Library / in-context) to use when, the conventions
 > (base-not-distilled, the collapse gate), and a status index of this section's `plans/sref-*` trail.
 
+### 🟡 STYLE-LIBRARY-BROADEN attempt (2026-07-23) — NEGATIVE: tight CSD cluster ≠ transferable style LoRA
+Tried to grow the retrieval library from 3 → 5 styles by CSD-clustering the hot pool (k=50), visually
+curating two BOLD, non-duplicate candidates (sticker/kawaii c26; B&W ink/gothic c3), seed-curating tight
+subsets (mean cos 0.638 / 0.674, well above the failed painterly 0.45) and training rank-16 base LoRAs
+(400 steps, clean convergence, correct 74.7 MB export). BOTH FAILED the render quality gate and were NOT
+shipped (release stays at 3 styles):
+- **sticker** — die-cut stickers are characters on a WHITE BACKGROUND, so the LoRA learned "blank
+  background": invisible at scale 1.2, wipes the image to a flat fill at 2.5. No usable range.
+- **ink** — learned TONE (dark/desaturated), not the pen-and-ink LINEWORK; at 2.5 just a dark moody
+  photo portrait, not the illustration look.
+**Lesson (durable):** a tight CSD cluster does NOT imply a transferable style LoRA. Styles defined by
+COMPOSITION/BACKGROUND (die-cut) or fine LINEWORK don't imprint as usable LoRAs on the frozen base; the
+shipped 3 (cyberpunk/fantasy/graphic) work because they're bold COLOR/TEXTURE transforms that apply to
+any subject. Future library adds should target color/texture-defined styles, and gate on a real render
+(retrieval cosine + tight cluster are necessary, NOT sufficient). Trained LoRAs kept as artifacts on
+`/Volumes/2TBSSD/sref_eval/lora_lib/{sticker_c26,ink_c3}_base.safetensors` (unreleased).
+
 The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
