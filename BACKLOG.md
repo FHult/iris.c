@@ -334,6 +334,18 @@ and re-ran styleCSD Δ on all three failures. Findings:
   watercolour records (right medium), then keep only the CSD-tightest ~250 (raises tightness toward 0.74
   while staying watercolour). That is the one experiment that could still land a 4th style; gate on styleCSD Δ.
 
+**INTERSECTION EXPERIMENT RUN (2026-07-24) — improved but still FAILS.** Built it: 969 caption-matched
+watercolour records ∩ CSD-tightest 250 → intra **0.682** (up from the loose 0.507; montage confirmed clean,
+VARIED watercolour medium — not collapsed to fantasy). Trained the identical recipe, gated on styleCSD Δ
+(base vs LoRA on robot + fisherman @1.2): mean Δ **−0.0125** (robot +0.023, fisherman −0.048); the fisherman
+render is photorealistic, no watercolour. So tightening moved the metric the RIGHT way as predicted
+(v1 −0.114 → intersection −0.0125) but did NOT cross the +0.10 bar. **Conclusion: even the right MEDIUM +
+tighter cluster (0.68) doesn't imprint** — landing a 4th style needs tightness ≥ ~0.74 AND the CSD-content
+conflation makes a genuinely-watercolour cluster that tight hard to build. **Library-broadening effort
+CONCLUDED for now** (3 style types tried, all metric-confirmed negative; the shipped 3 remain the library).
+Reopening this needs a fundamentally tighter clean-medium subset (e.g. tightest-150, or a non-CSD style
+signal) — not more of the same. All failed LoRAs kept unreleased on `lora_lib/`.
+
 The end goal: a user uploads a reference image; generations adopt its STYLE (not
 content) via the IP-adapter on Flux.2 Klein, served by the iris engine. Gap analysis
 2026-06-10 (post Phase-2 / TRAIN-7 / held-out-cond_gap session):
