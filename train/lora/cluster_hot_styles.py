@@ -11,7 +11,6 @@ record_allowlist) + centroids + exemplar rec_ids (nearest the centroid, to eyeba
 import argparse, glob, json, os, sys
 import numpy as np
 
-HOT = "/Volumes/2TBSSD/baseline_pool_hot"
 CSD_CACHE = "/Volumes/2TBSSD/sref_eval/style_cache"
 
 

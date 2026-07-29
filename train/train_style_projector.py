@@ -38,8 +38,11 @@ def _load_vae_bn_stats(flux_model_dir):
         s = mx.sqrt(st["bn.running_var"].astype(mx.float32).reshape(32, 2, 2) + 1e-4)
         mx.eval(m, s); return m, s
     except Exception as e:
-        print(f"  WARNING: VAE-Q1 bn stats unavailable ({e}); latents NOT BN-packed", flush=True)
-        return None, None
+        raise RuntimeError(
+            f"VAE-Q1: VAE BatchNorm stats unavailable ({e}). Latents cannot be BN-packed "
+            f"into C's inference latent space — training in the raw std~1.7 VAE-latent space "
+            f"silently yields a model that does NOT transfer to C inference (see BUGS.md VAE-Q1). "
+            f"Aborting rather than training in the wrong space.") from e
 
 
 def _bn_pack(lat, m, s):
@@ -94,6 +97,11 @@ def main():
     B = int(dcfg.get("batch_size", 1))
     bucket = tuple(dcfg.get("bucket", [512, 512]))
     guidance = tcfg.get("guidance")  # base model CFG guidance (None ok in the flow forward)
+
+    # Determinism: seed BOTH Python `random` (null-style/CFG-dropout decision) and the global mlx
+    # PRNG (training noise) once, before anything draws. Mirrors train_latent_csd_projector.py:171.
+    seed = int(dcfg.get("seed") or 0)
+    random.seed(seed); mx.random.seed(seed)
 
     print(f"loading Flux2Klein ({model_dir}) ...", flush=True)
     t0 = time.time()

@@ -152,6 +152,13 @@ def main():
     guidance = tcfg.get("guidance")
     LN2 = math.log(2.0)
 
+    # Determinism: seed BOTH the Python `random` (CFG-dropout / null-style decisions) and the global
+    # mlx PRNG (training noise + LoRA/CSDModulation init) here, once, before anything draws. Mirrors
+    # train_latent_csd_projector.py:171. NOTE: never reseed the global mlx PRNG mid-training (that
+    # restarts the shared training-noise stream) — diagnostics use a dedicated key instead.
+    seed = int(dcfg.get("seed") or 0)
+    random.seed(seed); mx.random.seed(seed)
+
     print(f"loading Flux2Klein ({model_dir}) ...", flush=True)
     t0 = time.time()
     flux = Flux2Klein(model_path=model_dir, quantize=None)
@@ -240,8 +247,10 @@ def main():
             the unambiguous proof the reference is being used (test_pair_contrastive.py)."""
         t_int = mx.full((1,), 850, dtype=mx.int32)
         alpha, sigma = get_schedule_values(t_int)
-        mx.random.seed(1234)
-        noisy, _ = fused_flow_noise(latent, mx.random.normal(latent.shape), alpha, sigma)
+        # Reproducible diag noise WITHOUT perturbing the global training-noise stream: draw from a
+        # dedicated key rather than mx.random.seed() (which would restart the shared PRNG).
+        dnoise = mx.random.normal(latent.shape, key=mx.random.key(1234))
+        noisy, _ = fused_flow_noise(latent, dnoise, alpha, sigma)
         v_a = _forward_vpred(flux, csd_mod, noisy, text, s_a, t_int, guidance, ckpt_d, ckpt_s)
         v_b = _forward_vpred(flux, csd_mod, noisy, text, s_b, t_int, guidance, ckpt_d, ckpt_s)
         x0_a = reconstruct_x0(noisy, v_a, alpha, sigma).astype(mx.float32)

@@ -1237,6 +1237,9 @@ def train(config: dict) -> None:
     # result (same noise, latent, text embeds). This is NOT gradient accumulation —
     # effective LR is multiplied by N. Only useful without block-injection.
     _n_grad_steps       = int(tcfg.get("n_grad_steps_per_fwd", 1))
+    # TODO(deferred): the `use_block_injection=False` default was reviewed as a possible defect but
+    # changing it alters training behavior (Flux-Jacobian block injection, ~4.7x slower) and needs a
+    # dedicated smoke before flipping — intentionally left as-is here.
     _use_block_injection = bool(tcfg.get("use_block_injection", False))
     if _use_block_injection and _n_grad_steps > 1:
         print("  TRAIN-6: use_block_injection=true — n_grad_steps_per_fwd forced to 1")
@@ -2915,7 +2918,9 @@ def _load_text_encoder(flux):
 def _load_vae_bn_stats(flux_model_dir: str):
     """Load the VAE BatchNorm running stats as [32,2,2] mean / std arrays (VAE-Q1).
 
-    Returns (bn_mean_r, bn_std_r) or (None, None) if unavailable. The 128 BN
+    Returns (bn_mean_r, bn_std_r); raises RuntimeError if the stats are unavailable
+    (M4: BN-packing is mandatory — training in the raw std~1.7 space is a silent
+    train->infer break, so it must be a hard failure, not a warn-and-continue). The 128 BN
     features map to (latent_channel c, patch-row pi, patch-col pj) as
     feature = c*4 + pi*2 + pj — the same channel order iris_patchify / the trainer's
     pack step use — so reshaping to [32,2,2] lets a spatial tile apply the right
@@ -2929,9 +2934,12 @@ def _load_vae_bn_stats(flux_model_dir: str):
         mx.eval(bn_mean_r, bn_std_r)
         return bn_mean_r, bn_std_r
     except Exception as e:
-        print(f"  WARNING: VAE-Q1 bn stats unavailable ({e}); latents will NOT be "
-              f"BN-packed — training space will not match C inference", flush=True)
-        return None, None
+        raise RuntimeError(
+            f"VAE-Q1: VAE BatchNorm stats unavailable ({e}). Latents cannot be BN-packed "
+            f"into C's inference latent space, so training would run in the raw std~1.7 "
+            f"VAE-latent space and silently produce a model that does NOT transfer to C "
+            f"inference (see BUGS.md VAE-Q1). Aborting rather than training in the wrong space."
+        ) from e
 
 
 def _bn_pack_latents(lat: mx.array, bn_mean_r, bn_std_r) -> mx.array:
