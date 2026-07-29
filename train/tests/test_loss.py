@@ -3,7 +3,7 @@ train/tests/test_loss.py — Unit tests for flow matching loss functions.
 
 Tests correctness of:
   - get_schedule_values: linear schedule boundary and midpoint values
-  - fused_flow_noise: v-prediction formula (noisy, target)
+  - fused_flow_noise: rectified-flow velocity target (noisy, target = noise - latent)
   - per-sample timestep broadcast over [B, C, H, W]
   - gram_matrix / gram_style_loss: shape, symmetry, zero-input, gradient
   - Metal kernel path vs MLX fallback: parity within bf16 tolerance
@@ -106,36 +106,36 @@ class TestFusedFlowNoise:
         assert float(mx.max(diff).item()) < 1e-5
 
     def test_target_formula(self):
-        """target = alpha*noise - sigma*latent (v-prediction)."""
+        """target = noise - latent (rectified-flow velocity, constant in t)."""
         latent, noise = self._make_batch(B=1)
         alpha = mx.array([0.7])
         sigma = mx.array([0.3])
         _, target = fused_flow_noise(latent, noise, alpha, sigma)
-        expected = 0.7 * noise - 0.3 * latent
+        expected = noise - latent
         mx.eval(target, expected)
         diff = mx.abs(target - expected)
         mx.eval(diff)
         assert float(mx.max(diff).item()) < 1e-5
 
     def test_t0_noisy_equals_latent(self):
-        """At t=0: alpha=1, sigma=0 → noisy=latent, target=noise."""
+        """At t=0: alpha=1, sigma=0 → noisy=latent; target=noise-latent (constant)."""
         latent, noise = self._make_batch(B=1)
         alpha = mx.array([1.0])
         sigma = mx.array([0.0])
         noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
         mx.eval(noisy, target, latent, noise)
         assert float(mx.max(mx.abs(noisy - latent)).item()) < 1e-5
-        assert float(mx.max(mx.abs(target - noise)).item()) < 1e-5
+        assert float(mx.max(mx.abs(target - (noise - latent))).item()) < 1e-5
 
     def test_t1000_noisy_equals_noise(self):
-        """At t=1000: alpha=0, sigma=1 → noisy=noise, target=-latent."""
+        """At t=1000: alpha=0, sigma=1 → noisy=noise; target=noise-latent (constant)."""
         latent, noise = self._make_batch(B=1)
         alpha = mx.array([0.0])
         sigma = mx.array([1.0])
         noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
         mx.eval(noisy, target, latent, noise)
         assert float(mx.max(mx.abs(noisy - noise)).item()) < 1e-5
-        assert float(mx.max(mx.abs(target + latent)).item()) < 1e-5
+        assert float(mx.max(mx.abs(target - (noise - latent))).item()) < 1e-5
 
     def test_per_sample_broadcast(self):
         """Per-sample timesteps [B] broadcast correctly over [B, C, H, W]."""
@@ -289,13 +289,10 @@ class TestGramStyleLoss:
 
     def test_x0_reconstruction_math(self):
         """
-        Verify the reconstruction identity used in the style loss:
-          x0_pred = alpha * x_t - sigma * v_pred
-        = alpha*(alpha*x0+sigma*eps) - sigma*(alpha*eps-sigma*x0)
-        = (alpha^2 + sigma^2) * x0
-        For the linear schedule alpha=1-t/1000, sigma=t/1000, the factor is
-        (1-t/1000)^2 + (t/1000)^2, not 1.  The style loss accepts approximate
-        x0 (gradient signal is scale-invariant for the Gram MSE).
+        Rectified-flow reconstruction identity used by the style/leak losses:
+          x0 = noisy - sigma * v    (v = noise - x0, the target)
+        Exact recovery of the clean latent — no (alpha^2+sigma^2) bias factor
+        (that factor was an artifact of the old, wrong v-prediction target).
         """
         rng = np.random.default_rng(24)
         x0 = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
@@ -303,14 +300,11 @@ class TestGramStyleLoss:
         alpha, sigma = get_schedule_values(mx.array([600]))
         noisy, target = fused_flow_noise(x0, noise, alpha, sigma)
 
-        a = float(alpha[0])
         s = float(sigma[0])
-        x0_rec = a * noisy - s * target
+        x0_rec = noisy - s * target
         mx.eval(x0_rec)
-        # Reconstruction gives (a^2 + s^2) * x0, not x0 itself.
-        scale = a ** 2 + s ** 2
-        expected = scale * np.array(x0)
-        assert np.allclose(np.array(x0_rec), expected, atol=1e-5)
+        # Exact recovery: noisy - sigma*(noise - x0) = x0.
+        assert np.allclose(np.array(x0_rec), np.array(x0), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -319,17 +313,12 @@ class TestGramStyleLoss:
 
 class TestReconstructX0:
     """
-    Tests for the unbiased x0 reconstruction helper.
+    Tests for the x0 reconstruction helper (rectified flow).
 
-    Core identity (v-prediction, any schedule):
-        noisy  = alpha * x0 + sigma * noise
-        target = alpha * noise − sigma * x0
-        → x0 = (alpha * noisy − sigma * target) / (alpha² + sigma²)
-
-    For the linear schedule (alpha=1−t/1000, sigma=t/1000):
-        alpha² + sigma² ∈ [0.5, 1.0]   (min at t=500, both =0.5)
-    The raw formula alpha*noisy − sigma*v_pred gives (alpha²+sigma²)*x0 — biased.
-    reconstruct_x0 corrects for this factor.
+    Core identity:
+        noisy  = alpha * x0 + sigma * noise    (alpha=1-t', sigma=t')
+        v      = noise - x0                     (the target)
+        → x0   = noisy - sigma * v              (exact, no bias factor)
     """
 
     def test_exact_when_prediction_perfect(self):
@@ -343,10 +332,11 @@ class TestReconstructX0:
         mx.eval(x0_rec, x0)
         assert np.allclose(np.array(x0_rec), np.array(x0), atol=1e-5)
 
-    def test_unbiased_vs_raw_at_mid_timestep(self):
+    def test_exact_at_mid_timestep(self):
         """
-        At t=500 (alpha=sigma=0.5): raw formula gives 0.5·x0 (because
-        alpha²+sigma²=0.5); reconstruct_x0 returns x0 after dividing by 0.5.
+        At t=500 (alpha=sigma=0.5): reconstruct_x0 = noisy - sigma*v recovers x0
+        exactly. The old v-prediction inverse produced a biased (alpha²+sigma²)·x0;
+        the rectified-flow inverse has no bias factor.
         """
         rng = np.random.default_rng(51)
         x0    = mx.array(rng.standard_normal((1, 8, 4, 4)).astype(np.float32))
@@ -354,15 +344,6 @@ class TestReconstructX0:
         alpha, sigma = get_schedule_values(mx.array([500]))
         noisy, v_target = fused_flow_noise(x0, noise, alpha, sigma)
 
-        # Raw biased formula: equals (alpha²+sigma²)*x0 when prediction is perfect
-        a, s = float(alpha[0]), float(sigma[0])
-        raw = a * noisy.astype(mx.float32) - s * v_target.astype(mx.float32)
-        mx.eval(raw)
-        expected_biased = (a ** 2 + s ** 2) * np.array(x0)
-        assert np.allclose(np.array(raw), expected_biased, atol=1e-5), \
-            "raw formula should give (alpha²+sigma²)·x0"
-
-        # Corrected: reconstruct_x0 divides out the scale factor → exact x0
         x0_rec = reconstruct_x0(noisy, v_target, alpha, sigma)
         mx.eval(x0_rec)
         assert np.allclose(np.array(x0_rec), np.array(x0), atol=1e-5), \
@@ -414,7 +395,7 @@ class TestFusedFlowNoiseKernelPaths:
     """
 
     def test_b1_path_correct_formula(self):
-        """B=1 (potential Metal path) gives the exact v-prediction formula."""
+        """B=1 (potential Metal path) gives the exact rectified-flow target."""
         rng = np.random.default_rng(30)
         latent = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
         noise  = mx.array(rng.standard_normal((1, 32, 4, 4)).astype(np.float32))
@@ -422,7 +403,7 @@ class TestFusedFlowNoiseKernelPaths:
         sigma  = mx.array([0.4])
         noisy, target = fused_flow_noise(latent, noise, alpha, sigma)
         exp_noisy  = 0.6 * latent + 0.4 * noise
-        exp_target = 0.6 * noise  - 0.4 * latent
+        exp_target = noise - latent
         mx.eval(noisy, target, exp_noisy, exp_target)
         # bf16 FMA vs separate mul+add: up to ~2 × bf16 eps tolerance
         BF16_TOL = 0.016
@@ -443,7 +424,7 @@ class TestFusedFlowNoiseKernelPaths:
         for i in range(B):
             a, s = float(alpha[i]), float(sigma[i])
             exp_n = a * np.array(latent[i]) + s * np.array(noise[i])
-            exp_t = a * np.array(noise[i])  - s * np.array(latent[i])
+            exp_t = np.array(noise[i]) - np.array(latent[i])
             assert np.allclose(np.array(noisy[i]),  exp_n, atol=1e-5)
             assert np.allclose(np.array(target[i]), exp_t, atol=1e-5)
 

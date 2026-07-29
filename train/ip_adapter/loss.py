@@ -1,10 +1,16 @@
 """
 train/ip_adapter/loss.py — Flow matching loss for IP-Adapter training.
 
-Uses v-prediction flow matching (matching Flux Klein's training objective):
-  noisy  = alpha_t * latent + sigma_t * noise
-  target = alpha_t * noise  - sigma_t * latent   (v-prediction)
+Uses rectified-flow matching (Flux.2 Klein's objective; verified against the mflux
+reference trainer.py:98 `error=(clean+pred-noise)^2` ⇒ the model output is trained to
+equal `noise - x0`, and inference integrates it as a velocity `z += dt*v`):
+  noisy  = alpha_t * latent + sigma_t * noise      (alpha=1-t', sigma=t')
+  target = noise - latent                          (constant rectified velocity)
   loss   = MSE(model_velocity, target)
+
+Fixed 2026-07-30: the target was previously `alpha*noise - sigma*latent` (v-prediction),
+which does NOT match the frozen base's output space nor the Euler inference update
+(iris_sample.c: z += dt*v). Guarded by train/tests/test_flow_target_parity.py.
 
 fused_flow_noise has two paths:
   Metal kernel  — single GPU dispatch; used when B=1 (standard training batch).
@@ -234,31 +240,28 @@ def reconstruct_x0(
     sigma_t: mx.array,
 ) -> mx.array:
     """
-    Unbiased clean-latent estimate from the predicted velocity.
+    Clean-latent estimate from the predicted rectified-flow velocity.
 
-    In v-prediction flow matching:
-        noisy  = alpha_t · x0 + sigma_t · noise
-        v_pred ≈ alpha_t · noise − sigma_t · x0
-    Solving for x0 exactly:
-        x0 = (alpha_t · noisy − sigma_t · v_pred) / (alpha_t² + sigma_t²)
+    Rectified flow (Flux.2 Klein):
+        noisy = alpha_t · x0 + sigma_t · noise   (alpha=1-t', sigma=t')
+        v     = noise − x0                        (constant velocity — the target)
+    Solving noisy = x0 + sigma_t·v for x0 exactly:
+        x0 = noisy − sigma_t · v_pred
 
-    The raw formula alpha·noisy − sigma·v_pred gives (alpha²+sigma²)·x0 — biased
-    at mid-timesteps.  For the linear schedule (alpha = 1−t/1000, sigma = t/1000)
-    the denominator lies in [0.5, 1.0] and is always safe to divide by; the clamp
-    at 1e-6 is a defensive guard for non-standard schedules.
+    Exact — no bias factor. The earlier (alpha·noisy−sigma·v)/(alpha²+sigma²) form
+    was the inverse of the wrong v-prediction target (fixed 2026-07-30). alpha_t is
+    unused, kept in the signature for call-site compatibility.
 
     All inputs are cast to float32 internally; output shape matches noisy.
     """
-    a = alpha_t.reshape(-1, 1, 1, 1).astype(mx.float32)
     s = sigma_t.reshape(-1, 1, 1, 1).astype(mx.float32)
-    denom = mx.maximum(a * a + s * s, mx.array(1e-6, dtype=mx.float32))
-    return (a * noisy.astype(mx.float32) - s * v_pred.astype(mx.float32)) / denom
+    return noisy.astype(mx.float32) - s * v_pred.astype(mx.float32)
 
 
 # ---------------------------------------------------------------------------
-# Fused Metal kernel — v-prediction noise scheduler
+# Fused Metal kernel — rectified-flow noise scheduler
 # Inputs: latent, noise, alpha (scalar [1]), sigma (scalar [1]), count (uint32 [1])
-# Output: noisy = alpha*latent + sigma*noise, target = alpha*noise - sigma*latent
+# Output: noisy = alpha*latent + sigma*noise, target = noise - latent (velocity)
 #
 # count is passed explicitly because the Metal device pointer type does not
 # expose a .size member; bounds-checking via a separate uint32 is the portable
@@ -273,7 +276,7 @@ _FUSED_FLOW_NOISE_SOURCE = """
     float l = latent[i], nv = noise[i];
     float a = alpha[0],  s = sigma[0];
     noisy[i]  = a * l + s * nv;
-    target[i] = a * nv - s * l;
+    target[i] = nv - l;
 """
 
 _fused_flow_kernel = None
@@ -306,7 +309,7 @@ def fused_flow_noise(
     sigma_t: mx.array,
 ):
     """
-    Compute (noisy, target) for v-prediction flow matching.
+    Compute (noisy, target) for rectified-flow matching.
 
     latent:  clean latent [B, C, H, W], bfloat16 or float32
     noise:   Gaussian noise, same shape as latent
@@ -320,7 +323,7 @@ def fused_flow_noise(
 
     Returns:
       noisy:  alpha_t * latent + sigma_t * noise
-      target: alpha_t * noise  - sigma_t * latent  (v-prediction target)
+      target: noise - latent  (rectified-flow velocity target)
     """
     if _HAS_METAL_KERNEL and alpha_t.size == 1:
         # Metal path: single GPU kernel dispatch, float32 in/out.
@@ -352,7 +355,7 @@ def fused_flow_noise(
     while sigma_t.ndim < latent.ndim:
         sigma_t = sigma_t[..., None]
     noisy  = alpha_t * latent + sigma_t * noise
-    target = alpha_t * noise  - sigma_t * latent
+    target = noise - latent
     return noisy, target
 
 
