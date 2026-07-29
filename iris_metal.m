@@ -98,11 +98,13 @@ typedef struct {
 
 static sdpa_graph_cache_t g_sdpa_graph_cache[MAX_SDPA_GRAPH_CACHE];
 static int g_sdpa_graph_count = 0;
+static int g_sdpa_graph_next = 0;
 static pthread_mutex_t g_sdpa_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph-based SDPA graphs (float32) — reuses the same struct */
 static sdpa_graph_cache_t g_sdpa_f32_graph_cache[MAX_SDPA_GRAPH_CACHE];
 static int g_sdpa_f32_graph_count = 0;
+static int g_sdpa_f32_graph_next = 0;
 static pthread_mutex_t g_sdpa_f32_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph-based bf16 linear graphs */
@@ -122,6 +124,7 @@ typedef struct {
 
 static linear_graph_cache_t g_linear_graph_cache[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_count = 0;
+static int g_linear_graph_next = 0;
 static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph bf16 matmul graphs (no fp32 casts).
@@ -129,6 +132,7 @@ static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
  * fp32-cast graphs above. */
 static linear_graph_cache_t g_linear_graph_cache_bf16[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_bf16_count = 0;
+static int g_linear_graph_bf16_next = 0;
 static pthread_mutex_t g_linear_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_linear_graph_bf16_disabled = 0;
 static int g_linear_graph_bf16_seen_success = 0;
@@ -232,9 +236,6 @@ static id<MTLBuffer> batch_get_input_buffer(const void *cpu_ptr, size_t size) {
 
 /* Forward declarations for compute shaders (defined later) */
 static id<MTLComputePipelineState> g_softmax_pipeline;
-static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline;
-static id<MTLComputePipelineState> g_bmm_half_sv_pipeline;
-static id<MTLComputePipelineState> g_softmax_half_pipeline;
 /* BF16 native pipelines (forward declarations) */
 static id<MTLComputePipelineState> g_rms_norm_bf16_pipeline;
 static id<MTLComputePipelineState> g_qk_rms_norm_bf16_pipeline;
@@ -1594,106 +1595,6 @@ int iris_metal_conv2d(float *out, const float *in,
     }
 }
 
-void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
-                            int M, int N, int K,
-                            float alpha,
-                            const float *A, int lda, int stride_a,
-                            const float *B, int ldb, int stride_b,
-                            float beta,
-                            float *C, int ldc, int stride_c,
-                            int batch_count) {
-    if (!g_initialized || batch_count <= 0) return;
-
-    @autoreleasepool {
-        /* For batched ops, encode all into single command buffer */
-        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-
-        int rowsA = transpose_a ? K : M;
-        int colsA = transpose_a ? M : K;
-        int rowsB = transpose_b ? N : K;
-        int colsB = transpose_b ? K : N;
-
-        /* Create descriptors once */
-        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
-            matrixDescriptorWithRows:rowsA columns:colsA
-                            rowBytes:lda * sizeof(float)
-                            dataType:MPSDataTypeFloat32];
-        MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
-            matrixDescriptorWithRows:rowsB columns:colsB
-                            rowBytes:ldb * sizeof(float)
-                            dataType:MPSDataTypeFloat32];
-        MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
-            matrixDescriptorWithRows:M columns:N
-                            rowBytes:ldc * sizeof(float)
-                            dataType:MPSDataTypeFloat32];
-
-        /* Create kernel once */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:transpose_a ? YES : NO
-              transposeRight:transpose_b ? YES : NO
-                  resultRows:M resultColumns:N interiorColumns:K
-                       alpha:alpha beta:beta];
-
-        size_t sizeA_elem = (size_t)rowsA * lda * sizeof(float);
-        size_t sizeB_elem = (size_t)rowsB * ldb * sizeof(float);
-        size_t sizeC_elem = (size_t)M * ldc * sizeof(float);
-
-        /* Store C buffers so we can copy results back after GPU completes.
-         * __strong so ARC retains on assignment (cBuffers[i] = bufC) and releases
-         * on cBuffers[i] = nil below; calloc zero-inits the slots as ARC requires.
-         * Newer toolchains require the explicit ownership qualifier on a malloc'd
-         * array of object pointers. */
-        __strong id<MTLBuffer> *cBuffers =
-            (__strong id<MTLBuffer> *)calloc(batch_count, sizeof(id<MTLBuffer>));
-        float **cPtrs = (float **)malloc(batch_count * sizeof(float *));
-        if (!cBuffers || !cPtrs) {
-            free(cBuffers);
-            free(cPtrs);
-            fprintf(stderr, "iris_metal_sgemm_batch: out of memory (batch_count=%d)\n", batch_count);
-            return;
-        }
-
-        for (int i = 0; i < batch_count; i++) {
-            const float *Ai = A + i * stride_a;
-            const float *Bi = B + i * stride_b;
-            float *Ci = C + i * stride_c;
-
-            /* Use copy-based buffers to avoid alignment issues */
-            id<MTLBuffer> bufA = [g_device newBufferWithBytes:Ai
-                                                       length:sizeA_elem
-                                                      options:MTLResourceStorageModeShared];
-            id<MTLBuffer> bufB = get_cached_weight_buffer(Bi, sizeB_elem);
-            id<MTLBuffer> bufC = [g_device newBufferWithLength:sizeC_elem
-                                                       options:MTLResourceStorageModeShared];
-
-            cBuffers[i] = bufC;
-            cPtrs[i] = Ci;
-
-            MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:bufA descriptor:descA];
-            MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:bufB descriptor:descB];
-            MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:bufC descriptor:descC];
-
-            [matmul encodeToCommandBuffer:cmdBuffer
-                               leftMatrix:matA
-                              rightMatrix:matB
-                             resultMatrix:matC];
-        }
-
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-
-        /* Copy results back and release buffers */
-        for (int i = 0; i < batch_count; i++) {
-            memcpy(cPtrs[i], [cBuffers[i] contents], sizeC_elem);
-            cBuffers[i] = nil;  /* Release under ARC */
-        }
-
-        free(cBuffers);
-        free(cPtrs);
-    }
-}
-
 void iris_metal_sync(void) {
     /* This is a legacy no-op function. Actual GPU synchronization is handled by:
      * - iris_gpu_sync() for tensor operations (g_tensor_cmd)
@@ -1908,169 +1809,6 @@ void iris_metal_attention(float *out,
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
         memcpy(out, [bufOut contents], sizeOut);
-
-        /* Release pooled buffers */
-        pool_release_buffer(bufQ);
-        pool_release_buffer(bufK);
-        pool_release_buffer(bufV);
-        pool_release_buffer(bufScores);
-        pool_release_buffer(bufOut);
-    }
-}
-
-/* ========================================================================
- * Half-Precision Attention with Custom Metal Compute Shaders
- *
- * Same interface as iris_metal_attention but uses half-precision compute
- * shaders with f32 accumulation. This provides
- * ~2x memory bandwidth savings while maintaining numerical stability.
- *
- * Layout (same as iris_metal_attention):
- * Q: [heads, seq_q, head_dim]
- * K: [heads, seq_k, head_dim]
- * V: [heads, seq_k, head_dim]
- * scores_scratch: unused (kept for interface compatibility)
- * out: [heads, seq_q, head_dim]
- * ======================================================================== */
-void iris_metal_attention_bf16(float *out,
-                               const float *Q, const float *K, const float *V,
-                               float *scores_scratch,
-                               int heads, int seq_q, int seq_k, int head_dim,
-                               float scale) {
-    if (!g_initialized || heads <= 0) return;
-    if (!g_shaders_initialized || !g_bmm_half_qkt_pipeline ||
-        !g_bmm_half_sv_pipeline || !g_softmax_half_pipeline) {
-        /* Fall back to f32 attention if shaders not available */
-        iris_metal_attention(out, Q, K, V, scores_scratch,
-                            heads, seq_q, seq_k, head_dim, scale);
-        return;
-    }
-    (void)scores_scratch;  /* Unused - kept for interface compatibility */
-
-    @autoreleasepool {
-        size_t q_elements = (size_t)heads * seq_q * head_dim;
-        size_t k_elements = (size_t)heads * seq_k * head_dim;
-        size_t v_elements = (size_t)heads * seq_k * head_dim;
-        size_t out_elements = (size_t)heads * seq_q * head_dim;
-        size_t scores_elements = (size_t)heads * seq_q * seq_k;
-
-        size_t q_size_f16 = q_elements * sizeof(uint16_t);
-        size_t k_size_f16 = k_elements * sizeof(uint16_t);
-        size_t v_size_f16 = v_elements * sizeof(uint16_t);
-        size_t out_size_f16 = out_elements * sizeof(uint16_t);
-        size_t scores_size_f16 = scores_elements * sizeof(uint16_t);
-
-        /* Allocate f16 buffers */
-        id<MTLBuffer> bufQ = pool_get_buffer(q_size_f16);
-        id<MTLBuffer> bufK = pool_get_buffer(k_size_f16);
-        id<MTLBuffer> bufV = pool_get_buffer(v_size_f16);
-        id<MTLBuffer> bufScores = pool_get_buffer(scores_size_f16);
-        id<MTLBuffer> bufOut = pool_get_buffer(out_size_f16);
-
-        if (!bufQ || !bufK || !bufV || !bufScores || !bufOut) {
-            if (bufQ) pool_release_buffer(bufQ);
-            if (bufK) pool_release_buffer(bufK);
-            if (bufV) pool_release_buffer(bufV);
-            if (bufScores) pool_release_buffer(bufScores);
-            if (bufOut) pool_release_buffer(bufOut);
-            return;
-        }
-
-        /* Convert f32 inputs to f16 */
-        uint16_t *q_f16 = (uint16_t *)[bufQ contents];
-        uint16_t *k_f16 = (uint16_t *)[bufK contents];
-        uint16_t *v_f16 = (uint16_t *)[bufV contents];
-
-        for (size_t i = 0; i < q_elements; i++) {
-            q_f16[i] = f32_to_f16(Q[i]);
-        }
-        for (size_t i = 0; i < k_elements; i++) {
-            k_f16[i] = f32_to_f16(K[i]);
-        }
-        for (size_t i = 0; i < v_elements; i++) {
-            v_f16[i] = f32_to_f16(V[i]);
-        }
-
-        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-
-        /* === Phase 1: Q @ K^T using custom half compute shader === */
-        {
-            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-            [encoder setComputePipelineState:g_bmm_half_qkt_pipeline];
-
-            [encoder setBuffer:bufQ offset:0 atIndex:0];
-            [encoder setBuffer:bufK offset:0 atIndex:1];
-            [encoder setBuffer:bufScores offset:0 atIndex:2];
-            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
-            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
-            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
-            [encoder setBytes:&scale length:sizeof(float) atIndex:7];
-
-            /* Dispatch: threadgroups cover output [batch, M, N] */
-            uint TILE_SIZE = 16;
-            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
-            MTLSize numGroups = MTLSizeMake(
-                (seq_k + TILE_SIZE - 1) / TILE_SIZE,
-                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
-                heads);
-
-            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
-            [encoder endEncoding];
-        }
-
-        /* === Phase 2: Softmax on GPU === */
-        {
-            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-            [encoder setComputePipelineState:g_softmax_half_pipeline];
-
-            [encoder setBuffer:bufScores offset:0 atIndex:0];
-            int total_rows = heads * seq_q;
-            [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
-            [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
-
-            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
-            MTLSize numGroups = MTLSizeMake(total_rows, 1, 1);
-            MTLSize groupSize = MTLSizeMake(threadsPerGroup, 1, 1);
-
-            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:groupSize];
-            [encoder endEncoding];
-        }
-
-        /* === Phase 3: scores @ V using custom half compute shader === */
-        {
-            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-            [encoder setComputePipelineState:g_bmm_half_sv_pipeline];
-
-            [encoder setBuffer:bufScores offset:0 atIndex:0];
-            [encoder setBuffer:bufV offset:0 atIndex:1];
-            [encoder setBuffer:bufOut offset:0 atIndex:2];
-            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
-            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
-            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
-            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
-
-            /* Dispatch: threadgroups cover output [batch, M, N] */
-            uint TILE_SIZE = 16;
-            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
-            MTLSize numGroups = MTLSizeMake(
-                (head_dim + TILE_SIZE - 1) / TILE_SIZE,
-                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
-                heads);
-
-            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
-            [encoder endEncoding];
-        }
-
-        /* Execute all phases */
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-
-        /* Convert f16 output back to f32 */
-        uint16_t *out_f16 = (uint16_t *)[bufOut contents];
-        for (size_t i = 0; i < out_elements; i++) {
-            out[i] = f16_to_f32(out_f16[i]);
-        }
 
         /* Release pooled buffers */
         pool_release_buffer(bufQ);
@@ -3308,9 +3046,6 @@ static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
 static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
-static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline = nil;
-static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
-static id<MTLComputePipelineState> g_softmax_half_pipeline = nil;
 /* Note: BF16 pipelines are forward-declared at top of file */
 
 int iris_metal_shaders_available(void) {
@@ -3492,33 +3227,6 @@ int iris_metal_init_shaders(void) {
             g_concat_attn_mlp_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_concat_attn_mlp_pipeline) {
                 fprintf(stderr, "Metal shaders: concat_attn_mlp pipeline failed: %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
-        }
-
-        func = [g_shader_library newFunctionWithName:@"batched_matmul_half_qkt"];
-        if (func) {
-            g_bmm_half_qkt_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
-            if (!g_bmm_half_qkt_pipeline) {
-                fprintf(stderr, "Metal shaders: batched_matmul_half_qkt pipeline failed: %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
-        }
-
-        func = [g_shader_library newFunctionWithName:@"batched_matmul_half_sv"];
-        if (func) {
-            g_bmm_half_sv_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
-            if (!g_bmm_half_sv_pipeline) {
-                fprintf(stderr, "Metal shaders: batched_matmul_half_sv pipeline failed: %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
-        }
-
-        func = [g_shader_library newFunctionWithName:@"softmax_half"];
-        if (func) {
-            g_softmax_half_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
-            if (!g_softmax_half_pipeline) {
-                fprintf(stderr, "Metal shaders: softmax_half pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -4631,6 +4339,8 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     int slot = 0;
     if (g_sdpa_graph_count < MAX_SDPA_GRAPH_CACHE) {
         slot = g_sdpa_graph_count++;
+    } else {
+        slot = g_sdpa_graph_next++ % MAX_SDPA_GRAPH_CACHE;
     }
 
     sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[slot];
@@ -4737,6 +4447,8 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache_f32(int seq_q, int seq_k, int nu
     int slot = 0;
     if (g_sdpa_f32_graph_count < MAX_SDPA_GRAPH_CACHE) {
         slot = g_sdpa_f32_graph_count++;
+    } else {
+        slot = g_sdpa_f32_graph_next++ % MAX_SDPA_GRAPH_CACHE;
     }
 
     sdpa_graph_cache_t *entry = &g_sdpa_f32_graph_cache[slot];
@@ -4826,6 +4538,8 @@ static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int
     int slot = 0;
     if (g_linear_graph_count < MAX_LINEAR_GRAPH_CACHE) {
         slot = g_linear_graph_count++;
+    } else {
+        slot = g_linear_graph_next++ % MAX_LINEAR_GRAPH_CACHE;
     }
 
     linear_graph_cache_t *entry = &g_linear_graph_cache[slot];
@@ -4882,6 +4596,8 @@ static linear_graph_cache_t *get_linear_graph_cache_bf16(int seq_len, int in_dim
     int slot = 0;
     if (g_linear_graph_bf16_count < MAX_LINEAR_GRAPH_CACHE) {
         slot = g_linear_graph_bf16_count++;
+    } else {
+        slot = g_linear_graph_bf16_next++ % MAX_LINEAR_GRAPH_CACHE;
     }
 
     linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[slot];
@@ -5677,10 +5393,14 @@ void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         [encoder setBytes:&num_kv_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
 
-        /* Dispatch: one thread per (pos, head) - max of q_heads and kv_heads */
+        /* Dispatch: one thread per (pos, head) - max of q_heads and kv_heads.
+         * Use dispatchThreads with a SIMD-friendly threadgroup width (matching the
+         * f32 RoPE path) so threads over the head axis pack into a threadgroup
+         * instead of one thread per group. The rope_bf16 kernel indexes by
+         * thread_position_in_grid, so total thread count is unchanged. */
         int max_heads = num_q_heads > num_kv_heads ? num_q_heads : num_kv_heads;
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, max_heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(max_heads, 64), 1)];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
