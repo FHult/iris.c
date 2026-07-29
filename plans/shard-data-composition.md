@@ -52,7 +52,7 @@ Derived per-source presence (a shard can involve >1 source):
   LoRA mechanism works (BACKLOG SREF-LEARNED-STAGE1 / retrieval-hybrid Phase 0).
 - **Painterly specifically**: the corpus cannot supply dense, labeled painterly clusters (wikiart too thin).
   Acquiring the clean public **WikiArt** dataset (movement-labeled) remains the lever for those styles —
-  see `plans/sref-phase1-data-scoping.md`.
+  see `plans/archive/sref-phase1-data-scoping.md`.
 - **No re-index needed**: the subset style compute of all shards is DONE. A FULL per-image CSD (5000/shard)
   would only be worth it to surface more painterly needles from the diluted wikiart — low yield; prefer
   clean WikiArt.

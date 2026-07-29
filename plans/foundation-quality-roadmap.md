@@ -1,7 +1,7 @@
 # Foundation Quality Roadmap
 
 **Created 2026-07-22.** The next major thrust after the SREF workstream closed. This is a living
-roadmap; supersedes the May scaffolding in `plans/cold-full-shard-build-foundation-runs.md` (which
+roadmap; supersedes the May scaffolding in `plans/archive/cold-full-shard-build-foundation-runs.md` (which
 predates the actual corpus build) and folds in the TRAIN-7 higher-res work.
 
 ## What this is — and isn't
@@ -101,7 +101,7 @@ Goal: the highest-quality adapters the hardware supports, packaged for release.
 - **D2. 1024px SREF + IP-adapter** (Stage 3, `stage3_1024px.yaml`, warm-start from the 768px winner);
   add `(1024,1024)` to `BUCKETS` (revert if not adopted).
 - **D3. Release** the winners as `sref-adapter-v2` / an IP-adapter bundle, reusing the now-established
-  release runbook (`plans/sref-adapter-release-runbook.md`) + model-card pattern.
+  release runbook (`plans/archive/sref-adapter-release-runbook.md`) + model-card pattern.
 - **Gate D:** 1024px adapter beats 768px on the scorecard AND passes the collapse gate; memory peak
   ≤21.5 GB (TRAIN-7 measured).
 
@@ -138,9 +138,9 @@ Goal: the highest-quality adapters the hardware supports, packaged for release.
   or widen the pool first? Recommend **resolution-first on a curated subset** (Phase B before scale).
 
 ## References
-- `plans/cold-full-shard-build-foundation-runs.md` (the original data-build scaffolding, now mostly done)
+- `plans/archive/cold-full-shard-build-foundation-runs.md` (the original data-build scaffolding, now mostly done)
 - `memory/train7_plan` + BACKLOG TRAIN-7 (higher-res memory profile + gate-passed numbers)
 - `memory/flywheel_throughput_strategy` (precompute-dominated throughput)
 - `plans/pipeline-v2-architecture.md`, `plans/warmup-campaign-runbook.md` (pipeline + campaign mechanics)
 - `plans/precomp2-proxy-vae-design.md` (the throughput unlock)
-- `docs/sref.md`, `plans/sref-joint-backbone-project.md` (the SREF adapter to lift)
+- `docs/sref.md`, `plans/archive/sref-joint-backbone-project.md` (the SREF adapter to lift)

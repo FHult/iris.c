@@ -480,7 +480,7 @@ ablation:
 
 ## Flywheel Precompute + Versioned Publish (Added Later)
 
-See dedicated `plans/flywheel-precompute-architecture.md` for the full Claude/AI-readable architecture doc (problem statement, the per-iter precompute + cached train + publish flow, versioning with PrecomputeCache + current update + rmtree, integration points, why it matches the "actions same but efficiency different" observation).
+See dedicated `plans/archive/flywheel-precompute-architecture.md` for the full Claude/AI-readable architecture doc (problem statement, the per-iter precompute + cached train + publish flow, versioning with PrecomputeCache + current update + rmtree, integration points, why it matches the "actions same but efficiency different" observation).
 
 Inline: big explanatory comment block right before the per-iter precomp setup in `orchestrator.py` (search for "FLYWHEEL PER-ITER PRECOMPUTE").
 

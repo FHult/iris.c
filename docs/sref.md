@@ -81,10 +81,12 @@ keeping texture/style. This is what band-control refines.
 Routing a reference to a per-type specialist (painterly/graphic/…) was tested three times and is
 **closed**: no specialist beats the generic at any data mix that preserves prompt-following (the last
 attempt, a 40:60 WikiArt+diverse painterly specialist, diluted the style below generic levels). The
-**generic Learned Style adapter is the robust answer.** Trail: `plans/sref-mixed-painterly-specialist.md`,
+**generic Learned Style adapter is the robust answer.** Trail: `plans/archive/sref-mixed-painterly-specialist.md`,
 BACKLOG `SREF-STYLE-ROUTER`.
 
-## Research trail (`plans/sref-*`) — by status
+## Research trail (`plans/archive/sref-*`) — by status
+
+The SREF workstream is shipped and closed; its plan docs now live under `plans/archive/`.
 
 **Shipped / current:**
 - `sref-rope-band-control.md` — band-control (v5.0), shipped.
