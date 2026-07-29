@@ -4117,113 +4117,26 @@ float *iris_transformer_forward(iris_transformer_t *tf,
     double single_start = tf_get_time_ms();
 
 #ifdef USE_METAL
-    /* Try BF16 native path first */
-    int bf16_path_ok = 0;
     int gpu_chained_ok = 0;
     iris_gpu_tensor_t concat_hidden_gpu = NULL;
 
-    /* BF16 native single block path - currently disabled.
-     * MPS GEMM doesn't support bf16, so our custom bf16 linear kernel is ~4x slower than
-     * MPS SGEMM with f16 weights. To achieve higher bf16 performance, we would need
-     * highly optimized custom Metal matmul kernels.
-     * The f32 path with f16 weights and pre-warmed caches is currently faster. */
-    if (0 && iris_metal_available() && iris_bf16_pipeline_available() && !tf->use_mmap && tf->use_bf16) {
-        /* Create f32 GPU tensor first, then convert to bf16 */
-        iris_gpu_tensor_t hidden_f32 = iris_gpu_tensor_create(concat_hidden, total_seq * hidden);
-        if (hidden_f32) {
-            iris_gpu_tensor_t hidden_bf16 = iris_gpu_tensor_f32_to_bf16(hidden_f32);
-            iris_gpu_tensor_free(hidden_f32);
-
-            if (hidden_bf16) {
-                iris_gpu_tensor_set_persistent(hidden_bf16, 1);
-                bf16_path_ok = 1;
-
-                /* Pre-compute AdaLN modulation and convert to bf16 */
-                int mod_size = hidden * 3;
-                for (int j = 0; j < hidden; j++) {
-                    float x = t_emb[j];
-                    tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-                }
-                int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
-                float *mod_params = tf->work2 + total_seq * fused_dim;
-                iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
-
-                /* Convert modulation to bf16 GPU tensors */
-                iris_gpu_tensor_t shift_f32 = iris_gpu_tensor_create(mod_params, hidden);
-                iris_gpu_tensor_t scale_f32 = iris_gpu_tensor_create(mod_params + hidden, hidden);
-                iris_gpu_tensor_t gate_f32 = iris_gpu_tensor_create(mod_params + hidden * 2, hidden);
-
-                iris_gpu_tensor_t shift_bf16 = shift_f32 ? iris_gpu_tensor_f32_to_bf16(shift_f32) : NULL;
-                iris_gpu_tensor_t scale_bf16 = scale_f32 ? iris_gpu_tensor_f32_to_bf16(scale_f32) : NULL;
-                iris_gpu_tensor_t gate_bf16 = gate_f32 ? iris_gpu_tensor_f32_to_bf16(gate_f32) : NULL;
-
-                if (shift_f32) iris_gpu_tensor_free(shift_f32);
-                if (scale_f32) iris_gpu_tensor_free(scale_f32);
-                if (gate_f32) iris_gpu_tensor_free(gate_f32);
-
-                if (shift_bf16 && scale_bf16 && gate_bf16) {
-                    iris_gpu_batch_begin();
-
-                    /* Process all single blocks in bf16 */
-                    for (int i = 0; i < tf->num_single_layers && bf16_path_ok; i++) {
-                        /* Convert norm weights to bf16 tensors for this block */
-                        iris_gpu_tensor_t norm_q_f32 = iris_gpu_tensor_create(
-                            tf->single_blocks[i].norm_q_weight, tf->head_dim);
-                        iris_gpu_tensor_t norm_k_f32 = iris_gpu_tensor_create(
-                            tf->single_blocks[i].norm_k_weight, tf->head_dim);
-                        iris_gpu_tensor_t norm_q_bf16 = norm_q_f32 ? iris_gpu_tensor_f32_to_bf16(norm_q_f32) : NULL;
-                        iris_gpu_tensor_t norm_k_bf16 = norm_k_f32 ? iris_gpu_tensor_f32_to_bf16(norm_k_f32) : NULL;
-
-                        if (norm_q_f32) iris_gpu_tensor_free(norm_q_f32);
-                        if (norm_k_f32) iris_gpu_tensor_free(norm_k_f32);
-
-                        if (!norm_q_bf16 || !norm_k_bf16 ||
-                            !single_block_forward_bf16(hidden_bf16, &tf->single_blocks[i],
-                                                       shift_bf16, scale_bf16, gate_bf16,
-                                                       norm_q_bf16, norm_k_bf16,
-                                                       img_rope_cos, img_rope_sin,
-                                                       txt_rope_cos, txt_rope_sin,
-                                                       total_seq, txt_seq, tf, NULL, i)) {
-                            bf16_path_ok = 0;
-                            iris_gpu_batch_end();
-                            /* Convert back to f32 for fallback */
-                            iris_gpu_tensor_t result_f32 = iris_gpu_tensor_bf16_to_f32(hidden_bf16);
-                            if (result_f32) {
-                                iris_gpu_tensor_read(result_f32, concat_hidden);
-                                iris_gpu_tensor_free(result_f32);
-                            }
-                        }
-
-                        if (norm_q_bf16) iris_gpu_tensor_free(norm_q_bf16);
-                        if (norm_k_bf16) iris_gpu_tensor_free(norm_k_bf16);
-
-                        if (iris_substep_callback)
-                            iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
-                    }
-
-                    if (bf16_path_ok) {
-                        iris_gpu_batch_end();
-                        /* Convert final result back to f32 */
-                        iris_gpu_tensor_t result_f32 = iris_gpu_tensor_bf16_to_f32(hidden_bf16);
-                        if (result_f32) {
-                            iris_gpu_tensor_read(result_f32, concat_hidden);
-                            iris_gpu_tensor_free(result_f32);
-                        }
-                    }
-                } else {
-                    bf16_path_ok = 0;
-                }
-
-                if (shift_bf16) iris_gpu_tensor_free(shift_bf16);
-                if (scale_bf16) iris_gpu_tensor_free(scale_bf16);
-                if (gate_bf16) iris_gpu_tensor_free(gate_bf16);
-                iris_gpu_tensor_free(hidden_bf16);
+    /* When single-block LoRA adapters are active, the GPU single-block paths (which
+     * do not apply LoRA) must be skipped so the CPU single_block_forward runs and
+     * applies the deltas -- matching the double stream, which always runs on CPU under
+     * active LoRA. Byte-identical to before when no LoRA is active (scale 0 / no adapter). */
+    int has_single_lora = 0;
+    if (tf->lora && tf->lora->scale != 0.0f) {
+        for (int si = 0; si < tf->num_single_layers; si++) {
+            if (tf->lora->single_linear1[si].lora_A || tf->lora->single_linear2[si].lora_A) {
+                has_single_lora = 1;
+                break;
             }
         }
     }
 
-    /* Fall back to f32 GPU-chained path if bf16 path not used or failed */
-    if (!bf16_path_ok && iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap && !tf->ip) {
+    /* f32 GPU-chained single-block path (no-mmap only). Skipped when single-block
+     * LoRA is active so the CPU single_block_forward applies the adapter deltas. */
+    if (iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap && !tf->ip && !has_single_lora) {
         /* Create persistent GPU tensor for hidden state */
         concat_hidden_gpu = iris_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (concat_hidden_gpu) {
@@ -4289,7 +4202,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
     }
 
     /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
-    if (!bf16_path_ok && !gpu_chained_ok) {
+    if (!gpu_chained_ok) {
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand and free after use */
@@ -4299,8 +4212,11 @@ float *iris_transformer_forward(iris_transformer_t *tf,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
 #ifdef USE_METAL
-            /* Try GPU-optimized path first */
-            if (tf->ip != NULL ||
+            /* Try GPU-optimized path first. Skip it when this single block has an active
+             * LoRA adapter so the CPU single_block_forward applies the deltas. */
+            int blk_has_lora = (tf->lora && tf->lora->scale != 0.0f &&
+                (tf->lora->single_linear1[i].lora_A || tf->lora->single_linear2[i].lora_A));
+            if (tf->ip != NULL || blk_has_lora ||
                 !single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
@@ -4368,6 +4284,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
 
     float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output_nlc) { free(t_emb); return NULL; }
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
@@ -4376,6 +4293,7 @@ float *iris_transformer_forward(iris_transformer_t *tf,
      * Output: output[c * img_seq + pos]
      */
     float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output) { free(output_nlc); free(t_emb); return NULL; }
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
@@ -4617,11 +4535,13 @@ float *iris_transformer_forward_with_refs(iris_transformer_t *tf,
     free(img_hidden);
 
     float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output_nlc) { free(t_emb); return NULL; }
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
     /* Transpose output from NLC to NCHW */
     float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output) { free(output_nlc); free(t_emb); return NULL; }
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
@@ -4702,6 +4622,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) return NULL;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -4710,9 +4631,16 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
      * block's adaLN + final norm. NULL = off (default; bit-identical). */
     if (tf->csd_delta && !tf->csd_skip) { for (int i = 0; i < hidden; i++) t_emb[i] += tf->csd_delta[i]; }
 
-    /* Allocate combined RoPE arrays */
+    /* Allocate combined RoPE arrays. Recomputed per step (not cached like the single-ref
+     * get_cached_combined_rope): the multi-ref key is variable (num_refs + each ref h/w/t_offset)
+     * and the single-slot cache cannot represent it without header/struct changes and stale-cache
+     * risk, so caching is deliberately deferred. */
     float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
     float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    if (!combined_rope_cos || !combined_rope_sin) {
+        free(combined_rope_cos); free(combined_rope_sin); free(t_emb);
+        return NULL;
+    }
 
     /* Compute RoPE for target image (T=0) */
     compute_rope_2d(combined_rope_cos, combined_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
@@ -4738,7 +4666,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Transpose and concatenate all image latents */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
-    if (!combined_transposed) { free(t_emb); return NULL; }
+    if (!combined_transposed) { free(combined_rope_cos); free(combined_rope_sin); free(t_emb); return NULL; }
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4784,7 +4712,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
-    if (!combined_hidden) { free(t_emb); return NULL; }
+    if (!combined_hidden) { free(combined_transposed); free(combined_rope_cos); free(combined_rope_sin); free(t_emb); return NULL; }
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
     free(combined_transposed);
@@ -4826,7 +4754,7 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
 
     /* Concatenate for single blocks */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
-    if (!concat_hidden) { free(combined_hidden); free(t_emb); return NULL; }
+    if (!concat_hidden) { free(combined_hidden); free(combined_rope_cos); free(combined_rope_sin); free(t_emb); return NULL; }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
@@ -4871,11 +4799,13 @@ float *iris_transformer_forward_with_multi_refs(iris_transformer_t *tf,
     free(img_hidden);
 
     float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output_nlc) { free(t_emb); free(combined_rope_cos); free(combined_rope_sin); return NULL; }
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
     /* Transpose output from NLC to NCHW */
     float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    if (!output) { free(output_nlc); free(t_emb); free(combined_rope_cos); free(combined_rope_sin); return NULL; }
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
