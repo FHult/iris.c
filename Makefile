@@ -10,7 +10,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c embcache.c iris_lora.c iris_ip_adapter.c iris_csdmod.c
+SRCS = iris.c iris_kernels.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c embcache.c iris_lora.c iris_ip_adapter.c iris_csdmod.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = iris_cli.c linenoise.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
@@ -264,7 +264,6 @@ endif
 # =============================================================================
 iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h embcache.h iris_lora.h
 iris_kernels.o: iris_kernels.c iris_kernels.h
-iris_tokenizer.o: iris_tokenizer.c iris.h
 iris_vae.o: iris_vae.c iris.h iris_kernels.h
 iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h iris_lora.h
 iris_lora.o: iris_lora.c iris_lora.h iris_safetensors.h

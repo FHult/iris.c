@@ -182,41 +182,63 @@ float *iris_official_schedule(int num_steps, int image_seq_len) {
 }
 
 /*
- * Z-Image schedule: FlowMatchEulerDiscreteScheduler with static shift.
+ * Z-Image schedule: FlowMatch-Euler sigmas with a static (resolution-blind)
+ * shift; default shift = 3.0.
  *
- * Matches diffusers FlowMatchEulerDiscreteScheduler.set_timesteps()
- * for use_dynamic_shifting=False, invert_sigmas=False.
+ * Sigma construction (num_train_timesteps=1000):
+ *   1) linspace(sigma_max=1, sigma_min, num_steps), where sigma_min is the
+ *      shifted 1/1000 training sigma.
+ *   2) apply the static shift  s*x / (1 + (s-1)*x)  to each sigma.
+ *   3) append terminal sigma = 0.
+ * The Euler loop uses these directly: dt = sigma_next - sigma (negative for
+ * denoising); the transformer timestep = (1 - sigma), range [0, 1].
  *
- * Diffusers behavior (with num_train_timesteps=1000, shift=3.0):
- * 1) Build training sigmas from [1.0 .. 1/1000], then shift once.
- * 2) For inference, linspace from sigma_max to sigma_min (already shifted).
- * 3) Shift again.
- * 4) Append terminal sigma=0.
+ * SHIFT ARBITRATION (2026-07-30 — OPEN, behaviour intentionally UNCHANGED):
+ * The 3.0 here is a fixed, resolution-INDEPENDENT shift. The only concrete
+ * reference implementation present on this machine, mflux, instead uses a
+ * resolution-DEPENDENT (dynamic) shift for Z-Image-Turbo:
+ *   requires_sigma_shift=True, base_shift=0.5, max_shift=1.15,
+ *   base_seq_len=256, max_seq_len=4096, effective shift = exp(mu),
+ *   mu = slope*image_seq_len + b,  slope=(max_shift-base_shift)/(max-base seq),
+ *   b = base_shift - slope*base_seq_len.
+ * That gives shift ~= 3.16 @ 1024^2 and ~= 1.88 @ 512^2 (vs the flat 3.0 here),
+ * i.e. it matches this static value only near ~986^2 and diverges elsewhere.
+ * BUT the authoritative sources CLAUDE.md cites for static shift (official
+ * diffusers FlowMatchEulerDiscreteScheduler + the model's scheduler_config.json)
+ * are NOT installed, so static-vs-dynamic cannot be arbitrated from any file
+ * here. To avoid regressing the working Z-Image path, the default is left as a
+ * static 3.0; the shift is exposed via the IRIS_ZIMAGE_SHIFT env var for A/B
+ * experimentation (e.g. IRIS_ZIMAGE_SHIFT=3.16 to approximate mflux at 1024^2).
+ * Resolving this needs an authoritative diffusers/model-card golden.
  *
  * Returns array of num_steps+1 sigma values.
- * The sampling loop uses these as sigmas directly with Euler:
- *   dt = sigma_next - sigma (negative for denoising)
- *   The transformer timestep = (1 - sigma), range [0, 1]
  */
 float *iris_zimage_schedule(int num_steps, int image_seq_len) {
-    (void)image_seq_len;  /* Not used for static shift */
+    (void)image_seq_len;  /* static shift is resolution-blind; see header note */
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
     if (!schedule) return NULL;
-    const float shift = 3.0f;
+
+    /* Default static shift = 3.0, overridable via env for experimentation.
+     * Only a positive value overrides; anything else keeps the 3.0 default. */
+    float shift = 3.0f;
+    const char *shift_env = getenv("IRIS_ZIMAGE_SHIFT");
+    if (shift_env) {
+        float v = (float)atof(shift_env);
+        if (v > 0.0f) shift = v;
+    }
+
     const float sigma_max = 1.0f;
     const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
     const float sigma_min = shift * sigma_train_min /
                             (1.0f + (shift - 1.0f) * sigma_train_min);
 
-    /* Diffusers set_timesteps(): linspace(sigma_max, sigma_min, num_steps),
-     * then apply static shift one more time. */
+    /* linspace(sigma_max, sigma_min, num_steps), then apply the static shift. */
     for (int i = 0; i < num_steps; i++) {
         float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
         float raw = sigma_max + (sigma_min - sigma_max) * u;
         schedule[i] = shift * raw / (1.0f + (shift - 1.0f) * raw);
     }
-    /* Diffusers appends terminal sigma=0 (invert_sigmas=False). */
-    schedule[num_steps] = 0.0f;
+    schedule[num_steps] = 0.0f;  /* terminal sigma = 0 */
 
     return schedule;
 }

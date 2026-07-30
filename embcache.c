@@ -162,10 +162,12 @@ void emb_cache_init(void) {
     g_cache_initialized = 1;
 }
 
-/* Store quantized text embeddings keyed by prompt string.
- * If the prompt already exists, update its embedding in place and refresh
- * its LRU timestamp. Otherwise claim an empty slot or evict the LRU entry. */
-void emb_cache_store(const char *prompt, const float *embedding, int num_elements) {
+/* Store quantized text embeddings keyed by prompt string, recording the real
+ * (unpadded) token count. If the prompt already exists, update its embedding
+ * in place and refresh its LRU timestamp. Otherwise claim an empty slot or
+ * evict the LRU entry. seq_len <= 0 records "unknown". */
+void emb_cache_store_seq(const char *prompt, const float *embedding,
+                         int num_elements, int seq_len) {
     if (!prompt || !embedding || num_elements <= 0) return;
     if (!g_cache_initialized) emb_cache_init();
 
@@ -178,6 +180,7 @@ void emb_cache_store(const char *prompt, const float *embedding, int num_element
         emb_quantized_free(g_cache[i].emb);
         g_cache[i].emb       = emb_quantize_4bit(embedding, num_elements);
         g_cache[i].last_used = ++g_cache_clock;
+        g_cache[i].seq_len   = (seq_len > 0) ? seq_len : 0;
         if (!g_cache[i].emb) clear_slot(i);
         return;
     }
@@ -197,12 +200,17 @@ void emb_cache_store(const char *prompt, const float *embedding, int num_element
     g_cache[target].prompt    = strdup(prompt);
     g_cache[target].hash      = hash;
     g_cache[target].last_used = ++g_cache_clock;
+    g_cache[target].seq_len   = (seq_len > 0) ? seq_len : 0;
     g_cache[target].emb       = emb_quantize_4bit(embedding, num_elements);
     if (!g_cache[target].prompt || !g_cache[target].emb)
         clear_slot(target);
 }
 
-float *emb_cache_lookup_ex(const char *prompt, int *num_elements) {
+void emb_cache_store(const char *prompt, const float *embedding, int num_elements) {
+    emb_cache_store_seq(prompt, embedding, num_elements, 0);
+}
+
+float *emb_cache_lookup_seq(const char *prompt, int *num_elements, int *seq_len) {
     if (!prompt || !g_cache_initialized) return NULL;
 
     uint64_t hash = hash_string(prompt);
@@ -212,13 +220,18 @@ float *emb_cache_lookup_ex(const char *prompt, int *num_elements) {
         /* Hit — refresh LRU timestamp */
         g_cache[i].last_used = ++g_cache_clock;
         if (num_elements) *num_elements = g_cache[i].emb->num_elements;
+        if (seq_len) *seq_len = g_cache[i].seq_len;
         return emb_dequantize_4bit(g_cache[i].emb);
     }
     return NULL;
 }
 
+float *emb_cache_lookup_ex(const char *prompt, int *num_elements) {
+    return emb_cache_lookup_seq(prompt, num_elements, NULL);
+}
+
 float *emb_cache_lookup(const char *prompt) {
-    return emb_cache_lookup_ex(prompt, NULL);
+    return emb_cache_lookup_seq(prompt, NULL, NULL);
 }
 
 int emb_cache_has(const char *prompt) {
