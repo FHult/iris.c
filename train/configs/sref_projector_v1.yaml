@@ -25,4 +25,3 @@ training:
   weight_decay: 0.01
   checkpoint_every: 500
   checkpoint_dir: /Volumes/2TBSSD/checkpoints/sref_projector
-  guidance: 3.5                                # 4B base CFG guidance

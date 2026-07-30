@@ -135,10 +135,15 @@ def main():
         if step >= steps:
             break
 
-    if use_ema:
+    if use_ema and ema_n > 0:
         flux.update(ema)                                        # promote EMA = the exported weights
         mx.eval(flux.trainable_parameters())
-        print("  exporting EMA weights", flush=True)
+        print(f"  exporting EMA weights (EMA updated {ema_n}x)", flush=True)
+    elif use_ema:
+        # M5: EMA was seeded from the zero-init lora_B and never updated (steps < ema_update_every),
+        # so promoting it would export an INERT (zero-B) LoRA. Keep the live trained weights instead.
+        print(f"  EMA never updated (steps {steps} < ema_update_every {ema_every}); exporting the "
+              f"live trained weights instead of the zero-init EMA snapshot", flush=True)
     n = export_lora_diffusers(flux, args.out)
     print(f"EXPORTED {n} adapters -> {args.out}  (skipped {skipped} incomplete batches)", flush=True)
     print("TRAINDONE", flush=True)

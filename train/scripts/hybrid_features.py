@@ -82,7 +82,9 @@ def main() -> int:
     os.close(fd)
     packed.astype(np.float32).tofile(tmp)
     os.replace(tmp, out)
-    print(json.dumps({"out": str(out), "rows": TOKENS + 1, "dim": DIM, "csd_dim": CSD_DIM}))
+    # rows = actual packed row count: 730 normally, grid*grid+1 when --siglip-pool-grid pools the
+    # SigLIP tokens (mirrors dataset.py option-2 for train<->infer parity). Was hardcoded TOKENS+1.
+    print(json.dumps({"out": str(out), "rows": int(packed.shape[0]), "dim": DIM, "csd_dim": CSD_DIM}))
     return 0
 
 
