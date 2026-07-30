@@ -41,6 +41,7 @@ typedef struct {
     emb_quantized_t *emb;      /* Quantized embedding */
     uint64_t hash;             /* Hash of prompt for quick comparison */
     uint64_t last_used;        /* Logical timestamp for LRU eviction */
+    int seq_len;               /* Real (unpadded) token count; 0 = unknown/untracked */
 } emb_cache_entry_t;
 
 /* ========================================================================
@@ -63,8 +64,15 @@ void emb_quantized_free(emb_quantized_t *q);
 /* Initialize the embedding cache (call once at startup) */
 void emb_cache_init(void);
 
-/* Store embedding in cache for given prompt (takes ownership of embedding) */
+/* Store embedding in cache for given prompt (takes ownership of embedding).
+ * The real token count is recorded as unknown (0) — use emb_cache_store_seq
+ * when the caller tracks the unpadded sequence length (e.g. Z-Image). */
 void emb_cache_store(const char *prompt, const float *embedding, int num_elements);
+
+/* Store embedding together with its real (unpadded) token count.
+ * seq_len <= 0 records "unknown". */
+void emb_cache_store_seq(const char *prompt, const float *embedding,
+                         int num_elements, int seq_len);
 
 /* Lookup embedding for prompt. Returns dequantized embedding if found, NULL otherwise.
  * Caller must free the returned embedding. */
@@ -73,6 +81,11 @@ float *emb_cache_lookup(const char *prompt);
 /* Lookup embedding with element count metadata.
  * If found, sets *num_elements to total float elements in returned embedding. */
 float *emb_cache_lookup_ex(const char *prompt, int *num_elements);
+
+/* Lookup embedding with element count and real-token-count metadata.
+ * On a hit, sets *num_elements (if non-NULL) to total float elements and
+ * *seq_len (if non-NULL) to the stored real token count (0 if untracked). */
+float *emb_cache_lookup_seq(const char *prompt, int *num_elements, int *seq_len);
 
 /* Check if prompt is in cache without dequantizing */
 int emb_cache_has(const char *prompt);

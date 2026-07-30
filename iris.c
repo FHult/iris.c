@@ -29,16 +29,10 @@
  * Forward Declarations for Internal Types
  * ======================================================================== */
 
-typedef struct iris_tokenizer iris_tokenizer;
 typedef struct iris_vae iris_vae_t;
 typedef struct iris_transformer iris_transformer_t;
 
 /* Internal function declarations */
-extern iris_tokenizer *iris_tokenizer_load(const char *path);
-extern void iris_tokenizer_free(iris_tokenizer *tok);
-extern int *iris_tokenize(iris_tokenizer *tok, const char *text,
-                          int *num_tokens, int max_len);
-
 extern iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf);
 extern iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                                   int z_channels,
@@ -179,7 +173,6 @@ static float *iris_selected_zimage_schedule(const iris_params *p, int image_seq_
 
 struct iris_ctx {
     /* Components */
-    iris_tokenizer *tokenizer;
     qwen3_encoder_t *qwen3_encoder;
     iris_vae_t *vae;
     iris_transformer_t *transformer;
@@ -362,7 +355,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         }
         ctx->is_non_commercial = 0;  /* Z-Image is Apache 2.0 */
         ctx->num_heads = num_heads;
-        ctx->default_steps = 9;       /* 8 NFE = 9 scheduler steps */
+        ctx->default_steps = 8;       /* 8 NFE (schedule has num_steps+1 = 9 sigma values) */
         ctx->default_guidance = 0.0f; /* No CFG for Z-Image-Turbo */
         ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
         snprintf(ctx->model_name, sizeof(ctx->model_name),
@@ -428,7 +421,6 @@ iris_ctx *iris_load_dir(const char *model_dir) {
 void iris_free(iris_ctx *ctx) {
     if (!ctx) return;
 
-    iris_tokenizer_free(ctx->tokenizer);
     qwen3_encoder_free(ctx->qwen3_encoder);
     iris_vae_free(ctx->vae);
     iris_transformer_free(ctx->transformer);
@@ -715,11 +707,19 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     }
 
     /* Check embedding cache first */
-    float *cached = emb_cache_lookup(prompt);
+    int cached_seq_len = 0;
+    float *cached = emb_cache_lookup_seq(prompt, NULL, &cached_seq_len);
     if (cached) {
         if (iris_phase_callback) iris_phase_callback("encoding text (cached)", 0);
         if (iris_phase_callback) iris_phase_callback("encoding text (cached)", 1);
-        *out_seq_len = QWEN3_MAX_SEQ_LEN;
+        /* Z-Image needs the real (unpadded) caption length: a padded 512 would
+         * change caption RoPE/attention, so a cached repeat would render
+         * differently than the first (uncached) run. Fall back to the padded
+         * length only when the entry predates seq-len tracking (<=0). */
+        if (ctx->is_zimage && cached_seq_len > 0)
+            *out_seq_len = cached_seq_len;
+        else
+            *out_seq_len = QWEN3_MAX_SEQ_LEN;
         return cached;
     }
 
@@ -756,10 +756,12 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
                                                &num_real_tokens);
     if (iris_phase_callback) iris_phase_callback("encoding text", 1);
 
-    /* Store in cache for future lookups */
+    /* Store in cache for future lookups. Record the real (unpadded) token
+     * count so a later cache hit can restore the Z-Image caption length. */
     if (embeddings) {
-        emb_cache_store(prompt, embeddings,
-                        QWEN3_MAX_SEQ_LEN * ctx->text_dim);
+        emb_cache_store_seq(prompt, embeddings,
+                            QWEN3_MAX_SEQ_LEN * ctx->text_dim,
+                            num_real_tokens);
     }
 
     if (ctx->is_zimage) {

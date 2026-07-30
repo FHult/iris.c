@@ -1622,7 +1622,13 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
         goto error;
     }
 
-    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
+    /* Close and null each handle so the shared error: path (which closes
+     * files[] again) is idempotent — otherwise a failure in the RoPE/work-buffer
+     * allocation below double-frees these safetensors handles. */
+    for (int i = 0; i < num_files; i++) {
+        safetensors_close(files[i]);
+        files[i] = NULL;
+    }
 
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;

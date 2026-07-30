@@ -1518,7 +1518,7 @@ int main(int argc, char *argv[]) {
     /* Resolve auto-parameters now that we know the model type */
     if (!steps_set || params.num_steps <= 0) {
         if (iris_is_zimage(ctx))
-            params.num_steps = 9;  /* Z-Image-Turbo: 9 scheduler steps (8 NFE) */
+            params.num_steps = 8;  /* Z-Image-Turbo: 8 NFE (schedule has 8+1 = 9 sigma values) */
         else
             params.num_steps = iris_is_distilled(ctx) ? 4 : 50;
     }
