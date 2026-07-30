@@ -86,6 +86,18 @@ This project implements three targets:
   corrected assumption), write it to `BACKLOG.md` (or `BUGS.md` for defects) immediately — with
   numbers and the date — rather than only reporting it in chat. Mark superseded entries rather
   than deleting them; keep the trail. The backlog is the durable record of what we know.
+- **Metadata stores are the source of truth — READ them first, UPDATE them after any scan.**
+  Never re-derive facts by walking the filesystem (enumerating cold `.npz` dirs, `tar tf` over
+  shards, `ls` on million-file dirs) when a metadata store can hold the answer — cold-HDD scans cost
+  minutes-to-hours and recur. Before investigating, query the stores: precompute **manifests**
+  (`manifest.json`: `complete`, `record_count`, `shard_count`), `shard_scores.db` (`shards`:
+  `n_images`, `source`, scores + the `precompute_coverage` table for per-shard/per-encoder record
+  counts), and the doctor (`pipeline_doctor.py --ai`). Whenever a scan IS unavoidable (a coverage
+  audit, an `n_images` recount, a per-shard precompute census), **persist the result to the sqlite
+  store in the same pass** (upsert into `shards` / `precompute_coverage`; run `shard_index.py` for
+  the index) so the next session reads it instantly. A scan whose output only lands in chat is a
+  bug — it guarantees the expensive investigation repeats. Keep hot and cold `shard_scores.db` copies
+  consistent (cold is authoritative; sync the hot working copy).
 
 # Training→Inference Correctness Protocol (mandatory for the train↔infer boundary)
 

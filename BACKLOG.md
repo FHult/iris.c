@@ -4,6 +4,50 @@ Completed items are archived in [COMPLETED_BACKLOG.md](COMPLETED_BACKLOG.md).
 
 ---
 
+## Foundation Quality — Phase A progress
+
+**A1 — VAE precompute CLOSED (2026-07-29).** The doctor's long-standing "VAE `v_2232c1` incomplete"
+(the roadmap's one real data-foundation gap) was NOT missing data. The cold cache held **1,154,314
+npz latents / 936 shards** — one MORE than the complete qwen3 cache (1,154,313), same precompute run
+(git_sha `6333e24f`), identical filenames in identical order — but the build was interrupted before
+`mark_complete`, so the manifest stayed `complete:false` with no `record_count` (hence the doctor's
+`records:null` — a manifest artifact, never a data count). Fixed with
+`PrecomputeCache.mark_complete(record_count=1154314, shard_count=936)` behind guards (version hash
+reconstructs to `v_2232c1`; count > 1.1M sanity). **No GPU, no re-encode, no shard staging.** Verified:
+`cache_manager.py list vae` → `complete=True records=1154314`; doctor `cold_precompute.vae` →
+`complete:true`. Notes: (a) there is **no `cache_manager.py --verify`** (only `list`/`consolidate`) —
+the roadmap's stated verify command was wrong, now corrected. (b) `mark_complete` overwrites
+`created_at` with now — but qwen3/siglip show the same (created_at ≈ completed_at), so it's the
+convention, not a regression. (c) The remaining 3 "current version incomplete" doctor warnings are the
+HOT ~522k-record staged **subsets** (Phase A2, cosmetic) — intentional partial working copies, NOT the
+full 1.15M universe; do not blindly mark them complete.
+
+**Coverage caveat (do NOT read A1 as "the corpus is precomputed").** `mark_complete` means "this run
+finished the work it was configured to do," NOT "covers all shards/images." All three encoders cover
+the SAME subset: ~935–945 of the **1,280**-shard corpus (~344 shards have NO precompute) and ~1.15M
+records — roughly **18% of the ~6.4M documented corpus images** (~1,233 records/covered-shard vs
+~5,000 nominal ⇒ the covered shards are also SUBSAMPLED, consistent with the `--subsample-per-shard`
+lever, DP-2c). So A1 fixed a manifest bug and made VAE consistent with qwen3/siglip; it did NOT do
+full-corpus precompute. Full-shard / full-image (and the 768/1024px re-encode) is the separate
+data-SCALE work — roadmap Phase 3 / A3 — a real multi-day GPU + hot-staging job for ALL THREE encoders,
+still open.
+
+**ZIMAGE-SCHED-1 (open, needs authoritative golden) — Z-Image scheduler shift resolution-dependence.**
+Review 2026-07-30 (H2): the C FlowMatch scheduler uses a resolution-blind static `shift=3.0`
+(`iris_sample.c:201-222`). The only reference implementation on this machine, mflux, uses a
+resolution-DEPENDENT shift for Z-Image-Turbo (`base_shift=0.5, max_shift=1.15, base/max_seq_len
+256/4096`; effective ≈3.16 @1024², ≈1.88 @512²) — never a flat 3.0; symptom is a wasted near-zero
+final step at high res (penultimate sigma 0.0089 vs ~0.31 @1024²/8-step). CLAUDE.md asserts static is
+the OFFICIAL-diffusers behavior, but official diffusers + the model's `scheduler_config.json` are
+ABSENT from the machine (confirmed by a machine-wide scan), so it cannot be arbitrated. **Not changed**
+(regressing a working path on an unconfirmed reference is worse); a `IRIS_ZIMAGE_SHIFT` env override was
+added (default 3.0, behavior unchanged). **To close:** obtain the official Z-Image-Turbo diffusers
+scheduler config / model card, confirm `use_dynamic_shifting`, and only then switch + add a Z-Image
+scheduler golden fixture (MISSING — the whole Z-Image path is unguarded by `make test`). Also fixes the
+documented default-steps off-by-one (M1, 9→8) shipped in the same change. Cross-ref: review-2026-07-30.
+
+---
+
 ## Training Development Lessons
 
 Lessons crystallised from the TRAIN-6 / Option C development cycle (2026-05-13).
@@ -2361,6 +2405,22 @@ needs a restart. See `plans/quality-loop-v3.21-migration.md` §7–8.
 
 - **BL-004: simdgroup_matrix for Custom GEMM Tiles** — M3+ only
 - **BL-005: Native bfloat MSL Type** — M3+ only
+- **BL-009: GPU-fused single-block LoRA — restore block fusion under an active adapter (P3, speed).**
+  Context: the single-block-LoRA-dropped-on-Metal bug (review 2026-07-30, H1) was fixed *conservatively*
+  by routing single blocks to the C-orchestrated `single_block_forward` whenever a single-block adapter
+  is active (mirrors how double blocks already behaved under LoRA). That path still runs every GEMM +
+  attention on the GPU (`iris_linear`/`iris_matmul` → `iris_metal_sgemm`; `mha_forward` → SDPA) — it is
+  NOT a CPU fallback — but it loses the fully-fused `single_block_forward_gpu` kernel's on-GPU residency,
+  so a LoRA/SREF generation pays extra CPU↔GPU dispatch+readback across the ~20–24 single blocks each
+  step vs a no-LoRA run. Correctness is unaffected; only LoRA/SREF latency (the app's Style Library /
+  Learned Style path). **Optimization:** apply the LoRA delta `A·Bᵀ·scale` directly inside the fused GPU
+  single-block kernel (an extra GPU matmul or a fused epilogue) so LoRA generation keeps the fused path.
+  Caveat: won't be bit-exact vs the CPU reference (f32 delta vs bf16 GEMM rounding) — needs its own
+  tolerance-based parity check, not the exact `test_lora.c` guard. Only worth building if LoRA/SREF
+  inference latency becomes a product concern. Note: the old hard-disabled `if (0 && …)` bf16 single-block
+  inject block was REMOVED in the H1 cleanup, so **HW-M5-4's "re-enable the bf16 GPU inject" premise is
+  now "implement it fresh"** — update that item's file:line when this lands. Cross-refs: HW-M5-4, BL-004,
+  BL-005, review-2026-07-30 H1.
 
 ### Metal Kernel Audit (Grok, 2026-05) — Triaged / mostly SUPERSEDED (2026-07-20)
 

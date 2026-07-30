@@ -58,8 +58,14 @@ cold build:
 ### Phase A — Complete & verify the data foundation (prerequisite; ~days, precompute-bound)
 Goal: a single, complete, verified precompute set at the training resolution so no campaign silently
 skips samples (the cache-miss "dies at step 0" class — CLAUDE.md invariant #1/#6).
-- **A1. Finish the VAE precompute** (`v_2232c1` is incomplete). Run `precompute_all.py --vae-output`
-  over the full shard set; verify with `cache_manager.py --verify`. This is the gating data gap.
+- **A1. Finish the VAE precompute** — ✅ DONE 2026-07-29 (manifest finalize, NOT a re-encode).
+  `v_2232c1` was data-complete (1,154,314 npz / 936 shards, same run as the complete qwen3 cache) but
+  its manifest was stuck at `complete:false` because the build was interrupted before `mark_complete`.
+  Fixed via `PrecomputeCache.mark_complete`. NOTE: this covers only the ~936-shard / ~1.15M-record
+  precomputed SUBSET (~18% of the ~6.4M-image corpus, uneven per shard) — full-corpus coverage is the
+  separate data-SCALE work below. Verify with `cache_manager.py list vae` + `pipeline_doctor --ai`
+  (`cold_precompute.vae`); there is NO `cache_manager.py --verify` subcommand. Per-shard coverage now
+  lives in the `precompute_coverage` table (`train/scripts/precompute_coverage.py query`).
 - **A2. Write correct `manifest.json`s** for the hot subset versions (the 3 cosmetic doctor warnings)
   so completeness is machine-checkable. Small.
 - **A3. Decide the training resolution's precompute strategy.** 512px latents exist; 768/1024px need
@@ -122,7 +128,8 @@ Goal: the highest-quality adapters the hardware supports, packaged for release.
 ## Concrete first actions (in order)
 
 1. `pipeline_doctor --ai` → confirm the exact precompute completeness state (VAE gap).
-2. **A1:** finish the VAE precompute over the full shard set; `cache_manager.py --verify`.
+2. **A1:** ✅ done — VAE manifest finalized (`PrecomputeCache.mark_complete`); verify with
+   `cache_manager.py list vae` (no `--verify` subcommand exists).
 3. Write `stage2_768px.yaml` (from `stage1_512px.yaml` + `bucket:[768,768]`) and precompute a 768px
    VAE set for a curated ~120-shard subset (the long pole — consider the proxy-VAE first).
 4. **B3 smoke** the 768px SREF recipe (100 steps) → confirm ~19 GB / step time vs TRAIN-7.
