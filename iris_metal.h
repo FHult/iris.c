@@ -120,19 +120,6 @@ int iris_metal_conv2d(float *out, const float *in,
                       int stride, int padding);
 
 /*
- * Batch matrix multiplication on GPU.
- * Performs batch_count independent matrix multiplications.
- */
-void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
-                            int M, int N, int K,
-                            float alpha,
-                            const float *A, int lda, int stride_a,
-                            const float *B, int ldb, int stride_b,
-                            float beta,
-                            float *C, int ldc, int stride_c,
-                            int batch_count);
-
-/*
  * Synchronize GPU operations (wait for completion).
  */
 void iris_metal_sync(void);
@@ -628,18 +615,6 @@ void iris_metal_attention(float *out,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
-
-/*
- * Half-precision version of iris_metal_attention.
- * Same interface but uses f16 MPS matmuls internally for ~2x bandwidth savings.
- * Takes f32 inputs, converts to f16, computes attention, converts back to f32.
- * scores_scratch is unused (kept for interface compatibility).
- */
-void iris_metal_attention_bf16(float *out,
-                               const float *Q, const float *K, const float *V,
-                               float *scores_scratch,
-                               int heads, int seq_q, int seq_k, int head_dim,
-                               float scale);
 
 /*
  * GPU-accelerated causal attention for text encoder (Qwen3).
