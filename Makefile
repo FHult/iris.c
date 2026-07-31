@@ -21,7 +21,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test test-unit test-quick test-ci check-untested web-tests pngtest help generic blas mps
+.PHONY: all clean debug lib install info test test-unit test-parity test-quick test-ci check-untested web-tests pngtest help generic blas mps
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -42,6 +42,7 @@ endif
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make test     - Run inference test"
+	@echo "  make test-parity - Real-weights parity scaffolds (skip w/o weights)"
 	@echo "  make pngtest  - Compare PNG load on compressed image"
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
@@ -199,6 +200,10 @@ test-unit:
 	@$(CC) -O2 -I. -o /tmp/flux_test_config debug/test_config_parse.c -lm
 	@/tmp/flux_test_config
 	@rm -f /tmp/flux_test_config
+	@echo "=== Z-Image scheduler golden tests (hermetic; links real iris_sample.c) ==="
+	@$(CC) -O2 -I. -Wl,-dead_strip -o /tmp/flux_test_zimage_scheduler debug/test_zimage_scheduler.c iris_sample.c -lm
+	@/tmp/flux_test_zimage_scheduler
+	@rm -f /tmp/flux_test_zimage_scheduler
 	@echo "=== Safetensors parser tests ==="
 	@$(CC) -O2 -I. -o /tmp/flux_test_st debug/test_safetensors.c iris_safetensors.c -lm
 	@/tmp/flux_test_st
@@ -220,6 +225,33 @@ test-unit:
 	@echo "PNG TEST PASSED"
 	@echo ""
 	@echo "All unit tests passed."
+
+# Real-weights / GPU parity SCAFFOLDS for the train<->infer & reference boundaries.
+# These CANNOT run in a clean checkout (no Flux/Z-Image weights, no flux_env/mflux).
+# Each scaffold SKIPS gracefully (exit 0) with a clear message and the fixture
+# contract needed to enable it; NONE of them fake a pass. See each debug/*.c/.py
+# header. Wired as a separate on-demand target (NOT part of `make test`), because
+# a green run here means "skipped cleanly", not "parity verified".
+test-parity:
+	@echo "=== Flux base-forward parity (C vs mflux) — scaffold ==="
+	@$(CC) -O2 -I. -o /tmp/iris_test_flux_forward_parity debug/test_flux_forward_parity.c -lm
+	@/tmp/iris_test_flux_forward_parity; rm -f /tmp/iris_test_flux_forward_parity
+	@echo "=== Qwen3 layer-extraction (8/17/26) parity — scaffold ==="
+	@$(CC) -O2 -I. -o /tmp/iris_test_qwen3_extract_parity debug/test_qwen3_extract_parity.c -lm
+	@/tmp/iris_test_qwen3_extract_parity; rm -f /tmp/iris_test_qwen3_extract_parity
+	@echo "=== SigLIP/CSD producer parity (inference producer vs training cache) — scaffold ==="
+	@if [ -x train/.venv/bin/python ]; then \
+		train/.venv/bin/python debug/test_siglip_csd_parity.py; \
+	else \
+		python3 debug/test_siglip_csd_parity.py || \
+		echo "SKIP siglip/csd-producer-parity: no train/.venv and system python3 lacks deps."; \
+	fi
+	@echo "=== Z-Image transformer/RoPE parity — scaffold (BLOCKED: no Z-Image model) ==="
+	@$(CC) -O2 -I. -o /tmp/iris_test_zimage_transformer_parity debug/test_zimage_transformer_parity.c -lm
+	@/tmp/iris_test_zimage_transformer_parity; rm -f /tmp/iris_test_zimage_transformer_parity
+	@echo ""
+	@echo "Parity scaffolds ran. 'SKIP' = prerequisite absent (expected in a clean"
+	@echo "checkout); only 'FAIL' indicates a real parity regression."
 
 pngtest:
 	@echo "Running PNG compression compare test..."

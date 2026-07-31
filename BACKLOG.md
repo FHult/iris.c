@@ -46,6 +46,20 @@ scheduler config / model card, confirm `use_dynamic_shifting`, and only then swi
 scheduler golden fixture (MISSING — the whole Z-Image path is unguarded by `make test`). Also fixes the
 documented default-steps off-by-one (M1, 9→8) shipped in the same change. Cross-ref: review-2026-07-30.
 
+UPDATE 2026-07-31 — hermetic scheduler guard now EXISTS (`debug/test_zimage_scheduler.c`, wired into
+`make test-unit`; links the real `iris_zimage_schedule` via `-Wl,-dead_strip`, 13/13 PASS under both
+-O2 and full production flags). It pins: M1 (8 NFE ⇒ 9 sigmas, sigma[8]=0, strictly decreasing); an
+EXACT sigma snapshot under the current static shift=3.0 at 512²/1024² — which are BYTE-IDENTICAL because
+the shift is resolution-blind (the array asserts this identity deliberately, so switching to a
+resolution-dependent shift will trip it); and the `IRIS_ZIMAGE_SHIFT` override (default/garbage ⇒ 3.0).
+Snapshot @shift=3.0: [1.0, 0.94754249, 0.88278770, 0.80083734, 0.69379306, 0.54804564, 0.33797211,
+0.00892854, 0.0]; penultimate 0.00892854 matches the documented near-zero final step. IMPORTANT: this
+encodes CURRENT (unresolved-H2) behavior, NOT a claim of official-correctness — when H2 is closed with an
+authoritative golden, this snapshot must be replaced (and the 512²==1024² assertion removed) alongside the
+switch. The real-weights parity boundaries (Flux forward vs mflux, Qwen3 8/17/26 extraction, SigLIP/CSD
+producer) now have skip-scaffolds under `make test-parity`; the Z-Image transformer/RoPE golden remains
+BLOCKED (no Z-Image model on this machine — `debug/test_zimage_transformer_parity.c` skips with that reason).
+
 ---
 
 ## Training Development Lessons
