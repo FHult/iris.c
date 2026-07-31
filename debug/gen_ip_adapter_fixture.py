@@ -142,6 +142,73 @@ def _dump_goldens(model, out, suffix, siglip, img_q):
     return float(ip_embeds.std()), float(contrib.std())
 
 
+# ── Per-block IP-injection propagation golden (M3 parity guard) ──────────────────────────────
+# The existing goldens above test each IP stage in ISOLATION at block 0. They do NOT test that a
+# block's IP contribution PROPAGATES: C inference (iris_transformer_flux.c) injects k_ip/v_ip PER
+# BLOCK into the post-block hidden state, so block i+1 derives its image-Q from a state that
+# already carries block i's injection. This mirrors the Python `use_block_injection=True` path
+# (_flux_forward_with_ip). The DEFAULT trainer path (_pred_from_embeds, use_block_injection=False)
+# is an APPROXIMATION: every block's Q comes from the IP-free hidden and contributions are summed
+# ONCE at the end — a different result. This fixture guards the CORRECT per-block-injected forward.
+#
+# Hermetic: no Flux weights. The frozen-Flux per-block transform is stood in by identity, and the
+# image-Q is derived by a per-head RMSNorm (head_dim=128, the Flux invariant) of the CURRENT
+# hidden — the minimal op that makes Q depend on accumulated injections (so propagation is
+# actually exercised). The IP math itself (perceive / get_kv / inject SDPA + per-block scale) is
+# the REAL parity surface, computed by the same model methods the C functions mirror.
+BP_EPS = 1e-6
+
+
+def _derive_q(h, gamma):
+    """Per-head RMSNorm(head_dim=128) of the current image hidden → [1, HEADS, S, HEAD_DIM].
+    Stand-in for the block's post-QK-norm PRE-RoPE image-Q; makes Q depend on the accumulated
+    hidden so the per-block injection propagation is testable. Mirrored bit-for-bit in C."""
+    S = h.shape[1]
+    qh = h.reshape(1, S, HEADS, HEAD_DIM)
+    ms = mx.mean(qh * qh, axis=-1, keepdims=True)
+    qn = qh * mx.rsqrt(ms + BP_EPS) * gamma          # gamma broadcasts over HEAD_DIM
+    return qn.transpose(0, 2, 1, 3)                  # [1, HEADS, S, HEAD_DIM]
+
+
+def _forward_block_injected(model, ip_embeds, h0, gamma):
+    """Correct per-block-injected forward (matches C + use_block_injection=True):
+    h_{i+1} = h_i + scale[i] * SDPA(derive_q(h_i), k_i, v_i)  — Q sees earlier injections."""
+    k_all, v_all = model.get_kv_all(ip_embeds)
+    h = h0
+    for i in range(model.num_blocks):
+        q4 = _derive_q(h, gamma)
+        h = h + model.inject(q4, k_all[:, i], v_all[:, i], i)   # inject() applies scale[i]
+    return h
+
+
+def _forward_end_sum(model, ip_embeds, h0, gamma):
+    """The use_block_injection=False APPROXIMATION (negative control): every block's Q comes
+    from the IP-free initial hidden and contributions are summed ONCE. Must differ from the
+    per-block forward, else the fixture would not discriminate a regression to end-sum."""
+    k_all, v_all = model.get_kv_all(ip_embeds)
+    q4 = _derive_q(h0, gamma)                          # ALL blocks reuse the initial Q
+    ip_total = mx.zeros_like(h0)
+    for i in range(model.num_blocks):
+        ip_total = ip_total + model.inject(q4, k_all[:, i], v_all[:, i], i)
+    return h0 + ip_total
+
+
+def _dump_block_prop(model, out, siglip, img_q_flat, gamma_np):
+    ip_embeds = model.get_image_embeds(siglip)
+    gamma = mx.array(gamma_np.astype(np.float32))
+    h0 = img_q_flat[None]                              # [1, IMG_SEQ, HIDDEN]
+    h_perblock = _forward_block_injected(model, ip_embeds, h0, gamma)
+    h_endsum   = _forward_end_sum(model, ip_embeds, h0, gamma)
+    mx.eval(h_perblock, h_endsum)
+    _save(h_perblock, out / "gold_blockprop.bin")
+    # Discrimination: prove the fixture would CATCH a regression to the end-sum approximation.
+    diff = float(mx.linalg.norm(h_perblock - h_endsum))
+    base = float(mx.linalg.norm(h_perblock))
+    rel = diff / max(base, 1e-9)
+    assert rel > 0.01, f"block-injection vs end-sum differ by only {rel:.4%} — fixture too weak"
+    return float(h_perblock.std()), rel
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "debug" / "fixtures" / "ip_adapter"))
@@ -240,6 +307,37 @@ def main() -> int:
         es, cs = _dump_goldens(hyb_model, out, "_hybrid", hyb_feat, img_q_flat)
         print(f"  hybrid  : ip_embeds std={es:.4f}  contrib std={cs:.4f}")
 
+    # ── Block-injection propagation fixture (M3): siglip perceiver, RANDOMISED per-block scale ──
+    #    (so the per-block scale application/indexing is guarded, not a constant), ≥3 blocks
+    #    (N_BLOCKS=5) so propagation across blocks is exercised. Uses its OWN small initial hidden
+    #    and boosted scales so each block's injection meaningfully rotates the propagated image-Q
+    #    — otherwise (h0≈unit, injection≪h0) per-head RMSNorm makes per-block ≈ end-sum and the
+    #    fixture cannot discriminate the two forwards.
+    mx.random.seed(9182)
+    bp_model = IPAdapterKlein(num_blocks=N_BLOCKS, hidden_dim=HIDDEN,
+                              num_image_tokens=N_TOKENS, siglip_dim=SIGLIP_DIM,
+                              perceiver_heads=PERCEIVER_HEADS, num_double_blocks=N_DOUBLE)
+    # Distinct per-block scale (default ip_scale_init makes all blocks 1.0 → indexing untested).
+    bp_scale = mx.random.uniform(low=1.5, high=4.0, shape=(N_BLOCKS,))
+    bp_model.update(tree_unflatten([("scale", bp_scale)]))
+    mx.eval(bp_model.parameters())
+    # gamma: per-head RMSNorm weight (RMSNorm inits to ones → randomise so it is exercised).
+    gamma_np = (1.0 + np.random.default_rng(9182).normal(size=(HEAD_DIM,)) * 0.2).astype(np.float32)
+    _save(gamma_np, out / "in_blockprop_gamma.bin")
+    # Small initial hidden so per-block injections dominate the propagated Q direction.
+    bp_h0 = mx.random.normal((IMG_SEQ, HIDDEN)) * 0.1
+    mx.eval(bp_h0)
+    _save(bp_h0, out / "in_blockprop_h0.bin")
+    flat_bp = dict(tree_flatten(bp_model.parameters()))
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = Path(td) / "step_0000001.safetensors"
+        mx.save_safetensors(str(ckpt), flat_bp)
+        bdir = out / "bundle_blockprop"
+        _export(ckpt, bdir, "float16")
+        _reload_from_bundle(bp_model, bdir)
+        hs, rel = _dump_block_prop(bp_model, out, siglip, bp_h0, gamma_np)
+        print(f"  blockprop: h_final std={hs:.4f}  perblock-vs-endsum rel-diff={rel:.2%}")
+
     shapes = {
         "hidden": HIDDEN, "heads": HEADS, "head_dim": HEAD_DIM,
         "perceiver_heads": PERCEIVER_HEADS,
@@ -261,6 +359,12 @@ def main() -> int:
         "gold_k_ip_b0_hybrid": [1, 2 * N_TOKENS, HIDDEN],
         "gold_v_ip_b0_hybrid": [1, 2 * N_TOKENS, HIDDEN],
         "gold_inject_b0_hybrid": [1, IMG_SEQ, HIDDEN],
+        # Block-injection propagation (M3): per-head RMSNorm derive_q, per-block inject over
+        # N_BLOCKS, gamma = [HEAD_DIM] RMSNorm weight, golden = final hidden [1, IMG_SEQ, HIDDEN].
+        "blockprop_eps": BP_EPS,
+        "in_blockprop_gamma": [HEAD_DIM],
+        "in_blockprop_h0": [IMG_SEQ, HIDDEN],
+        "gold_blockprop": [1, IMG_SEQ, HIDDEN],
     }
     (out / "shapes.json").write_text(json.dumps(shapes, indent=2))
     print(f"wrote fixtures + bundle to {out}")

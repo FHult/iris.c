@@ -60,6 +60,29 @@ switch. The real-weights parity boundaries (Flux forward vs mflux, Qwen3 8/17/26
 producer) now have skip-scaffolds under `make test-parity`; the Z-Image transformer/RoPE golden remains
 BLOCKED (no Z-Image model on this machine — `debug/test_zimage_transformer_parity.c` skips with that reason).
 
+**M3 (VERIFIED FAITHFUL + GUARDED, 2026-07-31) — IP-adapter per-block injection train↔infer parity.**
+Review 2026-07-30 flagged that the DEFAULT trainer path `_pred_from_embeds`
+(`train/train_ip_adapter.py`, `use_block_injection=False`) is an APPROXIMATION of C inference: it sums
+all blocks' IP-attention outputs into `h_final` ONCE before `norm_out`/`proj_out`, deriving every
+block's image-Q from the IP-FREE hidden — whereas C (`iris_transformer_flux.c`) injects k_ip/v_ip PER
+BLOCK into the post-block hidden, so block i+1's Q sees block i's injection. **Source audit of the
+alternative `use_block_injection=True` path (`_flux_forward_with_ip`) vs C: CONFIRMED FAITHFUL** on all
+five axes — (1) injection point = post-block hidden (double: end of block; single: image rows of
+[txt|img]); (2) propagation = each block's input carries prior injections; (3) k_ip/v_ip = `ip_embeds @
+to_{k,v}_ip_stacked[i]` (einsum `btd,de`), reshaped to heads=hidden/128; (4) image-Q = post-QK-norm,
+PRE-RoPE (both sides skip RoPE — SigLIP K/V are position-free); (5) per-block scale `scale[i]`, flat
+index (double `0..nd-1`, single `nd+j`). So **enabling `use_block_injection=True` is train↔infer-CORRECT**
+(safe from a parity standpoint) — its only cost is the ~4.7× slower training already documented, a
+separate paid decision. Left OFF as instructed. New hermetic guard: `bundle_blockprop` +
+`gold_blockprop.bin` in `debug/gen_ip_adapter_fixture.py` and `run_block_prop()` in
+`debug/test_ip_adapter.c` (wired via `make test-unit`) reproduce the per-block-injected forward over 5
+blocks with randomised per-block scale and a per-head-RMSNorm derive_q (so Q depends on accumulated
+injections). Parity corr=1.000000 / max_abs=6e-5 (5e-5 under production `-ffast-math -O3 -flto` flags —
+noise, not mismatch). The generator asserts the per-block vs end-sum forwards differ by 20.5% (>1%), so
+a regression to the end-sum approximation would fail the fixture. NOTE: the `_pred_from_embeds` default
+itself is unchanged — it remains the fast (approximate) training path; this work only VERIFIED the
+correct path and added the regression guard. Cross-ref: review-2026-07-30, IP-ADAPTER-INFER-1.
+
 ---
 
 ## Training Development Lessons
