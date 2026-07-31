@@ -90,5 +90,18 @@
     1,
     12,
     256
+  ],
+  "blockprop_eps": 1e-06,
+  "in_blockprop_gamma": [
+    128
+  ],
+  "in_blockprop_h0": [
+    12,
+    256
+  ],
+  "gold_blockprop": [
+    1,
+    12,
+    256
   ]
 }

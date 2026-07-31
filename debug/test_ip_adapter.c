@@ -195,6 +195,64 @@ static void run_hybrid_bundle(const float *img_q) {
     iris_ip_adapter_free(a);
 }
 
+/* Per-block IP-injection propagation parity (M3, review 2026-07-30). The stages above test each
+ * IP op in ISOLATION at block 0; they do NOT test that a block's injection PROPAGATES. C inference
+ * (iris_transformer_flux.c) injects k_ip/v_ip into the post-block hidden PER BLOCK, so block i+1
+ * derives its image-Q from a state that already carries block i's injection — matching the Python
+ * `use_block_injection=True` path (_flux_forward_with_ip). This reproduces that CORRECT per-block-
+ * injected forward and guards: propagation across ≥3 blocks, per-block scale application, and the
+ * flat per-block index mapping (double 0..nd-1, single nd+j). derive_q = per-head RMSNorm
+ * (head_dim=128, the Flux invariant) of the CURRENT hidden — stands in for the block's post-QK-norm
+ * PRE-RoPE image-Q and makes Q depend on accumulated injections. Mirrors gen_ip_adapter_fixture.py
+ * _derive_q / _forward_block_injected bit-for-bit. Tight 1e-3 tolerance. */
+#define BP_EPS 1e-6f
+static void run_block_prop(const float *siglip) {
+    const char *bundle = FIX "/bundle_blockprop";
+    printf("--- block-injection propagation (M3) (%s) ---\n", bundle);
+    iris_ip_adapter_t *a = iris_ip_adapter_load(bundle);
+    if (!a) { fprintf(stderr, "FAIL load %s\n", bundle); failures++; return; }
+    int H = a->hidden_dim, T = a->num_image_tokens, NB = a->num_blocks;
+    int hd = 128, heads = H / hd, S = IMG_SEQ;
+    int meta_ok = (H == HID && T == TOK && NB == 5 && a->perceiver_heads == PHEADS);
+    printf("meta dims  blocks=%d pheads=%d %s\n", NB, a->perceiver_heads, meta_ok ? "PASS" : "FAIL");
+    meta_ok ? passes++ : failures++;
+
+    float *gamma = load_bin(FIX "/in_blockprop_gamma.bin", (long)hd);
+    float *h0    = load_bin(FIX "/in_blockprop_h0.bin", (long)S * H);
+    float *gold  = load_bin(FIX "/gold_blockprop.bin", (long)S * H);
+    if (!gamma || !h0 || !gold) { failures++; return; }
+
+    float *ip = malloc((size_t)T * H * sizeof(float));
+    iris_ip_adapter_perceive(a, siglip, SIG_SEQ, ip);
+
+    float *h = malloc((size_t)S * H * sizeof(float));
+    memcpy(h, h0, (size_t)S * H * sizeof(float));
+    float *q = malloc((size_t)S * H * sizeof(float));
+    float *k = malloc((size_t)T * H * sizeof(float));
+    float *v = malloc((size_t)T * H * sizeof(float));
+
+    for (int i = 0; i < NB; i++) {
+        /* derive_q: per-head RMSNorm(head_dim) of the CURRENT hidden (carries injections 0..i-1) */
+        for (int s = 0; s < S; s++)
+            for (int hh = 0; hh < heads; hh++) {
+                const float *xin = h + (size_t)s * H + hh * hd;
+                float *xout = q + (size_t)s * H + hh * hd;
+                float ss = 0.0f;
+                for (int d = 0; d < hd; d++) ss += xin[d] * xin[d];
+                float inv = 1.0f / sqrtf(ss / (float)hd + BP_EPS);
+                for (int d = 0; d < hd; d++) xout[d] = xin[d] * inv * gamma[d];
+            }
+        iris_ip_adapter_get_kv(a, i, ip, k, v);
+        iris_ip_adapter_inject(a, i, q, S, k, v, h);   /* h += scale[i] * SDPA(q, k_ip, v_ip) */
+    }
+    /* Golden is the per-block-injected forward; a regression to the end-sum approximation
+     * (all Q from h0, contributions summed once) differs by ~20% here — well outside 1e-3. */
+    compare_tol("blockprop", h, gold, (long)S * H, 1e-3);
+
+    free(gamma); free(h0); free(gold); free(ip); free(h); free(q); free(k); free(v);
+    iris_ip_adapter_free(a);
+}
+
 static void check(const char *name, int ok) {
     printf("%-24s %s\n", name, ok ? "PASS" : "FAIL");
     if (ok) passes++; else failures++;
@@ -250,6 +308,7 @@ int main(void) {
     run_bundle(FIX "/bundle_int8", "_int8", "int8",    siglip, img_q);
     run_csd_bundle(img_q);
     run_hybrid_bundle(img_q);
+    run_block_prop(siglip);   /* M3: per-block injection propagation (uses its own h0/gamma) */
 
     free(siglip); free(img_q);
     printf("\n%d passed, %d failed\n", passes, failures);
