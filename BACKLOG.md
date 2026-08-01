@@ -83,6 +83,22 @@ a regression to the end-sum approximation would fail the fixture. NOTE: the `_pr
 itself is unchanged — it remains the fast (approximate) training path; this work only VERIFIED the
 correct path and added the regression guard. Cross-ref: review-2026-07-30, IP-ADAPTER-INFER-1.
 
+**C1 RECTIFIED-FLOW FIX — EMPIRICALLY VALIDATED (A/B + scale sweep, 2026-08-01).** Retrained the shipped
+cyberpunk cluster-23 LoRA with IDENTICAL data/recipe, ONLY the loss target changed (old v-pred vs fixed
+`noise-x0`, `main 6d1881e`). Result: the fix WORKS. styleCSD Δ (vs centroid) **baseline −0.121 → treatment
+−0.015 (+0.106)**; collapse gate cross-prompt corr **0.84 → 0.29**. Visual is decisive: old-loss LoRA →
+degraded dark artifact-mush, near-collapsed (~same output any prompt); fixed-loss LoRA → clean, coherent,
+prompt-responsive styled images. So the old v-prediction target trained adapters in a velocity space
+inconsistent with inference → corrupt/collapsed weights; the fix produces coherent, potent adapters.
+**Scale sweep** (fixed-loss LoRA is far more potent → operates ~2.5× lower than the old ~1.0–1.2): two kept
+operating points — **0.60** (chunky mecha robot, tasteful style, Δ +0.082) and **0.61** (the knee: max
+style while still a robot, Δ +0.157; 0.61–0.65 are one regime, 0.61 best); ≥0.70 overrides content
+(robot→human→gone). **Implication (the product win): re-train the whole Style Library (cyberpunk/fantasy/
+graphic) under the fixed loss + re-calibrate scales to ~0.60–0.61, then reship.** Full data + LoRA +
+renders + scripts + resume point archived to cold: `/Volumes/16TBCold/experiments/c1_rectified_flow_ab_
+2026-08-01/` (README.md + OPERATING_SCALES.md). Caveat: sweep is one prompt/seed — confirm 0.60/0.61 on
+2–3 more prompts before locking a library default. Cross-ref: [[train_flow_matching_target]].
+
 ---
 
 ## Training Development Lessons

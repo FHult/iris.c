@@ -33,6 +33,11 @@ DBS = ["/Volumes/16TBCold/metadata/shard_scores.db", "/Volumes/2TBSSD/shard_scor
 FLUX = os.path.join(REPO, "flux-klein-4b")   # symlink -> flux-klein-model (VAE parity verified)
 VENV_PY = os.path.join(REPO, "train/.venv/bin/python")
 VER = {"qwen3": "v_059443", "vae": "v_2232c1", "siglip": "v_336c6e"}
+# SigLIP is the precompute long pole (~77% of per-shard time on the torch-MPS fallback,
+# which stalls the GPU on per-batch empty_cache) AND it is IP-adapter-only. Backfill only
+# the universally-needed encoders here (~4.3x faster, GPU-bound); SigLIP is a separate
+# deferred pass. Measured 2026-07-31: cold-disk writes are NOT the bottleneck (235 MB/s).
+BACKFILL_ENCODERS = ("qwen3", "vae")
 IMG = (".jpg", ".jpeg", ".png", ".webp")
 MIN_FREE_GB = 150   # keep this much hot headroom before staging a batch
 
@@ -51,12 +56,12 @@ def _absent_shards():
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     cur = con.cursor()
     covered = {}
-    for e in VER:
+    for e in BACKFILL_ENCODERS:
         cur.execute("SELECT shard_id FROM precompute_coverage WHERE encoder=? AND n_records>0", (e,))
         covered[e] = set(r[0] for r in cur.fetchall())
     con.close()
     corpus = sorted(os.path.basename(f)[:-4] for f in glob.glob(f"{COLD_SHARDS}/*.tar"))
-    return [s for s in corpus if any(s not in covered[e] for e in VER)]
+    return [s for s in corpus if any(s not in covered[e] for e in BACKFILL_ENCODERS)]
 
 
 def _free_gb(path):
@@ -78,7 +83,7 @@ def _update_coverage(shard_ids, subsample):
     for sid in shard_ids:
         nimg = _tar_images(os.path.join(HOT_POOL, f"{sid}.tar"))
         nrec = min(subsample, nimg) if nimg else subsample
-        for e in VER:
+        for e in BACKFILL_ENCODERS:
             rows.append((e, VER[e], sid, nrec, nimg, None, ts))
     for db in DBS:
         if os.path.isdir(os.path.dirname(db)):
@@ -108,8 +113,7 @@ def _precompute(subsample):
         # version dir (validated 2026-07-30). PrecomputeCache derives enc_dir = parent.
         "--qwen3-output", os.path.join(COLD_PRE, "qwen3", VER["qwen3"]),
         "--vae-output", os.path.join(COLD_PRE, "vae", VER["vae"]),
-        "--siglip-output", os.path.join(COLD_PRE, "siglip", VER["siglip"]),
-        "--siglip", "--image-size", "512",
+        "--image-size", "512",  # SigLIP deferred (see BACKFILL_ENCODERS) — the ~77% long pole
         "--subsample-per-shard", str(subsample), "--skip-light-scores",
         "--flux-model", FLUX, "--seed", "1", "--ai",
     ]

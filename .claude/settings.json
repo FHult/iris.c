@@ -17,7 +17,17 @@
       "Bash(train/.venv/bin/python debug/flywheel_refgap.py *)",
       "Bash(train/.venv/bin/python train/scripts/config_schema.py *)",
       "Bash(iostat *)",
-      "Bash(diskutil info *)"
+      "Bash(diskutil info *)",
+      "Bash(sysctl -n *)",
+      "Bash(vm_stat)",
+      "Bash(pmset -g)",
+      "Bash(pmset -g *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(./iris *)",
+      "Bash(iris *)"
     ]
   }
 }

@@ -98,6 +98,16 @@ This project implements three targets:
   the index) so the next session reads it instantly. A scan whose output only lands in chat is a
   bug — it guarantees the expensive investigation repeats. Keep hot and cold `shard_scores.db` copies
   consistent (cold is authoritative; sync the hot working copy).
+- **Be performance-conscious when designing scripts, and MEASURE before you optimize or diagnose.**
+  For any long/batch job, design it to stay compute-bound and keep the expensive resource (GPU) busy:
+  batch to amortize fixed costs, avoid per-item GPU syncs (e.g. `torch.mps.empty_cache()` in a hot
+  loop) and needless small-file I/O, and only compute what the target work needs (e.g. skip an
+  IP-adapter-only encoder when doing style/foundation work). When GPU/CPU utilization is LOW, treat it
+  as a bug to diagnose, not accept. Crucially, find the real bottleneck by MEASURING (per-phase timings,
+  `ps` state, `iostat`, a quick throughput micro-benchmark) — never assume. A wrong assumption cost a
+  stop/restart here (2026-07-31): the backfill's low utilization was blamed on "slow cold-disk writes,"
+  but a 5-second `dd` showed cold does 235 MB/s — the true long pole was the SigLIP torch-MPS encoder
+  (~77% of per-shard time, stalling the GPU on per-batch `empty_cache`). Measure first, then fix.
 
 # Training→Inference Correctness Protocol (mandatory for the train↔infer boundary)
 
